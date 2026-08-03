@@ -20,6 +20,19 @@ krowk uploads create ../../tmp/screenshots/foobar.jpg \
   expires in 47h
 ```
 
+Go, standard library only. One static binary, no runtime to install — agent
+containers rarely have Node, and the whole point is that the upload step never
+fails for boring reasons.
+
+## Install
+
+```bash
+go install github.com/krowkcom/cli/cmd/krowk@latest
+```
+
+Release binaries, a Homebrew tap and the `npx krowk` wrapper the website
+advertises all land with the first tagged release — see the prerequisites below.
+
 ## Commands
 
 | Command | What it does |
@@ -31,7 +44,8 @@ krowk uploads create ../../tmp/screenshots/foobar.jpg \
 | `krowk doctor` | Report version, API reachability, auth and detected run context |
 
 Upload flags: `--pull-request`, `--reference` (repeatable), `--session`,
-`--title`, plus `--repo` / `--commit` / `--agent` to override detection.
+`--title`, plus `--repo` / `--commit` / `--agent` to override detection. Flags
+may follow the filenames.
 
 Global flags: `--format human|json|markdown`, `--json`, `--quiet`, `--help`,
 `--version`. Output is human on a TTY and JSON when piped, so an agent that
@@ -59,7 +73,7 @@ implement this for the CLI to work unchanged.
 POST {KROWK_API_URL}/artifacts
 Authorization: Bearer <token>        # optional — anonymous uploads allowed
 Content-Type: multipart/form-data
-  file      one or more files, repeated field
+  file      one or more files, repeated field, streamed off disk
   metadata  JSON blob (table above)
 ```
 
@@ -101,19 +115,29 @@ body alone:
 ## Development
 
 ```bash
-bun install
-bun test            # 9 tests, runs the CLI against an in-process mock registry
-bun run typecheck
-bun run build       # → dist/cli.js, the npm bin
+make check       # go vet + go test ./...
+make build       # → bin/krowk, version stamped from git describe
+make mock        # stand-in registry on :8787
+make install     # → $GOPATH/bin/krowk
 
-bun run mock        # mock registry on :8787
-KROWK_API_URL=http://localhost:8787/v1 bun src/cli.ts uploads create screenshot.png
+KROWK_API_URL=http://localhost:8787/v1 ./bin/krowk uploads create screenshot.png
 ```
 
-`mock/server.ts` is a working stand-in for `api.krowk.com`: digest-derived IDs,
-the error envelope, rate-limit headers. It exists so the CLI can be developed
-and demoed before the registry ships — and doubles as the spec the registry
-has to satisfy.
+```
+cmd/krowk               the binary
+cmd/krowk-mock          the mock registry
+internal/cli            flag parsing, routing, commands
+internal/api            HTTP client, streamed multipart, retries, credentials
+internal/runctx         git and CI metadata detection
+internal/output         human / json / markdown rendering
+internal/registry       the mock registry handler, shared with the tests
+```
+
+`internal/registry` is a working stand-in for `api.krowk.com`: digest-derived
+IDs, the error envelope, rate-limit headers. It exists so the CLI can be
+developed and demoed before the registry ships — and doubles as the spec the
+registry has to satisfy. The CLI tests drive the real binary against it over a
+real socket via `httptest`.
 
 Environment: `KROWK_TOKEN`, `KROWK_API_URL`, `KROWK_AGENT`.
 
@@ -122,24 +146,24 @@ Environment: `KROWK_TOKEN`, `KROWK_API_URL`, `KROWK_AGENT`.
 Blocking, in order:
 
 1. **The registry.** `api.krowk.com` does not resolve. Nothing ships until
-   something implements `mock/server.ts` for real — storage, digest-keyed IDs,
-   48h expiry with a `410` tombstone.
+   something implements `internal/registry` for real — storage, digest-keyed
+   IDs, 48h expiry with a `410` tombstone.
 2. **The unfurl layer.** The whole pitch is the preview card. That means
    `krowk.com/a/{id}` serving OpenGraph tags plus a rendered `preview.png`, and
    a Slack app for Slack's own unfurl path. The CLI is done when this exists;
    without it the URL is a bare link.
-3. **Names.** `krowk` and `@krowk/mcp` are unclaimed on npm and
-   `github.com/krowkcom/cli` is a 404. Claim all three before the site's
-   `npx krowk push` instruction is true.
+3. **Distribution.** `krowk` and `@krowk/mcp` are unclaimed on npm. The site
+   tells people to run `npx krowk push`, so the first release needs GoReleaser
+   for the binaries plus a thin npm wrapper that pulls the right one through
+   per-platform `optionalDependencies` — the pattern esbuild uses. A Homebrew
+   tap and `curl | bash` come off the same build.
 4. **Tokens.** `auth login --token` is a placeholder. The site promises scoped
    keys per agent per repo with their own quota; that needs an issuing endpoint
-   and a dashboard, or at minimum a `krowk auth login` device flow like the
-   Basecamp CLI's.
+   and a dashboard, or at minimum a device flow like the Basecamp CLI's.
 
 Non-blocking, in rough value order: the `@krowk/mcp` server wrapping
 `uploads create` as `krowk_push`; a Claude Code `PostToolUse` hook so
-screenshots upload with no prompting; a GitHub Action; release binaries and a
-Homebrew tap.
+screenshots upload with no prompting; a GitHub Action.
 
 ## Open contract questions
 

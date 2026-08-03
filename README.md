@@ -59,6 +59,8 @@ Flags win; everything else is detected so the agent never has to type it.
 | --- | --- |
 | `repo` | `GITHUB_REPOSITORY`, else `git remote get-url origin` |
 | `commit` | `GITHUB_SHA`, else `git rev-parse HEAD` |
+| `commit_url` | `{GITHUB_SERVER_URL}/{repo}/commit/{sha}` — omitted when the remote is not GitHub, rather than guessing a path shape |
+| `dirty` | `git status --porcelain` is non-empty, i.e. the screenshot may not match the commit |
 | `branch` | `git rev-parse --abbrev-ref HEAD` |
 | `agent` | `KROWK_AGENT`, else `CLAUDECODE` → `claude-code`, `CURSOR_TRACE_ID` → `cursor`, `GITHUB_ACTIONS` → `github-actions` |
 | `pull_request` | `--pull-request`, else derived from `GITHUB_REF` in a PR build |

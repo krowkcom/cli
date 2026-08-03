@@ -12,6 +12,8 @@ import (
 type Metadata struct {
 	Repo        string   `json:"repo,omitempty"`
 	Commit      string   `json:"commit,omitempty"`
+	CommitURL   string   `json:"commit_url,omitempty"`
+	Dirty       bool     `json:"dirty,omitempty"`
 	Branch      string   `json:"branch,omitempty"`
 	Agent       string   `json:"agent,omitempty"`
 	PullRequest string   `json:"pull_request,omitempty"`
@@ -27,14 +29,35 @@ type Env func(string) string
 
 // Detect fills in everything that can be read off the machine.
 func Detect(env Env) Metadata {
-	return Metadata{
-		Repo:        firstNonEmpty(env("GITHUB_REPOSITORY"), Slug(git("remote", "get-url", "origin"))),
+	remote := git("remote", "get-url", "origin")
+
+	m := Metadata{
+		Repo:        firstNonEmpty(env("GITHUB_REPOSITORY"), Slug(remote)),
 		Commit:      firstNonEmpty(env("GITHUB_SHA"), git("rev-parse", "HEAD")),
 		Branch:      git("rev-parse", "--abbrev-ref", "HEAD"),
+		Dirty:       git("status", "--porcelain") != "",
 		Agent:       DetectAgent(env),
 		Session:     DetectSession(env),
 		PullRequest: CIPullRequest(env),
 	}
+	m.CommitURL = CommitURL(env, remote, m.Repo, m.Commit)
+	return m
+}
+
+// CommitURL links the commit on GitHub. It stays empty for any other host
+// rather than guessing a path shape and emitting a link that 404s.
+func CommitURL(env Env, remote, repo, commit string) string {
+	if repo == "" || commit == "" {
+		return ""
+	}
+	server := env("GITHUB_SERVER_URL") // set by Actions, and correct on Enterprise
+	if server == "" && Host(remote) == "github.com" {
+		server = "https://github.com"
+	}
+	if server == "" {
+		return ""
+	}
+	return strings.TrimRight(server, "/") + "/" + repo + "/commit/" + commit
 }
 
 // DetectSession finds the agent run this upload belongs to, so --session is a
@@ -66,7 +89,16 @@ func DetectAgent(env Env) string {
 var (
 	slugRE  = regexp.MustCompile(`[:/]([^/:]+/[^/]+?)(?:\.git)?/?$`)
 	prRefRE = regexp.MustCompile(`^refs/pull/(\d+)/`)
+	hostRE  = regexp.MustCompile(`^(?:[a-z+]+://)?(?:[^@/]+@)?([^/:]+)[:/]`)
 )
+
+// Host pulls github.com out of either remote spelling.
+func Host(remote string) string {
+	if m := hostRE.FindStringSubmatch(remote); m != nil {
+		return m[1]
+	}
+	return ""
+}
 
 // Slug turns git@github.com:acme/storefront.git into acme/storefront.
 func Slug(remote string) string {

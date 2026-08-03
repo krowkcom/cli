@@ -37,6 +37,41 @@ func TestDetectAgent(t *testing.T) {
 	}
 }
 
+func TestHost(t *testing.T) {
+	for in, want := range map[string]string{
+		"git@github.com:acme/storefront.git":     "github.com",
+		"https://github.com/acme/storefront":     "github.com",
+		"ssh://git@git.acme.dev:2222/acme/store": "git.acme.dev",
+		"":                                       "",
+	} {
+		if got := Host(in); got != want {
+			t.Errorf("Host(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestCommitURL(t *testing.T) {
+	const sha = "757cc51982cd8291486f65e921d45d96a9f688a6"
+	want := "https://github.com/acme/storefront/commit/" + sha
+
+	if got := CommitURL(env(nil), "git@github.com:acme/storefront.git", "acme/storefront", sha); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// Actions supplies the server, so Enterprise hosts link correctly.
+	ghes := map[string]string{"GITHUB_SERVER_URL": "https://github.acme.dev/"}
+	if got, want := CommitURL(env(ghes), "", "acme/storefront", sha),
+		"https://github.acme.dev/acme/storefront/commit/"+sha; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// A non-GitHub remote gets no link rather than a broken one.
+	if got := CommitURL(env(nil), "git@gitlab.com:acme/storefront.git", "acme/storefront", sha); got != "" {
+		t.Errorf("got %q, want empty for a non-GitHub remote", got)
+	}
+	if got := CommitURL(env(nil), "git@github.com:acme/storefront.git", "acme/storefront", ""); got != "" {
+		t.Errorf("got %q, want empty without a commit", got)
+	}
+}
+
 func TestDetectSession(t *testing.T) {
 	claude := map[string]string{"CLAUDE_CODE_SESSION_ID": "3fe6808d-088d-4a6f-a04c-cc9690bcf852"}
 	if got := DetectSession(env(claude)); got != claude["CLAUDE_CODE_SESSION_ID"] {

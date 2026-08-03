@@ -1,0 +1,28 @@
+{
+  "name": "krowk",
+  "version": "0.1.0",
+  "description": "Permalinks for agent output — push an artifact, get a URL that unfurls.",
+  "license": "MIT",
+  "repository": "github:krowkcom/cli",
+  "type": "module",
+  "bin": {
+    "krowk": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "bun build src/cli.ts --target=node --outfile=dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "mock": "bun mock/server.ts",
+    "krowk": "bun src/cli.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.2"
+  }
+}

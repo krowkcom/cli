@@ -37,6 +37,24 @@ func TestDetectAgent(t *testing.T) {
 	}
 }
 
+func TestDetectSession(t *testing.T) {
+	claude := map[string]string{"CLAUDE_CODE_SESSION_ID": "3fe6808d-088d-4a6f-a04c-cc9690bcf852"}
+	if got := DetectSession(env(claude)); got != claude["CLAUDE_CODE_SESSION_ID"] {
+		t.Errorf("got %q, want the Claude Code session", got)
+	}
+	if got := DetectSession(env(map[string]string{"GITHUB_RUN_ID": "18273645"})); got != "18273645" {
+		t.Errorf("got %q, want the CI run", got)
+	}
+	// An explicit override beats detection.
+	both := map[string]string{"KROWK_SESSION": "mine", "CLAUDE_CODE_SESSION_ID": "theirs"}
+	if got := DetectSession(env(both)); got != "mine" {
+		t.Errorf("got %q, want the override", got)
+	}
+	if got := DetectSession(env(nil)); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
 func TestCIPullRequest(t *testing.T) {
 	in := map[string]string{"GITHUB_REF": "refs/pull/412/merge", "GITHUB_REPOSITORY": "acme/storefront"}
 	if got, want := CIPullRequest(env(in)), "https://github.com/acme/storefront/pull/412"; got != want {

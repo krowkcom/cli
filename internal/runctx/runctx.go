@@ -32,8 +32,20 @@ func Detect(env Env) Metadata {
 		Commit:      firstNonEmpty(env("GITHUB_SHA"), git("rev-parse", "HEAD")),
 		Branch:      git("rev-parse", "--abbrev-ref", "HEAD"),
 		Agent:       DetectAgent(env),
+		Session:     DetectSession(env),
 		PullRequest: CIPullRequest(env),
 	}
+}
+
+// DetectSession finds the agent run this upload belongs to, so --session is a
+// correction rather than something the agent has to remember.
+func DetectSession(env Env) string {
+	return firstNonEmpty(
+		env("KROWK_SESSION"),
+		env("CLAUDE_CODE_SESSION_ID"),
+		env("CURSOR_TRACE_ID"),
+		env("GITHUB_RUN_ID"),
+	)
 }
 
 // DetectAgent names the tool driving the upload.

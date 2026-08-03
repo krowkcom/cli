@@ -135,6 +135,16 @@ func TestFlagsMayFollowFilenames(t *testing.T) {
 	}
 }
 
+func TestSessionIsDetectedWithoutAFlag(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["CLAUDE_CODE_SESSION_ID"] = "3fe6808d-088d-4a6f-a04c-cc9690bcf852"
+
+	_, stdout, _ := h.run("push", h.fixture)
+	if got := decode(t, stdout).Data.Metadata["session"]; got != h.env["CLAUDE_CODE_SESSION_ID"] {
+		t.Errorf("session = %v, want the detected agent session", got)
+	}
+}
+
 func TestMarkdownFormatIsPasteReady(t *testing.T) {
 	h := newHarness(t, 0)
 

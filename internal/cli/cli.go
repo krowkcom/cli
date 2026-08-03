@@ -183,8 +183,8 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 	overrideString(&metadata.Commit, f.commit)
 	overrideString(&metadata.Agent, f.agent)
 	overrideString(&metadata.PullRequest, f.pullRequest)
+	overrideString(&metadata.Session, f.session)
 	metadata.Reference = f.references
-	metadata.Session = f.session
 	metadata.Title = f.title
 	metadata.Client = "krowk-cli/" + Version
 

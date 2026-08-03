@@ -62,7 +62,8 @@ Flags win; everything else is detected so the agent never has to type it.
 | `branch` | `git rev-parse --abbrev-ref HEAD` |
 | `agent` | `KROWK_AGENT`, else `CLAUDECODE` → `claude-code`, `CURSOR_TRACE_ID` → `cursor`, `GITHUB_ACTIONS` → `github-actions` |
 | `pull_request` | `--pull-request`, else derived from `GITHUB_REF` in a PR build |
-| `reference`, `session`, `title` | Flags only |
+| `session` | `--session`, else `KROWK_SESSION`, `CLAUDE_CODE_SESSION_ID`, `CURSOR_TRACE_ID`, `GITHUB_RUN_ID` |
+| `reference`, `title` | Flags only |
 
 ## Wire contract
 

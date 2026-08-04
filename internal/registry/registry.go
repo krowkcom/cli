@@ -206,6 +206,10 @@ const anonymousClass = "anonymous"
 // derived from the bytes, so without the partition a keyed push of a file
 // someone had already pushed anonymously would inherit their unowned artifact,
 // with its shorter expiry and no way to adopt it into the workspace.
+//
+// Every handler that classifies calls authorize first, which turns an invalid
+// token into a 401 — so the invalid branch here is defence in depth, never a
+// silent fall into the anonymous class.
 func ownerClass(r *http.Request) string {
 	info, anonymous := describeKey(bearer(r))
 	if anonymous || !info.Valid {
@@ -480,6 +484,15 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 		defer s.mu.Unlock()
 
 		rate := rateHeaders(max(0, dailyUploads-len(s.artifacts)))
+
+		// The same gate as begin: an invalid token is a 401, not a silent fall
+		// into the anonymous class, and a read-only key cannot complete what it
+		// could never have opened. Without this, finalize would classify
+		// `Bearer garbage` as anonymous and let a krk_ro_ key — same workspace
+		// class as a writer — finish a pending workspace upload.
+		if !authorize(w, r, rate) {
+			return
+		}
 
 		// The ID is public — it is the last segment of the link people paste
 		// into pull requests. So it authorises nothing on its own: proving you

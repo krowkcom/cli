@@ -103,6 +103,31 @@ func (c *client) begin(req beginRequest) (int, beginResponse) {
 	return res.StatusCode, out
 }
 
+// beginAs opens a handshake with an Authorization header.
+func (c *client) beginAs(token string, req beginRequest) (int, beginResponse) {
+	c.t.Helper()
+	payload, err := json.Marshal(req)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	post, err := http.NewRequest(http.MethodPost, c.url+"/v1/artifacts", bytes.NewReader(payload))
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	post.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		post.Header.Set("Authorization", "Bearer "+token)
+	}
+	res, err := http.DefaultClient.Do(post)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var out beginResponse
+	_ = json.NewDecoder(res.Body).Decode(&out)
+	return res.StatusCode, out
+}
+
 func TestHandshakeStoresTheArtifactAndIsIdempotent(t *testing.T) {
 	c := serve(t, 0)
 	req := declare([2]string{"before.png", "one"}, [2]string{"after.png", "two"})
@@ -648,6 +673,65 @@ func TestFinalizeRetryIsScopedToTheOwnershipClass(t *testing.T) {
 		map[string]string{"idempotency_key": req.IdempotencyKey})
 	if code != http.StatusOK {
 		t.Errorf("anonymous retry = %d %v, want 200", code, out)
+	}
+}
+
+// finalize stands behind the same gate as begin: an invalid token is a 401,
+// not a silent fall into the anonymous class, and a read-only key — which
+// shares the writer's workspace class — cannot complete what it could never
+// have opened.
+func TestFinalizeRejectsInvalidAndReadOnlyKeys(t *testing.T) {
+	c := serve(t, 0)
+	req := declare([2]string{"shot.png", "one"})
+
+	_, begun := c.beginAs("krk_live_abc", req)
+	if code, _ := c.put(begun.Uploads[0].URL, "one"); code != http.StatusOK {
+		t.Fatal("put failed")
+	}
+
+	finalize := "/v1/artifacts/" + begun.ID + "/finalize"
+	body := map[string]string{"idempotency_key": req.IdempotencyKey}
+
+	code, out := c.postAs(finalize, "hunter2", body)
+	if code != http.StatusUnauthorized || out["error"] != "invalid_key" {
+		t.Errorf("finalize with a garbage token = %d %v, want 401 invalid_key", code, out)
+	}
+
+	code, out = c.postAs(finalize, "krk_ro_view", body)
+	if code != http.StatusForbidden || out["error"] != "insufficient_scope" {
+		t.Errorf("read-only finalize = %d %v, want 403 insufficient_scope", code, out)
+	}
+
+	// The writer still completes its own upload.
+	if code, done := c.postAs(finalize, "krk_live_abc", body); code != http.StatusOK {
+		t.Errorf("the writer's finalize = %d %v, want 200", code, done)
+	}
+}
+
+// The same 401 protects anonymous pending uploads: `Bearer garbage` is not an
+// anonymous caller, so it cannot complete a handshake and take the claim URL.
+func TestGarbageTokenCannotFinalizeAnAnonymousUpload(t *testing.T) {
+	c := serve(t, 0)
+	req := declare([2]string{"shot.png", "one"})
+
+	_, begun := c.begin(req) // anonymous
+	if code, _ := c.put(begun.Uploads[0].URL, "one"); code != http.StatusOK {
+		t.Fatal("put failed")
+	}
+
+	finalize := "/v1/artifacts/" + begun.ID + "/finalize"
+	body := map[string]string{"idempotency_key": req.IdempotencyKey}
+
+	code, out := c.postAs(finalize, "hunter2", body)
+	if code != http.StatusUnauthorized || out["error"] != "invalid_key" {
+		t.Errorf("finalize with a garbage token = %d %v, want 401 invalid_key", code, out)
+	}
+	if out["claim_url"] != nil {
+		t.Errorf("the rejection carried the claim URL: %v", out["claim_url"])
+	}
+
+	if code, done := c.postAs(finalize, "", body); code != http.StatusOK || done["claim_url"] == nil {
+		t.Errorf("anonymous finalize = %d %v, want 200 with the claim URL", code, done)
 	}
 }
 

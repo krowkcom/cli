@@ -236,8 +236,9 @@ body alone:
   same ID and the same upload targets, so blobs already stored stay stored.
 - **The ID authorises nothing.** It is the last segment of every link that gets
   pasted anywhere, so `finalize` requires the idempotency key and rejects a
-  request without one. Only the caller that opened a handshake can complete it,
-  or replay it to get the artifact back.
+  request without one. Only a caller in the same ownership class — no key for
+  anonymous uploads, a valid write-scoped key in the same workspace for keyed
+  ones — can complete a handshake, or replay it to get the artifact back.
 - **IDs lengthen on collision.** Seven hex characters is 28 bits, so two
   unrelated uploads collide after a few thousand — inside a real registry's
   first week. A collision extends the new ID rather than letting it take over an

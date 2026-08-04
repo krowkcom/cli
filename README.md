@@ -374,6 +374,14 @@ commit and pull request behind it. Artifact IDs are seven characters and
 enumerable, so on a café or office network a wider bind hands that to whoever is
 nearby. `--addr` can still open it up, and the banner says so when you do.
 
+Pending state is bounded, because declaring an upload needs no key and sends no
+bytes — so it is the cheapest request here and the one worth abusing. A handshake
+that never finalizes expires after an hour, swept on the next declaration; at most
+256 may be in flight at once (`503`, retryable); and one manifest may declare at
+most 64 files, since each mints a blob token and the body limit alone would allow
+thousands. Finishing an upload releases its handshake too — only the artifact and
+its ID reservation are kept, so a live link can never be handed to a later upload.
+
 ## Development
 
 ```bash

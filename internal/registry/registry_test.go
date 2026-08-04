@@ -597,6 +597,60 @@ func TestTheClaimURLIsHandedBackOnlyOnce(t *testing.T) {
 	}
 }
 
+// Dedup is scoped to an ownership class. A keyed push of bytes somebody had
+// already pushed anonymously must mint its own workspace-owned artifact — not
+// inherit the anonymous one, with its 24h window and no claim path to recover.
+func TestKeyedPushDoesNotInheritAnAnonymousUpload(t *testing.T) {
+	c := serve(t, 0)
+
+	anon := c.pushAs("", [2]string{"shared.png", "one"})
+	keyed := c.pushAs("krk_live_abc", [2]string{"shared.png", "one"})
+
+	if keyed["id"] == anon["id"] {
+		t.Fatalf("the keyed push inherited the anonymous artifact %v", anon["id"])
+	}
+	if keyed["anonymous"] != nil {
+		t.Errorf("anonymous = %v, want the keyed artifact owned by the workspace", keyed["anonymous"])
+	}
+	if keyed["claim_url"] != nil {
+		t.Errorf("claim_url = %v, want none — there is nothing to claim", keyed["claim_url"])
+	}
+	expires, _ := keyed["expires_at"].(string)
+	at, _ := time.Parse(time.RFC3339, expires)
+	if left := time.Until(at); left > workspaceExpiry || left < workspaceExpiry-time.Minute {
+		t.Errorf("expires in %v, want the workspace window %v", left, workspaceExpiry)
+	}
+
+	// And a keyed retry replays the keyed artifact, not the anonymous one.
+	again := c.pushAs("krk_live_abc", [2]string{"shared.png", "one"})
+	if again["id"] != keyed["id"] {
+		t.Errorf("retry replayed %v, want %v", again["id"], keyed["id"])
+	}
+}
+
+// The finalize retry is partitioned the same way: the right key presented from
+// the wrong ownership class does not replay someone else's artifact.
+func TestFinalizeRetryIsScopedToTheOwnershipClass(t *testing.T) {
+	c := serve(t, 0)
+	req := declare([2]string{"shared.png", "one"})
+
+	done := c.pushAs("", [2]string{"shared.png", "one"})
+	id, _ := done["id"].(string)
+
+	code, out := c.postAs("/v1/artifacts/"+id+"/finalize", "krk_live_abc",
+		map[string]string{"idempotency_key": req.IdempotencyKey})
+	if code != http.StatusConflict || out["error"] != "idempotency_key_mismatch" {
+		t.Errorf("keyed finalize of an anonymous artifact = %d %v, want 409", code, out)
+	}
+
+	// The caller that pushed it still gets the free retry.
+	code, out = c.postAs("/v1/artifacts/"+id+"/finalize", "",
+		map[string]string{"idempotency_key": req.IdempotencyKey})
+	if code != http.StatusOK {
+		t.Errorf("anonymous retry = %d %v, want 200", code, out)
+	}
+}
+
 // Which side of the fence an upload lands on is settled when the handshake
 // opens, so it cannot change hands by finalizing with a different key.
 func TestOwnershipIsDecidedAtTheManifest(t *testing.T) {

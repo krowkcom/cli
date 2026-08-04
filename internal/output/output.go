@@ -161,8 +161,15 @@ func Artifact(a *api.Artifact, f Format, title string, quiet, colour bool, now t
 
 func summarise(a *api.Artifact) string {
 	s := fmt.Sprintf("%d artifact(s), %s", max(len(a.Files), 1), HumanBytes(a.Bytes))
-	if a.Anonymous {
+	// The claim advice only belongs where there is a claim URL to act on. A
+	// replay deliberately omits it — the claim URL was handed out once, to the
+	// push that created the artifact — so telling this caller to claim would
+	// point at nothing.
+	if a.ClaimURL != "" {
 		return s + ", anonymous — claim it to keep it"
+	}
+	if a.Anonymous {
+		return s + ", anonymous"
 	}
 	return s
 }

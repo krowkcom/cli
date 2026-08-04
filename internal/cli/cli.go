@@ -145,13 +145,6 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		return report(stderr, err, format, f.quiet, colour)
 	}
 
-	// registry.Handler treats <= 0 as "use the default", so a negative limit
-	// would silently mean 100 MiB. Reject it instead of guessing.
-	if f.limitBytes < 0 {
-		err := api.Fail("bad_flag", "--limit-bytes must not be negative — omit it or pass 0 for the default")
-		return report(stderr, err, format, f.quiet, colour)
-	}
-
 	switch {
 	case f.version:
 		fmt.Fprintln(stdout, Version)
@@ -256,6 +249,12 @@ func registryMode(client *api.Client, env runctx.Env) string {
 // registryServe runs the local stand-in for api.krowk.com, so developing against
 // a registry needs neither the network nor a checkout of this repository.
 func registryServe(w io.Writer, f flags) error {
+	// registry.Handler treats <= 0 as "use the default", so a negative limit
+	// would silently mean 100 MiB. Reject it instead of guessing.
+	if f.limitBytes < 0 {
+		return api.Fail("bad_flag", "--limit-bytes must not be negative — omit it or pass 0 for the default")
+	}
+
 	addr := f.addr
 	if addr == "" {
 		addr = defaultRegistryAddr
@@ -267,6 +266,12 @@ func registryServe(w io.Writer, f flags) error {
 	if err != nil {
 		return api.Fail("registry_unavailable", "could not listen on "+addr+": "+err.Error())
 	}
+	return serveOn(w, ln, addr, f)
+}
+
+// serveOn runs the registry on an already-bound listener. Split from
+// registryServe so a test can hold the listener and close it to stop serving.
+func serveOn(w io.Writer, ln net.Listener, addr string, f flags) error {
 	fmt.Fprint(w, serveBanner(localBase(ln.Addr().String(), addr)))
 
 	server := &http.Server{
@@ -294,14 +299,24 @@ func serveBanner(base string) string {
 // the listener reports, which resolves ":0" to the real port; asked keeps the
 // hostname the user typed, since the listener flattens it to an IP.
 func localBase(bound, asked string) string {
-	if strings.HasPrefix(asked, ":") {
-		_, port, err := net.SplitHostPort(bound)
-		if err != nil {
-			return "http://localhost" + asked
-		}
-		return "http://localhost:" + port
+	host, port, err := net.SplitHostPort(asked)
+	if err != nil {
+		return "http://" + asked
 	}
-	return "http://" + asked
+	// An asked port of 0 means "any port", and only the bound address knows
+	// which one it became.
+	if port == "0" {
+		if _, boundPort, splitErr := net.SplitHostPort(bound); splitErr == nil {
+			port = boundPort
+		}
+	}
+	// Wildcard binds listen everywhere but dial nowhere; localhost is the
+	// loopback name that reaches them on either stack.
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 // authHint points a rejected upload at the self-check. The registry cannot know

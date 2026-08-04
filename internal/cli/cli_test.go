@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http/httptest"
 	"os"
@@ -528,6 +529,12 @@ func TestLocalBaseTurnsAListenAddressIntoAURL(t *testing.T) {
 		// A hostname the user typed survives, even though the listener
 		// reports the IP it resolved to.
 		{"127.0.0.1:9000", "127.0.0.1:9000", "http://127.0.0.1:9000"},
+		// "any port" with a named host still takes the port from the bind.
+		{"127.0.0.1:41234", "localhost:0", "http://localhost:41234"},
+		// A wildcard bind listens everywhere but dials nowhere, so the URL
+		// says localhost instead.
+		{"0.0.0.0:8787", "0.0.0.0:8787", "http://localhost:8787"},
+		{"[::]:8787", "[::]:8787", "http://localhost:8787"},
 	} {
 		if got := localBase(tc.bound, tc.asked); got != tc.want {
 			t.Errorf("localBase(%q, %q) = %q, want %q", tc.bound, tc.asked, got, tc.want)
@@ -606,6 +613,46 @@ func TestNegativeLimitBytesIsRejected(t *testing.T) {
 	e := decode(t, stderr)
 	if e.Error["error"] != "bad_flag" {
 		t.Errorf("error = %v, want bad_flag", e.Error["error"])
+	}
+}
+
+// The check lives in the serve path, so asking for help never trips over a
+// flag value that only `registry serve` cares about.
+func TestHelpWinsOverANegativeLimitBytes(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, stdout, stderr := h.run("--help", "--limit-bytes", "-5")
+	if code != 0 || !strings.Contains(stdout, "uploads create") {
+		t.Errorf("--help with a bad --limit-bytes = %q (exit %d), stderr: %s", stdout, code, stderr)
+	}
+}
+
+// The one path the handler tests cannot see: the flags actually reaching
+// registry.Handler. A limit small enough to refuse the fixture proves it.
+func TestRegistryServeWiresLimitBytesIntoTheHandler(t *testing.T) {
+	h := newHarness(t, 0)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- serveOn(io.Discard, ln, ln.Addr().String(), flags{limitBytes: 4}) }()
+
+	h.env["KROWK_API_URL"] = "http://" + ln.Addr().String() + "/v1"
+	code, _, stderr := h.run("push", h.fixture)
+	if code == 0 {
+		t.Fatal("a push above --limit-bytes should fail")
+	}
+	e := decode(t, stderr)
+	if e.Error["error"] != "artifact_too_large" {
+		t.Errorf("error = %v, want artifact_too_large", e.Error["error"])
+	}
+
+	ln.Close()
+	var apiErr *api.Error
+	if serveErr := <-done; !errors.As(serveErr, &apiErr) || apiErr.Code() != "registry_unavailable" {
+		t.Errorf("serve after the listener closed = %v, want registry_unavailable", serveErr)
 	}
 }
 

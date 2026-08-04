@@ -139,6 +139,15 @@ func TestMarkdownFallsBackToALinkWithoutAPreview(t *testing.T) {
 	if got := PasteFor(a, "Checkout").Markdown; got != "[Checkout](https://krowk.com/a/9f3c2e1)" {
 		t.Errorf("markdown = %q, want a plain link when there is nothing to embed", got)
 	}
+
+	// The human label must not promise an image the markdown does not carry.
+	got := Artifact(a, Human, "Checkout", false, false, time.Now())
+	if strings.Contains(got, embedSurfaces) {
+		t.Errorf("human output claims %q without a preview:\n%s", embedSurfaces, got)
+	}
+	if !strings.Contains(got, plainSurfaces) {
+		t.Errorf("human output is missing %q:\n%s", plainSurfaces, got)
+	}
 }
 
 func TestResolveFormat(t *testing.T) {

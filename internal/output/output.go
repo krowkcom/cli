@@ -40,6 +40,9 @@ type Paste struct {
 // Surfaces name where each form belongs, so the choice never has to be guessed.
 const (
 	embedSurfaces = "GitHub, Linear, Notion — renders the image"
+	// plainSurfaces replaces embedSurfaces when there is no preview to embed and
+	// the markdown form is only a plain link, so the label stays honest.
+	plainSurfaces = "GitHub, Linear, Notion — plain link, no preview to embed"
 	linkSurfaces  = "Slack, Basecamp — they unfurl the link themselves"
 )
 
@@ -179,9 +182,13 @@ func humanArtifact(a *api.Artifact, paste Paste, title string, colour bool, now 
 	}
 	// Both paste forms, labelled, because the right one depends on where it is
 	// going and neither surface renders the other's.
+	markdownSurfaces := embedSurfaces
+	if a.PreviewURL == "" {
+		markdownSurfaces = plainSurfaces
+	}
 	lines = append(lines,
 		"",
-		paint(colour, dim, "  "+embedSurfaces),
+		paint(colour, dim, "  "+markdownSurfaces),
 		"  "+paste.Markdown,
 		"",
 		paint(colour, dim, "  "+linkSurfaces),

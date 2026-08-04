@@ -123,6 +123,23 @@ publish it somewhere I can fetch". Symlink order is the subtle half — a link
 inside the repo pointing at `~/.ssh/id_rsa` sails through a prefix test done
 before resolving.
 
+Two things a plain prefix check gets wrong, both worth stating because both are
+the common case rather than the exotic one:
+
+- **The root may not be the home directory, or `/`.** It defaults to the working
+  directory, so an agent started outside a checkout would otherwise take `$HOME`
+  as its boundary — and `~/.ssh`, `~/.aws` and `~/.config/krowk` are all inside
+  that. A root that broad is refused with a message saying to pass `--root`.
+- **Credential files are refused inside the root too.** A checkout is not free of
+  secrets: `.env` files live in them, and so do stray keys and service-account
+  JSON. `.env*`, `.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker`, `.netrc`, `.npmrc`,
+  `.pypirc`, `.git-credentials`, `credentials.json` and `id_rsa` / `id_ed25519` /
+  `id_ecdsa` are refused wherever they sit. Nobody publishes these on purpose, so
+  the cost of refusing is an error message and the cost of allowing is a secret
+  with a permalink.
+
+The boundary constrains `krowk_push`; it is not a sandbox around the agent.
+
 ## Metadata
 
 Flags win; everything else is detected so the agent never has to type it.
@@ -302,6 +319,16 @@ body alone:
   the host and arrive as a `GET`, taking the method restriction with it. And the
   address is judged as it is dialled rather than by resolving the name first,
   since whoever returned the name can answer the check and the dial differently.
+
+  "Inside the network" means more than the obvious four shapes: carrier-grade NAT
+  (`100.64.0.0/10`, where Tailscale lives), `240.0.0.0/4`, multicast, and the
+  NAT64 prefix `64:ff9b::/96`, which on an IPv6-only runner is how you reach the
+  metadata service without naming a link-local address at all.
+
+  **Behind a proxy the connection check stands down**, because every connection
+  then goes to the proxy — which is typically on a private address, so judging it
+  would refuse every upload — and the proxy does the name resolution that the
+  check was there to get in front of. The URL check carries the boundary there.
 - **Expiry** — an expired free link returns `410 Gone` carrying the original
   filename and upload time.
 

@@ -53,9 +53,11 @@ upload, so treat it as a secret: give it to the human, never paste it into a
 pull request, an issue or a chat message.
 
 krowk_push only uploads files from the working directory and below. Anything
-outside it is refused, symlinks included. An artifact is published at a URL that
-needs no credential to read, so do not try to route around this: if a file you
-were asked to share sits elsewhere, say so and let the human move it.`
+outside it is refused, symlinks included, and credential files are refused even
+inside it — .env, .ssh, .aws, .netrc, private keys, credentials.json. An artifact
+is published at a URL that needs no credential to read, so do not try to route
+around this: if a file you were asked to share sits elsewhere, say so and let the
+human move it.`
 
 // Server speaks MCP over a pair of streams.
 type Server struct {
@@ -98,7 +100,55 @@ func (s *Server) resolveRoot() (string, error) {
 	if real, err := filepath.EvalSymlinks(abs); err == nil {
 		abs = real
 	}
+	// A root of / or the home directory is not a boundary. The home directory is
+	// the one that happens by accident: an agent started outside a checkout takes
+	// its working directory as the root, and then ~/.ssh/id_rsa, ~/.aws and
+	// ~/.config/krowk are all inside it — exactly the reach confinement is here to
+	// remove. Better to refuse and be told where the files are.
+	if abs == string(filepath.Separator) {
+		return "", api.Fail("root_too_broad",
+			"the upload root is / — start the server in a project directory, or pass --root")
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if resolved, err := filepath.EvalSymlinks(home); err == nil {
+			home = resolved
+		}
+		if abs == home {
+			return "", api.Fail("root_too_broad",
+				"the upload root is the home directory, which holds ~/.ssh and ~/.aws — "+
+					"start the server in a project directory, or pass --root")
+		}
+	}
 	return abs, nil
+}
+
+// secretNames are refused wherever they sit, root or no root, because a
+// repository is not free of credentials either: .env files live in checkouts, and
+// so do stray keys and service-account JSON. An artifact is published at a URL
+// that needs no credential to read, and nobody publishes these on purpose — so
+// the cost of refusing them is a clear error, and the cost of not refusing them
+// is a leaked secret with a permalink.
+var secretNames = map[string]bool{
+	".ssh": true, ".aws": true, ".gnupg": true, ".kube": true, ".docker": true,
+	".env": true, ".netrc": true, ".npmrc": true, ".pypirc": true, ".git-credentials": true,
+	"credentials.json": true, "id_rsa": true, "id_ed25519": true, "id_ecdsa": true,
+}
+
+// secretPath reports whether any part of the path is one of those names, so a
+// directory match covers everything under it.
+func secretPath(root, resolved string) string {
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil {
+		return ""
+	}
+	for part := range strings.SplitSeq(rel, string(filepath.Separator)) {
+		lower := strings.ToLower(part)
+		// .env.local and .env.production are the same file by another name.
+		if secretNames[lower] || strings.HasPrefix(lower, ".env.") {
+			return part
+		}
+	}
+	return ""
 }
 
 // permit resolves one requested path and confirms it lies inside root.
@@ -118,6 +168,10 @@ func permit(root, path string) (string, error) {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", api.Fail("outside_root",
 			"`"+path+"` is outside "+root+" — krowk_push only uploads files from the working directory")
+	}
+	if name := secretPath(root, real); name != "" {
+		return "", api.Fail("secret_path",
+			"`"+path+"` is a credential file (`"+name+"`) — refusing to publish it at a public URL")
 	}
 	return real, nil
 }
@@ -477,8 +531,9 @@ func toolSchemas() []map[string]any {
 						"items":    map[string]any{"type": "string"},
 						"minItems": 1,
 						"description": "Paths to upload, resolved from the working directory. Must be " +
-							"inside it — paths outside are refused, symlinks included, because an " +
-							"artifact is readable by anyone with the link.",
+							"inside it — paths outside are refused, symlinks included, and credential " +
+							"files are refused even inside it, because an artifact is readable by " +
+							"anyone with the link.",
 					},
 					"title": map[string]any{
 						"type":        "string",

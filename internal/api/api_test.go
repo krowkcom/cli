@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -231,6 +232,16 @@ func TestUploadTargetsInsideTheNetworkAreRefused(t *testing.T) {
 		// and several CI providers keep their internal hosts.
 		"https://100.64.1.2/blob",
 		"https://198.18.0.1/blob",
+		"https://192.0.0.1/blob",
+		"https://240.0.0.1/blob",
+		"https://255.255.255.255/blob",
+		"https://239.1.2.3/blob",
+		// NAT64: on an IPv6-only network this is the metadata service, and it is
+		// none of loopback, private or link-local as far as Go is concerned.
+		"https://[64:ff9b::a9fe:a9fe]/latest/meta-data/",
+		"https://[64:ff9b::7f00:1]/blob",
+		// IPv4-mapped, the other spelling of the same reach.
+		"https://[::ffff:169.254.169.254]/blob",
 	} {
 		if _, err := production.storageOrigin(raw); err == nil {
 			t.Errorf("%s was accepted", raw)
@@ -366,6 +377,7 @@ func TestTheAPIHostMayRedirect(t *testing.T) {
 // name in the case that matters. This asserts the hook is actually wired into the
 // client's transport, not merely correct in isolation.
 func TestTheDialerRefusesInternalAddresses(t *testing.T) {
+	noProxy(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("a request reached a loopback address")
 	}))
@@ -384,10 +396,92 @@ func TestTheDialerRefusesInternalAddresses(t *testing.T) {
 		t.Errorf("error = %v, want it to name untrusted_endpoint", err)
 	}
 
+	// A private address is refused the same way a loopback one is.
+	if err := client.permitDial("tcp", "10.0.0.7:3128", nil); err == nil {
+		t.Error("a private address was permitted with no proxy configured")
+	}
+
 	// A local registry means local addresses throughout, so the hook stands down.
 	local := New(DevBaseURL, "")
 	if err := local.permitDial("tcp", "127.0.0.1:8787", nil); err != nil {
 		t.Errorf("a local registry was refused its own address: %v", err)
+	}
+}
+
+// A zone makes an address unparseable, and permitDial judges what it can parse —
+// so without stripping it, "fe80::1%eth0" is waved through at the dial.
+func TestTheDialerStripsAnIPv6Zone(t *testing.T) {
+	noProxy(t)
+	client := New("https://api.krowk.com/v1", "krk_secret")
+
+	for _, address := range []string{"[fe80::1%eth0]:443", "[fe80::1]:443", "[64:ff9b::a9fe:a9fe]:443"} {
+		if err := client.permitDial("tcp6", address, nil); err == nil {
+			t.Errorf("%s was permitted", address)
+		}
+	}
+}
+
+// Behind a proxy every connection goes to the proxy, and corporate proxies sit on
+// private addresses — so judging the dialled address there refuses every upload
+// from the environments this tool exists for.
+func TestUploadsWorkBehindAProxyOnAPrivateAddress(t *testing.T) {
+	var proxied int
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+
+	t.Setenv("HTTP_PROXY", proxy.URL)
+	client := New("https://api.krowk.com/v1", "krk_secret")
+	if !client.proxied {
+		t.Fatal("the client did not notice HTTP_PROXY")
+	}
+	// The proxy is on loopback here, which is the shape of a proxy on 10.0.0.0/8.
+	// The request is plain http so it is forwarded rather than tunnelled with
+	// CONNECT, which a bare test server cannot answer.
+	client.HTTP.Transport.(*http.Transport).Proxy = func(*http.Request) (*url.URL, error) {
+		return url.Parse(proxy.URL)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "http://storage.example.com/blob", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.HTTP.Do(req); err != nil {
+		t.Fatalf("an upload behind a proxy was refused: %v", err)
+	}
+	if proxied != 1 {
+		t.Errorf("the proxy saw %d requests, want 1", proxied)
+	}
+}
+
+// noProxy clears the proxy environment, so the tests that assert the dial hook is
+// on duty do not depend on whoever is running them.
+func noProxy(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy",
+	} {
+		t.Setenv(k, "")
+	}
+}
+
+// Go decides whether to forward Authorization on a redirect by host alone, so
+// https -> http on one host would carry the token in the clear.
+func TestARedirectMayNotDowngradeTheScheme(t *testing.T) {
+	client := New("https://api.krowk.com/v1", "krk_secret")
+
+	from, _ := http.NewRequest(http.MethodPost, "https://api.krowk.com/v1/artifacts", nil)
+	to, _ := http.NewRequest(http.MethodPost, "http://api.krowk.com/v1/artifacts", nil)
+
+	err := client.checkRedirect(to, []*http.Request{from})
+	if err == nil {
+		t.Fatal("a downgrade to http was followed with the token attached")
+	}
+	var apiErr *Error
+	if !errorAs(err, &apiErr) || apiErr.Code() != "insecure_redirect" {
+		t.Errorf("error = %v, want insecure_redirect", err)
 	}
 }
 

@@ -45,6 +45,10 @@ type Client struct {
 	HTTP    *http.Client
 	// Sleep is swapped out in tests so backoff does not cost wall clock.
 	Sleep func(time.Duration)
+	// proxied records that a proxy stands between this process and everything it
+	// talks to, which changes what the dial hook can usefully judge. Set once in
+	// New; the tests set it directly.
+	proxied bool
 }
 
 // BaseURLFor picks which registry to talk to. dev is an explicit request — a
@@ -80,6 +84,7 @@ func New(baseURL, token string) *Client {
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Token:   token,
 		Sleep:   time.Sleep,
+		proxied: proxyConfigured(os.Getenv),
 	}
 	// The upload boundary lives here, on the connection, not only on the URL the
 	// registry returned. Checking the URL alone leaves two ways past it: a
@@ -691,12 +696,20 @@ func (c *Client) storageOrigin(raw string) (string, error) {
 // answered. The API's own host may still redirect (http -> https in front of a
 // self-hosted registry is ordinary); permitDial covers where that can land.
 func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) > 0 {
-		if _, err := c.sameOrigin(via[0].URL.String()); err != nil {
-			return Fail("upload_redirected",
-				"the upload target "+via[0].URL.Host+" redirected to "+req.URL.Host+
-					" — a presigned URL is where the bytes belong, so this is not followed")
-		}
+	if len(via) == 0 {
+		return nil
+	}
+	if _, err := c.sameOrigin(via[0].URL.String()); err != nil {
+		return Fail("upload_redirected",
+			"the upload target "+via[0].URL.Host+" redirected to "+req.URL.Host+
+				" — a presigned URL is where the bytes belong, so this is not followed")
+	}
+	// Go forwards Authorization to the same host on a redirect, and judges "same"
+	// by host alone — so https -> http on one host keeps carrying the token, in
+	// the clear. Refuse the downgrade rather than rely on nobody arranging it.
+	if last := via[len(via)-1].URL; last.Scheme == "https" && req.URL.Scheme != "https" {
+		return Fail("insecure_redirect",
+			"the registry redirected from https to "+req.URL.Scheme+" — refusing, the token would go in the clear")
 	}
 	if len(via) >= 10 {
 		return errors.New("stopped after 10 redirects")
@@ -719,9 +732,23 @@ func (c *Client) permitDial(network, address string, _ syscall.RawConn) error {
 	if c.isLocal() {
 		return nil
 	}
+	// Behind a proxy every connection goes to the proxy, so this hook would see
+	// the proxy's address and nothing else. Corporate proxies sit on private
+	// addresses, so judging that address refuses every upload from the CI
+	// environments this tool exists for. The proxy also does the resolving, which
+	// is what this hook was here to get in front of — so it has nothing left to
+	// decide, and storageOrigin's check on the URL carries the boundary instead.
+	if c.proxied {
+		return nil
+	}
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil
+	}
+	// A zone makes an address unparseable — "fe80::1%eth0" — and an unparseable
+	// address would otherwise be waved through.
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host = host[:i]
 	}
 	ip := net.ParseIP(host)
 	if ip != nil && reservedIP(ip) {
@@ -771,12 +798,20 @@ func internalHost(host string) bool {
 	return false
 }
 
-// cgnat is 100.64.0.0/10 and benchmark is 198.18.0.0/15. Neither is private by
-// Go's reckoning, and the first is where Tailscale and a number of CI providers
-// put the hosts an artifact upload has no business reaching.
+// What Go's own predicates leave out. Each of these reaches somewhere an
+// artifact upload has no business going.
 var reservedRanges = []net.IPNet{
+	// Carrier-grade NAT: not private by Go's reckoning, and where Tailscale and
+	// several CI providers put their internal hosts.
 	{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)},
 	{IP: net.IPv4(198, 18, 0, 0), Mask: net.CIDRMask(15, 32)},
+	{IP: net.IPv4(192, 0, 0, 0), Mask: net.CIDRMask(24, 32)},
+	// 240.0.0.0/4, reserved, and it carries the broadcast address with it.
+	{IP: net.IPv4(240, 0, 0, 0), Mask: net.CIDRMask(4, 32)},
+	// NAT64. On an IPv6-only network 64:ff9b::a9fe:a9fe is the metadata service,
+	// and it is neither loopback, private nor link-local to Go — this is the
+	// standard way past a check that only knows the IPv4 shapes.
+	{IP: net.ParseIP("64:ff9b::"), Mask: net.CIDRMask(96, 128)},
 }
 
 func reservedIP(ip net.IP) bool {
@@ -785,10 +820,24 @@ func reservedIP(ip net.IP) bool {
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() ||
+		ip.IsMulticast() ||
 		ip.IsInterfaceLocalMulticast() {
 		return true
 	}
 	return slices.ContainsFunc(reservedRanges, func(n net.IPNet) bool { return n.Contains(ip) })
+}
+
+// proxyConfigured reports whether the environment routes this process through a
+// proxy, in either of the spellings Go's own ProxyFromEnvironment reads.
+func proxyConfigured(env func(string) string) bool {
+	for _, k := range []string{
+		"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy",
+	} {
+		if strings.TrimSpace(env(k)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func malformed(detail string) *Error {

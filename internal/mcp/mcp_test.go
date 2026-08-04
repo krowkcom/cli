@@ -353,6 +353,70 @@ func TestPushAcceptsFilesInsideTheRoot(t *testing.T) {
 	}
 }
 
+// The root defaults to the working directory, so an agent started outside a
+// checkout takes the home directory as its boundary — and then ~/.ssh/id_rsa and
+// ~/.config/krowk/credentials.json are inside it. That is precisely the reach the
+// confinement exists to remove, so a root that broad is refused instead.
+func TestARootThatIsNoBoundaryIsRefused(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("no home directory: %v", err)
+	}
+	for _, root := range []string{home, string(filepath.Separator)} {
+		s := &Server{Root: root}
+		if _, err := s.resolveRoot(); err == nil {
+			t.Errorf("root %q was accepted", root)
+		} else if code := err.(*api.Error).Code(); code != "root_too_broad" {
+			t.Errorf("root %q: error = %q, want root_too_broad", root, code)
+		}
+	}
+
+	// A project directory is the expected case and stays fine.
+	if _, err := (&Server{Root: t.TempDir()}).resolveRoot(); err != nil {
+		t.Errorf("a project directory was refused: %v", err)
+	}
+}
+
+// A correct root is still not free of credentials: checkouts carry .env files,
+// stray keys and service-account JSON, and all of them are inside the boundary.
+func TestPushRefusesCredentialFilesInsideTheRoot(t *testing.T) {
+	s := newSession(t, "krk_test")
+	root := filepath.Dir(s.fixture)
+
+	for _, rel := range []string{
+		".env",
+		".env.production",
+		".netrc",
+		"credentials.json",
+		filepath.Join(".ssh", "id_rsa"),
+		filepath.Join(".aws", "credentials"),
+		filepath.Join("config", "id_ed25519"),
+	} {
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("SECRET"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		result := s.callTool("krowk_push", map[string]any{"files": []string{path}})
+		if result["isError"] != true {
+			t.Errorf("%s was accepted for publishing", rel)
+			continue
+		}
+		if body := text(t, result); !strings.Contains(body, "secret_path") {
+			t.Errorf("%s: text = %q, want secret_path", rel, body)
+		}
+	}
+
+	// The actual use case is untouched.
+	result := s.callTool("krowk_push", map[string]any{"files": []string{s.fixture}})
+	if result["isError"] == true {
+		t.Errorf("a screenshot was refused: %s", text(t, result))
+	}
+}
+
 func TestPushNeedsFiles(t *testing.T) {
 	s := newSession(t, "krk_test")
 

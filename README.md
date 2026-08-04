@@ -156,6 +156,14 @@ body alone:
   arrival, so agreeing on the key really does mean agreeing on the bytes.
 - **Resumable** — declaring the same key again before finalizing returns the
   same ID and the same upload targets, so blobs already stored stay stored.
+- **The ID authorises nothing.** It is the last segment of every link that gets
+  pasted anywhere, so `finalize` requires the idempotency key and rejects a
+  request without one. Only the caller that opened a handshake can complete it,
+  or replay it to get the artifact back.
+- **IDs lengthen on collision.** Seven hex characters is 28 bits, so two
+  unrelated uploads collide after a few thousand — inside a real registry's
+  first week. A collision extends the new ID rather than letting it take over an
+  existing upload's link, so links stay short until they cannot be.
 - **Rate limits** — `X-RateLimit-Limit`, `X-RateLimit-Remaining` on every
   response; `Retry-After` on the 429.
 - **Retries** — each step retries up to 3 times on `retryable: true` (default

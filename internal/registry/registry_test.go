@@ -197,6 +197,89 @@ func TestFinalizeNeedsEveryBlob(t *testing.T) {
 	}
 }
 
+// The artifact ID is public — it is the last segment of every shared link — so
+// it must authorise nothing. Without the key, finalize is a lookup that hands
+// out whatever the response carries.
+func TestFinalizeWillNotHandTheArtifactToTheIDAlone(t *testing.T) {
+	c := serve(t, 0)
+	req := declare([2]string{"shot.png", "one"})
+	_, begun := c.begin(req)
+	if code, _ := c.put(begun.Uploads[0].URL, "one"); code != http.StatusOK {
+		t.Fatal("put failed")
+	}
+	if code, _ := c.postURL(begun.FinalizeURL, map[string]string{"idempotency_key": req.IdempotencyKey}); code != http.StatusOK {
+		t.Fatal("finalize failed")
+	}
+
+	// A stranger with the shared link, and nothing else.
+	code, out := c.postURL(begun.FinalizeURL, map[string]any{})
+	if code == http.StatusOK {
+		t.Fatalf("the ID alone returned the artifact: %v", out)
+	}
+	if out["error"] != "missing_idempotency_key" {
+		t.Errorf("error = %v, want missing_idempotency_key", out["error"])
+	}
+
+	// And a wrong key does not work either.
+	code, out = c.postURL(begun.FinalizeURL, map[string]string{"idempotency_key": strings.Repeat("b", 64)})
+	if code != http.StatusConflict || out["error"] != "idempotency_key_mismatch" {
+		t.Errorf("wrong key = %d %v, want 409 idempotency_key_mismatch", code, out)
+	}
+}
+
+// A stranger who guesses a pending upload's ID must not be able to complete it.
+func TestFinalizeOfSomeoneElsesPendingUploadIsRefused(t *testing.T) {
+	c := serve(t, 0)
+	req := declare([2]string{"shot.png", "one"})
+	_, begun := c.begin(req)
+	if code, _ := c.put(begun.Uploads[0].URL, "one"); code != http.StatusOK {
+		t.Fatal("put failed")
+	}
+
+	code, out := c.postURL(begun.FinalizeURL, map[string]any{})
+	if code == http.StatusOK {
+		t.Fatalf("finalized without the key: %v", out)
+	}
+}
+
+// Seven hex characters collide after a few thousand uploads, which is well
+// inside a real registry's first week. A collision must lengthen the ID, never
+// hand one upload's link to another.
+func TestCollidingIDsDoNotDisplaceEachOther(t *testing.T) {
+	s := &store{
+		pending:   map[string]*upload{},
+		byID:      map[string]*upload{},
+		byToken:   map[string]tokenRef{},
+		artifacts: map[string]artifact{},
+		finalized: map[string]string{},
+		idOwner:   map[string]string{},
+	}
+
+	keyA := "eb7015b56be919a2c96c3fcb7e4ddd08fc17c1ccf17fd86dd060409ad58e0cb9"
+	keyB := "c5adf0a95aa71de9eb2d5e3c0a190e176ded7ecc9642be8744306f4b1175b5b7"
+	if idDigest(keyA)[:idLength] != idDigest(keyB)[:idLength] {
+		t.Fatal("these keys no longer collide; pick another pair")
+	}
+
+	first := s.mintID(keyA)
+	s.idOwner[first] = keyA
+	second := s.mintID(keyB)
+
+	if len(first) != idLength {
+		t.Errorf("the first ID should stay short: %q", first)
+	}
+	if second == first {
+		t.Fatalf("both uploads were given the ID %q", second)
+	}
+	if len(second) <= idLength {
+		t.Errorf("the colliding ID should have lengthened, got %q", second)
+	}
+	// Still deterministic for the same key.
+	if again := s.mintID(keyA); again != first {
+		t.Errorf("the same key minted %q then %q", first, again)
+	}
+}
+
 func TestFinalizeRejectsTheWrongKey(t *testing.T) {
 	c := serve(t, 0)
 	req := declare([2]string{"shot.png", "one"})

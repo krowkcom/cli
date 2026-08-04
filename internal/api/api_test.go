@@ -260,6 +260,35 @@ func TestAlreadyCompleteSkipsTheUpload(t *testing.T) {
 	}
 }
 
+func TestRetryAfterAcceptsBothSpellings(t *testing.T) {
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		in   string
+		want time.Duration
+		ok   bool
+	}{
+		{"5", 5 * time.Second, true},
+		{" 7 ", 7 * time.Second, true},
+		// The spec allows an absolute date, which Atoi alone would drop.
+		{now.Add(30 * time.Second).UTC().Format(http.TimeFormat), 30 * time.Second, true},
+		// A registry must not be able to wedge the CLI for a week.
+		{"604800", 60 * time.Second, true},
+		{now.Add(72 * time.Hour).UTC().Format(http.TimeFormat), 60 * time.Second, true},
+		// Already past, or nonsense: fall back to exponential backoff.
+		{now.Add(-time.Hour).UTC().Format(http.TimeFormat), 0, false},
+		{"0", 0, false},
+		{"-3", 0, false},
+		{"soon", 0, false},
+		{"", 0, false},
+	} {
+		got, ok := retryAfter(tc.in, now)
+		if ok != tc.ok || (ok && got != tc.want) {
+			t.Errorf("retryAfter(%q) = %v, %v; want %v, %v", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
 func TestRetryableStepIsRetriedThenSucceeds(t *testing.T) {
 	var attempts int
 	mux := http.NewServeMux()

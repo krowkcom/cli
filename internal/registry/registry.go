@@ -94,6 +94,9 @@ type store struct {
 	byToken   map[string]tokenRef // by blob token, for PUT
 	artifacts map[string]artifact // finalized, by artifact ID
 	finalized map[string]string   // idempotency key -> artifact ID
+	// idOwner remembers which key claimed each ID, pending or finalized, so a
+	// second upload can never be handed an ID that is already spoken for.
+	idOwner map[string]string // artifact ID -> idempotency key
 }
 
 type tokenRef struct {
@@ -114,6 +117,7 @@ func Handler(limitBytes int64, siteURL string) http.Handler {
 		byToken:   map[string]tokenRef{},
 		artifacts: map[string]artifact{},
 		finalized: map[string]string{},
+		idOwner:   map[string]string{},
 	}
 
 	mux := http.NewServeMux()
@@ -198,11 +202,12 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 		up, resumed := s.pending[req.IdempotencyKey]
 		if !resumed {
 			up = &upload{
-				id:       artifactID(req.IdempotencyKey),
+				id:       s.mintID(req.IdempotencyKey),
 				key:      req.IdempotencyKey,
 				metadata: validMetadata(req.Metadata),
 				slots:    make([]*slot, 0, len(req.Files)),
 			}
+			s.idOwner[up.id] = up.key
 			for _, f := range req.Files {
 				sl := &slot{manifestFile: f, token: newToken()}
 				up.slots = append(up.slots, sl)
@@ -318,8 +323,31 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 
 		rate := rateHeaders(max(0, dailyUploads-len(s.artifacts)))
 
-		// Finalizing twice is not an error; it is the retry path.
+		// The ID is public — it is the last segment of the link people paste
+		// into pull requests. So it authorises nothing on its own: proving you
+		// opened this handshake means presenting the key, which is derived from
+		// the bytes and never leaves the pusher.
+		if body.IdempotencyKey == "" {
+			writeJSON(w, http.StatusUnprocessableEntity, rate, map[string]any{
+				"error":     "missing_idempotency_key",
+				"fix":       "finalize with the same idempotency_key the handshake was opened with",
+				"retryable": false,
+			})
+			return
+		}
+
+		// Finalizing twice is not an error; it is the retry path. But only for
+		// the caller that opened it — anyone else gets the same answer as for an
+		// ID that was never theirs.
 		if done, ok := s.artifacts[id]; ok {
+			if s.finalized[body.IdempotencyKey] != id {
+				writeJSON(w, http.StatusConflict, rate, map[string]any{
+					"error":     "idempotency_key_mismatch",
+					"fix":       "finalize with the same idempotency_key the handshake was opened with",
+					"retryable": false,
+				})
+				return
+			}
 			writeJSON(w, http.StatusOK, rate, done)
 			return
 		}
@@ -334,7 +362,7 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 			})
 			return
 		}
-		if body.IdempotencyKey != "" && body.IdempotencyKey != up.key {
+		if body.IdempotencyKey != up.key {
 			writeJSON(w, http.StatusConflict, rate, map[string]any{
 				"error":     "idempotency_key_mismatch",
 				"fix":       "finalize with the same idempotency_key the handshake was opened with",
@@ -436,11 +464,31 @@ func foldKey(slots []*slot) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// artifactID derives the public ID from the idempotency key, so the same bytes
+// idLength is how many hex characters a public ID starts at. Short, because it
+// ends up in every link that gets pasted anywhere.
+const idLength = 7
+
+// mintID derives the public ID from the idempotency key, so the same bytes
 // always resolve to the same link without the key itself appearing in the URL.
-func artifactID(key string) string {
+//
+// Seven hex characters is only 28 bits, which sounds like plenty and is not: two
+// unrelated uploads collide after a few thousand, well inside a real registry's
+// first week. So a collision lengthens the ID rather than letting a new upload
+// take over an existing one's link. IDs stay short until they cannot be.
+func (s *store) mintID(key string) string {
+	full := idDigest(key)
+	for n := idLength; n < len(full); n++ {
+		candidate := full[:n]
+		if owner, taken := s.idOwner[candidate]; !taken || owner == key {
+			return candidate
+		}
+	}
+	return full
+}
+
+func idDigest(key string) string {
 	sum := sha256.Sum256([]byte("krowk-artifact\x00" + key))
-	return hex.EncodeToString(sum[:])[:7]
+	return hex.EncodeToString(sum[:])
 }
 
 func newToken() string {

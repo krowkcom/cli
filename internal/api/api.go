@@ -444,14 +444,36 @@ func (c *Client) retry(ctx context.Context, do func() error) error {
 	return last
 }
 
-// backoff honours Retry-After when the registry sends one.
+// backoff honours Retry-After when the registry sends one, in either spelling
+// the HTTP spec allows — a delay in seconds, or an absolute date.
 func backoff(e *Error, attempt int) time.Duration {
 	if v, ok := e.Body["retry_after"].(string); ok {
-		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
-			return time.Duration(secs) * time.Second
+		if d, ok := retryAfter(v, time.Now()); ok {
+			return d
 		}
 	}
 	return time.Duration(1<<attempt) * 250 * time.Millisecond
+}
+
+// retryAfter caps what the registry can ask for: a header saying "come back in
+// a week" must not wedge the CLI for a week.
+func retryAfter(v string, now time.Time) (time.Duration, bool) {
+	const maxWait = 60 * time.Second
+
+	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+		if secs <= 0 {
+			return 0, false
+		}
+		return min(time.Duration(secs)*time.Second, maxWait), true
+	}
+	at, err := http.ParseTime(strings.TrimSpace(v))
+	if err != nil {
+		return 0, false
+	}
+	if d := at.Sub(now); d > 0 {
+		return min(d, maxWait), true
+	}
+	return 0, false
 }
 
 // sameOrigin resolves raw against the API base and refuses to take the token

@@ -1,0 +1,108 @@
+name: opencode PR Review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened, synchronize]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  review:
+    if: |
+      (github.event_name == 'pull_request' &&
+        github.event.pull_request.draft == false &&
+        github.event.pull_request.user.login != 'dependabot[bot]' &&
+        github.event.pull_request.user.login != 'renovate[bot]') ||
+      (github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        (contains(github.event.comment.body, '/opencode') || contains(github.event.comment.body, '/oc'))) ||
+      (github.event_name == 'pull_request_review_comment' &&
+        (contains(github.event.comment.body, '/opencode') || contains(github.event.comment.body, '/oc')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      # setup-go needs this to save its build cache; without it every run
+      # ends in "cache write denied: token has no writable scopes".
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run opencode review
+        uses: anomalyco/opencode/github@latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        with:
+          model: opencode-go/qwen3.8-max
+          use_github_token: true
+          share: false
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+
+            Review this pull request. This is a Go CLI. Be pragmatic and terse — a senior Go
+            reviewer who already knows the codebase, not a checklist. Lead with the biggest
+            problem. Concrete fixes with `file:line`, not formal critique.
+
+            Read the diff first (`gh pr diff`), then read the surrounding files for anything
+            you are unsure about. Do not review code the PR did not touch.
+
+            What actually matters here:
+            - **Correctness over style.** Wrong behaviour, bad edge cases, broken contracts.
+            - **Errors are values.** Wrapped with context (`fmt.Errorf("...: %w", err)`), never
+              swallowed, never `_ =` on something that can fail meaningfully.
+            - **Concurrency.** Data races, goroutine leaks, unbuffered channels that can block
+              forever, `context.Context` that is accepted but never honoured.
+            - **Resource lifetime.** Missing `defer Close()`, files/conns/tickers left open,
+              `defer` inside a loop.
+            - **Nil and bounds.** Nil map writes, nil pointer derefs on error paths, slice
+              aliasing after `append`.
+            - **The CLI surface is a contract.** Flag names, exit codes, stdout vs stderr,
+              output format. Breaking changes must be called out explicitly.
+            - **Tests.** New behaviour needs a test. Table-driven where it fits. Say so when a
+              tricky path is untested — name the path.
+            - **Abstractions must earn their place.** Interface with one implementation, wrapper
+              with one caller, package with one function: inline it.
+
+            Skip formatting, import order, and naming-only preferences — gofmt and the linters
+            cover those. Do not suggest comments for self-evident code.
+
+            Output format:
+
+            1. One short paragraph: what the PR does, your overall take.
+            2. **Score: N/5** — overall PR quality.
+               - 5: ship it, exemplary.
+               - 4: solid, minor nits only.
+               - 3: works, needs cleanup before merge.
+               - 2: significant issues, rework needed.
+               - 1: do not merge, fundamental problems.
+            3. A "Findings" section grouped by severity:
+               - **Critical**: bugs, security issues, data loss, races, regressions, broken CLI contracts.
+               - **Major**: missing tests for new behaviour, broken edge cases, unhandled errors,
+                 performance problems that bite at scale.
+               - **Minor**: small correctness or design issues worth fixing before merge.
+            4. If nothing is worth raising, say so plainly in one line. Do not pad.
+
+            For each finding: `file:line`, the issue, why it matters, the suggested fix.
+
+            Post the summary, score, and cross-cutting notes as one top-level PR comment, and
+            line-specific findings as inline review comments. Do not approve and do not request
+            changes — just leave the review.
+
+            If this run was triggered by a `/opencode` or `/oc` mention, the commenter's request
+            is part of your context: address what they asked while still producing the full
+            review above, unless they explicitly narrowed the scope.

@@ -358,7 +358,7 @@ The CLI ships the registry it develops against, so trying it out needs neither
 the network nor a key. In one terminal:
 
 ```bash
-krowk registry serve                 # listens on :8787
+krowk registry serve                 # listens on 127.0.0.1:8787
 ```
 
 And in another, `--dev` points the CLI at it:

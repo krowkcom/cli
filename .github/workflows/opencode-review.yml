@@ -25,6 +25,9 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+      # setup-go needs this to save its build cache; without it every run
+      # ends in "cache write denied: token has no writable scopes".
+      actions: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5

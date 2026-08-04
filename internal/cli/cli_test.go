@@ -764,9 +764,11 @@ func TestCreateRunIsNotRetried(t *testing.T) {
 	var mu sync.Mutex
 	var runPosts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		runPosts++
-		mu.Unlock()
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs" {
+			mu.Lock()
+			runPosts++
+			mu.Unlock()
+		}
 		// Retryable by policy — which is exactly why this endpoint must opt out.
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprint(w, `{"error":{"code":"boom","message":"transient"}}`)

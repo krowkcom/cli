@@ -71,6 +71,9 @@ type artifact struct {
 	uploadTok  string
 	uploadTil  time.Time
 	claimed    bool
+	// storageKey is pinned at declare time: claiming moves the artifact to a
+	// new workspace, but the bytes stay where the presigned URL was signed for.
+	storageKey string
 	// seq orders a listing. A timestamp would tie when two artifacts are created
 	// in the same instant, and a page has to be totally ordered or rows swap
 	// places between pages.
@@ -243,6 +246,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		workspace:   workspace,
 		uploadTok:   randomToken(),
 		uploadTil:   now.Add(uploadURLLifetime),
+		storageKey:  key,
 	}
 	if in.Run != "" {
 		a.Run = in.Run
@@ -291,7 +295,7 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
 	var wantSize int64
 	var until time.Time
 	if a != nil {
-		wantKey = path.Join(a.workspace, a.Slug, safeFilename(a.Filename))
+		wantKey = a.storageKey
 		wantTok, wantType, wantSum = a.uploadTok, a.ContentType, a.Checksum
 		wantSize, until = a.ByteSize, a.uploadTil
 	}

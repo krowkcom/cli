@@ -211,6 +211,30 @@ func TestClaimRequiresTheRealToken(t *testing.T) {
 	}
 }
 
+// Claiming moves the artifact to a new workspace, but the bytes stay where the
+// presigned URL was signed for — an upload URL issued before the claim must
+// keep working, or a claimed pending artifact could never become ready.
+func TestClaimDoesNotInvalidateTheUploadURL(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	payload := declare(t, server, "", "a.txt", "the bytes")
+	slug, _ := payload["slug"].(string)
+	token, _ := payload["claim_token"].(string)
+
+	status, body := request(t, http.MethodPost, server.URL+"/v1/artifacts/"+slug+"/claim",
+		"krowk_sk_test", "application/json", fmt.Sprintf(`{"claim_token":%q}`, token))
+	if status != http.StatusOK {
+		t.Fatalf("claim = %d %v", status, body)
+	}
+
+	if status := put(t, uploadURL(t, payload), "the bytes"); status != http.StatusOK {
+		t.Fatalf("PUT after claim = %d, want the pre-claim URL to still work", status)
+	}
+	if status, body := finalize(t, server, "krowk_sk_test", payload); status != http.StatusOK {
+		t.Errorf("finalize after claim = %d %v", status, body)
+	}
+}
+
 // The stand-in must not be more forgiving than the real thing: a run body that
 // does not parse is refused, exactly as a garbage artifact body is.
 func TestGarbageRunBodyIsRejected(t *testing.T) {

@@ -113,6 +113,18 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 			}
 			continue
 		}
+		if req.Method == "" {
+			// null, {} and an id with no method all unmarshal cleanly, but a
+			// Request must carry a method and "" is never a legitimate one.
+			if err := write(encoder, writer, response{
+				JSONRPC: "2.0",
+				ID:      json.RawMessage("null"),
+				Error:   &rpcError{Code: -32600, Message: "the message is JSON but not a Request object"},
+			}); err != nil {
+				return err
+			}
+			continue
+		}
 
 		result, rpcErr := s.dispatch(ctx, req)
 

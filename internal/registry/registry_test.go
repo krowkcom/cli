@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // declare builds the manifest and the idempotency key the CLI would send.
@@ -168,6 +169,77 @@ func TestInterruptedHandshakeResumesOntoTheSameTargets(t *testing.T) {
 
 	if first.ID != second.ID || first.Uploads[0].URL != second.Uploads[0].URL {
 		t.Errorf("resume changed the targets: %+v then %+v", first, second)
+	}
+}
+
+// A resume restarts the expiry clock. If it kept the original declaration's
+// timestamp, a handshake resumed just under the TTL would be swept by the next
+// unrelated declaration and its finalize would 404 — the client would have to
+// resend every byte, which is exactly what "resumable" promises not to do.
+func TestResumedHandshakeSurvivesASweep(t *testing.T) {
+	c, s := serveStore(t, 0)
+	req := declare([2]string{"shot.png", "one"})
+
+	_, first := c.begin(req)
+
+	// Age the handshake to just under the TTL, then resume it.
+	s.mu.Lock()
+	s.pending[req.IdempotencyKey].at = s.pending[req.IdempotencyKey].at.Add(-pendingTTL + time.Minute)
+	s.mu.Unlock()
+	if code, second := c.begin(req); code != http.StatusCreated || second.ID != first.ID {
+		t.Fatalf("resume = %d id %q, want 201 with id %q", code, second.ID, first.ID)
+	}
+
+	// Two more minutes pass — past the original declaration's TTL, well within
+	// the resume's — and an unrelated declaration triggers a sweep.
+	s.mu.Lock()
+	s.pending[req.IdempotencyKey].at = s.pending[req.IdempotencyKey].at.Add(-2 * time.Minute)
+	s.mu.Unlock()
+	if code, _ := c.begin(declare([2]string{"other.png", "two"})); code != http.StatusCreated {
+		t.Fatal("unrelated declaration failed")
+	}
+
+	// The resumed handshake survives and finalizes.
+	if code, _ := c.put(first.Uploads[0].URL, "one"); code != http.StatusOK {
+		t.Fatalf("put after the sweep = %d, want 200 — the handshake was reaped", code)
+	}
+	code, out := c.postURL(first.FinalizeURL, map[string]string{"idempotency_key": req.IdempotencyKey})
+	if code != http.StatusOK {
+		t.Fatalf("finalize after the sweep = %d %v, want 200", code, out)
+	}
+}
+
+// A transfer slower than the TTL never re-declares, so each landed blob must
+// keep the handshake alive on its own.
+func TestActivelyUploadingHandshakeSurvivesASweep(t *testing.T) {
+	c, s := serveStore(t, 0)
+	req := declare([2]string{"a.png", "one"}, [2]string{"b.png", "two"})
+
+	_, begun := c.begin(req)
+
+	// The first blob lands just under the TTL after the declaration.
+	s.mu.Lock()
+	s.pending[req.IdempotencyKey].at = s.pending[req.IdempotencyKey].at.Add(-pendingTTL + time.Minute)
+	s.mu.Unlock()
+	if code, _ := c.put(begun.Uploads[0].URL, "one"); code != http.StatusOK {
+		t.Fatal("first put failed")
+	}
+
+	// Two more minutes on, an unrelated declaration sweeps. The slow transfer's
+	// last PUT reset the clock, so it must not be reaped mid-flight.
+	s.mu.Lock()
+	s.pending[req.IdempotencyKey].at = s.pending[req.IdempotencyKey].at.Add(-2 * time.Minute)
+	s.mu.Unlock()
+	if code, _ := c.begin(declare([2]string{"other.png", "three"})); code != http.StatusCreated {
+		t.Fatal("unrelated declaration failed")
+	}
+
+	if code, _ := c.put(begun.Uploads[1].URL, "two"); code != http.StatusOK {
+		t.Fatalf("second put after the sweep = %d, want 200 — the handshake was reaped", code)
+	}
+	code, out := c.postURL(begun.FinalizeURL, map[string]string{"idempotency_key": req.IdempotencyKey})
+	if code != http.StatusOK {
+		t.Fatalf("finalize after the sweep = %d %v, want 200", code, out)
 	}
 }
 

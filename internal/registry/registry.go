@@ -95,7 +95,8 @@ type upload struct {
 	key      string
 	metadata json.RawMessage
 	slots    []*slot
-	// at is when the handshake opened, so abandoned ones can be swept.
+	// at is when the handshake last showed signs of life — opened, resumed,
+	// or landed a blob — so only truly abandoned ones are swept.
 	at time.Time
 }
 
@@ -246,7 +247,12 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 		// An interrupted handshake resumes: same key, same targets, so the
 		// blobs already stored stay stored.
 		up, resumed := s.pending[req.IdempotencyKey]
-		if !resumed {
+		if resumed {
+			// A resume restarts the clock. Without this, `at` keeps the
+			// original declaration's time and a handshake resumed minutes ago
+			// gets swept mid-transfer, turning its finalize into a 404.
+			up.at = time.Now()
+		} else {
 			// Declaring needs no key and no bytes, so this is the cheapest thing
 			// an attacker can ask for and the one that has to be bounded.
 			if len(s.pending) >= maxPending {
@@ -360,6 +366,9 @@ func (s *store) put(limitBytes int64) http.HandlerFunc {
 
 		s.mu.Lock()
 		sl.received = true
+		// A blob landing is proof of life: a transfer slower than the TTL never
+		// re-declares, so each finished PUT keeps the handshake alive itself.
+		ref.upload.at = time.Now()
 		s.mu.Unlock()
 
 		w.WriteHeader(http.StatusOK)

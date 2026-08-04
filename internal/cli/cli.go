@@ -350,8 +350,11 @@ func listenPort(addr string) string {
 // usableAddr rejects what net.Listen would reject anyway, so the banner does not
 // print "http://localhost:" and a network warning for an address that never
 // binds. --addr 8787 is the easy mistake.
+// An empty port is accepted by SplitHostPort and listens on a port the kernel
+// picks, which the banner then misreports — so it has to be named too. An empty
+// host is fine: that is what ":8787" means.
 func usableAddr(addr string) error {
-	if _, _, err := net.SplitHostPort(addr); err != nil {
+	if _, port, err := net.SplitHostPort(addr); err != nil || port == "" {
 		return fmt.Errorf("--addr %q needs a host and a port, like 127.0.0.1:8787 or :8787", addr)
 	}
 	return nil

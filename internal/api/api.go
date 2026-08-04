@@ -693,11 +693,23 @@ func (c *Client) onAPIOrigin(u *url.URL) bool {
 	if err != nil || base.Hostname() == "" || u.Hostname() != base.Hostname() {
 		return false
 	}
-	if u.Scheme == base.Scheme && u.Port() == base.Port() {
+	if u.Scheme == base.Scheme && defaultedPort(u) == defaultedPort(base) {
 		return true
 	}
-	return base.Scheme == "http" && u.Scheme == "https" &&
-		(u.Port() == "" || u.Port() == "443")
+	return base.Scheme == "http" && u.Scheme == "https" && defaultedPort(u) == "443"
+}
+
+// defaultedPort is the port a dial to u would use: the explicit one, or the
+// scheme's default — so https://host and https://host:443 name one origin, the
+// way the dial layer already treats them.
+func defaultedPort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	if u.Scheme == "https" {
+		return "443"
+	}
+	return "80"
 }
 
 // storageOrigin accepts the object-storage host a presigned URL names — that is

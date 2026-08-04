@@ -461,6 +461,15 @@ func TestASelfHostedRegistryOnAPrivateNetworkIsTrusted(t *testing.T) {
 	if _, err := client.storageOrigin("https://10.1.2.3/blobs/tok"); err != nil {
 		t.Errorf("an upload target on the API's own origin was refused: %v", err)
 	}
+	// An explicit default port and an implicit one spell the same origin, in
+	// both directions — the dial layer already treats them as one address.
+	if _, err := client.storageOrigin("https://10.1.2.3:443/blobs/tok"); err != nil {
+		t.Errorf("the API's origin with its default port spelled out was refused: %v", err)
+	}
+	if _, err := New("https://10.1.2.3:443/v1", "krk_secret").
+		storageOrigin("https://10.1.2.3/blobs/tok"); err != nil {
+		t.Errorf("the API's origin with the default port left implicit was refused: %v", err)
+	}
 	// A different private host, or the same host on plaintext http, earns nothing.
 	if _, err := client.storageOrigin("https://10.9.9.9/blobs/tok"); err == nil {
 		t.Error("an upload target on another private host was accepted")

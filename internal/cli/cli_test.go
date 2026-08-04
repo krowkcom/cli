@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -291,6 +293,83 @@ func TestAuthVerifyReportsTheKeyAndItsScopes(t *testing.T) {
 	}
 }
 
+// A read-only key is valid, and the output has to say — in both formats — that
+// it cannot upload, before a push finds out the hard way.
+func TestAuthVerifyWithAReadOnlyKeySaysItCannotUpload(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["KROWK_TOKEN"] = "krk_ro_readonly"
+
+	code, stdout, stderr := h.run("auth", "verify", "--format=human")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "cannot upload") || !strings.Contains(stdout, "artifacts:write") {
+		t.Errorf("human output = %q, want it to say the key cannot upload and name the missing scope", stdout)
+	}
+
+	code, stdout, stderr = h.run("auth", "verify", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	var e struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			Valid  bool     `json:"valid"`
+			Scopes []string `json:"scopes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &e); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	if !e.OK || !e.Data.Valid {
+		t.Fatalf("a read-only key is still a valid key: %s", stdout)
+	}
+	if slices.Contains(e.Data.Scopes, "artifacts:write") {
+		t.Errorf("scopes = %v, want artifacts:write absent", e.Data.Scopes)
+	}
+}
+
+// --quiet is documented as "no envelope", for verify like everything else.
+func TestAuthVerifyQuietIsTheBareKey(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, stdout, stderr := h.run("auth", "verify", "--quiet")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	var key map[string]any
+	if err := json.Unmarshal([]byte(stdout), &key); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	if _, wrapped := key["ok"]; wrapped {
+		t.Errorf("--quiet should drop the envelope, got %s", stdout)
+	}
+	if key["valid"] != true {
+		t.Errorf("quiet output = %s, want the key itself", stdout)
+	}
+}
+
+// There is no link to a key, so --format url (and markdown) degrade to the
+// JSON envelope, as the help text says.
+func TestAuthVerifyURLFormatFallsBackToJSON(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, stdout, stderr := h.run("auth", "verify", "--format=url")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	var e struct {
+		OK   bool           `json:"ok"`
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &e); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	if !e.OK || e.Data["valid"] != true {
+		t.Errorf("--format url should fall back to the envelope, got %s", stdout)
+	}
+}
+
 func TestAuthVerifyWithoutAKeySaysSoWithoutCallingOut(t *testing.T) {
 	h := newHarness(t, 0)
 	h.env["KROWK_TOKEN"] = ""
@@ -349,6 +428,65 @@ func TestAnonymousPushIsAllowed(t *testing.T) {
 	}
 }
 
+// The mock accepts anonymous pushes, but a real registry may not; when it says
+// no to an unauthenticated client, the fix has to name `auth login`.
+func TestAnonymousRejectionPointsAtLogin(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["KROWK_TOKEN"] = ""
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"error":"no_key","fix":"authenticate","retryable":false}`)
+	}))
+	t.Cleanup(srv.Close)
+	h.env["KROWK_API_URL"] = srv.URL + "/v1"
+
+	code, _, stderr := h.run("push", h.fixture)
+	if code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	fix, _ := decode(t, stderr).Error["fix"].(string)
+	if !strings.Contains(fix, "auth login") {
+		t.Errorf("fix = %q, want it to name `krowk auth login`", fix)
+	}
+}
+
+// A 403 off a presigned storage URL means the upload target went bad, not the
+// key; the auth hint must not send the agent chasing `auth verify`.
+func TestStorageRejectionDoesNotBlameTheKey(t *testing.T) {
+	h := newHarness(t, 0)
+
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/artifacts":
+			fmt.Fprintf(w, `{"id":"art_1","uploads":[{"filename":%q,"method":"PUT","url":%q}],"finalize_url":%q}`,
+				filepath.Base(h.fixture), srv.URL+"/put", srv.URL+"/v1/artifacts/art_1/finalize")
+		case r.Method == http.MethodPut && r.URL.Path == "/put":
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"error":"upload_expired","fix":"start the upload again","retryable":false}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	h.env["KROWK_API_URL"] = srv.URL + "/v1"
+
+	code, _, stderr := h.run("push", h.fixture)
+	if code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	e := decode(t, stderr)
+	if e.Error["error"] != "upload_expired" {
+		t.Fatalf("error = %v, want upload_expired", e.Error)
+	}
+	if fix, _ := e.Error["fix"].(string); strings.Contains(fix, "auth verify") {
+		t.Errorf("fix = %q, must not point a storage failure at the key", fix)
+	}
+}
+
 func TestDoctorReportsTheKeyAndReachability(t *testing.T) {
 	h := newHarness(t, 0)
 
@@ -389,6 +527,22 @@ func TestDoctorSaysUnreachableWhenNothingIsListening(t *testing.T) {
 	}
 	if status, _ := report["api_status"].(string); !strings.HasPrefix(status, "unreachable") {
 		t.Errorf("api_status = %v, want unreachable", report["api_status"])
+	}
+}
+
+// A URL that never parses reaches nothing; doctor must not call it reachable.
+func TestDoctorSaysUnreachableForAMalformedURL(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["KROWK_API_URL"] = "notaurl"
+
+	_, stdout, _ := h.run("doctor")
+	var report map[string]any
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatal(err)
+	}
+	status, _ := report["api_status"].(string)
+	if !strings.HasPrefix(status, "unreachable") || !strings.Contains(status, "bad_api_url") {
+		t.Errorf("api_status = %q, want unreachable — bad_api_url", status)
 	}
 }
 

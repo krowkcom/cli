@@ -155,9 +155,13 @@ func Artifact(a *api.Artifact, f Format, title string, quiet, colour bool, now t
 	})
 }
 
-// Key renders a verified API key: who it belongs to and what it may do.
-func Key(k *api.Key, f Format, colour bool) string {
+// Key renders a verified API key: who it belongs to and what it may do. There
+// is no link to a key, so markdown and url fall back to the JSON envelope.
+func Key(k *api.Key, f Format, quiet, colour bool) string {
 	if f != Human {
+		if quiet {
+			return encode(k)
+		}
 		return encode(Envelope{
 			OK:      true,
 			Data:    k,

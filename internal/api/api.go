@@ -141,6 +141,7 @@ func (c *Client) VerifyKey(ctx context.Context) (*Key, error) {
 	}
 
 	var key Key
+	var status int
 	err = c.retry(ctx, func() error {
 		req, err := c.request(ctx, http.MethodPost, endpoint, strings.NewReader("{}"), "")
 		if err != nil {
@@ -152,15 +153,21 @@ func (c *Client) VerifyKey(ctx context.Context) (*Key, error) {
 			return err
 		}
 		key.RateLimitRemaining = res.Header.Get("X-RateLimit-Remaining")
+		status = res.Status
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	// A 200 saying valid:false is still a rejection; surface it as one.
+	// A 200 saying valid:false is still a rejection; surface it as one, carrying
+	// the status it arrived with so the caller can tell it apart from an error
+	// formed before any HTTP exchange.
 	if !key.Valid {
-		return nil, Fail("invalid_key",
-			"the registry does not recognise this key — run `krowk auth login --token krk_...` with a current one")
+		return nil, &Error{Status: status, Body: map[string]any{
+			"error":     "invalid_key",
+			"fix":       "the registry does not recognise this key — run `krowk auth login --token krk_...` with a current one",
+			"retryable": false,
+		}}
 	}
 	return &key, nil
 }

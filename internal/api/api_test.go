@@ -336,8 +336,14 @@ func TestVerifyKeyTreatsValidFalseAsRejection(t *testing.T) {
 	defer srv.Close()
 
 	_, err := New(srv.URL+"/v1", "krk_secret").VerifyKey(context.Background())
-	if err == nil || err.(*Error).Code() != "invalid_key" {
-		t.Errorf("err = %v, want invalid_key", err)
+	var apiErr *Error
+	if !errorAs(err, &apiErr) || apiErr.Code() != "invalid_key" {
+		t.Fatalf("err = %v, want invalid_key", err)
+	}
+	// The verdict rode in on a 200; carrying that status is what lets doctor
+	// tell "the registry said no" apart from "nothing answered at all".
+	if apiErr.Status != http.StatusOK {
+		t.Errorf("status = %d, want the 200 the verdict arrived with", apiErr.Status)
 	}
 }
 

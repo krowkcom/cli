@@ -96,12 +96,18 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 
 		var req request
 		if json.Unmarshal(line, &req) != nil {
-			// Nothing to correlate a reply to, so answer with a null id, which
-			// is what JSON-RPC asks for on a parse failure.
+			// Nothing to correlate a reply to, so answer with a null id.
+			// -32700 is only for text that fails to parse as JSON; a line that
+			// parses but is not a Request object — a batch array, a bare
+			// string — is an invalid request, -32600.
+			rpcErr := &rpcError{Code: -32700, Message: "the message is not JSON"}
+			if json.Valid(line) {
+				rpcErr = &rpcError{Code: -32600, Message: "the message is JSON but not a Request object"}
+			}
 			if err := write(encoder, writer, response{
 				JSONRPC: "2.0",
 				ID:      json.RawMessage("null"),
-				Error:   &rpcError{Code: -32700, Message: "the message is not JSON"},
+				Error:   rpcErr,
 			}); err != nil {
 				return err
 			}

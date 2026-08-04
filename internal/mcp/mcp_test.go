@@ -405,6 +405,29 @@ func TestMalformedLineDoesNotKillTheSession(t *testing.T) {
 	}
 }
 
+// A line that is valid JSON but not a Request object — a batch array, a bare
+// string — is an invalid request (-32600), not a parse error (-32700).
+func TestValidJSONThatIsNotARequestIsInvalidNotUnparseable(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	replies := s.exchange(
+		`[{"jsonrpc":"2.0","id":1,"method":"ping"}]`,
+		`"just a string"`,
+		`{"jsonrpc":"2.0","id":7,"method":"ping"}`,
+	)
+	if len(replies) != 3 {
+		t.Fatalf("got %d replies, want two invalid-request errors then the pong: %+v", len(replies), replies)
+	}
+	for i := range 2 {
+		if e, _ := replies[i]["error"].(map[string]any); e == nil || e["code"] != float64(-32600) {
+			t.Errorf("reply %d = %+v, want a -32600 invalid request", i, replies[i])
+		}
+	}
+	if replies[2]["id"] != float64(7) {
+		t.Errorf("last reply = %+v, want the ping answered", replies[2])
+	}
+}
+
 // Cancelling the context must end the server even while it sits blocked in a
 // read — that is what lets Ctrl-C kill the process.
 func TestCancellationEndsAnIdleServer(t *testing.T) {

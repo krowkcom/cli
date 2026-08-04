@@ -155,6 +155,37 @@ func Artifact(a *api.Artifact, f Format, title string, quiet, colour bool, now t
 	})
 }
 
+// Key renders a verified API key: who it belongs to and what it may do.
+func Key(k *api.Key, f Format, colour bool) string {
+	if f != Human {
+		return encode(Envelope{
+			OK:      true,
+			Data:    k,
+			Summary: fmt.Sprintf("%s in %s, scopes: %s", k.KeyID, k.Workspace, strings.Join(k.Scopes, " ")),
+			Breadcrumbs: []Breadcrumb{
+				{Action: "push", Cmd: "krowk push screenshot.png"},
+			},
+		})
+	}
+
+	lines := []string{
+		fmt.Sprintf("%s key valid  %s", paint(colour, green, "✓"), k.KeyID),
+		fmt.Sprintf("  %-11s %s", "workspace", k.Workspace),
+		fmt.Sprintf("  %-11s %s", "scopes", strings.Join(k.Scopes, " ")),
+	}
+	if !k.HasScope(api.ScopeWrite) {
+		lines = append(lines, "  "+paint(colour, red, "cannot upload")+
+			" — this key is missing "+api.ScopeWrite)
+	}
+	if k.ExpiresAt != "" {
+		lines = append(lines, fmt.Sprintf("  %-11s %s", "expires", k.ExpiresAt))
+	}
+	if k.RateLimitRemaining != "" {
+		lines = append(lines, paint(colour, dim, fmt.Sprintf("  %-11s %s", "remaining", k.RateLimitRemaining)))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func humanArtifact(a *api.Artifact, paste Paste, title string, colour bool, now time.Time) string {
 	what := fmt.Sprintf("%d artifacts", len(a.Files))
 	if len(a.Files) == 1 {

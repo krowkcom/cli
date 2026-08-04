@@ -13,7 +13,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -121,6 +123,7 @@ func Handler(limitBytes int64, siteURL string) http.Handler {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/keys/verify", s.verify)
 	mux.HandleFunc("POST /v1/artifacts", s.begin(limitBytes, siteURL))
 	mux.HandleFunc("PUT /v1/blobs/{token}", s.put(limitBytes))
 	mux.HandleFunc("POST /v1/artifacts/{id}/finalize", s.finalize(siteURL))
@@ -128,6 +131,108 @@ func Handler(limitBytes int64, siteURL string) http.Handler {
 	mux.HandleFunc("/", notFound)
 
 	return mux
+}
+
+// keyInfo is what the registry knows about one API key.
+type keyInfo struct {
+	Valid     bool     `json:"valid"`
+	KeyID     string   `json:"key_id,omitempty"`
+	Workspace string   `json:"workspace,omitempty"`
+	Scopes    []string `json:"scopes,omitempty"`
+}
+
+// KeyPrefix is the shape the platform issues. The mock has no issuing service,
+// so the token's own prefix stands in for a lookup: krk_ro_ is read-only,
+// anything else with the krk_ prefix can write. Enough to exercise the CLI's
+// scope handling without inventing a key database.
+const (
+	KeyPrefix         = "krk_"
+	readOnlyKeyPrefix = "krk_ro_"
+)
+
+// bearer pulls the token out of the request, if there is one.
+func bearer(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if after, ok := strings.CutPrefix(h, "Bearer "); ok {
+		return strings.TrimSpace(after)
+	}
+	return ""
+}
+
+// describeKey resolves a token to what it may do. An empty token is anonymous,
+// which is a valid way to upload, not a rejected key.
+func describeKey(token string) (info keyInfo, anonymous bool) {
+	if token == "" {
+		return keyInfo{}, true
+	}
+	if !strings.HasPrefix(token, KeyPrefix) {
+		return keyInfo{Valid: false}, false
+	}
+	scopes := []string{"artifacts:read", "artifacts:write"}
+	if strings.HasPrefix(token, readOnlyKeyPrefix) {
+		scopes = []string{"artifacts:read"}
+	}
+	// Derived, never the token itself — a key ID ends up in logs and output.
+	sum := sha256.Sum256([]byte(token))
+	return keyInfo{
+		Valid:     true,
+		KeyID:     "key_" + hex.EncodeToString(sum[:])[:8],
+		Workspace: "acme",
+		Scopes:    scopes,
+	}, false
+}
+
+// verify lets the CLI self-check auth and scopes before doing any work.
+func (s *store) verify(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	rate := rateHeaders(max(0, dailyUploads-len(s.artifacts)))
+	s.mu.Unlock()
+
+	info, anonymous := describeKey(bearer(r))
+	if anonymous {
+		writeJSON(w, http.StatusUnauthorized, rate, map[string]any{
+			"error":     "no_key",
+			"fix":       "send `Authorization: Bearer krk_...`, or upload anonymously and claim it later",
+			"retryable": false,
+		})
+		return
+	}
+	if !info.Valid {
+		writeJSON(w, http.StatusUnauthorized, rate, map[string]any{
+			"error":     "invalid_key",
+			"fix":       "this is not a krowk API key — they start with " + KeyPrefix,
+			"retryable": false,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, rate, info)
+}
+
+// authorize enforces the write scope on the upload path.
+func authorize(w http.ResponseWriter, r *http.Request, rate map[string]string) bool {
+	info, anonymous := describeKey(bearer(r))
+	if anonymous {
+		return true // anonymous uploads are allowed
+	}
+	if !info.Valid {
+		writeJSON(w, http.StatusUnauthorized, rate, map[string]any{
+			"error":     "invalid_key",
+			"fix":       "this is not a krowk API key — they start with " + KeyPrefix,
+			"retryable": false,
+		})
+		return false
+	}
+	if !slices.Contains(info.Scopes, "artifacts:write") {
+		writeJSON(w, http.StatusForbidden, rate, map[string]any{
+			"error":     "insufficient_scope",
+			"required":  "artifacts:write",
+			"scopes":    info.Scopes,
+			"fix":       "this key may only read — push with a key that carries artifacts:write",
+			"retryable": false,
+		})
+		return false
+	}
+	return true
 }
 
 // begin takes the manifest and hands back one presigned target per file.
@@ -177,6 +282,12 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 		defer s.mu.Unlock()
 
 		rate := rateHeaders(max(0, dailyUploads-len(s.artifacts)))
+
+		// Auth before any work, so a key that cannot write finds out here
+		// rather than after streaming a 2 GB video to storage.
+		if !authorize(w, r, rate) {
+			return
+		}
 
 		// The same key twice: hand back the finished artifact rather than a
 		// second set of upload targets. This is what makes a retry free.

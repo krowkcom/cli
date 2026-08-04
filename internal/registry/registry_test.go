@@ -351,6 +351,102 @@ func TestManifestValidation(t *testing.T) {
 	}
 }
 
+// postAs posts with an Authorization header, so scope handling can be driven.
+func (c *client) postAs(path, token string, body any) (int, map[string]any) {
+	c.t.Helper()
+	payload, err := json.Marshal(body)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, c.url+path, bytes.NewReader(payload))
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	defer res.Body.Close()
+	out := map[string]any{}
+	_ = json.NewDecoder(res.Body).Decode(&out)
+	return res.StatusCode, out
+}
+
+func TestVerifyReportsScopes(t *testing.T) {
+	c := serve(t, 0)
+
+	code, out := c.postAs("/v1/keys/verify", "krk_live_abc", nil)
+	if code != http.StatusOK || out["valid"] != true {
+		t.Fatalf("verify = %d %v, want 200 valid", code, out)
+	}
+	if out["workspace"] != "acme" {
+		t.Errorf("workspace = %v", out["workspace"])
+	}
+	scopes, _ := out["scopes"].([]any)
+	if len(scopes) != 2 || scopes[1] != "artifacts:write" {
+		t.Errorf("scopes = %v, want read and write", out["scopes"])
+	}
+	// The key ID must be derived, never the token — it ends up in logs.
+	if id, _ := out["key_id"].(string); id == "" || strings.Contains(id, "abc") {
+		t.Errorf("key_id = %q, want a derived identifier", id)
+	}
+}
+
+func TestVerifyDistinguishesNoKeyFromBadKey(t *testing.T) {
+	c := serve(t, 0)
+
+	if code, out := c.postAs("/v1/keys/verify", "", nil); code != http.StatusUnauthorized || out["error"] != "no_key" {
+		t.Errorf("anonymous = %d %v, want 401 no_key", code, out)
+	}
+	if code, out := c.postAs("/v1/keys/verify", "hunter2", nil); code != http.StatusUnauthorized ||
+		out["error"] != "invalid_key" {
+		t.Errorf("junk token = %d %v, want 401 invalid_key", code, out)
+	}
+}
+
+func TestReadOnlyKeyCannotUpload(t *testing.T) {
+	c := serve(t, 0)
+
+	code, out := c.postAs("/v1/keys/verify", "krk_ro_abc", nil)
+	if code != http.StatusOK {
+		t.Fatalf("verify = %d %v", code, out)
+	}
+	if scopes, _ := out["scopes"].([]any); len(scopes) != 1 || scopes[0] != "artifacts:read" {
+		t.Fatalf("scopes = %v, want read only", out["scopes"])
+	}
+
+	// Rejected at the manifest, before any bytes are asked for.
+	code, out = c.postAs("/v1/artifacts", "krk_ro_abc", declare([2]string{"shot.png", "one"}))
+	if code != http.StatusForbidden || out["error"] != "insufficient_scope" {
+		t.Fatalf("begin = %d %v, want 403 insufficient_scope", code, out)
+	}
+	if out["required"] != "artifacts:write" {
+		t.Errorf("required = %v, want the missing scope named", out["required"])
+	}
+}
+
+func TestBadKeyIsRejectedAtTheManifest(t *testing.T) {
+	c := serve(t, 0)
+
+	code, out := c.postAs("/v1/artifacts", "hunter2", declare([2]string{"shot.png", "one"}))
+	if code != http.StatusUnauthorized || out["error"] != "invalid_key" {
+		t.Fatalf("begin = %d %v, want 401 invalid_key", code, out)
+	}
+}
+
+func TestAnonymousUploadIsAllowed(t *testing.T) {
+	c := serve(t, 0)
+
+	code, out := c.postAs("/v1/artifacts", "", declare([2]string{"shot.png", "one"}))
+	if code != http.StatusCreated {
+		t.Fatalf("anonymous begin = %d %v, want 201", code, out)
+	}
+}
+
 func TestGetReturnsFinalizedArtifactsOnly(t *testing.T) {
 	c := serve(t, 0)
 	req := declare([2]string{"shot.png", "one"})

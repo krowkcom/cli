@@ -46,6 +46,7 @@ advertises all land with the first tagged release — see the prerequisites belo
 | `krowk push <file...>` | Alias for `uploads create` — the form the website advertises |
 | `krowk auth login --token <token>` | Store an API token in `~/.config/krowk/credentials.json` (0600) |
 | `krowk auth token` | Print the stored token, for scripts |
+| `krowk auth verify` | Ask the registry what the key is and what it may do |
 | `krowk doctor` | Report version, API reachability, auth and detected run context |
 
 Upload flags: `--pull-request`, `--reference` (repeatable), `--session`,
@@ -138,6 +139,26 @@ Content-Type: application/json
 **2. Send the bytes.** One `PUT` per target, streamed off disk, carrying the
 headers the registry supplied. The API token is deliberately *not* attached —
 a presigned URL carries its own authorisation and may point at any host.
+
+**Auth.** A key is a bearer token; `--token` stores it, `KROWK_TOKEN` overrides
+the file. Because a key can be revoked, expired or scoped read-only — none of
+which is visible from the token string — the CLI can ask instead of guessing:
+
+```
+POST {KROWK_API_URL}/keys/verify
+Authorization: Bearer <token>
+```
+
+```jsonc
+// 200 OK
+{ "valid": true, "key_id": "key_7f3a91c2", "workspace": "acme",
+  "scopes": ["artifacts:read", "artifacts:write"] }
+```
+
+`401` with `no_key` when no token was sent, `invalid_key` when it was rejected.
+A `200` carrying `valid: false` counts as a rejection too. Uploading needs
+`artifacts:write`; a key without it is turned down at the manifest, before any
+bytes move, with `403 insufficient_scope` naming the scope it lacked.
 
 **3. Finalize.**
 

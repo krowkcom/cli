@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -260,6 +261,134 @@ func TestUnknownCommandIsReadable(t *testing.T) {
 	}
 	if got := decode(t, stderr).Error["error"]; got != "unknown_command" {
 		t.Errorf("error = %v", got)
+	}
+}
+
+func TestAuthVerifyReportsTheKeyAndItsScopes(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, stdout, stderr := h.run("auth", "verify")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	var e struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			Valid     bool     `json:"valid"`
+			KeyID     string   `json:"key_id"`
+			Workspace string   `json:"workspace"`
+			Scopes    []string `json:"scopes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &e); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	if !e.OK || !e.Data.Valid || e.Data.KeyID == "" {
+		t.Fatalf("verify = %s", stdout)
+	}
+	if !slices.Contains(e.Data.Scopes, "artifacts:write") {
+		t.Errorf("scopes = %v, want artifacts:write", e.Data.Scopes)
+	}
+}
+
+func TestAuthVerifyWithoutAKeySaysSoWithoutCallingOut(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["KROWK_TOKEN"] = ""
+	h.env["KROWK_API_URL"] = "http://127.0.0.1:1/v1" // any call would fail loudly
+
+	code, _, stderr := h.run("auth", "verify")
+	if code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if got := decode(t, stderr).Error["error"]; got != "not_authenticated" {
+		t.Errorf("error = %v, want not_authenticated", got)
+	}
+}
+
+func TestAuthVerifyRejectsAKeyTheRegistryDoesNotKnow(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["KROWK_TOKEN"] = "hunter2"
+
+	code, _, stderr := h.run("auth", "verify")
+	if code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	if got := decode(t, stderr).Error["error"]; got != "invalid_key" {
+		t.Errorf("error = %v, want invalid_key", got)
+	}
+}
+
+// A key that cannot write should fail at the manifest, and the message should
+// point at the self-check rather than leaving the agent to guess.
+func TestReadOnlyKeyFailsThePushWithAPointerToVerify(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["KROWK_TOKEN"] = "krk_ro_readonly"
+
+	code, _, stderr := h.run("push", h.fixture)
+	if code != 1 {
+		t.Fatalf("exit %d, want 1", code)
+	}
+	e := decode(t, stderr)
+	if e.Error["error"] != "insufficient_scope" {
+		t.Fatalf("error = %v, want insufficient_scope", e.Error)
+	}
+	fix, _ := e.Error["fix"].(string)
+	if !strings.Contains(fix, "krowk auth verify") {
+		t.Errorf("fix = %q, want it to name the self-check", fix)
+	}
+}
+
+func TestAnonymousPushIsAllowed(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["KROWK_TOKEN"] = ""
+
+	// Anonymous uploads are a supported path, not a rejected one; the auth hint
+	// only appears when the registry actually turns the call down.
+	if code, _, stderr := h.run("push", h.fixture); code != 0 {
+		t.Fatalf("anonymous push should work: exit %d, %s", code, stderr)
+	}
+}
+
+func TestDoctorReportsTheKeyAndReachability(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, stdout, stderr := h.run("doctor")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	var report map[string]any
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	if status, _ := report["api_status"].(string); !strings.HasPrefix(status, "reachable") {
+		t.Errorf("api_status = %v, want reachable", report["api_status"])
+	}
+	if key, _ := report["key"].(string); !strings.Contains(key, "artifacts:write") {
+		t.Errorf("key = %v, want the scopes summarised", report["key"])
+	}
+
+	// No key at all reads differently from a rejected one.
+	h.env["KROWK_TOKEN"] = ""
+	_, stdout, _ = h.run("doctor")
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatal(err)
+	}
+	if key, _ := report["key"].(string); !strings.Contains(key, "anonymous") {
+		t.Errorf("key = %v, want it to say uploads will be anonymous", report["key"])
+	}
+}
+
+func TestDoctorSaysUnreachableWhenNothingIsListening(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["KROWK_API_URL"] = "http://127.0.0.1:1/v1"
+
+	_, stdout, _ := h.run("doctor")
+	var report map[string]any
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := report["api_status"].(string); !strings.HasPrefix(status, "unreachable") {
+		t.Errorf("api_status = %v, want unreachable", report["api_status"])
 	}
 }
 

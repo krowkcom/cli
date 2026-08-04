@@ -556,6 +556,9 @@ func TestReachableByDev(t *testing.T) {
 		{"0.0.0.0:8787", true},
 		{"127.0.0.1:9000", false}, // right host, wrong port
 		{"192.168.1.5:8787", false},
+		// Loopback, but not where localhost lands — --dev cannot connect, so the
+		// banner must advise KROWK_API_URL instead.
+		{"127.0.0.2:8787", false},
 	} {
 		if got := reachableByDev(tc.addr); got != tc.want {
 			t.Errorf("reachableByDev(%q) = %v, want %v", tc.addr, got, tc.want)

@@ -515,6 +515,18 @@ func TestTheAPIHostsHTTPSUpgradeMayBeDialled(t *testing.T) {
 		t.Error("an upload target on another private host was accepted")
 	}
 
+	// And the redirect gate agrees with both: a leg that started on the upgraded
+	// origin may redirect within its host, and nowhere else.
+	ufrom, _ := http.NewRequest(http.MethodPut, "https://10.1.2.3/v1/blobs/tok", nil)
+	uto, _ := http.NewRequest(http.MethodGet, "https://10.1.2.3/v1/blobs/moved", nil)
+	if err := client.checkRedirect(uto, []*http.Request{ufrom}); err != nil {
+		t.Errorf("a same-host redirect on the upgraded leg was refused: %v", err)
+	}
+	away, _ := http.NewRequest(http.MethodGet, "https://10.1.2.4/v1/blobs/tok", nil)
+	if err := client.checkRedirect(away, []*http.Request{ufrom}); err == nil {
+		t.Error("a redirect off the upgraded origin was followed")
+	}
+
 	// An https base earns no port 80: the redirect there is a downgrade, and
 	// checkRedirect refuses it before any dial.
 	if err := New("https://10.1.2.3/v1", "krk_secret").

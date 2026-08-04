@@ -683,6 +683,23 @@ func (c *Client) sameOrigin(raw string) (string, error) {
 	return u.String(), nil
 }
 
+// onAPIOrigin reports whether u is on the origin the user configured, counting
+// the https upgrade of an http base — same host, default https port, upgrade
+// direction only. It is the one judgement of "the API's own origin" shared by
+// the upload-URL check, the redirect gate and (via isAPIAddress) the dial hook,
+// so a URL one layer permits is not refused by the next.
+func (c *Client) onAPIOrigin(u *url.URL) bool {
+	base, err := url.Parse(c.BaseURL)
+	if err != nil || base.Hostname() == "" || u.Hostname() != base.Hostname() {
+		return false
+	}
+	if u.Scheme == base.Scheme && u.Port() == base.Port() {
+		return true
+	}
+	return base.Scheme == "http" && u.Scheme == "https" &&
+		(u.Port() == "" || u.Port() == "443")
+}
+
 // storageOrigin accepts the object-storage host a presigned URL names — that is
 // the whole point of presigning — but only a host worth sending bytes to.
 //
@@ -705,17 +722,9 @@ func (c *Client) storageOrigin(raw string) (string, error) {
 	// A registry that serves blobs on its own host — this repository's own does —
 	// points the upload at the origin the user already configured. That host is
 	// trusted on the API's own terms, so a self-hosted registry on a private
-	// network keeps working — and its https upgrade is trusted the way
-	// checkRedirect and isAPIAddress already trust it: same host, default https
-	// port, upgrade direction only.
-	if base, err := url.Parse(c.BaseURL); err == nil && u.Hostname() == base.Hostname() {
-		if u.Scheme == base.Scheme && u.Port() == base.Port() {
-			return u.String(), nil
-		}
-		if base.Scheme == "http" && u.Scheme == "https" &&
-			(u.Port() == "" || u.Port() == "443") {
-			return u.String(), nil
-		}
+	// network keeps working, https upgrade included.
+	if c.onAPIOrigin(u) {
+		return u.String(), nil
 	}
 	if u.Scheme != "https" {
 		return "", Fail("insecure_upload_url",
@@ -745,7 +754,7 @@ func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) == 0 {
 		return nil
 	}
-	if _, err := c.sameOrigin(via[0].URL.String()); err != nil {
+	if !c.onAPIOrigin(via[0].URL) {
 		return Fail("upload_redirected",
 			"the upload target "+via[0].URL.Host+" redirected to "+req.URL.Host+
 				" — a presigned URL is where the bytes belong, so this is not followed")
@@ -753,7 +762,7 @@ func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 	// The request started on the API's own origin, so it stays on that host, hop
 	// after hop. The scheme may change — http -> https in front of a self-hosted
 	// registry is the ordinary case — and the downgrade below is refused anyway.
-	// sameOrigin above already proved BaseURL parses with a host.
+	// onAPIOrigin above already proved BaseURL parses with a host.
 	if base, _ := url.Parse(c.BaseURL); req.URL.Hostname() != base.Hostname() {
 		return Fail("untrusted_redirect",
 			"the registry redirected a request from its own origin to "+req.URL.Host+

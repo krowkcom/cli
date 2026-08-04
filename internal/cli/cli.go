@@ -324,9 +324,15 @@ func reachableByDev(addr string) bool {
 	if listenPort(addr) != dev.Port() {
 		return false
 	}
-	// Bound to loopback or to everything, --dev's localhost arrives either way.
-	host := listenHost(addr)
-	return host == "" || host == "0.0.0.0" || host == "::" || isLoopbackHost(host)
+	// --dev dials localhost, which lands on 127.0.0.1 or ::1 — so only those
+	// hosts, their name, and every-interface binds qualify. The rest of
+	// 127.0.0.0/8 is loopback too, but localhost does not reach it, so the
+	// advice for 127.0.0.2 is KROWK_API_URL, not a --dev that cannot connect.
+	switch listenHost(addr) {
+	case "", "0.0.0.0", "::", "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
 
 func listenHost(addr string) string {

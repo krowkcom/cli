@@ -121,6 +121,10 @@ type Key struct {
 	Scopes             []string `json:"scopes,omitempty"`
 	ExpiresAt          string   `json:"expires_at,omitempty"`
 	RateLimitRemaining string   `json:"rate_limit_remaining,omitempty"`
+	// Status is the HTTP status the verification answered with. Diagnostics
+	// print what actually arrived rather than assuming 200; the send path
+	// accepts any 2xx. Transport detail, not part of the key itself.
+	Status int `json:"-"`
 }
 
 // HasScope reports whether the key carries a named scope.
@@ -153,6 +157,7 @@ func (c *Client) VerifyKey(ctx context.Context) (*Key, error) {
 			return err
 		}
 		key.RateLimitRemaining = res.Header.Get("X-RateLimit-Remaining")
+		key.Status = res.Status
 		status = res.Status
 		return nil
 	})

@@ -516,6 +516,28 @@ func TestDoctorReportsTheKeyAndReachability(t *testing.T) {
 	}
 }
 
+// send accepts any 2xx, so doctor must report the status that actually
+// arrived rather than assuming 200.
+func TestDoctorReportsTheStatusThatArrived(t *testing.T) {
+	h := newHarness(t, 0)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprint(w, `{"valid":true,"key_id":"key_1","workspace":"ws","scopes":["artifacts:write"]}`)
+	}))
+	t.Cleanup(srv.Close)
+	h.env["KROWK_API_URL"] = srv.URL + "/v1"
+
+	_, stdout, _ := h.run("doctor")
+	var report map[string]any
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := report["api_status"].(string); status != "reachable (HTTP 202)" {
+		t.Errorf("api_status = %q, want the 202 the registry sent", status)
+	}
+}
+
 func TestDoctorSaysUnreachableWhenNothingIsListening(t *testing.T) {
 	h := newHarness(t, 0)
 	h.env["KROWK_API_URL"] = "http://127.0.0.1:1/v1"

@@ -279,7 +279,7 @@ func doctor(w io.Writer, format output.Format, env runctx.Env) error {
 		"version":       Version,
 		"runtime":       runtime.Version() + " " + runtime.GOOS + "/" + runtime.GOARCH,
 		"api":           client.BaseURL,
-		"api_status":    reachability(keyErr),
+		"api_status":    reachability(key, keyErr),
 		"authenticated": client.Token != "",
 		"key":           keySummary(client.Token, key, keyErr),
 		"credentials":   api.CredentialsPath(),
@@ -301,9 +301,11 @@ func doctor(w io.Writer, format output.Format, env runctx.Env) error {
 }
 
 // reachability separates "the registry answered" from "nothing is listening".
-func reachability(err error) string {
+func reachability(key *api.Key, err error) string {
 	if err == nil {
-		return "reachable (HTTP 200)"
+		// The status the verification actually answered with — send accepts any
+		// 2xx, so the diagnostic must not assume 200.
+		return fmt.Sprintf("reachable (HTTP %d)", key.Status)
 	}
 	var apiErr *api.Error
 	if errors.As(err, &apiErr) {

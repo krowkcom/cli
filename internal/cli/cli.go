@@ -30,6 +30,11 @@ Usage
   krowk auth token                         Print the stored token
   krowk doctor                             Check the local setup
 
+Pasting the result
+  GitHub, Linear, Notion   --format markdown   embeds the image
+  Slack, Basecamp          --format url        they unfurl the link themselves
+  Human output shows both, labelled; --json carries both under "paste".
+
 Upload flags
   --pull-request <url>   Pull request the work belongs to
   --reference <url>      Related link — repeat for more than one
@@ -40,7 +45,7 @@ Upload flags
   --agent <name>         Override the detected agent
 
 Global flags
-  --format <fmt>         human | json | markdown (default: human on a TTY, json when piped)
+  --format <fmt>         human | json | markdown | url (default: human on a TTY, json when piped)
   --json                 Shorthand for --format json
   --quiet                Raw JSON, no envelope
   -h, --help             Show this

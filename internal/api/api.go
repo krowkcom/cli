@@ -85,8 +85,9 @@ func New(baseURL, token string) *Client {
 	// registry returned. Checking the URL alone leaves two ways past it: a
 	// redirect off the vetted host, and a name that resolves once for the check
 	// and again for the dial.
-	// Cloned rather than built fresh, to keep the proxy, timeout and HTTP/2
-	// defaults; only the dial is ours.
+	//
+	// The transport is cloned rather than built fresh, to keep the proxy, timeout
+	// and HTTP/2 defaults; only the dial is ours.
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = (&net.Dialer{
 		Timeout:   30 * time.Second,

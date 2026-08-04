@@ -388,7 +388,7 @@ func (c *Client) send(req *http.Request) (*response, error) {
 		// "check KROWK_API_URL" is only good advice when the API is what failed;
 		// a blob PUT goes to whatever storage host the registry named.
 		fix := "cannot reach " + origin + " — check the network"
-		if base, baseErr := url.Parse(c.BaseURL); baseErr == nil && base.Scheme == req.URL.Scheme && base.Host == req.URL.Host {
+		if c.isAPIOrigin(req.URL) {
 			fix = "cannot reach " + c.BaseURL + " — check the network, or point KROWK_API_URL at a reachable registry"
 		}
 		return nil, &Error{Body: map[string]any{
@@ -418,9 +418,16 @@ func (c *Client) send(req *http.Request) (*response, error) {
 	if res.StatusCode >= 400 {
 		body := map[string]any{}
 		if readErr != nil || json.Unmarshal(payload, &body) != nil || body["error"] == nil {
+			// Same split as the Do-error path: a storage host answers in XML as a
+			// matter of course, and KROWK_API_URL has nothing to do with it.
+			fix := "the storage host at " + req.URL.Scheme + "://" + req.URL.Host +
+				" rejected the request without a JSON error — a presigned upload may have expired; rerun the command for fresh URLs"
+			if c.isAPIOrigin(req.URL) {
+				fix = "the registry did not return a JSON error — check KROWK_API_URL points at the API, not the website"
+			}
 			body = map[string]any{
 				"error": fmt.Sprintf("http_%d", res.StatusCode),
-				"fix":   "the registry did not return a JSON error — check KROWK_API_URL points at the API, not the website",
+				"fix":   fix,
 			}
 		}
 		apiErr := &Error{Status: res.StatusCode, Body: body}
@@ -490,11 +497,16 @@ func backoff(e *Error, attempt int) time.Duration {
 func retryAfter(v string, now time.Time) (time.Duration, bool) {
 	const maxWait = 60 * time.Second
 
-	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+	if secs, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
 		if secs <= 0 {
 			return 0, false
 		}
-		return min(time.Duration(secs)*time.Second, maxWait), true
+		// Capped before the multiply: a huge integer would overflow
+		// time.Duration and wrap negative, sailing straight past min.
+		if secs > int64(maxWait/time.Second) {
+			return maxWait, true
+		}
+		return time.Duration(secs) * time.Second, true
 	}
 	at, err := http.ParseTime(strings.TrimSpace(v))
 	if err != nil {
@@ -504,6 +516,14 @@ func retryAfter(v string, now time.Time) (time.Duration, bool) {
 		return min(d, maxWait), true
 	}
 	return 0, false
+}
+
+// isAPIOrigin reports whether u shares the API base's scheme and host — the
+// line between failures where "check KROWK_API_URL" is the fix and failures
+// on a storage host where it would only mislead.
+func (c *Client) isAPIOrigin(u *url.URL) bool {
+	base, err := url.Parse(c.BaseURL)
+	return err == nil && base.Scheme == u.Scheme && base.Host == u.Host
 }
 
 // sameOrigin resolves raw against the API base and refuses to take the token

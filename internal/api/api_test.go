@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -275,6 +276,9 @@ func TestRetryAfterAcceptsBothSpellings(t *testing.T) {
 		{now.Add(30 * time.Second).UTC().Format(http.TimeFormat), 30 * time.Second, true},
 		// A registry must not be able to wedge the CLI for a week.
 		{"604800", 60 * time.Second, true},
+		// Nor defeat the cap outright: this value overflows time.Duration if
+		// multiplied first, wrapping negative and slipping under the min.
+		{"9223372036854775807", 60 * time.Second, true},
 		{now.Add(72 * time.Hour).UTC().Format(http.TimeFormat), 60 * time.Second, true},
 		// Already past, or nonsense: fall back to exponential backoff.
 		{now.Add(-time.Hour).UTC().Format(http.TimeFormat), 0, false},
@@ -390,6 +394,108 @@ func TestBlobPutRetryReopensAndResendsTheFullBody(t *testing.T) {
 	// A drained, un-reopened body would arrive empty here and fail quietly.
 	if bodies[0] != "the whole file" || bodies[1] != "the whole file" {
 		t.Errorf("bodies = %q, want the full file on both attempts", bodies)
+	}
+}
+
+// Targets come back in manifest order; a registry that reorders them or names
+// a different file would land bytes under the wrong name, so putAll refuses.
+func TestUploadTargetWithWrongFilenameIsRefused(t *testing.T) {
+	var puts int
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(beginResponse{
+			ID:          "abc1234",
+			Uploads:     []UploadTarget{{Filename: "other.png", URL: srv.URL + "/blobs/tok"}},
+			FinalizeURL: "/v1/artifacts/abc1234/finalize",
+		})
+	})
+	mux.HandleFunc("/blobs/", func(w http.ResponseWriter, r *http.Request) { puts++ })
+
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := New(srv.URL+"/v1", "")
+	client.Sleep = func(time.Duration) {}
+
+	file := write(t, t.TempDir(), "shot.png", "one")
+	_, err := client.CreateArtifact(context.Background(), []string{file}, nil)
+	if err == nil || err.(*Error).Code() != "malformed_response" {
+		t.Errorf("err = %v, want malformed_response for a mismatched target filename", err)
+	}
+	if puts != 0 {
+		t.Errorf("the client sent %d blob request(s) against a mismatched target", puts)
+	}
+}
+
+// A non-JSON error from a storage host must not blame KROWK_API_URL — an
+// expired presigned signature comes back as XML and the API URL is fine.
+func TestStorageErrorAdviceDoesNotBlameTheAPIURL(t *testing.T) {
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `<Error><Code>AccessDenied</Code></Error>`)
+	}))
+	defer storage.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		var body beginRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("begin body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(beginResponse{
+			ID:          "abc1234",
+			Uploads:     []UploadTarget{{Filename: body.Files[0].Filename, URL: storage.URL + "/blobs/tok"}},
+			FinalizeURL: "/v1/artifacts/abc1234/finalize",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := New(srv.URL+"/v1", "")
+	client.Sleep = func(time.Duration) {}
+
+	file := write(t, t.TempDir(), "shot.png", "one")
+	_, err := client.CreateArtifact(context.Background(), []string{file}, nil)
+	if err == nil {
+		t.Fatal("a 403 from the storage host should surface as an error")
+	}
+	fix := err.(*Error).Fix()
+	if strings.Contains(fix, "KROWK_API_URL") {
+		t.Errorf("fix = %q, blames KROWK_API_URL for a storage-host failure", fix)
+	}
+	if !strings.Contains(fix, storage.URL) {
+		t.Errorf("fix = %q, want it to name the storage host %s", fix, storage.URL)
+	}
+}
+
+// retry checks the context before every attempt: a context that is already
+// dead must produce cancelled without a single request going out.
+func TestCancelledContextStopsBeforeAnyRequest(t *testing.T) {
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+	}))
+	defer srv.Close()
+
+	client := New(srv.URL+"/v1", "")
+	client.Sleep = func(time.Duration) {}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	file := write(t, t.TempDir(), "shot.png", "one")
+	_, err := client.CreateArtifact(ctx, []string{file}, nil)
+	if err == nil || err.(*Error).Code() != "cancelled" {
+		t.Errorf("err = %v, want cancelled", err)
+	}
+	if requests != 0 {
+		t.Errorf("a cancelled context still sent %d request(s)", requests)
 	}
 }
 

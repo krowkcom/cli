@@ -349,13 +349,32 @@ func listenPort(addr string) string {
 // binds. --addr 8787 is the easy mistake.
 // An empty port is accepted by SplitHostPort and listens on a port the kernel
 // picks, which the banner then misreports — so it has to be named too, and port
-// 0 asks the kernel the same question by other means. An empty host is fine:
-// that is what ":8787" means.
+// 0 asks the kernel the same question by other means. A service name like
+// "http" binds too (net.Listen resolves it) and the banner would print it
+// verbatim, so only digits pass. An empty host is fine: that is what ":8787"
+// means.
 func usableAddr(addr string) error {
-	if _, port, err := net.SplitHostPort(addr); err != nil || port == "" || port == "0" {
-		return fmt.Errorf("--addr %q needs a host and a fixed port, like 127.0.0.1:8787 or :8787", addr)
+	if _, port, err := net.SplitHostPort(addr); err != nil || !fixedPort(port) {
+		return fmt.Errorf("--addr %q needs a host and a numeric port, like 127.0.0.1:8787 or :8787", addr)
 	}
 	return nil
+}
+
+// fixedPort reports whether port names one specific port: all digits, not zero.
+func fixedPort(port string) bool {
+	if port == "" {
+		return false
+	}
+	zero := true
+	for _, r := range port {
+		if r < '0' || r > '9' {
+			return false
+		}
+		if r != '0' {
+			zero = false
+		}
+	}
+	return !zero
 }
 
 func isLoopbackHost(host string) bool {

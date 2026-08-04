@@ -371,6 +371,20 @@ func TestARootThatIsNoBoundaryIsRefused(t *testing.T) {
 		}
 	}
 
+	// A root inside a secret-named directory is no boundary either: secretPath
+	// only inspects components below the root, so a server started in ~/.ssh
+	// would otherwise make config and authorized_keys pushable.
+	ssh := filepath.Join(t.TempDir(), ".ssh")
+	if err := os.Mkdir(ssh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{Root: ssh}
+	if _, err := s.resolveRoot(); err == nil {
+		t.Errorf("root %q was accepted", ssh)
+	} else if code := err.(*api.Error).Code(); code != "root_too_broad" {
+		t.Errorf("root %q: error = %q, want root_too_broad", ssh, code)
+	}
+
 	// A project directory is the expected case and stays fine.
 	if _, err := (&Server{Root: t.TempDir()}).resolveRoot(); err != nil {
 		t.Errorf("a project directory was refused: %v", err)

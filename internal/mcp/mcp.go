@@ -120,6 +120,14 @@ func (s *Server) resolveRoot() (string, error) {
 					"start the server in a project directory, or pass --root")
 		}
 	}
+	// A root sitting inside a secret-named directory is no boundary either:
+	// secretPath only inspects components below the root, so a server started in
+	// ~/.ssh would otherwise make config and authorized_keys pushable.
+	if name := secretComponent(abs); name != "" {
+		return "", api.Fail("root_too_broad",
+			"the upload root is inside "+name+", which holds credentials — "+
+				"start the server in a project directory, or pass --root")
+	}
 	return abs, nil
 }
 
@@ -135,14 +143,19 @@ var secretNames = map[string]bool{
 	"credentials.json": true, "id_rsa": true, "id_ed25519": true, "id_ecdsa": true,
 }
 
-// secretPath reports whether any part of the path is one of those names, so a
-// directory match covers everything under it.
+// secretPath reports whether any part of the path below root is one of those
+// names, so a directory match covers everything under it.
 func secretPath(root, resolved string) string {
 	rel, err := filepath.Rel(root, resolved)
 	if err != nil {
 		return ""
 	}
-	for part := range strings.SplitSeq(rel, string(filepath.Separator)) {
+	return secretComponent(rel)
+}
+
+// secretComponent returns the first path component that names a secret, if any.
+func secretComponent(path string) string {
+	for part := range strings.SplitSeq(path, string(filepath.Separator)) {
 		lower := strings.ToLower(part)
 		// .env.local and .env.production are the same file by another name.
 		if secretNames[lower] || strings.HasPrefix(lower, ".env.") {

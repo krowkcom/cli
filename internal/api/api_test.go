@@ -420,6 +420,25 @@ func TestTheAPIHostMayRedirect(t *testing.T) {
 	}
 }
 
+// The same-origin allowance is the origin, not a first hop that launders the
+// rest: a request that started on the API's own host must stay there, or an
+// upload URL on that origin could aim a GET anywhere with one redirect.
+func TestASameOriginRedirectMayNotLeaveTheHost(t *testing.T) {
+	client := New("https://api.krowk.com/v1", "krk_secret")
+
+	from, _ := http.NewRequest(http.MethodPost, "https://api.krowk.com/v1/artifacts", nil)
+	to, _ := http.NewRequest(http.MethodPost, "https://internal.example/latest/meta-data/", nil)
+
+	err := client.checkRedirect(to, []*http.Request{from})
+	if err == nil {
+		t.Fatal("a redirect off the API's own host was followed")
+	}
+	var apiErr *Error
+	if !errorAs(err, &apiErr) || apiErr.Code() != "untrusted_redirect" {
+		t.Errorf("error = %v, want untrusted_redirect", err)
+	}
+}
+
 // KROWK_API_URL is documented as an arbitrary base URL, and a self-hosted
 // registry on a private network is the ordinary reason to set one. The host the
 // user typed is trusted the way isLocal trusts loopback: its own address may be
@@ -449,6 +468,16 @@ func TestASelfHostedRegistryOnAPrivateNetworkIsTrusted(t *testing.T) {
 	if _, err := client.storageOrigin("http://10.1.2.3/blobs/tok"); err == nil {
 		t.Error("a plaintext upload target was accepted on an https API's host")
 	}
+
+	// The dial hook sees resolved addresses, so a name-based base URL has to be
+	// recognised by where it resolves to, not by its spelling.
+	named := New("https://localhost:8443/v1", "krk_secret")
+	if !named.isAPIAddress("127.0.0.1:8443") {
+		t.Error("the API host's resolved address was not recognised as the API's own")
+	}
+	if named.isAPIAddress("127.0.0.1:9999") {
+		t.Error("a different port on the API's resolved address was recognised as the API's own")
+	}
 }
 
 // The dialer hook is the half that survives DNS: internalHost resolves a name to
@@ -471,6 +500,24 @@ func TestTheDialerRefusesInternalAddresses(t *testing.T) {
 	}
 	if _, err := client.HTTP.Do(req); err == nil {
 		t.Fatal("the client connected to a loopback address")
+	} else if !strings.Contains(err.Error(), "untrusted_endpoint") {
+		t.Errorf("error = %v, want it to name untrusted_endpoint", err)
+	}
+
+	// The hook judges the address after resolution, so a name is judged by where
+	// it lands: the same server reached as "localhost" is refused the same way
+	// its literal address is. This is the property a URL-level check cannot have,
+	// and the one a hook that runs before resolution silently loses.
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	named, err := http.NewRequest(http.MethodGet, "http://localhost:"+u.Port(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.HTTP.Do(named); err == nil {
+		t.Fatal("the client connected to a loopback address reached by name")
 	} else if !strings.Contains(err.Error(), "untrusted_endpoint") {
 		t.Errorf("error = %v, want it to name untrusted_endpoint", err)
 	}

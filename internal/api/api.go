@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -90,16 +91,18 @@ func New(baseURL, token string) *Client {
 	// round trip records which proxy the transport selected for that request —
 	// the dial hook needs it, and by dial time the request is out of sight.
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	dialer := &net.Dialer{
+	// ControlContext rather than DialContext: the transport hands DialContext the
+	// URL's host:port before resolution, so a judgement there never sees where a
+	// name actually lands. ControlContext runs inside the dialer, per resolved
+	// candidate address, and still carries the request context the proxy
+	// exemption needs.
+	transport.DialContext = (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-	}
-	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		if err := c.permitDial(ctx, address); err != nil {
-			return nil, err
-		}
-		return dialer.DialContext(ctx, network, address)
-	}
+		ControlContext: func(ctx context.Context, network, address string, _ syscall.RawConn) error {
+			return c.permitDial(ctx, address)
+		},
+	}).DialContext
 	c.HTTP = &http.Client{
 		Timeout:       5 * time.Minute,
 		Transport:     &proxyStamp{base: transport},
@@ -728,8 +731,9 @@ func (c *Client) storageOrigin(raw string) (string, error) {
 // honest answer is to fail the upload rather than complete it against whatever
 // answered. The API's own origin may still redirect (http -> https in front of a
 // self-hosted registry is ordinary), and that allowance covers upload URLs on
-// that origin too — a registry serving its own blobs may reshuffle its paths;
-// the downgrade check and permitDial cover where such a hop can land.
+// that origin too — a registry serving its own blobs may reshuffle its paths —
+// but every hop stays on that host; the allowance is the origin the user
+// configured, not a first hop that launders the rest.
 func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) == 0 {
 		return nil
@@ -738,6 +742,15 @@ func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 		return Fail("upload_redirected",
 			"the upload target "+via[0].URL.Host+" redirected to "+req.URL.Host+
 				" — a presigned URL is where the bytes belong, so this is not followed")
+	}
+	// The request started on the API's own origin, so it stays on that host, hop
+	// after hop. The scheme may change — http -> https in front of a self-hosted
+	// registry is the ordinary case — and the downgrade below is refused anyway.
+	// sameOrigin above already proved BaseURL parses with a host.
+	if base, _ := url.Parse(c.BaseURL); req.URL.Hostname() != base.Hostname() {
+		return Fail("untrusted_redirect",
+			"the registry redirected a request from its own origin to "+req.URL.Host+
+				" — a request to the API's origin stays there")
 	}
 	// Go forwards Authorization to the same host on a redirect, and judges "same"
 	// by host alone — so https -> http on one host keeps carrying the token, in

@@ -25,7 +25,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -45,9 +44,6 @@ type Client struct {
 	HTTP    *http.Client
 	// Sleep is swapped out in tests so backoff does not cost wall clock.
 	Sleep func(time.Duration)
-	// env reads the proxy configuration, so the dial hook can tell a connection to
-	// the proxy from a connection somewhere it should not go. Swapped in tests.
-	env func(string) string
 }
 
 // BaseURLFor picks which registry to talk to. dev is an explicit request — a
@@ -83,7 +79,6 @@ func New(baseURL, token string) *Client {
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Token:   token,
 		Sleep:   time.Sleep,
-		env:     os.Getenv,
 	}
 	// The upload boundary lives here, on the connection, not only on the URL the
 	// registry returned. Checking the URL alone leaves two ways past it: a
@@ -91,19 +86,49 @@ func New(baseURL, token string) *Client {
 	// and again for the dial.
 	//
 	// The transport is cloned rather than built fresh, to keep the proxy, timeout
-	// and HTTP/2 defaults; only the dial is ours.
+	// and HTTP/2 defaults; only the dial is ours. The clone is wrapped so each
+	// round trip records which proxy the transport selected for that request —
+	// the dial hook needs it, and by dial time the request is out of sight.
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = (&net.Dialer{
+	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-		Control:   c.permitDial,
-	}).DialContext
+	}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if err := c.permitDial(ctx, address); err != nil {
+			return nil, err
+		}
+		return dialer.DialContext(ctx, network, address)
+	}
 	c.HTTP = &http.Client{
 		Timeout:       5 * time.Minute,
-		Transport:     transport,
+		Transport:     &proxyStamp{base: transport},
 		CheckRedirect: c.checkRedirect,
 	}
 	return c
+}
+
+// proxyKey carries the proxy the transport selected for one request from the
+// round trip, where the request is visible, to the dial, where it is not.
+type proxyKey struct{}
+
+// proxyStamp asks the transport which proxy it will use for a request and stamps
+// the answer on the request's context before handing it over. permitDial reads
+// it back, so the exemption it grants is for the proxy this request actually
+// goes through — not for any proxy configured somewhere in the environment.
+type proxyStamp struct{ base *http.Transport }
+
+func (t *proxyStamp) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.base.Proxy != nil {
+		u, err := t.base.Proxy(req)
+		if err != nil {
+			return nil, err
+		}
+		if u != nil {
+			req = req.WithContext(context.WithValue(req.Context(), proxyKey{}, u))
+		}
+	}
+	return t.base.RoundTrip(req)
 }
 
 // File is one uploaded file as the registry reports it back.
@@ -662,7 +687,8 @@ func (c *Client) sameOrigin(raw string) (string, error) {
 // address inside the machine or its network is worse: it turns the client into a
 // confused deputy, issuing requests from a position the registry could not reach
 // on its own. Plaintext http is refused too, since the bytes are the artifact.
-// The local registry is the one exception, and it has to ask for it.
+// Two origins are exempt because the user chose them: the local registry, and
+// the API's own origin — a self-hosted registry serves blobs on its own host.
 func (c *Client) storageOrigin(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
@@ -671,6 +697,14 @@ func (c *Client) storageOrigin(raw string) (string, error) {
 
 	// Talking to a local registry means local upload targets, by definition.
 	if c.isLocal() {
+		return u.String(), nil
+	}
+	// A registry that serves blobs on its own host — this repository's own does —
+	// points the upload at the origin the user already configured. That host is
+	// trusted on the API's own terms, scheme included, so a self-hosted registry
+	// on a private network keeps working.
+	if base, err := url.Parse(c.BaseURL); err == nil &&
+		u.Scheme == base.Scheme && u.Host == base.Host {
 		return u.String(), nil
 	}
 	if u.Scheme != "https" {
@@ -692,8 +726,10 @@ func (c *Client) storageOrigin(raw string) (string, error) {
 // a GET. A presigned URL is a final destination and does not redirect, so a
 // redirect here means the registry is aiming this process somewhere, and the
 // honest answer is to fail the upload rather than complete it against whatever
-// answered. The API's own host may still redirect (http -> https in front of a
-// self-hosted registry is ordinary); permitDial covers where that can land.
+// answered. The API's own origin may still redirect (http -> https in front of a
+// self-hosted registry is ordinary), and that allowance covers upload URLs on
+// that origin too — a registry serving its own blobs may reshuffle its paths;
+// the downgrade check and permitDial cover where such a hop can land.
 func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) == 0 {
 		return nil
@@ -711,7 +747,8 @@ func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 			"the registry redirected from https to "+req.URL.Scheme+" — refusing, the token would go in the clear")
 	}
 	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
+		return Fail("too_many_redirects",
+			"gave up after 10 redirects from "+via[0].URL.Host+" — the registry is looping")
 	}
 	return nil
 }
@@ -724,9 +761,9 @@ func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 // zero-TTL record can answer public for the check and internal for the dial.
 // Deciding here instead leaves nothing between the check and the connection.
 //
-// With an HTTP proxy configured this sees the proxy's address rather than the
+// With an HTTP proxy in play this sees the proxy's address rather than the
 // target's; the URL-level checks still stand in that case.
-func (c *Client) permitDial(network, address string, _ syscall.RawConn) error {
+func (c *Client) permitDial(ctx context.Context, address string) error {
 	// A local registry means local addresses throughout — that is the point of it.
 	if c.isLocal() {
 		return nil
@@ -744,59 +781,48 @@ func (c *Client) permitDial(network, address string, _ syscall.RawConn) error {
 	if ip == nil || !reservedIP(ip) {
 		return nil
 	}
-	// One reserved address is legitimate: the proxy everything goes through.
-	// Corporate proxies sit on private addresses, so refusing this outright would
-	// refuse every upload from the CI environments this tool exists for. Only the
-	// proxy's own address earns the exemption though — a request that skipped the
-	// proxy, because NO_PROXY covers its host, is judged like any other.
-	if c.isProxy(address) {
+	// The host the user typed into KROWK_API_URL is trusted the way isLocal
+	// already trusts loopback: a self-hosted registry on a private network is
+	// configuration, not the registry steering this process somewhere.
+	if c.isAPIAddress(address) {
+		return nil
+	}
+	// One other reserved address is legitimate: the proxy this request goes
+	// through. Corporate proxies sit on private addresses, so refusing this
+	// outright would refuse every upload from the CI environments this tool
+	// exists for. Only the proxy the transport selected for this request earns
+	// the exemption though — a request that skipped the proxy, because NO_PROXY
+	// covers its host or its scheme names a different variable, is judged like
+	// any other, even when its target resolves to a configured proxy's address.
+	if proxy, ok := ctx.Value(proxyKey{}).(*url.URL); ok &&
+		slices.Contains(hostAddresses(proxy.Hostname(), proxy.Port(), proxy.Scheme), address) {
 		return nil
 	}
 	return Fail("untrusted_endpoint",
 		"refusing to connect to "+address+", which is inside this machine or its network")
 }
 
-// isProxy reports whether address is where a configured proxy listens.
+// isAPIAddress reports whether address is where BaseURL's own host lives.
 //
 // Resolved here rather than cached at startup, and only on the path that is about
-// to refuse a connection: a proxy that moved to a new address would otherwise
+// to refuse a connection: a registry that moved to a new address would otherwise
 // break every upload until the process restarted, which is a bad trade for
 // saving a lookup on a path taken a handful of times per run.
-func (c *Client) isProxy(address string) bool {
-	if c.env == nil {
+func (c *Client) isAPIAddress(address string) bool {
+	base, err := url.Parse(c.BaseURL)
+	if err != nil || base.Hostname() == "" {
 		return false
 	}
-	for _, k := range proxyVars {
-		raw := strings.TrimSpace(c.env(k))
-		if raw == "" {
-			continue
-		}
-		if slices.Contains(proxyAddresses(raw), address) {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(hostAddresses(base.Hostname(), base.Port(), base.Scheme), address)
 }
 
-var proxyVars = []string{
-	"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy",
-}
-
-// proxyAddresses turns one proxy setting into the addresses a dial to it would
-// use — the literal host:port, and the resolved ones, since a dial happens after
-// resolution.
-func proxyAddresses(raw string) []string {
-	// A bare "10.0.0.7:3128" has no scheme, which url.Parse reads as a path.
-	if !strings.Contains(raw, "//") {
-		raw = "//" + raw
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Hostname() == "" {
-		return nil
-	}
-	port := u.Port()
+// hostAddresses turns a host into the addresses a dial to it would use — the
+// literal host:port, and the resolved ones, since a dial happens after
+// resolution. An empty port falls back to the scheme's default, the way a URL
+// without one is dialled.
+func hostAddresses(hostname, port, scheme string) []string {
 	if port == "" {
-		switch u.Scheme {
+		switch scheme {
 		case "https":
 			port = "443"
 		case "socks5", "socks5h":
@@ -805,9 +831,8 @@ func proxyAddresses(raw string) []string {
 			port = "80"
 		}
 	}
-
-	out := []string{net.JoinHostPort(u.Hostname(), port)}
-	if ips, err := net.LookupIP(u.Hostname()); err == nil {
+	out := []string{net.JoinHostPort(hostname, port)}
+	if ips, err := net.LookupIP(hostname); err == nil {
 		for _, ip := range ips {
 			out = append(out, net.JoinHostPort(ip.String(), port))
 		}

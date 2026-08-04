@@ -257,9 +257,6 @@ func registryMode(client *api.Client, env runctx.Env) string {
 // a registry needs neither the network nor a checkout of this repository.
 func registryServe(w io.Writer, f flags) error {
 	addr := f.addr
-	if addr == "" {
-		addr = defaultRegistryAddr
-	}
 	if err := usableAddr(addr); err != nil {
 		return err
 	}
@@ -351,11 +348,12 @@ func listenPort(addr string) string {
 // print "http://localhost:" and a network warning for an address that never
 // binds. --addr 8787 is the easy mistake.
 // An empty port is accepted by SplitHostPort and listens on a port the kernel
-// picks, which the banner then misreports — so it has to be named too. An empty
-// host is fine: that is what ":8787" means.
+// picks, which the banner then misreports — so it has to be named too, and port
+// 0 asks the kernel the same question by other means. An empty host is fine:
+// that is what ":8787" means.
 func usableAddr(addr string) error {
-	if _, port, err := net.SplitHostPort(addr); err != nil || port == "" {
-		return fmt.Errorf("--addr %q needs a host and a port, like 127.0.0.1:8787 or :8787", addr)
+	if _, port, err := net.SplitHostPort(addr); err != nil || port == "" || port == "0" {
+		return fmt.Errorf("--addr %q needs a host and a fixed port, like 127.0.0.1:8787 or :8787", addr)
 	}
 	return nil
 }

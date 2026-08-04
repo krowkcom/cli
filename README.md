@@ -318,27 +318,35 @@ body alone:
   always sends `PUT`, and refuses loopback, link-local, private and carrier-grade
   NAT addresses. Otherwise a response body would choose the method, host, path,
   headers and body of a request the CLI makes from its own network position —
-  which in CI reaches a great deal the registry cannot. A local registry is the
-  one exception, since local targets are the whole point there.
+  which in CI reaches a great deal the registry cannot. Two origins are exempt
+  because the user chose them: a local registry, where local targets are the
+  whole point, and the host `KROWK_API_URL` itself names — a self-hosted
+  registry on a private network serves blobs on its own host, and that host is
+  configuration, not the registry steering the client.
 
   The check is on the connection, not only on the URL, because a URL check alone
   has two ways past it. An upload target that answers with a redirect is refused
   outright — a presigned URL is where the bytes belong, and a `302` would change
-  the host and arrive as a `GET`, taking the method restriction with it. And the
-  address is judged as it is dialled rather than by resolving the name first,
-  since whoever returned the name can answer the check and the dial differently.
+  the host and arrive as a `GET`, taking the method restriction with it. The one
+  exception is an upload URL on the API's own origin, which may redirect within
+  it the way the API itself may; the https-downgrade check and the dial check
+  still apply to the hop. And the address is judged as it is dialled rather than
+  by resolving the name first, since whoever returned the name can answer the
+  check and the dial differently.
 
   "Inside the network" means more than the obvious four shapes: carrier-grade NAT
   (`100.64.0.0/10`, where Tailscale lives), `240.0.0.0/4`, multicast, and the
   NAT64 prefix `64:ff9b::/96`, which on an IPv6-only runner is how you reach the
   metadata service without naming a link-local address at all.
 
-  **A configured proxy is exempt, and only at its own address.** Corporate proxies
-  sit on private addresses, so refusing those outright would refuse every upload
-  from the environments this tool is for — but the exemption is the proxy's
-  address, resolved from `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`, not a switch
-  that turns the boundary off. A request that skipped the proxy because `NO_PROXY`
-  covers its host is judged like any other. One thing does stay out of reach:
+  **The proxy a request goes through is exempt, and only at its own address.**
+  Corporate proxies sit on private addresses, so refusing those outright would
+  refuse every upload from the environments this tool is for — but the exemption
+  is the address of the proxy the transport selected for that request, not any
+  proxy configured in the environment and not a switch that turns the boundary
+  off. A request that skipped the proxy — `NO_PROXY` covers its host, or its
+  scheme names a different variable — is judged like any other, even when its
+  dial lands on a configured proxy's address. One thing does stay out of reach:
   where a proxy sends the bytes is the proxy's business, so a name that resolves
   differently for it than for the URL check is not something this client can see.
 - **Expiry** — an expired free link returns `410 Gone` carrying the original

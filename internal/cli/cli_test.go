@@ -567,8 +567,9 @@ func TestReachableByDev(t *testing.T) {
 // listening URL and warned about as if it were open to the network.
 func TestAnAddressWithoutAPortIsRejected(t *testing.T) {
 	// "127.0.0.1:" splits cleanly but listens on a port the kernel picks, which
-	// the banner would then misreport.
-	for _, addr := range []string{"8787", "localhost", "127.0.0.1", "127.0.0.1:", ":"} {
+	// the banner would then misreport — and "127.0.0.1:0" asks for the same thing
+	// explicitly.
+	for _, addr := range []string{"8787", "localhost", "127.0.0.1", "127.0.0.1:", ":", "127.0.0.1:0", ":0"} {
 		if err := usableAddr(addr); err == nil {
 			t.Errorf("usableAddr(%q) = nil, want an error naming the right shape", addr)
 		}

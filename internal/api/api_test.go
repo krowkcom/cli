@@ -361,6 +361,53 @@ func TestAnUploadTargetMayNotRedirect(t *testing.T) {
 	}
 }
 
+// An upload URL on the API's own origin is the shape of a registry that serves
+// its own blobs — this stack's does — and the same-origin allowance in
+// checkRedirect means redirects on that leg are followed, not refused. Pinned
+// here because it is an exception to "an upload target may not redirect": the
+// downgrade check and the dial hook still apply, and the hop stays on the origin
+// the user configured.
+func TestAnUploadTargetOnTheAPIHostMayRedirect(t *testing.T) {
+	var landed int
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		var body beginRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(beginResponse{
+			ID:          "abc1234",
+			Uploads:     []UploadTarget{{Filename: body.Files[0].Filename, Method: http.MethodPut, URL: srv.URL + "/blobs/tok"}},
+			FinalizeURL: "/v1/artifacts/abc1234/finalize",
+		})
+	})
+	mux.HandleFunc("/blobs/tok", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/blobs/moved", http.StatusFound)
+	})
+	mux.HandleFunc("/blobs/moved", func(w http.ResponseWriter, r *http.Request) {
+		landed++
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("POST /v1/artifacts/{id}/finalize", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Artifact{ID: "abc1234", URL: "https://krowk.com/a/abc1234"})
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := New(srv.URL+"/v1", "krk_secret")
+	client.Sleep = func(time.Duration) {}
+
+	file := write(t, t.TempDir(), "shot.png", "one")
+	if _, err := client.CreateArtifact(context.Background(), []string{file}, nil); err != nil {
+		t.Fatalf("a same-origin redirect on the upload leg was refused: %v", err)
+	}
+	if landed != 1 {
+		t.Errorf("the redirect target on the API's own origin was hit %d time(s), want 1", landed)
+	}
+}
+
 // The API's own host is allowed to redirect — http -> https in front of a
 // self-hosted registry is ordinary — and permitDial still covers where it lands.
 func TestTheAPIHostMayRedirect(t *testing.T) {
@@ -370,6 +417,37 @@ func TestTheAPIHostMayRedirect(t *testing.T) {
 	to, _ := http.NewRequest(http.MethodPost, "https://api.krowk.com/v1/artifacts/", nil)
 	if err := client.checkRedirect(to, []*http.Request{from}); err != nil {
 		t.Errorf("the API host was refused a redirect: %v", err)
+	}
+}
+
+// KROWK_API_URL is documented as an arbitrary base URL, and a self-hosted
+// registry on a private network is the ordinary reason to set one. The host the
+// user typed is trusted the way isLocal trusts loopback: its own address may be
+// dialled, and upload targets on its own origin are accepted — this stack's
+// registry serves blobs on its own host. Everything else stays refused.
+func TestASelfHostedRegistryOnAPrivateNetworkIsTrusted(t *testing.T) {
+	noProxy(t)
+	client := New("https://10.1.2.3/v1", "krk_secret")
+
+	if err := client.permitDial(context.Background(), "10.1.2.3:443"); err != nil {
+		t.Errorf("the API host's own address was refused: %v", err)
+	}
+	// The trust is the host the user typed, not the network around it.
+	for _, address := range []string{"10.1.2.4:443", "10.1.2.3:8080", "169.254.169.254:80"} {
+		if err := client.permitDial(context.Background(), address); err == nil {
+			t.Errorf("%s was permitted because the API lives on a private network", address)
+		}
+	}
+
+	if _, err := client.storageOrigin("https://10.1.2.3/blobs/tok"); err != nil {
+		t.Errorf("an upload target on the API's own origin was refused: %v", err)
+	}
+	// A different private host, or the same host on plaintext http, earns nothing.
+	if _, err := client.storageOrigin("https://10.9.9.9/blobs/tok"); err == nil {
+		t.Error("an upload target on another private host was accepted")
+	}
+	if _, err := client.storageOrigin("http://10.1.2.3/blobs/tok"); err == nil {
+		t.Error("a plaintext upload target was accepted on an https API's host")
 	}
 }
 
@@ -398,13 +476,13 @@ func TestTheDialerRefusesInternalAddresses(t *testing.T) {
 	}
 
 	// A private address is refused the same way a loopback one is.
-	if err := client.permitDial("tcp", "10.0.0.7:3128", nil); err == nil {
+	if err := client.permitDial(context.Background(), "10.0.0.7:3128"); err == nil {
 		t.Error("a private address was permitted with no proxy configured")
 	}
 
 	// A local registry means local addresses throughout, so the hook stands down.
 	local := New(DevBaseURL, "")
-	if err := local.permitDial("tcp", "127.0.0.1:8787", nil); err != nil {
+	if err := local.permitDial(context.Background(), "127.0.0.1:8787"); err != nil {
 		t.Errorf("a local registry was refused its own address: %v", err)
 	}
 }
@@ -416,7 +494,7 @@ func TestTheDialerStripsAnIPv6Zone(t *testing.T) {
 	client := New("https://api.krowk.com/v1", "krk_secret")
 
 	for _, address := range []string{"[fe80::1%eth0]:443", "[fe80::1]:443", "[64:ff9b::a9fe:a9fe]:443"} {
-		if err := client.permitDial("tcp6", address, nil); err == nil {
+		if err := client.permitDial(context.Background(), address); err == nil {
 			t.Errorf("%s was permitted", address)
 		}
 	}
@@ -433,15 +511,11 @@ func TestUploadsWorkBehindAProxyOnAPrivateAddress(t *testing.T) {
 	}))
 	defer proxy.Close()
 
-	t.Setenv("HTTP_PROXY", proxy.URL)
 	client := New("https://api.krowk.com/v1", "krk_secret")
-	if !client.isProxy(strings.TrimPrefix(proxy.URL, "http://")) {
-		t.Fatalf("the client did not recognise %s as the proxy", proxy.URL)
-	}
 	// The proxy is on loopback here, which is the shape of a proxy on 10.0.0.0/8.
 	// The request is plain http so it is forwarded rather than tunnelled with
 	// CONNECT, which a bare test server cannot answer.
-	client.HTTP.Transport.(*http.Transport).Proxy = func(*http.Request) (*url.URL, error) {
+	client.HTTP.Transport.(*proxyStamp).base.Proxy = func(*http.Request) (*url.URL, error) {
 		return url.Parse(proxy.URL)
 	}
 
@@ -456,29 +530,60 @@ func TestUploadsWorkBehindAProxyOnAPrivateAddress(t *testing.T) {
 		t.Errorf("the proxy saw %d requests, want 1", proxied)
 	}
 
-	// Only the proxy's own address earns the exemption. A request that skipped the
-	// proxy — NO_PROXY covers its host — is judged like any other, so configuring
-	// a proxy must not switch the boundary off wholesale.
+	// Only the proxy this request goes through earns the exemption. A dial with
+	// no proxy stamped on it — the transport chose to go direct — is judged like
+	// any other, so configuring a proxy must not switch the boundary off.
 	for _, address := range []string{"169.254.169.254:80", "10.0.0.99:443", "127.0.0.1:9999"} {
-		if err := client.permitDial("tcp", address, nil); err == nil {
+		if err := client.permitDial(context.Background(), address); err == nil {
 			t.Errorf("%s was permitted because a proxy is configured elsewhere", address)
 		}
 	}
 }
 
-func TestProxyAddressesReadsTheSpellingsPeopleUse(t *testing.T) {
+// The exemption is for the proxy the transport selected for this request, not
+// for any proxy configured in the environment. HTTP_PROXY is never consulted
+// for an https request, so such a request going direct must be judged like any
+// other, even when its dial lands on the proxy's own address — the registry
+// controls the port, and rebinding controls the IP.
+func TestAProxyForAnotherSchemeEarnsNoExemption(t *testing.T) {
+	noProxy(t)
+	client := New("https://api.krowk.com/v1", "krk_secret")
+	// The shape HTTP_PROXY=http://127.0.0.1:9999 gives the transport: a proxy for
+	// http requests, direct for everything else.
+	client.HTTP.Transport.(*proxyStamp).base.Proxy = func(req *http.Request) (*url.URL, error) {
+		if req.URL.Scheme == "http" {
+			return url.Parse("http://127.0.0.1:9999")
+		}
+		return nil, nil
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://127.0.0.1:9999/blob", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.HTTP.Do(req); err == nil {
+		t.Fatal("a direct dial to the http proxy's address was permitted for an https request")
+	} else if !strings.Contains(err.Error(), "untrusted_endpoint") {
+		t.Errorf("error = %v, want it to name untrusted_endpoint", err)
+	}
+}
+
+func TestHostAddressesDerivesTheSchemesDefaultPort(t *testing.T) {
 	for _, tc := range []struct {
 		raw  string
 		want string
 	}{
 		{"http://10.0.0.7:3128", "10.0.0.7:3128"},
-		{"10.0.0.7:3128", "10.0.0.7:3128"}, // no scheme, which url.Parse reads as a path
 		{"http://10.0.0.7", "10.0.0.7:80"},
 		{"https://10.0.0.7", "10.0.0.7:443"},
 		{"socks5://10.0.0.7", "10.0.0.7:1080"},
 	} {
-		if got := proxyAddresses(tc.raw); !slices.Contains(got, tc.want) {
-			t.Errorf("proxyAddresses(%q) = %v, want it to include %q", tc.raw, got, tc.want)
+		u, err := url.Parse(tc.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := hostAddresses(u.Hostname(), u.Port(), u.Scheme); !slices.Contains(got, tc.want) {
+			t.Errorf("hostAddresses(%q) = %v, want it to include %q", tc.raw, got, tc.want)
 		}
 	}
 }

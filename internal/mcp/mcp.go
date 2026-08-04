@@ -80,7 +80,8 @@ type Server struct {
 	Now func() time.Time
 }
 
-// resolveRoot is the confinement boundary, fully resolved once at startup.
+// resolveRoot is the confinement boundary, fully resolved on every call — so a
+// process that changes directory moves the boundary with it.
 func (s *Server) resolveRoot() (string, error) {
 	root := s.Root
 	if root == "" {

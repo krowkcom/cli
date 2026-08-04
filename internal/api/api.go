@@ -321,10 +321,15 @@ func (c *Client) ClaimArtifact(ctx context.Context, slug, claimToken string) (*A
 
 // CreateRun opens a run to hang artifacts off. Needs a key: a run belongs to a
 // workspace, and a keyless upload has none.
+//
+// Not retried: the POST is not idempotent, and a run committed under a lost
+// response would be duplicated by the retry — an orphan whose slug never
+// surfaces anywhere. Declaring an artifact is the same mechanics, but a stray
+// pending record is harmless where a stray open run is not.
 func (c *Client) CreateRun(ctx context.Context, metadata any) (*Run, error) {
 	var run Run
 	body := map[string]any{"run": map[string]any{"metadata": metadata}}
-	if err := c.call(ctx, http.MethodPost, "/runs", body, &run); err != nil {
+	if err := c.callOnce(ctx, http.MethodPost, "/runs", body, &run); err != nil {
 		return nil, err
 	}
 	return &run, nil
@@ -443,7 +448,17 @@ func (c *Client) call(ctx context.Context, method, path string, body any, out an
 	return c.do(ctx, method, c.BaseURL+path, body, out)
 }
 
+// callOnce is call without the retry loop, for requests that must not be
+// repeated on a lost response.
+func (c *Client) callOnce(ctx context.Context, method, path string, body any, out any) error {
+	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, 1)
+}
+
 func (c *Client) do(ctx context.Context, method, url string, body any, out any) error {
+	return c.doAttempts(ctx, method, url, body, out, maxAttempts)
+}
+
+func (c *Client) doAttempts(ctx context.Context, method, url string, body any, out any, attempts int) error {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -453,7 +468,7 @@ func (c *Client) do(ctx context.Context, method, url string, body any, out any) 
 	}
 
 	var last error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		var reader io.Reader
 		if payload != nil {
 			reader = bytes.NewReader(payload)
@@ -477,7 +492,7 @@ func (c *Client) do(ctx context.Context, method, url string, body any, out any) 
 		last = err
 
 		var apiErr *Error
-		if !errors.As(err, &apiErr) || !apiErr.Retryable() || attempt == maxAttempts {
+		if !errors.As(err, &apiErr) || !apiErr.Retryable() || attempt == attempts {
 			return err
 		}
 		c.Sleep(backoff(apiErr, attempt))

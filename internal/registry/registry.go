@@ -70,6 +70,7 @@ type artifact struct {
 	storedSum  string
 	uploadTok  string
 	uploadTil  time.Time
+	claimed    bool
 	// seq orders a listing. A timestamp would tie when two artifacts are created
 	// in the same instant, and a page has to be totally ordered or rows swap
 	// places between pages.
@@ -93,12 +94,20 @@ type store struct {
 	runs      map[string]*run
 	objects   map[string][]byte
 	created   int
+	now       func() time.Time
 }
 
 // Handler serves the stand-in registry. siteURL is the origin baked into the
 // links it hands out; empty means "whatever host the request arrived on".
 // limitBytes caps an upload the way the real registry's max_upload_bytes does.
 func Handler(limitBytes int64, siteURL string) http.Handler {
+	return HandlerWithClock(limitBytes, siteURL, time.Now)
+}
+
+// HandlerWithClock is Handler with the clock injected, which is the only way a
+// test can reach the expiry surface: a 24-hour lifetime and a 15-minute upload
+// window are not going to elapse inside one.
+func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) http.Handler {
 	if limitBytes <= 0 {
 		limitBytes = DefaultLimitBytes
 	}
@@ -106,6 +115,7 @@ func Handler(limitBytes int64, siteURL string) http.Handler {
 		artifacts: map[string]*artifact{},
 		runs:      map[string]*run{},
 		objects:   map[string][]byte{},
+		now:       now,
 	}
 
 	mux := http.NewServeMux()
@@ -217,7 +227,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	slug := generateSlug("art")
 	key := path.Join(workspace, slug, safeFilename(in.Filename))
 	url := site + "/_storage/" + key
-	now := time.Now().UTC()
+	now := s.now().UTC()
 
 	a := &artifact{
 		Slug:        slug,
@@ -277,16 +287,20 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
 	// them bare.
 	s.mu.Lock()
 	a := s.artifacts[r.PathValue("slug")]
-	var wantTok, wantType, wantSum string
+	var wantKey, wantTok, wantType, wantSum string
 	var wantSize int64
 	var until time.Time
 	if a != nil {
+		wantKey = path.Join(a.workspace, a.Slug, safeFilename(a.Filename))
 		wantTok, wantType, wantSum = a.uploadTok, a.ContentType, a.Checksum
 		wantSize, until = a.ByteSize, a.uploadTil
 	}
 	s.mu.Unlock()
 
-	if a == nil || wantTok == "" || r.URL.Query().Get("upload_token") != wantTok {
+	// A real presigned URL signs the key, not just the object: bytes must land
+	// exactly where the artifact says they live, never under a rewritten
+	// filename or another workspace's prefix.
+	if a == nil || key != wantKey || wantTok == "" || r.URL.Query().Get("upload_token") != wantTok {
 		// Storage speaks XML, as R2 and S3 do, so a client cannot get away with
 		// assuming every failure is a krowk envelope. A finalized artifact's token
 		// is spent, so a re-PUT of a ready permalink lands here too.
@@ -295,7 +309,7 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
 	}
 	// The URL's advertised expiry is enforced, as real object storage enforces
 	// the signature's window.
-	if time.Now().After(until) {
+	if s.now().After(until) {
 		writeXMLError(w, http.StatusForbidden, "AccessDenied")
 		return
 	}
@@ -373,7 +387,7 @@ func (s *store) finalizeArtifact(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, serializeArtifact(a))
 		return
 	}
-	if expired(a) {
+	if s.expired(a) {
 		writeError(w, http.StatusGone, "expired",
 			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
 		return
@@ -482,7 +496,7 @@ func (s *store) showArtifact(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
-	if expired(a) {
+	if s.expired(a) {
 		writeError(w, http.StatusGone, "expired",
 			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
 		return
@@ -512,19 +526,24 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 
 	a := s.artifacts[r.PathValue("slug")]
-	// An artifact the workspace already holds answers with itself, so a retry
-	// after a successful claim is the same success rather than a 404.
-	if a != nil && a.workspace == workspace {
+	// The token is checked before anything else: even an artifact the workspace
+	// already holds does not answer 200 to a token that was never its own.
+	match := a != nil && a.claimHash != "" && a.claimHash == sha256Hex([]byte(body.ClaimToken))
+	// A retry after a successful claim is the same success rather than a 404 —
+	// the hash is kept, not cleared, so the retry can still be told apart from
+	// a wrong token.
+	if match && a.claimed && a.workspace == workspace {
 		writeJSON(w, http.StatusOK, serializeArtifact(a))
 		return
 	}
-	// A slug that does not exist, a token that does not match it, and an artifact
-	// already claimed by someone else are all the same answer.
-	if a == nil || a.claimHash == "" || a.claimHash != sha256Hex([]byte(body.ClaimToken)) {
+	// A slug that does not exist, a token that does not match it, an artifact
+	// that was never anonymous, and one already claimed by someone else are all
+	// the same answer.
+	if !match || a.claimed {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
-	if expired(a) {
+	if s.expired(a) {
 		writeError(w, http.StatusGone, "expired",
 			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
 		return
@@ -532,7 +551,7 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 
 	a.workspace = workspace
 	a.ExpiresAt = nil
-	a.claimHash = "" // a token is good once
+	a.claimed = true // a token is good once
 	writeJSON(w, http.StatusOK, serializeArtifact(a))
 }
 
@@ -547,14 +566,20 @@ func (s *store) createRun(w http.ResponseWriter, r *http.Request) {
 			Metadata json.RawMessage `json:"metadata"`
 		} `json:"run"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+	// A body that does not parse is refused, exactly as createArtifact refuses
+	// one — an empty body is fine, a run needs no metadata.
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil && err != io.EOF {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: run.", nil)
+		return
+	}
 
 	metadata := body.Run.Metadata
 	if !json.Valid(metadata) {
 		metadata = json.RawMessage("{}")
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := s.now().UTC().Format(time.RFC3339Nano)
 	entry := &run{
 		Slug:      generateSlug("run"),
 		Status:    "open",
@@ -588,7 +613,7 @@ func (s *store) finishRun(w http.ResponseWriter, r *http.Request) {
 	// Idempotent: finishing a finished run keeps the moment it first finished.
 	if entry.Status != "finished" {
 		entry.Status = "finished"
-		entry.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		entry.FinishedAt = s.now().UTC().Format(time.RFC3339Nano)
 	}
 	writeJSON(w, http.StatusOK, entry)
 }
@@ -653,13 +678,13 @@ func writeUnauthorized(w http.ResponseWriter) {
 		"Provide a valid API key as `Authorization: Bearer krowk_sk_...`.", nil)
 }
 
-func expired(a *artifact) bool {
+func (s *store) expired(a *artifact) bool {
 	iso, ok := a.ExpiresAt.(string)
 	if !ok {
 		return false
 	}
 	at, err := time.Parse(time.RFC3339Nano, iso)
-	return err == nil && at.Before(time.Now())
+	return err == nil && at.Before(s.now())
 }
 
 func serializeArtifact(a *artifact) map[string]any {

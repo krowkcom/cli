@@ -758,6 +758,35 @@ func TestUnfinishedRunIsReportedNotSwallowed(t *testing.T) {
 	}
 }
 
+// Opening a run is not idempotent: a run committed under a lost response would
+// be duplicated by a retry, and the first slug orphaned. So it gets one attempt.
+func TestCreateRunIsNotRetried(t *testing.T) {
+	var mu sync.Mutex
+	var runPosts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		runPosts++
+		mu.Unlock()
+		// Retryable by policy — which is exactly why this endpoint must opt out.
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"error":{"code":"boom","message":"transient"}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	h := &harness{t: t, server: server, env: map[string]string{
+		"KROWK_API_URL": server.URL + "/v1",
+		"KROWK_TOKEN":   "krowk_sk_test",
+	}}
+	h.fixture = h.write("shot.png", "some bytes")
+
+	h.fails("push", h.fixture)
+	mu.Lock()
+	defer mu.Unlock()
+	if runPosts != 1 {
+		t.Errorf("POST /v1/runs was sent %d times, want exactly 1", runPosts)
+	}
+}
+
 // next_step is an instruction the registry hands to agents; if it names a route
 // that does not exist, doing literally what it says answers 404. The wire-shape
 // test pins the calls the client makes — this pins the instruction itself.

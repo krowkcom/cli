@@ -305,6 +305,10 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 		// second set of upload targets. This is what makes a retry free.
 		if id, ok := s.finalized[req.IdempotencyKey]; ok {
 			done := s.artifacts[id]
+			// Not the claim URL though — see finalize. The key comes from the
+			// bytes, so holding a copy of the file is not the same as being the
+			// person who uploaded it.
+			done.ClaimURL = ""
 			writeJSON(w, http.StatusOK, rate, beginResponse{ID: id, Complete: true, Artifact: &done})
 			return
 		}
@@ -472,6 +476,12 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 				})
 				return
 			}
+			// The claim URL is handed back once, to the call that created the
+			// artifact. Identity is derived from the bytes, so anyone holding a
+			// copy of the same file derives the same key — without this, pushing
+			// a file someone else had already pushed anonymously would hand you
+			// their claim URL, and with it their upload and its metadata.
+			done.ClaimURL = ""
 			writeJSON(w, http.StatusOK, rate, done)
 			return
 		}

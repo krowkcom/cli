@@ -174,10 +174,16 @@ Claiming happens in a browser, signed in — there is no API call for it. Which
 side of the fence an upload lands on is settled when the handshake opens, so it
 cannot change hands by finalizing with a different key.
 
-The claim URL is a **capability**: anyone holding it can adopt the upload. So it
-is printed for whoever ran the push, kept out of both paste forms, and never
-returned by `GET /v1/artifacts/{id}` — the artifact ID is public, since it is in
-the shareable link, and knowing it must not be enough to claim the upload.
+The claim URL is a **capability**: anyone holding it can adopt the upload. So:
+
+- it is printed for whoever ran the push, and kept out of both paste forms;
+- `GET /v1/artifacts/{id}` never returns it — the ID is public, since it is in
+  the shareable link, and knowing it must not be enough to claim the upload;
+- it is handed back exactly once, to the call that created the artifact. Identity
+  is derived from the bytes, so anyone holding a copy of the same file derives
+  the same key; without this, pushing a file someone else had already shared
+  anonymously would hand you their upload and its metadata. A retry that lost the
+  original response gets the link but not the claim URL.
 
 **3. Finalize.**
 

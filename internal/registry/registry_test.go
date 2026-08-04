@@ -473,6 +473,20 @@ func (c *client) pushAs(token string, files ...[2]string) map[string]any {
 	_ = json.NewDecoder(res.Body).Decode(&begun)
 	res.Body.Close()
 
+	// This key was already finalized: no targets, no bytes to send. The client
+	// takes the same short-circuit.
+	if begun.Complete && begun.Artifact != nil {
+		out := map[string]any{}
+		encoded, err := json.Marshal(begun.Artifact)
+		if err != nil {
+			c.t.Fatal(err)
+		}
+		if err := json.Unmarshal(encoded, &out); err != nil {
+			c.t.Fatal(err)
+		}
+		return out
+	}
+
 	for i, f := range files {
 		if code, out := c.put(begun.Uploads[i].URL, f[1]); code != http.StatusOK {
 			c.t.Fatalf("put %d = %d: %v", i, code, out)
@@ -554,6 +568,32 @@ func TestLookupDoesNotLeakTheClaimURL(t *testing.T) {
 	}
 	if looked["anonymous"] != true {
 		t.Errorf("anonymous = %v, want the status still visible", looked["anonymous"])
+	}
+}
+
+// Identity is derived from the bytes, so two people holding the same file
+// derive the same key. The second one gets the same link — that is the point of
+// idempotency — but must not be handed the first one's claim URL, or pushing a
+// file someone else had already shared would adopt their upload.
+func TestTheClaimURLIsHandedBackOnlyOnce(t *testing.T) {
+	c := serve(t, 0)
+
+	first := c.pushAs("", [2]string{"shared.png", "one"})
+	if first["claim_url"] == nil {
+		t.Fatal("the original push should get a claim URL")
+	}
+
+	// Somebody else, same bytes, no key.
+	second := c.pushAs("", [2]string{"shared.png", "one"})
+	if second["id"] != first["id"] {
+		t.Fatalf("identical bytes should resolve to one artifact: %v then %v", first["id"], second["id"])
+	}
+	if second["claim_url"] != nil {
+		t.Errorf("a replay handed out the claim URL again: %v", second["claim_url"])
+	}
+	// The link itself is still returned, so the retry path stays useful.
+	if second["url"] != first["url"] {
+		t.Errorf("url = %v, want the original link", second["url"])
 	}
 }
 

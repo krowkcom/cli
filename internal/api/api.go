@@ -704,11 +704,18 @@ func (c *Client) storageOrigin(raw string) (string, error) {
 	}
 	// A registry that serves blobs on its own host — this repository's own does —
 	// points the upload at the origin the user already configured. That host is
-	// trusted on the API's own terms, scheme included, so a self-hosted registry
-	// on a private network keeps working.
-	if base, err := url.Parse(c.BaseURL); err == nil &&
-		u.Scheme == base.Scheme && u.Host == base.Host {
-		return u.String(), nil
+	// trusted on the API's own terms, so a self-hosted registry on a private
+	// network keeps working — and its https upgrade is trusted the way
+	// checkRedirect and isAPIAddress already trust it: same host, default https
+	// port, upgrade direction only.
+	if base, err := url.Parse(c.BaseURL); err == nil && u.Hostname() == base.Hostname() {
+		if u.Scheme == base.Scheme && u.Port() == base.Port() {
+			return u.String(), nil
+		}
+		if base.Scheme == "http" && u.Scheme == "https" &&
+			(u.Port() == "" || u.Port() == "443") {
+			return u.String(), nil
+		}
 	}
 	if u.Scheme != "https" {
 		return "", Fail("insecure_upload_url",

@@ -574,7 +574,7 @@ func TestAnAddressWithoutAPortIsRejected(t *testing.T) {
 	for _, addr := range []string{
 		"8787", "localhost", "127.0.0.1", "127.0.0.1:", ":",
 		"127.0.0.1:0", ":0", ":00", "127.0.0.1:http", ":-1",
-		"127.0.0.1:99999", ":65536",
+		"127.0.0.1:99999", ":65536", "127.0.0.1:08787",
 	} {
 		if err := usableAddr(addr); err == nil {
 			t.Errorf("usableAddr(%q) = nil, want an error naming the right shape", addr)

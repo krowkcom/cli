@@ -503,6 +503,18 @@ func TestTheAPIHostsHTTPSUpgradeMayBeDialled(t *testing.T) {
 		}
 	}
 
+	// The upload leg agrees with the dial: a blob URL on the upgraded origin is
+	// accepted — same host, default https port, nothing wider.
+	if _, err := client.storageOrigin("https://10.1.2.3/v1/blobs/tok"); err != nil {
+		t.Errorf("an upload target on the upgraded API origin was refused: %v", err)
+	}
+	if _, err := client.storageOrigin("https://10.1.2.3:8443/v1/blobs/tok"); err == nil {
+		t.Error("an upload target on another port of the API host was accepted")
+	}
+	if _, err := client.storageOrigin("https://10.1.2.4/v1/blobs/tok"); err == nil {
+		t.Error("an upload target on another private host was accepted")
+	}
+
 	// An https base earns no port 80: the redirect there is a downgrade, and
 	// checkRedirect refuses it before any dial.
 	if err := New("https://10.1.2.3/v1", "krk_secret").

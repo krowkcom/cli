@@ -522,7 +522,11 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 			})
 			return
 		}
-		if body.IdempotencyKey != up.key {
+		// Pending uploads are partitioned the same way as finished ones: the key
+		// alone is derivable from the bytes, so a keyed caller holding a copy of
+		// an anonymously-pushed file could otherwise finalize the anonymous
+		// pending upload and walk off with its one-time claim capability.
+		if scopedKey(ownerClass(r), body.IdempotencyKey) != up.scoped {
 			writeJSON(w, http.StatusConflict, rate, map[string]any{
 				"error":     "idempotency_key_mismatch",
 				"fix":       "finalize with the same idempotency_key the handshake was opened with",
@@ -590,8 +594,19 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 		if up.anonymous {
 			// Whoever holds this can adopt the upload, so it is minted straight
 			// into this one response — never stored — and handed back exactly
-			// once, to the process that did the pushing. No later egress path
-			// can leak what the store never held.
+			// once, on the single response that finalizes the artifact. No later
+			// egress path can leak what the store never held.
+			//
+			// "Once" is a promise about responses, not people: completing the
+			// upload earns the claim. Anonymous identity is derived from the
+			// bytes, so if the opener is interrupted before finalizing, a second
+			// anonymous pusher of the same file resumes the pending handshake
+			// and — by finalizing first — receives the claim URL and the
+			// opener's metadata. There is no opener identity to check against;
+			// the alternatives (fresh identity per anonymous begin, or expiring
+			// pending uploads) would break the resumability and dedup this
+			// registry promises, so the trade-off is made deliberately and
+			// stated in the README.
 			a.ClaimURL = fmt.Sprintf("%s/claim/%s", site, newToken())
 		}
 

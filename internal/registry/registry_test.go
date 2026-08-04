@@ -652,7 +652,9 @@ func TestFinalizeRetryIsScopedToTheOwnershipClass(t *testing.T) {
 }
 
 // Which side of the fence an upload lands on is settled when the handshake
-// opens, so it cannot change hands by finalizing with a different key.
+// opens, so it cannot change hands by finalizing with a different key: a keyed
+// finalize of an anonymous pending upload is rejected, or the keyed caller
+// would walk off with the one-time claim capability.
 func TestOwnershipIsDecidedAtTheManifest(t *testing.T) {
 	c := serve(t, 0)
 	req := declare([2]string{"shot.png", "one"})
@@ -662,13 +664,68 @@ func TestOwnershipIsDecidedAtTheManifest(t *testing.T) {
 		t.Fatal("put failed")
 	}
 
-	code, done := c.postAs("/v1/artifacts/"+begun.ID+"/finalize", "krk_live_abc",
+	code, out := c.postAs("/v1/artifacts/"+begun.ID+"/finalize", "krk_live_abc",
+		map[string]string{"idempotency_key": req.IdempotencyKey})
+	if code != http.StatusConflict || out["error"] != "idempotency_key_mismatch" {
+		t.Fatalf("keyed finalize of an anonymous pending upload = %d %v, want 409", code, out)
+	}
+	if out["claim_url"] != nil {
+		t.Fatalf("the rejection carried the claim URL: %v", out["claim_url"])
+	}
+
+	// The anonymous caller that opened the handshake still completes it freely.
+	code, done := c.postAs("/v1/artifacts/"+begun.ID+"/finalize", "",
+		map[string]string{"idempotency_key": req.IdempotencyKey})
+	if code != http.StatusOK {
+		t.Fatalf("anonymous finalize = %d %v, want 200", code, done)
+	}
+	if done["anonymous"] != true {
+		t.Errorf("anonymous = %v, want the upload to stay anonymous", done["anonymous"])
+	}
+	if done["claim_url"] == nil {
+		t.Errorf("the completing anonymous caller should receive the claim URL")
+	}
+}
+
+// Completing the upload earns the claim. Anonymous identity is derived from
+// the bytes, so an interrupted anonymous handshake resumes for anyone holding
+// the same file — and the claim URL goes to whoever finalizes, exactly once.
+// This is the documented trade-off of resumable, content-derived identity.
+func TestAnInterruptedAnonymousUploadYieldsItsClaimToTheFinisher(t *testing.T) {
+	c := serve(t, 0)
+	req := declare([2]string{"shot.png", "one"})
+
+	// The opener pushes every byte but is interrupted before finalizing.
+	_, begun := c.begin(req)
+	if code, _ := c.put(begun.Uploads[0].URL, "one"); code != http.StatusOK {
+		t.Fatal("put failed")
+	}
+
+	// A second anonymous pusher of the same bytes resumes the handshake...
+	_, resumed := c.begin(req)
+	if resumed.ID != begun.ID {
+		t.Fatalf("same anonymous bytes should resume one upload: %v then %v", begun.ID, resumed.ID)
+	}
+
+	// ...and, by finalizing first, is the one handed the claim URL.
+	code, done := c.postAs("/v1/artifacts/"+begun.ID+"/finalize", "",
 		map[string]string{"idempotency_key": req.IdempotencyKey})
 	if code != http.StatusOK {
 		t.Fatalf("finalize = %d %v", code, done)
 	}
-	if done["anonymous"] != true {
-		t.Errorf("anonymous = %v, want the upload to stay anonymous", done["anonymous"])
+	if done["claim_url"] == nil {
+		t.Fatal("the finalizing caller should receive the claim URL")
+	}
+
+	// The opener, finalizing late, gets the artifact back — but the claim
+	// capability was minted once, into the response that completed the upload.
+	code, late := c.postAs("/v1/artifacts/"+begun.ID+"/finalize", "",
+		map[string]string{"idempotency_key": req.IdempotencyKey})
+	if code != http.StatusOK {
+		t.Fatalf("late finalize = %d %v", code, late)
+	}
+	if late["claim_url"] != nil {
+		t.Errorf("the claim URL was handed out twice: %v", late["claim_url"])
 	}
 }
 

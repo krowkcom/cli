@@ -179,11 +179,16 @@ The claim URL is a **capability**: anyone holding it can adopt the upload. So:
 - it is printed for whoever ran the push, and kept out of both paste forms;
 - `GET /v1/artifacts/{id}` never returns it — the ID is public, since it is in
   the shareable link, and knowing it must not be enough to claim the upload;
-- it is handed back exactly once, to the call that created the artifact. Identity
-  is derived from the bytes, so anyone holding a copy of the same file derives
-  the same key; without this, pushing a file someone else had already shared
-  anonymously would hand you their upload and its metadata. A retry that lost the
-  original response gets the link but not the claim URL.
+- it is handed back exactly once, on the single response that finalizes the
+  artifact — completing the upload earns the claim. Identity is derived from the
+  bytes, so anyone holding a copy of the same file derives the same key; once an
+  artifact exists, a replay gets the link but not the claim URL, so pushing a
+  file someone else had already shared anonymously cannot adopt their upload.
+  The one caveat is an *interrupted* anonymous handshake: it resumes for anyone
+  anonymous with the same bytes, and whoever finalizes first gets the claim URL
+  (and the opener's metadata). There is no opener identity to check against —
+  that is the deliberate price of anonymous, content-derived identity being
+  resumable.
 
 **3. Finalize.**
 

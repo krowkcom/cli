@@ -124,6 +124,53 @@ func TestSameBytesUploadToTheSameURL(t *testing.T) {
 	}
 }
 
+// A second anonymous push of the same bytes replays the stored artifact: same
+// link, still marked anonymous, but the claim URL was handed out once — to the
+// push that completed the upload — so the replay must not advise claiming what
+// this caller cannot reach.
+func TestSecondAnonymousPushReplaysWithoutTheClaim(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["KROWK_TOKEN"] = ""
+
+	_, first, _ := h.run("push", h.fixture)
+	code, second, stderr := h.run("push", h.fixture)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+
+	var e struct {
+		Data struct {
+			URL       string `json:"url"`
+			Anonymous bool   `json:"anonymous"`
+			ClaimURL  string `json:"claim_url"`
+		} `json:"data"`
+		Summary     string `json:"summary"`
+		Breadcrumbs []struct {
+			Action string `json:"action"`
+		} `json:"breadcrumbs"`
+	}
+	if err := json.Unmarshal([]byte(second), &e); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, second)
+	}
+	if e.Data.URL != decode(t, first).Data.URL {
+		t.Errorf("replay produced a second link: %q then %q", decode(t, first).Data.URL, e.Data.URL)
+	}
+	if !e.Data.Anonymous {
+		t.Errorf("anonymous = false, want the replay still flagged anonymous: %s", second)
+	}
+	if e.Data.ClaimURL != "" {
+		t.Errorf("claim_url = %q, want none on a replay", e.Data.ClaimURL)
+	}
+	if !strings.Contains(e.Summary, "anonymous") || strings.Contains(e.Summary, "claim") {
+		t.Errorf("summary = %q, want the anonymous status without claim advice", e.Summary)
+	}
+	for _, b := range e.Breadcrumbs {
+		if b.Action == "claim" {
+			t.Errorf("breadcrumbs = %+v, want no claim step without a claim URL", e.Breadcrumbs)
+		}
+	}
+}
+
 func TestMultipleFilesLandUnderOneArtifact(t *testing.T) {
 	h := newHarness(t, 0)
 	second := filepath.Join(filepath.Dir(h.fixture), "checkout-before.png")

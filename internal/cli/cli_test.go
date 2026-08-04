@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -583,24 +584,65 @@ func TestReachableByDev(t *testing.T) {
 // An address without a port cannot bind, so it must not first be announced as a
 // listening URL and warned about as if it were open to the network.
 func TestAnAddressWithoutAPortIsRejected(t *testing.T) {
-	// "127.0.0.1:" splits cleanly but listens on a port the kernel picks, which
-	// the banner would then misreport — "127.0.0.1:0" asks for the same thing
-	// explicitly, and "127.0.0.1:http" binds port 80 while the banner prints the
-	// name verbatim.
+	// "127.0.0.1:" splits cleanly but binds a kernel-picked port the banner has
+	// no name for; "127.0.0.1:http" binds port 80 while the banner prints the
+	// name verbatim; ":08787" binds 8787 under a different spelling.
 	// "127.0.0.1:99999" is the same failure by overflow: announced, never bound.
 	for _, addr := range []string{
 		"8787", "localhost", "127.0.0.1", "127.0.0.1:", ":",
-		"127.0.0.1:0", ":0", ":00", "127.0.0.1:http", ":-1",
+		":00", "127.0.0.1:http", ":-1",
 		"127.0.0.1:99999", ":65536", "127.0.0.1:08787",
 	} {
 		if err := usableAddr(addr); err == nil {
 			t.Errorf("usableAddr(%q) = nil, want an error naming the right shape", addr)
 		}
 	}
-	for _, addr := range []string{":8787", "127.0.0.1:8787", "0.0.0.0:9000", ":65535", defaultRegistryAddr} {
+	// ":0" passes: the kernel picks the port, and since the bind precedes the
+	// banner, the banner reports the port it picked rather than misreporting.
+	for _, addr := range []string{
+		":8787", "127.0.0.1:8787", "0.0.0.0:9000", ":65535", ":0", "127.0.0.1:0",
+		defaultRegistryAddr,
+	} {
 		if err := usableAddr(addr); err != nil {
 			t.Errorf("usableAddr(%q) = %v", addr, err)
 		}
+	}
+}
+
+// Bind-before-banner makes ":0" a feature rather than a misreport: the kernel
+// picks a free port, the registry serves on it, and the banner names the port
+// that was actually bound, with advice that connects.
+func TestAddrPortZeroServesOnAKernelPickedPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- serveOn(io.Discard, ln, "127.0.0.1:0", flags{}) }()
+
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	banner := registryBanner(ln.Addr().String(), "127.0.0.1:0")
+	if !strings.Contains(banner, "krowk registry listening on http://localhost:"+port+"\n") {
+		t.Errorf("banner = %q, want it to carry the bound port %s", banner, port)
+	}
+	if !strings.Contains(banner, "KROWK_API_URL=http://localhost:"+port+"/v1") {
+		t.Errorf("banner = %q, want KROWK_API_URL advice naming the bound port", banner)
+	}
+
+	// And a registry really answers on the port the kernel picked.
+	resp, err := http.Get("http://" + ln.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("nothing answered on the bound port: %v", err)
+	}
+	resp.Body.Close()
+
+	ln.Close()
+	var apiErr *api.Error
+	if serveErr := <-done; !errors.As(serveErr, &apiErr) || apiErr.Code() != "registry_unavailable" {
+		t.Errorf("serve after the listener closed = %v, want registry_unavailable", serveErr)
 	}
 }
 

@@ -392,32 +392,30 @@ func listenPort(addr string) string {
 // usableAddr rejects what net.Listen would reject anyway, so the banner does not
 // print "http://localhost:" and a network warning for an address that never
 // binds. --addr 8787 is the easy mistake.
-// An empty port is accepted by SplitHostPort and listens on a port the kernel
-// picks, which the banner then misreports — so it has to be named too, and port
-// 0 asks the kernel the same question by other means. A service name like
-// "http" binds too (net.Listen resolves it) and the banner would print it
-// verbatim, so only digits pass. An empty host is fine: that is what ":8787"
-// means.
+// An empty port is accepted by SplitHostPort but binds a kernel-picked port the
+// banner has no name for — ":0" is the explicit spelling of that request, and it
+// is welcome: the bind happens before the banner, which then reports the port
+// the kernel picked. An empty host is fine: that is what ":8787" means.
 func usableAddr(addr string) error {
-	if _, port, err := net.SplitHostPort(addr); err != nil || !fixedPort(port) {
+	if _, port, err := net.SplitHostPort(addr); err != nil || !bindablePort(port) {
 		return fmt.Errorf("--addr %q needs a host and a numeric port, like 127.0.0.1:8787 or :8787", addr)
 	}
 	return nil
 }
 
-// fixedPort reports whether port names one specific bindable port, spelled the
-// way it will bind: all digits (net.Listen also resolves signs and service
-// names), in 1-65535 — port 0 asks the kernel to pick, and 99999 announces
-// itself and then fails to bind — and with no leading zeros, since ":08787"
-// binds 8787 while the banner prints the spelling verbatim.
-func fixedPort(port string) bool {
+// bindablePort reports whether port is one the listener can take as given: all
+// digits (net.Listen also resolves signs and service names like "http", which
+// the banner would print verbatim), within 0-65535 — 99999 announces itself and
+// then fails to bind — and spelled the way it binds, since ":08787" binds 8787.
+// Port 0 asks the kernel to pick, and the banner reports what it picked.
+func bindablePort(port string) bool {
 	for _, r := range port {
 		if r < '0' || r > '9' {
 			return false
 		}
 	}
 	n, err := strconv.Atoi(port)
-	return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == port
+	return err == nil && n <= 65535 && strconv.Itoa(n) == port
 }
 
 func isLoopbackHost(host string) bool {

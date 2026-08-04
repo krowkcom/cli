@@ -1,10 +1,11 @@
 // Package api talks to the krowk artifact registry.
 //
 // An upload is a three-step handshake: declare the files, PUT their bytes to
-// the presigned URLs the registry hands back, then finalize. Every step carries
-// the same idempotency key, derived from the bytes themselves, so an agent that
-// retries — or crashes and runs the whole command again — converges on one
-// artifact and one link instead of littering the registry with duplicates.
+// the presigned URLs the registry hands back, then finalize. Declare and
+// finalize carry the same idempotency key, derived from the bytes themselves,
+// so an agent that retries — or crashes and runs the whole command again —
+// converges on one artifact and one link instead of littering the registry
+// with duplicates; the blob PUT is identified by its presigned URL alone.
 package api
 
 import (
@@ -49,8 +50,18 @@ func New(baseURL, token string) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Token:   token,
-		HTTP:    &http.Client{Timeout: 5 * time.Minute},
-		Sleep:   time.Sleep,
+		HTTP: &http.Client{
+			Timeout: 5 * time.Minute,
+			// Never follow a redirect. sameOrigin vets the URL a request starts
+			// at, not where a 302 sends it next — and Go forwards Authorization
+			// on any same-host hop, so a redirect to another port, a subdomain,
+			// or an https→http downgrade still carries the token. send turns the
+			// 3xx this leaves behind into an error.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		Sleep: time.Sleep,
 	}
 }
 
@@ -373,17 +384,36 @@ type response struct {
 func (c *Client) send(req *http.Request) (*response, error) {
 	res, err := c.HTTP.Do(req)
 	if err != nil {
+		origin := req.URL.Scheme + "://" + req.URL.Host
+		// "check KROWK_API_URL" is only good advice when the API is what failed;
+		// a blob PUT goes to whatever storage host the registry named.
+		fix := "cannot reach " + origin + " — check the network"
+		if base, baseErr := url.Parse(c.BaseURL); baseErr == nil && base.Scheme == req.URL.Scheme && base.Host == req.URL.Host {
+			fix = "cannot reach " + c.BaseURL + " — check the network, or point KROWK_API_URL at a reachable registry"
+		}
 		return nil, &Error{Body: map[string]any{
 			"error":     "network_unreachable",
 			"endpoint":  req.URL.String(),
 			"detail":    err.Error(),
-			"fix":       "cannot reach " + c.BaseURL + " — check the network, or point KROWK_API_URL at a reachable registry",
+			"fix":       fix,
 			"retryable": false,
 		}}
 	}
 	defer res.Body.Close()
 
 	payload, readErr := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+
+	// CheckRedirect hands 3xx responses back instead of following them; treat
+	// them as the refusal they are rather than as a body to decode.
+	if res.StatusCode >= 300 && res.StatusCode < 400 {
+		return nil, &Error{Status: res.StatusCode, Body: map[string]any{
+			"error":     "unexpected_redirect",
+			"endpoint":  req.URL.String(),
+			"location":  res.Header.Get("Location"),
+			"fix":       "the server redirected this request — following it could carry the request past the origin checks, so it is not followed",
+			"retryable": false,
+		}}
+	}
 
 	if res.StatusCode >= 400 {
 		body := map[string]any{}

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -286,6 +287,109 @@ func TestRetryAfterAcceptsBothSpellings(t *testing.T) {
 		if ok != tc.ok || (ok && got != tc.want) {
 			t.Errorf("retryAfter(%q) = %v, %v; want %v, %v", tc.in, got, ok, tc.want, tc.ok)
 		}
+	}
+}
+
+// sameOrigin vets where a request starts, and only CheckRedirect covers where
+// a 302 sends it next: Go forwards Authorization on any same-host hop, so a
+// registry answering with a redirect to another port on its own host would
+// otherwise deliver the token there.
+func TestRedirectsAreRefusedWithoutLeakingTheToken(t *testing.T) {
+	var mu sync.Mutex
+	var hijacked []string
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hijacked = append(hijacked, r.Header.Get("Authorization"))
+		mu.Unlock()
+	}))
+	defer elsewhere.Close()
+
+	// Same host as the attacker's server — both 127.0.0.1 — different port,
+	// which is exactly the hop the default client follows with the token on.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer srv.Close()
+
+	client := New(srv.URL+"/v1", "krk_secret")
+	client.Sleep = func(time.Duration) {}
+
+	file := write(t, t.TempDir(), "shot.png", "one")
+	_, err := client.CreateArtifact(context.Background(), []string{file}, nil)
+	if err == nil {
+		t.Fatal("a redirected API call should fail, not be followed")
+	}
+	if code := err.(*Error).Code(); code != "unexpected_redirect" {
+		t.Errorf("error = %q, want unexpected_redirect", code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hijacked) != 0 {
+		t.Errorf("the redirect was followed %d time(s), carrying Authorization %q", len(hijacked), hijacked)
+	}
+}
+
+// The per-attempt reopen in put: a retry must send the whole file again, since
+// the failed attempt drained the previous handle off disk.
+func TestBlobPutRetryReopensAndResendsTheFullBody(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		var body beginRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("begin body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(beginResponse{
+			ID:          "abc1234",
+			Uploads:     []UploadTarget{{Filename: body.Files[0].Filename, URL: srv.URL + "/blobs/tok"}},
+			FinalizeURL: "/v1/artifacts/abc1234/finalize",
+		})
+	})
+	mux.HandleFunc("PUT /blobs/tok", func(w http.ResponseWriter, r *http.Request) {
+		payload, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("put body: %v", err)
+		}
+		mu.Lock()
+		bodies = append(bodies, string(payload))
+		attempt := len(bodies)
+		mu.Unlock()
+		if attempt == 1 {
+			// A storage hiccup: 5xx is retryable by default.
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("POST /v1/artifacts/{id}/finalize", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Artifact{ID: "abc1234", URL: "https://krowk.com/a/abc1234"})
+	})
+
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := New(srv.URL+"/v1", "")
+	client.Sleep = func(time.Duration) {}
+
+	file := write(t, t.TempDir(), "shot.png", "the whole file")
+	if _, err := client.CreateArtifact(context.Background(), []string{file}, nil); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("put attempts = %d, want 2", len(bodies))
+	}
+	// A drained, un-reopened body would arrive empty here and fail quietly.
+	if bodies[0] != "the whole file" || bodies[1] != "the whole file" {
+		t.Errorf("bodies = %q, want the full file on both attempts", bodies)
 	}
 }
 

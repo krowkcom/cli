@@ -151,9 +151,13 @@ body alone:
 - **Idempotency** — the key is a SHA-256 fold over each file's name, size and
   content digest, in order: `sha256(name \0 size \0 digest \0 …)`. It is
   derived from the bytes, so a retry, a crash-and-rerun, or the same push from
-  another machine all converge on one artifact and one link. All three steps
-  carry it; the registry verifies each blob against its declared digest on
-  arrival, so agreeing on the key really does mean agreeing on the bytes.
+  another machine all converge on one artifact and one link. Declare and
+  finalize carry it — the blob `PUT` does not, being identified by the token in
+  its presigned URL — and the registry verifies each blob against its declared
+  digest on arrival, so agreeing on the key really does mean agreeing on the
+  bytes. The body field is normative; the `Idempotency-Key` header the client
+  also sends is a courtesy copy for middleware, and a registry may reject a
+  request where the two disagree.
 - **Resumable** — declaring the same key again before finalizing returns the
   same ID and the same upload targets, so blobs already stored stay stored.
 - **The ID authorises nothing.** It is the last segment of every link that gets
@@ -169,7 +173,8 @@ body alone:
 - **Retries** — each step retries up to 3 times on `retryable: true` (default
   for 429 and 5xx), honouring `Retry-After`.
 - **Same-origin** — `finalize_url` must be on the API's own origin. The client
-  refuses to send the token anywhere else, so a compromised registry response
+  refuses to send the token anywhere else, and never follows a redirect — a
+  3xx from any step fails the upload — so a compromised registry response
   cannot redirect the key. Upload URLs may point anywhere `http(s)`.
 - **Expiry** — an expired free link returns `410 Gone` carrying the original
   filename and upload time.

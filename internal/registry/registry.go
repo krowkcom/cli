@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,6 +26,15 @@ const (
 	// expiry is how long a link lives. Anonymous uploads get their own window
 	// once the CLI grows a claim flow.
 	expiry = 48 * time.Hour
+	// A declaration that never finalizes still costs memory, and declaring costs
+	// an attacker one request with no bytes behind it. So pending state expires
+	// and is capped: without both, the one endpoint that needs no key is a way to
+	// grow this process until it dies.
+	pendingTTL = time.Hour
+	maxPending = 256
+	// maxManifestFiles bounds one declaration. The body limit alone allows
+	// thousands of entries, each of which mints a blob token.
+	maxManifestFiles = 64
 )
 
 type file struct {
@@ -85,6 +95,8 @@ type upload struct {
 	key      string
 	metadata json.RawMessage
 	slots    []*slot
+	// at is when the handshake opened, so abandoned ones can be swept.
+	at time.Time
 }
 
 type store struct {
@@ -107,17 +119,26 @@ type tokenRef struct {
 // Handler serves the mock registry. siteURL is the origin baked into returned
 // links; empty means "whatever host the request arrived on".
 func Handler(limitBytes int64, siteURL string) http.Handler {
-	if limitBytes <= 0 {
-		limitBytes = DefaultLimitBytes
-	}
+	return newStore().handler(limitBytes, siteURL)
+}
 
-	s := &store{
+func newStore() *store {
+	return &store{
 		pending:   map[string]*upload{},
 		byID:      map[string]*upload{},
 		byToken:   map[string]tokenRef{},
 		artifacts: map[string]artifact{},
 		finalized: map[string]string{},
 		idOwner:   map[string]string{},
+	}
+}
+
+// handler wires the routes onto one store, so a test can hold the store it is
+// asserting about — whether pending state is actually reclaimed is not visible
+// from the outside.
+func (s *store) handler(limitBytes int64, siteURL string) http.Handler {
+	if limitBytes <= 0 {
+		limitBytes = DefaultLimitBytes
 	}
 
 	mux := http.NewServeMux()
@@ -159,8 +180,23 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 			})
 			return
 		}
+		if len(req.Files) > maxManifestFiles {
+			writeJSON(w, http.StatusUnprocessableEntity, nil, map[string]any{
+				"error":     "too_many_files",
+				"limit":     maxManifestFiles,
+				"got":       len(req.Files),
+				"fix":       fmt.Sprintf("declare at most %d files per upload", maxManifestFiles),
+				"retryable": false,
+			})
+			return
+		}
 
+		// Summed with a per-file bound and an early break: `bytes` is
+		// caller-controlled, and a naive sum of two huge declarations overflows
+		// int64 and slips under the limit. tooLarge also stops `put` from ever
+		// hashing more than the limit, because no slot can declare more.
 		var total int64
+		tooLarge := false
 		for _, f := range req.Files {
 			if f.Filename == "" || f.Digest == "" || f.Bytes < 0 {
 				writeJSON(w, http.StatusUnprocessableEntity, nil, map[string]any{
@@ -169,6 +205,12 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 					"retryable": false,
 				})
 				return
+			}
+			if f.Bytes > limitBytes-total {
+				tooLarge = true
+				// The true total may not fit in int64; report the best lower bound.
+				total = max(total, f.Bytes)
+				break
 			}
 			total += f.Bytes
 		}
@@ -186,7 +228,7 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 			return
 		}
 
-		if total > limitBytes {
+		if tooLarge {
 			writeJSON(w, http.StatusRequestEntityTooLarge, rate, map[string]any{
 				"error":       "artifact_too_large",
 				"limit_bytes": limitBytes,
@@ -197,15 +239,31 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 			return
 		}
 
+		// Sweep first, so an abandoned handshake from an hour ago makes room for
+		// this one rather than counting against it.
+		s.expirePending(time.Now())
+
 		// An interrupted handshake resumes: same key, same targets, so the
 		// blobs already stored stay stored.
 		up, resumed := s.pending[req.IdempotencyKey]
 		if !resumed {
+			// Declaring needs no key and no bytes, so this is the cheapest thing
+			// an attacker can ask for and the one that has to be bounded.
+			if len(s.pending) >= maxPending {
+				writeJSON(w, http.StatusServiceUnavailable, rate, map[string]any{
+					"error":     "too_many_pending_uploads",
+					"limit":     maxPending,
+					"fix":       "finish or abandon an upload in flight, then retry — unfinished handshakes expire after an hour",
+					"retryable": true,
+				})
+				return
+			}
 			up = &upload{
 				id:       s.mintID(req.IdempotencyKey),
 				key:      req.IdempotencyKey,
 				metadata: validMetadata(req.Metadata),
 				slots:    make([]*slot, 0, len(req.Files)),
+				at:       time.Now(),
 			}
 			s.idOwner[up.id] = up.key
 			for _, f := range req.Files {
@@ -314,7 +372,18 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 		var body struct {
 			IdempotencyKey string `json:"idempotency_key"`
 		}
-		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+		// An empty body is an absent key, reported below; a body that fails to
+		// decode is a broken client, and folding the two into one error would
+		// leave that client no way to tell which it is.
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, nil, map[string]any{
+				"error":     "malformed_finalize",
+				"detail":    err.Error(),
+				"fix":       "POST a JSON body with `idempotency_key`",
+				"retryable": false,
+			})
+			return
+		}
 
 		id := r.PathValue("id")
 
@@ -418,6 +487,10 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 		s.artifacts[a.ID] = a
 		s.finalized[up.key] = a.ID
 		delete(s.pending, up.key)
+		// byID exists to find a handshake in flight, and finalize answers a repeat
+		// from s.artifacts before it ever looks here — so holding the upload and
+		// its slots past this point keeps them alive for nothing.
+		delete(s.byID, up.id)
 		for _, sl := range up.slots {
 			delete(s.byToken, sl.token)
 		}
@@ -425,6 +498,32 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 		// Recomputed now this upload is counted, so the header an agent reads
 		// off a successful push is its remaining quota, not its previous one.
 		writeJSON(w, http.StatusOK, rateHeaders(max(0, dailyUploads-len(s.artifacts))), a)
+	}
+}
+
+// expirePending drops handshakes that were opened and never finished. Callers
+// hold the lock.
+//
+// Every abandoned declaration otherwise sits in pending, byID and one byToken
+// entry per declared file for the life of the process, and the endpoint that
+// creates them needs no key. An hour is far longer than a push takes and short
+// enough that a loop cannot outrun it.
+func (s *store) expirePending(now time.Time) {
+	for key, up := range s.pending {
+		if now.Sub(up.at) < pendingTTL {
+			continue
+		}
+		delete(s.pending, key)
+		delete(s.byID, up.id)
+		for _, sl := range up.slots {
+			delete(s.byToken, sl.token)
+		}
+		// The ID goes back in the pool with it. Nothing ever published this one —
+		// a link is printed after finalize, and this handshake never got there —
+		// so reserving it forever would be the same unbounded growth in a smaller
+		// map. A finalized ID keeps its idOwner entry, which is what stops mintID
+		// from ever handing a live link to a different upload.
+		delete(s.idOwner, up.id)
 	}
 }
 

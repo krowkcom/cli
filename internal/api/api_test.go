@@ -480,6 +480,37 @@ func TestASelfHostedRegistryOnAPrivateNetworkIsTrusted(t *testing.T) {
 	}
 }
 
+// checkRedirect permits an API-origin request to upgrade http -> https, and the
+// dial that hop then makes goes to port 443, not the base's — so the API-host
+// exemption must cover it, or a private self-hosted registry behind an https
+// front fails on every request. The exemption is that one extra port in the
+// upgrade direction, not the host wholesale and not a downgrade.
+func TestTheAPIHostsHTTPSUpgradeMayBeDialled(t *testing.T) {
+	noProxy(t)
+	client := New("http://10.1.2.3/v1", "krk_secret")
+
+	from, _ := http.NewRequest(http.MethodPost, "http://10.1.2.3/v1/artifacts", nil)
+	to, _ := http.NewRequest(http.MethodPost, "https://10.1.2.3/v1/artifacts", nil)
+	if err := client.checkRedirect(to, []*http.Request{from}); err != nil {
+		t.Fatalf("the upgrade hop was refused at the redirect: %v", err)
+	}
+	if err := client.permitDial(context.Background(), "10.1.2.3:443"); err != nil {
+		t.Errorf("the upgrade hop's dial was refused: %v", err)
+	}
+	for _, address := range []string{"10.1.2.3:8443", "10.1.2.4:443"} {
+		if err := client.permitDial(context.Background(), address); err == nil {
+			t.Errorf("%s was permitted alongside the upgrade port", address)
+		}
+	}
+
+	// An https base earns no port 80: the redirect there is a downgrade, and
+	// checkRedirect refuses it before any dial.
+	if err := New("https://10.1.2.3/v1", "krk_secret").
+		permitDial(context.Background(), "10.1.2.3:80"); err == nil {
+		t.Error("an https API's host was permitted on port 80")
+	}
+}
+
 // The dialer hook is the half that survives DNS: internalHost resolves a name to
 // judge it, the transport resolves again to dial it, and the registry owns the
 // name in the case that matters. This asserts the hook is actually wired into the

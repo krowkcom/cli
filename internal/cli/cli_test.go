@@ -570,15 +570,17 @@ func TestAnAddressWithoutAPortIsRejected(t *testing.T) {
 	// the banner would then misreport — "127.0.0.1:0" asks for the same thing
 	// explicitly, and "127.0.0.1:http" binds port 80 while the banner prints the
 	// name verbatim.
+	// "127.0.0.1:99999" is the same failure by overflow: announced, never bound.
 	for _, addr := range []string{
 		"8787", "localhost", "127.0.0.1", "127.0.0.1:", ":",
 		"127.0.0.1:0", ":0", ":00", "127.0.0.1:http", ":-1",
+		"127.0.0.1:99999", ":65536",
 	} {
 		if err := usableAddr(addr); err == nil {
 			t.Errorf("usableAddr(%q) = nil, want an error naming the right shape", addr)
 		}
 	}
-	for _, addr := range []string{":8787", "127.0.0.1:8787", "0.0.0.0:9000", defaultRegistryAddr} {
+	for _, addr := range []string{":8787", "127.0.0.1:8787", "0.0.0.0:9000", ":65535", defaultRegistryAddr} {
 		if err := usableAddr(addr); err != nil {
 			t.Errorf("usableAddr(%q) = %v", addr, err)
 		}

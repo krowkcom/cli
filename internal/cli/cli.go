@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -360,21 +361,17 @@ func usableAddr(addr string) error {
 	return nil
 }
 
-// fixedPort reports whether port names one specific port: all digits, not zero.
+// fixedPort reports whether port names one specific bindable port: all digits
+// (net.Listen also resolves signs and service names), and in 1-65535 — port 0
+// asks the kernel to pick, and 99999 announces itself and then fails to bind.
 func fixedPort(port string) bool {
-	if port == "" {
-		return false
-	}
-	zero := true
 	for _, r := range port {
 		if r < '0' || r > '9' {
 			return false
 		}
-		if r != '0' {
-			zero = false
-		}
 	}
-	return !zero
+	n, err := strconv.Atoi(port)
+	return err == nil && n >= 1 && n <= 65535
 }
 
 func isLoopbackHost(host string) bool {

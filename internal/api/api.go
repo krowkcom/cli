@@ -826,7 +826,15 @@ func (c *Client) isAPIAddress(address string) bool {
 	if err != nil || base.Hostname() == "" {
 		return false
 	}
-	return slices.Contains(hostAddresses(base.Hostname(), base.Port(), base.Scheme), address)
+	if slices.Contains(hostAddresses(base.Hostname(), base.Port(), base.Scheme), address) {
+		return true
+	}
+	// checkRedirect permits an API-origin request to upgrade its scheme —
+	// http -> https in front of a self-hosted registry is the ordinary case —
+	// and the upgraded hop dials port 443, not the base's. Cover exactly that
+	// hop: the same host's addresses, one extra port, upgrade direction only.
+	return base.Scheme == "http" &&
+		slices.Contains(hostAddresses(base.Hostname(), "443", "https"), address)
 }
 
 // hostAddresses turns a host into the addresses a dial to it would use — the

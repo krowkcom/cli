@@ -131,7 +131,7 @@ Content-Type: application/json
     "method": "PUT", "url": "https://…?X-Amz-Signature=…",
     "headers": { "Content-Type": "image/jpeg", "Content-Length": "421888" }
   },
-  "next_step": "PUT the file to upload.url …, then POST /v1/artifacts/art_2e1d/finalize",
+  "next_step": "PUT the file to upload.url …, then PUT /v1/artifacts/art_2e1d/finalization",
   "claim_token": "krowk_claim_…"              // anonymous uploads only, shown once
 }
 ```

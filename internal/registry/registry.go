@@ -69,6 +69,7 @@ type artifact struct {
 	storedSize int64
 	storedSum  string
 	uploadTok  string
+	uploadTil  time.Time
 	// seq orders a listing. A timestamp would tie when two artifacts are created
 	// in the same instant, and a page has to be totally ordered or rows swap
 	// places between pages.
@@ -231,6 +232,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		CreatedAt:   now.Format(time.RFC3339Nano),
 		workspace:   workspace,
 		uploadTok:   randomToken(),
+		uploadTil:   now.Add(uploadURLLifetime),
 	}
 	if in.Run != "" {
 		a.Run = in.Run
@@ -254,10 +256,10 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		"method":     "PUT",
 		"url":        url + "?upload_token=" + a.uploadTok,
 		"headers":    map[string]string{"Content-Type": a.ContentType, "Content-Length": itoa(a.ByteSize)},
-		"expires_at": now.Add(uploadURLLifetime).Format(time.RFC3339Nano),
+		"expires_at": a.uploadTil.Format(time.RFC3339Nano),
 	}
 	payload["next_step"] = "PUT the file to upload.url with the headers in upload.headers, " +
-		"then POST /v1/artifacts/" + slug + "/finalize"
+		"then PUT /v1/artifacts/" + slug + "/finalization"
 	if claimToken != "" {
 		payload["claim_token"] = claimToken
 	}
@@ -270,40 +272,64 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
 	key := path.Join(r.PathValue("workspace"), r.PathValue("slug"), r.PathValue("filename"))
 
+	// Everything the checks need is copied under the lock: finalizeArtifact
+	// mutates ByteSize and Checksum, and a PUT racing a finalize must not read
+	// them bare.
 	s.mu.Lock()
 	a := s.artifacts[r.PathValue("slug")]
+	var wantTok, wantType, wantSum string
+	var wantSize int64
+	var until time.Time
+	if a != nil {
+		wantTok, wantType, wantSum = a.uploadTok, a.ContentType, a.Checksum
+		wantSize, until = a.ByteSize, a.uploadTil
+	}
 	s.mu.Unlock()
 
-	if a == nil || r.URL.Query().Get("upload_token") != a.uploadTok {
+	if a == nil || wantTok == "" || r.URL.Query().Get("upload_token") != wantTok {
 		// Storage speaks XML, as R2 and S3 do, so a client cannot get away with
-		// assuming every failure is a krowk envelope.
+		// assuming every failure is a krowk envelope. A finalized artifact's token
+		// is spent, so a re-PUT of a ready permalink lands here too.
 		writeXMLError(w, http.StatusForbidden, "SignatureDoesNotMatch")
 		return
 	}
-	if got := r.Header.Get("Content-Type"); got != a.ContentType {
+	// The URL's advertised expiry is enforced, as real object storage enforces
+	// the signature's window.
+	if time.Now().After(until) {
+		writeXMLError(w, http.StatusForbidden, "AccessDenied")
+		return
+	}
+	if got := r.Header.Get("Content-Type"); got != wantType {
 		writeXMLError(w, http.StatusForbidden, "SignatureDoesNotMatch")
 		return
 	}
 
-	bytes, err := io.ReadAll(io.LimitReader(r.Body, a.ByteSize+1))
+	bytes, err := io.ReadAll(io.LimitReader(r.Body, wantSize+1))
 	if err != nil {
 		writeXMLError(w, http.StatusBadRequest, "IncompleteBody")
 		return
 	}
 	// The length is signed in, so storage refuses a body of any other size.
-	if int64(len(bytes)) != a.ByteSize {
+	if int64(len(bytes)) != wantSize {
 		writeXMLError(w, http.StatusBadRequest, "IncorrectContentLength")
 		return
 	}
 	// So is the digest, when one was declared — corruption is caught at the edge
 	// rather than stored and discovered later.
 	sum := sha256Hex(bytes)
-	if a.Checksum != "" && sum != a.Checksum {
+	if wantSum != "" && sum != wantSum {
 		writeXMLError(w, http.StatusBadRequest, "BadDigest")
 		return
 	}
 
 	s.mu.Lock()
+	// A finalize may have landed while the body was being read; a ready
+	// artifact's bytes are immutable.
+	if a.uploadTok != wantTok {
+		s.mu.Unlock()
+		writeXMLError(w, http.StatusForbidden, "SignatureDoesNotMatch")
+		return
+	}
 	s.objects[key] = bytes
 	a.uploaded = true
 	a.storedSize = int64(len(bytes))
@@ -371,12 +397,14 @@ func (s *store) finalizeArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The size on the record becomes what storage actually holds, not what the
-	// client claimed it would send.
+	// client claimed it would send. The upload token is spent: a ready
+	// artifact's bytes are immutable, so its presigned URL stops working.
 	a.State = "ready"
 	a.ByteSize = a.storedSize
 	if a.Checksum == "" {
 		a.Checksum = a.storedSum
 	}
+	a.uploadTok = ""
 	writeJSON(w, http.StatusOK, serializeArtifact(a))
 }
 

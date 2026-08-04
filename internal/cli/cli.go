@@ -228,17 +228,20 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 		spec.Run = runSlug
 		artifact, err := client.Push(ctx, spec)
 		if err != nil {
-			return withProgress(err, result.Artifacts)
+			return withProgress(err, result.Artifacts, runSlug, ownRun)
 		}
 		result.Artifacts = append(result.Artifacts, artifact)
 	}
 
 	// A run this command opened is a run this command closes. Failing to close it
 	// is not worth failing the upload over — the artifacts are up and their links
-	// work — so the run is reported as it was last known.
+	// work — but it is worth saying: the run stays open until someone retries.
 	if ownRun {
 		if finished, err := client.FinishRun(ctx, runSlug); err == nil {
 			result.Run = finished
+		} else {
+			result.Notes = append(result.Notes, "run "+runSlug+" could not be finished: "+
+				errCode(err)+" — retry `krowk runs finish "+runSlug+"`")
 		}
 	}
 
@@ -305,22 +308,39 @@ func anonymousMetadataNote(f flags) string {
 		"and opening a run needs an API key — run `krowk auth login --token krowk_sk_...`"
 }
 
-// withProgress keeps the links of whatever did upload before the failure, so a
-// partial upload does not lose the artifacts it already created.
-func withProgress(err error, done []*api.Artifact) error {
-	if len(done) == 0 {
-		return err
-	}
+// withProgress keeps what a failed batch would otherwise lose: the links of
+// whatever did upload, and the run this command opened. Without the slug the
+// run is unrecoverable — the error body is all the caller ever sees of it.
+func withProgress(err error, done []*api.Artifact, runSlug string, ownRun bool) error {
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) {
 		return err
 	}
-	urls := make([]string, 0, len(done))
-	for _, a := range done {
-		urls = append(urls, a.URL)
+	if len(done) > 0 {
+		urls := make([]string, 0, len(done))
+		for _, a := range done {
+			urls = append(urls, a.URL)
+		}
+		apiErr.Body["uploaded_before_failure"] = urls
 	}
-	apiErr.Body["uploaded_before_failure"] = urls
+	if ownRun {
+		apiErr.Body["run"] = runSlug
+		finish := "the run is still open — close it with `krowk runs finish " + runSlug + "`"
+		if fix, _ := apiErr.Body["fix"].(string); fix != "" {
+			finish = fix + "; " + finish
+		}
+		apiErr.Body["fix"] = finish
+	}
 	return apiErr
+}
+
+// errCode names an error the way the envelope would, so a note can carry it.
+func errCode(err error) string {
+	var apiErr *api.Error
+	if errors.As(err, &apiErr) {
+		return apiErr.Code()
+	}
+	return err.Error()
 }
 
 // uploadsList pages through the key's workspace. Needs a key: keyless requests

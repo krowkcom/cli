@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -669,5 +670,142 @@ func TestHelpAndVersion(t *testing.T) {
 	}
 	if code, stdout, _ := h.run(); code != 0 || !strings.Contains(stdout, "krowk push") {
 		t.Errorf("bare invocation should print help, got %q (exit %d)", stdout, code)
+	}
+}
+
+// faultyHarness is a harness whose registry drops one request, chosen by the
+// caller — the way tests reproduce a mid-batch failure without a mid-batch bug.
+func faultyHarness(t *testing.T, breaks func(r *http.Request, n int) bool) *harness {
+	t.Helper()
+
+	var mu sync.Mutex
+	var n int
+	inner := registry.Handler(0, "")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		broken := breaks(r, n)
+		mu.Unlock()
+		if broken {
+			// 403 rather than 500, so the client does not sit out retry backoffs.
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"error":{"code":"injected_fault","message":"injected fault"}}`)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	h := &harness{t: t, server: server, env: map[string]string{
+		"KROWK_API_URL": server.URL + "/v1",
+		"KROWK_TOKEN":   "krowk_sk_test",
+	}}
+	h.fixture = h.write("checkout-after.png", "fake png bytes for the test")
+	return h
+}
+
+// A keyed push that dies mid-batch opened a run, and the error body is the only
+// place its slug can survive — without it the run can never be finished.
+func TestFailedKeyedPushNamesItsRunAndKeepsProgress(t *testing.T) {
+	var puts int
+	h := faultyHarness(t, func(r *http.Request, n int) bool {
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/_storage") {
+			puts++
+			return puts == 2
+		}
+		return false
+	})
+	second := h.write("log.txt", "the build log")
+	third := h.write("trace.txt", "the trace")
+
+	body := h.fails("push", h.fixture, second, third)
+
+	slug, _ := body["run"].(string)
+	if !strings.HasPrefix(slug, "run_") {
+		t.Fatalf("run = %v, want the slug of the run the push opened", body["run"])
+	}
+	if fix, _ := body["fix"].(string); !strings.Contains(fix, "krowk runs finish "+slug) {
+		t.Errorf("fix = %q, want it to name `krowk runs finish %s`", fix, slug)
+	}
+	// The first file made it up before the second died, and its link still works.
+	urls, _ := body["uploaded_before_failure"].([]any)
+	if len(urls) != 1 {
+		t.Fatalf("uploaded_before_failure = %v, want the first file's URL", body["uploaded_before_failure"])
+	}
+	if status, bytes := h.get(urls[0].(string)); status != 200 || bytes != "fake png bytes for the test" {
+		t.Errorf("GET %v = %d %q", urls[0], status, bytes)
+	}
+	// The slug in the error is enough to actually close the run.
+	if e := h.ok("runs", "finish", slug); e.Data.Status != "finished" {
+		t.Errorf("runs finish = %+v", e.Data)
+	}
+}
+
+// Failing to close the run must not fail the upload — but it must not be
+// silent either: the caller is told the run is open and how to finish it.
+func TestUnfinishedRunIsReportedNotSwallowed(t *testing.T) {
+	h := faultyHarness(t, func(r *http.Request, n int) bool {
+		return strings.HasSuffix(r.URL.Path, "/completion")
+	})
+
+	e := h.ok("push", h.fixture)
+	if e.Data.Run == nil || e.Data.Run.Status != "open" {
+		t.Fatalf("run = %+v, want it reported as it was last known: open", e.Data.Run)
+	}
+	note := strings.Join(e.Data.Notes, "\n")
+	if !strings.Contains(note, "krowk runs finish "+e.Data.Run.Slug) {
+		t.Errorf("notes = %q, want the retry command with the run's slug", note)
+	}
+}
+
+// next_step is an instruction the registry hands to agents; if it names a route
+// that does not exist, doing literally what it says answers 404. The wire-shape
+// test pins the calls the client makes — this pins the instruction itself.
+func TestNextStepNamesTheRealFinalizationRoute(t *testing.T) {
+	h := newHarness(t, 0)
+
+	res, err := http.Post(h.server.URL+"/v1/artifacts", "application/json",
+		strings.NewReader(`{"artifact":{"filename":"a.png","content_type":"image/png","byte_size":4}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var payload struct {
+		Slug     string `json:"slug"`
+		NextStep string `json:"next_step"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if want := "PUT /v1/artifacts/" + payload.Slug + "/finalization"; !strings.Contains(payload.NextStep, want) {
+		t.Errorf("next_step = %q, want it to name %q", payload.NextStep, want)
+	}
+}
+
+// A ready artifact is a permalink; its presigned URL must not keep working
+// after finalization, or a re-PUT could silently swap the stored bytes.
+func TestReadyArtifactRejectsAnotherUpload(t *testing.T) {
+	h := newHarness(t, 0)
+
+	a := only(t, h.ok("push", h.fixture))
+
+	// The upload URL is not surfaced by the CLI after a push, so reconstruct the
+	// PUT the way an attacker holding a leaked token would: any token is as good
+	// as none once finalization has spent it.
+	req, err := http.NewRequest(http.MethodPut, a.URL+"?upload_token=anything", strings.NewReader("swapped"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", a.ContentType)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusForbidden {
+		t.Errorf("re-PUT after finalize = %d, want 403", res.StatusCode)
+	}
+	if _, body := h.get(a.URL); body != "fake png bytes for the test" {
+		t.Errorf("stored bytes changed to %q", body)
 	}
 }

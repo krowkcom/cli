@@ -16,8 +16,13 @@ krowk uploads create ../../tmp/screenshots/foobar.jpg \
 
 ```
 ✓ uploaded  foobar.jpg  412 KB
-  https://krowk.com/a/9f3c2e1
   expires in 47h
+
+  GitHub, Linear, Notion — renders the image
+  [![foobar.jpg](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)
+
+  Slack, Basecamp — they unfurl the link themselves
+  https://krowk.com/a/9f3c2e1
 ```
 
 Go, standard library only. One static binary, no runtime to install — agent
@@ -47,9 +52,31 @@ Upload flags: `--pull-request`, `--reference` (repeatable), `--session`,
 `--title`, plus `--repo` / `--commit` / `--agent` to override detection. Flags
 may follow the filenames.
 
-Global flags: `--format human|json|markdown`, `--json`, `--quiet`, `--help`,
-`--version`. Output is human on a TTY and JSON when piped, so an agent that
-captures stdout gets structured data without asking for it.
+Global flags: `--format human|json|markdown|url`, `--json`, `--quiet`,
+`--help`, `--version`. Output is human on a TTY and JSON when piped, so an agent
+that captures stdout gets structured data without asking for it.
+
+## Pasting the result
+
+There is no single paste-ready string, because the surfaces disagree.
+
+| Destination | Use | Why |
+| --- | --- | --- |
+| GitHub, Linear, Notion | `--format markdown` | GitHub builds preview cards only for its own resources, so a bare third-party link renders as a plain blue anchor no matter what OpenGraph tags the page carries. It *does* render image URLs inline, so `[![title](preview)](page)` is what actually shows the artifact in a PR comment. |
+| Slack, Basecamp | `--format url` | Both unfurl a bare URL into a card of their own. Slack renders no markdown image embeds at all — pasting the embed form there shows raw text. |
+
+Human output prints both, labelled. `--json` carries both under `paste`:
+
+```json
+{
+  "ok": true,
+  "data": { },
+  "paste": {
+    "markdown": "[![foobar.jpg](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)",
+    "url": "https://krowk.com/a/9f3c2e1"
+  }
+}
+```
 
 ## Metadata
 

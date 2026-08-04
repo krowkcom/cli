@@ -21,7 +21,32 @@ const (
 	Human    Format = "human"
 	JSON     Format = "json"
 	Markdown Format = "markdown"
+	URL      Format = "url"
 )
+
+// Paste is one artifact in the two forms its destinations need. There is no
+// single paste-ready string: GitHub does not build preview cards for
+// third-party links, so only the image embed shows the artifact there, while
+// Slack renders no markdown image embeds at all and unfurls a bare URL into a
+// card of its own. So the CLI prints both and says which is which.
+type Paste struct {
+	// Markdown embeds the image and links through to the artifact page. This is
+	// the form for GitHub, Linear and Notion.
+	Markdown string `json:"markdown"`
+	// URL is the bare link, for Slack and Basecamp, which unfurl it themselves.
+	URL string `json:"url"`
+}
+
+// Surfaces name where each form belongs, so the choice never has to be guessed.
+const (
+	embedSurfaces = "GitHub, Linear, Notion — renders the image"
+	linkSurfaces  = "Slack, Basecamp — they unfurl the link themselves"
+)
+
+// PasteFor builds both forms for one artifact.
+func PasteFor(a *api.Artifact, title string) Paste {
+	return Paste{Markdown: MarkdownLink(a, title), URL: a.URL}
+}
 
 // Breadcrumb suggests the next command, the way the Basecamp CLI does.
 type Breadcrumb struct {
@@ -33,6 +58,7 @@ type Breadcrumb struct {
 type Envelope struct {
 	OK          bool           `json:"ok"`
 	Data        any            `json:"data,omitempty"`
+	Paste       *Paste         `json:"paste,omitempty"`
 	Summary     string         `json:"summary,omitempty"`
 	Breadcrumbs []Breadcrumb   `json:"breadcrumbs,omitempty"`
 	Error       map[string]any `json:"error,omitempty"`
@@ -45,7 +71,7 @@ func ResolveFormat(flag string, jsonFlag, isTTY bool) (Format, error) {
 		return JSON, nil
 	}
 	switch Format(flag) {
-	case Human, JSON, Markdown:
+	case Human, JSON, Markdown, URL:
 		return Format(flag), nil
 	case "":
 		if isTTY {
@@ -53,7 +79,7 @@ func ResolveFormat(flag string, jsonFlag, isTTY bool) (Format, error) {
 		}
 		return JSON, nil
 	}
-	return "", api.Fail("bad_format", "unknown --format "+flag+" (expected human, json or markdown)")
+	return "", api.Fail("bad_format", "unknown --format "+flag+" (expected human, json, markdown or url)")
 }
 
 // HumanBytes renders a byte count the way the terminal output does.
@@ -106,11 +132,15 @@ func MarkdownLink(a *api.Artifact, title string) string {
 
 // Artifact renders a successful upload.
 func Artifact(a *api.Artifact, f Format, title string, quiet, colour bool, now time.Time) string {
+	paste := PasteFor(a, title)
+
 	switch f {
 	case Markdown:
-		return MarkdownLink(a, title)
+		return paste.Markdown
+	case URL:
+		return paste.URL
 	case Human:
-		return humanArtifact(a, title, colour, now)
+		return humanArtifact(a, paste, title, colour, now)
 	}
 
 	if quiet {
@@ -119,12 +149,13 @@ func Artifact(a *api.Artifact, f Format, title string, quiet, colour bool, now t
 	return encode(Envelope{
 		OK:          true,
 		Data:        a,
+		Paste:       &paste,
 		Summary:     fmt.Sprintf("%d artifact(s), %s", max(len(a.Files), 1), HumanBytes(a.Bytes)),
 		Breadcrumbs: []Breadcrumb{{Action: "share", Cmd: "open " + a.URL}},
 	})
 }
 
-func humanArtifact(a *api.Artifact, title string, colour bool, now time.Time) string {
+func humanArtifact(a *api.Artifact, paste Paste, title string, colour bool, now time.Time) string {
 	what := fmt.Sprintf("%d artifacts", len(a.Files))
 	if len(a.Files) == 1 {
 		what = a.Files[0].Filename
@@ -134,7 +165,6 @@ func humanArtifact(a *api.Artifact, title string, colour bool, now time.Time) st
 
 	lines := []string{
 		fmt.Sprintf("%s uploaded  %s  %s", paint(colour, green, "✓"), what, HumanBytes(a.Bytes)),
-		"  " + a.URL,
 	}
 	if expiry := RelativeExpiry(a.ExpiresAt, now); expiry != "" {
 		lines = append(lines, paint(colour, dim, "  "+expiry))
@@ -142,6 +172,16 @@ func humanArtifact(a *api.Artifact, title string, colour bool, now time.Time) st
 	if title != "" {
 		lines = append(lines, paint(colour, dim, "  "+title))
 	}
+	// Both paste forms, labelled, because the right one depends on where it is
+	// going and neither surface renders the other's.
+	lines = append(lines,
+		"",
+		paint(colour, dim, "  "+embedSurfaces),
+		"  "+paste.Markdown,
+		"",
+		paint(colour, dim, "  "+linkSurfaces),
+		"  "+paste.URL,
+	)
 	return strings.Join(lines, "\n")
 }
 

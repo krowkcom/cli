@@ -63,7 +63,7 @@ Upload flags
   --agent <name>         Override the detected agent
 
 Local registry flags
-  --addr <host:port>     Listen address for ` + "`registry serve`" + ` (default %s)
+  --addr <host:port>     Listen address for ` + "`registry serve`" + ` (default %s, loopback only)
   --site <url>           Origin for the links it returns (default: the request host)
   --limit-bytes <n>      Reject uploads above this size
 
@@ -257,31 +257,54 @@ func registryMode(client *api.Client, env runctx.Env) string {
 // registryServe runs the local stand-in for api.krowk.com, so developing against
 // a registry needs neither the network nor a checkout of this repository.
 func registryServe(w io.Writer, f flags) error {
+	// registry.Handler treats <= 0 as "use the default", so a negative limit
+	// would silently mean 100 MiB. Reject it instead of guessing.
+	if f.limitBytes < 0 {
+		return api.Fail("bad_flag", "--limit-bytes must not be negative — omit it or pass 0 for the default")
+	}
+
 	addr := f.addr
+	// The flag carries the default, but a direct caller may pass the zero value.
+	if addr == "" {
+		addr = defaultRegistryAddr
+	}
 	if err := usableAddr(addr); err != nil {
 		return err
 	}
-	fmt.Fprint(w, registryBanner(addr))
+
+	// Bind before announcing anything, so a script keying off the banner never
+	// proceeds against a port that failed to open.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return api.Fail("registry_unavailable", "could not listen on "+addr+": "+err.Error())
+	}
+	return serveOn(w, ln, addr, f)
+}
+
+// serveOn runs the registry on an already-bound listener. Split from
+// registryServe so a test can hold the listener and close it to stop serving.
+func serveOn(w io.Writer, ln net.Listener, addr string, f flags) error {
+	fmt.Fprint(w, registryBanner(ln.Addr().String(), addr))
 
 	server := &http.Server{
-		Addr:    addr,
 		Handler: registry.Handler(f.limitBytes, f.site),
 		// Uploads can be slow and large, so only the header read is bounded.
 		ReadHeaderTimeout: 20 * time.Second,
 	}
-	if err := server.ListenAndServe(); err != nil {
-		return api.Fail("registry_unavailable", "could not listen on "+addr+": "+err.Error())
+	if err := server.Serve(ln); err != nil {
+		return api.Fail("registry_unavailable", "registry on "+addr+" stopped: "+err.Error())
 	}
 	return nil
 }
 
-// registryBanner is what `registry serve` prints before it blocks, kept separate
-// so it can be checked without binding a port.
-func registryBanner(addr string) string {
-	base := localBase(addr)
+// registryBanner is what `registry serve` prints once the listener is bound:
+// where the registry is, how to point a push at it, and — bound wider than this
+// machine — that it is open. Kept separate so it can be checked without a bind.
+func registryBanner(bound, asked string) string {
+	base := localBase(bound, asked)
 
 	lines := []string{"krowk registry listening on " + base}
-	if reachableByDev(addr) {
+	if reachableByDev(asked) {
 		lines = append(lines, "  krowk push screenshot.png --dev")
 	} else {
 		// --dev only knows the default address, so say what to use instead.
@@ -290,7 +313,7 @@ func registryBanner(addr string) string {
 	// Bound wider than this machine, deliberately or not, it is worth saying out
 	// loud: this registry takes uploads without a key, and will answer a lookup
 	// for any artifact ID with the repo, branch and commit behind it.
-	if host := listenHost(addr); !isLoopbackHost(host) {
+	if host := listenHost(asked); !isLoopbackHost(host) {
 		lines = append(lines,
 			"  ! reachable from the network on "+bindDescription(host)+" — it needs no key to accept uploads")
 	}
@@ -304,11 +327,26 @@ func bindDescription(host string) string {
 	return host
 }
 
-// localBase turns a listen address into a URL a client can call. A bare port, or
-// one bound to every interface, is reached over loopback from this machine.
-func localBase(addr string) string {
-	host, port := listenHost(addr), listenPort(addr)
-	if host == "" || host == "0.0.0.0" || host == "::" {
+// localBase turns a listen address into a URL a client can call. bound is what
+// the listener reports, which resolves ":0" to the real port; asked keeps the
+// hostname the user typed, since the listener flattens it to an IP.
+func localBase(bound, asked string) string {
+	host, port, err := net.SplitHostPort(asked)
+	if err != nil {
+		return "http://" + asked
+	}
+	// An asked port of 0 means "any port", and only the bound address knows
+	// which one it became.
+	if port == "0" {
+		if _, boundPort, splitErr := net.SplitHostPort(bound); splitErr == nil {
+			port = boundPort
+		}
+	}
+	// Wildcard binds listen everywhere but dial nowhere; localhost is the
+	// loopback name that reaches them on either stack. Loopback IPs fold to
+	// the same name, so the default bind stays the address --dev dials.
+	switch host {
+	case "", "0.0.0.0", "::", "127.0.0.1", "::1":
 		host = "localhost"
 	}
 	return "http://" + net.JoinHostPort(host, port)

@@ -1,5 +1,7 @@
 // Command krowk-mock runs a local stand-in for api.krowk.com, so the CLI can be
-// developed and demoed before the real registry exists.
+// developed and demoed without Postgres, object storage or a Rails process. It
+// stands in for object storage too, on a /_storage path, so the links it hands
+// out actually serve the bytes.
 package main
 
 import (
@@ -18,8 +20,8 @@ func main() {
 	flag.Parse()
 
 	base := "http://localhost" + *addr
-	fmt.Printf("mock krowk registry on %s\n", base)
-	fmt.Printf("  KROWK_API_URL=%s/v1 krowk uploads create <file>\n", base)
+	fmt.Printf("stand-in krowk registry on %s\n", base)
+	fmt.Printf("  KROWK_API_URL=%s/v1 krowk push <file>\n", base)
 
 	if err := http.ListenAndServe(*addr, registry.Handler(*limit, *site)); err != nil {
 		fmt.Fprintln(os.Stderr, err)

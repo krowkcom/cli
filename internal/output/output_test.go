@@ -52,15 +52,31 @@ func TestPasteCarriesBothForms(t *testing.T) {
 	}
 
 	// GitHub renders no card for a third-party link, so the embed is the only
-	// form that shows the artifact.
+	// form that shows the artifact. Labels are user-controlled, so delimiter
+	// characters must arrive escaped or the embed breaks.
+	for _, tc := range []struct {
+		title    string
+		filename string
+		want     string
+	}{
+		{"Checkout", "foobar.jpg", "[![Checkout](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)"},
+		{"Checkout [v2]", "foobar.jpg", `[![Checkout \[v2\]](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)`},
+		{"", "frame[0].png", `[![frame\[0\].png](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)`},
+		{`back\slash`, "foobar.jpg", `[![back\\slash](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)`},
+	} {
+		a.Files[0].Filename = tc.filename
+		p := PasteFor(a, tc.title)
+		if p.Markdown != tc.want {
+			t.Errorf("PasteFor(%q/%q).Markdown = %q, want %q", tc.title, tc.filename, p.Markdown, tc.want)
+		}
+		// Slack renders no markdown image embeds, so it needs the plain link.
+		if p.URL != a.URL {
+			t.Errorf("url = %q, want the bare link", p.URL)
+		}
+	}
+
+	a.Files[0].Filename = "foobar.jpg"
 	p := PasteFor(a, "Checkout")
-	if want := "[![Checkout](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)"; p.Markdown != want {
-		t.Errorf("markdown = %q, want %q", p.Markdown, want)
-	}
-	// Slack renders no markdown image embeds, so it needs the plain link.
-	if p.URL != a.URL {
-		t.Errorf("url = %q, want the bare link", p.URL)
-	}
 
 	if got := Artifact(a, Markdown, "Checkout", false, false, time.Now()); got != p.Markdown {
 		t.Errorf("--format markdown = %q, want just the embed", got)

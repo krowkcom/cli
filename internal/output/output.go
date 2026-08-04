@@ -115,6 +115,10 @@ func RelativeExpiry(iso string, now time.Time) string {
 	return fmt.Sprintf("expires in %dd", int(d.Round(24*time.Hour).Hours()/24))
 }
 
+// labelEscaper escapes the characters that end or nest a link label. Parens
+// are legal in CommonMark link text, so they stay.
+var labelEscaper = strings.NewReplacer(`\`, `\\`, `[`, `\[`, `]`, `\]`)
+
 // MarkdownLink is the paste-ready preview link.
 func MarkdownLink(a *api.Artifact, title string) string {
 	label := title
@@ -124,6 +128,7 @@ func MarkdownLink(a *api.Artifact, title string) string {
 	if label == "" {
 		label = a.ID
 	}
+	label = labelEscaper.Replace(label)
 	if a.PreviewURL == "" {
 		return fmt.Sprintf("[%s](%s)", label, a.URL)
 	}

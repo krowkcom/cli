@@ -211,6 +211,102 @@ func TestFinalizeOnAnotherHostIsRefused(t *testing.T) {
 	}
 }
 
+// A presigned URL legitimately names a foreign host, but a compromised registry
+// must not be able to aim the client at the machine it runs on or the network
+// around it — a CI runner can reach plenty the registry cannot.
+func TestUploadTargetsInsideTheNetworkAreRefused(t *testing.T) {
+	production := New("https://api.krowk.com/v1", "krk_secret")
+
+	for _, raw := range []string{
+		"https://127.0.0.1/blob",
+		"https://localhost/blob",
+		"https://[::1]/blob",
+		"https://10.0.0.5/blob",
+		"https://192.168.1.10/blob",
+		"https://172.16.4.4/blob",
+		"https://169.254.169.254/latest/meta-data/",
+		"https://0.0.0.0/blob",
+	} {
+		if _, err := production.storageOrigin(raw); err == nil {
+			t.Errorf("%s was accepted", raw)
+		} else if code := err.(*Error).Code(); code != "untrusted_endpoint" {
+			t.Errorf("%s: error = %q, want untrusted_endpoint", raw, code)
+		}
+	}
+
+	// The artifact is the payload, so it does not travel in the clear.
+	if _, err := production.storageOrigin("http://storage.example.com/blob"); err == nil {
+		t.Error("a plaintext upload URL was accepted")
+	} else if code := err.(*Error).Code(); code != "insecure_upload_url" {
+		t.Errorf("error = %q, want insecure_upload_url", code)
+	}
+
+	// A real storage host still works.
+	if _, err := production.storageOrigin("https://storage.example.com/blob?sig=abc"); err != nil {
+		t.Errorf("a legitimate storage URL was refused: %v", err)
+	}
+}
+
+// Against a local registry, local targets are the expected case, not an attack.
+func TestLocalRegistryMayUseLocalUploadTargets(t *testing.T) {
+	local := New(DevBaseURL, "")
+
+	for _, raw := range []string{
+		"http://localhost:8787/v1/blobs/tok",
+		"http://127.0.0.1:8787/v1/blobs/tok",
+	} {
+		if _, err := local.storageOrigin(raw); err != nil {
+			t.Errorf("%s was refused against a local registry: %v", raw, err)
+		}
+	}
+}
+
+// The contract documents one method. Honouring target.Method would let a
+// response body choose what request this process makes.
+func TestUploadAlwaysUsesPUT(t *testing.T) {
+	var methods []string
+	var srv *httptest.Server
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		var body beginRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(beginResponse{
+			ID: "abc1234",
+			Uploads: []UploadTarget{{
+				Filename: body.Files[0].Filename,
+				// A registry asking for something else entirely.
+				Method: http.MethodDelete,
+				URL:    srv.URL + "/blobs/tok",
+			}},
+			FinalizeURL: "/v1/artifacts/abc1234/finalize",
+		})
+	})
+	mux.HandleFunc("/blobs/tok", func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("POST /v1/artifacts/{id}/finalize", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Artifact{ID: "abc1234", URL: "https://krowk.com/a/abc1234"})
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := New(srv.URL+"/v1", "krk_secret")
+	client.Sleep = func(time.Duration) {}
+
+	file := write(t, t.TempDir(), "shot.png", "one")
+	if _, err := client.CreateArtifact(context.Background(), []string{file}, nil); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if len(methods) != 1 || methods[0] != http.MethodPut {
+		t.Errorf("methods = %v, want a single PUT regardless of what the registry asked for", methods)
+	}
+}
+
 func TestUploadURLMustBeHTTP(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -519,11 +519,76 @@ func TestDevFlagRedirectsTheClient(t *testing.T) {
 }
 
 func TestLocalBaseTurnsAListenAddressIntoAURL(t *testing.T) {
-	if got := localBase(":8787"); got != "http://localhost:8787" {
-		t.Errorf("localBase(:8787) = %q", got)
+	for _, tc := range []struct{ addr, want string }{
+		{":8787", "http://localhost:8787"},
+		{"127.0.0.1:9000", "http://127.0.0.1:9000"},
+		// Bound to everything, but reached over loopback from this machine.
+		{"0.0.0.0:8787", "http://localhost:8787"},
+	} {
+		if got := localBase(tc.addr); got != tc.want {
+			t.Errorf("localBase(%q) = %q, want %q", tc.addr, got, tc.want)
+		}
 	}
-	if got := localBase("127.0.0.1:9000"); got != "http://127.0.0.1:9000" {
-		t.Errorf("localBase(127.0.0.1:9000) = %q", got)
+}
+
+// The registry takes uploads with no key and answers a lookup for any artifact
+// ID with the repo, branch and commit behind it. Off-box by default would hand
+// that to whoever shares the network.
+func TestTheLocalRegistryBindsLoopbackByDefault(t *testing.T) {
+	host := listenHost(defaultRegistryAddr)
+	if !isLoopbackHost(host) {
+		t.Errorf("default listen host = %q, want loopback", host)
+	}
+	// And still on the port --dev looks for, or the shorthand breaks.
+	if !reachableByDev(defaultRegistryAddr) {
+		t.Errorf("--dev cannot reach the default address %q", defaultRegistryAddr)
+	}
+}
+
+func TestReachableByDev(t *testing.T) {
+	for _, tc := range []struct {
+		addr string
+		want bool
+	}{
+		{"127.0.0.1:8787", true},
+		{"localhost:8787", true},
+		{":8787", true}, // every interface includes loopback
+		{"0.0.0.0:8787", true},
+		{"127.0.0.1:9000", false}, // right host, wrong port
+		{"192.168.1.5:8787", false},
+	} {
+		if got := reachableByDev(tc.addr); got != tc.want {
+			t.Errorf("reachableByDev(%q) = %v, want %v", tc.addr, got, tc.want)
+		}
+	}
+}
+
+func TestTheBannerWarnsOnlyWhenBoundOffBox(t *testing.T) {
+	// The default: loopback on the dev port, so --dev is the advice and there is
+	// nothing to warn about.
+	def := registryBanner(defaultRegistryAddr)
+	if !strings.Contains(def, "--dev") {
+		t.Errorf("default banner should point at --dev:\n%s", def)
+	}
+	if strings.Contains(def, "reachable from the network") {
+		t.Errorf("loopback should not warn:\n%s", def)
+	}
+
+	// Off-box, deliberately or by binding everything: say so, and say why.
+	for _, addr := range []string{"0.0.0.0:8787", ":8787", "192.168.1.5:8787"} {
+		got := registryBanner(addr)
+		if !strings.Contains(got, "reachable from the network") {
+			t.Errorf("%s should warn:\n%s", addr, got)
+		}
+		if !strings.Contains(got, "needs no key") {
+			t.Errorf("%s: the warning should say why it matters:\n%s", addr, got)
+		}
+	}
+
+	// A non-default port cannot be reached by --dev, so the banner says what can.
+	other := registryBanner("127.0.0.1:9000")
+	if !strings.Contains(other, "KROWK_API_URL=http://127.0.0.1:9000/v1") {
+		t.Errorf("banner should give the env var for a non-default port:\n%s", other)
 	}
 }
 

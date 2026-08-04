@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -400,14 +401,16 @@ func (c *Client) putAll(ctx context.Context, paths []string, manifest []Manifest
 }
 
 func (c *Client) put(ctx context.Context, path string, declared ManifestFile, target UploadTarget) error {
-	endpoint, err := storageOrigin(target.URL)
+	endpoint, err := c.storageOrigin(target.URL)
 	if err != nil {
 		return err
 	}
-	method := target.Method
-	if method == "" {
-		method = http.MethodPut
-	}
+	// Always PUT, whatever target.Method says. The contract documents one method,
+	// and letting a response body choose it would hand a compromised registry the
+	// method, host, path, headers and body of a request this process issues from
+	// its own network position — a CI runner can reach a great deal that the
+	// registry cannot.
+	method := http.MethodPut
 
 	return c.retry(ctx, func() error {
 		// Reopened per attempt: the body streams off disk and cannot be rewound
@@ -622,15 +625,82 @@ func (c *Client) sameOrigin(raw string) (string, error) {
 	return u.String(), nil
 }
 
-// storageOrigin accepts any http(s) host, because that is the whole point of a
-// presigned URL, but nothing else — a file:// or data: target would make the
-// client read or leak something local.
-func storageOrigin(raw string) (string, error) {
+// storageOrigin accepts the object-storage host a presigned URL names — that is
+// the whole point of presigning — but only a host worth sending bytes to.
+//
+// A file:// or data: target would make the client read something local. An
+// address inside the machine or its network is worse: it turns the client into a
+// confused deputy, issuing requests from a position the registry could not reach
+// on its own. Plaintext http is refused too, since the bytes are the artifact.
+// The local registry is the one exception, and it has to ask for it.
+func (c *Client) storageOrigin(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return "", malformed("the registry returned an upload URL that is not http(s): " + raw)
 	}
+
+	// Talking to a local registry means local upload targets, by definition.
+	if c.isLocal() {
+		return u.String(), nil
+	}
+	if u.Scheme != "https" {
+		return "", Fail("insecure_upload_url",
+			"the registry asked for a plaintext upload to "+u.Host+" — refusing to send the artifact over http")
+	}
+	if internalHost(u.Hostname()) {
+		return "", Fail("untrusted_endpoint",
+			"the registry pointed the upload at "+u.Host+", which is inside this machine or its network — refusing")
+	}
 	return u.String(), nil
+}
+
+// isLocal reports whether this client is pointed at a registry on this machine,
+// where loopback upload targets are expected rather than suspicious.
+func (c *Client) isLocal() bool {
+	base, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return false
+	}
+	return isLoopback(base.Hostname())
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// internalHost reports whether a host names something only reachable from where
+// this process happens to be sitting. A literal IP is judged directly; a name is
+// resolved, because "metadata.internal" is a name.
+func internalHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return reservedIP(ip)
+	}
+	// A name that will not resolve is not obviously internal; let the request
+	// fail on its own rather than guessing. A name that resolves to anything
+	// reserved is refused, so a single bad answer is enough to stop it.
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		return false
+	}
+	for _, ip := range addrs {
+		if reservedIP(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func reservedIP(ip net.IP) bool {
+	return ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() ||
+		ip.IsInterfaceLocalMulticast()
 }
 
 func malformed(detail string) *Error {

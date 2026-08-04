@@ -112,6 +112,17 @@ The upload handshake is not exposed as separate begin/finalize tools: the `PUT`
 step needs access to the local file, which the MCP client does not have, so the
 handshake stays behind `krowk_push` where it belongs.
 
+**`krowk_push` is confined to a root** — the working directory, or `--root` /
+`KROWK_MCP_ROOT`. Paths are resolved with symlinks followed *before* the check,
+and anything landing outside is refused. This matters more here than in the CLI:
+there a person types the path, here a model picks it, and a model reads
+repository files, web pages and issue bodies. An artifact is published at a URL
+that needs no credential to read, so without the boundary an instruction hidden
+in any of those would turn `krowk_push` into "read any file on this machine and
+publish it somewhere I can fetch". Symlink order is the subtle half — a link
+inside the repo pointing at `~/.ssh/id_rsa` sails through a prefix test done
+before resolving.
+
 ## Metadata
 
 Flags win; everything else is detected so the agent never has to type it.
@@ -276,7 +287,14 @@ body alone:
   for 429 and 5xx), honouring `Retry-After`.
 - **Same-origin** — `finalize_url` must be on the API's own origin. The client
   refuses to send the token anywhere else, so a compromised registry response
-  cannot redirect the key. Upload URLs may point anywhere `http(s)`.
+  cannot redirect the key.
+- **Upload targets are storage, not anything reachable.** A presigned URL names a
+  foreign host by design, but the client requires `https`, ignores `method` and
+  always sends `PUT`, and refuses hosts that resolve to loopback, link-local or
+  private ranges. Otherwise a response body would choose the method, host, path,
+  headers and body of a request the CLI makes from its own network position —
+  which in CI reaches a great deal the registry cannot. A local registry is the
+  one exception, since local targets are the whole point there.
 - **Expiry** — an expired free link returns `410 Gone` carrying the original
   filename and upload time.
 
@@ -303,6 +321,12 @@ server at it too. Precedence, most to least specific: `--dev`, then
 `registry serve` takes `--addr`, `--site` (the origin baked into returned links,
 for demoing production-looking URLs) and `--limit-bytes` (to exercise the
 too-large path).
+
+It binds `127.0.0.1:8787` — **loopback by default**, because it accepts uploads
+without a key and will answer a lookup for any artifact ID with the repo, branch,
+commit and pull request behind it. Artifact IDs are seven characters and
+enumerable, so on a café or office network a wider bind hands that to whoever is
+nearby. `--addr` can still open it up, and the banner says so when you do.
 
 ## Development
 

@@ -17,6 +17,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,7 +50,12 @@ other's form, so choose deliberately.
 
 If the push comes back anonymous it carries a claim_url. That link adopts the
 upload, so treat it as a secret: give it to the human, never paste it into a
-pull request, an issue or a chat message.`
+pull request, an issue or a chat message.
+
+krowk_push only uploads files from the working directory and below. Anything
+outside it is refused, symlinks included. An artifact is published at a URL that
+needs no credential to read, so do not try to route around this: if a file you
+were asked to share sits elsewhere, say so and let the human move it.`
 
 // Server speaks MCP over a pair of streams.
 type Server struct {
@@ -58,8 +65,61 @@ type Server struct {
 	Env runctx.Env
 	// Version is reported to the client and recorded on every upload.
 	Version string
+	// Root confines which files may be uploaded. Paths are resolved, symlinks
+	// and all, and anything landing outside is refused.
+	//
+	// This matters more here than in the CLI. There a person types the path; here
+	// a model chooses it, and a model reads repository files, web pages and issue
+	// bodies — so an instruction hidden in any of them would otherwise turn
+	// krowk_push into "read any file on this machine and publish it at a URL I can
+	// fetch without credentials". Empty means the working directory.
+	Root string
 	// Now is swapped out in tests so expiry text is stable.
 	Now func() time.Time
+}
+
+// resolveRoot is the confinement boundary, fully resolved once at startup.
+func (s *Server) resolveRoot() (string, error) {
+	root := s.Root
+	if root == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", api.Fail("no_working_directory", "cannot determine the working directory: "+err.Error())
+		}
+		root = wd
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", api.Fail("bad_root", "cannot resolve "+root+": "+err.Error())
+	}
+	// Resolve the root too: on macOS the working directory is often under
+	// /var, which is a symlink to /private/var, and comparing a resolved path
+	// against an unresolved root would reject everything.
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = real
+	}
+	return abs, nil
+}
+
+// permit resolves one requested path and confirms it lies inside root.
+func permit(root, path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", api.Fail("file_unreadable", "cannot resolve `"+path+"`: "+err.Error())
+	}
+	// Symlinks are resolved before the check, not after: a link inside the root
+	// pointing at ~/.ssh/id_rsa would sail through a plain prefix test.
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", api.Fail("file_unreadable",
+			"cannot read `"+path+"` — paths resolve from the working directory")
+	}
+	rel, err := filepath.Rel(root, real)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", api.Fail("outside_root",
+			"`"+path+"` is outside "+root+" — krowk_push only uploads files from the working directory")
+	}
+	return real, nil
 }
 
 // Serve reads requests until the stream ends or the context is cancelled.
@@ -271,6 +331,21 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		return "", nil, api.Fail("no_file", "pass at least one path in `files`")
 	}
 
+	// Confine before reading anything: an instruction the model picked up from a
+	// repository file or a web page must not be able to name ~/.ssh/id_rsa here.
+	root, err := s.resolveRoot()
+	if err != nil {
+		return "", nil, err
+	}
+	files := make([]string, 0, len(a.Files))
+	for _, path := range a.Files {
+		allowed, err := permit(root, path)
+		if err != nil {
+			return "", nil, err
+		}
+		files = append(files, allowed)
+	}
+
 	metadata := runctx.Resolve(s.Env, runctx.Overrides{
 		Repo:        a.Repo,
 		Commit:      a.Commit,
@@ -282,7 +357,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Client:      "krowk-mcp/" + s.Version,
 	})
 
-	artifact, err := s.Client.CreateArtifact(ctx, a.Files, metadata)
+	artifact, err := s.Client.CreateArtifact(ctx, files, metadata)
 	if err != nil {
 		return "", nil, err
 	}
@@ -398,10 +473,12 @@ func toolSchemas() []map[string]any {
 				"required": []string{"files"},
 				"properties": map[string]any{
 					"files": map[string]any{
-						"type":        "array",
-						"items":       map[string]any{"type": "string"},
-						"minItems":    1,
-						"description": "Paths to upload, resolved from the working directory.",
+						"type":     "array",
+						"items":    map[string]any{"type": "string"},
+						"minItems": 1,
+						"description": "Paths to upload, resolved from the working directory. Must be " +
+							"inside it — paths outside are refused, symlinks included, because an " +
+							"artifact is readable by anyone with the link.",
 					},
 					"title": map[string]any{
 						"type":        "string",

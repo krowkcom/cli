@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strings"
 	"time"
@@ -26,7 +28,13 @@ var Version = "0.1.0"
 
 // defaultRegistryAddr is where `registry serve` listens, matching api.DevBaseURL
 // so --dev finds it with no configuration.
-const defaultRegistryAddr = ":8787"
+//
+// Loopback, not ":8787". This registry takes uploads without a key and will
+// answer a lookup for any artifact ID — seven characters, enumerable — with the
+// repository, branch, commit and pull request the upload came from. On a café or
+// office network, binding every interface hands that to whoever is nearby. A
+// wider bind stays possible, but it has to be asked for.
+const defaultRegistryAddr = "127.0.0.1:8787"
 
 const helpTemplate = `krowk %s — permalinks for agent output
 
@@ -252,15 +260,7 @@ func registryServe(w io.Writer, f flags) error {
 	if addr == "" {
 		addr = defaultRegistryAddr
 	}
-	base := localBase(addr)
-
-	fmt.Fprintf(w, "krowk registry listening on %s\n", base)
-	if base+"/v1" == api.DevBaseURL {
-		fmt.Fprintln(w, "  krowk push screenshot.png --dev")
-	} else {
-		// --dev only knows the default address, so say what to use instead.
-		fmt.Fprintf(w, "  KROWK_API_URL=%s/v1 krowk push screenshot.png\n", base)
-	}
+	fmt.Fprint(w, registryBanner(addr))
 
 	server := &http.Server{
 		Addr:    addr,
@@ -274,12 +274,82 @@ func registryServe(w io.Writer, f flags) error {
 	return nil
 }
 
-// localBase turns a listen address into a URL a client can call.
-func localBase(addr string) string {
-	if strings.HasPrefix(addr, ":") {
-		return "http://localhost" + addr
+// registryBanner is what `registry serve` prints before it blocks, kept separate
+// so it can be checked without binding a port.
+func registryBanner(addr string) string {
+	base := localBase(addr)
+
+	lines := []string{"krowk registry listening on " + base}
+	if reachableByDev(addr) {
+		lines = append(lines, "  krowk push screenshot.png --dev")
+	} else {
+		// --dev only knows the default address, so say what to use instead.
+		lines = append(lines, "  KROWK_API_URL="+base+"/v1 krowk push screenshot.png")
 	}
-	return "http://" + addr
+	// Bound wider than this machine, deliberately or not, it is worth saying out
+	// loud: this registry takes uploads without a key, and will answer a lookup
+	// for any artifact ID with the repo, branch and commit behind it.
+	if host := listenHost(addr); !isLoopbackHost(host) {
+		lines = append(lines,
+			"  ! reachable from the network on "+bindDescription(host)+" — it needs no key to accept uploads")
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func bindDescription(host string) string {
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return "every interface"
+	}
+	return host
+}
+
+// localBase turns a listen address into a URL a client can call. A bare port, or
+// one bound to every interface, is reached over loopback from this machine.
+func localBase(addr string) string {
+	host, port := listenHost(addr), listenPort(addr)
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
+
+// reachableByDev reports whether --dev, which knows only one address, will find
+// a registry listening here.
+func reachableByDev(addr string) bool {
+	dev, err := url.Parse(api.DevBaseURL)
+	if err != nil {
+		return false
+	}
+	if listenPort(addr) != dev.Port() {
+		return false
+	}
+	// Bound to loopback or to everything, --dev's localhost arrives either way.
+	host := listenHost(addr)
+	return host == "" || host == "0.0.0.0" || host == "::" || isLoopbackHost(host)
+}
+
+func listenHost(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
+func listenPort(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return port
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // authHint points a rejected upload at the self-check. The registry cannot know

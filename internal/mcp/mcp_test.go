@@ -39,8 +39,12 @@ func newSession(t *testing.T, token string) *session {
 	return &session{
 		t: t,
 		server: &Server{
-			Client:  api.New(srv.URL+"/v1", token),
-			Env:     func(k string) string { return env[k] },
+			Client: api.New(srv.URL+"/v1", token),
+			Env:    func(k string) string { return env[k] },
+			// The fixture's own directory, standing in for a checkout. Uploads
+			// are confined to it, so tests exercise the same boundary a real
+			// agent hits rather than an unconfined filesystem.
+			Root:    filepath.Dir(fixture),
 			Version: "1.2.3",
 			Now:     func() time.Time { return time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC) },
 		},
@@ -254,6 +258,98 @@ func TestAFailedToolIsAResultNotAProtocolError(t *testing.T) {
 	payload, _ := result["structuredContent"].(map[string]any)
 	if payload["error"] != "file_unreadable" {
 		t.Errorf("structuredContent = %+v, want the machine-readable body", payload)
+	}
+}
+
+// An artifact is readable by anyone holding the link, and a model picks the
+// paths — so a instruction hidden in a repository file or a fetched page must not
+// be able to name a key and have it published.
+func TestPushRefusesFilesOutsideTheRoot(t *testing.T) {
+	s := newSession(t, "krk_test")
+	root := filepath.Dir(s.fixture)
+
+	// A secret next door to the root, the shape of ~/.ssh/id_rsa.
+	outside := filepath.Join(t.TempDir(), "id_rsa")
+	if err := os.WriteFile(outside, []byte("PRIVATE KEY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{
+		outside,
+		filepath.Join(root, "..", filepath.Base(filepath.Dir(outside)), "id_rsa"),
+		"/etc/passwd",
+	} {
+		result := s.callTool("krowk_push", map[string]any{"files": []string{path}})
+		if result["isError"] != true {
+			t.Errorf("%s was accepted", path)
+			continue
+		}
+		if body := text(t, result); !strings.Contains(body, "outside_root") &&
+			!strings.Contains(body, "file_unreadable") {
+			t.Errorf("%s: text = %q", path, body)
+		}
+	}
+}
+
+// A symlink inside the root pointing out of it defeats a prefix check that runs
+// before symlinks are resolved, so resolve first.
+func TestPushRefusesASymlinkEscapingTheRoot(t *testing.T) {
+	s := newSession(t, "krk_test")
+	root := filepath.Dir(s.fixture)
+
+	secret := filepath.Join(t.TempDir(), "credentials.json")
+	if err := os.WriteFile(secret, []byte(`{"token":"krk_live_secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "innocent-screenshot.png")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	result := s.callTool("krowk_push", map[string]any{"files": []string{link}})
+	if result["isError"] != true {
+		t.Fatalf("a symlink out of the root was followed: %s", text(t, result))
+	}
+	if body := text(t, result); !strings.Contains(body, "outside_root") {
+		t.Errorf("text = %q, want outside_root", body)
+	}
+}
+
+// One bad path must not sneak through alongside a legitimate one.
+func TestPushRefusesTheWholeBatchIfAnyFileIsOutside(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	outside := filepath.Join(t.TempDir(), "id_rsa")
+	if err := os.WriteFile(outside, []byte("PRIVATE KEY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := s.callTool("krowk_push", map[string]any{"files": []string{s.fixture, outside}})
+	if result["isError"] != true {
+		t.Fatalf("a mixed batch was accepted: %s", text(t, result))
+	}
+}
+
+// Confinement must not get in the way of the actual use case.
+func TestPushAcceptsFilesInsideTheRoot(t *testing.T) {
+	s := newSession(t, "krk_test")
+	root := filepath.Dir(s.fixture)
+
+	nested := filepath.Join(root, "screenshots")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	deep := filepath.Join(nested, "after.png")
+	if err := os.WriteFile(deep, []byte("nested fake png"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Absolute, nested, and relative-with-a-detour all resolve inside.
+	for _, path := range []string{deep, filepath.Join(root, "screenshots", "..", "screenshots", "after.png")} {
+		result := s.callTool("krowk_push", map[string]any{"files": []string{path}})
+		if result["isError"] == true {
+			t.Errorf("%s was refused: %s", path, text(t, result))
+		}
 	}
 }
 

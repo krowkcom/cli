@@ -160,6 +160,25 @@ A `200` carrying `valid: false` counts as a rejection too. Uploading needs
 `artifacts:write`; a key without it is turned down at the manifest, before any
 bytes move, with `403 insufficient_scope` naming the scope it lacked.
 
+**Anonymous uploads.** No key is a supported path, not an error — the point is
+that the upload step never fails for boring reasons. An anonymous upload is
+ephemeral and unowned, so the finalize response marks it and hands back a link
+that adopts it:
+
+```jsonc
+{ "anonymous": true, "expires_at": "…",           // 24h, not the workspace 48h
+  "claim_url": "https://krowk.com/claim/2b7f91" }
+```
+
+Claiming happens in a browser, signed in — there is no API call for it. Which
+side of the fence an upload lands on is settled when the handshake opens, so it
+cannot change hands by finalizing with a different key.
+
+The claim URL is a **capability**: anyone holding it can adopt the upload. So it
+is printed for whoever ran the push, kept out of both paste forms, and never
+returned by `GET /v1/artifacts/{id}` — the artifact ID is public, since it is in
+the shareable link, and knowing it must not be enough to claim the upload.
+
 **3. Finalize.**
 
 ```

@@ -117,6 +117,35 @@ func TestJSONCarriesBothPasteForms(t *testing.T) {
 	}
 }
 
+func TestClaimURLIsShownButNeverPasteable(t *testing.T) {
+	a := &api.Artifact{
+		ID:         "9f3c2e1",
+		URL:        "https://krowk.com/a/9f3c2e1",
+		PreviewURL: "https://krowk.com/a/9f3c2e1/preview.png",
+		Anonymous:  true,
+		ClaimURL:   "https://krowk.com/claim/2b7f",
+		Files:      []api.File{{Filename: "foobar.jpg"}},
+	}
+
+	// Visible to whoever ran the push...
+	human := Artifact(a, Human, "", false, false, time.Now())
+	if !strings.Contains(human, a.ClaimURL) || !strings.Contains(human, "do not share") {
+		t.Errorf("human output should show the claim URL and warn about it:\n%s", human)
+	}
+
+	// ...but never in something destined for a pull request comment.
+	p := PasteFor(a, "")
+	if strings.Contains(p.Markdown, "claim") || strings.Contains(p.URL, "claim") {
+		t.Errorf("paste = %+v, want no claim URL", p)
+	}
+	if got := Artifact(a, Markdown, "", false, false, time.Now()); strings.Contains(got, "claim") {
+		t.Errorf("--format markdown leaked the claim URL: %s", got)
+	}
+	if got := Artifact(a, URL, "", false, false, time.Now()); got != a.URL {
+		t.Errorf("--format url = %q, want just the shareable link", got)
+	}
+}
+
 func TestMarkdownFallsBackToALinkWithoutAPreview(t *testing.T) {
 	a := &api.Artifact{ID: "9f3c2e1", URL: "https://krowk.com/a/9f3c2e1"}
 

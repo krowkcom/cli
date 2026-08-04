@@ -349,6 +349,72 @@ func TestAnonymousPushIsAllowed(t *testing.T) {
 	}
 }
 
+func TestAnonymousPushPrintsAClaimURL(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["KROWK_TOKEN"] = ""
+
+	code, stdout, stderr := h.run("push", h.fixture)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+
+	var e struct {
+		Data struct {
+			URL       string `json:"url"`
+			Anonymous bool   `json:"anonymous"`
+			ClaimURL  string `json:"claim_url"`
+		} `json:"data"`
+		Paste struct {
+			Markdown string `json:"markdown"`
+			URL      string `json:"url"`
+		} `json:"paste"`
+		Breadcrumbs []struct {
+			Action string `json:"action"`
+			Cmd    string `json:"cmd"`
+		} `json:"breadcrumbs"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &e); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	if !e.Data.Anonymous || e.Data.ClaimURL == "" {
+		t.Fatalf("anonymous push = %s, want it flagged with a claim URL", stdout)
+	}
+
+	// The claim URL is a capability: anyone holding it can adopt the upload, so
+	// it must not ride along in anything meant for a pull request comment.
+	if strings.Contains(e.Paste.Markdown, e.Data.ClaimURL) || strings.Contains(e.Paste.URL, e.Data.ClaimURL) {
+		t.Errorf("the claim URL leaked into the paste output: %+v", e.Paste)
+	}
+
+	var claim bool
+	for _, b := range e.Breadcrumbs {
+		if b.Action == "claim" {
+			claim = true
+		}
+	}
+	if !claim {
+		t.Errorf("breadcrumbs = %+v, want a claim step", e.Breadcrumbs)
+	}
+}
+
+func TestKeyedPushIsNotClaimable(t *testing.T) {
+	h := newHarness(t, 0)
+
+	_, stdout, _ := h.run("push", h.fixture)
+	var e struct {
+		Data struct {
+			Anonymous bool   `json:"anonymous"`
+			ClaimURL  string `json:"claim_url"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Data.Anonymous || e.Data.ClaimURL != "" {
+		t.Errorf("a keyed push should already belong to the workspace: %s", stdout)
+	}
+}
+
 func TestDoctorReportsTheKeyAndReachability(t *testing.T) {
 	h := newHarness(t, 0)
 

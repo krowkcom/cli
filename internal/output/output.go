@@ -146,13 +146,25 @@ func Artifact(a *api.Artifact, f Format, title string, quiet, colour bool, now t
 	if quiet {
 		return encode(a)
 	}
+	breadcrumbs := []Breadcrumb{{Action: "share", Cmd: "open " + a.URL}}
+	if a.ClaimURL != "" {
+		breadcrumbs = append(breadcrumbs, Breadcrumb{Action: "claim", Cmd: "open " + a.ClaimURL})
+	}
 	return encode(Envelope{
 		OK:          true,
 		Data:        a,
 		Paste:       &paste,
-		Summary:     fmt.Sprintf("%d artifact(s), %s", max(len(a.Files), 1), HumanBytes(a.Bytes)),
-		Breadcrumbs: []Breadcrumb{{Action: "share", Cmd: "open " + a.URL}},
+		Summary:     summarise(a),
+		Breadcrumbs: breadcrumbs,
 	})
+}
+
+func summarise(a *api.Artifact) string {
+	s := fmt.Sprintf("%d artifact(s), %s", max(len(a.Files), 1), HumanBytes(a.Bytes))
+	if a.Anonymous {
+		return s + ", anonymous — claim it to keep it"
+	}
+	return s
 }
 
 // Key renders a verified API key: who it belongs to and what it may do.
@@ -213,6 +225,15 @@ func humanArtifact(a *api.Artifact, paste Paste, title string, colour bool, now 
 		paint(colour, dim, "  "+linkSurfaces),
 		"  "+paste.URL,
 	)
+	// Kept well clear of the paste blocks: anyone holding the claim URL can
+	// adopt the upload, so it must not get swept into a pull request comment.
+	if a.ClaimURL != "" {
+		lines = append(lines,
+			"",
+			paint(colour, dim, "  nobody owns this upload yet — claim it to keep it, do not share this link"),
+			"  "+a.ClaimURL,
+		)
+	}
 	return strings.Join(lines, "\n")
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // declare builds the manifest and the idempotency key the CLI would send.
@@ -444,6 +445,136 @@ func TestAnonymousUploadIsAllowed(t *testing.T) {
 	code, out := c.postAs("/v1/artifacts", "", declare([2]string{"shot.png", "one"}))
 	if code != http.StatusCreated {
 		t.Fatalf("anonymous begin = %d %v, want 201", code, out)
+	}
+}
+
+// pushAs runs the whole handshake and returns the finalized artifact.
+func (c *client) pushAs(token string, files ...[2]string) map[string]any {
+	c.t.Helper()
+	req := declare(files...)
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	post, err := http.NewRequest(http.MethodPost, c.url+"/v1/artifacts", bytes.NewReader(payload))
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	post.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		post.Header.Set("Authorization", "Bearer "+token)
+	}
+	res, err := http.DefaultClient.Do(post)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	var begun beginResponse
+	_ = json.NewDecoder(res.Body).Decode(&begun)
+	res.Body.Close()
+
+	for i, f := range files {
+		if code, out := c.put(begun.Uploads[i].URL, f[1]); code != http.StatusOK {
+			c.t.Fatalf("put %d = %d: %v", i, code, out)
+		}
+	}
+	code, done := c.postAs("/v1/artifacts/"+begun.ID+"/finalize", token,
+		map[string]string{"idempotency_key": req.IdempotencyKey})
+	if code != http.StatusOK {
+		c.t.Fatalf("finalize = %d: %v", code, done)
+	}
+	return done
+}
+
+func TestAnonymousUploadIsEphemeralAndClaimable(t *testing.T) {
+	c := serve(t, 0)
+
+	done := c.pushAs("", [2]string{"shot.png", "one"})
+	if done["anonymous"] != true {
+		t.Errorf("anonymous = %v, want true", done["anonymous"])
+	}
+	claim, _ := done["claim_url"].(string)
+	if !strings.Contains(claim, "/claim/") {
+		t.Fatalf("claim_url = %q, want a claim link", claim)
+	}
+
+	expires, _ := done["expires_at"].(string)
+	at, err := time.Parse(time.RFC3339, expires)
+	if err != nil {
+		t.Fatalf("expires_at = %q: %v", expires, err)
+	}
+	// 24h, not the 48h a workspace upload gets.
+	if left := time.Until(at); left > anonymousExpiry || left < anonymousExpiry-time.Minute {
+		t.Errorf("expires in %v, want about %v", left, anonymousExpiry)
+	}
+}
+
+func TestClaimedWindowAndNoClaimURLForAKeyedUpload(t *testing.T) {
+	c := serve(t, 0)
+
+	done := c.pushAs("krk_live_abc", [2]string{"shot.png", "one"})
+	if done["anonymous"] != nil {
+		t.Errorf("anonymous = %v, want it absent for a keyed upload", done["anonymous"])
+	}
+	if done["claim_url"] != nil {
+		t.Errorf("claim_url = %v, want none — it already belongs to a workspace", done["claim_url"])
+	}
+
+	expires, _ := done["expires_at"].(string)
+	at, _ := time.Parse(time.RFC3339, expires)
+	if left := time.Until(at); left > workspaceExpiry || left < workspaceExpiry-time.Minute {
+		t.Errorf("expires in %v, want about %v", left, workspaceExpiry)
+	}
+}
+
+// The artifact ID is public — it is in the shareable link. The claim URL is a
+// capability, so knowing the ID must not be enough to obtain it.
+func TestLookupDoesNotLeakTheClaimURL(t *testing.T) {
+	c := serve(t, 0)
+
+	done := c.pushAs("", [2]string{"shot.png", "one"})
+	id, _ := done["id"].(string)
+	if done["claim_url"] == nil {
+		t.Fatal("the push should have returned a claim URL")
+	}
+
+	res, err := http.Get(c.url + "/v1/artifacts/" + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	looked := map[string]any{}
+	_ = json.NewDecoder(res.Body).Decode(&looked)
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("get = %d", res.StatusCode)
+	}
+	if looked["claim_url"] != nil {
+		t.Errorf("a lookup by ID handed out the claim URL: %v", looked["claim_url"])
+	}
+	if looked["anonymous"] != true {
+		t.Errorf("anonymous = %v, want the status still visible", looked["anonymous"])
+	}
+}
+
+// Which side of the fence an upload lands on is settled when the handshake
+// opens, so it cannot change hands by finalizing with a different key.
+func TestOwnershipIsDecidedAtTheManifest(t *testing.T) {
+	c := serve(t, 0)
+	req := declare([2]string{"shot.png", "one"})
+
+	_, begun := c.begin(req) // anonymous
+	if code, _ := c.put(begun.Uploads[0].URL, "one"); code != http.StatusOK {
+		t.Fatal("put failed")
+	}
+
+	code, done := c.postAs("/v1/artifacts/"+begun.ID+"/finalize", "krk_live_abc",
+		map[string]string{"idempotency_key": req.IdempotencyKey})
+	if code != http.StatusOK {
+		t.Fatalf("finalize = %d %v", code, done)
+	}
+	if done["anonymous"] != true {
+		t.Errorf("anonymous = %v, want the upload to stay anonymous", done["anonymous"])
 	}
 }
 

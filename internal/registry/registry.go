@@ -24,9 +24,11 @@ const (
 	// DefaultLimitBytes matches the free tier the website advertises.
 	DefaultLimitBytes int64 = 100 << 20
 	dailyUploads            = 100
-	// expiry is how long a link lives. Anonymous uploads get their own window
-	// once the CLI grows a claim flow.
-	expiry = 48 * time.Hour
+	// workspaceExpiry is how long a link lives once it belongs to a workspace.
+	workspaceExpiry = 48 * time.Hour
+	// anonymousExpiry is shorter, because nobody has claimed the upload yet.
+	// Claiming it moves it onto the workspace window.
+	anonymousExpiry = 24 * time.Hour
 )
 
 type file struct {
@@ -43,6 +45,13 @@ type artifact struct {
 	ExpiresAt  string          `json:"expires_at"`
 	Files      []file          `json:"files"`
 	Metadata   json.RawMessage `json:"metadata"`
+	// Anonymous means no key was presented, so this upload belongs to nobody
+	// yet and expires sooner.
+	Anonymous bool `json:"anonymous,omitempty"`
+	// ClaimURL adopts an anonymous upload into a workspace. It is a website
+	// URL, opened signed-in in a browser — not an API call — and it is a
+	// capability, so it is never part of the paste-ready output.
+	ClaimURL string `json:"claim_url,omitempty"`
 }
 
 // manifestFile is one declared file, before its bytes arrive.
@@ -87,6 +96,9 @@ type upload struct {
 	key      string
 	metadata json.RawMessage
 	slots    []*slot
+	// anonymous is decided when the handshake opens, so an upload cannot change
+	// hands halfway through by finalizing with a different key.
+	anonymous bool
 }
 
 type store struct {
@@ -313,10 +325,11 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 		up, resumed := s.pending[req.IdempotencyKey]
 		if !resumed {
 			up = &upload{
-				id:       s.mintID(req.IdempotencyKey),
-				key:      req.IdempotencyKey,
-				metadata: validMetadata(req.Metadata),
-				slots:    make([]*slot, 0, len(req.Files)),
+				id:        s.mintID(req.IdempotencyKey),
+				key:       req.IdempotencyKey,
+				metadata:  validMetadata(req.Metadata),
+				slots:     make([]*slot, 0, len(req.Files)),
+				anonymous: bearer(r) == "",
 			}
 			s.idOwner[up.id] = up.key
 			for _, f := range req.Files {
@@ -517,14 +530,24 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 		}
 
 		site := publicOrigin(r, siteURL)
+		window := workspaceExpiry
+		if up.anonymous {
+			window = anonymousExpiry
+		}
 		a := artifact{
 			ID:         up.id,
 			URL:        fmt.Sprintf("%s/a/%s", site, up.id),
 			PreviewURL: fmt.Sprintf("%s/a/%s/preview.png", site, up.id),
 			Bytes:      total,
-			ExpiresAt:  time.Now().Add(expiry).UTC().Format(time.RFC3339),
+			ExpiresAt:  time.Now().Add(window).UTC().Format(time.RFC3339),
 			Files:      files,
 			Metadata:   up.metadata,
+			Anonymous:  up.anonymous,
+		}
+		if up.anonymous {
+			// Whoever holds this can adopt the upload, so it is minted fresh and
+			// handed back exactly once, to the process that did the pushing.
+			a.ClaimURL = fmt.Sprintf("%s/claim/%s", site, newToken())
 		}
 		s.artifacts[a.ID] = a
 		s.finalized[up.key] = a.ID
@@ -555,6 +578,9 @@ func (s *store) get(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// The ID is public — it is in the shareable link. The claim URL is not, so
+	// it goes back only to whoever completed the handshake, never to a lookup.
+	a.ClaimURL = ""
 	writeJSON(w, http.StatusOK, nil, a)
 }
 

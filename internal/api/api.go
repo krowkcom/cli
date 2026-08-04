@@ -72,6 +72,13 @@ type Artifact struct {
 	Files              []File          `json:"files,omitempty"`
 	Metadata           json.RawMessage `json:"metadata,omitempty"`
 	RateLimitRemaining string          `json:"rate_limit_remaining,omitempty"`
+	// Anonymous means no key was presented, so the upload belongs to nobody yet
+	// and expires sooner.
+	Anonymous bool `json:"anonymous,omitempty"`
+	// ClaimURL adopts an anonymous upload into a workspace. Anyone holding it
+	// can claim the upload, so it is a capability: it is printed for the person
+	// who ran the push and deliberately kept out of the paste-ready output.
+	ClaimURL string `json:"claim_url,omitempty"`
 }
 
 // Error carries the registry's machine-readable failure body verbatim, so the

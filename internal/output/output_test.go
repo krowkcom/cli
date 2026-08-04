@@ -82,9 +82,9 @@ func TestHumanOutputShowsBothFormsLabelled(t *testing.T) {
 	got := Artifact(a, Human, "", false, false, time.Now())
 	for _, want := range []string{
 		"✓ uploaded  foobar.jpg  412 KB",
-		embedSurfaces,
+		EmbedSurfaces,
 		"[![foobar.jpg](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)",
-		linkSurfaces,
+		LinkSurfaces,
 		"https://krowk.com/a/9f3c2e1",
 	} {
 		if !strings.Contains(got, want) {

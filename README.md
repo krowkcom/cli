@@ -79,6 +79,38 @@ Human output prints both, labelled. `--json` carries both under `paste`:
 }
 ```
 
+## MCP server
+
+`krowk-mcp` is the same thing for agents that cannot shell out — a thin client
+over the same `/v1` API, speaking MCP over stdio. No logic lives there that is
+not also in the CLI.
+
+```jsonc
+// Claude Code: .mcp.json — or `claude mcp add krowk -- krowk-mcp`
+{
+  "mcpServers": {
+    "krowk": { "command": "krowk-mcp", "env": { "KROWK_TOKEN": "krk_..." } }
+  }
+}
+```
+
+| Tool | What it does |
+| --- | --- |
+| `krowk_push` | Upload files, get both paste forms back |
+| `krowk_get_artifact` | Look one up by the ID at the end of its link |
+| `krowk_get_run` | Report the repo, commit, branch and agent that will be attached |
+| `krowk_verify_key` | Whether a key is configured, and what it may do |
+
+Every result carries the markdown embed and the bare URL, each labelled with the
+surfaces it belongs to, so the agent's job is copy-paste rather than templating.
+The machine-readable artifact rides along as `structuredContent`. A failed call
+comes back as a tool result with `isError` and the registry's own `fix`, not as a
+transport error, so the agent can read the reason and correct the call.
+
+The upload handshake is not exposed as separate begin/finalize tools: the `PUT`
+step needs access to the local file, which the MCP client does not have, so the
+handshake stays behind `krowk_push` where it belongs.
+
 ## Metadata
 
 Flags win; everything else is detected so the agent never has to type it.
@@ -260,11 +292,13 @@ KROWK_API_URL=http://localhost:8787/v1 ./bin/krowk uploads create screenshot.png
 
 ```
 cmd/krowk               the binary
+cmd/krowk-mcp           the MCP server
 cmd/krowk-mock          the mock registry
 internal/cli            flag parsing, routing, commands
 internal/api            HTTP client, the upload handshake, retries, credentials
 internal/runctx         git and CI metadata detection
 internal/output         human / json / markdown rendering
+internal/mcp            MCP over stdio, wrapping the same api client
 internal/registry       the mock registry handler, shared with the tests
 ```
 
@@ -299,9 +333,10 @@ Blocking, in order:
    keys per agent per repo with their own quota; that needs an issuing endpoint
    and a dashboard, or at minimum a device flow like the Basecamp CLI's.
 
-Non-blocking, in rough value order: the `@krowk/mcp` server wrapping
-`uploads create` as `krowk_push`; a Claude Code `PostToolUse` hook so
-screenshots upload with no prompting; a GitHub Action.
+Non-blocking, in rough value order: a Claude Code `PostToolUse` hook so
+screenshots upload with no prompting; a GitHub Action; publishing `krowk-mcp`
+under the `@krowk/mcp` name the website advertises, which needs the same npm
+wrapper as the CLI.
 
 ## Open contract questions
 

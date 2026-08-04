@@ -3,8 +3,9 @@ LDFLAGS := -s -w -X github.com/krowkcom/cli/internal/cli.Version=$(VERSION)
 
 .PHONY: build test lint vet fmt check mock install clean
 
-build: ## Build ./bin/krowk
+build: ## Build ./bin/krowk and ./bin/krowk-mcp
 	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/krowk ./cmd/krowk
+	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/krowk-mcp ./cmd/krowk-mcp
 
 test:
 	go test ./...
@@ -24,7 +25,7 @@ mock: ## Local stand-in for api.krowk.com on :8787
 	go run ./cmd/krowk-mock
 
 install:
-	go install -trimpath -ldflags "$(LDFLAGS)" ./cmd/krowk
+	go install -trimpath -ldflags "$(LDFLAGS)" ./cmd/krowk ./cmd/krowk-mcp
 
 clean:
 	rm -rf bin

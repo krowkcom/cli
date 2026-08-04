@@ -63,6 +63,7 @@ func TestPasteCarriesBothForms(t *testing.T) {
 		{"Checkout [v2]", "foobar.jpg", `[![Checkout \[v2\]](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)`},
 		{"", "frame[0].png", `[![frame\[0\].png](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)`},
 		{`back\slash`, "foobar.jpg", `[![back\\slash](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)`},
+		{"line1\nline2\r\nline3", "foobar.jpg", `[![line1 line2  line3](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)`},
 	} {
 		a.Files[0].Filename = tc.filename
 		p := PasteFor(a, tc.title)

@@ -260,6 +260,9 @@ func registryServe(w io.Writer, f flags) error {
 	if addr == "" {
 		addr = defaultRegistryAddr
 	}
+	if err := usableAddr(addr); err != nil {
+		return err
+	}
 	fmt.Fprint(w, registryBanner(addr))
 
 	server := &http.Server{
@@ -342,6 +345,16 @@ func listenPort(addr string) string {
 		return ""
 	}
 	return port
+}
+
+// usableAddr rejects what net.Listen would reject anyway, so the banner does not
+// print "http://localhost:" and a network warning for an address that never
+// binds. --addr 8787 is the easy mistake.
+func usableAddr(addr string) error {
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return fmt.Errorf("--addr %q needs a host and a port, like 127.0.0.1:8787 or :8787", addr)
+	}
+	return nil
 }
 
 func isLoopbackHost(host string) bool {

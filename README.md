@@ -290,11 +290,18 @@ body alone:
   cannot redirect the key.
 - **Upload targets are storage, not anything reachable.** A presigned URL names a
   foreign host by design, but the client requires `https`, ignores `method` and
-  always sends `PUT`, and refuses hosts that resolve to loopback, link-local or
-  private ranges. Otherwise a response body would choose the method, host, path,
+  always sends `PUT`, and refuses loopback, link-local, private and carrier-grade
+  NAT addresses. Otherwise a response body would choose the method, host, path,
   headers and body of a request the CLI makes from its own network position —
   which in CI reaches a great deal the registry cannot. A local registry is the
   one exception, since local targets are the whole point there.
+
+  The check is on the connection, not only on the URL, because a URL check alone
+  has two ways past it. An upload target that answers with a redirect is refused
+  outright — a presigned URL is where the bytes belong, and a `302` would change
+  the host and arrive as a `GET`, taking the method restriction with it. And the
+  address is judged as it is dialled rather than by resolving the name first,
+  since whoever returned the name can answer the check and the dial differently.
 - **Expiry** — an expired free link returns `410 Gone` carrying the original
   filename and upload time.
 

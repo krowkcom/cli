@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -226,6 +227,10 @@ func TestUploadTargetsInsideTheNetworkAreRefused(t *testing.T) {
 		"https://172.16.4.4/blob",
 		"https://169.254.169.254/latest/meta-data/",
 		"https://0.0.0.0/blob",
+		// Carrier-grade NAT: not private by Go's reckoning, but where Tailscale
+		// and several CI providers keep their internal hosts.
+		"https://100.64.1.2/blob",
+		"https://198.18.0.1/blob",
 	} {
 		if _, err := production.storageOrigin(raw); err == nil {
 			t.Errorf("%s was accepted", raw)
@@ -305,6 +310,107 @@ func TestUploadAlwaysUsesPUT(t *testing.T) {
 	if len(methods) != 1 || methods[0] != http.MethodPut {
 		t.Errorf("methods = %v, want a single PUT regardless of what the registry asked for", methods)
 	}
+}
+
+// storageOrigin can only vet the URL the registry returned, not where that URL
+// leads. Without this the guard above costs one redirect to get past: the host
+// changes, and a 302 arrives at the next one as a GET, so the method restriction
+// goes with it.
+func TestAnUploadTargetMayNotRedirect(t *testing.T) {
+	var internalHits int
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		internalHits++
+	}))
+	defer internal.Close()
+
+	// A storage host distinct from the registry's own, as a presigned URL is.
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, internal.URL+"/latest/meta-data/iam/", http.StatusFound)
+	}))
+	defer storage.Close()
+
+	registry := httptest.NewServer(handshake(storage.URL + "/blobs/tok"))
+	defer registry.Close()
+
+	client := New(registry.URL+"/v1", "krk_secret")
+	client.Sleep = func(time.Duration) {}
+
+	file := write(t, t.TempDir(), "shot.png", "one")
+	_, err := client.CreateArtifact(context.Background(), []string{file}, nil)
+	if err == nil {
+		t.Fatal("a redirect away from the upload target was followed, and the upload reported success")
+	}
+	var apiErr *Error
+	if !errorAs(err, &apiErr) || apiErr.Code() != "upload_redirected" {
+		t.Errorf("error = %v, want upload_redirected", err)
+	}
+	if internalHits != 0 {
+		t.Errorf("the redirect target was contacted %d time(s)", internalHits)
+	}
+}
+
+// The API's own host is allowed to redirect — http -> https in front of a
+// self-hosted registry is ordinary — and permitDial still covers where it lands.
+func TestTheAPIHostMayRedirect(t *testing.T) {
+	client := New("https://api.krowk.com/v1", "krk_secret")
+
+	from, _ := http.NewRequest(http.MethodPost, "https://api.krowk.com/v1/artifacts", nil)
+	to, _ := http.NewRequest(http.MethodPost, "https://api.krowk.com/v1/artifacts/", nil)
+	if err := client.checkRedirect(to, []*http.Request{from}); err != nil {
+		t.Errorf("the API host was refused a redirect: %v", err)
+	}
+}
+
+// The dialer hook is the half that survives DNS: internalHost resolves a name to
+// judge it, the transport resolves again to dial it, and the registry owns the
+// name in the case that matters. This asserts the hook is actually wired into the
+// client's transport, not merely correct in isolation.
+func TestTheDialerRefusesInternalAddresses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("a request reached a loopback address")
+	}))
+	defer srv.Close()
+
+	// Production base URL, so the local exemption does not apply.
+	client := New("https://api.krowk.com/v1", "krk_secret")
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.HTTP.Do(req); err == nil {
+		t.Fatal("the client connected to a loopback address")
+	} else if !strings.Contains(err.Error(), "untrusted_endpoint") {
+		t.Errorf("error = %v, want it to name untrusted_endpoint", err)
+	}
+
+	// A local registry means local addresses throughout, so the hook stands down.
+	local := New(DevBaseURL, "")
+	if err := local.permitDial("tcp", "127.0.0.1:8787", nil); err != nil {
+		t.Errorf("a local registry was refused its own address: %v", err)
+	}
+}
+
+// handshake is a registry that walks the three steps, aiming the upload leg at
+// uploadURL. Only the redirect tests need to choose that host, so it lives here.
+func handshake(uploadURL string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		var body beginRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(beginResponse{
+			ID:          "abc1234",
+			Uploads:     []UploadTarget{{Filename: body.Files[0].Filename, Method: http.MethodPut, URL: uploadURL}},
+			FinalizeURL: "/v1/artifacts/abc1234/finalize",
+		})
+	})
+	mux.HandleFunc("POST /v1/artifacts/{id}/finalize", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Artifact{ID: "abc1234", URL: "https://krowk.com/a/abc1234"})
+	})
+	return mux
 }
 
 func TestUploadURLMustBeHTTP(t *testing.T) {

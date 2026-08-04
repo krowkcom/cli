@@ -563,6 +563,21 @@ func TestReachableByDev(t *testing.T) {
 	}
 }
 
+// An address without a port cannot bind, so it must not first be announced as a
+// listening URL and warned about as if it were open to the network.
+func TestAnAddressWithoutAPortIsRejected(t *testing.T) {
+	for _, addr := range []string{"8787", "localhost", "127.0.0.1"} {
+		if err := usableAddr(addr); err == nil {
+			t.Errorf("usableAddr(%q) = nil, want an error naming the right shape", addr)
+		}
+	}
+	for _, addr := range []string{":8787", "127.0.0.1:8787", "0.0.0.0:9000", defaultRegistryAddr} {
+		if err := usableAddr(addr); err != nil {
+			t.Errorf("usableAddr(%q) = %v", addr, err)
+		}
+	}
+}
+
 func TestTheBannerWarnsOnlyWhenBoundOffBox(t *testing.T) {
 	// The default: loopback on the dev port, so --dev is the advice and there is
 	// nothing to warn about.

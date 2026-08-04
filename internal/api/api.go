@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -75,12 +76,29 @@ func New(baseURL, token string) *Client {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
-	return &Client{
+	c := &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Token:   token,
-		HTTP:    &http.Client{Timeout: 5 * time.Minute},
 		Sleep:   time.Sleep,
 	}
+	// The upload boundary lives here, on the connection, not only on the URL the
+	// registry returned. Checking the URL alone leaves two ways past it: a
+	// redirect off the vetted host, and a name that resolves once for the check
+	// and again for the dial.
+	// Cloned rather than built fresh, to keep the proxy, timeout and HTTP/2
+	// defaults; only the dial is ours.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   c.permitDial,
+	}).DialContext
+	c.HTTP = &http.Client{
+		Timeout:       5 * time.Minute,
+		Transport:     transport,
+		CheckRedirect: c.checkRedirect,
+	}
+	return c
 }
 
 // File is one uploaded file as the registry reports it back.
@@ -500,6 +518,13 @@ type response struct {
 func (c *Client) send(req *http.Request) (*response, error) {
 	res, err := c.HTTP.Do(req)
 	if err != nil {
+		// checkRedirect and permitDial refuse with an *Error of their own, which
+		// the client hands back wrapped. Why the request was refused is more use
+		// to the caller than "cannot reach the registry".
+		var refused *Error
+		if errors.As(err, &refused) {
+			return nil, refused
+		}
 		return nil, &Error{Body: map[string]any{
 			"error":     "network_unreachable",
 			"endpoint":  req.URL.String(),
@@ -654,6 +679,57 @@ func (c *Client) storageOrigin(raw string) (string, error) {
 	return u.String(), nil
 }
 
+// checkRedirect refuses to follow a redirect away from an upload target.
+//
+// storageOrigin vets the URL the registry returned; it cannot vet where that URL
+// points next. Following one hop hands back everything the vetting took away —
+// the host, the path, and the method too, since a 302 arrives at the next host as
+// a GET. A presigned URL is a final destination and does not redirect, so a
+// redirect here means the registry is aiming this process somewhere, and the
+// honest answer is to fail the upload rather than complete it against whatever
+// answered. The API's own host may still redirect (http -> https in front of a
+// self-hosted registry is ordinary); permitDial covers where that can land.
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) > 0 {
+		if _, err := c.sameOrigin(via[0].URL.String()); err != nil {
+			return Fail("upload_redirected",
+				"the upload target "+via[0].URL.Host+" redirected to "+req.URL.Host+
+					" — a presigned URL is where the bytes belong, so this is not followed")
+		}
+	}
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	return nil
+}
+
+// permitDial is the boundary applied to the address actually being connected to,
+// after the resolver has had its say.
+//
+// internalHost judges a name by resolving it, but the transport resolves again
+// when it dials, and the registry owns the name in the case that matters — so a
+// zero-TTL record can answer public for the check and internal for the dial.
+// Deciding here instead leaves nothing between the check and the connection.
+//
+// With an HTTP proxy configured this sees the proxy's address rather than the
+// target's; the URL-level checks still stand in that case.
+func (c *Client) permitDial(network, address string, _ syscall.RawConn) error {
+	// A local registry means local addresses throughout — that is the point of it.
+	if c.isLocal() {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && reservedIP(ip) {
+		return Fail("untrusted_endpoint",
+			"refusing to connect to "+address+", which is inside this machine or its network")
+	}
+	return nil
+}
+
 // isLocal reports whether this client is pointed at a registry on this machine,
 // where loopback upload targets are expected rather than suspicious.
 func (c *Client) isLocal() bool {
@@ -694,13 +770,24 @@ func internalHost(host string) bool {
 	return false
 }
 
+// cgnat is 100.64.0.0/10 and benchmark is 198.18.0.0/15. Neither is private by
+// Go's reckoning, and the first is where Tailscale and a number of CI providers
+// put the hosts an artifact upload has no business reaching.
+var reservedRanges = []net.IPNet{
+	{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)},
+	{IP: net.IPv4(198, 18, 0, 0), Mask: net.CIDRMask(15, 32)},
+}
+
 func reservedIP(ip net.IP) bool {
-	return ip.IsLoopback() ||
+	if ip.IsLoopback() ||
 		ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() ||
-		ip.IsInterfaceLocalMulticast()
+		ip.IsInterfaceLocalMulticast() {
+		return true
+	}
+	return slices.ContainsFunc(reservedRanges, func(n net.IPNet) bool { return n.Contains(ip) })
 }
 
 func malformed(detail string) *Error {

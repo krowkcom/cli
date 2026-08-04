@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -52,6 +53,40 @@ func TestRetryableFailureThenSuccessHonoursRetryAfter(t *testing.T) {
 	}
 	if len(*slept) != 1 || (*slept)[0] != 7*time.Second {
 		t.Errorf("slept %v, want exactly the server's Retry-After of 7s", *slept)
+	}
+}
+
+// A server that never recovers gets exactly maxAttempts requests — an
+// off-by-one in the loop bound would give up early or storm one extra, and
+// nothing else in the suite would notice.
+func TestRetriesStopAtTheAttemptCap(t *testing.T) {
+	var mu sync.Mutex
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"error":{"code":"boom","message":"still down"}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	c, slept := testClient(server)
+	_, err := c.ShowArtifact(context.Background(), "art_x")
+	if err == nil {
+		t.Fatal("want the exhausted failure back")
+	}
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "boom" {
+		t.Errorf("err = %v, want the last attempt's error", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != maxAttempts {
+		t.Errorf("calls = %d, want exactly maxAttempts (%d)", calls, maxAttempts)
+	}
+	if len(*slept) != maxAttempts-1 {
+		t.Errorf("slept %v, want a backoff between each attempt and none after the last", *slept)
 	}
 }
 
@@ -125,7 +160,46 @@ func TestPutBytesRetrySendsTheFullBodyAgain(t *testing.T) {
 			t.Errorf("attempt %d sent %q, want the full file", i+1, b)
 		}
 	}
-	if len(*slept) != 1 {
-		t.Errorf("slept %v, want one backoff between the attempts", *slept)
+	if len(*slept) != 1 || (*slept)[0] != 500*time.Millisecond {
+		t.Errorf("slept %v, want the first attempt's default backoff of 500ms", *slept)
+	}
+}
+
+// PutBytes has its own retry loop with the same cap, so it gets the same
+// exhaustion pin: a storage host that never recovers sees exactly maxAttempts
+// uploads.
+func TestPutBytesStopsAtTheAttemptCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shot.png")
+	if err := os.WriteFile(path, []byte("bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+
+	c, slept := testClient(server)
+	up := &Upload{Method: http.MethodPut, URL: server.URL + "/_storage/ws/art/shot.png"}
+	err := c.PutBytes(context.Background(), up, Spec{Path: path, ByteSize: int64(len("bytes"))})
+	if err == nil {
+		t.Fatal("want the exhausted failure back")
+	}
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "storage_rejected_upload" {
+		t.Errorf("err = %v, want the last attempt's storage error", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != maxAttempts {
+		t.Errorf("attempts = %d, want exactly maxAttempts (%d)", calls, maxAttempts)
+	}
+	if len(*slept) != maxAttempts-1 {
+		t.Errorf("slept %v, want a backoff between each attempt and none after the last", *slept)
 	}
 }

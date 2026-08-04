@@ -114,6 +114,12 @@ func TestEphemeralExpiryAnswersGoneEverywhere(t *testing.T) {
 	if status != http.StatusGone || errorCode(body) != "expired" {
 		t.Errorf("claim after expiry = %d %v, want 410 expired", status, body)
 	}
+	// The promise covers the bytes too: the public URL stops serving, as the
+	// real registry's lifecycle rule deletes the object.
+	url, _ := payload["url"].(string)
+	if status, _ := request(t, http.MethodGet, url, "", "", ""); status != http.StatusNotFound {
+		t.Errorf("GET %s after expiry = %d, want 404", url, status)
+	}
 }
 
 func TestClaimJustBeforeExpiryStillSucceeds(t *testing.T) {

@@ -362,6 +362,12 @@ func (s *store) getObject(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	bytes, ok := s.objects[key]
+	// The 24-hour promise covers the bytes, not just the record: an expired
+	// artifact's public URL stops serving, as the real registry's lifecycle
+	// rule deletes the object. Gone reads as never-there, the way storage does.
+	if a := s.artifacts[r.PathValue("slug")]; a != nil && s.expired(a) {
+		ok = false
+	}
 	s.mu.Unlock()
 
 	if !ok {

@@ -528,13 +528,16 @@ func TestLocalBaseTurnsAListenAddressIntoAURL(t *testing.T) {
 		{"[::]:41234", ":0", "http://localhost:41234"},
 		// A hostname the user typed survives, even though the listener
 		// reports the IP it resolved to.
-		{"127.0.0.1:9000", "127.0.0.1:9000", "http://127.0.0.1:9000"},
+		{"192.0.2.1:9000", "files.internal:9000", "http://files.internal:9000"},
 		// "any port" with a named host still takes the port from the bind.
 		{"127.0.0.1:41234", "localhost:0", "http://localhost:41234"},
 		// A wildcard bind listens everywhere but dials nowhere, so the URL
-		// says localhost instead.
+		// says localhost instead; loopback IPs fold to the same name, so the
+		// default bind stays the address --dev dials.
 		{"0.0.0.0:8787", "0.0.0.0:8787", "http://localhost:8787"},
 		{"[::]:8787", "[::]:8787", "http://localhost:8787"},
+		{"127.0.0.1:8787", defaultRegistryAddr, "http://localhost:8787"},
+		{"[::1]:8787", "[::1]:8787", "http://localhost:8787"},
 	} {
 		if got := localBase(tc.bound, tc.asked); got != tc.want {
 			t.Errorf("localBase(%q, %q) = %q, want %q", tc.bound, tc.asked, got, tc.want)
@@ -647,6 +650,37 @@ func TestRegistryServeWiresLimitBytesIntoTheHandler(t *testing.T) {
 	e := decode(t, stderr)
 	if e.Error["error"] != "artifact_too_large" {
 		t.Errorf("error = %v, want artifact_too_large", e.Error["error"])
+	}
+
+	ln.Close()
+	var apiErr *api.Error
+	if serveErr := <-done; !errors.As(serveErr, &apiErr) || apiErr.Code() != "registry_unavailable" {
+		t.Errorf("serve after the listener closed = %v, want registry_unavailable", serveErr)
+	}
+}
+
+// --site rebrands the public links only, so a push still lands on the local
+// listener while the returned URLs carry the named origin.
+func TestRegistryServeWiresSiteIntoTheHandler(t *testing.T) {
+	h := newHarness(t, 0)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- serveOn(io.Discard, ln, ln.Addr().String(), flags{site: "https://files.example"})
+	}()
+
+	h.env["KROWK_API_URL"] = "http://" + ln.Addr().String() + "/v1"
+	code, stdout, stderr := h.run("push", h.fixture)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	e := decode(t, stdout)
+	if !strings.HasPrefix(e.Data.URL, "https://files.example/") {
+		t.Errorf("artifact url = %q, want the --site origin baked in", e.Data.URL)
 	}
 
 	ln.Close()

@@ -26,8 +26,9 @@ import (
 var Version = "0.1.0"
 
 // defaultRegistryAddr is where `registry serve` listens, matching api.DevBaseURL
-// so --dev finds it with no configuration.
-const defaultRegistryAddr = ":8787"
+// so --dev finds it with no configuration. Loopback only: the registry accepts
+// anonymous uploads, so by default it must not be reachable from the LAN.
+const defaultRegistryAddr = "127.0.0.1:8787"
 
 const helpTemplate = `krowk %s — permalinks for agent output
 
@@ -55,7 +56,7 @@ Upload flags
   --agent <name>         Override the detected agent
 
 Local registry flags
-  --addr <host:port>     Listen address for ` + "`registry serve`" + ` (default %s)
+  --addr <host:port>     Listen address for ` + "`registry serve`" + ` (default %s, loopback only)
   --site <url>           Origin for the links it returns (default: the request host)
   --limit-bytes <n>      Reject uploads above this size
 
@@ -311,9 +312,10 @@ func localBase(bound, asked string) string {
 		}
 	}
 	// Wildcard binds listen everywhere but dial nowhere; localhost is the
-	// loopback name that reaches them on either stack.
+	// loopback name that reaches them on either stack. Loopback IPs fold to
+	// the same name, so the default bind stays the address --dev dials.
 	switch host {
-	case "", "0.0.0.0", "::":
+	case "", "0.0.0.0", "::", "127.0.0.1", "::1":
 		host = "localhost"
 	}
 	return "http://" + net.JoinHostPort(host, port)

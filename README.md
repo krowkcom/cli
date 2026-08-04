@@ -316,7 +316,6 @@ make install     # → $GOPATH/bin/{krowk,krowk-mcp}
 ```
 cmd/krowk               the binary
 cmd/krowk-mcp           the MCP server
-cmd/krowk-mock          the mock registry
 internal/cli            flag parsing, routing, commands
 internal/api            HTTP client, the upload handshake, retries, credentials
 internal/runctx         git and CI metadata detection

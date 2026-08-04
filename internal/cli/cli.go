@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"runtime"
 	"strings"
@@ -144,6 +145,13 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		return report(stderr, err, format, f.quiet, colour)
 	}
 
+	// registry.Handler treats <= 0 as "use the default", so a negative limit
+	// would silently mean 100 MiB. Reject it instead of guessing.
+	if f.limitBytes < 0 {
+		err := api.Fail("bad_flag", "--limit-bytes must not be negative — omit it or pass 0 for the default")
+		return report(stderr, err, format, f.quiet, colour)
+	}
+
 	switch {
 	case f.version:
 		fmt.Fprintln(stdout, Version)
@@ -252,34 +260,48 @@ func registryServe(w io.Writer, f flags) error {
 	if addr == "" {
 		addr = defaultRegistryAddr
 	}
-	base := localBase(addr)
 
-	fmt.Fprintf(w, "krowk registry listening on %s\n", base)
-	if base+"/v1" == api.DevBaseURL {
-		fmt.Fprintln(w, "  krowk push screenshot.png --dev")
-	} else {
-		// --dev only knows the default address, so say what to use instead.
-		fmt.Fprintf(w, "  KROWK_API_URL=%s/v1 krowk push screenshot.png\n", base)
+	// Bind before announcing anything, so a script keying off the banner never
+	// proceeds against a port that failed to open.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return api.Fail("registry_unavailable", "could not listen on "+addr+": "+err.Error())
 	}
+	fmt.Fprint(w, serveBanner(localBase(ln.Addr().String(), addr)))
 
 	server := &http.Server{
-		Addr:    addr,
 		Handler: registry.Handler(f.limitBytes, f.site),
 		// Uploads can be slow and large, so only the header read is bounded.
 		ReadHeaderTimeout: 20 * time.Second,
 	}
-	if err := server.ListenAndServe(); err != nil {
-		return api.Fail("registry_unavailable", "could not listen on "+addr+": "+err.Error())
+	if err := server.Serve(ln); err != nil {
+		return api.Fail("registry_unavailable", "registry on "+addr+" stopped: "+err.Error())
 	}
 	return nil
 }
 
-// localBase turns a listen address into a URL a client can call.
-func localBase(addr string) string {
-	if strings.HasPrefix(addr, ":") {
-		return "http://localhost" + addr
+// serveBanner says where the registry is and how to point a push at it. --dev
+// only knows the default address, so any other base gets the explicit form.
+func serveBanner(base string) string {
+	banner := "krowk registry listening on " + base + "\n"
+	if base+"/v1" == api.DevBaseURL {
+		return banner + "  krowk push screenshot.png --dev\n"
 	}
-	return "http://" + addr
+	return banner + "  KROWK_API_URL=" + base + "/v1 krowk push screenshot.png\n"
+}
+
+// localBase turns a listen address into a URL a client can call. bound is what
+// the listener reports, which resolves ":0" to the real port; asked keeps the
+// hostname the user typed, since the listener flattens it to an IP.
+func localBase(bound, asked string) string {
+	if strings.HasPrefix(asked, ":") {
+		_, port, err := net.SplitHostPort(bound)
+		if err != nil {
+			return "http://localhost" + asked
+		}
+		return "http://localhost:" + port
+	}
+	return "http://" + asked
 }
 
 // authHint points a rejected upload at the self-check. The registry cannot know

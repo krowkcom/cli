@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -519,11 +521,91 @@ func TestDevFlagRedirectsTheClient(t *testing.T) {
 }
 
 func TestLocalBaseTurnsAListenAddressIntoAURL(t *testing.T) {
-	if got := localBase(":8787"); got != "http://localhost:8787" {
-		t.Errorf("localBase(:8787) = %q", got)
+	for _, tc := range []struct{ bound, asked, want string }{
+		{"[::]:8787", ":8787", "http://localhost:8787"},
+		// ":0" means "any port", and the bound address says which one it was.
+		{"[::]:41234", ":0", "http://localhost:41234"},
+		// A hostname the user typed survives, even though the listener
+		// reports the IP it resolved to.
+		{"127.0.0.1:9000", "127.0.0.1:9000", "http://127.0.0.1:9000"},
+	} {
+		if got := localBase(tc.bound, tc.asked); got != tc.want {
+			t.Errorf("localBase(%q, %q) = %q, want %q", tc.bound, tc.asked, got, tc.want)
+		}
 	}
-	if got := localBase("127.0.0.1:9000"); got != "http://127.0.0.1:9000" {
-		t.Errorf("localBase(127.0.0.1:9000) = %q", got)
+}
+
+func TestServeBannerSaysHowToReachTheRegistry(t *testing.T) {
+	for _, tc := range []struct {
+		name, base, want string
+	}{
+		{"the default address is what --dev dials", "http://localhost:8787",
+			"krowk push screenshot.png --dev"},
+		{"any other address needs KROWK_API_URL spelled out", "http://localhost:9000",
+			"KROWK_API_URL=http://localhost:9000/v1 krowk push screenshot.png"},
+	} {
+		got := serveBanner(tc.base)
+		if !strings.Contains(got, "krowk registry listening on "+tc.base+"\n") {
+			t.Errorf("%s: banner is missing the address: %q", tc.name, got)
+		}
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("%s: banner = %q, want it to mention %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The banner only appears after a successful bind, so a script keying off
+// "listening" never proceeds against a port that failed to open.
+func TestRegistryServeFailsToBindWithoutPrintingTheBanner(t *testing.T) {
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+
+	var out bytes.Buffer
+	serveErr := registryServe(&out, flags{addr: taken.Addr().String()})
+
+	var apiErr *api.Error
+	if !errors.As(serveErr, &apiErr) || apiErr.Code() != "registry_unavailable" {
+		t.Fatalf("serve on a taken port = %v, want registry_unavailable", serveErr)
+	}
+	if !strings.Contains(apiErr.Fix(), taken.Addr().String()) {
+		t.Errorf("fix = %q, want it to name the address", apiErr.Fix())
+	}
+	if out.Len() != 0 {
+		t.Errorf("banner printed despite the failed bind: %q", out.String())
+	}
+}
+
+// An empty --addr means the default port; holding that port shows the fallback
+// engaged without leaving a server running.
+func TestRegistryServeFallsBackToTheDefaultAddr(t *testing.T) {
+	if taken, err := net.Listen("tcp", defaultRegistryAddr); err == nil {
+		defer taken.Close()
+	} // if the listen failed, something else holds the port — same outcome
+
+	var out bytes.Buffer
+	serveErr := registryServe(&out, flags{addr: ""})
+
+	var apiErr *api.Error
+	if !errors.As(serveErr, &apiErr) || !strings.Contains(apiErr.Fix(), defaultRegistryAddr) {
+		t.Fatalf("serve with an empty addr = %v, want a bind failure naming %s", serveErr, defaultRegistryAddr)
+	}
+}
+
+// registry.Handler treats <= 0 as "use the default", so a negative limit has
+// to be rejected up front or it silently means 100 MiB.
+func TestNegativeLimitBytesIsRejected(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, _, stderr := h.run("registry", "serve", "--limit-bytes", "-5")
+	if code == 0 {
+		t.Fatal("a negative --limit-bytes should fail")
+	}
+	e := decode(t, stderr)
+	if e.Error["error"] != "bad_flag" {
+		t.Errorf("error = %v, want bad_flag", e.Error["error"])
 	}
 }
 

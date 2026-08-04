@@ -31,7 +31,9 @@ func main() {
 	defer stop()
 
 	server := &mcp.Server{
-		Client:  api.New(os.Getenv("KROWK_API_URL"), api.ReadToken(os.Getenv)),
+		// Same registry precedence as the CLI, so KROWK_DEV points both at a
+		// local registry without either needing its own plumbing.
+		Client:  api.New(api.BaseURLFor(false, os.Getenv), api.ReadToken(os.Getenv)),
 		Env:     runctx.Env(os.Getenv),
 		Version: cli.Version,
 	}

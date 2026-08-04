@@ -11,7 +11,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/krowkcom/cli/internal/api"
 	"github.com/krowkcom/cli/internal/registry"
+	"github.com/krowkcom/cli/internal/runctx"
 )
 
 // harness runs the CLI against a throwaway registry, the way a user would.
@@ -455,6 +457,84 @@ func TestDoctorSaysUnreachableWhenNothingIsListening(t *testing.T) {
 	}
 	if status, _ := report["api_status"].(string); !strings.HasPrefix(status, "unreachable") {
 		t.Errorf("api_status = %v, want unreachable", report["api_status"])
+	}
+}
+
+func TestDoctorLabelsWhichRegistryItIsTalkingTo(t *testing.T) {
+	h := newHarness(t, 0)
+
+	mode := func(args ...string) string {
+		t.Helper()
+		_, stdout, _ := h.run(args...)
+		var report map[string]any
+		if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+			t.Fatalf("not JSON: %v\n%s", err, stdout)
+		}
+		got, _ := report["registry"].(string)
+		return got
+	}
+
+	// The harness points KROWK_API_URL at a throwaway server.
+	if got := mode("doctor"); got != "custom (KROWK_API_URL)" {
+		t.Errorf("registry = %q, want it flagged as custom", got)
+	}
+
+	// --dev overrides that, and says so.
+	if got := mode("doctor", "--dev"); got != "local" {
+		t.Errorf("registry with --dev = %q, want local", got)
+	}
+
+	h.env["KROWK_API_URL"] = ""
+	if got := mode("doctor"); got != "production" {
+		t.Errorf("registry with nothing set = %q, want production", got)
+	}
+	h.env["KROWK_DEV"] = "yes"
+	if got := mode("doctor"); got != "local" {
+		t.Errorf("registry with KROWK_DEV = %q, want local", got)
+	}
+}
+
+// Every command builds its client through one helper, so checking the helper
+// checks the wiring — without depending on whether :8787 happens to be free.
+func TestDevFlagRedirectsTheClient(t *testing.T) {
+	env := func(m map[string]string) runctx.Env {
+		return func(k string) string { return m[k] }
+	}
+	dev := strings.TrimRight(api.DevBaseURL, "/")
+
+	if got := newClient(flags{dev: true}, env(nil)).BaseURL; got != dev {
+		t.Errorf("--dev = %q, want %q", got, dev)
+	}
+	// A flag typed on the command line beats an ambient variable.
+	staging := env(map[string]string{"KROWK_API_URL": "https://staging/v1"})
+	if got := newClient(flags{dev: true}, staging).BaseURL; got != dev {
+		t.Errorf("--dev with KROWK_API_URL set = %q, want %q", got, dev)
+	}
+	if got := newClient(flags{}, staging).BaseURL; got != "https://staging/v1" {
+		t.Errorf("KROWK_API_URL = %q", got)
+	}
+	if got := newClient(flags{}, env(nil)).BaseURL; got != strings.TrimRight(api.DefaultBaseURL, "/") {
+		t.Errorf("default = %q, want the public registry", got)
+	}
+}
+
+func TestLocalBaseTurnsAListenAddressIntoAURL(t *testing.T) {
+	if got := localBase(":8787"); got != "http://localhost:8787" {
+		t.Errorf("localBase(:8787) = %q", got)
+	}
+	if got := localBase("127.0.0.1:9000"); got != "http://127.0.0.1:9000" {
+		t.Errorf("localBase(127.0.0.1:9000) = %q", got)
+	}
+}
+
+func TestHelpMentionsTheLocalRegistry(t *testing.T) {
+	h := newHarness(t, 0)
+
+	_, stdout, _ := h.run("--help")
+	for _, want := range []string{"registry serve", "--dev", "KROWK_DEV", "http://localhost:8787/v1"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("help is missing %q", want)
+		}
 	}
 }
 

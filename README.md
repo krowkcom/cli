@@ -48,6 +48,7 @@ advertises all land with the first tagged release — see the prerequisites belo
 | `krowk auth token` | Print the stored token, for scripts |
 | `krowk auth verify` | Ask the registry what the key is and what it may do |
 | `krowk doctor` | Report version, API reachability, auth and detected run context |
+| `krowk registry serve` | Run a local registry to develop and test against |
 
 Upload flags: `--pull-request`, `--reference` (repeatable), `--session`,
 `--title`, plus `--repo` / `--commit` / `--agent` to override detection. Flags
@@ -279,15 +280,37 @@ body alone:
 - **Expiry** — an expired free link returns `410 Gone` carrying the original
   filename and upload time.
 
+## Testing against a local registry
+
+The CLI ships the registry it develops against, so trying it out needs neither
+the network nor a key. In one terminal:
+
+```bash
+krowk registry serve                 # listens on :8787
+```
+
+And in another, `--dev` points the CLI at it:
+
+```bash
+krowk push screenshot.png --dev
+krowk doctor --dev                   # says registry: local
+```
+
+`KROWK_DEV=1` does the same thing without the flag, which is how to point the MCP
+server at it too. Precedence, most to least specific: `--dev`, then
+`KROWK_API_URL`, then `KROWK_DEV`, then the public registry.
+
+`registry serve` takes `--addr`, `--site` (the origin baked into returned links,
+for demoing production-looking URLs) and `--limit-bytes` (to exercise the
+too-large path).
+
 ## Development
 
 ```bash
 make check       # go vet + go test ./...
-make build       # → bin/krowk, version stamped from git describe
-make mock        # stand-in registry on :8787
-make install     # → $GOPATH/bin/krowk
-
-KROWK_API_URL=http://localhost:8787/v1 ./bin/krowk uploads create screenshot.png
+make build       # → bin/krowk and bin/krowk-mcp, versions stamped from git describe
+make mock        # the same registry as `krowk registry serve`, from the checkout
+make install     # → $GOPATH/bin/{krowk,krowk-mcp}
 ```
 
 ```

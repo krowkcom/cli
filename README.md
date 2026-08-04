@@ -160,6 +160,11 @@ body alone:
   request where the two disagree.
 - **Resumable** — declaring the same key again before finalizing returns the
   same ID and the same upload targets, so blobs already stored stay stored.
+  Resumability is bounded by inactivity: a registry may reclaim a pending
+  handshake that has seen no declaration or blob for an hour, after which the
+  same key starts a fresh handshake. A registry at its pending-handshake
+  capacity may also refuse a new declaration with a retryable 503
+  `too_many_pending_uploads`.
 - **The ID authorises nothing.** It is the last segment of every link that gets
   pasted anywhere, so `finalize` requires the idempotency key and rejects a
   request without one. Only the caller that opened a handshake can complete it,

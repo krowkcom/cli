@@ -248,8 +248,16 @@ func (c *Client) begin(ctx context.Context, body beginRequest) (*beginResponse, 
 			return err
 		}
 		out = beginResponse{}
-		_, err = c.decode(req, &out)
-		return err
+		res, err := c.decode(req, &out)
+		if err != nil {
+			return err
+		}
+		// A replayed upload short-circuits before finalize, so the rate limit
+		// has to ride this response or the envelope loses the field.
+		if out.Complete && out.Artifact != nil {
+			out.Artifact.RateLimitRemaining = res.Header.Get("X-RateLimit-Remaining")
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err

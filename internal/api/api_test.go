@@ -235,6 +235,7 @@ func TestAlreadyCompleteSkipsTheUpload(t *testing.T) {
 	var puts int
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "42")
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(beginResponse{
 			ID:       "abc1234",
@@ -259,6 +260,49 @@ func TestAlreadyCompleteSkipsTheUpload(t *testing.T) {
 	}
 	if puts != 0 {
 		t.Errorf("a finished upload should not send bytes again, got %d request(s)", puts)
+	}
+	// A replay is still a success, so its envelope carries the same fields a
+	// first push does — the rate limit rides the begin response here, because
+	// finalize never runs.
+	if artifact.RateLimitRemaining != "42" {
+		t.Errorf("rate limit = %q, want it carried off the begin response on a replay", artifact.RateLimitRemaining)
+	}
+}
+
+// The manifest is built from the files as they were; if one vanishes before
+// its PUT, the per-attempt reopen is what catches it, not a hung request.
+func TestFileVanishingBetweenDescribeAndPutFails(t *testing.T) {
+	var mu sync.Mutex
+	var steps []step
+	srv := stubRegistry(t, &steps, &mu, func() string { return "" })
+
+	client := New(srv.URL+"/v1", "krk_secret")
+	client.Sleep = func(time.Duration) {}
+
+	file := write(t, t.TempDir(), "shot.png", "one")
+	manifest, key, err := Describe([]string{file})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+
+	begin, err := client.begin(context.Background(), beginRequest{IdempotencyKey: key, Files: manifest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.putAll(context.Background(), []string{file}, manifest, begin.Uploads)
+	if err == nil || err.(*Error).Code() != "file_unreadable" {
+		t.Fatalf("err = %v, want file_unreadable for a file that went away mid-upload", err)
+	}
+	// The failure is on open, so no request ever reached the blob endpoint.
+	mu.Lock()
+	defer mu.Unlock()
+	for _, s := range steps {
+		if s.name == "put" {
+			t.Error("a vanished file still sent a PUT")
+		}
 	}
 }
 

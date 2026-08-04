@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -434,8 +435,8 @@ func TestUploadsWorkBehindAProxyOnAPrivateAddress(t *testing.T) {
 
 	t.Setenv("HTTP_PROXY", proxy.URL)
 	client := New("https://api.krowk.com/v1", "krk_secret")
-	if !client.proxied {
-		t.Fatal("the client did not notice HTTP_PROXY")
+	if !client.isProxy(strings.TrimPrefix(proxy.URL, "http://")) {
+		t.Fatalf("the client did not recognise %s as the proxy", proxy.URL)
 	}
 	// The proxy is on loopback here, which is the shape of a proxy on 10.0.0.0/8.
 	// The request is plain http so it is forwarded rather than tunnelled with
@@ -453,6 +454,32 @@ func TestUploadsWorkBehindAProxyOnAPrivateAddress(t *testing.T) {
 	}
 	if proxied != 1 {
 		t.Errorf("the proxy saw %d requests, want 1", proxied)
+	}
+
+	// Only the proxy's own address earns the exemption. A request that skipped the
+	// proxy — NO_PROXY covers its host — is judged like any other, so configuring
+	// a proxy must not switch the boundary off wholesale.
+	for _, address := range []string{"169.254.169.254:80", "10.0.0.99:443", "127.0.0.1:9999"} {
+		if err := client.permitDial("tcp", address, nil); err == nil {
+			t.Errorf("%s was permitted because a proxy is configured elsewhere", address)
+		}
+	}
+}
+
+func TestProxyAddressesReadsTheSpellingsPeopleUse(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want string
+	}{
+		{"http://10.0.0.7:3128", "10.0.0.7:3128"},
+		{"10.0.0.7:3128", "10.0.0.7:3128"}, // no scheme, which url.Parse reads as a path
+		{"http://10.0.0.7", "10.0.0.7:80"},
+		{"https://10.0.0.7", "10.0.0.7:443"},
+		{"socks5://10.0.0.7", "10.0.0.7:1080"},
+	} {
+		if got := proxyAddresses(tc.raw); !slices.Contains(got, tc.want) {
+			t.Errorf("proxyAddresses(%q) = %v, want it to include %q", tc.raw, got, tc.want)
+		}
 	}
 }
 

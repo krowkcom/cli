@@ -173,6 +173,16 @@ func permit(root, path string) (string, error) {
 		return "", api.Fail("secret_path",
 			"`"+path+"` is a credential file (`"+name+"`) — refusing to publish it at a public URL")
 	}
+	// A hard link is the one escape resolving symlinks cannot see: a second name
+	// for the same inode, so a path inside the root can be a key outside it with
+	// nothing to resolve. Nothing says where the other names are, so a file with
+	// any is refused. Screenshots do not have them; package stores do, which is
+	// why this rejects node_modules rather than anything worth publishing.
+	if info, err := os.Stat(real); err == nil && info.Mode().IsRegular() && multiplyLinked(info) {
+		return "", api.Fail("hard_linked",
+			"`"+path+"` has more than one name on disk, so it may be a file from outside "+root+
+				" — copy it in and push the copy")
+	}
 	return real, nil
 }
 

@@ -137,8 +137,16 @@ the common case rather than the exotic one:
   `id_ecdsa` are refused wherever they sit. Nobody publishes these on purpose, so
   the cost of refusing is an error message and the cost of allowing is a secret
   with a permalink.
+- **A file with more than one name is refused.** Resolving symlinks catches a link
+  pointing out of the root, but a hard link is not a link to anything — it is a
+  second name for the same inode, so a path inside the root can be a key outside
+  it with nothing to resolve. Nothing reports where the other names are, so a file
+  with any is refused; copy it in and push the copy. In practice this rejects
+  package-store files and nothing anyone wanted to publish.
 
-The boundary constrains `krowk_push`; it is not a sandbox around the agent.
+The boundary constrains `krowk_push`; it is not a sandbox around the agent. An
+agent that can also run a shell can read whatever it likes — this stops the tool
+from being the thing that publishes it.
 
 ## Metadata
 
@@ -325,10 +333,14 @@ body alone:
   NAT64 prefix `64:ff9b::/96`, which on an IPv6-only runner is how you reach the
   metadata service without naming a link-local address at all.
 
-  **Behind a proxy the connection check stands down**, because every connection
-  then goes to the proxy — which is typically on a private address, so judging it
-  would refuse every upload — and the proxy does the name resolution that the
-  check was there to get in front of. The URL check carries the boundary there.
+  **A configured proxy is exempt, and only at its own address.** Corporate proxies
+  sit on private addresses, so refusing those outright would refuse every upload
+  from the environments this tool is for — but the exemption is the proxy's
+  address, resolved from `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`, not a switch
+  that turns the boundary off. A request that skipped the proxy because `NO_PROXY`
+  covers its host is judged like any other. One thing does stay out of reach:
+  where a proxy sends the bytes is the proxy's business, so a name that resolves
+  differently for it than for the URL check is not something this client can see.
 - **Expiry** — an expired free link returns `410 Gone` carrying the original
   filename and upload time.
 

@@ -417,6 +417,33 @@ func TestPushRefusesCredentialFilesInsideTheRoot(t *testing.T) {
 	}
 }
 
+// A hard link is a second name for one inode, not a link to anything — so a path
+// inside the root can be a file outside it with nothing for EvalSymlinks to
+// resolve. Nothing reports where the other names are, so a file with any is
+// refused.
+func TestPushRefusesAHardLinkedFile(t *testing.T) {
+	s := newSession(t, "krk_test")
+	root := filepath.Dir(s.fixture)
+
+	outside := filepath.Join(t.TempDir(), "id_rsa")
+	if err := os.WriteFile(outside, []byte("PRIVATE KEY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Same filesystem is a hard link's requirement; t.TempDir may not share one.
+	link := filepath.Join(root, "screenshot-2.png")
+	if err := os.Link(outside, link); err != nil {
+		t.Skipf("hard links unavailable across these directories: %v", err)
+	}
+
+	result := s.callTool("krowk_push", map[string]any{"files": []string{link}})
+	if result["isError"] != true {
+		t.Fatalf("a hard link to a file outside the root was published: %s", text(t, result))
+	}
+	if body := text(t, result); !strings.Contains(body, "hard_linked") {
+		t.Errorf("text = %q, want hard_linked", body)
+	}
+}
+
 func TestPushNeedsFiles(t *testing.T) {
 	s := newSession(t, "krk_test")
 

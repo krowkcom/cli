@@ -45,10 +45,9 @@ type Client struct {
 	HTTP    *http.Client
 	// Sleep is swapped out in tests so backoff does not cost wall clock.
 	Sleep func(time.Duration)
-	// proxied records that a proxy stands between this process and everything it
-	// talks to, which changes what the dial hook can usefully judge. Set once in
-	// New; the tests set it directly.
-	proxied bool
+	// env reads the proxy configuration, so the dial hook can tell a connection to
+	// the proxy from a connection somewhere it should not go. Swapped in tests.
+	env func(string) string
 }
 
 // BaseURLFor picks which registry to talk to. dev is an explicit request — a
@@ -84,7 +83,7 @@ func New(baseURL, token string) *Client {
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Token:   token,
 		Sleep:   time.Sleep,
-		proxied: proxyConfigured(os.Getenv),
+		env:     os.Getenv,
 	}
 	// The upload boundary lives here, on the connection, not only on the URL the
 	// registry returned. Checking the URL alone leaves two ways past it: a
@@ -732,15 +731,6 @@ func (c *Client) permitDial(network, address string, _ syscall.RawConn) error {
 	if c.isLocal() {
 		return nil
 	}
-	// Behind a proxy every connection goes to the proxy, so this hook would see
-	// the proxy's address and nothing else. Corporate proxies sit on private
-	// addresses, so judging that address refuses every upload from the CI
-	// environments this tool exists for. The proxy also does the resolving, which
-	// is what this hook was here to get in front of — so it has nothing left to
-	// decide, and storageOrigin's check on the URL carries the boundary instead.
-	if c.proxied {
-		return nil
-	}
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil
@@ -751,11 +741,78 @@ func (c *Client) permitDial(network, address string, _ syscall.RawConn) error {
 		host = host[:i]
 	}
 	ip := net.ParseIP(host)
-	if ip != nil && reservedIP(ip) {
-		return Fail("untrusted_endpoint",
-			"refusing to connect to "+address+", which is inside this machine or its network")
+	if ip == nil || !reservedIP(ip) {
+		return nil
 	}
-	return nil
+	// One reserved address is legitimate: the proxy everything goes through.
+	// Corporate proxies sit on private addresses, so refusing this outright would
+	// refuse every upload from the CI environments this tool exists for. Only the
+	// proxy's own address earns the exemption though — a request that skipped the
+	// proxy, because NO_PROXY covers its host, is judged like any other.
+	if c.isProxy(address) {
+		return nil
+	}
+	return Fail("untrusted_endpoint",
+		"refusing to connect to "+address+", which is inside this machine or its network")
+}
+
+// isProxy reports whether address is where a configured proxy listens.
+//
+// Resolved here rather than cached at startup, and only on the path that is about
+// to refuse a connection: a proxy that moved to a new address would otherwise
+// break every upload until the process restarted, which is a bad trade for
+// saving a lookup on a path taken a handful of times per run.
+func (c *Client) isProxy(address string) bool {
+	if c.env == nil {
+		return false
+	}
+	for _, k := range proxyVars {
+		raw := strings.TrimSpace(c.env(k))
+		if raw == "" {
+			continue
+		}
+		if slices.Contains(proxyAddresses(raw), address) {
+			return true
+		}
+	}
+	return false
+}
+
+var proxyVars = []string{
+	"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy",
+}
+
+// proxyAddresses turns one proxy setting into the addresses a dial to it would
+// use — the literal host:port, and the resolved ones, since a dial happens after
+// resolution.
+func proxyAddresses(raw string) []string {
+	// A bare "10.0.0.7:3128" has no scheme, which url.Parse reads as a path.
+	if !strings.Contains(raw, "//") {
+		raw = "//" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return nil
+	}
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "https":
+			port = "443"
+		case "socks5", "socks5h":
+			port = "1080"
+		default:
+			port = "80"
+		}
+	}
+
+	out := []string{net.JoinHostPort(u.Hostname(), port)}
+	if ips, err := net.LookupIP(u.Hostname()); err == nil {
+		for _, ip := range ips {
+			out = append(out, net.JoinHostPort(ip.String(), port))
+		}
+	}
+	return out
 }
 
 // isLocal reports whether this client is pointed at a registry on this machine,
@@ -825,19 +882,6 @@ func reservedIP(ip net.IP) bool {
 		return true
 	}
 	return slices.ContainsFunc(reservedRanges, func(n net.IPNet) bool { return n.Contains(ip) })
-}
-
-// proxyConfigured reports whether the environment routes this process through a
-// proxy, in either of the spellings Go's own ProxyFromEnvironment reads.
-func proxyConfigured(env func(string) string) bool {
-	for _, k := range []string{
-		"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy",
-	} {
-		if strings.TrimSpace(env(k)) != "" {
-			return true
-		}
-	}
-	return false
 }
 
 func malformed(detail string) *Error {

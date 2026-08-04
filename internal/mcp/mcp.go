@@ -63,25 +63,32 @@ type Server struct {
 }
 
 // Serve reads requests until the stream ends or the context is cancelled.
+//
+// The read runs in its own goroutine feeding a channel, because a blocked read
+// on stdin would otherwise keep a cancelled server alive forever: returning
+// from here exits the process, and the reader dies with it.
 func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 	if s.Now == nil {
 		s.Now = time.Now
 	}
 
-	reader := bufio.NewReaderSize(in, 64<<10)
 	writer := bufio.NewWriter(out)
 	encoder := json.NewEncoder(writer)
+	lines := readLines(ctx, in)
 
 	for {
-		if err := ctx.Err(); err != nil {
+		var line []byte
+		select {
+		case <-ctx.Done():
 			return nil
-		}
-		line, err := readLine(reader)
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
+		case msg, ok := <-lines:
+			if !ok {
+				return nil
+			}
+			if msg.err != nil {
+				return msg.err
+			}
+			line = msg.line
 		}
 		if len(strings.TrimSpace(string(line))) == 0 {
 			continue
@@ -119,15 +126,42 @@ func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 	}
 }
 
-func readLine(r *bufio.Reader) ([]byte, error) {
-	line, err := r.ReadBytes('\n')
-	if len(line) > maxLine {
-		return nil, fmt.Errorf("mcp: message longer than %d bytes", maxLine)
-	}
-	if err == io.EOF && len(line) > 0 {
-		return line, nil // a final line with no trailing newline
-	}
-	return line, err
+// message is one line off the stream, or the error that ended it.
+type message struct {
+	line []byte
+	err  error
+}
+
+// readLines scans the stream line by line on its own goroutine. The scanner's
+// buffer enforces maxLine while reading, so an oversized message is rejected
+// at the cap instead of being allocated in full first.
+func readLines(ctx context.Context, in io.Reader) <-chan message {
+	lines := make(chan message)
+	go func() {
+		defer close(lines)
+		scanner := bufio.NewScanner(in)
+		scanner.Buffer(make([]byte, 0, 64<<10), maxLine)
+		for scanner.Scan() {
+			line := make([]byte, len(scanner.Bytes()))
+			copy(line, scanner.Bytes())
+			select {
+			case lines <- message{line: line}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		err := scanner.Err()
+		if errors.Is(err, bufio.ErrTooLong) {
+			err = fmt.Errorf("mcp: message longer than %d bytes", maxLine)
+		}
+		if err != nil {
+			select {
+			case lines <- message{err: err}:
+			case <-ctx.Done():
+			}
+		}
+	}()
+	return lines
 }
 
 func write(e *json.Encoder, w *bufio.Writer, res response) error {
@@ -140,8 +174,8 @@ func write(e *json.Encoder, w *bufio.Writer, res response) error {
 func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {
 	switch req.Method {
 	case "initialize":
-		return s.initialize(req.Params), nil
-	case "notifications/initialized", "notifications/cancelled":
+		return s.initialize(req.Params)
+	case "notifications/initialized":
 		return nil, nil
 	case "ping":
 		return map[string]any{}, nil
@@ -153,18 +187,21 @@ func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {
 	return nil, &rpcError{Code: -32601, Message: "unknown method " + req.Method}
 }
 
-func (s *Server) initialize(params json.RawMessage) any {
+func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
 	var p struct {
 		ProtocolVersion string `json:"protocolVersion"`
 	}
-	_ = json.Unmarshal(params, &p)
+	// A client that cannot frame initialize is the one case worth surfacing.
+	if len(params) > 0 && json.Unmarshal(params, &p) != nil {
+		return nil, &rpcError{Code: -32602, Message: "initialize params are not an object"}
+	}
 
 	return map[string]any{
 		"protocolVersion": negotiate(p.ProtocolVersion),
 		"capabilities":    map[string]any{"tools": map[string]any{}},
 		"serverInfo":      map[string]any{"name": "krowk", "version": s.Version},
 		"instructions":    instructions,
-	}
+	}, nil
 }
 
 // negotiate answers with the client's revision when it is one we speak, and

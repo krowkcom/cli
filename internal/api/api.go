@@ -707,10 +707,12 @@ func (c *Client) doOnce(req *http.Request, out any, status *int) error {
 		if err.Code() == "unauthorized" {
 			if c.Token == "" {
 				err.Body["fix"] = "this endpoint needs an API key — run `krowk auth login --token krowk_sk_...`, or set KROWK_TOKEN"
-			} else {
+			} else if !strings.HasSuffix(req.URL.Path, "/keys/verify") {
 				// A key was sent and rejected, which is exactly the moment the
 				// self-check earns its keep — the registry cannot know the CLI has
 				// a verify command, so the client adds that half of the fix itself.
+				// Except on the self-check: telling `auth verify` to run
+				// `auth verify` is a loop, not a fix.
 				hint := "run `krowk auth verify` to see what this key is allowed to do"
 				if fix, _ := err.Body["fix"].(string); fix != "" {
 					err.Body["fix"] = fix + " — " + hint

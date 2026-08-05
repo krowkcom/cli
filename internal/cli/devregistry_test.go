@@ -140,6 +140,14 @@ func TestRejectedKeyOnPushPointsAtVerify(t *testing.T) {
 		t.Errorf("keyed 401 fix = %q, want it to point at `krowk auth verify`", fix)
 	}
 
+	// The self-check itself is exempt: telling `auth verify` to run
+	// `auth verify` is a loop, not a fix.
+	body = h.fails("auth", "verify")
+	fix, _ = body["fix"].(string)
+	if strings.Contains(fix, "auth verify") {
+		t.Errorf("verify's own 401 fix = %q, must not point back at the command that just ran", fix)
+	}
+
 	// No key sent: nothing to verify, so the advice is to log in.
 	body = h.anonymous().fails("push", h.fixture)
 	fix, _ = body["fix"].(string)

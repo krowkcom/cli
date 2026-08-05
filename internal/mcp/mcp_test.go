@@ -547,15 +547,16 @@ func TestGetRunReportsDetectedMetadata(t *testing.T) {
 	}
 }
 
-func TestVerifyKeyReportsScopesAndAnonymousMode(t *testing.T) {
+func TestVerifyKeyReportsTheWorkspaceAndAnonymousMode(t *testing.T) {
 	s := newSession(t, "krk_test")
 
 	result := s.callTool("krowk_verify_key", nil)
 	if result["isError"] == true {
 		t.Fatalf("failed: %s", text(t, result))
 	}
-	if body := text(t, result); !strings.Contains(body, "artifacts:write") {
-		t.Errorf("text = %q, want the scopes", body)
+	// An agent needs to know where its uploads land, which is the workspace.
+	if body := text(t, result); !strings.Contains(body, "workspace") {
+		t.Errorf("text = %q, want the workspace", body)
 	}
 
 	// Without a key the answer is "anonymous", not an error — pushing still works.

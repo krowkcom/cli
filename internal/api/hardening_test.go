@@ -607,19 +607,18 @@ func TestRetryAfterAcceptsBothSpellings(t *testing.T) {
 	}
 }
 
-func TestVerifyKeyReportsScopes(t *testing.T) {
+func TestVerifyKeyReadsTheKeyResource(t *testing.T) {
 	var mu sync.Mutex
-	var auth string
+	var auth, method, path string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		auth = r.Header.Get("Authorization")
+		auth, method, path = r.Header.Get("Authorization"), r.Method, r.URL.Path
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(Key{
-			Valid:     true,
 			KeyID:     "key_7f3a",
-			Workspace: "acme",
-			Scopes:    []string{"artifacts:read", ScopeWrite},
+			Name:      "CI",
+			Workspace: "ws_acme",
 		})
 	}))
 	defer srv.Close()
@@ -633,35 +632,38 @@ func TestVerifyKeyReportsScopes(t *testing.T) {
 	if auth != "Bearer krowk_sk_secret" {
 		t.Errorf("Authorization = %q", auth)
 	}
-	mu.Unlock()
-	if key.KeyID != "key_7f3a" || key.Workspace != "acme" {
-		t.Errorf("key = %+v", key)
+	// A key is read, not acted on, so the registry serves it as a singular
+	// resource — nothing about asking changes what the key may do.
+	if method != http.MethodGet || path != "/v1/key" {
+		t.Errorf("%s %s, want GET /v1/key", method, path)
 	}
-	if !key.HasScope(ScopeWrite) || key.HasScope("artifacts:delete") {
-		t.Errorf("scopes = %v", key.Scopes)
+	mu.Unlock()
+	if key.KeyID != "key_7f3a" || key.Workspace != "ws_acme" || key.Name != "CI" {
+		t.Errorf("key = %+v", key)
 	}
 	if key.Status != http.StatusOK {
 		t.Errorf("status = %d, want the 200 the answer arrived with", key.Status)
 	}
 }
 
-// A 200 is not the same as a yes.
-func TestVerifyKeyTreatsValidFalseAsRejection(t *testing.T) {
+// A 200 from something that is not the registry is not a yes. There is no
+// "valid" field to consult — a key that arrives naming no key is the tell.
+func TestVerifyKeyRefusesAnAnswerThatNamesNoKey(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(Key{Valid: false})
+		fmt.Fprint(w, `{"welcome":"to the website"}`)
 	}))
 	defer srv.Close()
 
 	_, err := New(srv.URL+"/v1", "krowk_sk_secret").VerifyKey(context.Background())
 	var apiErr *Error
-	if !errors.As(err, &apiErr) || apiErr.Code() != "invalid_key" {
-		t.Fatalf("err = %v, want invalid_key", err)
+	if !errors.As(err, &apiErr) || apiErr.Code() != "malformed_response" {
+		t.Fatalf("err = %v, want malformed_response", err)
 	}
-	// The verdict rode in on a 200; carrying that status is what lets doctor
-	// tell "the registry said no" apart from "nothing answered at all".
+	// The answer rode in on a 200; carrying that status is what lets doctor tell
+	// "something answered wrongly" apart from "nothing answered at all".
 	if apiErr.Status != http.StatusOK {
-		t.Errorf("status = %d, want the 200 the verdict arrived with", apiErr.Status)
+		t.Errorf("status = %d, want the 200 the answer arrived with", apiErr.Status)
 	}
 }
 

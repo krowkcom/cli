@@ -408,8 +408,9 @@ func Artifact(a *api.Artifact, f Format, quiet, colour bool, now time.Time) stri
 	return Upload(result, f, quiet, colour, now)
 }
 
-// Key renders a verified API key: who it belongs to and what it may do. There
-// is no link to a key, so markdown and url fall back to the JSON envelope.
+// Key renders a verified API key: which key it is, and the workspace every call
+// with it lands in — the fact worth confirming before an upload. There is no
+// link to a key, so markdown and url fall back to the JSON envelope.
 func Key(k *api.Key, f Format, quiet, colour bool) string {
 	if f != Human {
 		if quiet {
@@ -418,7 +419,7 @@ func Key(k *api.Key, f Format, quiet, colour bool) string {
 		return encode(Envelope{
 			OK:      true,
 			Data:    k,
-			Summary: fmt.Sprintf("%s in %s, scopes: %s", k.KeyID, k.Workspace, strings.Join(k.Scopes, " ")),
+			Summary: fmt.Sprintf("%s in %s", k.KeyID, k.Workspace),
 			Breadcrumbs: []Breadcrumb{
 				{Action: "push", Cmd: "krowk push screenshot.png"},
 			},
@@ -428,11 +429,9 @@ func Key(k *api.Key, f Format, quiet, colour bool) string {
 	lines := []string{
 		fmt.Sprintf("%s key valid  %s", paint(colour, green, "✓"), k.KeyID),
 		fmt.Sprintf("  %-11s %s", "workspace", k.Workspace),
-		fmt.Sprintf("  %-11s %s", "scopes", strings.Join(k.Scopes, " ")),
 	}
-	if !k.HasScope(api.ScopeWrite) {
-		lines = append(lines, "  "+paint(colour, red, "cannot upload")+
-			" — this key is missing "+api.ScopeWrite)
+	if k.Name != "" {
+		lines = append(lines, fmt.Sprintf("  %-11s %s", "name", k.Name))
 	}
 	if k.ExpiresAt != "" {
 		lines = append(lines, fmt.Sprintf("  %-11s %s", "expires", k.ExpiresAt))

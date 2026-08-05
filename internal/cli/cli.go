@@ -47,7 +47,7 @@ Usage
   krowk claim <artifact> <claim-token>      Keep an anonymous upload past expiry
   krowk auth login --token <token>          Store an API token
   krowk auth token                          Print the stored token
-  krowk auth verify                         Check the key and its scopes
+  krowk auth verify                         Check the key and its workspace
   krowk doctor                              Check the local setup
   krowk registry serve                      Run a local registry to develop against
 
@@ -574,8 +574,8 @@ func probe(client *api.Client) string {
 	return fmt.Sprintf("reachable (%s, %s)", service.Service, strings.Join(service.Versions, " "))
 }
 
-// keySummary says what the key is good for in one line. It only calls out to
-// the registry when there is a key to verify, so a keyless doctor stays a
+// keySummary names the key and where it lands, in one line. It only calls out
+// to the registry when there is a key to verify, so a keyless doctor stays a
 // single request.
 func keySummary(client *api.Client) string {
 	if client.Token == "" {
@@ -589,11 +589,10 @@ func keySummary(client *api.Client) string {
 		}
 		return "unknown — " + err.Error()
 	}
-	scopes := strings.Join(key.Scopes, " ")
-	if scopes == "" {
-		scopes = "no scopes"
+	if key.Name != "" {
+		return fmt.Sprintf("%s (%s) %s", key.KeyID, key.Workspace, key.Name)
 	}
-	return fmt.Sprintf("%s (%s) %s", key.KeyID, key.Workspace, scopes)
+	return fmt.Sprintf("%s (%s)", key.KeyID, key.Workspace)
 }
 
 // registryServe runs the local stand-in for api.krowk.com, so developing against

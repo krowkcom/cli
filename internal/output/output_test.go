@@ -232,20 +232,21 @@ func TestClaimTokenIsSurfacedButNeverPasteable(t *testing.T) {
 	}
 }
 
-func TestKeyRendersScopesAndWarnsWhenItCannotUpload(t *testing.T) {
-	k := &api.Key{Valid: true, KeyID: "key_9f3c2e1d", Workspace: "acme",
-		Scopes: []string{"artifacts:read"}}
+func TestKeyRendersTheKeyAndItsWorkspace(t *testing.T) {
+	k := &api.Key{KeyID: "key_9f3c2e1d", Name: "CI", Workspace: "ws_acme",
+		ExpiresAt: "2026-09-01T00:00:00Z"}
 
 	human := Key(k, Human, false, false)
-	for _, want := range []string{"key_9f3c2e1d", "acme", "artifacts:read", "cannot upload"} {
+	// The workspace is the fact worth confirming: it is where an upload lands.
+	for _, want := range []string{"key_9f3c2e1d", "ws_acme", "CI", "2026-09-01"} {
 		if !strings.Contains(human, want) {
 			t.Errorf("human key output is missing %q:\n%s", want, human)
 		}
 	}
 
-	k.Scopes = append(k.Scopes, api.ScopeWrite)
-	if got := Key(k, Human, false, false); strings.Contains(got, "cannot upload") {
-		t.Errorf("a write-scoped key must not warn:\n%s", got)
+	// A key that never expires says nothing about expiry rather than saying none.
+	if got := Key(&api.Key{KeyID: "key_9f3c2e1d"}, Human, false, false); strings.Contains(got, "expires") {
+		t.Errorf("a key with no expiry must not mention one:\n%s", got)
 	}
 
 	// There is no link to a key, so url falls back to the JSON envelope.

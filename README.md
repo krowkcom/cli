@@ -42,9 +42,10 @@ advertises all land with the first tagged release — see the prerequisites belo
 | `krowk uploads create <file...>` | The same thing, spelled out |
 | `krowk uploads list` | List the workspace's uploads, newest first (`--limit`, `--before`) |
 | `krowk uploads show <artifact>` | Read one artifact back |
+| `krowk uploads attach <artifact> --run <run>` | Put an upload under a run after it was uploaded |
 | `krowk runs start` | Open a run to group later uploads under |
 | `krowk runs finish <run>` | Close a run |
-| `krowk claim <artifact> <claim-token>` | Keep an anonymous upload past its expiry |
+| `krowk claim <artifact> <claim-token>` | Keep an anonymous upload past its expiry (`--run` groups it while claiming) |
 | `krowk auth login --token <token>` | Check a token against the registry, then store it in `~/.config/krowk/credentials.json` (0600) |
 | `krowk auth token` | Print the stored token, for scripts |
 | `krowk auth verify` | Ask the registry which key this is, and the workspace it acts in |
@@ -118,7 +119,7 @@ not also in the CLI.
 | `krowk_push` | Upload files — one artifact per file, grouped under a run — and get both paste forms back |
 | `krowk_list_artifacts` | List the workspace's artifacts, newest first (needs a key) |
 | `krowk_get_artifact` | Look one up by its slug |
-| `krowk_claim_artifact` | Spend a claim token to keep an anonymous upload (needs a key) |
+| `krowk_claim_artifact` | Spend a claim token to keep an anonymous upload, and group it under a run with `run` (needs a key) |
 | `krowk_get_run` | Report the repo, commit, branch and agent that will be attached |
 | `krowk_verify_key` | Whether a key is configured, and the workspace it acts in |
 
@@ -192,6 +193,14 @@ artifact. A run belongs to a workspace, so it needs an API key:
   run, so metadata named by flag is *not* recorded, and the result says so in
   `notes` rather than dropping it silently.
 
+An upload can join a run afterwards, which is the only way one that started out
+anonymous ever gets a run at all: it could not name one when it was created, and
+claiming it does not give it one. `krowk claim <artifact> <token> --run <run>`
+does both in the order that works — the claim moves the upload into the key's
+workspace, and only then can it be attached to a run there. `krowk uploads
+attach <artifact> --run <run>` is the same attach on its own, for an upload
+already owned. Both are idempotent, and neither moves the link.
+
 ## Wire contract
 
 What the registry implements, and what this client talks to. Bytes never pass
@@ -200,7 +209,8 @@ straight to object storage, and a later call verifies what landed.
 
 The API is resourceful all the way down, so what would be a verb hanging off an
 artifact is a nested resource instead. The method follows from whether the call
-can be repeated — finalizing and completing are idempotent, so they are `PUT`s;
+can be repeated — finalizing, completing and setting the run an artifact belongs
+to are idempotent, so they are `PUT`s;
 claiming spends a one-shot token, so it is a `POST`. Reading a key is the same
 rule the other way round: asking what it may do changes nothing about it, so the
 key a request is made with is a singular resource reached with a `GET`:
@@ -213,13 +223,14 @@ POST       /v1/artifacts                      declare an upload
 GET        /v1/artifacts/:slug                read one back
 PUT|PATCH  /v1/artifacts/:slug/finalization   confirm the bytes landed
 POST       /v1/artifacts/:slug/claim          spend a claim token (needs a key)
+PUT|PATCH  /v1/artifacts/:slug/run            put it under a run (needs a key)
 POST       /v1/runs                           open a run (needs a key)
 PUT|PATCH  /v1/runs/:slug/completion          close a run (needs a key)
 ```
 
-Everything but listing, claiming, the key and the run endpoints works without a key: for a
-keyless request the slug *is* the capability, since slugs are 21 random base58
-characters and the bytes are public on the CDN regardless.
+Everything but listing, claiming, attaching, the key and the run endpoints works
+without a key: for a keyless request the slug *is* the capability, since slugs
+are 21 random base58 characters and the bytes are public on the CDN regardless.
 
 ```
 POST {KROWK_API_URL}/artifacts

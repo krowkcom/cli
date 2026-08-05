@@ -235,6 +235,11 @@ func TestAttachRunIsAnIdempotentPut(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
+	// Two attaches, two requests: a success the client retried anyway would mean
+	// the run was set more than once for one caller asking once.
+	if len(calls) != 2 {
+		t.Fatalf("calls = %v, want one per attach", calls)
+	}
 	for i, call := range calls {
 		if call != "PUT /v1/artifacts/art_x/run" {
 			t.Errorf("call %d = %q, want PUT /v1/artifacts/art_x/run", i, call)

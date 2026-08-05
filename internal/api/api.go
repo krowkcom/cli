@@ -14,12 +14,12 @@
 //
 // The registry's API is resourceful all the way down, so what would be a verb
 // hanging off an artifact is a nested resource instead — the finalization of an
-// artifact, the claim on one, the run it belongs to, the completion of a run.
-// The verb follows from
-// whether the call can be repeated: finalizing and completing are idempotent, so
-// they are PUTs; claiming spends a one-shot token, so it is a POST. Checking a
-// key is the same rule read the other way — GET /v1/key names the key this
-// request is made with, because asking what it may do changes nothing about it.
+// artifact, the claim on one, the run it belongs to, the completion of a run. The
+// verb follows from whether the call can be repeated: finalizing, completing and
+// setting an artifact's run are idempotent, so they are PUTs; claiming spends a
+// one-shot token, so it is a POST. Checking a key is the same rule read the other
+// way — GET /v1/key names the key this request is made with, because asking what
+// it may do changes nothing about it.
 package api
 
 import (

@@ -368,6 +368,21 @@ func TestAttachRunPutsAnOwnedArtifactUnderARun(t *testing.T) {
 	if shown := mustShow(t, server, token, slug); shown["url"] != artifact["url"] {
 		t.Errorf("attaching moved the link: %v → %v", artifact["url"], shown["url"])
 	}
+
+	// A closed run still accepts one. The case this exists for is a CI run that
+	// finished long before anyone claimed the anonymous upload it left behind, so
+	// refusing here would leave that upload nowhere to go.
+	if status, payload := request(t, http.MethodPut,
+		server.URL+"/v1/runs/"+run+"/completion", token, "", ""); status != http.StatusOK {
+		t.Fatalf("finish run = %d %v", status, payload)
+	}
+	second := declare(t, server, token, "later.png", "some bytes")
+	laterSlug, _ := second["slug"].(string)
+	if status, payload := request(t, http.MethodPut,
+		server.URL+"/v1/artifacts/"+laterSlug+"/run", token, "application/json",
+		fmt.Sprintf(`{"run":%q}`, run)); status != http.StatusOK || payload["run"] != run {
+		t.Errorf("attach to a finished run = %d %v, want it allowed", status, payload)
+	}
 }
 
 func mustShow(t *testing.T, server *httptest.Server, token, slug string) map[string]any {

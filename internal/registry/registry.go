@@ -581,6 +581,11 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 // Keyless is refused with the same run_needs_key createArtifact answers with
 // rather than a 401: what is wrong is not the missing key by itself but that a
 // run belongs to a workspace and a keyless request has none.
+//
+// A finished run still accepts one, deliberately: the case this exists for is a
+// CI job whose run closed long before anyone got round to claiming the anonymous
+// upload it left behind, and refusing then would leave that upload with nowhere
+// to go for good.
 func (s *store) attachRun(w http.ResponseWriter, r *http.Request) {
 	workspace, ok := authenticate(w, r)
 	if !ok {

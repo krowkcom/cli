@@ -209,11 +209,11 @@ straight to object storage, and a later call verifies what landed.
 
 The API is resourceful all the way down, so what would be a verb hanging off an
 artifact is a nested resource instead. The method follows from whether the call
-can be repeated — finalizing, completing and setting the run an artifact belongs
-to are idempotent, so they are `PUT`s;
-claiming spends a one-shot token, so it is a `POST`. Reading a key is the same
-rule the other way round: asking what it may do changes nothing about it, so the
-key a request is made with is a singular resource reached with a `GET`:
+can be repeated — finalizing, completing and setting an artifact's run are
+idempotent, so they are `PUT`s; claiming spends a one-shot token, so it is a
+`POST`. Reading a key is the same rule the other way round: asking what it may do
+changes nothing about it, so the key a request is made with is a singular
+resource reached with a `GET`:
 
 ```
 GET        /                                  service descriptor

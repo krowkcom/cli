@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -169,13 +168,6 @@ func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
 func upload(w io.Writer, files []string, f flags, format output.Format, env runctx.Env, colour bool) error {
 	if len(files) == 0 {
 		return api.Fail("no_file", "pass at least one path: `krowk uploads create screenshot.png`")
-	}
-	for _, path := range files {
-		info, err := os.Stat(path)
-		if err != nil || !info.Mode().IsRegular() {
-			return api.Fail("file_unreadable",
-				"cannot read `"+path+"` — paths resolve from the current directory")
-		}
 	}
 
 	metadata := runctx.Detect(env)

@@ -66,19 +66,64 @@ Flags win; everything else is detected so the agent never has to type it.
 
 ## Wire contract
 
-Reconstructed from what krowk.com already promises. The registry has to
-implement this for the CLI to work unchanged.
+An upload is a three-step handshake: declare the files, PUT their bytes to the
+presigned URLs the registry hands back, then finalize. Bytes never pass through
+the API host, so the registry stays a control plane and storage does the heavy
+lifting. The registry has to implement this for the CLI to work unchanged.
+
+**1. Declare.** The client hashes each file first, so it can name the upload
+before sending a byte.
 
 ```
 POST {KROWK_API_URL}/artifacts
 Authorization: Bearer <token>        # optional — anonymous uploads allowed
-Content-Type: multipart/form-data
-  file      one or more files, repeated field, streamed off disk
-  metadata  JSON blob (table above)
+Idempotency-Key: <key>
+Content-Type: application/json
 ```
 
 ```jsonc
-// 201 Created — 200 OK when the same bytes were already uploaded
+{
+  "idempotency_key": "<sha256 fold, see below>",
+  "files": [
+    { "filename": "foobar.jpg", "bytes": 421888, "content_type": "image/jpeg", "digest": "<sha256 of the bytes>" }
+  ],
+  "metadata": { }                    // the table above
+}
+```
+
+```jsonc
+// 201 Created — one target per declared file, in the order they were declared
+{
+  "id": "9f3c2e1",
+  "uploads": [
+    { "filename": "foobar.jpg", "method": "PUT", "url": "https://storage.../blob?sig=...",
+      "headers": { "Content-Type": "image/jpeg" } }
+  ],
+  "finalize_url": "https://api.krowk.com/v1/artifacts/9f3c2e1/finalize"
+}
+```
+
+```jsonc
+// 200 OK — this key was already finalized. No bytes are sent; this is the retry path.
+{ "id": "9f3c2e1", "complete": true, "artifact": { } }
+```
+
+**2. Send the bytes.** One `PUT` per target, streamed off disk, carrying the
+headers the registry supplied. The API token is deliberately *not* attached —
+a presigned URL carries its own authorisation and may point at any host.
+
+**3. Finalize.**
+
+```
+POST {finalize_url}
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{ "idempotency_key": "<key>" }
+```
+
+```jsonc
+// 200 OK
 {
   "id": "9f3c2e1",
   "url": "https://krowk.com/a/9f3c2e1",
@@ -103,12 +148,39 @@ body alone:
 }
 ```
 
-- **Idempotency** — the ID is the file digest, so a retrying agent gets one
-  artifact and the same link.
+- **Idempotency** — the key is a SHA-256 fold over each file's name, size and
+  content digest, in order: `sha256(name \0 size \0 digest \0 …)`. It is
+  derived from the bytes, so a retry, a crash-and-rerun, or the same push from
+  another machine all converge on one artifact and one link. Declare and
+  finalize carry it — the blob `PUT` does not, being identified by the token in
+  its presigned URL — and the registry verifies each blob against its declared
+  digest on arrival, so agreeing on the key really does mean agreeing on the
+  bytes. The body field is normative; the `Idempotency-Key` header the client
+  also sends is a courtesy copy for middleware, and a registry may reject a
+  request where the two disagree.
+- **Resumable** — declaring the same key again before finalizing returns the
+  same ID and the same upload targets, so blobs already stored stay stored.
+  Resumability is bounded by inactivity: a registry may reclaim a pending
+  handshake that has seen no declaration or blob for an hour, after which the
+  same key starts a fresh handshake. A registry at its pending-handshake
+  capacity may also refuse a new declaration with a retryable 503
+  `too_many_pending_uploads`.
+- **The ID authorises nothing.** It is the last segment of every link that gets
+  pasted anywhere, so `finalize` requires the idempotency key and rejects a
+  request without one. Only the caller that opened a handshake can complete it,
+  or replay it to get the artifact back.
+- **IDs lengthen on collision.** Seven hex characters is 28 bits, so two
+  unrelated uploads collide after a few thousand — inside a real registry's
+  first week. A collision extends the new ID rather than letting it take over an
+  existing upload's link, so links stay short until they cannot be.
 - **Rate limits** — `X-RateLimit-Limit`, `X-RateLimit-Remaining` on every
   response; `Retry-After` on the 429.
-- **Retries** — the client retries up to 3 times on `retryable: true`
-  (default for 429 and 5xx), honouring `Retry-After`.
+- **Retries** — each step retries up to 3 times on `retryable: true` (default
+  for 429 and 5xx), honouring `Retry-After`.
+- **Same-origin** — `finalize_url` must be on the API's own origin. The client
+  refuses to send the token anywhere else, and never follows a redirect — a
+  3xx from any step fails the upload — so a compromised registry response
+  cannot redirect the key. Upload URLs may point anywhere `http(s)`.
 - **Expiry** — an expired free link returns `410 Gone` carrying the original
   filename and upload time.
 
@@ -127,17 +199,20 @@ KROWK_API_URL=http://localhost:8787/v1 ./bin/krowk uploads create screenshot.png
 cmd/krowk               the binary
 cmd/krowk-mock          the mock registry
 internal/cli            flag parsing, routing, commands
-internal/api            HTTP client, streamed multipart, retries, credentials
+internal/api            HTTP client, the upload handshake, retries, credentials
 internal/runctx         git and CI metadata detection
 internal/output         human / json / markdown rendering
 internal/registry       the mock registry handler, shared with the tests
 ```
 
-`internal/registry` is a working stand-in for `api.krowk.com`: digest-derived
-IDs, the error envelope, rate-limit headers. It exists so the CLI can be
-developed and demoed before the registry ships — and doubles as the spec the
-registry has to satisfy. The CLI tests drive the real binary against it over a
-real socket via `httptest`.
+`internal/registry` is a working stand-in for `api.krowk.com`: the three-step
+handshake, idempotency keys verified against the bytes that actually arrive,
+the error envelope, rate-limit headers. It exists so the CLI can be developed
+and demoed before the registry ships — and doubles as the spec the registry has
+to satisfy. It serves the blob `PUT` itself rather than presigning out to object
+storage, which keeps the mock one process while exercising exactly the same
+client path. The CLI tests drive the real binary against it over a real socket
+via `httptest`.
 
 Environment: `KROWK_TOKEN`, `KROWK_API_URL`, `KROWK_AGENT`.
 

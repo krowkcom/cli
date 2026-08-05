@@ -123,6 +123,26 @@ func TestSameBytesUploadToTheSameURL(t *testing.T) {
 	}
 }
 
+func TestMultipleFilesLandUnderOneArtifact(t *testing.T) {
+	h := newHarness(t, 0)
+	second := filepath.Join(filepath.Dir(h.fixture), "checkout-before.png")
+	if err := os.WriteFile(second, []byte("the other fake png"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := h.run("push", h.fixture, second)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	e := decode(t, stdout)
+	if len(e.Data.Files) != 2 {
+		t.Errorf("files = %v, want both under one artifact", e.Data.Files)
+	}
+	if e.Data.Bytes != int64(len("fake png bytes for the test")+len("the other fake png")) {
+		t.Errorf("bytes = %d, want the sum of both files", e.Data.Bytes)
+	}
+}
+
 func TestFlagsMayFollowFilenames(t *testing.T) {
 	h := newHarness(t, 0)
 

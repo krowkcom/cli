@@ -5,10 +5,11 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
+	"maps"
 	"runtime"
 	"strings"
 	"time"
@@ -28,6 +29,7 @@ Usage
   krowk push <file...> [flags]             Alias for ` + "`uploads create`" + `
   krowk auth login --token <token>         Store an API token
   krowk auth token                         Print the stored token
+  krowk auth verify                        Check the key and its scopes
   krowk doctor                             Check the local setup
 
 Pasting the result
@@ -46,6 +48,7 @@ Upload flags
 
 Global flags
   --format <fmt>         human | json | markdown | url (default: human on a TTY, json when piped)
+                         markdown and url describe an upload; other commands fall back to json
   --json                 Shorthand for --format json
   --quiet                Raw JSON, no envelope
   -h, --help             Show this
@@ -137,6 +140,8 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		err = authLogin(stdout, f.token)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
 		err = authToken(stdout, env)
+	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "verify":
+		err = authVerify(stdout, format, env, f.quiet, colour)
 	case positionals[0] == "doctor":
 		err = doctor(stdout, format, env)
 	default:
@@ -188,11 +193,40 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 	client := api.New(env("KROWK_API_URL"), api.ReadToken(env))
 	artifact, err := client.CreateArtifact(context.Background(), files, metadata)
 	if err != nil {
-		return err
+		return authHint(err, client.Token != "")
 	}
 
 	fmt.Fprintln(w, output.Artifact(artifact, format, f.title, f.quiet, colour, time.Now()))
 	return nil
+}
+
+// authHint points a rejected upload at the self-check. The registry cannot know
+// the CLI has a verify command, so the CLI adds that half of the fix itself.
+// It keys on the error code, not the HTTP status: a 403 can also come off a
+// presigned storage URL mid-upload, where the key is fine and pointing the
+// agent at auth would be a dead end.
+func authHint(err error, authenticated bool) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	switch apiErr.Code() {
+	case "no_key", "invalid_key", "insufficient_scope":
+	default:
+		return err
+	}
+
+	hint := "run `krowk auth verify` to see what this key is allowed to do"
+	if !authenticated {
+		hint = "this push was anonymous — run `krowk auth login --token krk_...` first"
+	}
+	body := maps.Clone(apiErr.Body)
+	if fix, ok := body["fix"].(string); ok && fix != "" {
+		body["fix"] = fix + " — " + hint
+	} else {
+		body["fix"] = hint
+	}
+	return &api.Error{Status: apiErr.Status, Body: body}
 }
 
 func authLogin(w io.Writer, token string) error {
@@ -217,17 +251,37 @@ func authToken(w io.Writer, env runctx.Env) error {
 	return nil
 }
 
+// authVerify reports what the stored key can actually do, rather than trusting
+// that a token-shaped string is a working key.
+func authVerify(w io.Writer, format output.Format, env runctx.Env, quiet, colour bool) error {
+	client := api.New(env("KROWK_API_URL"), api.ReadToken(env))
+	if client.Token == "" {
+		return api.Fail("not_authenticated",
+			"no key to verify — run `krowk auth login --token krk_...`, or upload anonymously")
+	}
+
+	key, err := client.VerifyKey(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, output.Key(key, format, quiet, colour))
+	return nil
+}
+
 func doctor(w io.Writer, format output.Format, env runctx.Env) error {
 	client := api.New(env("KROWK_API_URL"), api.ReadToken(env))
 
-	status := probe(client)
+	// One call answers both questions: whether the registry is there, and what
+	// the key is good for. An HTTP response of any status proves reachability.
+	key, keyErr := client.VerifyKey(context.Background())
 
 	report := map[string]any{
 		"version":       Version,
 		"runtime":       runtime.Version() + " " + runtime.GOOS + "/" + runtime.GOARCH,
 		"api":           client.BaseURL,
-		"api_status":    status,
+		"api_status":    reachability(key, keyErr),
 		"authenticated": client.Token != "",
+		"key":           keySummary(client.Token, key, keyErr),
 		"credentials":   api.CredentialsPath(),
 		"context":       runctx.Detect(env),
 	}
@@ -238,7 +292,7 @@ func doctor(w io.Writer, format output.Format, env runctx.Env) error {
 		return nil
 	}
 
-	for _, k := range []string{"version", "runtime", "api", "api_status", "authenticated", "credentials"} {
+	for _, k := range []string{"version", "runtime", "api", "api_status", "authenticated", "key", "credentials"} {
 		fmt.Fprintf(w, "%-14s %v\n", k, report[k])
 	}
 	b, _ := json.Marshal(report["context"])
@@ -246,18 +300,44 @@ func doctor(w io.Writer, format output.Format, env runctx.Env) error {
 	return nil
 }
 
-// probe asks the registry whether it is there at all, without uploading.
-func probe(client *api.Client) string {
-	req, err := http.NewRequest(http.MethodOptions, client.BaseURL+"/artifacts", nil)
-	if err != nil {
-		return "unreachable — " + err.Error()
+// reachability separates "the registry answered" from "nothing is listening".
+func reachability(key *api.Key, err error) string {
+	if err == nil {
+		// The status the verification actually answered with — send accepts any
+		// 2xx, so the diagnostic must not assume 200.
+		return fmt.Sprintf("reachable (HTTP %d)", key.Status)
 	}
-	res, err := client.HTTP.Do(req)
-	if err != nil {
-		return "unreachable — " + err.Error()
+	var apiErr *api.Error
+	if errors.As(err, &apiErr) {
+		if apiErr.Status != 0 {
+			return fmt.Sprintf("reachable (HTTP %d)", apiErr.Status)
+		}
+		if detail, ok := apiErr.Body["detail"].(string); ok {
+			return "unreachable — " + detail
+		}
+		// A verdict formed before any HTTP exchange, e.g. an unparseable URL.
+		return "unreachable — " + apiErr.Code()
 	}
-	res.Body.Close()
-	return fmt.Sprintf("reachable (HTTP %d)", res.StatusCode)
+	return "unreachable — " + err.Error()
+}
+
+// keySummary says what the key is good for in one line.
+func keySummary(token string, key *api.Key, err error) string {
+	if token == "" {
+		return "none — uploads will be anonymous"
+	}
+	if err != nil {
+		var apiErr *api.Error
+		if errors.As(err, &apiErr) {
+			return "rejected — " + apiErr.Code()
+		}
+		return "unknown — " + err.Error()
+	}
+	scopes := strings.Join(key.Scopes, " ")
+	if scopes == "" {
+		scopes = "no scopes"
+	}
+	return fmt.Sprintf("%s (%s) %s", key.KeyID, key.Workspace, scopes)
 }
 
 func overrideString(dst *string, v string) {

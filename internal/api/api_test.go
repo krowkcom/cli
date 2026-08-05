@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,9 @@ import (
 	"testing"
 	"time"
 )
+
+// errorAs is errors.As, named so the assertions below read as assertions.
+func errorAs(err error, target any) bool { return errors.As(err, target) }
 
 func write(t *testing.T, dir, name, body string) string {
 	t.Helper()
@@ -335,6 +339,78 @@ func TestRetryAfterAcceptsBothSpellings(t *testing.T) {
 		if ok != tc.ok || (ok && got != tc.want) {
 			t.Errorf("retryAfter(%q) = %v, %v; want %v, %v", tc.in, got, ok, tc.want, tc.ok)
 		}
+	}
+}
+
+func TestVerifyKeyReportsScopes(t *testing.T) {
+	var auth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+		w.Header().Set("X-RateLimit-Remaining", "42")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Key{
+			Valid:     true,
+			KeyID:     "key_7f3a",
+			Workspace: "acme",
+			Scopes:    []string{"artifacts:read", ScopeWrite},
+		})
+	}))
+	defer srv.Close()
+
+	client := New(srv.URL+"/v1", "krk_secret")
+	key, err := client.VerifyKey(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth != "Bearer krk_secret" {
+		t.Errorf("Authorization = %q", auth)
+	}
+	if key.KeyID != "key_7f3a" || key.Workspace != "acme" {
+		t.Errorf("key = %+v", key)
+	}
+	if !key.HasScope(ScopeWrite) || key.HasScope("artifacts:delete") {
+		t.Errorf("scopes = %v", key.Scopes)
+	}
+	if key.RateLimitRemaining != "42" {
+		t.Errorf("remaining = %q, want it off the header", key.RateLimitRemaining)
+	}
+}
+
+// A 200 is not the same as a yes.
+func TestVerifyKeyTreatsValidFalseAsRejection(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Key{Valid: false})
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL+"/v1", "krk_secret").VerifyKey(context.Background())
+	var apiErr *Error
+	if !errorAs(err, &apiErr) || apiErr.Code() != "invalid_key" {
+		t.Fatalf("err = %v, want invalid_key", err)
+	}
+	// The verdict rode in on a 200; carrying that status is what lets doctor
+	// tell "the registry said no" apart from "nothing answered at all".
+	if apiErr.Status != http.StatusOK {
+		t.Errorf("status = %d, want the 200 the verdict arrived with", apiErr.Status)
+	}
+}
+
+func TestVerifyKeyPassesTheRegistrysRejectionThrough(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"error":"key_revoked","fix":"issue a new key","retryable":false}`)
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL+"/v1", "krk_secret").VerifyKey(context.Background())
+	var apiErr *Error
+	if !errorAs(err, &apiErr) || apiErr.Code() != "key_revoked" || apiErr.Status != http.StatusUnauthorized {
+		t.Fatalf("err = %v, want the registry's own key_revoked", err)
+	}
+	if apiErr.Fix() != "issue a new key" {
+		t.Errorf("fix = %q", apiErr.Fix())
 	}
 }
 

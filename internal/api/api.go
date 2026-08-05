@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -119,6 +120,72 @@ func (e *Error) Retryable() bool {
 // Fail builds a client-side error in the same shape as a server-side one.
 func Fail(code, fix string) *Error {
 	return &Error{Body: map[string]any{"error": code, "fix": fix, "retryable": false}}
+}
+
+// Key is what the registry says about the token it was called with. Verifying
+// beats guessing: a key can be revoked, expired, or simply scoped for reading,
+// and none of that is visible from the token string.
+type Key struct {
+	Valid              bool     `json:"valid"`
+	KeyID              string   `json:"key_id,omitempty"`
+	Workspace          string   `json:"workspace,omitempty"`
+	Scopes             []string `json:"scopes,omitempty"`
+	ExpiresAt          string   `json:"expires_at,omitempty"`
+	RateLimitRemaining string   `json:"rate_limit_remaining,omitempty"`
+	// Status is the HTTP status the verification answered with. Diagnostics
+	// print what actually arrived rather than assuming 200; the send path
+	// accepts any 2xx. Transport detail, not part of the key itself.
+	Status int `json:"-"`
+}
+
+// HasScope reports whether the key carries a named scope.
+func (k *Key) HasScope(scope string) bool {
+	return slices.Contains(k.Scopes, scope)
+}
+
+// ScopeWrite is what an upload needs.
+const ScopeWrite = "artifacts:write"
+
+// VerifyKey asks the registry to confirm the token and report its scopes. It
+// sends whatever token the client holds, including none, so the caller can tell
+// "no key" from "rejected key" from "registry unreachable".
+func (c *Client) VerifyKey(ctx context.Context) (*Key, error) {
+	endpoint, err := c.sameOrigin(c.BaseURL + "/keys/verify")
+	if err != nil {
+		return nil, err
+	}
+
+	var key Key
+	var status int
+	err = c.retry(ctx, func() error {
+		req, err := c.request(ctx, http.MethodPost, endpoint, strings.NewReader("{}"), "")
+		if err != nil {
+			return err
+		}
+		key = Key{}
+		res, err := c.decode(req, &key)
+		if err != nil {
+			return err
+		}
+		key.RateLimitRemaining = res.Header.Get("X-RateLimit-Remaining")
+		key.Status = res.Status
+		status = res.Status
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// A 200 saying valid:false is still a rejection; surface it as one, carrying
+	// the status it arrived with so the caller can tell it apart from an error
+	// formed before any HTTP exchange.
+	if !key.Valid {
+		return nil, &Error{Status: status, Body: map[string]any{
+			"error":     "invalid_key",
+			"fix":       "the registry does not recognise this key — run `krowk auth login --token krk_...` with a current one",
+			"retryable": false,
+		}}
+	}
+	return &key, nil
 }
 
 // ManifestFile declares one file before any bytes are sent. Digest lets the

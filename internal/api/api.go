@@ -463,8 +463,9 @@ func (c *Client) ClaimArtifact(ctx context.Context, slug, claimToken string) (*A
 //
 // A PUT for the same reason finalizing is one: the artifact ends up under the
 // same run however many times it is asked for, so a retry is a success rather
-// than an error. Both slugs resolve in the key's workspace, so an artifact has
-// to be claimed before it can be attached.
+// than an error. An artifact belongs to one run, so naming a different one moves
+// it. Both slugs resolve in the key's workspace, so an artifact has to be
+// claimed before it can be attached.
 func (c *Client) AttachRun(ctx context.Context, artifactSlug, runSlug string) (*Artifact, error) {
 	var artifact Artifact
 	body := map[string]any{"run": runSlug}

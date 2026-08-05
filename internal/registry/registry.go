@@ -623,6 +623,10 @@ func (s *store) attachRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Set, not appended to: an artifact belongs to one run, so a PUT naming a
+	// different one moves it rather than failing. That is what makes the call
+	// idempotent, and it is the only reading under which a retry whose first
+	// response was lost is a success.
 	a.Run = body.Run
 	writeJSON(w, http.StatusOK, serializeArtifact(a))
 }

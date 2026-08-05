@@ -578,22 +578,19 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 // that was anonymous at create time ever gets one: it could not name a run then,
 // and claiming it does not give it one.
 //
-// Keyless is refused with the same run_needs_key createArtifact answers with
-// rather than a 401: what is wrong is not the missing key by itself but that a
-// run belongs to a workspace and a keyless request has none.
+// A keyless request is a plain 401, not the run_needs_key a keyless push naming a
+// run answers with: the registry requires a key on this route the ordinary way,
+// and raises run_needs_key only where an upload may legitimately arrive without
+// one. Answering something friendlier here would make --dev disagree with
+// production about the code a client branches on.
 //
 // A finished run still accepts one, deliberately: the case this exists for is a
 // CI job whose run closed long before anyone got round to claiming the anonymous
 // upload it left behind, and refusing then would leave that upload with nowhere
 // to go for good.
 func (s *store) attachRun(w http.ResponseWriter, r *http.Request) {
-	workspace, ok := authenticate(w, r)
+	workspace, ok := requireKey(w, r)
 	if !ok {
-		return
-	}
-	if workspace == "" {
-		writeError(w, http.StatusUnprocessableEntity, "run_needs_key",
-			"Attaching an artifact to a run needs an API key — a keyless upload has no workspace.", nil)
 		return
 	}
 
@@ -616,6 +613,16 @@ func (s *store) attachRun(w http.ResponseWriter, r *http.Request) {
 	a := s.find(workspace, r.PathValue("slug"))
 	if a == nil {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+	// Past its expiry an artifact is gone as far as the API is concerned, on every
+	// endpoint rather than only the ones that can meet an expiring one today.
+	// Nothing here produces this state — only a keyless upload gets an expiry, and
+	// this route needs a key — but the meaning of an expiry has to be uniform if an
+	// ephemeral artifact ever does reach a keyed workspace.
+	if s.expired(a) {
+		writeError(w, http.StatusGone, "expired",
+			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
 		return
 	}
 	if existing, ok := s.runs[body.Run]; !ok || existing.workspace != workspace {

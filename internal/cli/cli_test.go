@@ -439,8 +439,11 @@ func TestUploadsAttachNeedsBothHalves(t *testing.T) {
 	}
 }
 
-// Attaching needs a key, because a run belongs to a workspace. The refusal is
-// shared with a keyless push naming a run, so its advice must fit both.
+// Attaching needs a key the ordinary way, so a keyless one is a plain 401 — not
+// the run_needs_key a keyless push naming a run gets, which the registry raises
+// only where a request may legitimately arrive without a key. Pinned because the
+// difference is what a client branches on, and a friendlier stand-in here would
+// hide it until production.
 func TestUploadsAttachNeedsAKey(t *testing.T) {
 	h := newHarness(t, 0)
 	started := h.ok("runs", "start")
@@ -448,11 +451,12 @@ func TestUploadsAttachNeedsAKey(t *testing.T) {
 
 	h.anonymous()
 	body := h.fails("uploads", "attach", pushed.Slug, "--run="+started.Data.Slug)
-	if body["error"] != "run_needs_key" {
-		t.Fatalf("error = %v, want run_needs_key", body)
+	if body["error"] != "unauthorized" {
+		t.Fatalf("error = %v, want unauthorized", body)
 	}
-	if fix, _ := body["fix"].(string); !strings.Contains(fix, "API key") {
-		t.Errorf("fix = %q, want it to name the key", fix)
+	// With no key sent at all, "check your token" is no advice; naming the login is.
+	if fix, _ := body["fix"].(string); !strings.Contains(fix, "auth login") {
+		t.Errorf("fix = %q, want it to name the login", fix)
 	}
 }
 

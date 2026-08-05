@@ -274,14 +274,15 @@ func TestAttachRunOnAForeignSlugIsNotFound(t *testing.T) {
 	}
 }
 
-// The keyless refusal is reached by an attach as well as by a push naming a run,
-// so its fix must not tell the caller to drop a flag an attach does not have.
-func TestRunNeedsKeyFixIsNotPushSpecific(t *testing.T) {
+// Only an upload naming a run reaches run_needs_key — the attach route answers a
+// keyless request with a plain 401 — so the fix may name --run, and the CLI must
+// not have generalized it into advice that fits neither path well.
+func TestRunNeedsKeyFixNamesTheFlagThatCausedIt(t *testing.T) {
 	fix := fixFor("run_needs_key", http.StatusUnprocessableEntity)
 	if !strings.Contains(fix, "API key") {
 		t.Errorf("fix = %q, want it to name the key", fix)
 	}
-	if strings.Contains(fix, "--run") {
-		t.Errorf("fix = %q, want no push-only flag in it", fix)
+	if !strings.Contains(fix, "--run") {
+		t.Errorf("fix = %q, want the flag that caused it", fix)
 	}
 }

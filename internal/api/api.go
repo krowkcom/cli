@@ -823,10 +823,10 @@ func fixFor(code string, status int) string {
 	case "unauthorized":
 		return "the registry rejected the key — check KROWK_TOKEN, or run `krowk auth login --token krowk_sk_...`"
 	case "run_needs_key":
-		// Reached from a push naming a run and from an attach alike, so it says what
-		// is missing rather than which flag to drop.
-		return "a run belongs to a workspace, so attaching an upload to one needs an API key — " +
-			"run `krowk auth login --token krowk_sk_...`, or leave the run off"
+		// Only an upload naming a run reaches this: the registry raises it where a
+		// request may legitimately arrive keyless, and refuses the attach route with a
+		// plain 401 instead. So naming --run here is right, not push-specific.
+		return "attaching an upload to a run needs an API key — authenticate, or upload without --run"
 	case "upload_missing":
 		return "the bytes had not landed when the upload was finalized — retry the upload"
 	case "checksum_mismatch":

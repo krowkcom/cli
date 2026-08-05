@@ -396,7 +396,7 @@ func mustShow(t *testing.T, server *httptest.Server, token, slug string) map[str
 
 // A run belongs to a workspace, so a keyless attach is refused with the same code
 // a keyless push naming a run gets — and the run parameter is required.
-func TestAttachRunRefusesKeylessAndDemandsARun(t *testing.T) {
+func TestAttachRunNeedsAKeyAndARun(t *testing.T) {
 	server, _ := newClockedServer(t)
 	const token = "krowk_sk_owner"
 
@@ -405,9 +405,12 @@ func TestAttachRunRefusesKeylessAndDemandsARun(t *testing.T) {
 	run := openRun(t, server, token)
 	url := server.URL + "/v1/artifacts/" + slug + "/run"
 
+	// A plain 401, the way the registry refuses this route — not the run_needs_key a
+	// keyless push naming a run gets, which is raised only where a request may
+	// legitimately arrive without a key.
 	status, payload := request(t, http.MethodPut, url, "", "application/json", fmt.Sprintf(`{"run":%q}`, run))
-	if status != http.StatusUnprocessableEntity || errorCode(payload) != "run_needs_key" {
-		t.Errorf("keyless attach = %d %s, want 422 run_needs_key", status, errorCode(payload))
+	if status != http.StatusUnauthorized || errorCode(payload) != "unauthorized" {
+		t.Errorf("keyless attach = %d %s, want 401 unauthorized", status, errorCode(payload))
 	}
 
 	status, payload = request(t, http.MethodPut, url, token, "application/json", `{}`)

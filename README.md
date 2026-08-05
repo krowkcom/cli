@@ -160,6 +160,36 @@ A `200` carrying `valid: false` counts as a rejection too. Uploading needs
 `artifacts:write`; a key without it is turned down at the manifest, before any
 bytes move, with `403 insufficient_scope` naming the scope it lacked.
 
+**Anonymous uploads.** No key is a supported path, not an error — the point is
+that the upload step never fails for boring reasons. An anonymous upload is
+ephemeral and unowned, so the finalize response marks it and hands back a link
+that adopts it:
+
+```jsonc
+{ "anonymous": true, "expires_at": "…",           // 24h, not the workspace 48h
+  "claim_url": "https://krowk.com/claim/2b7f91" }
+```
+
+Claiming happens in a browser, signed in — there is no API call for it. Which
+side of the fence an upload lands on is settled when the handshake opens, so it
+cannot change hands by finalizing with a different key.
+
+The claim URL is a **capability**: anyone holding it can adopt the upload. So:
+
+- it is printed for whoever ran the push, and kept out of both paste forms;
+- `GET /v1/artifacts/{id}` never returns it — the ID is public, since it is in
+  the shareable link, and knowing it must not be enough to claim the upload;
+- it is handed back exactly once, on the single response that finalizes the
+  artifact — completing the upload earns the claim. Identity is derived from the
+  bytes, so anyone holding a copy of the same file derives the same key; once an
+  artifact exists, a replay gets the link but not the claim URL, so pushing a
+  file someone else had already shared anonymously cannot adopt their upload.
+  The one caveat is an *interrupted* anonymous handshake: it resumes for anyone
+  anonymous with the same bytes, and whoever finalizes first gets the claim URL
+  (and the opener's metadata). There is no opener identity to check against —
+  that is the deliberate price of anonymous, content-derived identity being
+  resumable.
+
 **3. Finalize.**
 
 ```
@@ -215,8 +245,9 @@ body alone:
   `too_many_pending_uploads`.
 - **The ID authorises nothing.** It is the last segment of every link that gets
   pasted anywhere, so `finalize` requires the idempotency key and rejects a
-  request without one. Only the caller that opened a handshake can complete it,
-  or replay it to get the artifact back.
+  request without one. Only a caller in the same ownership class — no key for
+  anonymous uploads, a valid write-scoped key in the same workspace for keyed
+  ones — can complete a handshake, or replay it to get the artifact back.
 - **IDs lengthen on collision.** Seven hex characters is 28 bits, so two
   unrelated uploads collide after a few thousand — inside a real registry's
   first week. A collision extends the new ID rather than letting it take over an

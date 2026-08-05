@@ -25,9 +25,11 @@ const (
 	// DefaultLimitBytes matches the free tier the website advertises.
 	DefaultLimitBytes int64 = 100 << 20
 	dailyUploads            = 100
-	// expiry is how long a link lives. Anonymous uploads get their own window
-	// once the CLI grows a claim flow.
-	expiry = 48 * time.Hour
+	// workspaceExpiry is how long a link lives once it belongs to a workspace.
+	workspaceExpiry = 48 * time.Hour
+	// anonymousExpiry is shorter, because nobody has claimed the upload yet.
+	// Claiming it moves it onto the workspace window.
+	anonymousExpiry = 24 * time.Hour
 	// A declaration that never finalizes still costs memory, and declaring costs
 	// an attacker one request with no bytes behind it. So pending state expires
 	// and is capped: without both, the one endpoint that needs no key is a way to
@@ -53,6 +55,14 @@ type artifact struct {
 	ExpiresAt  string          `json:"expires_at"`
 	Files      []file          `json:"files"`
 	Metadata   json.RawMessage `json:"metadata"`
+	// Anonymous means no key was presented, so this upload belongs to nobody
+	// yet and expires sooner.
+	Anonymous bool `json:"anonymous,omitempty"`
+	// ClaimURL adopts an anonymous upload into a workspace. It is a website
+	// URL, opened signed-in in a browser — not an API call — and it is a
+	// capability, so it is never part of the paste-ready output. It is minted
+	// into the finalize response only, never stored.
+	ClaimURL string `json:"claim_url,omitempty"`
 }
 
 // manifestFile is one declared file, before its bytes arrive.
@@ -91,12 +101,18 @@ type slot struct {
 	received bool
 }
 
-// upload is an in-flight handshake, keyed by its idempotency key.
+// upload is an in-flight handshake, keyed by its scoped idempotency key.
 type upload struct {
-	id       string
-	key      string
+	id  string
+	key string
+	// scoped is the key qualified by ownership class — the form the store's
+	// maps use, so uploads in different classes never deduplicate together.
+	scoped   string
 	metadata json.RawMessage
 	slots    []*slot
+	// anonymous is decided when the handshake opens, so an upload cannot change
+	// hands halfway through by finalizing with a different key.
+	anonymous bool
 	// at is when the handshake last showed signs of life — opened, resumed,
 	// or landed a blob — so only truly abandoned ones are swept.
 	at time.Time
@@ -104,14 +120,14 @@ type upload struct {
 
 type store struct {
 	mu        sync.Mutex
-	pending   map[string]*upload  // by idempotency key
+	pending   map[string]*upload  // by scoped idempotency key
 	byID      map[string]*upload  // by artifact ID, for finalize
 	byToken   map[string]tokenRef // by blob token, for PUT
 	artifacts map[string]artifact // finalized, by artifact ID
-	finalized map[string]string   // idempotency key -> artifact ID
-	// idOwner remembers which key claimed each ID, pending or finalized, so a
-	// second upload can never be handed an ID that is already spoken for.
-	idOwner map[string]string // artifact ID -> idempotency key
+	finalized map[string]string   // scoped idempotency key -> artifact ID
+	// idOwner remembers which scoped key claimed each ID, pending or finalized,
+	// so a second upload can never be handed an ID that is already spoken for.
+	idOwner map[string]string // artifact ID -> scoped idempotency key
 }
 
 type tokenRef struct {
@@ -202,6 +218,33 @@ func describeKey(token string) (info keyInfo, anonymous bool) {
 		Workspace: "acme",
 		Scopes:    scopes,
 	}, false
+}
+
+// anonymousClass is the ownership class of an upload made without a key.
+const anonymousClass = "anonymous"
+
+// ownerClass names the ownership partition a request uploads into: anonymous,
+// or a workspace. Dedup happens only within one class — the idempotency key is
+// derived from the bytes, so without the partition a keyed push of a file
+// someone had already pushed anonymously would inherit their unowned artifact,
+// with its shorter expiry and no way to adopt it into the workspace.
+//
+// Every handler that classifies calls authorize first, which turns an invalid
+// token into a 401 — so the invalid branch here is defence in depth, never a
+// silent fall into the anonymous class.
+func ownerClass(r *http.Request) string {
+	info, anonymous := describeKey(bearer(r))
+	if anonymous || !info.Valid {
+		return anonymousClass
+	}
+	return "workspace\x00" + info.Workspace
+}
+
+// scopedKey is the idempotency key qualified by its ownership class. Every map
+// keyed by idempotency key uses this form, so uploads in different classes can
+// never observe each other.
+func scopedKey(class, key string) string {
+	return class + "\x00" + key
 }
 
 // verify lets the CLI self-check auth and scopes before doing any work.
@@ -332,9 +375,15 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 			return
 		}
 
-		// The same key twice: hand back the finished artifact rather than a
-		// second set of upload targets. This is what makes a retry free.
-		if id, ok := s.finalized[req.IdempotencyKey]; ok {
+		// The same key twice, in the same ownership class: hand back the
+		// finished artifact rather than a second set of upload targets. This is
+		// what makes a retry free. The class matters — the key comes from the
+		// bytes, so without it a keyed push would inherit an anonymous upload
+		// of the same file instead of minting one the workspace owns. The
+		// stored artifact never carries the claim URL — see finalize.
+		class := ownerClass(r)
+		scoped := scopedKey(class, req.IdempotencyKey)
+		if id, ok := s.finalized[scoped]; ok {
 			done := s.artifacts[id]
 			writeJSON(w, http.StatusOK, rate, beginResponse{ID: id, Complete: true, Artifact: &done})
 			return
@@ -357,7 +406,7 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 
 		// An interrupted handshake resumes: same key, same targets, so the
 		// blobs already stored stay stored.
-		up, resumed := s.pending[req.IdempotencyKey]
+		up, resumed := s.pending[scoped]
 		if resumed {
 			// A resume restarts the clock. Without this, `at` keeps the
 			// original declaration's time and a handshake resumed minutes ago
@@ -376,19 +425,21 @@ func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
 				return
 			}
 			up = &upload{
-				id:       s.mintID(req.IdempotencyKey),
-				key:      req.IdempotencyKey,
-				metadata: validMetadata(req.Metadata),
-				slots:    make([]*slot, 0, len(req.Files)),
-				at:       time.Now(),
+				id:        s.mintID(scoped),
+				key:       req.IdempotencyKey,
+				scoped:    scoped,
+				metadata:  validMetadata(req.Metadata),
+				slots:     make([]*slot, 0, len(req.Files)),
+				anonymous: class == anonymousClass,
+				at:        time.Now(),
 			}
-			s.idOwner[up.id] = up.key
+			s.idOwner[up.id] = up.scoped
 			for _, f := range req.Files {
 				sl := &slot{manifestFile: f, token: newToken()}
 				up.slots = append(up.slots, sl)
 				s.byToken[sl.token] = tokenRef{upload: up, index: len(up.slots) - 1}
 			}
-			s.pending[up.key] = up
+			s.pending[up.scoped] = up
 			s.byID[up.id] = up
 		}
 
@@ -512,6 +563,15 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 
 		rate := rateHeaders(max(0, dailyUploads-len(s.artifacts)))
 
+		// The same gate as begin: an invalid token is a 401, not a silent fall
+		// into the anonymous class, and a read-only key cannot complete what it
+		// could never have opened. Without this, finalize would classify
+		// `Bearer garbage` as anonymous and let a krk_ro_ key — same workspace
+		// class as a writer — finish a pending workspace upload.
+		if !authorize(w, r, rate) {
+			return
+		}
+
 		// The ID is public — it is the last segment of the link people paste
 		// into pull requests. So it authorises nothing on its own: proving you
 		// opened this handshake means presenting the key, which is derived from
@@ -526,10 +586,12 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 		}
 
 		// Finalizing twice is not an error; it is the retry path. But only for
-		// the caller that opened it — anyone else gets the same answer as for an
-		// ID that was never theirs.
+		// the caller that opened it — the key and the ownership class must both
+		// agree, so a keyed caller holding the same bytes as an anonymous upload
+		// gets the same answer as for an ID that was never theirs. The stored
+		// artifact never carries the claim URL, so a replay cannot leak it.
 		if done, ok := s.artifacts[id]; ok {
-			if s.finalized[body.IdempotencyKey] != id {
+			if s.finalized[scopedKey(ownerClass(r), body.IdempotencyKey)] != id {
 				writeJSON(w, http.StatusConflict, rate, map[string]any{
 					"error":     "idempotency_key_mismatch",
 					"fix":       "finalize with the same idempotency_key the handshake was opened with",
@@ -551,7 +613,11 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 			})
 			return
 		}
-		if body.IdempotencyKey != up.key {
+		// Pending uploads are partitioned the same way as finished ones: the key
+		// alone is derivable from the bytes, so a keyed caller holding a copy of
+		// an anonymously-pushed file could otherwise finalize the anonymous
+		// pending upload and walk off with its one-time claim capability.
+		if scopedKey(ownerClass(r), body.IdempotencyKey) != up.scoped {
 			writeJSON(w, http.StatusConflict, rate, map[string]any{
 				"error":     "idempotency_key_mismatch",
 				"fix":       "finalize with the same idempotency_key the handshake was opened with",
@@ -595,24 +661,48 @@ func (s *store) finalize(siteURL string) http.HandlerFunc {
 		}
 
 		site := publicOrigin(r, siteURL)
+		window := workspaceExpiry
+		if up.anonymous {
+			window = anonymousExpiry
+		}
 		a := artifact{
 			ID:         up.id,
 			URL:        fmt.Sprintf("%s/a/%s", site, up.id),
 			PreviewURL: fmt.Sprintf("%s/a/%s/preview.png", site, up.id),
 			Bytes:      total,
-			ExpiresAt:  time.Now().Add(expiry).UTC().Format(time.RFC3339),
+			ExpiresAt:  time.Now().Add(window).UTC().Format(time.RFC3339),
 			Files:      files,
 			Metadata:   up.metadata,
+			Anonymous:  up.anonymous,
 		}
 		s.artifacts[a.ID] = a
-		s.finalized[up.key] = a.ID
-		delete(s.pending, up.key)
+		s.finalized[up.scoped] = a.ID
+		delete(s.pending, up.scoped)
 		// byID exists to find a handshake in flight, and finalize answers a repeat
 		// from s.artifacts before it ever looks here — so holding the upload and
 		// its slots past this point keeps them alive for nothing.
 		delete(s.byID, up.id)
 		for _, sl := range up.slots {
 			delete(s.byToken, sl.token)
+		}
+
+		if up.anonymous {
+			// Whoever holds this can adopt the upload, so it is minted straight
+			// into this one response — never stored — and handed back exactly
+			// once, on the single response that finalizes the artifact. No later
+			// egress path can leak what the store never held.
+			//
+			// "Once" is a promise about responses, not people: completing the
+			// upload earns the claim. Anonymous identity is derived from the
+			// bytes, so if the opener is interrupted before finalizing, a second
+			// anonymous pusher of the same file resumes the pending handshake
+			// and — by finalizing first — receives the claim URL and the
+			// opener's metadata. There is no opener identity to check against;
+			// the alternatives (fresh identity per anonymous begin, or expiring
+			// pending uploads) would break the resumability and dedup this
+			// registry promises, so the trade-off is made deliberately and
+			// stated in the README.
+			a.ClaimURL = fmt.Sprintf("%s/claim/%s", site, newToken())
 		}
 
 		// Recomputed now this upload is counted, so the header an agent reads
@@ -663,6 +753,9 @@ func (s *store) get(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// The ID is public — it is in the shareable link. The claim URL is not; it
+	// was minted into the finalize response and never stored, so a lookup has
+	// nothing to leak.
 	writeJSON(w, http.StatusOK, nil, a)
 }
 
@@ -687,8 +780,9 @@ func foldKey(slots []*slot) string {
 // ends up in every link that gets pasted anywhere.
 const idLength = 7
 
-// mintID derives the public ID from the idempotency key, so the same bytes
-// always resolve to the same link without the key itself appearing in the URL.
+// mintID derives the public ID from the scoped idempotency key, so the same
+// bytes pushed by the same ownership class always resolve to the same link
+// without the key itself appearing in the URL.
 //
 // Seven hex characters is only 28 bits, which sounds like plenty and is not: two
 // unrelated uploads collide after a few thousand, well inside a real registry's

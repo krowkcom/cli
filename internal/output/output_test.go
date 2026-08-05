@@ -134,6 +134,76 @@ func TestJSONCarriesBothPasteForms(t *testing.T) {
 	}
 }
 
+func TestClaimURLIsShownButNeverPasteable(t *testing.T) {
+	a := &api.Artifact{
+		ID:         "9f3c2e1",
+		URL:        "https://krowk.com/a/9f3c2e1",
+		PreviewURL: "https://krowk.com/a/9f3c2e1/preview.png",
+		Anonymous:  true,
+		ClaimURL:   "https://krowk.com/claim/2b7f",
+		Files:      []api.File{{Filename: "foobar.jpg"}},
+	}
+
+	// Visible to whoever ran the push...
+	human := Artifact(a, Human, "", false, false, time.Now())
+	if !strings.Contains(human, a.ClaimURL) || !strings.Contains(human, "do not share") {
+		t.Errorf("human output should show the claim URL and warn about it:\n%s", human)
+	}
+
+	// ...but never in something destined for a pull request comment.
+	p := PasteFor(a, "")
+	if strings.Contains(p.Markdown, "claim") || strings.Contains(p.URL, "claim") {
+		t.Errorf("paste = %+v, want no claim URL", p)
+	}
+	if got := Artifact(a, Markdown, "", false, false, time.Now()); strings.Contains(got, "claim") {
+		t.Errorf("--format markdown leaked the claim URL: %s", got)
+	}
+	if got := Artifact(a, URL, "", false, false, time.Now()); got != a.URL {
+		t.Errorf("--format url = %q, want just the shareable link", got)
+	}
+}
+
+// A replay arrives without the claim URL — it was handed out once, to the push
+// that created the artifact — so the summary must not advise claiming what
+// this caller cannot reach.
+func TestRetrySummaryDoesNotAdviseAnUnactionableClaim(t *testing.T) {
+	a := &api.Artifact{
+		ID:        "9f3c2e1",
+		URL:       "https://krowk.com/a/9f3c2e1",
+		Bytes:     3,
+		Anonymous: true,
+		Files:     []api.File{{Filename: "foobar.jpg", Bytes: 3}},
+	}
+
+	var e struct {
+		Summary     string       `json:"summary"`
+		Breadcrumbs []Breadcrumb `json:"breadcrumbs"`
+	}
+	if err := json.Unmarshal([]byte(Artifact(a, JSON, "", false, false, time.Now())), &e); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(e.Summary, "anonymous") {
+		t.Errorf("summary = %q, want the anonymous status still visible", e.Summary)
+	}
+	if strings.Contains(e.Summary, "claim") {
+		t.Errorf("summary = %q, want no claim advice without a claim URL to act on", e.Summary)
+	}
+	for _, b := range e.Breadcrumbs {
+		if b.Action == "claim" {
+			t.Errorf("breadcrumbs = %+v, want no claim action without a claim URL", e.Breadcrumbs)
+		}
+	}
+
+	// The original push, claim URL in hand, keeps the advice and the crumb.
+	a.ClaimURL = "https://krowk.com/claim/2b7f"
+	if err := json.Unmarshal([]byte(Artifact(a, JSON, "", false, false, time.Now())), &e); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(e.Summary, "claim it to keep it") {
+		t.Errorf("summary = %q, want the claim advice for the push holding the URL", e.Summary)
+	}
+}
+
 func TestMarkdownFallsBackToALinkWithoutAPreview(t *testing.T) {
 	a := &api.Artifact{ID: "9f3c2e1", URL: "https://krowk.com/a/9f3c2e1"}
 

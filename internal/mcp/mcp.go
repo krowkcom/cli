@@ -53,7 +53,8 @@ If a push comes back anonymous, each artifact carries a claim_token. Spending it
 — krowk_claim_artifact, or ` + "`krowk claim <slug> <token>`" + ` — is the only way to
 keep that upload past its expiry, and anyone holding the token can do it. Treat
 it as a secret: give it to the human, never paste it into a pull request, an
-issue or a chat message.
+issue or a chat message. An anonymous upload belongs to no run, so pass the run
+to krowk_claim_artifact if the upload should be grouped with the rest of them.
 
 krowk_push only uploads files from the working directory and below. Anything
 outside it is refused, symlinks included, and credential files are refused even
@@ -569,6 +570,24 @@ func withProgress(err error, done []*api.Artifact, runSlug string, ownRun bool) 
 	return apiErr
 }
 
+// withClaimed says what a failed attach leaves behind: the claim succeeded and
+// the token is spent, so calling the tool again would fail on the claim and look
+// like the upload was lost. Only the attach is left to retry.
+func withClaimed(err error, claimed *api.Artifact, runSlug string) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	apiErr.Body["claimed"] = claimed.Slug
+	retry := "the upload is claimed and kept, only the run is not attached — retry `krowk uploads attach " +
+		claimed.Slug + " --run " + runSlug + "`"
+	if fix, _ := apiErr.Body["fix"].(string); fix != "" {
+		retry = fix + "; " + retry
+	}
+	apiErr.Body["fix"] = retry
+	return apiErr
+}
+
 func listArtifacts(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
 	var a struct {
 		Limit  int    `json:"limit"`
@@ -619,13 +638,19 @@ func getArtifact(ctx context.Context, s *Server, args json.RawMessage) (string, 
 	return s.render(artifact, "")
 }
 
+// claimArtifact adopts an anonymous upload, and optionally puts it under a run on
+// the way — the agent spending the claim token is the one that knows which run the
+// upload came from, so there is no separate attach tool. The order is fixed: the
+// attach resolves both slugs in the key's workspace, so the claim has to land
+// first.
 func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
 	var a struct {
 		Slug       string `json:"slug"`
 		ClaimToken string `json:"claim_token"`
+		Run        string `json:"run"`
 	}
 	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
-		return "", nil, api.Fail("bad_arguments", "`slug` and `claim_token` must be strings")
+		return "", nil, api.Fail("bad_arguments", "`slug`, `claim_token` and `run` must be strings")
 	}
 	if strings.TrimSpace(a.Slug) == "" || strings.TrimSpace(a.ClaimToken) == "" {
 		return "", nil, api.Fail("missing_claim", "pass both the artifact slug and its claim_token")
@@ -635,7 +660,28 @@ func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string
 	if err != nil {
 		return "", nil, err
 	}
-	return s.render(artifact, "")
+
+	runSlug := strings.TrimSpace(a.Run)
+	if runSlug != "" {
+		// The claim has already been spent, so a failure here must not read as one
+		// the agent can undo by calling the tool again: the artifact is kept, and
+		// only the run is missing.
+		attached, err := s.Client.AttachRun(ctx, artifact.Slug, runSlug)
+		if err != nil {
+			return "", nil, withClaimed(err, artifact, runSlug)
+		}
+		artifact = attached
+	}
+
+	text, structured, err := s.render(artifact, "")
+	if err != nil {
+		return "", nil, err
+	}
+	if runSlug != "" {
+		// Said the way renderPush says it, since it is the same fact.
+		text += "\n\nGrouped under run " + runSlug + "."
+	}
+	return text, structured, nil
 }
 
 func getRun(_ context.Context, s *Server, _ json.RawMessage) (string, any, error) {
@@ -867,7 +913,9 @@ func toolSchemas() []map[string]any {
 		{
 			"name": "krowk_claim_artifact",
 			"description": "Spend a claim token to move an anonymous artifact into the key's " +
-				"workspace, where it stops expiring. Needs an API key.",
+				"workspace, where it stops expiring. Pass `run` to also group it under a run — " +
+				"an anonymous upload could not name one, so this is the only way it gets one. " +
+				"Needs an API key.",
 			"inputSchema": map[string]any{
 				"type":     "object",
 				"required": []string{"slug", "claim_token"},
@@ -879,6 +927,11 @@ func toolSchemas() []map[string]any {
 					"claim_token": map[string]any{
 						"type":        "string",
 						"description": "The claim token the anonymous push returned, e.g. krowk_claim_...",
+					},
+					"run": map[string]any{
+						"type": "string",
+						"description": "Run to attach the claimed upload to, e.g. run_... Attached after " +
+							"the claim, so it must be a run in this key's workspace.",
 					},
 				},
 				"additionalProperties": false,

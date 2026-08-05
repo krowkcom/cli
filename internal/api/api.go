@@ -1,10 +1,11 @@
 // Package api talks to the krowk artifact registry.
 //
 // An upload is a three-step handshake: declare the files, PUT their bytes to
-// the presigned URLs the registry hands back, then finalize. Every step carries
-// the same idempotency key, derived from the bytes themselves, so an agent that
-// retries — or crashes and runs the whole command again — converges on one
-// artifact and one link instead of littering the registry with duplicates.
+// the presigned URLs the registry hands back, then finalize. Declare and
+// finalize carry the same idempotency key, derived from the bytes themselves,
+// so an agent that retries — or crashes and runs the whole command again —
+// converges on one artifact and one link instead of littering the registry
+// with duplicates; the blob PUT is identified by its presigned URL alone.
 package api
 
 import (
@@ -50,8 +51,18 @@ func New(baseURL, token string) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Token:   token,
-		HTTP:    &http.Client{Timeout: 5 * time.Minute},
-		Sleep:   time.Sleep,
+		HTTP: &http.Client{
+			Timeout: 5 * time.Minute,
+			// Never follow a redirect. sameOrigin vets the URL a request starts
+			// at, not where a 302 sends it next — and Go forwards Authorization
+			// on any same-host hop, so a redirect to another port, a subdomain,
+			// or an https→http downgrade still carries the token. send turns the
+			// 3xx this leaves behind into an error.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		Sleep: time.Sleep,
 	}
 }
 
@@ -304,8 +315,16 @@ func (c *Client) begin(ctx context.Context, body beginRequest) (*beginResponse, 
 			return err
 		}
 		out = beginResponse{}
-		_, err = c.decode(req, &out)
-		return err
+		res, err := c.decode(req, &out)
+		if err != nil {
+			return err
+		}
+		// A replayed upload short-circuits before finalize, so the rate limit
+		// has to ride this response or the envelope loses the field.
+		if out.Complete && out.Artifact != nil {
+			out.Artifact.RateLimitRemaining = res.Header.Get("X-RateLimit-Remaining")
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -440,11 +459,18 @@ type response struct {
 func (c *Client) send(req *http.Request) (*response, error) {
 	res, err := c.HTTP.Do(req)
 	if err != nil {
+		origin := req.URL.Scheme + "://" + req.URL.Host
+		// "check KROWK_API_URL" is only good advice when the API is what failed;
+		// a blob PUT goes to whatever storage host the registry named.
+		fix := "cannot reach " + origin + " — check the network"
+		if c.isAPIOrigin(req.URL) {
+			fix = "cannot reach " + c.BaseURL + " — check the network, or point KROWK_API_URL at a reachable registry"
+		}
 		return nil, &Error{Body: map[string]any{
 			"error":     "network_unreachable",
 			"endpoint":  req.URL.String(),
 			"detail":    err.Error(),
-			"fix":       "cannot reach " + c.BaseURL + " — check the network, or point KROWK_API_URL at a reachable registry",
+			"fix":       fix,
 			"retryable": false,
 		}}
 	}
@@ -452,12 +478,31 @@ func (c *Client) send(req *http.Request) (*response, error) {
 
 	payload, readErr := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 
+	// CheckRedirect hands 3xx responses back instead of following them; treat
+	// them as the refusal they are rather than as a body to decode.
+	if res.StatusCode >= 300 && res.StatusCode < 400 {
+		return nil, &Error{Status: res.StatusCode, Body: map[string]any{
+			"error":     "unexpected_redirect",
+			"endpoint":  req.URL.String(),
+			"location":  res.Header.Get("Location"),
+			"fix":       "the server redirected this request — following it could carry the request past the origin checks, so it is not followed",
+			"retryable": false,
+		}}
+	}
+
 	if res.StatusCode >= 400 {
 		body := map[string]any{}
 		if readErr != nil || json.Unmarshal(payload, &body) != nil || body["error"] == nil {
+			// Same split as the Do-error path: a storage host answers in XML as a
+			// matter of course, and KROWK_API_URL has nothing to do with it.
+			fix := "the storage host at " + req.URL.Scheme + "://" + req.URL.Host +
+				" rejected the request without a JSON error — a presigned upload may have expired; rerun the command for fresh URLs"
+			if c.isAPIOrigin(req.URL) {
+				fix = "the registry did not return a JSON error — check KROWK_API_URL points at the API, not the website"
+			}
 			body = map[string]any{
 				"error": fmt.Sprintf("http_%d", res.StatusCode),
-				"fix":   "the registry did not return a JSON error — check KROWK_API_URL points at the API, not the website",
+				"fix":   fix,
 			}
 		}
 		apiErr := &Error{Status: res.StatusCode, Body: body}
@@ -527,11 +572,16 @@ func backoff(e *Error, attempt int) time.Duration {
 func retryAfter(v string, now time.Time) (time.Duration, bool) {
 	const maxWait = 60 * time.Second
 
-	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+	if secs, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
 		if secs <= 0 {
 			return 0, false
 		}
-		return min(time.Duration(secs)*time.Second, maxWait), true
+		// Capped before the multiply: a huge integer would overflow
+		// time.Duration and wrap negative, sailing straight past min.
+		if secs > int64(maxWait/time.Second) {
+			return maxWait, true
+		}
+		return time.Duration(secs) * time.Second, true
 	}
 	at, err := http.ParseTime(strings.TrimSpace(v))
 	if err != nil {
@@ -541,6 +591,14 @@ func retryAfter(v string, now time.Time) (time.Duration, bool) {
 		return min(d, maxWait), true
 	}
 	return 0, false
+}
+
+// isAPIOrigin reports whether u shares the API base's scheme and host — the
+// line between failures where "check KROWK_API_URL" is the fix and failures
+// on a storage host where it would only mislead.
+func (c *Client) isAPIOrigin(u *url.URL) bool {
+	base, err := url.Parse(c.BaseURL)
+	return err == nil && base.Scheme == u.Scheme && base.Host == u.Host
 }
 
 // sameOrigin resolves raw against the API base and refuses to take the token

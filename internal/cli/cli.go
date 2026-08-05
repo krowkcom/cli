@@ -42,9 +42,10 @@ Usage
   krowk uploads create <file...> [flags]    The same thing, spelled out
   krowk uploads list [--limit --before]     List the workspace's uploads, newest first
   krowk uploads show <artifact>             Read one artifact back
+  krowk uploads attach <art> --run <run>    Put an upload under a run afterwards
   krowk runs start [flags]                  Open a run to group uploads under
   krowk runs finish <run>                   Close a run
-  krowk claim <artifact> <claim-token>      Keep an anonymous upload past expiry
+  krowk claim <artifact> <token> [--run]    Keep an anonymous upload past expiry
   krowk auth login --token <token>          Check an API token, then store it
   krowk auth token                          Print the stored token
   krowk auth verify                         Check the key and its workspace
@@ -52,7 +53,9 @@ Usage
   krowk registry serve                      Run a local registry to develop against
 
 Upload flags
-  --run <slug>           Attach to an existing run instead of opening one
+  --run <slug>           Attach to an existing run instead of opening one. On
+                         ` + "`claim`" + ` and ` + "`uploads attach`" + ` it names the run an upload
+                         already made joins — a claimed upload has none otherwise
   --pull-request <url>   Pull request the work belongs to
   --reference <url>      Related link — repeat for more than one
   --session <id>         Agent session ID
@@ -188,6 +191,8 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		err = uploadsList(stdout, f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "uploads" && positionals[1] == "show":
 		err = uploadsShow(stdout, positionals[2:], f, format, env, colour)
+	case len(positionals) > 1 && positionals[0] == "uploads" && positionals[1] == "attach":
+		err = uploadsAttach(stdout, positionals[2:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "runs" && positionals[1] == "start":
 		err = runsStart(stdout, f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "runs" && positionals[1] == "finish":
@@ -393,6 +398,24 @@ func withProgress(err error, done []*api.Artifact, runSlug string, ownRun bool) 
 	return apiErr
 }
 
+// withClaimed says what a failed attach leaves behind: the claim succeeded and
+// the token is spent, so re-running the whole command would fail on the claim and
+// look like the artifact was lost. Only the attach is left to retry.
+func withClaimed(err error, claimed *api.Artifact, runSlug string) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	apiErr.Body["claimed"] = claimed.Slug
+	retry := "the upload is claimed and kept, only the run is not attached — retry `krowk uploads attach " +
+		claimed.Slug + " --run " + runSlug + "`"
+	if fix, _ := apiErr.Body["fix"].(string); fix != "" {
+		retry = fix + "; " + retry
+	}
+	apiErr.Body["fix"] = retry
+	return apiErr
+}
+
 // errCode names an error the way the envelope would, so a note can carry it.
 func errCode(err error) string {
 	var apiErr *api.Error
@@ -429,6 +452,26 @@ func uploadsShow(w io.Writer, args []string, f flags, format output.Format, env 
 	return nil
 }
 
+// uploadsAttach puts an upload under a run after the fact. It is the only way an
+// upload that started out anonymous ever gets one: it could not name a run when
+// it was created, and claiming it does not give it one.
+func uploadsAttach(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if len(args) == 0 {
+		return api.Fail("no_artifact", "pass the artifact: `krowk uploads attach art_... --run run_...`")
+	}
+	if f.run == "" {
+		return api.Fail("no_run", "pass the run to attach it to: `krowk uploads attach "+args[0]+" --run run_...`")
+	}
+	client := newClient(f, env)
+
+	artifact, err := client.AttachRun(context.Background(), args[0], f.run)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()))
+	return nil
+}
+
 func runsStart(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
 	client := newClient(f, env)
 
@@ -456,16 +499,32 @@ func runsFinish(w io.Writer, args []string, f flags, format output.Format, env r
 
 // claim spends the token an anonymous upload came back with, which is the only
 // way to keep that upload past its expiry.
+//
+// --run is the moment to name a run, because the caller holding the claim token
+// is the one that knows which run the upload came from. The order is fixed: the
+// attach resolves both slugs in the key's workspace, so it only works once the
+// claim has moved the artifact there.
 func claim(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
 	if len(args) < 2 {
 		return api.Fail("missing_claim",
 			"pass both the artifact and its token: `krowk claim art_... krowk_claim_...`")
 	}
 	client := newClient(f, env)
+	ctx := context.Background()
 
-	artifact, err := client.ClaimArtifact(context.Background(), args[0], args[1])
+	artifact, err := client.ClaimArtifact(ctx, args[0], args[1])
 	if err != nil {
 		return err
+	}
+	if f.run != "" {
+		// The claim has already been spent, so a failure here must not read as one
+		// the caller can undo by running the whole thing again: the artifact is kept,
+		// and only the run is missing.
+		attached, err := client.AttachRun(ctx, artifact.Slug, f.run)
+		if err != nil {
+			return withClaimed(err, artifact, f.run)
+		}
+		artifact = attached
 	}
 	fmt.Fprintln(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()))
 	return nil

@@ -349,6 +349,108 @@ func TestClaimKeepsAnAnonymousUploadPastExpiry(t *testing.T) {
 	}
 }
 
+// An upload that started out anonymous is the case with no other way out: it
+// could not name a run when it was created, and claiming it does not give it one.
+// So claim carries --run, and does the two halves in the only order that works.
+func TestClaimAttachesTheAdoptedUploadToARun(t *testing.T) {
+	h := newHarness(t, 0)
+	started := h.ok("runs", "start", "--session=sess_xyz")
+
+	h.anonymous()
+	uploaded := only(t, h.ok("push", h.fixture))
+	h.env["KROWK_TOKEN"] = "krowk_sk_test"
+
+	claimed := only(t, h.ok("claim", uploaded.Slug, uploaded.ClaimToken, "--run="+started.Data.Slug))
+	if claimed.Run != started.Data.Slug {
+		t.Errorf("claimed artifact run = %q, want %q", claimed.Run, started.Data.Slug)
+	}
+	if claimed.ExpiresAt != "" {
+		t.Errorf("expires_at = %q, want empty once claimed", claimed.ExpiresAt)
+	}
+	// The link is what has already been pasted, so neither half may move it.
+	if claimed.URL != uploaded.URL {
+		t.Errorf("claiming moved the link: %q → %q", uploaded.URL, claimed.URL)
+	}
+}
+
+// A run the claim cannot reach fails after the token is spent. The artifact is
+// kept either way, and saying so is the difference between a caller retrying the
+// attach and a caller believing the upload is gone.
+func TestAFailedAttachSaysTheClaimStillLanded(t *testing.T) {
+	h := newHarness(t, 0)
+
+	h.anonymous()
+	uploaded := only(t, h.ok("push", h.fixture))
+	h.env["KROWK_TOKEN"] = "krowk_sk_test"
+
+	body := h.fails("claim", uploaded.Slug, uploaded.ClaimToken, "--run=run_nosuchrunatall00000")
+	if body["error"] != "not_found" {
+		t.Fatalf("error = %v, want not_found", body)
+	}
+	if body["claimed"] != uploaded.Slug {
+		t.Errorf("claimed = %v, want %q", body["claimed"], uploaded.Slug)
+	}
+	fix, _ := body["fix"].(string)
+	if !strings.Contains(fix, "uploads attach "+uploaded.Slug) {
+		t.Errorf("fix = %q, want the attach to retry", fix)
+	}
+
+	// And the claim really did land: the artifact is in the workspace, unexpiring.
+	if shown := only(t, h.ok("uploads", "show", uploaded.Slug)); shown.ExpiresAt != "" {
+		t.Errorf("expires_at = %q, want the claim to have stuck", shown.ExpiresAt)
+	}
+}
+
+// The same attach on its own, for an upload the key already owns.
+func TestUploadsAttachPutsAnUploadUnderARun(t *testing.T) {
+	h := newHarness(t, 0)
+	started := h.ok("runs", "start")
+	pushed := only(t, h.ok("push", h.fixture, "--run="+started.Data.Slug))
+
+	other := h.ok("runs", "start")
+	attached := only(t, h.ok("uploads", "attach", pushed.Slug, "--run="+other.Data.Slug))
+	if attached.Run != other.Data.Slug {
+		t.Errorf("attach = %q, want %q", attached.Run, other.Data.Slug)
+	}
+	// Idempotent, because agents retry.
+	if again := only(t, h.ok("uploads", "attach", pushed.Slug, "--run="+other.Data.Slug)); again.Run != other.Data.Slug {
+		t.Errorf("second attach = %q", again.Run)
+	}
+}
+
+func TestUploadsAttachNeedsBothHalves(t *testing.T) {
+	h := newHarness(t, 0)
+	pushed := only(t, h.ok("push", h.fixture))
+
+	if got := h.fails("uploads", "attach")["error"]; got != "no_artifact" {
+		t.Errorf("no artifact gave %v, want no_artifact", got)
+	}
+	body := h.fails("uploads", "attach", pushed.Slug)
+	if body["error"] != "no_run" {
+		t.Errorf("no --run gave %v, want no_run", body["error"])
+	}
+	if fix, _ := body["fix"].(string); !strings.Contains(fix, "--run") {
+		t.Errorf("fix = %q, want it to name the flag", fix)
+	}
+}
+
+// Attaching needs a key, because a run belongs to a workspace. The refusal is
+// shared with a keyless push naming a run, so its advice must fit both.
+func TestUploadsAttachNeedsAKey(t *testing.T) {
+	h := newHarness(t, 0)
+	started := h.ok("runs", "start")
+	pushed := only(t, h.ok("push", h.fixture))
+
+	h.anonymous()
+	body := h.fails("uploads", "attach", pushed.Slug, "--run="+started.Data.Slug)
+	if body["error"] != "run_needs_key" {
+		t.Fatalf("error = %v, want run_needs_key", body)
+	}
+	if fix, _ := body["fix"].(string); !strings.Contains(fix, "API key") {
+		t.Errorf("fix = %q, want it to name the key", fix)
+	}
+}
+
 func TestRunsStartGroupsLaterUploads(t *testing.T) {
 	h := newHarness(t, 0)
 
@@ -640,6 +742,7 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	anonymous := only(t, h.ok("push", h.fixture))
 	h.env["KROWK_TOKEN"] = "krowk_sk_test"
 	h.ok("claim", anonymous.Slug, anonymous.ClaimToken)
+	h.ok("uploads", "attach", anonymous.Slug, "--run="+pushed.Run)
 
 	want := []string{
 		// push, with a key: open a run, declare, finalize, close the run.
@@ -656,6 +759,8 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 		"POST /v1/artifacts",
 		"PUT /v1/artifacts/{slug}/finalization",
 		"POST /v1/artifacts/{slug}/claim",
+		// and the run it never had, set afterwards.
+		"PUT /v1/artifacts/{slug}/run",
 	}
 
 	mu.Lock()

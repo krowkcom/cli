@@ -31,7 +31,10 @@ import (
 const (
 	// DefaultBaseURL is overridden by KROWK_API_URL.
 	DefaultBaseURL = "https://api.krowk.com/v1"
-	maxAttempts    = 3
+	// DevBaseURL is where `krowk registry serve` listens, and what --dev points
+	// at, so testing against a local registry needs no environment plumbing.
+	DevBaseURL  = "http://localhost:8787/v1"
+	maxAttempts = 3
 )
 
 // Client is safe for a single CLI invocation; it holds no state between calls.
@@ -41,6 +44,30 @@ type Client struct {
 	HTTP    *http.Client
 	// Sleep is swapped out in tests so backoff does not cost wall clock.
 	Sleep func(time.Duration)
+}
+
+// BaseURLFor picks which registry to talk to. dev is an explicit request — a
+// command-line flag — so it wins over an ambient environment variable;
+// KROWK_API_URL then beats KROWK_DEV because it names a specific target.
+func BaseURLFor(dev bool, env func(string) string) string {
+	switch {
+	case dev:
+		return DevBaseURL
+	case env("KROWK_API_URL") != "":
+		return env("KROWK_API_URL")
+	case Truthy(env("KROWK_DEV")):
+		return DevBaseURL
+	}
+	return DefaultBaseURL
+}
+
+// Truthy reads the spellings people actually type into an environment variable.
+func Truthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // New builds a client against baseURL, falling back to the public registry.

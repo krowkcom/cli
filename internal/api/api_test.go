@@ -414,6 +414,47 @@ func TestVerifyKeyPassesTheRegistrysRejectionThrough(t *testing.T) {
 	}
 }
 
+func TestBaseURLPrecedence(t *testing.T) {
+	env := func(m map[string]string) func(string) string {
+		return func(k string) string { return m[k] }
+	}
+
+	for _, tc := range []struct {
+		name string
+		dev  bool
+		env  map[string]string
+		want string
+	}{
+		{"nothing set", false, nil, DefaultBaseURL},
+		{"--dev", true, nil, DevBaseURL},
+		{"KROWK_DEV", false, map[string]string{"KROWK_DEV": "1"}, DevBaseURL},
+		{"KROWK_DEV off", false, map[string]string{"KROWK_DEV": "0"}, DefaultBaseURL},
+		{"KROWK_API_URL", false, map[string]string{"KROWK_API_URL": "https://staging/v1"}, "https://staging/v1"},
+		// A flag typed on the command line beats an ambient variable.
+		{"--dev over KROWK_API_URL", true, map[string]string{"KROWK_API_URL": "https://staging/v1"}, DevBaseURL},
+		// A named target beats a general "use dev".
+		{"KROWK_API_URL over KROWK_DEV", false,
+			map[string]string{"KROWK_API_URL": "https://staging/v1", "KROWK_DEV": "1"}, "https://staging/v1"},
+	} {
+		if got := BaseURLFor(tc.dev, env(tc.env)); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestTruthy(t *testing.T) {
+	for _, yes := range []string{"1", "true", "TRUE", "yes", " on "} {
+		if !Truthy(yes) {
+			t.Errorf("Truthy(%q) = false", yes)
+		}
+	}
+	for _, no := range []string{"", "0", "false", "off", "no", "maybe"} {
+		if Truthy(no) {
+			t.Errorf("Truthy(%q) = true", no)
+		}
+	}
+}
+
 // sameOrigin vets where a request starts, and only CheckRedirect covers where
 // a 302 sends it next: Go forwards Authorization on any same-host hop, so a
 // registry answering with a redirect to another port on its own host would

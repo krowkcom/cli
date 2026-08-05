@@ -3,7 +3,10 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,7 +16,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/krowkcom/cli/internal/api"
 	"github.com/krowkcom/cli/internal/registry"
+	"github.com/krowkcom/cli/internal/runctx"
 )
 
 // harness runs the CLI against a throwaway registry, the way a user would.
@@ -662,6 +667,244 @@ func TestDoctorSaysUnreachableWhenNothingIsListening(t *testing.T) {
 	}
 	if status, _ := report["api_status"].(string); !strings.HasPrefix(status, "unreachable") {
 		t.Errorf("api_status = %v, want unreachable", report["api_status"])
+	}
+}
+
+func TestDoctorLabelsWhichRegistryItIsTalkingTo(t *testing.T) {
+	h := newHarness(t, 0)
+
+	mode := func(args ...string) string {
+		t.Helper()
+		_, stdout, _ := h.run(args...)
+		var report map[string]any
+		if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+			t.Fatalf("not JSON: %v\n%s", err, stdout)
+		}
+		got, _ := report["registry"].(string)
+		return got
+	}
+
+	// The harness points KROWK_API_URL at a throwaway server.
+	if got := mode("doctor"); got != "custom (KROWK_API_URL)" {
+		t.Errorf("registry = %q, want it flagged as custom", got)
+	}
+
+	// --dev overrides that, and says so.
+	if got := mode("doctor", "--dev"); got != "local" {
+		t.Errorf("registry with --dev = %q, want local", got)
+	}
+
+	h.env["KROWK_API_URL"] = ""
+	if got := mode("doctor"); got != "production" {
+		t.Errorf("registry with nothing set = %q, want production", got)
+	}
+	h.env["KROWK_DEV"] = "yes"
+	if got := mode("doctor"); got != "local" {
+		t.Errorf("registry with KROWK_DEV = %q, want local", got)
+	}
+}
+
+// Every command builds its client through one helper, so checking the helper
+// checks the wiring — without depending on whether :8787 happens to be free.
+func TestDevFlagRedirectsTheClient(t *testing.T) {
+	env := func(m map[string]string) runctx.Env {
+		return func(k string) string { return m[k] }
+	}
+	dev := strings.TrimRight(api.DevBaseURL, "/")
+
+	if got := newClient(flags{dev: true}, env(nil)).BaseURL; got != dev {
+		t.Errorf("--dev = %q, want %q", got, dev)
+	}
+	// A flag typed on the command line beats an ambient variable.
+	staging := env(map[string]string{"KROWK_API_URL": "https://staging/v1"})
+	if got := newClient(flags{dev: true}, staging).BaseURL; got != dev {
+		t.Errorf("--dev with KROWK_API_URL set = %q, want %q", got, dev)
+	}
+	if got := newClient(flags{}, staging).BaseURL; got != "https://staging/v1" {
+		t.Errorf("KROWK_API_URL = %q", got)
+	}
+	if got := newClient(flags{}, env(nil)).BaseURL; got != strings.TrimRight(api.DefaultBaseURL, "/") {
+		t.Errorf("default = %q, want the public registry", got)
+	}
+}
+
+func TestLocalBaseTurnsAListenAddressIntoAURL(t *testing.T) {
+	for _, tc := range []struct{ bound, asked, want string }{
+		{"[::]:8787", ":8787", "http://localhost:8787"},
+		// ":0" means "any port", and the bound address says which one it was.
+		{"[::]:41234", ":0", "http://localhost:41234"},
+		// A hostname the user typed survives, even though the listener
+		// reports the IP it resolved to.
+		{"192.0.2.1:9000", "files.internal:9000", "http://files.internal:9000"},
+		// "any port" with a named host still takes the port from the bind.
+		{"127.0.0.1:41234", "localhost:0", "http://localhost:41234"},
+		// A wildcard bind listens everywhere but dials nowhere, so the URL
+		// says localhost instead; loopback IPs fold to the same name, so the
+		// default bind stays the address --dev dials.
+		{"0.0.0.0:8787", "0.0.0.0:8787", "http://localhost:8787"},
+		{"[::]:8787", "[::]:8787", "http://localhost:8787"},
+		{"127.0.0.1:8787", defaultRegistryAddr, "http://localhost:8787"},
+		{"[::1]:8787", "[::1]:8787", "http://localhost:8787"},
+	} {
+		if got := localBase(tc.bound, tc.asked); got != tc.want {
+			t.Errorf("localBase(%q, %q) = %q, want %q", tc.bound, tc.asked, got, tc.want)
+		}
+	}
+}
+
+func TestServeBannerSaysHowToReachTheRegistry(t *testing.T) {
+	for _, tc := range []struct {
+		name, base, want string
+	}{
+		{"the default address is what --dev dials", "http://localhost:8787",
+			"krowk push screenshot.png --dev"},
+		{"any other address needs KROWK_API_URL spelled out", "http://localhost:9000",
+			"KROWK_API_URL=http://localhost:9000/v1 krowk push screenshot.png"},
+	} {
+		got := serveBanner(tc.base)
+		if !strings.Contains(got, "krowk registry listening on "+tc.base+"\n") {
+			t.Errorf("%s: banner is missing the address: %q", tc.name, got)
+		}
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("%s: banner = %q, want it to mention %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The banner only appears after a successful bind, so a script keying off
+// "listening" never proceeds against a port that failed to open.
+func TestRegistryServeFailsToBindWithoutPrintingTheBanner(t *testing.T) {
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+
+	var out bytes.Buffer
+	serveErr := registryServe(&out, flags{addr: taken.Addr().String()})
+
+	var apiErr *api.Error
+	if !errors.As(serveErr, &apiErr) || apiErr.Code() != "registry_unavailable" {
+		t.Fatalf("serve on a taken port = %v, want registry_unavailable", serveErr)
+	}
+	if !strings.Contains(apiErr.Fix(), taken.Addr().String()) {
+		t.Errorf("fix = %q, want it to name the address", apiErr.Fix())
+	}
+	if out.Len() != 0 {
+		t.Errorf("banner printed despite the failed bind: %q", out.String())
+	}
+}
+
+// An empty --addr means the default port; holding that port shows the fallback
+// engaged without leaving a server running.
+func TestRegistryServeFallsBackToTheDefaultAddr(t *testing.T) {
+	if taken, err := net.Listen("tcp", defaultRegistryAddr); err == nil {
+		defer taken.Close()
+	} // if the listen failed, something else holds the port — same outcome
+
+	var out bytes.Buffer
+	serveErr := registryServe(&out, flags{addr: ""})
+
+	var apiErr *api.Error
+	if !errors.As(serveErr, &apiErr) || !strings.Contains(apiErr.Fix(), defaultRegistryAddr) {
+		t.Fatalf("serve with an empty addr = %v, want a bind failure naming %s", serveErr, defaultRegistryAddr)
+	}
+}
+
+// registry.Handler treats <= 0 as "use the default", so a negative limit has
+// to be rejected up front or it silently means 100 MiB.
+func TestNegativeLimitBytesIsRejected(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, _, stderr := h.run("registry", "serve", "--limit-bytes", "-5")
+	if code == 0 {
+		t.Fatal("a negative --limit-bytes should fail")
+	}
+	e := decode(t, stderr)
+	if e.Error["error"] != "bad_flag" {
+		t.Errorf("error = %v, want bad_flag", e.Error["error"])
+	}
+}
+
+// The check lives in the serve path, so asking for help never trips over a
+// flag value that only `registry serve` cares about.
+func TestHelpWinsOverANegativeLimitBytes(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, stdout, stderr := h.run("--help", "--limit-bytes", "-5")
+	if code != 0 || !strings.Contains(stdout, "uploads create") {
+		t.Errorf("--help with a bad --limit-bytes = %q (exit %d), stderr: %s", stdout, code, stderr)
+	}
+}
+
+// The one path the handler tests cannot see: the flags actually reaching
+// registry.Handler. A limit small enough to refuse the fixture proves it.
+func TestRegistryServeWiresLimitBytesIntoTheHandler(t *testing.T) {
+	h := newHarness(t, 0)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- serveOn(io.Discard, ln, ln.Addr().String(), flags{limitBytes: 4}) }()
+
+	h.env["KROWK_API_URL"] = "http://" + ln.Addr().String() + "/v1"
+	code, _, stderr := h.run("push", h.fixture)
+	if code == 0 {
+		t.Fatal("a push above --limit-bytes should fail")
+	}
+	e := decode(t, stderr)
+	if e.Error["error"] != "artifact_too_large" {
+		t.Errorf("error = %v, want artifact_too_large", e.Error["error"])
+	}
+
+	ln.Close()
+	var apiErr *api.Error
+	if serveErr := <-done; !errors.As(serveErr, &apiErr) || apiErr.Code() != "registry_unavailable" {
+		t.Errorf("serve after the listener closed = %v, want registry_unavailable", serveErr)
+	}
+}
+
+// --site rebrands the public links only, so a push still lands on the local
+// listener while the returned URLs carry the named origin.
+func TestRegistryServeWiresSiteIntoTheHandler(t *testing.T) {
+	h := newHarness(t, 0)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- serveOn(io.Discard, ln, ln.Addr().String(), flags{site: "https://files.example"})
+	}()
+
+	h.env["KROWK_API_URL"] = "http://" + ln.Addr().String() + "/v1"
+	code, stdout, stderr := h.run("push", h.fixture)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	e := decode(t, stdout)
+	if !strings.HasPrefix(e.Data.URL, "https://files.example/") {
+		t.Errorf("artifact url = %q, want the --site origin baked in", e.Data.URL)
+	}
+
+	ln.Close()
+	var apiErr *api.Error
+	if serveErr := <-done; !errors.As(serveErr, &apiErr) || apiErr.Code() != "registry_unavailable" {
+		t.Errorf("serve after the listener closed = %v, want registry_unavailable", serveErr)
+	}
+}
+
+func TestHelpMentionsTheLocalRegistry(t *testing.T) {
+	h := newHarness(t, 0)
+
+	_, stdout, _ := h.run("--help")
+	for _, want := range []string{"registry serve", "--dev", "KROWK_DEV", "http://localhost:8787/v1"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("help is missing %q", want)
+		}
 	}
 }
 

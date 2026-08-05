@@ -10,17 +10,25 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
+	"net/http"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/krowkcom/cli/internal/api"
 	"github.com/krowkcom/cli/internal/output"
+	"github.com/krowkcom/cli/internal/registry"
 	"github.com/krowkcom/cli/internal/runctx"
 )
 
 // Version is stamped at build time: -ldflags "-X .../internal/cli.Version=1.2.3".
 var Version = "0.1.0"
+
+// defaultRegistryAddr is where `registry serve` listens, matching api.DevBaseURL
+// so --dev finds it with no configuration. Loopback only: the registry accepts
+// anonymous uploads, so by default it must not be reachable from the LAN.
+const defaultRegistryAddr = "127.0.0.1:8787"
 
 const helpTemplate = `krowk %s — permalinks for agent output
 
@@ -31,6 +39,7 @@ Usage
   krowk auth token                         Print the stored token
   krowk auth verify                        Check the key and its scopes
   krowk doctor                             Check the local setup
+  krowk registry serve                     Run a local registry to develop against
 
 Pasting the result
   GitHub, Linear, Notion   --format markdown   embeds the image
@@ -46,7 +55,13 @@ Upload flags
   --commit <sha>         Override the detected commit
   --agent <name>         Override the detected agent
 
+Local registry flags
+  --addr <host:port>     Listen address for ` + "`registry serve`" + ` (default %s, loopback only)
+  --site <url>           Origin for the links it returns (default: the request host)
+  --limit-bytes <n>      Reject uploads above this size
+
 Global flags
+  --dev                  Talk to a local registry at %s
   --format <fmt>         human | json | markdown | url (default: human on a TTY, json when piped)
                          markdown and url describe an upload; other commands fall back to json
   --json                 Shorthand for --format json
@@ -57,7 +72,10 @@ Global flags
 Environment
   KROWK_TOKEN            API token — wins over the credentials file
   KROWK_API_URL          API base URL (default %s)
+  KROWK_DEV              1/true/yes/on — same as --dev
   KROWK_AGENT            Agent name to report
+
+Registry precedence: --dev, then KROWK_API_URL, then KROWK_DEV, then the default.
 
 Credentials live in %s (0600).
 `
@@ -72,6 +90,10 @@ type flags struct {
 	agent       string
 	token       string
 	format      string
+	addr        string
+	site        string
+	limitBytes  int64
+	dev         bool
 	json        bool
 	quiet       bool
 	help        bool
@@ -98,6 +120,10 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	fs.StringVar(&f.agent, "agent", "", "")
 	fs.StringVar(&f.token, "token", "", "")
 	fs.StringVar(&f.format, "format", "", "")
+	fs.StringVar(&f.addr, "addr", defaultRegistryAddr, "")
+	fs.StringVar(&f.site, "site", "", "")
+	fs.Int64Var(&f.limitBytes, "limit-bytes", 0, "")
+	fs.BoolVar(&f.dev, "dev", false, "")
 	fs.BoolVar(&f.json, "json", false, "")
 	fs.BoolVar(&f.quiet, "quiet", false, "")
 	fs.BoolVar(&f.help, "help", false, "")
@@ -126,7 +152,8 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		fmt.Fprintln(stdout, Version)
 		return 0
 	case f.help, len(positionals) == 0, positionals[0] == "help":
-		fmt.Fprintf(stdout, helpTemplate, Version, api.DefaultBaseURL, api.CredentialsPath())
+		fmt.Fprintf(stdout, helpTemplate, Version,
+			defaultRegistryAddr, api.DevBaseURL, api.DefaultBaseURL, api.CredentialsPath())
 		return 0
 	}
 
@@ -141,9 +168,11 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
 		err = authToken(stdout, env)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "verify":
-		err = authVerify(stdout, format, env, f.quiet, colour)
+		err = authVerify(stdout, format, f, env, colour)
+	case len(positionals) > 1 && positionals[0] == "registry" && positionals[1] == "serve":
+		err = registryServe(stdout, f)
 	case positionals[0] == "doctor":
-		err = doctor(stdout, format, env)
+		err = doctor(stdout, format, f, env)
 	default:
 		err = api.Fail("unknown_command",
 			"`"+strings.Join(clip(positionals, 2), " ")+"` is not a krowk command — run `krowk --help`")
@@ -191,7 +220,7 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 		Client:      "krowk-cli/" + Version,
 	})
 
-	client := api.New(env("KROWK_API_URL"), api.ReadToken(env))
+	client := newClient(f, env)
 	artifact, err := client.CreateArtifact(context.Background(), files, metadata)
 	if err != nil {
 		return authHint(err, client.Token != "")
@@ -199,6 +228,98 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 
 	fmt.Fprintln(w, output.Artifact(artifact, format, f.title, f.quiet, colour, time.Now()))
 	return nil
+}
+
+// newClient is the one place a registry client gets built, so every command
+// honours the same precedence.
+func newClient(f flags, env runctx.Env) *api.Client {
+	return api.New(api.BaseURLFor(f.dev, env), api.ReadToken(env))
+}
+
+// registryMode says where the client is pointed, so `doctor` can tell a
+// deliberate local run from a stray KROWK_API_URL.
+func registryMode(client *api.Client, env runctx.Env) string {
+	switch {
+	case client.BaseURL == strings.TrimRight(api.DevBaseURL, "/"):
+		return "local"
+	case env("KROWK_API_URL") != "":
+		return "custom (KROWK_API_URL)"
+	}
+	return "production"
+}
+
+// registryServe runs the local stand-in for api.krowk.com, so developing against
+// a registry needs neither the network nor a checkout of this repository.
+func registryServe(w io.Writer, f flags) error {
+	// registry.Handler treats <= 0 as "use the default", so a negative limit
+	// would silently mean 100 MiB. Reject it instead of guessing.
+	if f.limitBytes < 0 {
+		return api.Fail("bad_flag", "--limit-bytes must not be negative — omit it or pass 0 for the default")
+	}
+
+	addr := f.addr
+	if addr == "" {
+		addr = defaultRegistryAddr
+	}
+
+	// Bind before announcing anything, so a script keying off the banner never
+	// proceeds against a port that failed to open.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return api.Fail("registry_unavailable", "could not listen on "+addr+": "+err.Error())
+	}
+	return serveOn(w, ln, addr, f)
+}
+
+// serveOn runs the registry on an already-bound listener. Split from
+// registryServe so a test can hold the listener and close it to stop serving.
+func serveOn(w io.Writer, ln net.Listener, addr string, f flags) error {
+	fmt.Fprint(w, serveBanner(localBase(ln.Addr().String(), addr)))
+
+	server := &http.Server{
+		Handler: registry.Handler(f.limitBytes, f.site),
+		// Uploads can be slow and large, so only the header read is bounded.
+		ReadHeaderTimeout: 20 * time.Second,
+	}
+	if err := server.Serve(ln); err != nil {
+		return api.Fail("registry_unavailable", "registry on "+addr+" stopped: "+err.Error())
+	}
+	return nil
+}
+
+// serveBanner says where the registry is and how to point a push at it. --dev
+// only knows the default address, so any other base gets the explicit form.
+func serveBanner(base string) string {
+	banner := "krowk registry listening on " + base + "\n"
+	if base+"/v1" == api.DevBaseURL {
+		return banner + "  krowk push screenshot.png --dev\n"
+	}
+	return banner + "  KROWK_API_URL=" + base + "/v1 krowk push screenshot.png\n"
+}
+
+// localBase turns a listen address into a URL a client can call. bound is what
+// the listener reports, which resolves ":0" to the real port; asked keeps the
+// hostname the user typed, since the listener flattens it to an IP.
+func localBase(bound, asked string) string {
+	host, port, err := net.SplitHostPort(asked)
+	if err != nil {
+		return "http://" + asked
+	}
+	// An asked port of 0 means "any port", and only the bound address knows
+	// which one it became.
+	if port == "0" {
+		if _, boundPort, splitErr := net.SplitHostPort(bound); splitErr == nil {
+			port = boundPort
+		}
+	}
+	// Wildcard binds listen everywhere but dial nowhere; localhost is the
+	// loopback name that reaches them on either stack. Loopback IPs fold to
+	// the same name, so the default bind stays the address --dev dials.
+	switch host {
+	case "", "0.0.0.0", "::", "127.0.0.1", "::1":
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 // authHint points a rejected upload at the self-check. The registry cannot know
@@ -254,8 +375,8 @@ func authToken(w io.Writer, env runctx.Env) error {
 
 // authVerify reports what the stored key can actually do, rather than trusting
 // that a token-shaped string is a working key.
-func authVerify(w io.Writer, format output.Format, env runctx.Env, quiet, colour bool) error {
-	client := api.New(env("KROWK_API_URL"), api.ReadToken(env))
+func authVerify(w io.Writer, format output.Format, f flags, env runctx.Env, colour bool) error {
+	client := newClient(f, env)
 	if client.Token == "" {
 		return api.Fail("not_authenticated",
 			"no key to verify — run `krowk auth login --token krk_...`, or upload anonymously")
@@ -265,12 +386,12 @@ func authVerify(w io.Writer, format output.Format, env runctx.Env, quiet, colour
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.Key(key, format, quiet, colour))
+	fmt.Fprintln(w, output.Key(key, format, f.quiet, colour))
 	return nil
 }
 
-func doctor(w io.Writer, format output.Format, env runctx.Env) error {
-	client := api.New(env("KROWK_API_URL"), api.ReadToken(env))
+func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
+	client := newClient(f, env)
 
 	// One call answers both questions: whether the registry is there, and what
 	// the key is good for. An HTTP response of any status proves reachability.
@@ -280,6 +401,7 @@ func doctor(w io.Writer, format output.Format, env runctx.Env) error {
 		"version":       Version,
 		"runtime":       runtime.Version() + " " + runtime.GOOS + "/" + runtime.GOARCH,
 		"api":           client.BaseURL,
+		"registry":      registryMode(client, env),
 		"api_status":    reachability(key, keyErr),
 		"authenticated": client.Token != "",
 		"key":           keySummary(client.Token, key, keyErr),
@@ -293,7 +415,9 @@ func doctor(w io.Writer, format output.Format, env runctx.Env) error {
 		return nil
 	}
 
-	for _, k := range []string{"version", "runtime", "api", "api_status", "authenticated", "key", "credentials"} {
+	for _, k := range []string{
+		"version", "runtime", "api", "registry", "api_status", "authenticated", "key", "credentials",
+	} {
 		fmt.Fprintf(w, "%-14s %v\n", k, report[k])
 	}
 	b, _ := json.Marshal(report["context"])

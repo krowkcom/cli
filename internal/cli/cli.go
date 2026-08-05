@@ -195,7 +195,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	case positionals[0] == "claim":
 		err = claim(stdout, positionals[1:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "login":
-		err = authLogin(stdout, f.token, f, env, format, f.quiet, colour)
+		err = authLogin(stdout, f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
 		err = authToken(stdout, env)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "verify":
@@ -486,15 +486,15 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 // What the registry said, when it said anything, is written alongside the
 // token, so nothing afterwards has to ask again which workspace this key acts
 // in.
-func authLogin(w io.Writer, token string, f flags, env runctx.Env, format output.Format, quiet, colour bool) error {
-	if token == "" {
+func authLogin(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if f.token == "" {
 		return api.Fail("missing_token", "pass the key: `krowk auth login --token krowk_sk_...`")
 	}
 
 	// The key being stored, not the one already configured: verifying whatever
 	// is in the environment would happily bless a typo in the one that is about
 	// to be written to disk.
-	key, verifyErr := api.New(api.BaseURLFor(f.dev, env), token).VerifyKey(context.Background())
+	key, verifyErr := api.New(api.BaseURLFor(f.dev, env), f.token).VerifyKey(context.Background())
 	if api.KeyRejected(verifyErr) {
 		// The standing advice for a rejected key is to log in again, which is
 		// what just happened. Point at the two things that are actually left.
@@ -511,7 +511,7 @@ func authLogin(w io.Writer, token string, f flags, env runctx.Env, format output
 		id = api.Identity{KeyID: key.KeyID, Workspace: key.Workspace}
 	}
 
-	path, err := api.SaveCredentials(token, id)
+	path, err := api.SaveCredentials(f.token, id)
 	if err != nil {
 		return api.Fail("credentials_unwritable", "could not write "+api.CredentialsPath()+": "+err.Error())
 	}
@@ -522,7 +522,7 @@ func authLogin(w io.Writer, token string, f flags, env runctx.Env, format output
 	} else {
 		result.KeyID, result.Workspace = key.KeyID, key.Workspace
 	}
-	fmt.Fprintln(w, output.StoredKey(result, format, quiet, colour))
+	fmt.Fprintln(w, output.StoredKey(result, format, f.quiet, colour))
 	return nil
 }
 

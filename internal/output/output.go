@@ -40,6 +40,9 @@ type Paste struct {
 // Surfaces name where each form belongs, so the choice never has to be guessed.
 const (
 	embedSurfaces = "GitHub, Linear, Notion — renders the image"
+	// plainSurfaces replaces embedSurfaces when there is no preview to embed and
+	// the markdown form is only a plain link, so the label stays honest.
+	plainSurfaces = "GitHub, Linear, Notion — plain link, no preview to embed"
 	linkSurfaces  = "Slack, Basecamp — they unfurl the link themselves"
 )
 
@@ -115,6 +118,11 @@ func RelativeExpiry(iso string, now time.Time) string {
 	return fmt.Sprintf("expires in %dd", int(d.Round(24*time.Hour).Hours()/24))
 }
 
+// labelEscaper escapes the characters that end or nest a link label, and folds
+// newlines to spaces because CommonMark link text cannot span lines. Parens
+// are legal in link text, so they stay.
+var labelEscaper = strings.NewReplacer(`\`, `\\`, `[`, `\[`, `]`, `\]`, "\n", " ", "\r", " ")
+
 // MarkdownLink is the paste-ready preview link.
 func MarkdownLink(a *api.Artifact, title string) string {
 	label := title
@@ -124,6 +132,7 @@ func MarkdownLink(a *api.Artifact, title string) string {
 	if label == "" {
 		label = a.ID
 	}
+	label = labelEscaper.Replace(label)
 	if a.PreviewURL == "" {
 		return fmt.Sprintf("[%s](%s)", label, a.URL)
 	}
@@ -174,9 +183,13 @@ func summarise(a *api.Artifact) string {
 	return s
 }
 
-// Key renders a verified API key: who it belongs to and what it may do.
-func Key(k *api.Key, f Format, colour bool) string {
+// Key renders a verified API key: who it belongs to and what it may do. There
+// is no link to a key, so markdown and url fall back to the JSON envelope.
+func Key(k *api.Key, f Format, quiet, colour bool) string {
 	if f != Human {
+		if quiet {
+			return encode(k)
+		}
 		return encode(Envelope{
 			OK:      true,
 			Data:    k,
@@ -224,9 +237,13 @@ func humanArtifact(a *api.Artifact, paste Paste, title string, colour bool, now 
 	}
 	// Both paste forms, labelled, because the right one depends on where it is
 	// going and neither surface renders the other's.
+	markdownSurfaces := embedSurfaces
+	if a.PreviewURL == "" {
+		markdownSurfaces = plainSurfaces
+	}
 	lines = append(lines,
 		"",
-		paint(colour, dim, "  "+embedSurfaces),
+		paint(colour, dim, "  "+markdownSurfaces),
 		"  "+paste.Markdown,
 		"",
 		paint(colour, dim, "  "+linkSurfaces),

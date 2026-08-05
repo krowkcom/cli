@@ -41,9 +41,18 @@ type client struct {
 
 func serve(t *testing.T, limit int64) *client {
 	t.Helper()
-	srv := httptest.NewServer(Handler(limit, ""))
+	c, _ := serveStore(t, limit)
+	return c
+}
+
+// serveStore also hands back the store, for the assertions that are about state
+// being reclaimed rather than about a response.
+func serveStore(t *testing.T, limit int64) (*client, *store) {
+	t.Helper()
+	s := newStore()
+	srv := httptest.NewServer(s.handler(limit, ""))
 	t.Cleanup(srv.Close)
-	return &client{t: t, url: srv.URL}
+	return &client{t: t, url: srv.URL}, s
 }
 
 func (c *client) post(path string, body any) (int, map[string]any) {
@@ -185,6 +194,77 @@ func TestInterruptedHandshakeResumesOntoTheSameTargets(t *testing.T) {
 
 	if first.ID != second.ID || first.Uploads[0].URL != second.Uploads[0].URL {
 		t.Errorf("resume changed the targets: %+v then %+v", first, second)
+	}
+}
+
+// A resume restarts the expiry clock. If it kept the original declaration's
+// timestamp, a handshake resumed just under the TTL would be swept by the next
+// unrelated declaration and its finalize would 404 — the client would have to
+// resend every byte, which is exactly what "resumable" promises not to do.
+func TestResumedHandshakeSurvivesASweep(t *testing.T) {
+	c, s := serveStore(t, 0)
+	req := declare([2]string{"shot.png", "one"})
+
+	_, first := c.begin(req)
+
+	// Age the handshake to just under the TTL, then resume it.
+	s.mu.Lock()
+	s.pending[scopedKey(anonymousClass, req.IdempotencyKey)].at = s.pending[scopedKey(anonymousClass, req.IdempotencyKey)].at.Add(-pendingTTL + time.Minute)
+	s.mu.Unlock()
+	if code, second := c.begin(req); code != http.StatusCreated || second.ID != first.ID {
+		t.Fatalf("resume = %d id %q, want 201 with id %q", code, second.ID, first.ID)
+	}
+
+	// Two more minutes pass — past the original declaration's TTL, well within
+	// the resume's — and an unrelated declaration triggers a sweep.
+	s.mu.Lock()
+	s.pending[scopedKey(anonymousClass, req.IdempotencyKey)].at = s.pending[scopedKey(anonymousClass, req.IdempotencyKey)].at.Add(-2 * time.Minute)
+	s.mu.Unlock()
+	if code, _ := c.begin(declare([2]string{"other.png", "two"})); code != http.StatusCreated {
+		t.Fatal("unrelated declaration failed")
+	}
+
+	// The resumed handshake survives and finalizes.
+	if code, _ := c.put(first.Uploads[0].URL, "one"); code != http.StatusOK {
+		t.Fatalf("put after the sweep = %d, want 200 — the handshake was reaped", code)
+	}
+	code, out := c.postURL(first.FinalizeURL, map[string]string{"idempotency_key": req.IdempotencyKey})
+	if code != http.StatusOK {
+		t.Fatalf("finalize after the sweep = %d %v, want 200", code, out)
+	}
+}
+
+// A transfer slower than the TTL never re-declares, so each landed blob must
+// keep the handshake alive on its own.
+func TestActivelyUploadingHandshakeSurvivesASweep(t *testing.T) {
+	c, s := serveStore(t, 0)
+	req := declare([2]string{"a.png", "one"}, [2]string{"b.png", "two"})
+
+	_, begun := c.begin(req)
+
+	// The first blob lands just under the TTL after the declaration.
+	s.mu.Lock()
+	s.pending[scopedKey(anonymousClass, req.IdempotencyKey)].at = s.pending[scopedKey(anonymousClass, req.IdempotencyKey)].at.Add(-pendingTTL + time.Minute)
+	s.mu.Unlock()
+	if code, _ := c.put(begun.Uploads[0].URL, "one"); code != http.StatusOK {
+		t.Fatal("first put failed")
+	}
+
+	// Two more minutes on, an unrelated declaration sweeps. The slow transfer's
+	// last PUT reset the clock, so it must not be reaped mid-flight.
+	s.mu.Lock()
+	s.pending[scopedKey(anonymousClass, req.IdempotencyKey)].at = s.pending[scopedKey(anonymousClass, req.IdempotencyKey)].at.Add(-2 * time.Minute)
+	s.mu.Unlock()
+	if code, _ := c.begin(declare([2]string{"other.png", "three"})); code != http.StatusCreated {
+		t.Fatal("unrelated declaration failed")
+	}
+
+	if code, _ := c.put(begun.Uploads[1].URL, "two"); code != http.StatusOK {
+		t.Fatalf("second put after the sweep = %d, want 200 — the handshake was reaped", code)
+	}
+	code, out := c.postURL(begun.FinalizeURL, map[string]string{"idempotency_key": req.IdempotencyKey})
+	if code != http.StatusOK {
+		t.Fatalf("finalize after the sweep = %d %v, want 200", code, out)
 	}
 }
 
@@ -810,6 +890,150 @@ func TestAnInterruptedAnonymousUploadYieldsItsClaimToTheFinisher(t *testing.T) {
 	}
 	if late["claim_url"] != nil {
 		t.Errorf("the claim URL was handed out twice: %v", late["claim_url"])
+	}
+}
+
+// A declared size near int64's ceiling must not wrap the total back under the
+// limit, and no single file may exceed the limit — otherwise `put` would hash
+// arbitrarily many bytes before its own check could land.
+func TestDeclaredSizesCannotOverflowTheTotal(t *testing.T) {
+	c := serve(t, 0)
+
+	req := declare([2]string{"a.png", "x"}, [2]string{"b.png", "y"})
+	req.Files[0].Bytes = 6 << 60
+	req.Files[1].Bytes = 6 << 60 // naive summing wraps negative and slips under
+
+	code, out := c.post("/v1/artifacts", req)
+	if code != http.StatusRequestEntityTooLarge || out["error"] != "artifact_too_large" {
+		t.Fatalf("overflowing manifest = %d %v, want 413 artifact_too_large", code, out)
+	}
+
+	req = declare([2]string{"a.png", "x"})
+	req.Files[0].Bytes = DefaultLimitBytes + 1
+	code, out = c.post("/v1/artifacts", req)
+	if code != http.StatusRequestEntityTooLarge || out["error"] != "artifact_too_large" {
+		t.Fatalf("oversized file = %d %v, want 413 artifact_too_large", code, out)
+	}
+}
+
+// An undecodable finalize body is a broken client, not an absent key — the two
+// need different errors or the client cannot tell which it is.
+func TestFinalizeRejectsABodyItCannotDecode(t *testing.T) {
+	c := serve(t, 0)
+	req := declare([2]string{"shot.png", "one"})
+	_, begun := c.begin(req)
+
+	res, err := http.Post(c.url+strings.TrimPrefix(begun.FinalizeURL, c.url),
+		"application/json", strings.NewReader("{not json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	out := map[string]any{}
+	_ = json.NewDecoder(res.Body).Decode(&out)
+	if res.StatusCode != http.StatusBadRequest || out["error"] != "malformed_finalize" {
+		t.Fatalf("finalize = %d %v, want 400 malformed_finalize", res.StatusCode, out)
+	}
+}
+
+// Declaring needs no key and sends no bytes, so it is the cheapest request here
+// and the one that has to be bounded. Without a cap, every abandoned handshake
+// stays in pending, byID and one byToken entry per declared file for the life of
+// the process — a loop of declarations grows it until it dies.
+func TestAbandonedDeclarationsAreCappedAndExpire(t *testing.T) {
+	c, s := serveStore(t, 0)
+
+	for i := range maxPending {
+		req := declare([2]string{fmt.Sprintf("shot-%d.png", i), fmt.Sprintf("body %d", i)})
+		if code, _ := c.begin(req); code != http.StatusCreated {
+			t.Fatalf("declaration %d = %d, want 201", i, code)
+		}
+	}
+
+	// One past the cap, and nothing has been finalized, so this is refused —
+	// retryable, because finishing or abandoning one makes room.
+	over := declare([2]string{"one-too-many.png", "body"})
+	code, out := c.post("/v1/artifacts", over)
+	if code != http.StatusServiceUnavailable || out["error"] != "too_many_pending_uploads" {
+		t.Fatalf("over the cap = %d %v, want 503 too_many_pending_uploads", code, out)
+	}
+	if out["retryable"] != true {
+		t.Errorf("retryable = %v, want true", out["retryable"])
+	}
+
+	// An hour on, the abandoned ones are swept and the door opens again. The sweep
+	// runs on the next declaration rather than on a timer, so this is the path a
+	// real client takes.
+	s.mu.Lock()
+	for _, up := range s.pending {
+		up.at = up.at.Add(-2 * pendingTTL)
+	}
+	s.mu.Unlock()
+
+	if code, _ := c.begin(over); code != http.StatusCreated {
+		t.Fatalf("after expiry = %d, want 201", code)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.pending) != 1 {
+		t.Errorf("pending = %d, want 1 — the swept declarations should be gone", len(s.pending))
+	}
+	if len(s.byToken) != 1 {
+		t.Errorf("byToken = %d, want 1 — a swept declaration's blob tokens should go with it", len(s.byToken))
+	}
+	if len(s.byID) != 1 {
+		t.Errorf("byID = %d, want 1", len(s.byID))
+	}
+	if len(s.idOwner) != 1 {
+		t.Errorf("idOwner = %d, want 1 — an ID never published goes back in the pool", len(s.idOwner))
+	}
+}
+
+// A finished upload should not leave its handshake behind either: finalize
+// answers a repeat from artifacts, so the byID entry is dead weight after it.
+func TestFinalizingReleasesTheHandshake(t *testing.T) {
+	c, s := serveStore(t, 0)
+	req := declare([2]string{"shot.png", "body"})
+
+	_, begun := c.begin(req)
+	if code, _ := c.put(begun.Uploads[0].URL, "body"); code != http.StatusOK {
+		t.Fatal("put failed")
+	}
+	if code, _ := c.postURL(begun.FinalizeURL,
+		map[string]string{"idempotency_key": req.IdempotencyKey}); code != http.StatusOK {
+		t.Fatal("finalize failed")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.pending) != 0 || len(s.byToken) != 0 || len(s.byID) != 0 {
+		t.Errorf("after finalize: pending=%d byToken=%d byID=%d, want all zero",
+			len(s.pending), len(s.byToken), len(s.byID))
+	}
+	// The ID stays spoken for, or a later upload could be handed a link that is
+	// already in a pull request.
+	if len(s.idOwner) != 1 {
+		t.Errorf("idOwner = %d, want the finalized ID still reserved", len(s.idOwner))
+	}
+}
+
+// One declaration must not be able to mint thousands of blob tokens: the body
+// limit alone allows far more entries than any real push has.
+func TestAManifestCannotDeclareUnboundedFiles(t *testing.T) {
+	c := serve(t, 0)
+
+	files := make([][2]string, 0, maxManifestFiles+1)
+	for i := range maxManifestFiles + 1 {
+		files = append(files, [2]string{fmt.Sprintf("shot-%d.png", i), fmt.Sprintf("body %d", i)})
+	}
+	code, out := c.post("/v1/artifacts", declare(files...))
+	if code != http.StatusUnprocessableEntity || out["error"] != "too_many_files" {
+		t.Fatalf("oversized manifest = %d %v, want 422 too_many_files", code, out)
+	}
+
+	// The limit itself is still accepted.
+	if code, _ := c.begin(declare(files[:maxManifestFiles]...)); code != http.StatusCreated {
+		t.Errorf("a manifest at the limit was refused")
 	}
 }
 

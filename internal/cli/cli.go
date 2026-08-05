@@ -55,8 +55,8 @@ Upload flags
   --run <slug>           Attach to an existing run instead of opening one
   --pull-request <url>   Pull request the work belongs to
   --reference <url>      Related link — repeat for more than one
-  --session <id>         Agent session ID
   --title <text>         Label for the markdown link
+  --session <id>         Override the detected agent session
   --repo <owner/name>    Override the detected repository
   --commit <sha>         Override the detected commit
   --agent <name>         Override the detected agent

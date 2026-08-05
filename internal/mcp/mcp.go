@@ -818,7 +818,7 @@ func toolSchemas() []map[string]any {
 					},
 					"session": map[string]any{
 						"type":        "string",
-						"description": "Agent session ID, recorded on the run.",
+						"description": "Override the detected agent session. Recorded on the run.",
 					},
 					"repo":   map[string]any{"type": "string", "description": "Override the detected repository."},
 					"commit": map[string]any{"type": "string", "description": "Override the detected commit."},

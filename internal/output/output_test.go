@@ -362,3 +362,26 @@ func TestSummaryNamesACallerSuppliedRunForEveryFileCount(t *testing.T) {
 		t.Errorf("mixed runs = %q, want no run claimed", got)
 	}
 }
+
+// Human and JSON must not disagree about which run an upload went into. A push
+// given --run has the run on its artifacts and none of its own, and both formats
+// read it from the same place.
+func TestHumanAndJSONAgreeOnACallerSuppliedRun(t *testing.T) {
+	r := Result{Artifacts: []*api.Artifact{
+		{Slug: "art_a", Filename: "a.png", ByteSize: 10, Run: "run_y", URL: "https://cdn.example/a.png"},
+	}}
+	now := time.Now()
+
+	if human := Upload(r, Human, false, false, now); !strings.Contains(human, "run run_y") {
+		t.Errorf("human = %q, want the run named", human)
+	}
+	var e struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(Upload(r, JSON, false, false, now)), &e); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if !strings.Contains(e.Summary, "run run_y") {
+		t.Errorf("summary = %q, want the run named", e.Summary)
+	}
+}

@@ -322,8 +322,11 @@ func humanResult(r Result, colour bool, now time.Time) string {
 
 	// One trailing line for the facts that apply to the whole upload.
 	var facts []string
-	if r.Run != nil {
-		facts = append(facts, "run "+r.Run.Slug)
+	// The same run the envelope's summary names, so the two formats do not disagree
+	// about which run an upload went into — a push given --run has one recorded on
+	// its artifacts and none of its own.
+	if run := summaryRun(r); run != "" {
+		facts = append(facts, "run "+run)
 	}
 	if r.Title != "" {
 		facts = append(facts, r.Title)

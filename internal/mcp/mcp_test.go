@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -289,6 +290,18 @@ func TestGetArtifactRoundTripsAPush(t *testing.T) {
 	}
 }
 
+func TestGetArtifactNeedsAnID(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	result := s.callTool("krowk_get_artifact", map[string]any{"id": "  "})
+	if result["isError"] != true {
+		t.Fatalf("want isError, got %+v", result)
+	}
+	if body := text(t, result); !strings.Contains(body, "missing_id") {
+		t.Errorf("text = %q, want missing_id", body)
+	}
+}
+
 func TestGetArtifactSaysWhenThereIsNothingThere(t *testing.T) {
 	s := newSession(t, "krk_test")
 
@@ -389,6 +402,84 @@ func TestMalformedLineDoesNotKillTheSession(t *testing.T) {
 	}
 	if replies[1]["id"] != float64(7) {
 		t.Errorf("second reply = %+v, want the ping answered", replies[1])
+	}
+}
+
+// A line that is valid JSON but not a Request object — a batch array, a bare
+// string — is an invalid request (-32600), not a parse error (-32700).
+func TestValidJSONThatIsNotARequestIsInvalidNotUnparseable(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	replies := s.exchange(
+		`[{"jsonrpc":"2.0","id":1,"method":"ping"}]`,
+		`"just a string"`,
+		`null`,
+		`{}`,
+		`{"jsonrpc":"2.0","id":5}`,
+		`{"jsonrpc":"2.0","id":7,"method":"ping"}`,
+	)
+	if len(replies) != 6 {
+		t.Fatalf("got %d replies, want five invalid-request errors then the pong: %+v", len(replies), replies)
+	}
+	for i := range 5 {
+		if e, _ := replies[i]["error"].(map[string]any); e == nil || e["code"] != float64(-32600) {
+			t.Errorf("reply %d = %+v, want a -32600 invalid request", i, replies[i])
+		}
+	}
+	if replies[5]["id"] != float64(7) {
+		t.Errorf("last reply = %+v, want the ping answered", replies[5])
+	}
+}
+
+// Cancelling the context must end the server even while it sits blocked in a
+// read — that is what lets Ctrl-C kill the process.
+func TestCancellationEndsAnIdleServer(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	in, _ := io.Pipe() // never written to, so the read blocks forever
+	t.Cleanup(func() { in.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() { done <- s.server.Serve(ctx, in, &bytes.Buffer{}) }()
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Serve = %v, want a clean return on cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after the context was cancelled")
+	}
+}
+
+// One unterminated line over maxLine must end the session at the cap, not
+// after the whole thing has been buffered.
+func TestAMessageOverTheCapEndsTheSession(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	var out bytes.Buffer
+	in := strings.NewReader(strings.Repeat("x", maxLine+1))
+	err := s.server.Serve(context.Background(), in, &out)
+	if err == nil || !strings.Contains(err.Error(), "longer than") {
+		t.Fatalf("Serve = %v, want the message-too-long error", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("stdout carried %q, want nothing", out.String())
+	}
+}
+
+func TestMalformedInitializeParamsAreAProtocolError(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	replies := s.exchange(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":"not an object"}`)
+	if len(replies) != 1 {
+		t.Fatalf("got %d replies, want 1: %+v", len(replies), replies)
+	}
+	e, _ := replies[0]["error"].(map[string]any)
+	if e == nil || e["code"] != float64(-32602) {
+		t.Errorf("reply = %+v, want a -32602 invalid-params error", replies[0])
 	}
 }
 

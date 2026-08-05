@@ -45,9 +45,9 @@ Usage
   krowk runs start [flags]                  Open a run to group uploads under
   krowk runs finish <run>                   Close a run
   krowk claim <artifact> <claim-token>      Keep an anonymous upload past expiry
-  krowk auth login --token <token>          Store an API token
+  krowk auth login --token <token>          Check an API token, then store it
   krowk auth token                          Print the stored token
-  krowk auth verify                         Check the key and its scopes
+  krowk auth verify                         Check the key and its workspace
   krowk doctor                              Check the local setup
   krowk registry serve                      Run a local registry to develop against
 
@@ -195,7 +195,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	case positionals[0] == "claim":
 		err = claim(stdout, positionals[1:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "login":
-		err = authLogin(stdout, f.token)
+		err = authLogin(stdout, f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
 		err = authToken(stdout, env)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "verify":
@@ -471,16 +471,74 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 	return nil
 }
 
-func authLogin(w io.Writer, token string) error {
-	if token == "" {
+// authLogin stores a key, but only once the registry has been given the chance
+// to reject it. Storing first and finding out later meant a mistyped key was
+// discovered by the next upload failing, at which point the paste buffer that
+// held the real one is long gone.
+//
+// A rejection is fatal, and deliberately so: keeping a key the registry has
+// just disowned achieves nothing, and writing it over a working key would leave
+// the machine worse off than not logging in at all. Every other outcome — no
+// network, a registry that is down, a URL answering with something that is not
+// a key — stores the token anyway. Logging in before a flight is a real thing
+// to do, and none of those outcomes is evidence about the key.
+//
+// What the registry said, when it said anything, is written alongside the
+// token, so nothing afterwards has to ask again which workspace this key acts
+// in.
+func authLogin(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if f.token == "" {
 		return api.Fail("missing_token", "pass the key: `krowk auth login --token krowk_sk_...`")
 	}
-	path, err := api.SaveToken(token)
+
+	// The key being stored, not the one already configured: verifying whatever
+	// is in the environment would happily bless a typo in the one that is about
+	// to be written to disk.
+	key, verifyErr := api.New(api.BaseURLFor(f.dev, env), f.token).VerifyKey(context.Background())
+	if api.KeyRejected(verifyErr) {
+		// The standing advice for a rejected key is to log in again, which is
+		// what just happened. Point at the two things that are actually left.
+		var apiErr *api.Error
+		if errors.As(verifyErr, &apiErr) {
+			apiErr.Body["fix"] = "the registry does not accept this key — check it was pasted whole, " +
+				"or issue a new one in the dashboard"
+		}
+		return verifyErr
+	}
+
+	var id api.Identity
+	if verifyErr == nil {
+		id = api.Identity{KeyID: key.KeyID, Workspace: key.Workspace}
+	}
+
+	path, err := api.SaveCredentials(f.token, id)
 	if err != nil {
 		return api.Fail("credentials_unwritable", "could not write "+api.CredentialsPath()+": "+err.Error())
 	}
-	fmt.Fprintln(w, "✓ token stored in "+path)
+
+	result := &output.Login{Path: path, Confirmed: verifyErr == nil}
+	if verifyErr != nil {
+		result.Reason = unconfirmedReason(verifyErr)
+	} else {
+		result.KeyID, result.Workspace = key.KeyID, key.Workspace
+	}
+	fmt.Fprintln(w, output.StoredKey(result, format, f.quiet, colour))
 	return nil
+}
+
+// unconfirmedReason says why a login went unchecked in the few words that fit
+// on the line under it. The status is included when there was one, because
+// "the registry answered badly" and "nothing answered" call for different
+// things next.
+func unconfirmedReason(err error) string {
+	var apiErr *api.Error
+	if errors.As(err, &apiErr) {
+		if apiErr.Status != 0 {
+			return fmt.Sprintf("%s (HTTP %d)", apiErr.Code(), apiErr.Status)
+		}
+		return apiErr.Code()
+	}
+	return err.Error()
 }
 
 func authToken(w io.Writer, env runctx.Env) error {
@@ -520,7 +578,9 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 		"registry":      registryMode(client, env),
 		"api_status":    probe(client),
 		"authenticated": client.Authenticated(),
+		"token_source":  api.TokenSource(env),
 		"key":           keySummary(client),
+		"workspace":     recordedWorkspace(env),
 		// Runs are where the metadata goes, and they need a key — so whether they
 		// are available is the difference between metadata being kept and dropped.
 		"runs_available": client.Authenticated(),
@@ -529,7 +589,8 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 	}
 
 	keys := []string{"version", "runtime", "api", "registry", "api_status",
-		"authenticated", "key", "runs_available", "credentials"}
+		"authenticated", "token_source", "key", "workspace", "runs_available",
+		"credentials"}
 
 	if format != output.Human {
 		b, _ := json.MarshalIndent(report, "", "  ")
@@ -574,8 +635,8 @@ func probe(client *api.Client) string {
 	return fmt.Sprintf("reachable (%s, %s)", service.Service, strings.Join(service.Versions, " "))
 }
 
-// keySummary says what the key is good for in one line. It only calls out to
-// the registry when there is a key to verify, so a keyless doctor stays a
+// keySummary names the key and where it lands, in one line. It only calls out
+// to the registry when there is a key to verify, so a keyless doctor stays a
 // single request.
 func keySummary(client *api.Client) string {
 	if client.Token == "" {
@@ -589,11 +650,29 @@ func keySummary(client *api.Client) string {
 		}
 		return "unknown — " + err.Error()
 	}
-	scopes := strings.Join(key.Scopes, " ")
-	if scopes == "" {
-		scopes = "no scopes"
+	if key.Name != "" {
+		return fmt.Sprintf("%s (%s) %s", key.KeyID, key.Workspace, key.Name)
 	}
-	return fmt.Sprintf("%s (%s) %s", key.KeyID, key.Workspace, scopes)
+	return fmt.Sprintf("%s (%s)", key.KeyID, key.Workspace)
+}
+
+// recordedWorkspace says where uploads land according to what login wrote down,
+// without calling out at all. It is the answer keySummary spends a request on,
+// available on a train.
+//
+// Silence here is the point rather than a gap. A token from the environment was
+// never logged in, so nothing was recorded about it and the file's workspace
+// belongs to a different key; saying it would name somewhere uploads are not
+// going. A login the registry could not confirm recorded nothing either. Both
+// say so and point at the one thing that can settle it.
+func recordedWorkspace(env runctx.Env) string {
+	if id, ok := api.ReadIdentity(env); ok {
+		return id.Workspace
+	}
+	if api.TokenSource(env) == api.TokenSourceNone {
+		return "none — uploads will be anonymous"
+	}
+	return "unknown — not recorded at login; `krowk auth verify` asks the registry"
 }
 
 // registryServe runs the local stand-in for api.krowk.com, so developing against

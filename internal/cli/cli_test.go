@@ -16,6 +16,18 @@ import (
 	"github.com/krowkcom/cli/internal/registry"
 )
 
+// isolateConfig gives a test an empty config directory of its own.
+//
+// The credentials path is read from the process environment rather than from
+// the harness's, so without this every test sees whatever key the person
+// running the suite happens to be logged in with. A test that drops KROWK_TOKEN
+// to exercise the anonymous path then quietly gets their key instead, and the
+// suite passes or fails depending on whose machine it is on.
+func isolateConfig(t *testing.T) {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+}
+
 // harness runs the CLI against a throwaway registry, the way a user would.
 type harness struct {
 	t       *testing.T
@@ -29,6 +41,8 @@ func newHarness(t *testing.T, limitBytes int64) *harness {
 
 	server := httptest.NewServer(registry.Handler(limitBytes, ""))
 	t.Cleanup(server.Close)
+
+	isolateConfig(t)
 
 	h := &harness{
 		t:      t,
@@ -608,6 +622,7 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 		inner.ServeHTTP(w, r)
 	}))
 	t.Cleanup(server.Close)
+	isolateConfig(t)
 
 	h := &harness{t: t, server: server, env: map[string]string{
 		"KROWK_API_URL": server.URL + "/v1",
@@ -636,7 +651,7 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 		"GET /v1/artifacts/{slug}",
 		// doctor: the reachability probe, then the key check.
 		"GET /",
-		"POST /v1/keys/verify",
+		"GET /v1/key",
 		// push, keyless: no run to open or close.
 		"POST /v1/artifacts",
 		"PUT /v1/artifacts/{slug}/finalization",
@@ -776,6 +791,7 @@ func TestCreateRunIsNotRetried(t *testing.T) {
 		fmt.Fprint(w, `{"error":{"code":"boom","message":"transient"}}`)
 	}))
 	t.Cleanup(server.Close)
+	isolateConfig(t)
 
 	h := &harness{t: t, server: server, env: map[string]string{
 		"KROWK_API_URL": server.URL + "/v1",

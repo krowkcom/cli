@@ -16,7 +16,9 @@
 // hanging off an artifact is a nested resource instead — the finalization of an
 // artifact, the claim on one, the completion of a run. The verb follows from
 // whether the call can be repeated: finalizing and completing are idempotent, so
-// they are PUTs; claiming spends a one-shot token, so it is a POST.
+// they are PUTs; claiming spends a one-shot token, so it is a POST. Checking a
+// key is the same rule read the other way — GET /v1/key names the key this
+// request is made with, because asking what it may do changes nothing about it.
 package api
 
 import (
@@ -193,50 +195,59 @@ type Run struct {
 	Metadata   json.RawMessage `json:"metadata,omitempty"`
 }
 
-// Key is what the registry says about the token it was called with. Verifying
-// beats guessing: a key can be revoked, expired, or simply scoped for reading,
-// and none of that is visible from the token string.
+// Key is the key a request is made with, as the registry reports it. Asking
+// beats guessing: a token string says nothing about itself — it can be revoked,
+// expired, or for a workspace other than the one the caller expects, and all
+// three look identical until an upload fails.
 type Key struct {
-	Valid     bool     `json:"valid"`
-	KeyID     string   `json:"key_id,omitempty"`
-	Workspace string   `json:"workspace,omitempty"`
-	Scopes    []string `json:"scopes,omitempty"`
-	ExpiresAt string   `json:"expires_at,omitempty"`
-	// Status is the HTTP status the verification answered with. Diagnostics
-	// print what actually arrived rather than assuming 200. Transport detail,
-	// not part of the key itself.
+	KeyID      string `json:"key_id,omitempty"`
+	Name       string `json:"name,omitempty"`
+	Workspace  string `json:"workspace,omitempty"`
+	ExpiresAt  string `json:"expires_at,omitempty"`
+	LastUsedAt string `json:"last_used_at,omitempty"`
+	CreatedAt  string `json:"created_at,omitempty"`
+	// Status is the HTTP status the read answered with. Diagnostics print what
+	// actually arrived rather than assuming 200. Transport detail, not part of
+	// the key itself.
 	Status int `json:"-"`
 }
 
-// HasScope reports whether the key carries a named scope.
-func (k *Key) HasScope(scope string) bool {
-	return slices.Contains(k.Scopes, scope)
-}
-
-// ScopeWrite is what an upload needs.
-const ScopeWrite = "artifacts:write"
-
-// VerifyKey asks the registry to confirm the token and report its scopes. It
-// sends whatever token the client holds, including none, so the caller can tell
-// "no key" from "rejected key" from "registry unreachable".
+// VerifyKey reads back the key the client is holding. There is no "valid" field
+// to consult: a key the registry will not accept gets the same 401 here as
+// anywhere else, so a success is the answer. What is checked is that a key came
+// back at all — a 200 with no key_id is some other service answering, not a
+// registry saying yes.
 func (c *Client) VerifyKey(ctx context.Context) (*Key, error) {
 	var key Key
 	var status int
-	if err := c.callStatus(ctx, http.MethodPost, "/keys/verify", map[string]any{}, &key, &status); err != nil {
+	if err := c.callStatus(ctx, http.MethodGet, "/key", nil, &key, &status); err != nil {
 		return nil, err
 	}
 	key.Status = status
-	// A 200 saying valid:false is still a rejection; surface it as one, carrying
-	// the status it arrived with so the caller can tell it apart from an error
-	// formed before any HTTP exchange.
-	if !key.Valid {
+	if key.KeyID == "" {
 		return nil, &Error{Status: status, Body: map[string]any{
-			"error":     "invalid_key",
-			"fix":       "the registry does not recognise this key — run `krowk auth login --token krowk_sk_...` with a current one",
+			"error":     "malformed_response",
+			"fix":       "the registry answered the key lookup without naming a key — check KROWK_API_URL points at the API host, not the website",
 			"retryable": false,
 		}}
 	}
 	return &key, nil
+}
+
+// KeyRejected reports whether an error from VerifyKey is the registry saying it
+// will not accept this key, as opposed to not managing to answer at all.
+//
+// The distinction is the whole of `auth login`'s judgement. A 401 is a verdict
+// on the key itself and there is nothing to retry — the token is wrong now and
+// will be wrong later. Anything else, from no network to a 503 to something
+// that is not a registry answering, is a verdict on the moment, and the key may
+// well be fine. Only the first is grounds for refusing to store it.
+func KeyRejected(err error) bool {
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Status == http.StatusUnauthorized || apiErr.Status == http.StatusForbidden
 }
 
 // Error carries a failure flattened into one map, so everything downstream reads
@@ -707,7 +718,7 @@ func (c *Client) doOnce(req *http.Request, out any, status *int) error {
 		if err.Code() == "unauthorized" {
 			if c.Token == "" {
 				err.Body["fix"] = "this endpoint needs an API key — run `krowk auth login --token krowk_sk_...`, or set KROWK_TOKEN"
-			} else if !strings.HasSuffix(req.URL.Path, "/keys/verify") {
+			} else if !strings.HasSuffix(req.URL.Path, "/key") {
 				// A key was sent and rejected, which is exactly the moment the
 				// self-check earns its keep — the registry cannot know the CLI has
 				// a verify command, so the client adds that half of the fix itself.

@@ -45,9 +45,9 @@ advertises all land with the first tagged release — see the prerequisites belo
 | `krowk runs start` | Open a run to group later uploads under |
 | `krowk runs finish <run>` | Close a run |
 | `krowk claim <artifact> <claim-token>` | Keep an anonymous upload past its expiry |
-| `krowk auth login --token <token>` | Store an API token in `~/.config/krowk/credentials.json` (0600) |
+| `krowk auth login --token <token>` | Check a token against the registry, then store it in `~/.config/krowk/credentials.json` (0600) |
 | `krowk auth token` | Print the stored token, for scripts |
-| `krowk auth verify` | Ask the registry what the stored key may actually do |
+| `krowk auth verify` | Ask the registry which key this is, and the workspace it acts in |
 | `krowk doctor` | Report version, API reachability, auth and detected run context |
 | `krowk registry serve` | Run the local stand-in registry to develop against |
 
@@ -61,6 +61,17 @@ that captures stdout gets structured data without asking for it.
 
 **One file, one artifact, one link.** Pushing three files creates three
 artifacts with three URLs. What groups them is a run, not an artifact.
+
+**Logging in asks first.** `auth login` reads the key back from the registry
+before writing it down, so a mistyped token fails while the real one is still on
+the clipboard rather than at the next push. A key the registry rejects is not
+stored, and never replaces a working one; a registry that cannot be reached is
+not evidence about the key, so the token is stored unconfirmed and `auth verify`
+settles it later. What came back — the key ID and the workspace — is kept
+alongside the token, which is how `doctor` names the workspace an upload would
+land in without a round trip. `KROWK_TOKEN` outranks that file, so when it is
+set the recorded workspace describes a different key and is withheld rather than
+reported.
 
 ## Pasting the result
 
@@ -109,7 +120,7 @@ not also in the CLI.
 | `krowk_get_artifact` | Look one up by its slug |
 | `krowk_claim_artifact` | Spend a claim token to keep an anonymous upload (needs a key) |
 | `krowk_get_run` | Report the repo, commit, branch and agent that will be attached |
-| `krowk_verify_key` | Whether a key is configured, and what it may do |
+| `krowk_verify_key` | Whether a key is configured, and the workspace it acts in |
 
 Every result carries the markdown embed and the bare URL, each labelled with the
 surfaces it belongs to, so the agent's job is copy-paste rather than templating.
@@ -190,10 +201,13 @@ straight to object storage, and a later call verifies what landed.
 The API is resourceful all the way down, so what would be a verb hanging off an
 artifact is a nested resource instead. The method follows from whether the call
 can be repeated — finalizing and completing are idempotent, so they are `PUT`s;
-claiming spends a one-shot token, so it is a `POST`:
+claiming spends a one-shot token, so it is a `POST`. Reading a key is the same
+rule the other way round: asking what it may do changes nothing about it, so the
+key a request is made with is a singular resource reached with a `GET`:
 
 ```
 GET        /                                  service descriptor
+GET        /v1/key                            the key this request is made with
 GET        /v1/artifacts                      list, newest first (needs a key)
 POST       /v1/artifacts                      declare an upload
 GET        /v1/artifacts/:slug                read one back
@@ -203,7 +217,7 @@ POST       /v1/runs                           open a run (needs a key)
 PUT|PATCH  /v1/runs/:slug/completion          close a run (needs a key)
 ```
 
-Everything but listing, claiming and the run endpoints works without a key: for a
+Everything but listing, claiming, the key and the run endpoints works without a key: for a
 keyless request the slug *is* the capability, since slugs are 21 random base58
 characters and the bytes are public on the CDN regardless.
 
@@ -405,9 +419,9 @@ Blocking, in order:
    for the binaries plus a thin npm wrapper that pulls the right one through
    per-platform `optionalDependencies` — the pattern esbuild uses. A Homebrew
    tap and `curl | bash` come off the same build.
-3. **Getting a token.** `auth login --token` stores whatever it is handed. Keys
-   exist in the registry and the dashboard can issue them, but there is no
-   device flow, so an agent in a container still needs a human to paste one in.
+3. **Getting a token.** Keys exist in the registry and the dashboard can issue
+   them, but there is no device flow, so an agent in a container still needs a
+   human to paste one in.
 
 Non-blocking, in rough value order: a Claude Code `PostToolUse` hook so
 screenshots upload with no prompting; a GitHub Action. The MCP server itself

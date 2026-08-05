@@ -232,20 +232,21 @@ func TestClaimTokenIsSurfacedButNeverPasteable(t *testing.T) {
 	}
 }
 
-func TestKeyRendersScopesAndWarnsWhenItCannotUpload(t *testing.T) {
-	k := &api.Key{Valid: true, KeyID: "key_9f3c2e1d", Workspace: "acme",
-		Scopes: []string{"artifacts:read"}}
+func TestKeyRendersTheKeyAndItsWorkspace(t *testing.T) {
+	k := &api.Key{KeyID: "key_9f3c2e1d", Name: "CI", Workspace: "ws_acme",
+		ExpiresAt: "2026-09-01T00:00:00Z"}
 
 	human := Key(k, Human, false, false)
-	for _, want := range []string{"key_9f3c2e1d", "acme", "artifacts:read", "cannot upload"} {
+	// The workspace is the fact worth confirming: it is where an upload lands.
+	for _, want := range []string{"key_9f3c2e1d", "ws_acme", "CI", "2026-09-01"} {
 		if !strings.Contains(human, want) {
 			t.Errorf("human key output is missing %q:\n%s", want, human)
 		}
 	}
 
-	k.Scopes = append(k.Scopes, api.ScopeWrite)
-	if got := Key(k, Human, false, false); strings.Contains(got, "cannot upload") {
-		t.Errorf("a write-scoped key must not warn:\n%s", got)
+	// A key that never expires says nothing about expiry rather than saying none.
+	if got := Key(&api.Key{KeyID: "key_9f3c2e1d"}, Human, false, false); strings.Contains(got, "expires") {
+		t.Errorf("a key with no expiry must not mention one:\n%s", got)
 	}
 
 	// There is no link to a key, so url falls back to the JSON envelope.
@@ -258,5 +259,56 @@ func TestKeyRendersScopesAndWarnsWhenItCannotUpload(t *testing.T) {
 	}
 	if !e.OK || e.Data.KeyID != k.KeyID {
 		t.Errorf("url format = %+v, want the JSON envelope", e)
+	}
+}
+
+func TestStoredKeyDistinguishesAConfirmedLoginFromAnUnconfirmedOne(t *testing.T) {
+	confirmed := &Login{
+		Path: "/home/x/.config/krowk/credentials.json", Confirmed: true,
+		KeyID: "key_9f3c2e1d", Workspace: "ws_acme",
+	}
+
+	human := StoredKey(confirmed, Human, false, false)
+	for _, want := range []string{"key_9f3c2e1d", "ws_acme"} {
+		if !strings.Contains(human, want) {
+			t.Errorf("human login output is missing %q:\n%s", want, human)
+		}
+	}
+	if strings.Contains(human, "unconfirmed") {
+		t.Errorf("a confirmed login must not hedge:\n%s", human)
+	}
+
+	// The unconfirmed case is the one an agent has to be able to read: the
+	// command succeeded and the key is stored, but nothing has vouched for it.
+	pending := &Login{
+		Path: confirmed.Path, Confirmed: false, Reason: "network_unreachable",
+	}
+	if got := StoredKey(pending, Human, false, false); !strings.Contains(got, "unconfirmed") ||
+		!strings.Contains(got, "network_unreachable") {
+		t.Errorf("unconfirmed login does not say so:\n%s", got)
+	}
+
+	var e struct {
+		OK      bool   `json:"ok"`
+		Data    Login  `json:"data"`
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(StoredKey(pending, JSON, false, false)), &e); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if !e.OK {
+		t.Error("storing the token succeeded, so the envelope says ok")
+	}
+	if e.Data.Confirmed || e.Data.Reason != "network_unreachable" {
+		t.Errorf("data = %+v", e.Data)
+	}
+	// An unconfirmed login's next step is verifying, not pushing.
+	if !strings.Contains(StoredKey(pending, JSON, false, false), "auth verify") {
+		t.Error("unconfirmed login should point at `krowk auth verify`")
+	}
+
+	// --quiet drops the envelope, the way it does everywhere else.
+	if got := StoredKey(confirmed, JSON, true, false); strings.Contains(got, `"ok"`) {
+		t.Errorf("--quiet should drop the envelope, got %s", got)
 	}
 }

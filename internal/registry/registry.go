@@ -143,7 +143,8 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	mux.HandleFunc("PATCH /v1/artifacts/{slug}/finalization", s.finalizeArtifact)
 	mux.HandleFunc("POST /v1/artifacts/{slug}/claim", s.claimArtifact)
 
-	mux.HandleFunc("POST /v1/keys/verify", verifyKey)
+	// The key the request is made with — a singular resource, read with a GET.
+	mux.HandleFunc("GET /v1/key", showKey)
 
 	mux.HandleFunc("POST /v1/runs", s.createRun)
 	mux.HandleFunc("PUT /v1/runs/{slug}/completion", s.finishRun)
@@ -685,11 +686,14 @@ func workspaceFor(token string) string {
 	return "ws_" + sha256Hex([]byte(token))[:20]
 }
 
-// verifyKey lets the CLI self-check its key before doing any work. No key is a
-// 401 — there is nothing to verify — and any bearer token resolves to the same
+// showKey lets the CLI self-check its key before doing any work. No key is a
+// 401 — there is no key to report — and any bearer token resolves to the same
 // derived workspace the artifact endpoints use, so `auth verify` and a push
 // agree about where an upload would land.
-func verifyKey(w http.ResponseWriter, r *http.Request) {
+//
+// Nothing says "valid": a key the registry would refuse never gets this far, so
+// a 200 is the answer.
+func showKey(w http.ResponseWriter, r *http.Request) {
 	token, found := bearer(r.Header.Get("Authorization"))
 	if !found {
 		writeUnauthorized(w)
@@ -697,11 +701,10 @@ func verifyKey(w http.ResponseWriter, r *http.Request) {
 	}
 	sum := sha256Hex([]byte(token))
 	writeJSON(w, http.StatusOK, map[string]any{
-		"valid": true,
 		// Derived, never the token itself — a key ID ends up in logs and output.
 		"key_id":    "key_" + sum[:8],
+		"name":      "local",
 		"workspace": workspaceFor(token),
-		"scopes":    []string{"artifacts:read", "artifacts:write"},
 	})
 }
 

@@ -675,10 +675,12 @@ func verifyKey(ctx context.Context, s *Server, _ json.RawMessage) (string, any, 
 	lines := []string{
 		"Key " + key.KeyID + " is valid.",
 		"  workspace  " + key.Workspace,
-		"  scopes     " + strings.Join(key.Scopes, " "),
 	}
-	if !key.HasScope(api.ScopeWrite) {
-		lines = append(lines, "", "This key cannot upload — it is missing "+api.ScopeWrite+".")
+	if key.Name != "" {
+		lines = append(lines, "  name       "+key.Name)
+	}
+	if key.ExpiresAt != "" {
+		lines = append(lines, "  expires    "+key.ExpiresAt)
 	}
 	return strings.Join(lines, "\n"), key, nil
 }
@@ -894,8 +896,8 @@ func toolSchemas() []map[string]any {
 		},
 		{
 			"name": "krowk_verify_key",
-			"description": "Check whether an API key is configured and what it is allowed to do. " +
-				"Without a key, pushes still work but are anonymous and expire in 24h.",
+			"description": "Check whether an API key is configured, and which workspace uploads " +
+				"made with it land in. Without a key, pushes still work but are anonymous and expire in 24h.",
 			"inputSchema": map[string]any{
 				"type":                 "object",
 				"properties":           map[string]any{},

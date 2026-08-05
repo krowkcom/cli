@@ -312,3 +312,76 @@ func TestStoredKeyDistinguishesAConfirmedLoginFromAnUnconfirmedOne(t *testing.T)
 		t.Errorf("--quiet should drop the envelope, got %s", got)
 	}
 }
+
+// The run is the whole point of `uploads attach` and of `claim --run`, and both
+// answer through Artifact. The human line already prints it, so the envelope an
+// agent reads must not be the one place it goes missing.
+func TestAttachedRunReachesTheSummaryAndTheHumanLine(t *testing.T) {
+	attached := &api.Artifact{
+		Slug: "art_x", State: "ready", Filename: "shot.png", ByteSize: 15,
+		Run: "run_y", URL: "https://cdn.example/art_x/shot.png",
+	}
+	now := time.Now()
+
+	var e struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(Artifact(attached, JSON, false, false, now)), &e); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if !strings.Contains(e.Summary, "run run_y") {
+		t.Errorf("summary = %q, want the run named", e.Summary)
+	}
+	if human := Artifact(attached, Human, false, false, now); !strings.Contains(human, "run run_y") {
+		t.Errorf("human = %q, want the run named", human)
+	}
+
+	// An artifact with no run says nothing about one rather than trailing a comma.
+	loose := *attached
+	loose.Run = ""
+	if got := Artifact(&loose, JSON, false, false, now); strings.Contains(got, "run ") {
+		t.Errorf("envelope = %s, want no run mentioned", got)
+	}
+}
+
+// The summary speaks for the whole result, so a run it did not open is named only
+// when every artifact is in it — a push given --run, however many files it was.
+func TestSummaryNamesACallerSuppliedRunForEveryFileCount(t *testing.T) {
+	one := &api.Artifact{Slug: "art_a", Filename: "a.png", ByteSize: 10, Run: "run_y"}
+	two := &api.Artifact{Slug: "art_b", Filename: "b.png", ByteSize: 20, Run: "run_y"}
+	elsewhere := &api.Artifact{Slug: "art_c", Filename: "c.png", ByteSize: 30, Run: "run_z"}
+
+	if got := summary(Result{Artifacts: []*api.Artifact{one}}); !strings.Contains(got, "run run_y") {
+		t.Errorf("one file = %q, want the run named", got)
+	}
+	if got := summary(Result{Artifacts: []*api.Artifact{one, two}}); !strings.Contains(got, "run run_y") {
+		t.Errorf("two files in one run = %q, want the run named", got)
+	}
+	// Artifacts in different runs have no single run to report, so none is claimed.
+	if got := summary(Result{Artifacts: []*api.Artifact{one, elsewhere}}); strings.Contains(got, "run ") {
+		t.Errorf("mixed runs = %q, want no run claimed", got)
+	}
+}
+
+// Human and JSON must not disagree about which run an upload went into. A push
+// given --run has the run on its artifacts and none of its own, and both formats
+// read it from the same place.
+func TestHumanAndJSONAgreeOnACallerSuppliedRun(t *testing.T) {
+	r := Result{Artifacts: []*api.Artifact{
+		{Slug: "art_a", Filename: "a.png", ByteSize: 10, Run: "run_y", URL: "https://cdn.example/a.png"},
+	}}
+	now := time.Now()
+
+	if human := Upload(r, Human, false, false, now); !strings.Contains(human, "run run_y") {
+		t.Errorf("human = %q, want the run named", human)
+	}
+	var e struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(Upload(r, JSON, false, false, now)), &e); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if !strings.Contains(e.Summary, "run run_y") {
+		t.Errorf("summary = %q, want the run named", e.Summary)
+	}
+}

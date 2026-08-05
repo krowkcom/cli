@@ -236,10 +236,34 @@ func summary(r Result) string {
 		noun = "artifact"
 	}
 	s := fmt.Sprintf("%d %s, %s", len(r.Artifacts), noun, HumanBytes(r.Bytes()))
-	if r.Run != nil {
-		s += ", run " + r.Run.Slug
+	if run := summaryRun(r); run != "" {
+		s += ", run " + run
 	}
 	return s
+}
+
+// summaryRun names the run the summary line should carry. A run this command
+// opened is on the result; every other way an artifact ends up in one — a push
+// given --run, an artifact read back, one just attached — records it only on the
+// artifacts, and that is the fact `uploads attach` and `claim --run` exist to
+// report, so the summary must not omit it while the human line prints it.
+//
+// Falling back needs every artifact to agree, because the line speaks for the
+// whole result: naming the first one's run would be wrong for the rest.
+func summaryRun(r Result) string {
+	if r.Run != nil {
+		return r.Run.Slug
+	}
+	if len(r.Artifacts) == 0 {
+		return ""
+	}
+	shared := r.Artifacts[0].Run
+	for _, a := range r.Artifacts[1:] {
+		if a.Run != shared {
+			return ""
+		}
+	}
+	return shared
 }
 
 // breadcrumbs name the calls left to make. A claim token is the one that matters
@@ -298,8 +322,11 @@ func humanResult(r Result, colour bool, now time.Time) string {
 
 	// One trailing line for the facts that apply to the whole upload.
 	var facts []string
-	if r.Run != nil {
-		facts = append(facts, "run "+r.Run.Slug)
+	// The same run the envelope's summary names, so the two formats do not disagree
+	// about which run an upload went into — a push given --run has one recorded on
+	// its artifacts and none of its own.
+	if run := summaryRun(r); run != "" {
+		facts = append(facts, "run "+run)
 	}
 	if r.Title != "" {
 		facts = append(facts, r.Title)

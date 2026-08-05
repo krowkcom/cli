@@ -323,3 +323,135 @@ func TestFinishRunTwiceKeepsTheFirstFinishedAt(t *testing.T) {
 		t.Errorf("second completion answered differently:\nfirst:  %v\nsecond: %v", first, second)
 	}
 }
+
+// openRun opens a run and returns its slug.
+func openRun(t *testing.T, server *httptest.Server, token string) string {
+	t.Helper()
+	status, payload := request(t, http.MethodPost, server.URL+"/v1/runs", token, "application/json", `{"run":{}}`)
+	if status != http.StatusCreated {
+		t.Fatalf("open run = %d %v", status, payload)
+	}
+	slug, _ := payload["slug"].(string)
+	return slug
+}
+
+// Attaching a run after the fact is the route the claim flow needs: a keyless
+// upload cannot name a run, and claiming it does not give it one.
+func TestAttachRunPutsAnOwnedArtifactUnderARun(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const token = "krowk_sk_owner"
+
+	artifact := declare(t, server, token, "shot.png", "some bytes")
+	slug, _ := artifact["slug"].(string)
+	run := openRun(t, server, token)
+
+	url := server.URL + "/v1/artifacts/" + slug + "/run"
+	status, payload := request(t, http.MethodPut, url, token, "application/json",
+		fmt.Sprintf(`{"run":%q}`, run))
+	if status != http.StatusOK || payload["run"] != run {
+		t.Fatalf("attach = %d %v, want the artifact under %s", status, payload, run)
+	}
+
+	// Idempotent, because agents retry: the same PUT is the same success.
+	if again, body := request(t, http.MethodPut, url, token, "application/json",
+		fmt.Sprintf(`{"run":%q}`, run)); again != http.StatusOK || body["run"] != run {
+		t.Errorf("second attach = %d %v", again, body)
+	}
+
+	// PATCH is routed alongside PUT, as the registry's own routes are.
+	if status, body := request(t, http.MethodPatch, url, token, "application/json",
+		fmt.Sprintf(`{"run":%q}`, run)); status != http.StatusOK || body["run"] != run {
+		t.Errorf("PATCH alias = %d %v", status, body)
+	}
+
+	// The link is what has already been pasted, so attaching must not move it.
+	if shown := mustShow(t, server, token, slug); shown["url"] != artifact["url"] {
+		t.Errorf("attaching moved the link: %v → %v", artifact["url"], shown["url"])
+	}
+
+	// A closed run still accepts one. The case this exists for is a CI run that
+	// finished long before anyone claimed the anonymous upload it left behind, so
+	// refusing here would leave that upload nowhere to go.
+	if status, payload := request(t, http.MethodPut,
+		server.URL+"/v1/runs/"+run+"/completion", token, "", ""); status != http.StatusOK {
+		t.Fatalf("finish run = %d %v", status, payload)
+	}
+	second := declare(t, server, token, "later.png", "some bytes")
+	laterSlug, _ := second["slug"].(string)
+	if status, payload := request(t, http.MethodPut,
+		server.URL+"/v1/artifacts/"+laterSlug+"/run", token, "application/json",
+		fmt.Sprintf(`{"run":%q}`, run)); status != http.StatusOK || payload["run"] != run {
+		t.Errorf("attach to a finished run = %d %v, want it allowed", status, payload)
+	}
+}
+
+func mustShow(t *testing.T, server *httptest.Server, token, slug string) map[string]any {
+	t.Helper()
+	status, payload := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, token, "", "")
+	if status != http.StatusOK {
+		t.Fatalf("show = %d %v", status, payload)
+	}
+	return payload
+}
+
+// A run belongs to a workspace, so a keyless attach is refused with the same code
+// a keyless push naming a run gets — and the run parameter is required.
+func TestAttachRunNeedsAKeyAndARun(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const token = "krowk_sk_owner"
+
+	artifact := declare(t, server, token, "shot.png", "some bytes")
+	slug, _ := artifact["slug"].(string)
+	run := openRun(t, server, token)
+	url := server.URL + "/v1/artifacts/" + slug + "/run"
+
+	// A plain 401, the way the registry refuses this route — not the run_needs_key a
+	// keyless push naming a run gets, which is raised only where a request may
+	// legitimately arrive without a key.
+	status, payload := request(t, http.MethodPut, url, "", "application/json", fmt.Sprintf(`{"run":%q}`, run))
+	if status != http.StatusUnauthorized || errorCode(payload) != "unauthorized" {
+		t.Errorf("keyless attach = %d %s, want 401 unauthorized", status, errorCode(payload))
+	}
+
+	status, payload = request(t, http.MethodPut, url, token, "application/json", `{}`)
+	if status != http.StatusBadRequest || errorCode(payload) != "parameter_missing" {
+		t.Errorf("attach with no run = %d %s, want 400 parameter_missing", status, errorCode(payload))
+	}
+}
+
+// Both slugs resolve in the requesting key's workspace, so another workspace's
+// artifact and another workspace's run are both simply not there. That is also
+// what makes claim-then-attach the required order: an unclaimed anonymous upload
+// is in nobody's workspace.
+func TestAttachRunIsScopedToTheKeysWorkspace(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const owner, stranger = "krowk_sk_owner", "krowk_sk_stranger"
+
+	artifact := declare(t, server, owner, "shot.png", "some bytes")
+	slug, _ := artifact["slug"].(string)
+	run := openRun(t, server, owner)
+	url := server.URL + "/v1/artifacts/" + slug + "/run"
+
+	if status, payload := request(t, http.MethodPut, url, stranger, "application/json",
+		fmt.Sprintf(`{"run":%q}`, run)); status != http.StatusNotFound || errorCode(payload) != "not_found" {
+		t.Errorf("a stranger attached it: %d %s", status, errorCode(payload))
+	}
+	if status, payload := request(t, http.MethodPut, url, owner, "application/json",
+		`{"run":"run_nosuchrunatall00000"}`); status != http.StatusNotFound || errorCode(payload) != "not_found" {
+		t.Errorf("unknown run = %d %s, want 404 not_found", status, errorCode(payload))
+	}
+	// Someone else's run is the same answer, not a hint that it exists.
+	strangersRun := openRun(t, server, stranger)
+	if status, payload := request(t, http.MethodPut, url, owner, "application/json",
+		fmt.Sprintf(`{"run":%q}`, strangersRun)); status != http.StatusNotFound {
+		t.Errorf("attached to another workspace's run: %d %v", status, payload)
+	}
+
+	anonymous := declare(t, server, "", "anon.png", "some bytes")
+	anonSlug, _ := anonymous["slug"].(string)
+	if status, payload := request(t, http.MethodPut,
+		server.URL+"/v1/artifacts/"+anonSlug+"/run", owner, "application/json",
+		fmt.Sprintf(`{"run":%q}`, run)); status != http.StatusNotFound {
+		t.Errorf("an unclaimed anonymous upload was attachable: %d %v", status, payload)
+	}
+}

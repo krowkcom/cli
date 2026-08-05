@@ -575,24 +575,10 @@ func TestVerifyKeyReportsTheWorkspaceAndAnonymousMode(t *testing.T) {
 func TestClaimAdoptsAnAnonymousPushIntoTheWorkspace(t *testing.T) {
 	anon := newSession(t, "")
 
-	pushed := anon.callTool("krowk_push", map[string]any{"files": []string{anon.fixture}})
-	structured, _ := pushed["structuredContent"].(map[string]any)
-	artifacts, _ := structured["artifacts"].([]any)
-	artifact, _ := artifacts[0].(map[string]any)
-	slug, _ := artifact["slug"].(string)
-	claim, _ := artifact["claim_token"].(string)
-	if slug == "" || claim == "" {
-		t.Fatalf("anonymous push returned no claimable artifact: %+v", artifact)
-	}
+	slug, claim := anon.anonymousPush()
 
 	// Same registry, now with a key.
-	keyed := &session{t: t, server: &Server{
-		Client:  api.New(anon.server.Client.BaseURL, "krowk_sk_test"),
-		Env:     anon.server.Env,
-		Root:    anon.server.Root,
-		Version: anon.server.Version,
-		Now:     anon.server.Now,
-	}, fixture: anon.fixture}
+	keyed := anon.withKey("krowk_sk_test")
 
 	claimed := keyed.callTool("krowk_claim_artifact", map[string]any{
 		"slug": slug, "claim_token": claim,
@@ -617,6 +603,120 @@ func TestClaimAdoptsAnAnonymousPushIntoTheWorkspace(t *testing.T) {
 	if body := text(t, unlisted); !strings.Contains(body, "unauthorized") {
 		t.Errorf("text = %q, want unauthorized", body)
 	}
+}
+
+// The agent spending the claim token is the one that knows which run the upload
+// came from, so claiming takes the run rather than a separate attach tool. An
+// anonymous upload has no run and no other way to get one.
+func TestClaimGroupsTheAdoptedUploadUnderARun(t *testing.T) {
+	anon := newSession(t, "")
+	slug, claim := anon.anonymousPush()
+
+	keyed := anon.withKey("krowk_sk_test")
+	run := keyed.startRun()
+
+	claimed := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": slug, "claim_token": claim, "run": run,
+	})
+	if claimed["isError"] == true {
+		t.Fatalf("claim with a run failed: %s", text(t, claimed))
+	}
+	if body := text(t, claimed); !strings.Contains(body, "Grouped under run "+run) {
+		t.Errorf("text = %q, want the grouping named the way a push names it", body)
+	}
+	structured, _ := claimed["structuredContent"].(map[string]any)
+	artifact, _ := structured["artifact"].(map[string]any)
+	if artifact["run"] != run {
+		t.Errorf("artifact run = %v, want %q", artifact["run"], run)
+	}
+}
+
+// The claim is spent before the attach is tried, so a failing attach must not
+// read as a claim the agent can simply repeat.
+func TestAFailedAttachSaysTheClaimStillLanded(t *testing.T) {
+	anon := newSession(t, "")
+	slug, claim := anon.anonymousPush()
+	keyed := anon.withKey("krowk_sk_test")
+
+	failed := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": slug, "claim_token": claim, "run": "run_nosuchrunatall00000",
+	})
+	if failed["isError"] != true {
+		t.Fatalf("attaching to an unknown run should fail: %+v", failed)
+	}
+	body := text(t, failed)
+	if !strings.Contains(body, "claimed and kept") {
+		t.Errorf("text = %q, want it to say the claim landed", body)
+	}
+	// The retry has to be one this transport can make. An agent here cannot shell
+	// out, so naming the CLI's `uploads attach` would be advice it cannot follow.
+	if !strings.Contains(body, "krowk_claim_artifact again") {
+		t.Errorf("text = %q, want the retry to be a tool call", body)
+	}
+	if strings.Contains(body, "uploads attach") {
+		t.Errorf("text = %q, want no shell command on the MCP surface", body)
+	}
+	structured, _ := failed["structuredContent"].(map[string]any)
+	if structured["claimed"] != slug {
+		t.Errorf("claimed = %v, want %q", structured["claimed"], slug)
+	}
+
+	// And the advice works: the same slug and token, with a run that exists, is the
+	// same success — which is what makes re-calling the tool the retry.
+	run := keyed.startRun()
+	retried := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": slug, "claim_token": claim, "run": run,
+	})
+	if retried["isError"] == true {
+		t.Fatalf("the advertised retry failed: %s", text(t, retried))
+	}
+	structured, _ = retried["structuredContent"].(map[string]any)
+	artifact, _ := structured["artifact"].(map[string]any)
+	if artifact["run"] != run {
+		t.Errorf("retry left run = %v, want %q", artifact["run"], run)
+	}
+}
+
+// anonymousPush uploads the fixture without a key and returns the slug and the
+// claim token it came back with.
+func (s *session) anonymousPush() (slug, claimToken string) {
+	s.t.Helper()
+	pushed := s.callTool("krowk_push", map[string]any{"files": []string{s.fixture}})
+	structured, _ := pushed["structuredContent"].(map[string]any)
+	artifacts, _ := structured["artifacts"].([]any)
+	if len(artifacts) == 0 {
+		s.t.Fatalf("push returned nothing: %+v", pushed)
+	}
+	artifact, _ := artifacts[0].(map[string]any)
+	slug, _ = artifact["slug"].(string)
+	claimToken, _ = artifact["claim_token"].(string)
+	if slug == "" || claimToken == "" {
+		s.t.Fatalf("anonymous push returned no claimable artifact: %+v", artifact)
+	}
+	return slug, claimToken
+}
+
+// withKey is the same registry seen through a keyed client, which is how the
+// claim flow's two halves are exercised in one test.
+func (s *session) withKey(token string) *session {
+	return &session{t: s.t, server: &Server{
+		Client:  api.New(s.server.Client.BaseURL, token),
+		Env:     s.server.Env,
+		Root:    s.server.Root,
+		Version: s.server.Version,
+		Now:     s.server.Now,
+	}, fixture: s.fixture}
+}
+
+// startRun opens a run to attach to. There is no tool for it — runs are the
+// CLI's business — so it goes through the client the server holds.
+func (s *session) startRun() string {
+	s.t.Helper()
+	run, err := s.server.Client.CreateRun(context.Background(), map[string]any{"agent": "test"})
+	if err != nil {
+		s.t.Fatalf("create run: %v", err)
+	}
+	return run.Slug
 }
 
 func TestUnknownToolAndMethodAreProtocolErrors(t *testing.T) {

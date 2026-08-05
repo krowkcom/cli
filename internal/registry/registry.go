@@ -143,6 +143,12 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	mux.HandleFunc("PATCH /v1/artifacts/{slug}/finalization", s.finalizeArtifact)
 	mux.HandleFunc("POST /v1/artifacts/{slug}/claim", s.claimArtifact)
 
+	// The run an artifact belongs to is a singular nested resource, so it is set
+	// with a PUT rather than posted to: an artifact ends up under the same run
+	// however many times it is asked for.
+	mux.HandleFunc("PUT /v1/artifacts/{slug}/run", s.attachRun)
+	mux.HandleFunc("PATCH /v1/artifacts/{slug}/run", s.attachRun)
+
 	// The key the request is made with — a singular resource, read with a GET.
 	mux.HandleFunc("GET /v1/key", showKey)
 
@@ -565,6 +571,70 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 	a.workspace = workspace
 	a.ExpiresAt = nil
 	a.claimed = true // a token is good once
+	writeJSON(w, http.StatusOK, serializeArtifact(a))
+}
+
+// attachRun puts an artifact under a run after the fact, which is how an upload
+// that was anonymous at create time ever gets one: it could not name a run then,
+// and claiming it does not give it one.
+//
+// A keyless request is a plain 401, not the run_needs_key a keyless push naming a
+// run answers with: the registry requires a key on this route the ordinary way,
+// and raises run_needs_key only where an upload may legitimately arrive without
+// one. Answering something friendlier here would make --dev disagree with
+// production about the code a client branches on.
+//
+// A finished run still accepts one, deliberately: the case this exists for is a
+// CI job whose run closed long before anyone got round to claiming the anonymous
+// upload it left behind, and refusing then would leave that upload with nowhere
+// to go for good.
+func (s *store) attachRun(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		Run string `json:"run"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+	if body.Run == "" {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: run.", nil)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Both slugs are looked up in the request's own workspace, so another
+	// workspace's artifact and another workspace's run both read as not existing —
+	// and an unclaimed anonymous artifact is not attachable at all.
+	a := s.find(workspace, r.PathValue("slug"))
+	if a == nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+	// Past its expiry an artifact is gone as far as the API is concerned, on every
+	// endpoint rather than only the ones that can meet an expiring one today.
+	// Nothing here produces this state — only a keyless upload gets an expiry, and
+	// this route needs a key — but the meaning of an expiry has to be uniform if an
+	// ephemeral artifact ever does reach a keyed workspace.
+	if s.expired(a) {
+		writeError(w, http.StatusGone, "expired",
+			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+		return
+	}
+	if existing, ok := s.runs[body.Run]; !ok || existing.workspace != workspace {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+
+	// Set, not appended to: an artifact belongs to one run, so a PUT naming a
+	// different one moves it rather than failing. That is what makes the call
+	// idempotent, and it is the only reading under which a retry whose first
+	// response was lost is a success.
+	a.Run = body.Run
 	writeJSON(w, http.StatusOK, serializeArtifact(a))
 }
 

@@ -21,7 +21,45 @@ const (
 	Human    Format = "human"
 	JSON     Format = "json"
 	Markdown Format = "markdown"
+	URL      Format = "url"
 )
+
+// Paste is one upload in the two forms its destinations need. There is no
+// single paste-ready string: GitHub does not build preview cards for
+// third-party links, so only the image embed shows the artifact there, while
+// Slack renders no markdown image embeds at all and unfurls a bare URL into a
+// card of its own. So the CLI carries both and says which is which.
+type Paste struct {
+	// Markdown embeds the image and links through to the artifact. This is
+	// the form for GitHub, Linear and Notion.
+	Markdown string `json:"markdown"`
+	// URL is the bare link, for Slack and Basecamp, which unfurl it themselves.
+	URL string `json:"url"`
+}
+
+// EmbedSurfaces and LinkSurfaces name where each form belongs, so the choice
+// never has to be guessed. Exported because the MCP server says the same thing.
+const (
+	EmbedSurfaces = "GitHub, Linear, Notion — renders the image"
+	// PlainSurfaces replaces EmbedSurfaces when there is no image to embed and
+	// the markdown form is only a plain link, so the label stays honest.
+	PlainSurfaces = "GitHub, Linear, Notion — plain link, no preview to embed"
+	LinkSurfaces  = "Slack, Basecamp — they unfurl the link themselves"
+)
+
+// PasteFor builds both forms for one artifact.
+func PasteFor(a *api.Artifact, title string) Paste {
+	return Paste{Markdown: MarkdownLink(a, title), URL: a.URL}
+}
+
+// MarkdownSurfacesFor is the honest label for a paste's markdown form: it only
+// promises an image where the markdown actually embeds one.
+func MarkdownSurfacesFor(p Paste) string {
+	if strings.HasPrefix(p.Markdown, "!") {
+		return EmbedSurfaces
+	}
+	return PlainSurfaces
+}
 
 // Breadcrumb suggests the next command, the way the Basecamp CLI does.
 type Breadcrumb struct {
@@ -33,6 +71,7 @@ type Breadcrumb struct {
 type Envelope struct {
 	OK          bool           `json:"ok"`
 	Data        any            `json:"data,omitempty"`
+	Paste       *Paste         `json:"paste,omitempty"`
 	Summary     string         `json:"summary,omitempty"`
 	Breadcrumbs []Breadcrumb   `json:"breadcrumbs,omitempty"`
 	Error       map[string]any `json:"error,omitempty"`
@@ -68,7 +107,7 @@ func ResolveFormat(flag string, jsonFlag, isTTY bool) (Format, error) {
 		return JSON, nil
 	}
 	switch Format(flag) {
-	case Human, JSON, Markdown:
+	case Human, JSON, Markdown, URL:
 		return Format(flag), nil
 	case "":
 		if isTTY {
@@ -76,7 +115,7 @@ func ResolveFormat(flag string, jsonFlag, isTTY bool) (Format, error) {
 		}
 		return JSON, nil
 	}
-	return "", api.Fail("bad_format", "unknown --format "+flag+" (expected human, json or markdown)")
+	return "", api.Fail("bad_format", "unknown --format "+flag+" (expected human, json, markdown or url)")
 }
 
 // HumanBytes renders a byte count the way the terminal output does.
@@ -120,20 +159,28 @@ func RelativeExpiry(iso string, now time.Time) string {
 // this itself — an image embeds, anything else is a plain link — so its version
 // is used unless a title was asked for, which only the caller knows.
 func MarkdownLink(a *api.Artifact, title string) string {
-	if title == "" || a.Markdown == "" {
-		if a.Markdown != "" {
-			return a.Markdown
-		}
-		label := a.Filename
-		if label == "" {
-			label = a.Slug
-		}
-		return link(strings.HasPrefix(a.ContentType, "image/"), label, a.URL)
+	if title == "" && a.Markdown != "" {
+		return a.Markdown
 	}
-	return link(strings.HasPrefix(a.ContentType, "image/"), title, a.URL)
+	label := title
+	if label == "" {
+		label = a.Filename
+	}
+	if label == "" {
+		label = a.Slug
+	}
+	return link(strings.HasPrefix(a.ContentType, "image/"), label, a.URL)
 }
 
+// labelEscaper escapes the characters that end or nest a link label, and folds
+// newlines to spaces because CommonMark link text cannot span lines. Parens
+// are legal in link text, so they stay.
+var labelEscaper = strings.NewReplacer(`\`, `\\`, `[`, `\[`, `]`, `\]`, "\n", " ", "\r", " ")
+
 func link(embed bool, label, url string) string {
+	// Labels are user-controlled — a title, a filename — so delimiter
+	// characters must leave here escaped or the link breaks where it is pasted.
+	label = labelEscaper.Replace(label)
 	if embed {
 		return fmt.Sprintf("![%s](%s)", label, url)
 	}
@@ -145,6 +192,8 @@ func Upload(r Result, f Format, quiet, colour bool, now time.Time) string {
 	switch f {
 	case Markdown:
 		return markdownResult(r)
+	case URL:
+		return urlResult(r)
 	case Human:
 		return humanResult(r, colour, now)
 	}
@@ -155,9 +204,30 @@ func Upload(r Result, f Format, quiet, colour bool, now time.Time) string {
 	return encode(Envelope{
 		OK:          true,
 		Data:        r,
+		Paste:       pasteForResult(r),
 		Summary:     summary(r),
 		Breadcrumbs: breadcrumbs(r),
 	})
+}
+
+// pasteForResult carries both paste forms in the envelope, so an agent picks by
+// destination instead of templating: markdown for GitHub, Linear and Notion,
+// the bare URL for Slack and Basecamp.
+func pasteForResult(r Result) *Paste {
+	if len(r.Artifacts) == 0 {
+		return nil
+	}
+	return &Paste{Markdown: markdownResult(r), URL: urlResult(r)}
+}
+
+// urlResult is the bare link per artifact, for the surfaces that unfurl a URL
+// themselves and render no markdown embeds at all.
+func urlResult(r Result) string {
+	lines := make([]string, 0, len(r.Artifacts))
+	for _, a := range r.Artifacts {
+		lines = append(lines, a.URL)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func summary(r Result) string {
@@ -257,6 +327,8 @@ func List(p *api.Page, f Format, quiet, colour bool, now time.Time) string {
 			lines = append(lines, MarkdownLink(a, ""))
 		}
 		return strings.Join(lines, "\n")
+	case URL:
+		return urlResult(Result{Artifacts: p.Artifacts})
 	case Human:
 		return humanList(p, colour, now)
 	}
@@ -330,8 +402,42 @@ func Artifact(a *api.Artifact, f Format, quiet, colour bool, now time.Time) stri
 		return humanArtifact(a, colour, now)
 	case Markdown:
 		return markdownResult(result)
+	case URL:
+		return a.URL
 	}
 	return Upload(result, f, quiet, colour, now)
+}
+
+// Key renders a verified API key: who it belongs to and what it may do. There
+// is no link to a key, so markdown and url fall back to the JSON envelope.
+func Key(k *api.Key, f Format, quiet, colour bool) string {
+	if f != Human {
+		if quiet {
+			return encode(k)
+		}
+		return encode(Envelope{
+			OK:      true,
+			Data:    k,
+			Summary: fmt.Sprintf("%s in %s, scopes: %s", k.KeyID, k.Workspace, strings.Join(k.Scopes, " ")),
+			Breadcrumbs: []Breadcrumb{
+				{Action: "push", Cmd: "krowk push screenshot.png"},
+			},
+		})
+	}
+
+	lines := []string{
+		fmt.Sprintf("%s key valid  %s", paint(colour, green, "✓"), k.KeyID),
+		fmt.Sprintf("  %-11s %s", "workspace", k.Workspace),
+		fmt.Sprintf("  %-11s %s", "scopes", strings.Join(k.Scopes, " ")),
+	}
+	if !k.HasScope(api.ScopeWrite) {
+		lines = append(lines, "  "+paint(colour, red, "cannot upload")+
+			" — this key is missing "+api.ScopeWrite)
+	}
+	if k.ExpiresAt != "" {
+		lines = append(lines, fmt.Sprintf("  %-11s %s", "expires", k.ExpiresAt))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func humanArtifact(a *api.Artifact, colour bool, now time.Time) string {

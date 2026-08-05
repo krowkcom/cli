@@ -634,7 +634,9 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 		"PUT /v1/runs/{slug}/completion",
 		"GET /v1/artifacts",
 		"GET /v1/artifacts/{slug}",
+		// doctor: the reachability probe, then the key check.
 		"GET /",
+		"POST /v1/keys/verify",
 		// push, keyless: no run to open or close.
 		"POST /v1/artifacts",
 		"PUT /v1/artifacts/{slug}/finalization",

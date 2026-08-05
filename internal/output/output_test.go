@@ -43,184 +43,6 @@ func TestRelativeExpiry(t *testing.T) {
 	}
 }
 
-func TestPasteCarriesBothForms(t *testing.T) {
-	a := &api.Artifact{
-		ID:         "9f3c2e1",
-		URL:        "https://krowk.com/a/9f3c2e1",
-		PreviewURL: "https://krowk.com/a/9f3c2e1/preview.png",
-		Files:      []api.File{{Filename: "foobar.jpg"}},
-	}
-
-	// GitHub renders no card for a third-party link, so the embed is the only
-	// form that shows the artifact. Labels are user-controlled, so delimiter
-	// characters must arrive escaped or the embed breaks.
-	for _, tc := range []struct {
-		title    string
-		filename string
-		want     string
-	}{
-		{"Checkout", "foobar.jpg", "[![Checkout](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)"},
-		{"Checkout [v2]", "foobar.jpg", `[![Checkout \[v2\]](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)`},
-		{"", "frame[0].png", `[![frame\[0\].png](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)`},
-		{`back\slash`, "foobar.jpg", `[![back\\slash](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)`},
-		{"line1\nline2\r\nline3", "foobar.jpg", `[![line1 line2  line3](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)`},
-	} {
-		a.Files[0].Filename = tc.filename
-		p := PasteFor(a, tc.title)
-		if p.Markdown != tc.want {
-			t.Errorf("PasteFor(%q/%q).Markdown = %q, want %q", tc.title, tc.filename, p.Markdown, tc.want)
-		}
-		// Slack renders no markdown image embeds, so it needs the plain link.
-		if p.URL != a.URL {
-			t.Errorf("url = %q, want the bare link", p.URL)
-		}
-	}
-
-	a.Files[0].Filename = "foobar.jpg"
-	p := PasteFor(a, "Checkout")
-
-	if got := Artifact(a, Markdown, "Checkout", false, false, time.Now()); got != p.Markdown {
-		t.Errorf("--format markdown = %q, want just the embed", got)
-	}
-	if got := Artifact(a, URL, "Checkout", false, false, time.Now()); got != a.URL {
-		t.Errorf("--format url = %q, want just the link", got)
-	}
-}
-
-func TestHumanOutputShowsBothFormsLabelled(t *testing.T) {
-	a := &api.Artifact{
-		ID:         "9f3c2e1",
-		URL:        "https://krowk.com/a/9f3c2e1",
-		PreviewURL: "https://krowk.com/a/9f3c2e1/preview.png",
-		Bytes:      421888,
-		Files:      []api.File{{Filename: "foobar.jpg", Bytes: 421888}},
-	}
-
-	got := Artifact(a, Human, "", false, false, time.Now())
-	for _, want := range []string{
-		"✓ uploaded  foobar.jpg  412 KB",
-		EmbedSurfaces,
-		"[![foobar.jpg](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)",
-		LinkSurfaces,
-		"https://krowk.com/a/9f3c2e1",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("human output is missing %q:\n%s", want, got)
-		}
-	}
-}
-
-func TestJSONCarriesBothPasteForms(t *testing.T) {
-	a := &api.Artifact{
-		ID:         "9f3c2e1",
-		URL:        "https://krowk.com/a/9f3c2e1",
-		PreviewURL: "https://krowk.com/a/9f3c2e1/preview.png",
-		Files:      []api.File{{Filename: "foobar.jpg"}},
-	}
-
-	var e struct {
-		Paste Paste `json:"paste"`
-	}
-	if err := json.Unmarshal([]byte(Artifact(a, JSON, "", false, false, time.Now())), &e); err != nil {
-		t.Fatal(err)
-	}
-	if e.Paste.Markdown == "" || e.Paste.URL != a.URL {
-		t.Errorf("paste = %+v, want both forms so the agent can pick", e.Paste)
-	}
-
-	// --quiet is the registry's own body, untouched; no paste block belongs there.
-	if strings.Contains(Artifact(a, JSON, "", true, false, time.Now()), "paste") {
-		t.Error("--quiet should stay the raw artifact")
-	}
-}
-
-func TestClaimURLIsShownButNeverPasteable(t *testing.T) {
-	a := &api.Artifact{
-		ID:         "9f3c2e1",
-		URL:        "https://krowk.com/a/9f3c2e1",
-		PreviewURL: "https://krowk.com/a/9f3c2e1/preview.png",
-		Anonymous:  true,
-		ClaimURL:   "https://krowk.com/claim/2b7f",
-		Files:      []api.File{{Filename: "foobar.jpg"}},
-	}
-
-	// Visible to whoever ran the push...
-	human := Artifact(a, Human, "", false, false, time.Now())
-	if !strings.Contains(human, a.ClaimURL) || !strings.Contains(human, "do not share") {
-		t.Errorf("human output should show the claim URL and warn about it:\n%s", human)
-	}
-
-	// ...but never in something destined for a pull request comment.
-	p := PasteFor(a, "")
-	if strings.Contains(p.Markdown, "claim") || strings.Contains(p.URL, "claim") {
-		t.Errorf("paste = %+v, want no claim URL", p)
-	}
-	if got := Artifact(a, Markdown, "", false, false, time.Now()); strings.Contains(got, "claim") {
-		t.Errorf("--format markdown leaked the claim URL: %s", got)
-	}
-	if got := Artifact(a, URL, "", false, false, time.Now()); got != a.URL {
-		t.Errorf("--format url = %q, want just the shareable link", got)
-	}
-}
-
-// A replay arrives without the claim URL — it was handed out once, to the push
-// that created the artifact — so the summary must not advise claiming what
-// this caller cannot reach.
-func TestRetrySummaryDoesNotAdviseAnUnactionableClaim(t *testing.T) {
-	a := &api.Artifact{
-		ID:        "9f3c2e1",
-		URL:       "https://krowk.com/a/9f3c2e1",
-		Bytes:     3,
-		Anonymous: true,
-		Files:     []api.File{{Filename: "foobar.jpg", Bytes: 3}},
-	}
-
-	var e struct {
-		Summary     string       `json:"summary"`
-		Breadcrumbs []Breadcrumb `json:"breadcrumbs"`
-	}
-	if err := json.Unmarshal([]byte(Artifact(a, JSON, "", false, false, time.Now())), &e); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(e.Summary, "anonymous") {
-		t.Errorf("summary = %q, want the anonymous status still visible", e.Summary)
-	}
-	if strings.Contains(e.Summary, "claim") {
-		t.Errorf("summary = %q, want no claim advice without a claim URL to act on", e.Summary)
-	}
-	for _, b := range e.Breadcrumbs {
-		if b.Action == "claim" {
-			t.Errorf("breadcrumbs = %+v, want no claim action without a claim URL", e.Breadcrumbs)
-		}
-	}
-
-	// The original push, claim URL in hand, keeps the advice and the crumb.
-	a.ClaimURL = "https://krowk.com/claim/2b7f"
-	if err := json.Unmarshal([]byte(Artifact(a, JSON, "", false, false, time.Now())), &e); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(e.Summary, "claim it to keep it") {
-		t.Errorf("summary = %q, want the claim advice for the push holding the URL", e.Summary)
-	}
-}
-
-func TestMarkdownFallsBackToALinkWithoutAPreview(t *testing.T) {
-	a := &api.Artifact{ID: "9f3c2e1", URL: "https://krowk.com/a/9f3c2e1"}
-
-	if got := PasteFor(a, "Checkout").Markdown; got != "[Checkout](https://krowk.com/a/9f3c2e1)" {
-		t.Errorf("markdown = %q, want a plain link when there is nothing to embed", got)
-	}
-
-	// The human label must not promise an image the markdown does not carry.
-	got := Artifact(a, Human, "Checkout", false, false, time.Now())
-	if strings.Contains(got, EmbedSurfaces) {
-		t.Errorf("human output claims %q without a preview:\n%s", EmbedSurfaces, got)
-	}
-	if !strings.Contains(got, PlainSurfaces) {
-		t.Errorf("human output is missing %q:\n%s", PlainSurfaces, got)
-	}
-}
-
 func TestResolveFormat(t *testing.T) {
 	// Piped output defaults to JSON so an agent gets structure for free.
 	if got, _ := ResolveFormat("", false, false); got != JSON {
@@ -256,5 +78,185 @@ func TestErrorRendersLimitAndFix(t *testing.T) {
 		"  fix: re-encode below 100 MB or push frames separately"
 	if got != want {
 		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// GitHub renders no card for a third-party link, so the image embed is the only
+// form that shows the artifact there. Labels are user-controlled, so delimiter
+// characters must arrive escaped or the embed breaks.
+func TestPasteCarriesBothFormsAndEscapesLabels(t *testing.T) {
+	a := &api.Artifact{
+		Slug:        "art_2e1d",
+		Filename:    "foobar.jpg",
+		ContentType: "image/jpeg",
+		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+	}
+	url := a.URL
+
+	for _, tc := range []struct {
+		title    string
+		filename string
+		want     string
+	}{
+		{"Checkout", "foobar.jpg", "![Checkout](" + url + ")"},
+		{"Checkout [v2]", "foobar.jpg", `![Checkout \[v2\]](` + url + ")"},
+		{"", "frame[0].png", `![frame\[0\].png](` + url + ")"},
+		{`back\slash`, "foobar.jpg", `![back\\slash](` + url + ")"},
+		{"line1\nline2\r\nline3", "foobar.jpg", "![line1 line2  line3](" + url + ")"},
+	} {
+		a.Filename = tc.filename
+		p := PasteFor(a, tc.title)
+		if p.Markdown != tc.want {
+			t.Errorf("PasteFor(%q/%q).Markdown = %q, want %q", tc.title, tc.filename, p.Markdown, tc.want)
+		}
+		// Slack renders no markdown image embeds, so it needs the plain link.
+		if p.URL != a.URL {
+			t.Errorf("url = %q, want the bare link", p.URL)
+		}
+	}
+
+	a.Filename = "foobar.jpg"
+	r := Result{Artifacts: []*api.Artifact{a}, Title: "Checkout"}
+	if got := Upload(r, Markdown, false, false, time.Now()); got != "![Checkout]("+url+")" {
+		t.Errorf("--format markdown = %q, want just the embed", got)
+	}
+	if got := Upload(r, URL, false, false, time.Now()); got != url {
+		t.Errorf("--format url = %q, want just the link", got)
+	}
+}
+
+// The registry renders paste-ready markdown itself; without a caller-supplied
+// title, its version wins verbatim.
+func TestRegistryMarkdownWinsWithoutATitle(t *testing.T) {
+	a := &api.Artifact{
+		Slug:        "art_2e1d",
+		Filename:    "foobar.jpg",
+		ContentType: "image/jpeg",
+		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+		Markdown:    "![foobar.jpg](https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg)",
+	}
+	if got := MarkdownLink(a, ""); got != a.Markdown {
+		t.Errorf("MarkdownLink = %q, want the registry's own markdown", got)
+	}
+	if got := MarkdownLink(a, "Checkout"); got != "![Checkout]("+a.URL+")" {
+		t.Errorf("MarkdownLink with a title = %q, want the title to win", got)
+	}
+}
+
+func TestJSONEnvelopeCarriesBothPasteForms(t *testing.T) {
+	a := &api.Artifact{
+		Slug:        "art_2e1d",
+		Filename:    "foobar.jpg",
+		ContentType: "image/jpeg",
+		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+	}
+	r := Result{Artifacts: []*api.Artifact{a}}
+
+	var e struct {
+		Paste Paste `json:"paste"`
+	}
+	if err := json.Unmarshal([]byte(Upload(r, JSON, false, false, time.Now())), &e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Paste.Markdown == "" || e.Paste.URL != a.URL {
+		t.Errorf("paste = %+v, want both forms so the agent can pick", e.Paste)
+	}
+
+	// --quiet is the raw result, untouched; no paste block belongs there.
+	if strings.Contains(Upload(r, JSON, true, false, time.Now()), `"paste"`) {
+		t.Error("--quiet should stay the raw result")
+	}
+}
+
+// The surfaces label must not promise an image the markdown does not carry.
+func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
+	image := PasteFor(&api.Artifact{
+		Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
+		URL: "https://cdn.krowk.com/a/shot.png",
+	}, "")
+	if got := MarkdownSurfacesFor(image); got != EmbedSurfaces {
+		t.Errorf("image label = %q, want %q", got, EmbedSurfaces)
+	}
+
+	log := PasteFor(&api.Artifact{
+		Slug: "art_9f3c", Filename: "build.log", ContentType: "text/plain",
+		URL: "https://cdn.krowk.com/a/build.log",
+	}, "")
+	if !strings.HasPrefix(log.Markdown, "[") {
+		t.Fatalf("markdown = %q, want a plain link when there is nothing to embed", log.Markdown)
+	}
+	if got := MarkdownSurfacesFor(log); got != PlainSurfaces {
+		t.Errorf("plain-link label = %q, want %q", got, PlainSurfaces)
+	}
+}
+
+// A claim token adopts the upload, so it stays out of everything destined for a
+// pull request comment.
+func TestClaimTokenIsSurfacedButNeverPasteable(t *testing.T) {
+	a := &api.Artifact{
+		Slug:        "art_2e1d",
+		Filename:    "foobar.jpg",
+		ContentType: "image/jpeg",
+		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+		ClaimToken:  "krowk_claim_2b7f",
+	}
+	r := Result{Artifacts: []*api.Artifact{a}}
+
+	// Visible to whoever ran the push, as the breadcrumb that spends it...
+	var e struct {
+		Breadcrumbs []Breadcrumb `json:"breadcrumbs"`
+	}
+	if err := json.Unmarshal([]byte(Upload(r, JSON, false, false, time.Now())), &e); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, b := range e.Breadcrumbs {
+		if strings.Contains(b.Cmd, a.ClaimToken) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("breadcrumbs = %+v, want the claim command carrying the token", e.Breadcrumbs)
+	}
+
+	// ...but never in either paste form.
+	p := PasteFor(a, "")
+	if strings.Contains(p.Markdown, "claim") || strings.Contains(p.URL, "claim") {
+		t.Errorf("paste = %+v, want no claim token", p)
+	}
+	if got := Upload(r, Markdown, false, false, time.Now()); strings.Contains(got, "claim") {
+		t.Errorf("--format markdown leaked the claim token: %s", got)
+	}
+	if got := Upload(r, URL, false, false, time.Now()); got != a.URL {
+		t.Errorf("--format url = %q, want just the shareable link", got)
+	}
+}
+
+func TestKeyRendersScopesAndWarnsWhenItCannotUpload(t *testing.T) {
+	k := &api.Key{Valid: true, KeyID: "key_9f3c2e1d", Workspace: "acme",
+		Scopes: []string{"artifacts:read"}}
+
+	human := Key(k, Human, false, false)
+	for _, want := range []string{"key_9f3c2e1d", "acme", "artifacts:read", "cannot upload"} {
+		if !strings.Contains(human, want) {
+			t.Errorf("human key output is missing %q:\n%s", want, human)
+		}
+	}
+
+	k.Scopes = append(k.Scopes, api.ScopeWrite)
+	if got := Key(k, Human, false, false); strings.Contains(got, "cannot upload") {
+		t.Errorf("a write-scoped key must not warn:\n%s", got)
+	}
+
+	// There is no link to a key, so url falls back to the JSON envelope.
+	var e struct {
+		OK   bool    `json:"ok"`
+		Data api.Key `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(Key(k, URL, false, false)), &e); err != nil {
+		t.Fatal(err)
+	}
+	if !e.OK || e.Data.KeyID != k.KeyID {
+		t.Errorf("url format = %+v, want the JSON envelope", e)
 	}
 }

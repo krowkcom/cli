@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -30,37 +29,41 @@ var Version = "0.1.0"
 // defaultRegistryAddr is where `registry serve` listens, matching api.DevBaseURL
 // so --dev finds it with no configuration.
 //
-// Loopback, not ":8787". This registry takes uploads without a key and will
-// answer a lookup for any artifact ID — seven characters, enumerable — with the
-// repository, branch, commit and pull request the upload came from. On a café or
-// office network, binding every interface hands that to whoever is nearby. A
-// wider bind stays possible, but it has to be asked for.
+// Loopback, not ":8787". This registry takes uploads without a key and serves
+// their bytes to anyone who can reach it. On a café or office network, binding
+// every interface hands that to whoever is nearby. A wider bind stays possible,
+// but it has to be asked for.
 const defaultRegistryAddr = "127.0.0.1:8787"
 
 const helpTemplate = `krowk %s — permalinks for agent output
 
 Usage
-  krowk uploads create <file...> [flags]   Upload artifacts, get one canonical URL
-  krowk push <file...> [flags]             Alias for ` + "`uploads create`" + `
-  krowk auth login --token <token>         Store an API token
-  krowk auth token                         Print the stored token
-  krowk auth verify                        Check the key and its scopes
-  krowk doctor                             Check the local setup
-  krowk registry serve                     Run a local registry to develop against
-
-Pasting the result
-  GitHub, Linear, Notion   --format markdown   embeds the image
-  Slack, Basecamp          --format url        they unfurl the link themselves
-  Human output shows both, labelled; --json carries both under "paste".
+  krowk push <file...> [flags]              Upload files, get a link for each
+  krowk uploads create <file...> [flags]    The same thing, spelled out
+  krowk uploads list [--limit --before]     List the workspace's uploads, newest first
+  krowk uploads show <artifact>             Read one artifact back
+  krowk runs start [flags]                  Open a run to group uploads under
+  krowk runs finish <run>                   Close a run
+  krowk claim <artifact> <claim-token>      Keep an anonymous upload past expiry
+  krowk auth login --token <token>          Store an API token
+  krowk auth token                          Print the stored token
+  krowk auth verify                         Check the key and its scopes
+  krowk doctor                              Check the local setup
+  krowk registry serve                      Run a local registry to develop against
 
 Upload flags
+  --run <slug>           Attach to an existing run instead of opening one
   --pull-request <url>   Pull request the work belongs to
   --reference <url>      Related link — repeat for more than one
   --session <id>         Agent session ID
-  --title <text>         Label for the unfurl card
+  --title <text>         Label for the markdown link
   --repo <owner/name>    Override the detected repository
   --commit <sha>         Override the detected commit
   --agent <name>         Override the detected agent
+
+List flags
+  --limit <n>            Artifacts per page (1–100, default 50)
+  --before <artifact>    Start after this artifact — the ` + "`next`" + ` of the last page
 
 Local registry flags
   --addr <host:port>     Listen address for ` + "`registry serve`" + ` (default %s, loopback only)
@@ -84,10 +87,18 @@ Environment
 
 Registry precedence: --dev, then KROWK_API_URL, then KROWK_DEV, then the default.
 
+Run metadata — the pull request, references and session — is recorded on a run,
+and a run belongs to a workspace, so it needs an API key. Without one an upload
+still works: it lands anonymously, expires within a day, and comes back with a
+claim token that ` + "`krowk claim`" + ` spends to keep it.
+
 Credentials live in %s (0600).
 `
 
 type flags struct {
+	run         string
+	before      string
+	limit       int
 	pullRequest string
 	references  stringSlice
 	session     string
@@ -118,6 +129,9 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	fs := flag.NewFlagSet("krowk", flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // errors go through the krowk envelope, not flag's
 
+	fs.StringVar(&f.run, "run", "", "")
+	fs.StringVar(&f.before, "before", "", "")
+	fs.IntVar(&f.limit, "limit", 0, "")
 	fs.StringVar(&f.pullRequest, "pull-request", "", "")
 	fs.Var(&f.references, "reference", "")
 	fs.StringVar(&f.session, "session", "", "")
@@ -170,6 +184,16 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		err = upload(stdout, positionals[1:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "uploads" && positionals[1] == "create":
 		err = upload(stdout, positionals[2:], f, format, env, colour)
+	case len(positionals) > 1 && positionals[0] == "uploads" && positionals[1] == "list":
+		err = uploadsList(stdout, f, format, env, colour)
+	case len(positionals) > 1 && positionals[0] == "uploads" && positionals[1] == "show":
+		err = uploadsShow(stdout, positionals[2:], f, format, env, colour)
+	case len(positionals) > 1 && positionals[0] == "runs" && positionals[1] == "start":
+		err = runsStart(stdout, f, format, env, colour)
+	case len(positionals) > 1 && positionals[0] == "runs" && positionals[1] == "finish":
+		err = runsFinish(stdout, positionals[2:], f, format, env, colour)
+	case positionals[0] == "claim":
+		err = claim(stdout, positionals[1:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "login":
 		err = authLogin(stdout, f.token)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
@@ -196,49 +220,8 @@ func report(w io.Writer, err error, format output.Format, quiet, colour bool) in
 	return 1
 }
 
-// parseInterleaved lets `krowk uploads create a.png --session=x b.png` work.
-func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
-	var positionals []string
-	for {
-		if err := fs.Parse(args); err != nil {
-			return positionals, err
-		}
-		if fs.NArg() == 0 {
-			return positionals, nil
-		}
-		positionals = append(positionals, fs.Arg(0))
-		args = fs.Args()[1:]
-	}
-}
-
-func upload(w io.Writer, files []string, f flags, format output.Format, env runctx.Env, colour bool) error {
-	if len(files) == 0 {
-		return api.Fail("no_file", "pass at least one path: `krowk uploads create screenshot.png`")
-	}
-
-	metadata := runctx.Resolve(env, runctx.Overrides{
-		Repo:        f.repo,
-		Commit:      f.commit,
-		Agent:       f.agent,
-		PullRequest: f.pullRequest,
-		Reference:   f.references,
-		Session:     f.session,
-		Title:       f.title,
-		Client:      "krowk-cli/" + Version,
-	})
-
-	client := newClient(f, env)
-	artifact, err := client.CreateArtifact(context.Background(), files, metadata)
-	if err != nil {
-		return authHint(err, client.Token != "")
-	}
-
-	fmt.Fprintln(w, output.Artifact(artifact, format, f.title, f.quiet, colour, time.Now()))
-	return nil
-}
-
 // newClient is the one place a registry client gets built, so every command
-// honours the same precedence.
+// honours the same precedence: --dev, then KROWK_API_URL, then KROWK_DEV.
 func newClient(f flags, env runctx.Env) *api.Client {
 	return api.New(api.BaseURLFor(f.dev, env), api.ReadToken(env))
 }
@@ -255,8 +238,366 @@ func registryMode(client *api.Client, env runctx.Env) string {
 	return "production"
 }
 
+// parseInterleaved lets `krowk uploads create a.png --session=x b.png` work.
+func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positionals []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return positionals, err
+		}
+		if fs.NArg() == 0 {
+			return positionals, nil
+		}
+		positionals = append(positionals, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
+}
+
+// upload is the whole point of the CLI: every file becomes its own artifact, and
+// a run is what groups them and carries the metadata about where they came from.
+func upload(w io.Writer, files []string, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if len(files) == 0 {
+		return api.Fail("no_file", "pass at least one path: `krowk push screenshot.png`")
+	}
+
+	// Every file is measured and digested before anything is sent, so a typo in
+	// the last path fails before the first upload rather than halfway through.
+	specs := make([]api.Spec, 0, len(files))
+	for _, path := range files {
+		spec, err := api.Inspect(path)
+		if err != nil {
+			return err
+		}
+		specs = append(specs, spec)
+	}
+
+	client := newClient(f, env)
+	ctx := context.Background()
+
+	result := output.Result{Title: f.title}
+
+	runSlug, ownRun, err := resolveRun(ctx, client, f, env, &result)
+	if err != nil {
+		return err
+	}
+
+	for _, spec := range specs {
+		spec.Run = runSlug
+		artifact, err := client.Push(ctx, spec)
+		if err != nil {
+			return withProgress(err, result.Artifacts, runSlug, ownRun)
+		}
+		result.Artifacts = append(result.Artifacts, artifact)
+	}
+
+	// A run this command opened is a run this command closes. Failing to close it
+	// is not worth failing the upload over — the artifacts are up and their links
+	// work — but it is worth saying: the run stays open until someone retries.
+	if ownRun {
+		if finished, err := client.FinishRun(ctx, runSlug); err == nil {
+			result.Run = finished
+		} else {
+			result.Notes = append(result.Notes, "run "+runSlug+" could not be finished: "+
+				errCode(err)+" — retry `krowk runs finish "+runSlug+"`")
+		}
+	}
+
+	fmt.Fprintln(w, output.Upload(result, format, f.quiet, colour, time.Now()))
+	return nil
+}
+
+// resolveRun decides which run the artifacts belong to: the one named on the
+// command line, a fresh one carrying the detected metadata, or none at all when
+// there is no key to open one with.
+func resolveRun(ctx context.Context, client *api.Client, f flags, env runctx.Env, result *output.Result) (slug string, own bool, err error) {
+	if f.run != "" {
+		// The caller manages this run's lifecycle, so it is not finished here.
+		return f.run, false, nil
+	}
+	if !client.Authenticated() {
+		if note := anonymousMetadataNote(f); note != "" {
+			result.Notes = append(result.Notes, note)
+		}
+		return "", false, nil
+	}
+
+	run, err := client.CreateRun(ctx, metadataFor(f, env))
+	if err != nil {
+		return "", false, err
+	}
+	result.Run = run
+	return run.Slug, true, nil
+}
+
+// metadataFor is everything worth remembering about where an upload came from.
+// Flags win; the rest is detected so the agent never has to type it. Resolve is
+// the shared path — the MCP server goes through it too, so a new metadata field
+// lands in both or neither.
+func metadataFor(f flags, env runctx.Env) runctx.Metadata {
+	return runctx.Resolve(env, runctx.Overrides{
+		Repo:        f.repo,
+		Commit:      f.commit,
+		Agent:       f.agent,
+		PullRequest: f.pullRequest,
+		Reference:   f.references,
+		Session:     f.session,
+		Title:       f.title,
+		Client:      "krowk-cli/" + Version,
+	})
+}
+
+// anonymousMetadataNote says plainly that metadata asked for by name was not
+// recorded. Silently dropping it would leave an agent believing the pull request
+// it named is attached to the upload, and it is not.
+func anonymousMetadataNote(f flags) string {
+	var given []string
+	if f.pullRequest != "" {
+		given = append(given, "--pull-request")
+	}
+	if len(f.references) > 0 {
+		given = append(given, "--reference")
+	}
+	if f.session != "" {
+		given = append(given, "--session")
+	}
+	if len(given) == 0 {
+		return ""
+	}
+	return strings.Join(given, ", ") + " was not recorded: run metadata lives on a run, " +
+		"and opening a run needs an API key — run `krowk auth login --token krowk_sk_...`"
+}
+
+// withProgress keeps what a failed batch would otherwise lose: the links of
+// whatever did upload, and the run this command opened. Without the slug the
+// run is unrecoverable — the error body is all the caller ever sees of it.
+func withProgress(err error, done []*api.Artifact, runSlug string, ownRun bool) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	if len(done) > 0 {
+		urls := make([]string, 0, len(done))
+		for _, a := range done {
+			urls = append(urls, a.URL)
+		}
+		apiErr.Body["uploaded_before_failure"] = urls
+	}
+	if ownRun {
+		apiErr.Body["run"] = runSlug
+		finish := "the run is still open — close it with `krowk runs finish " + runSlug + "`"
+		if fix, _ := apiErr.Body["fix"].(string); fix != "" {
+			finish = fix + "; " + finish
+		}
+		apiErr.Body["fix"] = finish
+	}
+	return apiErr
+}
+
+// errCode names an error the way the envelope would, so a note can carry it.
+func errCode(err error) string {
+	var apiErr *api.Error
+	if errors.As(err, &apiErr) {
+		return apiErr.Code()
+	}
+	return err.Error()
+}
+
+// uploadsList pages through the key's workspace. Needs a key: keyless requests
+// all share the anonymous workspace, so there is nothing of one's own to list.
+func uploadsList(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
+	client := newClient(f, env)
+
+	page, err := client.ListArtifacts(context.Background(), f.before, f.limit)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, output.List(page, format, f.quiet, colour, time.Now()))
+	return nil
+}
+
+func uploadsShow(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if len(args) == 0 {
+		return api.Fail("no_artifact", "pass the artifact: `krowk uploads show art_...`")
+	}
+	client := newClient(f, env)
+
+	artifact, err := client.ShowArtifact(context.Background(), args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()))
+	return nil
+}
+
+func runsStart(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
+	client := newClient(f, env)
+
+	run, err := client.CreateRun(context.Background(), metadataFor(f, env))
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, output.Run(run, format, f.quiet, colour))
+	return nil
+}
+
+func runsFinish(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if len(args) == 0 {
+		return api.Fail("no_run", "pass the run: `krowk runs finish run_...`")
+	}
+	client := newClient(f, env)
+
+	run, err := client.FinishRun(context.Background(), args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, output.Run(run, format, f.quiet, colour))
+	return nil
+}
+
+// claim spends the token an anonymous upload came back with, which is the only
+// way to keep that upload past its expiry.
+func claim(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if len(args) < 2 {
+		return api.Fail("missing_claim",
+			"pass both the artifact and its token: `krowk claim art_... krowk_claim_...`")
+	}
+	client := newClient(f, env)
+
+	artifact, err := client.ClaimArtifact(context.Background(), args[0], args[1])
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()))
+	return nil
+}
+
+func authLogin(w io.Writer, token string) error {
+	if token == "" {
+		return api.Fail("missing_token", "pass the key: `krowk auth login --token krowk_sk_...`")
+	}
+	path, err := api.SaveToken(token)
+	if err != nil {
+		return api.Fail("credentials_unwritable", "could not write "+api.CredentialsPath()+": "+err.Error())
+	}
+	fmt.Fprintln(w, "✓ token stored in "+path)
+	return nil
+}
+
+func authToken(w io.Writer, env runctx.Env) error {
+	token := api.ReadToken(env)
+	if token == "" {
+		return api.Fail("not_authenticated",
+			"run `krowk auth login --token krowk_sk_...`, or upload anonymously")
+	}
+	fmt.Fprintln(w, token)
+	return nil
+}
+
+// authVerify reports what the stored key can actually do, rather than trusting
+// that a token-shaped string is a working key.
+func authVerify(w io.Writer, format output.Format, f flags, env runctx.Env, colour bool) error {
+	client := newClient(f, env)
+	if client.Token == "" {
+		return api.Fail("not_authenticated",
+			"no key to verify — run `krowk auth login --token krowk_sk_...`, or upload anonymously")
+	}
+
+	key, err := client.VerifyKey(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, output.Key(key, format, f.quiet, colour))
+	return nil
+}
+
+func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
+	client := newClient(f, env)
+
+	report := map[string]any{
+		"version":       Version,
+		"runtime":       runtime.Version() + " " + runtime.GOOS + "/" + runtime.GOARCH,
+		"api":           client.BaseURL,
+		"registry":      registryMode(client, env),
+		"api_status":    probe(client),
+		"authenticated": client.Authenticated(),
+		"key":           keySummary(client),
+		// Runs are where the metadata goes, and they need a key — so whether they
+		// are available is the difference between metadata being kept and dropped.
+		"runs_available": client.Authenticated(),
+		"credentials":    api.CredentialsPath(),
+		"context":        runctx.Detect(env),
+	}
+
+	keys := []string{"version", "runtime", "api", "registry", "api_status",
+		"authenticated", "key", "runs_available", "credentials"}
+
+	if format != output.Human {
+		b, _ := json.MarshalIndent(report, "", "  ")
+		fmt.Fprintln(w, string(b))
+		return nil
+	}
+
+	for _, k := range keys {
+		fmt.Fprintf(w, "%-15s %v\n", k, report[k])
+	}
+	b, _ := json.Marshal(report["context"])
+	fmt.Fprintf(w, "%-15s %s\n", "context", b)
+	return nil
+}
+
+// probe reads the service descriptor at the API root. It needs neither a key nor
+// a payload, so it says whether the registry is there without uploading — and
+// because it names the service, it also catches a URL pointing at the website or
+// at the wrong virtual host, which a bare 200 would not.
+//
+// It separates "the registry answered" from "nothing is listening": an HTTP
+// response of any status proves reachability, so the status that actually
+// arrived is reported rather than assumed.
+func probe(client *api.Client) string {
+	service, err := client.Root(context.Background())
+	if err != nil {
+		var apiErr *api.Error
+		if errors.As(err, &apiErr) {
+			if apiErr.Status != 0 {
+				return fmt.Sprintf("reachable (HTTP %d) — %s", apiErr.Status, apiErr.Code())
+			}
+			if detail, ok := apiErr.Body["detail"].(string); ok && detail != "" {
+				return "unreachable — " + apiErr.Code() + " — " + detail
+			}
+			return "unreachable — " + apiErr.Code()
+		}
+		return "unreachable — " + err.Error()
+	}
+	if service.Service == "" {
+		return "reachable, but not a krowk registry"
+	}
+	return fmt.Sprintf("reachable (%s, %s)", service.Service, strings.Join(service.Versions, " "))
+}
+
+// keySummary says what the key is good for in one line. It only calls out to
+// the registry when there is a key to verify, so a keyless doctor stays a
+// single request.
+func keySummary(client *api.Client) string {
+	if client.Token == "" {
+		return "none — uploads will be anonymous"
+	}
+	key, err := client.VerifyKey(context.Background())
+	if err != nil {
+		var apiErr *api.Error
+		if errors.As(err, &apiErr) {
+			return "rejected — " + apiErr.Code()
+		}
+		return "unknown — " + err.Error()
+	}
+	scopes := strings.Join(key.Scopes, " ")
+	if scopes == "" {
+		scopes = "no scopes"
+	}
+	return fmt.Sprintf("%s (%s) %s", key.KeyID, key.Workspace, scopes)
+}
+
 // registryServe runs the local stand-in for api.krowk.com, so developing against
-// a registry needs neither the network nor a checkout of this repository.
+// a registry needs neither the network nor a checkout of the registry itself.
 func registryServe(w io.Writer, f flags) error {
 	// registry.Handler treats <= 0 as "use the default", so a negative limit
 	// would silently mean 100 MiB. Reject it instead of guessing.
@@ -312,8 +653,8 @@ func registryBanner(bound, asked string) string {
 		lines = append(lines, "  KROWK_API_URL="+base+"/v1 krowk push screenshot.png")
 	}
 	// Bound wider than this machine, deliberately or not, it is worth saying out
-	// loud: this registry takes uploads without a key, and will answer a lookup
-	// for any artifact ID with the repo, branch and commit behind it.
+	// loud: this registry takes uploads without a key and serves their bytes to
+	// anyone who can reach it.
 	if host := listenHost(asked); !isLoopbackHost(host) {
 		lines = append(lines,
 			"  ! reachable from the network on "+bindDescription(host)+" — it needs no key to accept uploads")
@@ -425,149 +766,6 @@ func isLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
-}
-
-// authHint points a rejected upload at the self-check. The registry cannot know
-// the CLI has a verify command, so the CLI adds that half of the fix itself.
-// It keys on the error code, not the HTTP status: a 403 can also come off a
-// presigned storage URL mid-upload, where the key is fine and pointing the
-// agent at auth would be a dead end.
-func authHint(err error, authenticated bool) error {
-	var apiErr *api.Error
-	if !errors.As(err, &apiErr) {
-		return err
-	}
-	switch apiErr.Code() {
-	case "no_key", "invalid_key", "insufficient_scope":
-	default:
-		return err
-	}
-
-	hint := "run `krowk auth verify` to see what this key is allowed to do"
-	if !authenticated {
-		hint = "this push was anonymous — run `krowk auth login --token krk_...` first"
-	}
-	body := maps.Clone(apiErr.Body)
-	if fix, ok := body["fix"].(string); ok && fix != "" {
-		body["fix"] = fix + " — " + hint
-	} else {
-		body["fix"] = hint
-	}
-	return &api.Error{Status: apiErr.Status, Body: body}
-}
-
-func authLogin(w io.Writer, token string) error {
-	if token == "" {
-		return api.Fail("missing_token", "pass the key: `krowk auth login --token krk_...`")
-	}
-	path, err := api.SaveToken(token)
-	if err != nil {
-		return api.Fail("credentials_unwritable", "could not write "+api.CredentialsPath()+": "+err.Error())
-	}
-	fmt.Fprintln(w, "✓ token stored in "+path)
-	return nil
-}
-
-func authToken(w io.Writer, env runctx.Env) error {
-	token := api.ReadToken(env)
-	if token == "" {
-		return api.Fail("not_authenticated",
-			"run `krowk auth login --token krk_...`, or upload anonymously")
-	}
-	fmt.Fprintln(w, token)
-	return nil
-}
-
-// authVerify reports what the stored key can actually do, rather than trusting
-// that a token-shaped string is a working key.
-func authVerify(w io.Writer, format output.Format, f flags, env runctx.Env, colour bool) error {
-	client := newClient(f, env)
-	if client.Token == "" {
-		return api.Fail("not_authenticated",
-			"no key to verify — run `krowk auth login --token krk_...`, or upload anonymously")
-	}
-
-	key, err := client.VerifyKey(context.Background())
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(w, output.Key(key, format, f.quiet, colour))
-	return nil
-}
-
-func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
-	client := newClient(f, env)
-
-	// One call answers both questions: whether the registry is there, and what
-	// the key is good for. An HTTP response of any status proves reachability.
-	key, keyErr := client.VerifyKey(context.Background())
-
-	report := map[string]any{
-		"version":       Version,
-		"runtime":       runtime.Version() + " " + runtime.GOOS + "/" + runtime.GOARCH,
-		"api":           client.BaseURL,
-		"registry":      registryMode(client, env),
-		"api_status":    reachability(key, keyErr),
-		"authenticated": client.Token != "",
-		"key":           keySummary(client.Token, key, keyErr),
-		"credentials":   api.CredentialsPath(),
-		"context":       runctx.Detect(env),
-	}
-
-	if format != output.Human {
-		b, _ := json.MarshalIndent(report, "", "  ")
-		fmt.Fprintln(w, string(b))
-		return nil
-	}
-
-	for _, k := range []string{
-		"version", "runtime", "api", "registry", "api_status", "authenticated", "key", "credentials",
-	} {
-		fmt.Fprintf(w, "%-14s %v\n", k, report[k])
-	}
-	b, _ := json.Marshal(report["context"])
-	fmt.Fprintf(w, "%-14s %s\n", "context", b)
-	return nil
-}
-
-// reachability separates "the registry answered" from "nothing is listening".
-func reachability(key *api.Key, err error) string {
-	if err == nil {
-		// The status the verification actually answered with — send accepts any
-		// 2xx, so the diagnostic must not assume 200.
-		return fmt.Sprintf("reachable (HTTP %d)", key.Status)
-	}
-	var apiErr *api.Error
-	if errors.As(err, &apiErr) {
-		if apiErr.Status != 0 {
-			return fmt.Sprintf("reachable (HTTP %d)", apiErr.Status)
-		}
-		if detail, ok := apiErr.Body["detail"].(string); ok {
-			return "unreachable — " + detail
-		}
-		// A verdict formed before any HTTP exchange, e.g. an unparseable URL.
-		return "unreachable — " + apiErr.Code()
-	}
-	return "unreachable — " + err.Error()
-}
-
-// keySummary says what the key is good for in one line.
-func keySummary(token string, key *api.Key, err error) string {
-	if token == "" {
-		return "none — uploads will be anonymous"
-	}
-	if err != nil {
-		var apiErr *api.Error
-		if errors.As(err, &apiErr) {
-			return "rejected — " + apiErr.Code()
-		}
-		return "unknown — " + err.Error()
-	}
-	scopes := strings.Join(key.Scopes, " ")
-	if scopes == "" {
-		scopes = "no scopes"
-	}
-	return fmt.Sprintf("%s (%s) %s", key.KeyID, key.Workspace, scopes)
 }
 
 func clip[T any](s []T, n int) []T {

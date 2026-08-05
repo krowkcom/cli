@@ -36,10 +36,11 @@ const maxLine = 4 << 20
 
 // instructions tell the agent what to do with what it gets back, which is the
 // part a tool schema cannot express.
-const instructions = `krowk turns local files into permalinks that unfurl with their run metadata attached.
+const instructions = `krowk turns local files into permalinks, one artifact per file, grouped under a
+run that carries the metadata about where they came from.
 
-Call krowk_push with the paths you want to share. It returns two paste-ready
-forms and you must pick by destination:
+Call krowk_push with the paths you want to share. Every artifact comes back in
+two paste-ready forms and you must pick by destination:
 
   - markdown  ` + output.EmbedSurfaces + `
   - url       ` + output.LinkSurfaces + `
@@ -48,9 +49,11 @@ Pasting the markdown form into Slack shows raw text; pasting the bare URL into a
 GitHub comment shows a plain link with no image. Neither surface renders the
 other's form, so choose deliberately.
 
-If the push comes back anonymous it carries a claim_url. That link adopts the
-upload, so treat it as a secret: give it to the human, never paste it into a
-pull request, an issue or a chat message.
+If a push comes back anonymous, each artifact carries a claim_token. Spending it
+— krowk_claim_artifact, or ` + "`krowk claim <slug> <token>`" + ` — is the only way to
+keep that upload past its expiry, and anyone holding the token can do it. Treat
+it as a secret: give it to the human, never paste it into a pull request, an
+issue or a chat message.
 
 krowk_push only uploads files from the working directory and below. Anything
 outside it is refused, symlinks included, and credential files are refused even
@@ -440,15 +443,18 @@ func errorPayload(err error) any {
 type tool func(ctx context.Context, s *Server, args json.RawMessage) (string, any, error)
 
 var tools = map[string]tool{
-	"krowk_push":         push,
-	"krowk_get_artifact": getArtifact,
-	"krowk_get_run":      getRun,
-	"krowk_verify_key":   verifyKey,
+	"krowk_push":           push,
+	"krowk_list_artifacts": listArtifacts,
+	"krowk_get_artifact":   getArtifact,
+	"krowk_claim_artifact": claimArtifact,
+	"krowk_get_run":        getRun,
+	"krowk_verify_key":     verifyKey,
 }
 
 func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
 	var a struct {
 		Files       []string `json:"files"`
+		Run         string   `json:"run"`
 		Title       string   `json:"title"`
 		PullRequest string   `json:"pull_request"`
 		Reference   []string `json:"reference"`
@@ -479,33 +485,153 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		files = append(files, allowed)
 	}
 
-	metadata := runctx.Resolve(s.Env, runctx.Overrides{
-		Repo:        a.Repo,
-		Commit:      a.Commit,
-		Agent:       a.Agent,
-		PullRequest: a.PullRequest,
-		Reference:   a.Reference,
-		Session:     a.Session,
-		Title:       a.Title,
-		Client:      "krowk-mcp/" + s.Version,
-	})
+	// Every file is measured and digested before anything is sent, so a bad
+	// path in the last place fails before the first upload rather than halfway.
+	specs := make([]api.Spec, 0, len(files))
+	for _, path := range files {
+		spec, err := api.Inspect(path)
+		if err != nil {
+			return "", nil, err
+		}
+		specs = append(specs, spec)
+	}
 
-	artifact, err := s.Client.CreateArtifact(ctx, files, metadata)
+	var notes []string
+	runSlug, ownRun := a.Run, false
+	var run *api.Run
+	if runSlug == "" && s.Client.Authenticated() {
+		metadata := runctx.Resolve(s.Env, runctx.Overrides{
+			Repo:        a.Repo,
+			Commit:      a.Commit,
+			Agent:       a.Agent,
+			PullRequest: a.PullRequest,
+			Reference:   a.Reference,
+			Session:     a.Session,
+			Title:       a.Title,
+			Client:      "krowk-mcp/" + s.Version,
+		})
+		created, err := s.Client.CreateRun(ctx, metadata)
+		if err != nil {
+			return "", nil, err
+		}
+		run, runSlug, ownRun = created, created.Slug, true
+	}
+	if runSlug == "" && (a.PullRequest != "" || len(a.Reference) > 0 || a.Session != "") {
+		notes = append(notes, "pull_request, reference and session were not recorded: run metadata "+
+			"lives on a run, and opening a run needs an API key")
+	}
+
+	artifacts := make([]*api.Artifact, 0, len(specs))
+	for _, spec := range specs {
+		spec.Run = runSlug
+		artifact, err := s.Client.Push(ctx, spec)
+		if err != nil {
+			return "", nil, withProgress(err, artifacts, runSlug, ownRun)
+		}
+		artifacts = append(artifacts, artifact)
+	}
+
+	// A run this call opened is a run this call closes. Failing to close it is
+	// not worth failing the push over — the links work — but it is worth saying.
+	if ownRun {
+		if finished, err := s.Client.FinishRun(ctx, runSlug); err == nil {
+			run = finished
+		} else {
+			notes = append(notes, "run "+runSlug+" could not be finished — retry `krowk runs finish "+runSlug+"`")
+		}
+	}
+
+	return s.renderPush(artifacts, run, a.Title, notes)
+}
+
+// withProgress keeps what a failed batch would otherwise lose: the links of
+// whatever did upload, and the run this call opened.
+func withProgress(err error, done []*api.Artifact, runSlug string, ownRun bool) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	if len(done) > 0 {
+		urls := make([]string, 0, len(done))
+		for _, a := range done {
+			urls = append(urls, a.URL)
+		}
+		apiErr.Body["uploaded_before_failure"] = urls
+	}
+	if ownRun {
+		apiErr.Body["run"] = runSlug
+		finish := "the run is still open — close it with `krowk runs finish " + runSlug + "`"
+		if fix, _ := apiErr.Body["fix"].(string); fix != "" {
+			finish = fix + "; " + finish
+		}
+		apiErr.Body["fix"] = finish
+	}
+	return apiErr
+}
+
+func listArtifacts(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
+	var a struct {
+		Limit  int    `json:"limit"`
+		Before string `json:"before"`
+	}
+	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
+		return "", nil, api.Fail("bad_arguments", "`limit` must be a number and `before` a slug")
+	}
+
+	page, err := s.Client.ListArtifacts(ctx, strings.TrimSpace(a.Before), a.Limit)
 	if err != nil {
 		return "", nil, err
 	}
-	return s.render(artifact, a.Title)
+
+	lines := make([]string, 0, len(page.Artifacts)+2)
+	if len(page.Artifacts) == 0 {
+		lines = append(lines, "No artifacts in this workspace yet.")
+	}
+	for _, artifact := range page.Artifacts {
+		line := fmt.Sprintf("%s  %s  %s  %s",
+			artifact.Slug, artifact.Filename, output.HumanBytes(artifact.ByteSize), artifact.URL)
+		if artifact.State != "ready" {
+			line += "  (" + artifact.State + ")"
+		}
+		lines = append(lines, line)
+	}
+	if page.Next != "" {
+		lines = append(lines, "", "More: pass before="+page.Next+" for the next page.")
+	}
+	return strings.Join(lines, "\n"), page, nil
 }
 
 func getArtifact(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
 	var a struct {
-		ID string `json:"id"`
+		Slug string `json:"slug"`
 	}
 	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
-		return "", nil, api.Fail("bad_arguments", "`id` must be a string")
+		return "", nil, api.Fail("bad_arguments", "`slug` must be a string")
+	}
+	if strings.TrimSpace(a.Slug) == "" {
+		return "", nil, api.Fail("missing_slug", "pass the artifact slug, e.g. art_...")
 	}
 
-	artifact, err := s.Client.GetArtifact(ctx, strings.TrimSpace(a.ID))
+	artifact, err := s.Client.ShowArtifact(ctx, strings.TrimSpace(a.Slug))
+	if err != nil {
+		return "", nil, err
+	}
+	return s.render(artifact, "")
+}
+
+func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
+	var a struct {
+		Slug       string `json:"slug"`
+		ClaimToken string `json:"claim_token"`
+	}
+	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
+		return "", nil, api.Fail("bad_arguments", "`slug` and `claim_token` must be strings")
+	}
+	if strings.TrimSpace(a.Slug) == "" || strings.TrimSpace(a.ClaimToken) == "" {
+		return "", nil, api.Fail("missing_claim", "pass both the artifact slug and its claim_token")
+	}
+
+	artifact, err := s.Client.ClaimArtifact(ctx, strings.TrimSpace(a.Slug), strings.TrimSpace(a.ClaimToken))
 	if err != nil {
 		return "", nil, err
 	}
@@ -537,8 +663,8 @@ func getRun(_ context.Context, s *Server, _ json.RawMessage) (string, any, error
 
 func verifyKey(ctx context.Context, s *Server, _ json.RawMessage) (string, any, error) {
 	if s.Client.Token == "" {
-		return "No API key is configured, so pushes will be anonymous: they expire in 24h " +
-				"and come back with a claim URL.\n\nSet KROWK_TOKEN, or run `krowk auth login --token krk_...`.",
+		return "No API key is configured, so pushes will be anonymous: they expire within a day " +
+				"and come back with a claim token.\n\nSet KROWK_TOKEN, or run `krowk auth login --token krowk_sk_...`.",
 			map[string]any{"authenticated": false}, nil
 	}
 
@@ -557,38 +683,96 @@ func verifyKey(ctx context.Context, s *Server, _ json.RawMessage) (string, any, 
 	return strings.Join(lines, "\n"), key, nil
 }
 
-// render is the one place a result turns into text, so every tool hands back
-// both paste forms described the same way.
+// render is the one place a lone artifact turns into text, so every tool hands
+// back both paste forms described the same way.
 func (s *Server) render(a *api.Artifact, title string) (string, any, error) {
 	paste := output.PasteFor(a, title)
 
 	lines := []string{
-		fmt.Sprintf("Artifact %s — %s", a.ID, output.HumanBytes(a.Bytes)),
+		fmt.Sprintf("Artifact %s — %s, %s", a.Slug, a.Filename, output.HumanBytes(a.ByteSize)),
 	}
 	if expiry := output.RelativeExpiry(a.ExpiresAt, s.Now()); expiry != "" {
 		lines = append(lines, expiry)
 	}
-	lines = append(lines,
-		"",
-		"Paste into "+output.EmbedSurfaces+":",
-		paste.Markdown,
-		"",
-		"Paste into "+output.LinkSurfaces+":",
-		paste.URL,
-	)
-	if a.ClaimURL != "" {
-		lines = append(lines,
-			"",
-			"This upload is anonymous and nobody owns it yet. The link below adopts it —",
-			"it is a secret, so hand it to the human and do not paste it anywhere public:",
-			a.ClaimURL,
-		)
-	}
+	lines = append(lines, pasteLines(paste)...)
+	lines = append(lines, claimLines(a)...)
 
 	return strings.Join(lines, "\n"), map[string]any{
 		"artifact": a,
 		"paste":    paste,
 	}, nil
+}
+
+// renderPush reports a whole push: one artifact per file, each with both paste
+// forms, and the run they were grouped under when there was one.
+func (s *Server) renderPush(artifacts []*api.Artifact, run *api.Run, title string, notes []string) (string, any, error) {
+	// A title names one thing, so it labels a lone artifact and is left off a
+	// set of them rather than repeated on every line.
+	if len(artifacts) > 1 {
+		title = ""
+	}
+
+	var lines []string
+	pastes := make([]output.Paste, 0, len(artifacts))
+	for i, a := range artifacts {
+		if i > 0 {
+			lines = append(lines, "")
+		}
+		paste := output.PasteFor(a, title)
+		pastes = append(pastes, paste)
+		lines = append(lines,
+			fmt.Sprintf("Artifact %s — %s, %s", a.Slug, a.Filename, output.HumanBytes(a.ByteSize)))
+		if expiry := output.RelativeExpiry(a.ExpiresAt, s.Now()); expiry != "" {
+			lines = append(lines, expiry)
+		}
+		lines = append(lines, pasteLines(paste)...)
+		lines = append(lines, claimLines(a)...)
+	}
+	if run != nil {
+		lines = append(lines, "", "Grouped under run "+run.Slug+" ("+run.Status+").")
+	}
+	for _, note := range notes {
+		lines = append(lines, "", "Note: "+note)
+	}
+
+	structured := map[string]any{
+		"artifacts": artifacts,
+		"pastes":    pastes,
+	}
+	if run != nil {
+		structured["run"] = run
+	}
+	if len(notes) > 0 {
+		structured["notes"] = notes
+	}
+	return strings.Join(lines, "\n"), structured, nil
+}
+
+// pasteLines shows both paste forms, labelled honestly: the markdown label only
+// promises an image where the markdown actually embeds one.
+func pasteLines(paste output.Paste) []string {
+	return []string{
+		"",
+		"Paste into " + output.MarkdownSurfacesFor(paste) + ":",
+		paste.Markdown,
+		"",
+		"Paste into " + output.LinkSurfaces + ":",
+		paste.URL,
+	}
+}
+
+// claimLines carries the one-shot claim token of an anonymous upload, with the
+// warning it deserves.
+func claimLines(a *api.Artifact) []string {
+	if a.ClaimToken == "" {
+		return nil
+	}
+	return []string{
+		"",
+		"This upload is anonymous and nobody owns it yet. The command below adopts it —",
+		"the token is a secret, so hand it to the human and do not paste it anywhere public:",
+		"krowk claim " + a.Slug + " " + a.ClaimToken,
+	}
 }
 
 // ---- schemas ----
@@ -597,10 +781,11 @@ func toolSchemas() []map[string]any {
 	return []map[string]any{
 		{
 			"name": "krowk_push",
-			"description": "Upload one or more local files and get back a permalink that unfurls " +
-				"with the run metadata attached. Returns both paste-ready forms: the markdown " +
-				"image embed for GitHub, Linear and Notion, and the bare URL for Slack and " +
-				"Basecamp. Repo, commit, branch and agent are detected automatically.",
+			"description": "Upload one or more local files; every file becomes its own artifact with " +
+				"a permalink, grouped under a run when an API key is configured. Returns both " +
+				"paste-ready forms per artifact: the markdown image embed for GitHub, Linear and " +
+				"Notion, and the bare URL for Slack and Basecamp. Repo, commit, branch and agent " +
+				"are detected automatically.",
 			"inputSchema": map[string]any{
 				"type":     "object",
 				"required": []string{"files"},
@@ -614,9 +799,13 @@ func toolSchemas() []map[string]any {
 							"files are refused even inside it, because an artifact is readable by " +
 							"anyone with the link.",
 					},
+					"run": map[string]any{
+						"type":        "string",
+						"description": "Attach to an existing run instead of opening one.",
+					},
 					"title": map[string]any{
 						"type":        "string",
-						"description": "Label for the unfurl card and the markdown link text.",
+						"description": "Label for the markdown link text.",
 					},
 					"pull_request": map[string]any{
 						"type":        "string",
@@ -629,7 +818,7 @@ func toolSchemas() []map[string]any {
 					},
 					"session": map[string]any{
 						"type":        "string",
-						"description": "Agent session ID, to group a run's artifacts.",
+						"description": "Agent session ID, recorded on the run.",
 					},
 					"repo":   map[string]any{"type": "string", "description": "Override the detected repository."},
 					"commit": map[string]any{"type": "string", "description": "Override the detected commit."},
@@ -639,16 +828,55 @@ func toolSchemas() []map[string]any {
 			},
 		},
 		{
+			"name": "krowk_list_artifacts",
+			"description": "List the workspace's artifacts, newest first. Needs an API key: keyless " +
+				"uploads share the anonymous workspace, so there is nothing of one's own to list.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"limit": map[string]any{
+						"type":        "integer",
+						"description": "Artifacts per page (1–100, default 50).",
+					},
+					"before": map[string]any{
+						"type":        "string",
+						"description": "Start after this artifact slug — the `next` of the last page.",
+					},
+				},
+				"additionalProperties": false,
+			},
+		},
+		{
 			"name": "krowk_get_artifact",
-			"description": "Look up an artifact already uploaded, by the ID at the end of its link. " +
+			"description": "Look up an artifact already uploaded, by its slug. " +
 				"Returns the same paste-ready forms as a push.",
 			"inputSchema": map[string]any{
 				"type":     "object",
-				"required": []string{"id"},
+				"required": []string{"slug"},
 				"properties": map[string]any{
-					"id": map[string]any{
+					"slug": map[string]any{
 						"type":        "string",
-						"description": "Artifact ID, the last part of the URL — e.g. 9f3c2e1.",
+						"description": "Artifact slug, e.g. art_9f3c2e1abcdEFGH123456.",
+					},
+				},
+				"additionalProperties": false,
+			},
+		},
+		{
+			"name": "krowk_claim_artifact",
+			"description": "Spend a claim token to move an anonymous artifact into the key's " +
+				"workspace, where it stops expiring. Needs an API key.",
+			"inputSchema": map[string]any{
+				"type":     "object",
+				"required": []string{"slug", "claim_token"},
+				"properties": map[string]any{
+					"slug": map[string]any{
+						"type":        "string",
+						"description": "Artifact slug, e.g. art_9f3c2e1abcdEFGH123456.",
+					},
+					"claim_token": map[string]any{
+						"type":        "string",
+						"description": "The claim token the anonymous push returned, e.g. krowk_claim_...",
 					},
 				},
 				"additionalProperties": false,

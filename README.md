@@ -3,12 +3,13 @@
 Permalinks for agent output. Push a screenshot, get a URL that unfurls in
 GitHub, Slack, Basecamp and Linear with the run metadata attached.
 
-Proof of concept. The CLI is complete and tested against a local mock of the
-registry; the registry itself does not exist yet (see
-[What the POC still needs](#what-the-poc-still-needs)).
+Proof of concept. The CLI speaks the registry's real protocol and is tested
+against both a local stand-in and a running
+[krowk-registry](../krowk-registry); what is still missing is the unfurl layer
+and distribution (see [What the POC still needs](#what-the-poc-still-needs)).
 
 ```bash
-krowk uploads create ../../tmp/screenshots/foobar.jpg \
+krowk push ../../tmp/screenshots/foobar.jpg \
   --pull-request="https://github.com/acme/storefront/pull/412" \
   --reference="https://linear.app/acme/issue/ENG-9" \
   --session="3fe6808d-088d-4a6f-a04c-cc9690bcf852"
@@ -16,13 +17,8 @@ krowk uploads create ../../tmp/screenshots/foobar.jpg \
 
 ```
 ✓ uploaded  foobar.jpg  412 KB
-  expires in 47h
-
-  GitHub, Linear, Notion — renders the image
-  [![foobar.jpg](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)
-
-  Slack, Basecamp — they unfurl the link themselves
-  https://krowk.com/a/9f3c2e1
+  https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg
+  run run_8Kd2wq · expires in 24h
 ```
 
 Go, standard library only. One static binary, no runtime to install — agent
@@ -42,21 +38,29 @@ advertises all land with the first tagged release — see the prerequisites belo
 
 | Command | What it does |
 | --- | --- |
-| `krowk uploads create <file...>` | Upload artifacts, get one canonical URL |
-| `krowk push <file...>` | Alias for `uploads create` — the form the website advertises |
+| `krowk push <file...>` | Upload files, get a link for each |
+| `krowk uploads create <file...>` | The same thing, spelled out |
+| `krowk uploads list` | List the workspace's uploads, newest first (`--limit`, `--before`) |
+| `krowk uploads show <artifact>` | Read one artifact back |
+| `krowk runs start` | Open a run to group later uploads under |
+| `krowk runs finish <run>` | Close a run |
+| `krowk claim <artifact> <claim-token>` | Keep an anonymous upload past its expiry |
 | `krowk auth login --token <token>` | Store an API token in `~/.config/krowk/credentials.json` (0600) |
 | `krowk auth token` | Print the stored token, for scripts |
-| `krowk auth verify` | Ask the registry what the key is and what it may do |
+| `krowk auth verify` | Ask the registry what the stored key may actually do |
 | `krowk doctor` | Report version, API reachability, auth and detected run context |
-| `krowk registry serve` | Run a local registry to develop and test against |
+| `krowk registry serve` | Run the local stand-in registry to develop against |
 
-Upload flags: `--pull-request`, `--reference` (repeatable), `--session`,
+Upload flags: `--run`, `--pull-request`, `--reference` (repeatable), `--session`,
 `--title`, plus `--repo` / `--commit` / `--agent` to override detection. Flags
 may follow the filenames.
 
-Global flags: `--format human|json|markdown|url`, `--json`, `--quiet`,
+Global flags: `--dev`, `--format human|json|markdown|url`, `--json`, `--quiet`,
 `--help`, `--version`. Output is human on a TTY and JSON when piped, so an agent
 that captures stdout gets structured data without asking for it.
+
+**One file, one artifact, one link.** Pushing three files creates three
+artifacts with three URLs. What groups them is a run, not an artifact.
 
 ## Pasting the result
 
@@ -64,21 +68,24 @@ There is no single paste-ready string, because the surfaces disagree.
 
 | Destination | Use | Why |
 | --- | --- | --- |
-| GitHub, Linear, Notion | `--format markdown` | GitHub builds preview cards only for its own resources, so a bare third-party link renders as a plain blue anchor no matter what OpenGraph tags the page carries. It *does* render image URLs inline, so `[![title](preview)](page)` is what actually shows the artifact in a PR comment. |
+| GitHub, Linear, Notion | `--format markdown` | GitHub builds preview cards only for its own resources, so a bare third-party link renders as a plain blue anchor no matter what OpenGraph tags the page carries. It *does* render image URLs inline, so the image embed is what actually shows the artifact in a PR comment. |
 | Slack, Basecamp | `--format url` | Both unfurl a bare URL into a card of their own. Slack renders no markdown image embeds at all — pasting the embed form there shows raw text. |
 
-Human output prints both, labelled. `--json` carries both under `paste`:
+`--json` carries both forms under `paste`, one line per artifact:
 
 ```json
 {
   "ok": true,
   "data": { },
   "paste": {
-    "markdown": "[![foobar.jpg](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)",
-    "url": "https://krowk.com/a/9f3c2e1"
+    "markdown": "![foobar.jpg](https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg)",
+    "url": "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg"
   }
 }
 ```
+
+Link labels — the title or the filename — are escaped for CommonMark, so
+`frame[0].png` pastes as a working link rather than a broken one.
 
 ## MCP server
 
@@ -90,15 +97,17 @@ not also in the CLI.
 // Claude Code: .mcp.json — or `claude mcp add krowk -- krowk-mcp`
 {
   "mcpServers": {
-    "krowk": { "command": "krowk-mcp", "env": { "KROWK_TOKEN": "krk_..." } }
+    "krowk": { "command": "krowk-mcp", "env": { "KROWK_TOKEN": "krowk_sk_..." } }
   }
 }
 ```
 
 | Tool | What it does |
 | --- | --- |
-| `krowk_push` | Upload files, get both paste forms back |
-| `krowk_get_artifact` | Look one up by the ID at the end of its link |
+| `krowk_push` | Upload files — one artifact per file, grouped under a run — and get both paste forms back |
+| `krowk_list_artifacts` | List the workspace's artifacts, newest first (needs a key) |
+| `krowk_get_artifact` | Look one up by its slug |
+| `krowk_claim_artifact` | Spend a claim token to keep an anonymous upload (needs a key) |
 | `krowk_get_run` | Report the repo, commit, branch and agent that will be attached |
 | `krowk_verify_key` | Whether a key is configured, and what it may do |
 
@@ -108,9 +117,9 @@ The machine-readable artifact rides along as `structuredContent`. A failed call
 comes back as a tool result with `isError` and the registry's own `fix`, not as a
 transport error, so the agent can read the reason and correct the call.
 
-The upload handshake is not exposed as separate begin/finalize tools: the `PUT`
+The declare/upload/finalize sequence is not exposed as separate tools: the `PUT`
 step needs access to the local file, which the MCP client does not have, so the
-handshake stays behind `krowk_push` where it belongs.
+sequence stays behind `krowk_push` where it belongs.
 
 **`krowk_push` is confined to a root** — the working directory, or `--root` /
 `KROWK_MCP_ROOT`. Paths are resolved with symlinks followed *before* the check,
@@ -123,7 +132,7 @@ publish it somewhere I can fetch". Symlink order is the subtle half — a link
 inside the repo pointing at `~/.ssh/id_rsa` sails through a prefix test done
 before resolving.
 
-Two things a plain prefix check gets wrong, both worth stating because both are
+Three things a plain prefix check gets wrong, all worth stating because they are
 the common case rather than the exotic one:
 
 - **The root may not be the home directory, or `/`.** It defaults to the working
@@ -161,173 +170,101 @@ Flags win; everything else is detected so the agent never has to type it.
 | `pull_request` | `--pull-request`, else derived from `GITHUB_REF` in a PR build |
 | `reference`, `session`, `title` | Flags only |
 
+Metadata is recorded on the **run**, because the registry keeps none on an
+artifact. A run belongs to a workspace, so it needs an API key:
+
+- **With a key** — `push` opens a run carrying the metadata, attaches every
+  artifact to it, and closes it on the way out. `--run` attaches to a run you
+  opened yourself instead, and leaves closing it to you.
+- **Without a key** — the upload still works. It lands in the shared anonymous
+  workspace, expires in 24 hours, and comes back with a claim token. There is no
+  run, so metadata named by flag is *not* recorded, and the result says so in
+  `notes` rather than dropping it silently.
+
 ## Wire contract
 
-An upload is a three-step handshake: declare the files, PUT their bytes to the
-presigned URLs the registry hands back, then finalize. Bytes never pass through
-the API host, so the registry stays a control plane and storage does the heavy
-lifting. The registry has to implement this for the CLI to work unchanged.
+What the registry implements, and what this client talks to. Bytes never pass
+through the registry: it hands out a presigned upload URL, the client uploads
+straight to object storage, and a later call verifies what landed.
 
-**1. Declare.** The client hashes each file first, so it can name the upload
-before sending a byte.
+The API is resourceful all the way down, so what would be a verb hanging off an
+artifact is a nested resource instead. The method follows from whether the call
+can be repeated — finalizing and completing are idempotent, so they are `PUT`s;
+claiming spends a one-shot token, so it is a `POST`:
+
+```
+GET        /                                  service descriptor
+GET        /v1/artifacts                      list, newest first (needs a key)
+POST       /v1/artifacts                      declare an upload
+GET        /v1/artifacts/:slug                read one back
+PUT|PATCH  /v1/artifacts/:slug/finalization   confirm the bytes landed
+POST       /v1/artifacts/:slug/claim          spend a claim token (needs a key)
+POST       /v1/runs                           open a run (needs a key)
+PUT|PATCH  /v1/runs/:slug/completion          close a run (needs a key)
+```
+
+Everything but listing, claiming and the run endpoints works without a key: for a
+keyless request the slug *is* the capability, since slugs are 21 random base58
+characters and the bytes are public on the CDN regardless.
 
 ```
 POST {KROWK_API_URL}/artifacts
-Authorization: Bearer <token>        # optional — anonymous uploads allowed
-Idempotency-Key: <key>
-Content-Type: application/json
-```
-
-```jsonc
-{
-  "idempotency_key": "<sha256 fold, see below>",
-  "files": [
-    { "filename": "foobar.jpg", "bytes": 421888, "content_type": "image/jpeg", "digest": "<sha256 of the bytes>" }
-  ],
-  "metadata": { }                    // the table above
-}
-```
-
-```jsonc
-// 201 Created — one target per declared file, in the order they were declared
-{
-  "id": "9f3c2e1",
-  "uploads": [
-    { "filename": "foobar.jpg", "method": "PUT", "url": "https://storage.../blob?sig=...",
-      "headers": { "Content-Type": "image/jpeg" } }
-  ],
-  "finalize_url": "https://api.krowk.com/v1/artifacts/9f3c2e1/finalize"
-}
-```
-
-```jsonc
-// 200 OK — this key was already finalized. No bytes are sent; this is the retry path.
-{ "id": "9f3c2e1", "complete": true, "artifact": { } }
-```
-
-**2. Send the bytes.** One `PUT` per target, streamed off disk, carrying the
-headers the registry supplied. The API token is deliberately *not* attached —
-a presigned URL carries its own authorisation and may point at any host.
-
-**Auth.** A key is a bearer token; `--token` stores it, `KROWK_TOKEN` overrides
-the file. Because a key can be revoked, expired or scoped read-only — none of
-which is visible from the token string — the CLI can ask instead of guessing:
-
-```
-POST {KROWK_API_URL}/keys/verify
-Authorization: Bearer <token>
-```
-
-```jsonc
-// 200 OK
-{ "valid": true, "key_id": "key_7f3a91c2", "workspace": "acme",
-  "scopes": ["artifacts:read", "artifacts:write"] }
-```
-
-`401` with `no_key` when no token was sent, `invalid_key` when it was rejected.
-A `200` carrying `valid: false` counts as a rejection too. Uploading needs
-`artifacts:write`; a key without it is turned down at the manifest, before any
-bytes move, with `403 insufficient_scope` naming the scope it lacked.
-
-**Anonymous uploads.** No key is a supported path, not an error — the point is
-that the upload step never fails for boring reasons. An anonymous upload is
-ephemeral and unowned, so the finalize response marks it and hands back a link
-that adopts it:
-
-```jsonc
-{ "anonymous": true, "expires_at": "…",           // 24h, not the workspace 48h
-  "claim_url": "https://krowk.com/claim/2b7f91" }
-```
-
-Claiming happens in a browser, signed in — there is no API call for it. Which
-side of the fence an upload lands on is settled when the handshake opens, so it
-cannot change hands by finalizing with a different key.
-
-The claim URL is a **capability**: anyone holding it can adopt the upload. So:
-
-- it is printed for whoever ran the push, and kept out of both paste forms;
-- `GET /v1/artifacts/{id}` never returns it — the ID is public, since it is in
-  the shareable link, and knowing it must not be enough to claim the upload;
-- it is handed back exactly once, on the single response that finalizes the
-  artifact — completing the upload earns the claim. Identity is derived from the
-  bytes, so anyone holding a copy of the same file derives the same key; once an
-  artifact exists, a replay gets the link but not the claim URL, so pushing a
-  file someone else had already shared anonymously cannot adopt their upload.
-  The one caveat is an *interrupted* anonymous handshake: it resumes for anyone
-  anonymous with the same bytes, and whoever finalizes first gets the claim URL
-  (and the opener's metadata). There is no opener identity to check against —
-  that is the deliberate price of anonymous, content-derived identity being
-  resumable.
-
-**3. Finalize.**
-
-```
-POST {finalize_url}
-Authorization: Bearer <token>
+Authorization: Bearer krowk_sk_...      # optional — anonymous uploads allowed
 Content-Type: application/json
 
-{ "idempotency_key": "<key>" }
+{ "artifact": {
+    "filename": "foobar.jpg", "content_type": "image/jpeg",
+    "byte_size": 421888, "checksum": "<sha-256 hex>", "run": "run_..." } }
 ```
 
 ```jsonc
-// 200 OK
+// 201 Created
 {
-  "id": "9f3c2e1",
-  "url": "https://krowk.com/a/9f3c2e1",
-  "preview_url": "https://krowk.com/a/9f3c2e1/preview.png",
-  "bytes": 421888,
-  "expires_at": "2026-08-05T14:32:00Z",
-  "files": [{ "filename": "foobar.jpg", "bytes": 421888, "content_type": "image/jpeg" }],
-  "metadata": { }
+  "slug": "art_2e1d…", "state": "pending",
+  "url": "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+  "markdown": "![foobar.jpg](https://cdn.krowk.com/…)",
+  "expires_at": "2026-08-05T14:32:00Z",       // anonymous uploads only
+  "upload": {
+    "method": "PUT", "url": "https://…?X-Amz-Signature=…",
+    "headers": { "Content-Type": "image/jpeg", "Content-Length": "421888" }
+  },
+  "next_step": "PUT the file to upload.url …, then PUT /v1/artifacts/art_2e1d/finalization",
+  "claim_token": "krowk_claim_…"              // anonymous uploads only, shown once
 }
 ```
 
-Every failure carries the same shape, so an agent can fix the call from the
-body alone:
+Then the two calls `next_step` names:
+
+```
+PUT <upload.url>                                  # exactly the headers above, nothing more
+PUT {KROWK_API_URL}/artifacts/{slug}/finalization
+```
+
+Every failure carries the same shape, so an agent can branch on the code:
 
 ```json
-{
-  "error": "artifact_too_large",
-  "limit_bytes": 104857600,
-  "got_bytes": 214958080,
-  "fix": "re-encode below 100 MB or push frames separately",
-  "retryable": false
-}
+{ "error": { "code": "invalid",
+             "message": "Byte size must be at most 104857600 bytes",
+             "details": { "byte_size": ["must be at most 104857600 bytes"] } } }
 ```
 
-- **Idempotency** — the key is a SHA-256 fold over each file's name, size and
-  content digest, in order: `sha256(name \0 size \0 digest \0 …)`. It is
-  derived from the bytes, so a retry, a crash-and-rerun, or the same push from
-  another machine all converge on one artifact and one link. Declare and
-  finalize carry it — the blob `PUT` does not, being identified by the token in
-  its presigned URL — and the registry verifies each blob against its declared
-  digest on arrival, so agreeing on the key really does mean agreeing on the
-  bytes. The body field is normative; the `Idempotency-Key` header the client
-  also sends is a courtesy copy for middleware, and a registry may reject a
-  request where the two disagree.
-- **Resumable** — declaring the same key again before finalizing returns the
-  same ID and the same upload targets, so blobs already stored stay stored.
-  Resumability is bounded by inactivity: a registry may reclaim a pending
-  handshake that has seen no declaration or blob for an hour, after which the
-  same key starts a fresh handshake. A registry at its pending-handshake
-  capacity may also refuse a new declaration with a retryable 503
-  `too_many_pending_uploads`.
-- **The ID authorises nothing.** It is the last segment of every link that gets
-  pasted anywhere, so `finalize` requires the idempotency key and rejects a
-  request without one. Only a caller in the same ownership class — no key for
-  anonymous uploads, a valid write-scoped key in the same workspace for keyed
-  ones — can complete a handshake, or replay it to get the artifact back.
-- **IDs lengthen on collision.** Seven hex characters is 28 bits, so two
-  unrelated uploads collide after a few thousand — inside a real registry's
-  first week. A collision extends the new ID rather than letting it take over an
-  existing upload's link, so links stay short until they cannot be.
-- **Rate limits** — `X-RateLimit-Limit`, `X-RateLimit-Remaining` on every
-  response; `Retry-After` on the 429.
-- **Retries** — each step retries up to 3 times on `retryable: true` (default
-  for 429 and 5xx), honouring `Retry-After`.
-- **Same-origin** — `finalize_url` must be on the API's own origin. The client
-  refuses to send the token anywhere else, so a compromised registry response
-  cannot redirect the key.
+The client flattens that into one map and adds a `fix` line naming the next
+thing to actually do, so `krowk`'s own errors and the registry's read alike.
+
+- **Size and digest are declared up front** because they are signed into the
+  upload URL. That is what lets object storage refuse an oversized or corrupted
+  body at the edge instead of storing it and leaving us to notice later. It is
+  also why the client reads the whole file to digest it before the first call.
+- **Finalizing and completing are idempotent** — an agent that retries either gets
+  the same success, and the record keeps the moment it first reached that state.
+- **Listing is cursor-paged** — `next` carries the slug to pass back as `before`,
+  and is null on the last page. It is present whenever a page came back full, so a
+  total that is an exact multiple of `--limit` costs one extra empty page.
+- **Retries** — up to 3 attempts on a retryable failure (429, 5xx,
+  `upload_missing`, `storage_unavailable`), honouring `Retry-After` in either
+  spelling the HTTP spec allows, capped at 60 seconds so a header cannot wedge
+  the CLI.
+- **Expiry** — an anonymous artifact past its expiry answers `410 Gone`.
 - **Upload targets are storage, not anything reachable.** A presigned URL names a
   foreign host by design, but the client requires `https`, ignores `method` and
   always sends `PUT`, and refuses loopback, link-local, private and carrier-grade
@@ -364,8 +301,16 @@ body alone:
   dial lands on a configured proxy's address. One thing does stay out of reach:
   where a proxy sends the bytes is the proxy's business, so a name that resolves
   differently for it than for the URL check is not something this client can see.
-- **Expiry** — an expired free link returns `410 Gone` carrying the original
-  filename and upload time.
+
+### Not idempotent across pushes
+
+Pushing the same bytes twice creates **two artifacts with two links**. An
+artifact's identity is a random slug, not a digest of its contents, so the
+registry cannot tell a retry from a second upload. The earlier draft of this CLI
+promised digest-derived IDs and one stable link per file; the registry does not
+work that way, and this client no longer claims it does. An agent that retries a
+whole `push` after a partial failure leaves the first attempt's artifacts behind
+to expire.
 
 ## Testing against a local registry
 
@@ -392,18 +337,9 @@ for demoing production-looking URLs) and `--limit-bytes` (to exercise the
 too-large path).
 
 It binds `127.0.0.1:8787` — **loopback by default**, because it accepts uploads
-without a key and will answer a lookup for any artifact ID with the repo, branch,
-commit and pull request behind it. Artifact IDs are seven characters and
-enumerable, so on a café or office network a wider bind hands that to whoever is
-nearby. `--addr` can still open it up, and the banner says so when you do.
-
-Pending state is bounded, because declaring an upload needs no key and sends no
-bytes — so it is the cheapest request here and the one worth abusing. A handshake
-that never finalizes expires after an hour, swept on the next declaration; at most
-256 may be in flight at once (`503`, retryable); and one manifest may declare at
-most 64 files, since each mints a blob token and the body limit alone would allow
-thousands. Finishing an upload releases its handshake too — only the artifact and
-its ID reservation are kept, so a live link can never be handed to a later upload.
+without a key and serves their bytes to anyone who can reach it. On a café or
+office network a wider bind hands that to whoever is nearby. `--addr` can still
+open it up, and the banner says so when you do.
 
 ## Development
 
@@ -414,25 +350,44 @@ make mock        # the same registry as `krowk registry serve`, from the checkou
 make install     # → $GOPATH/bin/{krowk,krowk-mcp}
 ```
 
+Against the real registry, with [krowk-registry](../krowk-registry) up on port
+3000 — note the hostname, because that app routes by it:
+
+```bash
+export KROWK_API_URL=http://api.krowk.localhost:3000/v1
+./bin/krowk doctor
+./bin/krowk push screenshot.png                      # anonymous, expires in 24h
+
+# For the keyed flow, mint a key in the registry checkout:
+#   bin/rails runner 'puts Workspace.find_or_create_by!(name: "Local Dev") \
+#     .api_keys.create!(name: "krowk-cli local").token'
+export KROWK_TOKEN=krowk_sk_...
+./bin/krowk push screenshot.png --pull-request=https://github.com/acme/x/pull/1
+```
+
 ```
 cmd/krowk               the binary
 cmd/krowk-mcp           the MCP server
 internal/cli            flag parsing, routing, commands
-internal/api            HTTP client, the upload handshake, retries, credentials
+internal/api            the three-step upload, runs, retries, credentials
 internal/runctx         git and CI metadata detection
-internal/output         human / json / markdown rendering
+internal/output         human / json / markdown / url rendering
 internal/mcp            MCP over stdio, wrapping the same api client
-internal/registry       the mock registry handler, shared with the tests
+internal/registry       the stand-in registry handler, shared with the tests
 ```
 
-`internal/registry` is a working stand-in for `api.krowk.com`: the three-step
-handshake, idempotency keys verified against the bytes that actually arrive,
-the error envelope, rate-limit headers. It exists so the CLI can be developed
-and demoed before the registry ships — and doubles as the spec the registry has
-to satisfy. It serves the blob `PUT` itself rather than presigning out to object
-storage, which keeps the mock one process while exercising exactly the same
-client path. The CLI tests drive the real binary against it over a real socket
-via `httptest`.
+`internal/registry` is an in-memory stand-in for `api.krowk.com` that keeps the
+test suite hermetic — no Postgres, no object storage, no Rails. It implements the
+same sequence, the same error envelope and the same refusals the real registry
+makes, including the ones that exist to catch a broken client: it will not
+finalize bytes that never arrived, and it rejects a body whose length or digest
+is not what was declared. The one thing it fakes is signing — object storage is
+the same process on a `/_storage` path, with an opaque token in place of SigV4.
+
+A stand-in can drift with the client and keep the suite green while the real
+registry answers 404, so `TestWireShapeMatchesTheRegistrysRoutes` pins the method
+and path of every call the CLI makes. Check it against `bin/rails routes` in the
+registry checkout when either side moves.
 
 Environment: `KROWK_TOKEN`, `KROWK_API_URL`, `KROWK_AGENT`.
 
@@ -440,36 +395,38 @@ Environment: `KROWK_TOKEN`, `KROWK_API_URL`, `KROWK_AGENT`.
 
 Blocking, in order:
 
-1. **The registry.** `api.krowk.com` does not resolve. Nothing ships until
-   something implements `internal/registry` for real — storage, digest-keyed
-   IDs, 48h expiry with a `410` tombstone.
-2. **The unfurl layer.** The whole pitch is the preview card. That means
-   `krowk.com/a/{id}` serving OpenGraph tags plus a rendered `preview.png`, and
-   a Slack app for Slack's own unfurl path. The CLI is done when this exists;
-   without it the URL is a bare link.
-3. **Distribution.** `krowk` and `@krowk/mcp` are unclaimed on npm. The site
+1. **The unfurl layer.** The whole pitch is the preview card. Today `url` points
+   straight at the CDN object, so pasting it gets you an image or a file
+   download, not a card with the run metadata on it. That means a
+   `krowk.com/a/{slug}` page serving OpenGraph tags plus a rendered preview, and
+   a Slack app for Slack's own unfurl path.
+2. **Distribution.** `krowk` and `@krowk/mcp` are unclaimed on npm. The site
    tells people to run `npx krowk push`, so the first release needs GoReleaser
    for the binaries plus a thin npm wrapper that pulls the right one through
    per-platform `optionalDependencies` — the pattern esbuild uses. A Homebrew
    tap and `curl | bash` come off the same build.
-4. **Tokens.** `auth login --token` is a placeholder. The site promises scoped
-   keys per agent per repo with their own quota; that needs an issuing endpoint
-   and a dashboard, or at minimum a device flow like the Basecamp CLI's.
+3. **Getting a token.** `auth login --token` stores whatever it is handed. Keys
+   exist in the registry and the dashboard can issue them, but there is no
+   device flow, so an agent in a container still needs a human to paste one in.
 
 Non-blocking, in rough value order: a Claude Code `PostToolUse` hook so
-screenshots upload with no prompting; a GitHub Action; publishing `krowk-mcp`
-under the `@krowk/mcp` name the website advertises, which needs the same npm
-wrapper as the CLI.
+screenshots upload with no prompting; a GitHub Action. The MCP server itself
+already ships as `krowk-mcp`; what `@krowk/mcp` still needs is the npm wrapper.
 
-## Open contract questions
+## Open questions
 
-- A repeat push of identical bytes with *different* metadata currently keeps
-  the first upload's metadata, because the digest is the identity. Should the
-  second push merge metadata, or is the artifact genuinely immutable?
-- Multiple files in one call return one URL. Is that one artifact with many
-  files, or a gallery of artifacts under a group ID? The website shows one
-  URL for three files, so this assumes the former.
-- Anonymous uploads have no key to rate-limit against. IP, or a machine-scoped
-  anonymous token minted on first push?
+- **Nothing dedupes.** See [above](#not-idempotent-across-pushes). Should the
+  registry key artifacts by digest within a workspace, or is a link per push the
+  intended behaviour?
+- **A run per push.** With a key, every `push` that is not given `--run` opens
+  and closes its own run, so ten screenshots from one agent session become ten
+  runs. Should the CLI persist a run for the session — keyed on the agent's
+  session ID — so they group without the caller threading `--run` through?
+- **Oversized files are read before they are refused.** The upload cap lives in
+  the registry, so the client digests a 2 GB file and only then hears it is too
+  large. Should the API root publish `max_upload_bytes` so the client can refuse
+  it locally?
+- **Anonymous uploads have no key to rate-limit against.** IP, or a
+  machine-scoped anonymous token minted on first push?
 
 MIT.

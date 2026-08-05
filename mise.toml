@@ -1,0 +1,5 @@
+# go.mod declares the language version the code needs; this pins the toolchain
+# that builds it, so `make check` works on a clean checkout without a global
+# default set.
+[tools]
+go = "1.26.5"

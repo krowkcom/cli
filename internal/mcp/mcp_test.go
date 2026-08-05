@@ -140,8 +140,8 @@ func TestInitializeNegotiatesAndAdvertisesTools(t *testing.T) {
 		t.Errorf("serverInfo = %+v", info)
 	}
 	// The instructions are where the paste rules live; a schema cannot say it.
-	if instr, _ := init["instructions"].(string); !strings.Contains(instr, "claim_url") {
-		t.Errorf("instructions should warn about the claim URL, got %q", instr)
+	if instr, _ := init["instructions"].(string); !strings.Contains(instr, "claim_token") {
+		t.Errorf("instructions should warn about the claim token, got %q", instr)
 	}
 
 	list, _ := replies[1]["result"].(map[string]any)
@@ -158,7 +158,8 @@ func TestInitializeNegotiatesAndAdvertisesTools(t *testing.T) {
 			t.Errorf("%s has no description", name)
 		}
 	}
-	for _, want := range []string{"krowk_push", "krowk_get_artifact", "krowk_get_run", "krowk_verify_key"} {
+	for _, want := range []string{"krowk_push", "krowk_list_artifacts", "krowk_get_artifact",
+		"krowk_claim_artifact", "krowk_get_run", "krowk_verify_key"} {
 		if !names[want] {
 			t.Errorf("%s is not advertised", want)
 		}
@@ -188,34 +189,39 @@ func TestPushReturnsBothPasteFormsLabelled(t *testing.T) {
 	}
 
 	body := text(t, result)
-	for _, want := range []string{"Paste into GitHub", "Paste into Slack", "[![Checkout — mobile]("} {
+	for _, want := range []string{"Paste into GitHub", "Paste into Slack", "![Checkout — mobile]("} {
 		if !strings.Contains(body, want) {
 			t.Errorf("text is missing %q:\n%s", want, body)
 		}
 	}
 
 	structured, _ := result["structuredContent"].(map[string]any)
-	paste, _ := structured["paste"].(map[string]any)
+	pastes, _ := structured["pastes"].([]any)
+	if len(pastes) != 1 {
+		t.Fatalf("pastes = %+v, want one per artifact", structured["pastes"])
+	}
+	paste, _ := pastes[0].(map[string]any)
 	markdown, _ := paste["markdown"].(string)
 	url, _ := paste["url"].(string)
-	if !strings.HasPrefix(markdown, "[![Checkout — mobile](") {
+	if !strings.HasPrefix(markdown, "![Checkout — mobile](") {
 		t.Errorf("paste.markdown = %q", markdown)
 	}
-	if !strings.Contains(url, "/a/") {
-		t.Errorf("paste.url = %q", url)
+	if url == "" || strings.Contains(url, "![") {
+		t.Errorf("paste.url = %q, want the bare link", url)
 	}
-	// Structured output must carry the metadata that makes the link worth having.
-	artifact, _ := structured["artifact"].(map[string]any)
-	meta, _ := artifact["metadata"].(map[string]any)
+	// Metadata lives on the run, and the run must ride along in the structured
+	// output — it is what makes the link worth having.
+	run, _ := structured["run"].(map[string]any)
+	meta, _ := run["metadata"].(map[string]any)
 	if meta["pull_request"] != "https://github.com/acme/storefront/pull/412" {
-		t.Errorf("metadata = %v, want the pull request attached", meta)
+		t.Errorf("run metadata = %v, want the pull request attached", meta)
 	}
 	if meta["client"] != "krowk-mcp/1.2.3" {
 		t.Errorf("client = %v, want the MCP server to identify itself", meta["client"])
 	}
 }
 
-func TestAnonymousPushWarnsAboutTheClaimURL(t *testing.T) {
+func TestAnonymousPushWarnsAboutTheClaimToken(t *testing.T) {
 	s := newSession(t, "") // no key
 
 	result := s.callTool("krowk_push", map[string]any{"files": []string{s.fixture}})
@@ -225,20 +231,25 @@ func TestAnonymousPushWarnsAboutTheClaimURL(t *testing.T) {
 
 	body := text(t, result)
 	if !strings.Contains(body, "anonymous") || !strings.Contains(body, "do not paste it anywhere public") {
-		t.Errorf("an anonymous push should warn about the claim URL:\n%s", body)
+		t.Errorf("an anonymous push should warn about the claim token:\n%s", body)
 	}
 
 	structured, _ := result["structuredContent"].(map[string]any)
-	artifact, _ := structured["artifact"].(map[string]any)
-	claim, _ := artifact["claim_url"].(string)
+	artifacts, _ := structured["artifacts"].([]any)
+	if len(artifacts) != 1 {
+		t.Fatalf("artifacts = %+v, want one", structured["artifacts"])
+	}
+	artifact, _ := artifacts[0].(map[string]any)
+	claim, _ := artifact["claim_token"].(string)
 	if claim == "" {
-		t.Fatal("no claim URL on an anonymous push")
+		t.Fatal("no claim token on an anonymous push")
 	}
 	// It is a capability, so it must not be in either paste form.
-	paste, _ := structured["paste"].(map[string]any)
+	pastes, _ := structured["pastes"].([]any)
+	paste, _ := pastes[0].(map[string]any)
 	for k, v := range paste {
 		if s, _ := v.(string); strings.Contains(s, claim) {
-			t.Errorf("the claim URL leaked into paste.%s: %q", k, s)
+			t.Errorf("the claim token leaked into paste.%s: %q", k, s)
 		}
 	}
 }
@@ -476,42 +487,46 @@ func TestGetArtifactRoundTripsAPush(t *testing.T) {
 
 	pushed := s.callTool("krowk_push", map[string]any{"files": []string{s.fixture}})
 	structured, _ := pushed["structuredContent"].(map[string]any)
-	artifact, _ := structured["artifact"].(map[string]any)
-	id, _ := artifact["id"].(string)
-	if id == "" {
-		t.Fatalf("no ID from the push: %+v", pushed)
+	artifacts, _ := structured["artifacts"].([]any)
+	if len(artifacts) != 1 {
+		t.Fatalf("artifacts = %+v, want one", structured["artifacts"])
+	}
+	artifact, _ := artifacts[0].(map[string]any)
+	slug, _ := artifact["slug"].(string)
+	if slug == "" {
+		t.Fatalf("no slug from the push: %+v", pushed)
 	}
 
-	got := s.callTool("krowk_get_artifact", map[string]any{"id": id})
+	got := s.callTool("krowk_get_artifact", map[string]any{"slug": slug})
 	if got["isError"] == true {
 		t.Fatalf("lookup failed: %s", text(t, got))
 	}
-	if body := text(t, got); !strings.Contains(body, "Artifact "+id) {
-		t.Errorf("text = %q, want the artifact ID", body)
+	if body := text(t, got); !strings.Contains(body, "Artifact "+slug) {
+		t.Errorf("text = %q, want the artifact slug", body)
 	}
 }
 
-func TestGetArtifactNeedsAnID(t *testing.T) {
+func TestGetArtifactNeedsASlug(t *testing.T) {
 	s := newSession(t, "krk_test")
 
-	result := s.callTool("krowk_get_artifact", map[string]any{"id": "  "})
+	result := s.callTool("krowk_get_artifact", map[string]any{"slug": "  "})
 	if result["isError"] != true {
 		t.Fatalf("want isError, got %+v", result)
 	}
-	if body := text(t, result); !strings.Contains(body, "missing_id") {
-		t.Errorf("text = %q, want missing_id", body)
+	if body := text(t, result); !strings.Contains(body, "missing_slug") {
+		t.Errorf("text = %q, want missing_slug", body)
 	}
 }
 
 func TestGetArtifactSaysWhenThereIsNothingThere(t *testing.T) {
 	s := newSession(t, "krk_test")
 
-	result := s.callTool("krowk_get_artifact", map[string]any{"id": "nosuchid"})
+	result := s.callTool("krowk_get_artifact", map[string]any{"slug": "art_nosuchslug"})
 	if result["isError"] != true {
 		t.Fatalf("want isError, got %+v", result)
 	}
-	if body := text(t, result); !strings.Contains(body, "artifact_not_found") {
-		t.Errorf("text = %q, want artifact_not_found", body)
+	if body := text(t, result); !strings.Contains(body, "not_found") {
+		t.Errorf("text = %q, want not_found", body)
 	}
 }
 
@@ -554,15 +569,52 @@ func TestVerifyKeyReportsScopesAndAnonymousMode(t *testing.T) {
 	}
 }
 
-func TestReadOnlyKeyFailsThePushWithTheRegistrysReason(t *testing.T) {
-	s := newSession(t, "krk_ro_readonly")
+// An anonymous upload is kept by spending its claim token, and afterwards it
+// shows up in the key's own workspace listing.
+func TestClaimAdoptsAnAnonymousPushIntoTheWorkspace(t *testing.T) {
+	anon := newSession(t, "")
 
-	result := s.callTool("krowk_push", map[string]any{"files": []string{s.fixture}})
-	if result["isError"] != true {
-		t.Fatalf("want isError, got %+v", result)
+	pushed := anon.callTool("krowk_push", map[string]any{"files": []string{anon.fixture}})
+	structured, _ := pushed["structuredContent"].(map[string]any)
+	artifacts, _ := structured["artifacts"].([]any)
+	artifact, _ := artifacts[0].(map[string]any)
+	slug, _ := artifact["slug"].(string)
+	claim, _ := artifact["claim_token"].(string)
+	if slug == "" || claim == "" {
+		t.Fatalf("anonymous push returned no claimable artifact: %+v", artifact)
 	}
-	if body := text(t, result); !strings.Contains(body, "insufficient_scope") {
-		t.Errorf("text = %q, want insufficient_scope", body)
+
+	// Same registry, now with a key.
+	keyed := &session{t: t, server: &Server{
+		Client:  api.New(anon.server.Client.BaseURL, "krowk_sk_test"),
+		Env:     anon.server.Env,
+		Root:    anon.server.Root,
+		Version: anon.server.Version,
+		Now:     anon.server.Now,
+	}, fixture: anon.fixture}
+
+	claimed := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": slug, "claim_token": claim,
+	})
+	if claimed["isError"] == true {
+		t.Fatalf("claim failed: %s", text(t, claimed))
+	}
+
+	listed := keyed.callTool("krowk_list_artifacts", nil)
+	if listed["isError"] == true {
+		t.Fatalf("list failed: %s", text(t, listed))
+	}
+	if body := text(t, listed); !strings.Contains(body, slug) {
+		t.Errorf("listing = %q, want the claimed artifact in the workspace", body)
+	}
+
+	// Listing without a key is refused: keyless uploads share one workspace.
+	unlisted := anon.callTool("krowk_list_artifacts", nil)
+	if unlisted["isError"] != true {
+		t.Fatalf("keyless list should fail, got %+v", unlisted)
+	}
+	if body := text(t, unlisted); !strings.Contains(body, "unauthorized") {
+		t.Errorf("text = %q, want unauthorized", body)
 	}
 }
 

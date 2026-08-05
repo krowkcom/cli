@@ -1,8 +1,16 @@
-// Package registry is a stand-in for api.krowk.com until the real one exists.
-// It implements the contract the CLI speaks — the three-step upload handshake,
-// idempotency keys verified against the bytes that actually arrive, machine
-// readable errors, rate-limit headers — so the CLI can be developed and demoed
-// against something honest, and so the real registry has a spec to satisfy.
+// Package registry is an in-memory stand-in for api.krowk.com, so the CLI can
+// be tested and demoed without Postgres, object storage or a Rails process.
+//
+// It implements the same contract the real registry does — declare, upload,
+// finalize; runs; the claim flow; one error envelope — including the parts that
+// exist to catch a broken client: it refuses a finalize for bytes that never
+// arrived, and refuses bytes whose length or digest is not what was declared.
+// A client that passes against this one is exercising the real sequence.
+//
+// The one thing it fakes is signing. Object storage is this same process on a
+// /_storage path, and the "presigned" URL carries an opaque token rather than a
+// SigV4 signature. Everything the CLI has to get right — the exact headers, the
+// declared length, the digest — is still checked.
 package registry
 
 import (
@@ -10,10 +18,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,833 +30,774 @@ import (
 )
 
 const (
-	// DefaultLimitBytes matches the free tier the website advertises.
+	// DefaultLimitBytes matches the registry's own max_upload_bytes.
 	DefaultLimitBytes int64 = 100 << 20
-	dailyUploads            = 100
-	// workspaceExpiry is how long a link lives once it belongs to a workspace.
-	workspaceExpiry = 48 * time.Hour
-	// anonymousExpiry is shorter, because nobody has claimed the upload yet.
-	// Claiming it moves it onto the workspace window.
-	anonymousExpiry = 24 * time.Hour
-	// A declaration that never finalizes still costs memory, and declaring costs
-	// an attacker one request with no bytes behind it. So pending state expires
-	// and is capped: without both, the one endpoint that needs no key is a way to
-	// grow this process until it dies.
-	pendingTTL = time.Hour
-	maxPending = 256
-	// maxManifestFiles bounds one declaration. The body limit alone allows
-	// thousands of entries, each of which mints a blob token.
-	maxManifestFiles = 64
+
+	// How long a keyless upload survives, matching Artifact::EPHEMERAL_LIFETIME.
+	ephemeralLifetime = 24 * time.Hour
+
+	uploadURLLifetime = 15 * time.Minute
+
+	// How many artifacts a page holds, mirroring the registry's own bounds. The
+	// caller picks, so the ceiling is enforced rather than trusted.
+	defaultPageSize = 50
+	maxPageSize     = 100
+
+	// The workspace slug keyless uploads land in. One shared workspace, as in
+	// the real registry, so the storage keys look the same.
+	anonymousWorkspace = "ws_anonymous00000000"
 )
 
-type file struct {
-	Filename    string `json:"filename"`
-	Bytes       int64  `json:"bytes"`
-	ContentType string `json:"content_type"`
-}
-
 type artifact struct {
-	ID         string          `json:"id"`
-	URL        string          `json:"url"`
-	PreviewURL string          `json:"preview_url"`
-	Bytes      int64           `json:"bytes"`
-	ExpiresAt  string          `json:"expires_at"`
-	Files      []file          `json:"files"`
-	Metadata   json.RawMessage `json:"metadata"`
-	// Anonymous means no key was presented, so this upload belongs to nobody
-	// yet and expires sooner.
-	Anonymous bool `json:"anonymous,omitempty"`
-	// ClaimURL adopts an anonymous upload into a workspace. It is a website
-	// URL, opened signed-in in a browser — not an API call — and it is a
-	// capability, so it is never part of the paste-ready output. It is minted
-	// into the finalize response only, never stored.
-	ClaimURL string `json:"claim_url,omitempty"`
-}
-
-// manifestFile is one declared file, before its bytes arrive.
-type manifestFile struct {
+	Slug        string `json:"slug"`
+	State       string `json:"state"`
 	Filename    string `json:"filename"`
-	Bytes       int64  `json:"bytes"`
 	ContentType string `json:"content_type"`
-	Digest      string `json:"digest"`
+	ByteSize    int64  `json:"byte_size"`
+	Checksum    string `json:"checksum,omitempty"`
+	Region      string `json:"region"`
+	Run         any    `json:"run"`
+	URL         string `json:"url"`
+	Markdown    string `json:"markdown"`
+	ExpiresAt   any    `json:"expires_at"`
+	CreatedAt   string `json:"created_at"`
+
+	// Not serialized: what the stand-in has to remember between calls.
+	workspace  string
+	claimHash  string
+	uploaded   bool
+	storedSize int64
+	storedSum  string
+	uploadTok  string
+	uploadTil  time.Time
+	claimed    bool
+	// storageKey is pinned at declare time: claiming moves the artifact to a
+	// new workspace, but the bytes stay where the presigned URL was signed for.
+	storageKey string
+	// seq orders a listing. A timestamp would tie when two artifacts are created
+	// in the same instant, and a page has to be totally ordered or rows swap
+	// places between pages.
+	seq int
 }
 
-type beginRequest struct {
-	IdempotencyKey string          `json:"idempotency_key"`
-	Files          []manifestFile  `json:"files"`
-	Metadata       json.RawMessage `json:"metadata"`
-}
+type run struct {
+	Slug       string          `json:"slug"`
+	Status     string          `json:"status"`
+	StartedAt  string          `json:"started_at"`
+	FinishedAt any             `json:"finished_at"`
+	Metadata   json.RawMessage `json:"metadata"`
+	CreatedAt  string          `json:"created_at"`
 
-type uploadTarget struct {
-	Filename string            `json:"filename"`
-	Method   string            `json:"method"`
-	URL      string            `json:"url"`
-	Headers  map[string]string `json:"headers,omitempty"`
-}
-
-type beginResponse struct {
-	ID          string         `json:"id"`
-	Uploads     []uploadTarget `json:"uploads,omitempty"`
-	FinalizeURL string         `json:"finalize_url,omitempty"`
-	Complete    bool           `json:"complete,omitempty"`
-	Artifact    *artifact      `json:"artifact,omitempty"`
-}
-
-// slot is one declared file plus whatever has arrived for it.
-type slot struct {
-	manifestFile
-	token    string
-	received bool
-}
-
-// upload is an in-flight handshake, keyed by its scoped idempotency key.
-type upload struct {
-	id  string
-	key string
-	// scoped is the key qualified by ownership class — the form the store's
-	// maps use, so uploads in different classes never deduplicate together.
-	scoped   string
-	metadata json.RawMessage
-	slots    []*slot
-	// anonymous is decided when the handshake opens, so an upload cannot change
-	// hands halfway through by finalizing with a different key.
-	anonymous bool
-	// at is when the handshake last showed signs of life — opened, resumed,
-	// or landed a blob — so only truly abandoned ones are swept.
-	at time.Time
+	workspace string
 }
 
 type store struct {
 	mu        sync.Mutex
-	pending   map[string]*upload  // by scoped idempotency key
-	byID      map[string]*upload  // by artifact ID, for finalize
-	byToken   map[string]tokenRef // by blob token, for PUT
-	artifacts map[string]artifact // finalized, by artifact ID
-	finalized map[string]string   // scoped idempotency key -> artifact ID
-	// idOwner remembers which scoped key claimed each ID, pending or finalized,
-	// so a second upload can never be handed an ID that is already spoken for.
-	idOwner map[string]string // artifact ID -> scoped idempotency key
+	artifacts map[string]*artifact
+	runs      map[string]*run
+	objects   map[string][]byte
+	created   int
+	now       func() time.Time
 }
 
-type tokenRef struct {
-	upload *upload
-	index  int
-}
-
-// Handler serves the mock registry. siteURL is the origin baked into returned
-// links; empty means "whatever host the request arrived on".
+// Handler serves the stand-in registry. siteURL is the origin baked into the
+// links it hands out; empty means "whatever host the request arrived on".
+// limitBytes caps an upload the way the real registry's max_upload_bytes does.
 func Handler(limitBytes int64, siteURL string) http.Handler {
-	return newStore().handler(limitBytes, siteURL)
+	return HandlerWithClock(limitBytes, siteURL, time.Now)
 }
 
-func newStore() *store {
-	return &store{
-		pending:   map[string]*upload{},
-		byID:      map[string]*upload{},
-		byToken:   map[string]tokenRef{},
-		artifacts: map[string]artifact{},
-		finalized: map[string]string{},
-		idOwner:   map[string]string{},
-	}
-}
-
-// handler wires the routes onto one store, so a test can hold the store it is
-// asserting about — whether pending state is actually reclaimed is not visible
-// from the outside.
-func (s *store) handler(limitBytes int64, siteURL string) http.Handler {
+// HandlerWithClock is Handler with the clock injected, which is the only way a
+// test can reach the expiry surface: a 24-hour lifetime and a 15-minute upload
+// window are not going to elapse inside one.
+func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) http.Handler {
 	if limitBytes <= 0 {
 		limitBytes = DefaultLimitBytes
 	}
+	s := &store{
+		artifacts: map[string]*artifact{},
+		runs:      map[string]*run{},
+		objects:   map[string][]byte{},
+		now:       now,
+	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/keys/verify", s.verify)
-	mux.HandleFunc("POST /v1/artifacts", s.begin(limitBytes, siteURL))
-	mux.HandleFunc("PUT /v1/blobs/{token}", s.put(limitBytes))
-	mux.HandleFunc("POST /v1/artifacts/{id}/finalize", s.finalize(siteURL))
-	mux.HandleFunc("GET /v1/artifacts/{id}", s.get)
-	mux.HandleFunc("/", notFound)
+
+	// The service descriptor, which is what a reachability check reads.
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"service": "krowk-registry", "versions": []string{"v1"},
+		})
+	})
+
+	mux.HandleFunc("POST /v1/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		s.createArtifact(w, r, limitBytes, site(r, siteURL))
+	})
+	mux.HandleFunc("GET /v1/artifacts", s.listArtifacts)
+	mux.HandleFunc("GET /v1/artifacts/{slug}", s.showArtifact)
+
+	// Finalizing and completing are nested resources reached with PUT, because
+	// they are idempotent; claiming spends a one-shot token, so it is a POST.
+	// PATCH is accepted alongside PUT, as the registry's routes do.
+	mux.HandleFunc("PUT /v1/artifacts/{slug}/finalization", s.finalizeArtifact)
+	mux.HandleFunc("PATCH /v1/artifacts/{slug}/finalization", s.finalizeArtifact)
+	mux.HandleFunc("POST /v1/artifacts/{slug}/claim", s.claimArtifact)
+
+	mux.HandleFunc("POST /v1/keys/verify", verifyKey)
+
+	mux.HandleFunc("POST /v1/runs", s.createRun)
+	mux.HandleFunc("PUT /v1/runs/{slug}/completion", s.finishRun)
+	mux.HandleFunc("PATCH /v1/runs/{slug}/completion", s.finishRun)
+
+	// Object storage, standing in for R2. PUT is the presigned upload target;
+	// GET is the CDN, so a link this stand-in hands out actually resolves.
+	mux.HandleFunc("PUT /_storage/{workspace}/{slug}/{filename}", s.putObject)
+	mux.HandleFunc("GET /_storage/{workspace}/{slug}/{filename}", s.getObject)
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusNotFound, "not_found", "No such endpoint.", nil)
+	})
 
 	return mux
 }
 
-// keyInfo is what the registry knows about one API key.
-type keyInfo struct {
-	Valid     bool     `json:"valid"`
-	KeyID     string   `json:"key_id,omitempty"`
-	Workspace string   `json:"workspace,omitempty"`
-	Scopes    []string `json:"scopes,omitempty"`
-}
-
-// KeyPrefix is the shape the platform issues. The mock has no issuing service,
-// so the token's own prefix stands in for a lookup: krk_ro_ is read-only,
-// anything else with the krk_ prefix can write. Enough to exercise the CLI's
-// scope handling without inventing a key database.
-const (
-	KeyPrefix         = "krk_"
-	readOnlyKeyPrefix = "krk_ro_"
-)
-
-// bearer pulls the token out of the request, if there is one.
-func bearer(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if after, ok := strings.CutPrefix(h, "Bearer "); ok {
-		return strings.TrimSpace(after)
+// createArtifact records the artifact and hands back where to put the bytes.
+func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitBytes int64, site string) {
+	workspace, ok := authenticate(w, r)
+	if !ok {
+		return
 	}
-	return ""
-}
 
-// describeKey resolves a token to what it may do. An empty token is anonymous,
-// which is a valid way to upload, not a rejected key.
-func describeKey(token string) (info keyInfo, anonymous bool) {
-	if token == "" {
-		return keyInfo{}, true
+	var body struct {
+		Artifact struct {
+			Filename    string `json:"filename"`
+			ContentType string `json:"content_type"`
+			ByteSize    int64  `json:"byte_size"`
+			Checksum    string `json:"checksum"`
+			Run         string `json:"run"`
+		} `json:"artifact"`
 	}
-	if !strings.HasPrefix(token, KeyPrefix) {
-		return keyInfo{Valid: false}, false
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: artifact.", nil)
+		return
 	}
-	scopes := []string{"artifacts:read", "artifacts:write"}
-	if strings.HasPrefix(token, readOnlyKeyPrefix) {
-		scopes = []string{"artifacts:read"}
+	in := body.Artifact
+
+	switch {
+	case in.Filename == "":
+		writeError(w, http.StatusUnprocessableEntity, "invalid", "Filename can't be blank",
+			map[string]any{"filename": []string{"can't be blank"}})
+		return
+	case in.ContentType == "":
+		writeError(w, http.StatusUnprocessableEntity, "invalid", "Content type can't be blank",
+			map[string]any{"content_type": []string{"can't be blank"}})
+		return
+	case in.ByteSize <= 0:
+		writeError(w, http.StatusUnprocessableEntity, "invalid",
+			"Byte size must be greater than 0",
+			map[string]any{"byte_size": []string{"must be greater than 0"}})
+		return
+	case in.ByteSize > limitBytes:
+		writeError(w, http.StatusUnprocessableEntity, "invalid",
+			fmt.Sprintf("Byte size must be at most %d bytes", limitBytes),
+			map[string]any{"byte_size": []string{fmt.Sprintf("must be at most %d bytes", limitBytes)}})
+		return
 	}
-	// Derived, never the token itself — a key ID ends up in logs and output.
-	sum := sha256.Sum256([]byte(token))
-	return keyInfo{
-		Valid:     true,
-		KeyID:     "key_" + hex.EncodeToString(sum[:])[:8],
-		Workspace: "acme",
-		Scopes:    scopes,
-	}, false
-}
 
-// anonymousClass is the ownership class of an upload made without a key.
-const anonymousClass = "anonymous"
-
-// ownerClass names the ownership partition a request uploads into: anonymous,
-// or a workspace. Dedup happens only within one class — the idempotency key is
-// derived from the bytes, so without the partition a keyed push of a file
-// someone had already pushed anonymously would inherit their unowned artifact,
-// with its shorter expiry and no way to adopt it into the workspace.
-//
-// Every handler that classifies calls authorize first, which turns an invalid
-// token into a 401 — so the invalid branch here is defence in depth, never a
-// silent fall into the anonymous class.
-func ownerClass(r *http.Request) string {
-	info, anonymous := describeKey(bearer(r))
-	if anonymous || !info.Valid {
-		return anonymousClass
+	anonymous := workspace == ""
+	if anonymous {
+		workspace = anonymousWorkspace
 	}
-	return "workspace\x00" + info.Workspace
-}
 
-// scopedKey is the idempotency key qualified by its ownership class. Every map
-// keyed by idempotency key uses this form, so uploads in different classes can
-// never observe each other.
-func scopedKey(class, key string) string {
-	return class + "\x00" + key
-}
+	// A keyless upload naming a run is refused rather than quietly ignored:
+	// answering 201 for an upload not attached to the run the client asked for
+	// looks like success and is not.
+	if in.Run != "" && anonymous {
+		writeError(w, http.StatusUnprocessableEntity, "run_needs_key",
+			"Attaching an artifact to a run needs an API key — a keyless upload has no workspace.", nil)
+		return
+	}
 
-// verify lets the CLI self-check auth and scopes before doing any work.
-func (s *store) verify(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	rate := rateHeaders(max(0, dailyUploads-len(s.artifacts)))
+	defer s.mu.Unlock()
+
+	if in.Run != "" {
+		if existing, ok := s.runs[in.Run]; !ok || existing.workspace != workspace {
+			writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+			return
+		}
+	}
+
+	slug := generateSlug("art")
+	key := path.Join(workspace, slug, safeFilename(in.Filename))
+	url := site + "/_storage/" + key
+	now := s.now().UTC()
+
+	a := &artifact{
+		Slug:        slug,
+		State:       "pending",
+		Filename:    in.Filename,
+		ContentType: in.ContentType,
+		ByteSize:    in.ByteSize,
+		Checksum:    strings.ToLower(in.Checksum),
+		Region:      "weur",
+		URL:         url,
+		Markdown:    markdown(in.Filename, in.ContentType, url),
+		CreatedAt:   now.Format(time.RFC3339Nano),
+		workspace:   workspace,
+		uploadTok:   randomToken(),
+		uploadTil:   now.Add(uploadURLLifetime),
+		storageKey:  key,
+	}
+	if in.Run != "" {
+		a.Run = in.Run
+	}
+	s.created++
+	a.seq = s.created
+
+	payload := map[string]any{}
+	var claimToken string
+	if anonymous {
+		a.ExpiresAt = now.Add(ephemeralLifetime).Format(time.RFC3339Nano)
+		claimToken = "krowk_claim_" + randomToken()
+		a.claimHash = sha256Hex([]byte(claimToken))
+	}
+	s.artifacts[slug] = a
+
+	for k, v := range serializeArtifact(a) {
+		payload[k] = v
+	}
+	payload["upload"] = map[string]any{
+		"method":     "PUT",
+		"url":        url + "?upload_token=" + a.uploadTok,
+		"headers":    map[string]string{"Content-Type": a.ContentType, "Content-Length": itoa(a.ByteSize)},
+		"expires_at": a.uploadTil.Format(time.RFC3339Nano),
+	}
+	payload["next_step"] = "PUT the file to upload.url with the headers in upload.headers, " +
+		"then PUT /v1/artifacts/" + slug + "/finalization"
+	if claimToken != "" {
+		payload["claim_token"] = claimToken
+	}
+
+	writeJSON(w, http.StatusCreated, payload)
+}
+
+// putObject is object storage. It enforces what the real presigned URL enforces
+// through its signature: the token, the declared length and the declared digest.
+func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
+	key := path.Join(r.PathValue("workspace"), r.PathValue("slug"), r.PathValue("filename"))
+
+	// Everything the checks need is copied under the lock: finalizeArtifact
+	// mutates ByteSize and Checksum, and a PUT racing a finalize must not read
+	// them bare.
+	s.mu.Lock()
+	a := s.artifacts[r.PathValue("slug")]
+	var wantKey, wantTok, wantType, wantSum string
+	var wantSize int64
+	var until time.Time
+	if a != nil {
+		wantKey = a.storageKey
+		wantTok, wantType, wantSum = a.uploadTok, a.ContentType, a.Checksum
+		wantSize, until = a.ByteSize, a.uploadTil
+	}
 	s.mu.Unlock()
 
-	info, anonymous := describeKey(bearer(r))
-	if anonymous {
-		writeJSON(w, http.StatusUnauthorized, rate, map[string]any{
-			"error":     "no_key",
-			"fix":       "send `Authorization: Bearer krk_...`, or upload anonymously and claim it later",
-			"retryable": false,
-		})
+	// A real presigned URL signs the key, not just the object: bytes must land
+	// exactly where the artifact says they live, never under a rewritten
+	// filename or another workspace's prefix.
+	if a == nil || key != wantKey || wantTok == "" || r.URL.Query().Get("upload_token") != wantTok {
+		// Storage speaks XML, as R2 and S3 do, so a client cannot get away with
+		// assuming every failure is a krowk envelope. A finalized artifact's token
+		// is spent, so a re-PUT of a ready permalink lands here too.
+		writeXMLError(w, http.StatusForbidden, "SignatureDoesNotMatch")
 		return
 	}
-	if !info.Valid {
-		writeJSON(w, http.StatusUnauthorized, rate, map[string]any{
-			"error":     "invalid_key",
-			"fix":       "this is not a krowk API key — they start with " + KeyPrefix,
-			"retryable": false,
-		})
+	// The URL's advertised expiry is enforced, as real object storage enforces
+	// the signature's window.
+	if s.now().After(until) {
+		writeXMLError(w, http.StatusForbidden, "AccessDenied")
 		return
 	}
-	writeJSON(w, http.StatusOK, rate, info)
-}
-
-// authorize enforces the write scope on the upload path.
-func authorize(w http.ResponseWriter, r *http.Request, rate map[string]string) bool {
-	info, anonymous := describeKey(bearer(r))
-	if anonymous {
-		return true // anonymous uploads are allowed
+	if got := r.Header.Get("Content-Type"); got != wantType {
+		writeXMLError(w, http.StatusForbidden, "SignatureDoesNotMatch")
+		return
 	}
-	if !info.Valid {
-		writeJSON(w, http.StatusUnauthorized, rate, map[string]any{
-			"error":     "invalid_key",
-			"fix":       "this is not a krowk API key — they start with " + KeyPrefix,
-			"retryable": false,
-		})
-		return false
+
+	bytes, err := io.ReadAll(io.LimitReader(r.Body, wantSize+1))
+	if err != nil {
+		writeXMLError(w, http.StatusBadRequest, "IncompleteBody")
+		return
 	}
-	if !slices.Contains(info.Scopes, "artifacts:write") {
-		writeJSON(w, http.StatusForbidden, rate, map[string]any{
-			"error":     "insufficient_scope",
-			"required":  "artifacts:write",
-			"scopes":    info.Scopes,
-			"fix":       "this key may only read — push with a key that carries artifacts:write",
-			"retryable": false,
-		})
-		return false
+	// The length is signed in, so storage refuses a body of any other size.
+	if int64(len(bytes)) != wantSize {
+		writeXMLError(w, http.StatusBadRequest, "IncorrectContentLength")
+		return
 	}
-	return true
-}
-
-// begin takes the manifest and hands back one presigned target per file.
-func (s *store) begin(limitBytes int64, siteURL string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req beginRequest
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, nil, map[string]any{
-				"error":     "malformed_manifest",
-				"detail":    err.Error(),
-				"fix":       "POST a JSON body with `idempotency_key` and a `files` array",
-				"retryable": false,
-			})
-			return
-		}
-		if req.IdempotencyKey == "" {
-			writeJSON(w, http.StatusUnprocessableEntity, nil, map[string]any{
-				"error":     "missing_idempotency_key",
-				"fix":       "send `idempotency_key`: the digest of the files, so a retry is free",
-				"retryable": false,
-			})
-			return
-		}
-		if len(req.Files) == 0 {
-			writeJSON(w, http.StatusUnprocessableEntity, nil, map[string]any{
-				"error":     "no_file",
-				"fix":       "declare at least one file in `files`",
-				"retryable": false,
-			})
-			return
-		}
-		if len(req.Files) > maxManifestFiles {
-			writeJSON(w, http.StatusUnprocessableEntity, nil, map[string]any{
-				"error":     "too_many_files",
-				"limit":     maxManifestFiles,
-				"got":       len(req.Files),
-				"fix":       fmt.Sprintf("declare at most %d files per upload", maxManifestFiles),
-				"retryable": false,
-			})
-			return
-		}
-
-		// Summed with a per-file bound and an early break: `bytes` is
-		// caller-controlled, and a naive sum of two huge declarations overflows
-		// int64 and slips under the limit. tooLarge also stops `put` from ever
-		// hashing more than the limit, because no slot can declare more.
-		var total int64
-		tooLarge := false
-		for _, f := range req.Files {
-			if f.Filename == "" || f.Digest == "" || f.Bytes < 0 {
-				writeJSON(w, http.StatusUnprocessableEntity, nil, map[string]any{
-					"error":     "malformed_manifest",
-					"fix":       "every file needs `filename`, `bytes` and `digest`",
-					"retryable": false,
-				})
-				return
-			}
-			if f.Bytes > limitBytes-total {
-				tooLarge = true
-				// The true total may not fit in int64; report the best lower bound.
-				total = max(total, f.Bytes)
-				break
-			}
-			total += f.Bytes
-		}
-
-		s.mu.Lock()
-		defer s.mu.Unlock()
-
-		rate := rateHeaders(max(0, dailyUploads-len(s.artifacts)))
-
-		// Auth before any work, so a key that cannot write finds out here
-		// rather than after streaming a 2 GB video to storage.
-		if !authorize(w, r, rate) {
-			return
-		}
-
-		// The same key twice, in the same ownership class: hand back the
-		// finished artifact rather than a second set of upload targets. This is
-		// what makes a retry free. The class matters — the key comes from the
-		// bytes, so without it a keyed push would inherit an anonymous upload
-		// of the same file instead of minting one the workspace owns. The
-		// stored artifact never carries the claim URL — see finalize.
-		class := ownerClass(r)
-		scoped := scopedKey(class, req.IdempotencyKey)
-		if id, ok := s.finalized[scoped]; ok {
-			done := s.artifacts[id]
-			writeJSON(w, http.StatusOK, rate, beginResponse{ID: id, Complete: true, Artifact: &done})
-			return
-		}
-
-		if tooLarge {
-			writeJSON(w, http.StatusRequestEntityTooLarge, rate, map[string]any{
-				"error":       "artifact_too_large",
-				"limit_bytes": limitBytes,
-				"got_bytes":   total,
-				"fix":         fmt.Sprintf("re-encode below %d MB or push frames separately", limitBytes>>20),
-				"retryable":   false,
-			})
-			return
-		}
-
-		// Sweep first, so an abandoned handshake from an hour ago makes room for
-		// this one rather than counting against it.
-		s.expirePending(time.Now())
-
-		// An interrupted handshake resumes: same key, same targets, so the
-		// blobs already stored stay stored.
-		up, resumed := s.pending[scoped]
-		if resumed {
-			// A resume restarts the clock. Without this, `at` keeps the
-			// original declaration's time and a handshake resumed minutes ago
-			// gets swept mid-transfer, turning its finalize into a 404.
-			up.at = time.Now()
-		} else {
-			// Declaring needs no key and no bytes, so this is the cheapest thing
-			// an attacker can ask for and the one that has to be bounded.
-			if len(s.pending) >= maxPending {
-				writeJSON(w, http.StatusServiceUnavailable, rate, map[string]any{
-					"error":     "too_many_pending_uploads",
-					"limit":     maxPending,
-					"fix":       "finish or abandon an upload in flight, then retry — unfinished handshakes expire after an hour",
-					"retryable": true,
-				})
-				return
-			}
-			up = &upload{
-				id:        s.mintID(scoped),
-				key:       req.IdempotencyKey,
-				scoped:    scoped,
-				metadata:  validMetadata(req.Metadata),
-				slots:     make([]*slot, 0, len(req.Files)),
-				anonymous: class == anonymousClass,
-				at:        time.Now(),
-			}
-			s.idOwner[up.id] = up.scoped
-			for _, f := range req.Files {
-				sl := &slot{manifestFile: f, token: newToken()}
-				up.slots = append(up.slots, sl)
-				s.byToken[sl.token] = tokenRef{upload: up, index: len(up.slots) - 1}
-			}
-			s.pending[up.scoped] = up
-			s.byID[up.id] = up
-		}
-
-		// Endpoints the client calls back into are always on the host the
-		// request arrived at — siteURL rebrands the public links only, and the
-		// client rightly refuses to take its token to a different origin.
-		api := requestOrigin(r)
-		targets := make([]uploadTarget, 0, len(up.slots))
-		for _, sl := range up.slots {
-			targets = append(targets, uploadTarget{
-				Filename: sl.Filename,
-				Method:   http.MethodPut,
-				// A real registry points this at object storage. Serving it
-				// ourselves keeps the mock a single process while exercising
-				// exactly the same client path.
-				URL:     fmt.Sprintf("%s/v1/blobs/%s", api, sl.token),
-				Headers: map[string]string{"Content-Type": sl.ContentType},
-			})
-		}
-		writeJSON(w, http.StatusCreated, rate, beginResponse{
-			ID:          up.id,
-			Uploads:     targets,
-			FinalizeURL: fmt.Sprintf("%s/v1/artifacts/%s/finalize", api, up.id),
-		})
+	// So is the digest, when one was declared — corruption is caught at the edge
+	// rather than stored and discovered later.
+	sum := sha256Hex(bytes)
+	if wantSum != "" && sum != wantSum {
+		writeXMLError(w, http.StatusBadRequest, "BadDigest")
+		return
 	}
-}
-
-// put stands in for the presigned storage endpoint. It verifies the bytes
-// against what the manifest promised, which is what lets finalize trust the
-// idempotency key.
-func (s *store) put(limitBytes int64) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		s.mu.Lock()
-		ref, ok := s.byToken[r.PathValue("token")]
-		s.mu.Unlock()
-		if !ok {
-			writeJSON(w, http.StatusForbidden, nil, map[string]any{
-				"error":     "upload_url_unknown",
-				"fix":       "the presigned URL is expired or was never issued — start the handshake again",
-				"retryable": false,
-			})
-			return
-		}
-		sl := ref.upload.slots[ref.index]
-
-		sum := sha256.New()
-		// One byte past the declared size is enough to catch an overrun without
-		// reading an unbounded body.
-		written, err := io.Copy(sum, io.LimitReader(r.Body, sl.Bytes+1))
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, nil, map[string]any{
-				"error": "upload_unreadable", "detail": err.Error(), "retryable": true,
-			})
-			return
-		}
-		if written > limitBytes {
-			writeJSON(w, http.StatusRequestEntityTooLarge, nil, map[string]any{
-				"error":       "artifact_too_large",
-				"limit_bytes": limitBytes,
-				"got_bytes":   written,
-				"fix":         fmt.Sprintf("re-encode below %d MB or push frames separately", limitBytes>>20),
-				"retryable":   false,
-			})
-			return
-		}
-		if written != sl.Bytes {
-			writeJSON(w, http.StatusUnprocessableEntity, nil, map[string]any{
-				"error":          "size_mismatch",
-				"declared_bytes": sl.Bytes,
-				"got_bytes":      written,
-				"fix":            "the body length must match the `bytes` declared for " + sl.Filename,
-				"retryable":      false,
-			})
-			return
-		}
-		if got := hex.EncodeToString(sum.Sum(nil)); got != sl.Digest {
-			writeJSON(w, http.StatusUnprocessableEntity, nil, map[string]any{
-				"error":           "digest_mismatch",
-				"declared_digest": sl.Digest,
-				"got_digest":      got,
-				"fix":             "the bytes sent for " + sl.Filename + " are not the ones declared in the manifest",
-				"retryable":       false,
-			})
-			return
-		}
-
-		s.mu.Lock()
-		sl.received = true
-		// A blob landing is proof of life: a transfer slower than the TTL never
-		// re-declares, so each finished PUT keeps the handshake alive itself.
-		ref.upload.at = time.Now()
-		s.mu.Unlock()
-
-		w.WriteHeader(http.StatusOK)
-	}
-}
-
-// finalize turns a complete set of blobs into an artifact.
-func (s *store) finalize(siteURL string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			IdempotencyKey string `json:"idempotency_key"`
-		}
-		// An empty body is an absent key, reported below; a body that fails to
-		// decode is a broken client, and folding the two into one error would
-		// leave that client no way to tell which it is.
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-			writeJSON(w, http.StatusBadRequest, nil, map[string]any{
-				"error":     "malformed_finalize",
-				"detail":    err.Error(),
-				"fix":       "POST a JSON body with `idempotency_key`",
-				"retryable": false,
-			})
-			return
-		}
-
-		id := r.PathValue("id")
-
-		s.mu.Lock()
-		defer s.mu.Unlock()
-
-		rate := rateHeaders(max(0, dailyUploads-len(s.artifacts)))
-
-		// The same gate as begin: an invalid token is a 401, not a silent fall
-		// into the anonymous class, and a read-only key cannot complete what it
-		// could never have opened. Without this, finalize would classify
-		// `Bearer garbage` as anonymous and let a krk_ro_ key — same workspace
-		// class as a writer — finish a pending workspace upload.
-		if !authorize(w, r, rate) {
-			return
-		}
-
-		// The ID is public — it is the last segment of the link people paste
-		// into pull requests. So it authorises nothing on its own: proving you
-		// opened this handshake means presenting the key, which is derived from
-		// the bytes and never leaves the pusher.
-		if body.IdempotencyKey == "" {
-			writeJSON(w, http.StatusUnprocessableEntity, rate, map[string]any{
-				"error":     "missing_idempotency_key",
-				"fix":       "finalize with the same idempotency_key the handshake was opened with",
-				"retryable": false,
-			})
-			return
-		}
-
-		// Finalizing twice is not an error; it is the retry path. But only for
-		// the caller that opened it — the key and the ownership class must both
-		// agree, so a keyed caller holding the same bytes as an anonymous upload
-		// gets the same answer as for an ID that was never theirs. The stored
-		// artifact never carries the claim URL, so a replay cannot leak it.
-		if done, ok := s.artifacts[id]; ok {
-			if s.finalized[scopedKey(ownerClass(r), body.IdempotencyKey)] != id {
-				writeJSON(w, http.StatusConflict, rate, map[string]any{
-					"error":     "idempotency_key_mismatch",
-					"fix":       "finalize with the same idempotency_key the handshake was opened with",
-					"retryable": false,
-				})
-				return
-			}
-			writeJSON(w, http.StatusOK, rate, done)
-			return
-		}
-
-		up, ok := s.byID[id]
-		if !ok {
-			writeJSON(w, http.StatusNotFound, rate, map[string]any{
-				"error":     "upload_not_found",
-				"id":        id,
-				"fix":       "no handshake is open for this ID — POST /v1/artifacts first",
-				"retryable": false,
-			})
-			return
-		}
-		// Pending uploads are partitioned the same way as finished ones: the key
-		// alone is derivable from the bytes, so a keyed caller holding a copy of
-		// an anonymously-pushed file could otherwise finalize the anonymous
-		// pending upload and walk off with its one-time claim capability.
-		if scopedKey(ownerClass(r), body.IdempotencyKey) != up.scoped {
-			writeJSON(w, http.StatusConflict, rate, map[string]any{
-				"error":     "idempotency_key_mismatch",
-				"fix":       "finalize with the same idempotency_key the handshake was opened with",
-				"retryable": false,
-			})
-			return
-		}
-
-		var total int64
-		files := make([]file, 0, len(up.slots))
-		for _, sl := range up.slots {
-			if !sl.received {
-				writeJSON(w, http.StatusConflict, rate, map[string]any{
-					"error":     "upload_incomplete",
-					"missing":   sl.Filename,
-					"fix":       "PUT every file's bytes to its presigned URL before finalizing",
-					"retryable": false,
-				})
-				return
-			}
-			total += sl.Bytes
-			files = append(files, file{
-				Filename:    sl.Filename,
-				Bytes:       sl.Bytes,
-				ContentType: contentType(sl.ContentType),
-			})
-		}
-
-		// The key is the fold of what was declared, and every blob was checked
-		// against its declared digest on arrival — so agreeing here means the
-		// key really does identify the bytes that were stored.
-		if got := foldKey(up.slots); got != up.key {
-			writeJSON(w, http.StatusUnprocessableEntity, rate, map[string]any{
-				"error":     "idempotency_key_mismatch",
-				"expected":  got,
-				"got":       up.key,
-				"fix":       "derive idempotency_key from each file's name, size and digest in manifest order",
-				"retryable": false,
-			})
-			return
-		}
-
-		site := publicOrigin(r, siteURL)
-		window := workspaceExpiry
-		if up.anonymous {
-			window = anonymousExpiry
-		}
-		a := artifact{
-			ID:         up.id,
-			URL:        fmt.Sprintf("%s/a/%s", site, up.id),
-			PreviewURL: fmt.Sprintf("%s/a/%s/preview.png", site, up.id),
-			Bytes:      total,
-			ExpiresAt:  time.Now().Add(window).UTC().Format(time.RFC3339),
-			Files:      files,
-			Metadata:   up.metadata,
-			Anonymous:  up.anonymous,
-		}
-		s.artifacts[a.ID] = a
-		s.finalized[up.scoped] = a.ID
-		delete(s.pending, up.scoped)
-		// byID exists to find a handshake in flight, and finalize answers a repeat
-		// from s.artifacts before it ever looks here — so holding the upload and
-		// its slots past this point keeps them alive for nothing.
-		delete(s.byID, up.id)
-		for _, sl := range up.slots {
-			delete(s.byToken, sl.token)
-		}
-
-		if up.anonymous {
-			// Whoever holds this can adopt the upload, so it is minted straight
-			// into this one response — never stored — and handed back exactly
-			// once, on the single response that finalizes the artifact. No later
-			// egress path can leak what the store never held.
-			//
-			// "Once" is a promise about responses, not people: completing the
-			// upload earns the claim. Anonymous identity is derived from the
-			// bytes, so if the opener is interrupted before finalizing, a second
-			// anonymous pusher of the same file resumes the pending handshake
-			// and — by finalizing first — receives the claim URL and the
-			// opener's metadata. There is no opener identity to check against;
-			// the alternatives (fresh identity per anonymous begin, or expiring
-			// pending uploads) would break the resumability and dedup this
-			// registry promises, so the trade-off is made deliberately and
-			// stated in the README.
-			a.ClaimURL = fmt.Sprintf("%s/claim/%s", site, newToken())
-		}
-
-		// Recomputed now this upload is counted, so the header an agent reads
-		// off a successful push is its remaining quota, not its previous one.
-		writeJSON(w, http.StatusOK, rateHeaders(max(0, dailyUploads-len(s.artifacts))), a)
-	}
-}
-
-// expirePending drops handshakes that were opened and never finished. Callers
-// hold the lock.
-//
-// Every abandoned declaration otherwise sits in pending, byID and one byToken
-// entry per declared file for the life of the process, and the endpoint that
-// creates them needs no key. An hour is far longer than a push takes and short
-// enough that a loop cannot outrun it.
-func (s *store) expirePending(now time.Time) {
-	for key, up := range s.pending {
-		if now.Sub(up.at) < pendingTTL {
-			continue
-		}
-		delete(s.pending, key)
-		delete(s.byID, up.id)
-		for _, sl := range up.slots {
-			delete(s.byToken, sl.token)
-		}
-		// The ID goes back in the pool with it. Nothing ever published this one —
-		// a link is printed after finalize, and this handshake never got there —
-		// so reserving it forever would be the same unbounded growth in a smaller
-		// map. A finalized ID keeps its idOwner entry, which is what stops mintID
-		// from ever handing a live link to a different upload.
-		delete(s.idOwner, up.id)
-	}
-}
-
-func (s *store) get(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
 
 	s.mu.Lock()
-	a, ok := s.artifacts[id]
+	// A finalize may have landed while the body was being read; a ready
+	// artifact's bytes are immutable.
+	if a.uploadTok != wantTok {
+		s.mu.Unlock()
+		writeXMLError(w, http.StatusForbidden, "SignatureDoesNotMatch")
+		return
+	}
+	s.objects[key] = bytes
+	a.uploaded = true
+	a.storedSize = int64(len(bytes))
+	a.storedSum = sum
+	s.mu.Unlock()
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *store) getObject(w http.ResponseWriter, r *http.Request) {
+	key := path.Join(r.PathValue("workspace"), r.PathValue("slug"), r.PathValue("filename"))
+
+	s.mu.Lock()
+	bytes, ok := s.objects[key]
+	// The 24-hour promise covers the bytes, not just the record: an expired
+	// artifact's public URL stops serving, as the real registry's lifecycle
+	// rule deletes the object. Gone reads as never-there, the way storage does.
+	if a := s.artifacts[r.PathValue("slug")]; a != nil && s.expired(a) {
+		ok = false
+	}
 	s.mu.Unlock()
 
 	if !ok {
-		writeJSON(w, http.StatusNotFound, nil, map[string]any{
-			"error":     "artifact_not_found",
-			"id":        id,
-			"fix":       "check the ID",
-			"retryable": false,
-		})
+		writeXMLError(w, http.StatusNotFound, "NoSuchKey")
 		return
 	}
-	// The ID is public — it is in the shareable link. The claim URL is not; it
-	// was minted into the finalize response and never stored, so a lookup has
-	// nothing to leak.
-	writeJSON(w, http.StatusOK, nil, a)
+	_, _ = w.Write(bytes)
 }
 
-func notFound(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotFound, nil, map[string]any{
-		"error":     "not_found",
-		"fix":       "POST " + requestOrigin(r) + "/v1/artifacts with a file manifest",
-		"retryable": false,
+// finalizeArtifact verifies what landed and marks the artifact ready. Idempotent,
+// because agents retry.
+func (s *store) finalizeArtifact(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := authenticate(w, r)
+	if !ok {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a := s.find(workspace, r.PathValue("slug"))
+	if a == nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+	if a.State == "ready" {
+		writeJSON(w, http.StatusOK, serializeArtifact(a))
+		return
+	}
+	if s.expired(a) {
+		writeError(w, http.StatusGone, "expired",
+			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+		return
+	}
+	// 409 rather than 422: the request is well formed, it just arrived before the
+	// upload it describes, so retrying after uploading is the fix.
+	if !a.uploaded {
+		writeError(w, http.StatusConflict, "upload_missing",
+			"nothing uploaded for "+a.Slug+" yet", nil)
+		return
+	}
+	if a.storedSize == 0 {
+		writeError(w, http.StatusUnprocessableEntity, "empty_upload",
+			"what was uploaded for "+a.Slug+" is empty", nil)
+		return
+	}
+	if a.Checksum != "" && a.storedSum != a.Checksum {
+		writeError(w, http.StatusUnprocessableEntity, "checksum_mismatch",
+			fmt.Sprintf("%s was declared as %s but storage holds %s", a.Slug, a.Checksum, a.storedSum), nil)
+		return
+	}
+
+	// The size on the record becomes what storage actually holds, not what the
+	// client claimed it would send. The upload token is spent: a ready
+	// artifact's bytes are immutable, so its presigned URL stops working.
+	a.State = "ready"
+	a.ByteSize = a.storedSize
+	if a.Checksum == "" {
+		a.Checksum = a.storedSum
+	}
+	a.uploadTok = ""
+	writeJSON(w, http.StatusOK, serializeArtifact(a))
+}
+
+// listArtifacts is one page of a workspace's artifacts, newest first. It needs a
+// key: keyless requests all share the anonymous workspace, so listing it would
+// show every anonymous upload anyone has ever made.
+//
+// The page is "older than this one" rather than an offset, so rows are neither
+// skipped nor repeated when something is uploaded mid-listing.
+func (s *store) listArtifacts(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+
+	limit := defaultPageSize
+	if requested, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil {
+		// Clamped rather than refused: a caller asking for more than we serve gets
+		// the most we serve, which is what it wanted.
+		limit = min(max(requested, 1), maxPageSize)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var owned []*artifact
+	for _, a := range s.artifacts {
+		if a.workspace == workspace {
+			owned = append(owned, a)
+		}
+	}
+	slices.SortFunc(owned, func(x, y *artifact) int { return y.seq - x.seq })
+
+	if before := r.URL.Query().Get("before"); before != "" {
+		// Looked up in the same workspace as the page, so a slug from another
+		// tenant reads as simply not existing.
+		cursor := s.find(workspace, before)
+		if cursor == nil {
+			writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+			return
+		}
+		owned = slices.DeleteFunc(owned, func(a *artifact) bool { return a.seq >= cursor.seq })
+	}
+
+	// next is the slug to pass back as before, and is null on the last page.
+	// Present whenever the page came back full, as the registry's own does — so a
+	// total that is an exact multiple of the limit costs one extra empty page
+	// rather than a count query on every listing.
+	if len(owned) > limit {
+		owned = owned[:limit]
+	}
+	var next any
+	if len(owned) == limit {
+		next = owned[len(owned)-1].Slug
+	}
+
+	page := make([]map[string]any, 0, len(owned))
+	for _, a := range owned {
+		page = append(page, serializeArtifact(a))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"artifacts": page, "next": next})
+}
+
+func (s *store) showArtifact(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := authenticate(w, r)
+	if !ok {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a := s.find(workspace, r.PathValue("slug"))
+	if a == nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+	if s.expired(a) {
+		writeError(w, http.StatusGone, "expired",
+			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, serializeArtifact(a))
+}
+
+// claimArtifact moves an anonymous artifact into the key's workspace, where it
+// stops expiring. Needs a key: the key is what says which workspace.
+func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		ClaimToken string `json:"claim_token"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+	if body.ClaimToken == "" {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: claim_token.", nil)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a := s.artifacts[r.PathValue("slug")]
+	// The token is checked before anything else: even an artifact the workspace
+	// already holds does not answer 200 to a token that was never its own.
+	match := a != nil && a.claimHash != "" && a.claimHash == sha256Hex([]byte(body.ClaimToken))
+	// A retry after a successful claim is the same success rather than a 404 —
+	// the hash is kept, not cleared, so the retry can still be told apart from
+	// a wrong token.
+	if match && a.claimed && a.workspace == workspace {
+		writeJSON(w, http.StatusOK, serializeArtifact(a))
+		return
+	}
+	// A slug that does not exist, a token that does not match it, an artifact
+	// that was never anonymous, and one already claimed by someone else are all
+	// the same answer.
+	if !match || a.claimed {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+	if s.expired(a) {
+		writeError(w, http.StatusGone, "expired",
+			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+		return
+	}
+
+	a.workspace = workspace
+	a.ExpiresAt = nil
+	a.claimed = true // a token is good once
+	writeJSON(w, http.StatusOK, serializeArtifact(a))
+}
+
+func (s *store) createRun(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		Run struct {
+			Metadata json.RawMessage `json:"metadata"`
+		} `json:"run"`
+	}
+	// A body that does not parse is refused, exactly as createArtifact refuses
+	// one — an empty body is fine, a run needs no metadata.
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil && err != io.EOF {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: run.", nil)
+		return
+	}
+
+	metadata := body.Run.Metadata
+	if !json.Valid(metadata) {
+		metadata = json.RawMessage("{}")
+	}
+
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	entry := &run{
+		Slug:      generateSlug("run"),
+		Status:    "open",
+		StartedAt: now,
+		CreatedAt: now,
+		Metadata:  metadata,
+		workspace: workspace,
+	}
+
+	s.mu.Lock()
+	s.runs[entry.Slug] = entry
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusCreated, entry)
+}
+
+func (s *store) finishRun(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry := s.runs[r.PathValue("slug")]
+	if entry == nil || entry.workspace != workspace {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+	// Idempotent: finishing a finished run keeps the moment it first finished.
+	if entry.Status != "finished" {
+		entry.Status = "finished"
+		entry.FinishedAt = s.now().UTC().Format(time.RFC3339Nano)
+	}
+	writeJSON(w, http.StatusOK, entry)
+}
+
+// find scopes a lookup to the workspace the request belongs to, so a slug from
+// another one reads as simply not existing.
+func (s *store) find(workspace, slug string) *artifact {
+	if workspace == "" {
+		workspace = anonymousWorkspace
+	}
+	a := s.artifacts[slug]
+	if a == nil || a.workspace != workspace {
+		return nil
+	}
+	return a
+}
+
+// authenticate resolves the workspace a request acts in. An empty workspace with
+// ok is a keyless request; a malformed Authorization header is a 401 rather than
+// a silent fall back to anonymous, since falling back would hand the client an
+// ephemeral artifact when it asked for an owned one.
+func authenticate(w http.ResponseWriter, r *http.Request) (workspace string, ok bool) {
+	header := r.Header.Get("Authorization")
+	if header == "" {
+		return "", true
+	}
+	token, found := bearer(header)
+	if !found {
+		writeUnauthorized(w)
+		return "", false
+	}
+	return workspaceFor(token), true
+}
+
+// requireKey is authenticate for the endpoints that cannot work without one.
+func requireKey(w http.ResponseWriter, r *http.Request) (workspace string, ok bool) {
+	token, found := bearer(r.Header.Get("Authorization"))
+	if !found {
+		writeUnauthorized(w)
+		return "", false
+	}
+	return workspaceFor(token), true
+}
+
+func bearer(header string) (string, bool) {
+	const prefix = "bearer "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return "", false
+	}
+	token := strings.TrimSpace(header[len(prefix):])
+	return token, token != ""
+}
+
+// workspaceFor derives a stable workspace from the token, so two different keys
+// cannot see each other's artifacts — which is the property worth testing.
+func workspaceFor(token string) string {
+	return "ws_" + sha256Hex([]byte(token))[:20]
+}
+
+// verifyKey lets the CLI self-check its key before doing any work. No key is a
+// 401 — there is nothing to verify — and any bearer token resolves to the same
+// derived workspace the artifact endpoints use, so `auth verify` and a push
+// agree about where an upload would land.
+func verifyKey(w http.ResponseWriter, r *http.Request) {
+	token, found := bearer(r.Header.Get("Authorization"))
+	if !found {
+		writeUnauthorized(w)
+		return
+	}
+	sum := sha256Hex([]byte(token))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"valid": true,
+		// Derived, never the token itself — a key ID ends up in logs and output.
+		"key_id":    "key_" + sum[:8],
+		"workspace": workspaceFor(token),
+		"scopes":    []string{"artifacts:read", "artifacts:write"},
 	})
 }
 
-// foldKey recomputes the client's idempotency key from the manifest.
-func foldKey(slots []*slot) string {
-	h := sha256.New()
-	for _, sl := range slots {
-		fmt.Fprintf(h, "%s\x00%d\x00%s\x00", sl.Filename, sl.Bytes, sl.Digest)
-	}
-	return hex.EncodeToString(h.Sum(nil))
+func writeUnauthorized(w http.ResponseWriter) {
+	writeError(w, http.StatusUnauthorized, "unauthorized",
+		"Provide a valid API key as `Authorization: Bearer krowk_sk_...`.", nil)
 }
 
-// idLength is how many hex characters a public ID starts at. Short, because it
-// ends up in every link that gets pasted anywhere.
-const idLength = 7
+func (s *store) expired(a *artifact) bool {
+	iso, ok := a.ExpiresAt.(string)
+	if !ok {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339Nano, iso)
+	return err == nil && at.Before(s.now())
+}
 
-// mintID derives the public ID from the scoped idempotency key, so the same
-// bytes pushed by the same ownership class always resolve to the same link
-// without the key itself appearing in the URL.
-//
-// Seven hex characters is only 28 bits, which sounds like plenty and is not: two
-// unrelated uploads collide after a few thousand, well inside a real registry's
-// first week. So a collision lengthens the ID rather than letting a new upload
-// take over an existing one's link. IDs stay short until they cannot be.
-func (s *store) mintID(key string) string {
-	full := idDigest(key)
-	for n := idLength; n < len(full); n++ {
-		candidate := full[:n]
-		if owner, taken := s.idOwner[candidate]; !taken || owner == key {
-			return candidate
+func serializeArtifact(a *artifact) map[string]any {
+	return map[string]any{
+		"slug":         a.Slug,
+		"state":        a.State,
+		"filename":     a.Filename,
+		"content_type": a.ContentType,
+		"byte_size":    a.ByteSize,
+		"checksum":     a.Checksum,
+		"region":       a.Region,
+		"run":          a.Run,
+		"url":          a.URL,
+		"markdown":     a.Markdown,
+		"expires_at":   a.ExpiresAt,
+		"created_at":   a.CreatedAt,
+	}
+}
+
+// markdown is ready to paste into a pull request: an image embeds, anything else
+// becomes a plain link.
+func markdown(filename, contentType, url string) string {
+	if strings.HasPrefix(contentType, "image/") {
+		return fmt.Sprintf("![%s](%s)", filename, url)
+	}
+	return fmt.Sprintf("[%s](%s)", filename, url)
+}
+
+// safeFilename mirrors the real registry's: keys are attacker-influenced, so a
+// name like "../../other" must not let one artifact write over another's key.
+func safeFilename(filename string) string {
+	base := path.Base(strings.ReplaceAll(filename, `\`, "/"))
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '_', r == '-':
+			return r
 		}
+		return '-'
+	}, base)
+	cleaned = strings.Trim(cleaned, "-.")
+	if cleaned == "" {
+		return "file"
 	}
-	return full
+	return cleaned
 }
 
-func idDigest(key string) string {
-	sum := sha256.Sum256([]byte("krowk-artifact\x00" + key))
+const slugAlphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+// generateSlug matches the real registry's shape: a prefix and 21 base58
+// characters, so a slug is recognisable and never guessable.
+func generateSlug(prefix string) string {
+	b := make([]byte, 21)
+	if _, err := rand.Read(b); err != nil {
+		panic(err) // a stand-in with no randomness cannot issue slugs
+	}
+	for i, v := range b {
+		b[i] = slugAlphabet[int(v)%len(slugAlphabet)]
+	}
+	return prefix + "_" + string(b)
+}
+
+func randomToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b)
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
 
-func newToken() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand does not fail in practice; a panic here beats issuing a
-		// predictable upload URL.
-		panic("registry: out of randomness: " + err.Error())
-	}
-	return hex.EncodeToString(b[:])
-}
+func itoa(n int64) string { return fmt.Sprintf("%d", n) }
 
-func validMetadata(raw json.RawMessage) json.RawMessage {
-	if len(raw) == 0 || !json.Valid(raw) {
-		return json.RawMessage("{}")
+func site(r *http.Request, override string) string {
+	if override != "" {
+		return strings.TrimRight(override, "/")
 	}
-	return raw
-}
-
-func rateHeaders(remaining int) map[string]string {
-	return map[string]string{
-		"X-RateLimit-Limit":     strconv.Itoa(dailyUploads),
-		"X-RateLimit-Remaining": strconv.Itoa(remaining),
-	}
-}
-
-func writeJSON(w http.ResponseWriter, status int, headers map[string]string, body any) {
-	for k, v := range headers {
-		w.Header().Set(k, v)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(body)
-}
-
-// publicOrigin is the origin baked into shareable links.
-func publicOrigin(r *http.Request, siteURL string) string {
-	if siteURL != "" {
-		return siteURL
-	}
-	return requestOrigin(r)
-}
-
-// requestOrigin is where this mock is actually listening.
-func requestOrigin(r *http.Request) string {
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
@@ -856,9 +805,27 @@ func requestOrigin(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
-func contentType(s string) string {
-	if s == "" {
-		return "application/octet-stream"
+// writeError is the one error envelope the whole API answers in, so a client can
+// branch on error.code instead of parsing prose.
+func writeError(w http.ResponseWriter, status int, code, message string, details map[string]any) {
+	payload := map[string]any{"code": code, "message": message}
+	if len(details) > 0 {
+		payload["details"] = details
 	}
-	return s
+	writeJSON(w, status, map[string]any{"error": payload})
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(body)
+}
+
+// writeXMLError is object storage's error shape, not the registry's.
+func writeXMLError(w http.ResponseWriter, status int, code string) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>%s</Code></Error>", code)
 }

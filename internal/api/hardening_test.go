@@ -667,6 +667,40 @@ func TestVerifyKeyRefusesAnAnswerThatNamesNoKey(t *testing.T) {
 	}
 }
 
+// Whether `auth login` keeps a key turns entirely on this: a verdict on the key
+// is grounds for refusing it, a verdict on the moment is not.
+func TestKeyRejectedSeparatesABadKeyFromABadMoment(t *testing.T) {
+	rejections := map[string]error{
+		"401": &Error{Status: http.StatusUnauthorized, Body: map[string]any{"error": "unauthorized"}},
+		"403": &Error{Status: http.StatusForbidden, Body: map[string]any{"error": "forbidden"}},
+	}
+	for name, err := range rejections {
+		if !KeyRejected(err) {
+			t.Errorf("%s: the registry refused the key, so storing it is pointless", name)
+		}
+	}
+
+	keptAnyway := map[string]error{
+		// No status at all: the request never reached anything.
+		"unreachable": &Error{Body: map[string]any{"error": "network"}},
+		"503":         &Error{Status: http.StatusServiceUnavailable, Body: map[string]any{"error": "unavailable"}},
+		// The URL points somewhere that is not a registry — a configuration
+		// mistake, and no evidence about the key.
+		"not a registry": &Error{Status: http.StatusOK, Body: map[string]any{"error": "malformed_response"}},
+		"plain error":    errors.New("dial tcp: connection refused"),
+	}
+	for name, err := range keptAnyway {
+		if KeyRejected(err) {
+			t.Errorf("%s: says nothing about the key, so it must not block a login", name)
+		}
+	}
+
+	// Success is not a rejection, and neither is the absence of an error.
+	if KeyRejected(nil) {
+		t.Error("no error is not a rejection")
+	}
+}
+
 func TestVerifyKeyPassesTheRegistrysRejectionThrough(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

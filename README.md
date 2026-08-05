@@ -45,7 +45,7 @@ advertises all land with the first tagged release — see the prerequisites belo
 | `krowk runs start` | Open a run to group later uploads under |
 | `krowk runs finish <run>` | Close a run |
 | `krowk claim <artifact> <claim-token>` | Keep an anonymous upload past its expiry |
-| `krowk auth login --token <token>` | Store an API token in `~/.config/krowk/credentials.json` (0600) |
+| `krowk auth login --token <token>` | Check a token against the registry, then store it in `~/.config/krowk/credentials.json` (0600) |
 | `krowk auth token` | Print the stored token, for scripts |
 | `krowk auth verify` | Ask the registry which key this is, and the workspace it acts in |
 | `krowk doctor` | Report version, API reachability, auth and detected run context |
@@ -61,6 +61,17 @@ that captures stdout gets structured data without asking for it.
 
 **One file, one artifact, one link.** Pushing three files creates three
 artifacts with three URLs. What groups them is a run, not an artifact.
+
+**Logging in asks first.** `auth login` reads the key back from the registry
+before writing it down, so a mistyped token fails while the real one is still on
+the clipboard rather than at the next push. A key the registry rejects is not
+stored, and never replaces a working one; a registry that cannot be reached is
+not evidence about the key, so the token is stored unconfirmed and `auth verify`
+settles it later. What came back — the key ID and the workspace — is kept
+alongside the token, which is how `doctor` names the workspace an upload would
+land in without a round trip. `KROWK_TOKEN` outranks that file, so when it is
+set the recorded workspace describes a different key and is withheld rather than
+reported.
 
 ## Pasting the result
 
@@ -408,9 +419,9 @@ Blocking, in order:
    for the binaries plus a thin npm wrapper that pulls the right one through
    per-platform `optionalDependencies` — the pattern esbuild uses. A Homebrew
    tap and `curl | bash` come off the same build.
-3. **Getting a token.** `auth login --token` stores whatever it is handed. Keys
-   exist in the registry and the dashboard can issue them, but there is no
-   device flow, so an agent in a container still needs a human to paste one in.
+3. **Getting a token.** Keys exist in the registry and the dashboard can issue
+   them, but there is no device flow, so an agent in a container still needs a
+   human to paste one in.
 
 Non-blocking, in rough value order: a Claude Code `PostToolUse` hook so
 screenshots upload with no prompting; a GitHub Action. The MCP server itself

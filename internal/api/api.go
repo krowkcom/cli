@@ -234,6 +234,22 @@ func (c *Client) VerifyKey(ctx context.Context) (*Key, error) {
 	return &key, nil
 }
 
+// KeyRejected reports whether an error from VerifyKey is the registry saying it
+// will not accept this key, as opposed to not managing to answer at all.
+//
+// The distinction is the whole of `auth login`'s judgement. A 401 is a verdict
+// on the key itself and there is nothing to retry — the token is wrong now and
+// will be wrong later. Anything else, from no network to a 503 to something
+// that is not a registry answering, is a verdict on the moment, and the key may
+// well be fine. Only the first is grounds for refusing to store it.
+func KeyRejected(err error) bool {
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Status == http.StatusUnauthorized || apiErr.Status == http.StatusForbidden
+}
+
 // Error carries a failure flattened into one map, so everything downstream reads
 // it the same way regardless of whether it came from the registry, from object
 // storage, or from this client.

@@ -343,3 +343,22 @@ func TestAttachedRunReachesTheSummaryAndTheHumanLine(t *testing.T) {
 		t.Errorf("envelope = %s, want no run mentioned", got)
 	}
 }
+
+// The summary speaks for the whole result, so a run it did not open is named only
+// when every artifact is in it — a push given --run, however many files it was.
+func TestSummaryNamesACallerSuppliedRunForEveryFileCount(t *testing.T) {
+	one := &api.Artifact{Slug: "art_a", Filename: "a.png", ByteSize: 10, Run: "run_y"}
+	two := &api.Artifact{Slug: "art_b", Filename: "b.png", ByteSize: 20, Run: "run_y"}
+	elsewhere := &api.Artifact{Slug: "art_c", Filename: "c.png", ByteSize: 30, Run: "run_z"}
+
+	if got := summary(Result{Artifacts: []*api.Artifact{one}}); !strings.Contains(got, "run run_y") {
+		t.Errorf("one file = %q, want the run named", got)
+	}
+	if got := summary(Result{Artifacts: []*api.Artifact{one, two}}); !strings.Contains(got, "run run_y") {
+		t.Errorf("two files in one run = %q, want the run named", got)
+	}
+	// Artifacts in different runs have no single run to report, so none is claimed.
+	if got := summary(Result{Artifacts: []*api.Artifact{one, elsewhere}}); strings.Contains(got, "run ") {
+		t.Errorf("mixed runs = %q, want no run claimed", got)
+	}
+}

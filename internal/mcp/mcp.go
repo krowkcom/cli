@@ -578,7 +578,7 @@ func withProgress(err error, done []*api.Artifact, runSlug string, ownRun bool) 
 // cannot follow is worse than none. Calling claim again works because a repeat
 // claim with the same key is the same success rather than a spent-token error, so
 // the whole call can simply be made again with a run that exists.
-func withClaimed(err error, claimed *api.Artifact, runSlug string) error {
+func withClaimed(err error, claimed *api.Artifact) error {
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) {
 		return err
@@ -674,7 +674,7 @@ func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string
 		// only the run is missing.
 		attached, err := s.Client.AttachRun(ctx, artifact.Slug, runSlug)
 		if err != nil {
-			return "", nil, withClaimed(err, artifact, runSlug)
+			return "", nil, withClaimed(err, artifact)
 		}
 		artifact = attached
 	}

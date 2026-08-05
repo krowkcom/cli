@@ -571,16 +571,22 @@ func withProgress(err error, done []*api.Artifact, runSlug string, ownRun bool) 
 }
 
 // withClaimed says what a failed attach leaves behind: the claim succeeded and
-// the token is spent, so calling the tool again would fail on the claim and look
-// like the upload was lost. Only the attach is left to retry.
+// the token is spent, so the upload is kept and only the run is missing.
+//
+// The retry it names is this tool again, not the CLI's `uploads attach` — an agent
+// on this transport is here precisely because it cannot shell out, and advice it
+// cannot follow is worse than none. Calling claim again works because a repeat
+// claim with the same key is the same success rather than a spent-token error, so
+// the whole call can simply be made again with a run that exists.
 func withClaimed(err error, claimed *api.Artifact, runSlug string) error {
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) {
 		return err
 	}
 	apiErr.Body["claimed"] = claimed.Slug
-	retry := "the upload is claimed and kept, only the run is not attached — retry `krowk uploads attach " +
-		claimed.Slug + " --run " + runSlug + "`"
+	retry := "the upload is claimed and kept, only the run is not attached — call " +
+		"krowk_claim_artifact again with the same slug and claim_token, and a run this " +
+		"workspace holds; claiming twice with the same key is the same success"
 	if fix, _ := apiErr.Body["fix"].(string); fix != "" {
 		retry = fix + "; " + retry
 	}

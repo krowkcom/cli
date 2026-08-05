@@ -645,18 +645,35 @@ func TestAFailedAttachSaysTheClaimStillLanded(t *testing.T) {
 		t.Fatalf("attaching to an unknown run should fail: %+v", failed)
 	}
 	body := text(t, failed)
-	if !strings.Contains(body, "claimed and kept") || !strings.Contains(body, "uploads attach "+slug) {
-		t.Errorf("text = %q, want it to say the claim landed and name the retry", body)
+	if !strings.Contains(body, "claimed and kept") {
+		t.Errorf("text = %q, want it to say the claim landed", body)
+	}
+	// The retry has to be one this transport can make. An agent here cannot shell
+	// out, so naming the CLI's `uploads attach` would be advice it cannot follow.
+	if !strings.Contains(body, "krowk_claim_artifact again") {
+		t.Errorf("text = %q, want the retry to be a tool call", body)
+	}
+	if strings.Contains(body, "uploads attach") {
+		t.Errorf("text = %q, want no shell command on the MCP surface", body)
 	}
 	structured, _ := failed["structuredContent"].(map[string]any)
 	if structured["claimed"] != slug {
 		t.Errorf("claimed = %v, want %q", structured["claimed"], slug)
 	}
 
-	// And the claim really did land: a second claim of a spent token would not.
-	shown := keyed.callTool("krowk_get_artifact", map[string]any{"slug": slug})
-	if shown["isError"] == true {
-		t.Fatalf("the claimed artifact is not in the workspace: %s", text(t, shown))
+	// And the advice works: the same slug and token, with a run that exists, is the
+	// same success — which is what makes re-calling the tool the retry.
+	run := keyed.startRun()
+	retried := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": slug, "claim_token": claim, "run": run,
+	})
+	if retried["isError"] == true {
+		t.Fatalf("the advertised retry failed: %s", text(t, retried))
+	}
+	structured, _ = retried["structuredContent"].(map[string]any)
+	artifact, _ := structured["artifact"].(map[string]any)
+	if artifact["run"] != run {
+		t.Errorf("retry left run = %v, want %q", artifact["run"], run)
 	}
 }
 

@@ -27,6 +27,46 @@ type Metadata struct {
 // environment. Pass os.Getenv.
 type Env func(string) string
 
+// Overrides are the metadata fields a caller supplies rather than detects.
+// Empty strings leave the detected value alone; the fields that cannot be
+// detected at all are simply carried through.
+type Overrides struct {
+	Repo        string
+	Commit      string
+	Agent       string
+	PullRequest string
+	Reference   []string
+	Session     string
+	Title       string
+	Client      string
+}
+
+// Resolve detects what it can and lets the caller's values win. Shared by the
+// CLI and the MCP server so both report metadata the same way.
+func Resolve(env Env, o Overrides) Metadata {
+	m := Detect(env)
+	override(&m.Repo, o.Repo)
+	override(&m.Commit, o.Commit)
+	override(&m.Agent, o.Agent)
+	override(&m.PullRequest, o.PullRequest)
+	override(&m.Session, o.Session)
+	m.Reference = o.Reference
+	m.Title = o.Title
+	m.Client = o.Client
+	// An overridden repo or commit makes the detected link point at the wrong
+	// thing, so it is rebuilt rather than left stale.
+	if o.Repo != "" || o.Commit != "" {
+		m.CommitURL = CommitURL(env, git("remote", "get-url", "origin"), m.Repo, m.Commit)
+	}
+	return m
+}
+
+func override(dst *string, v string) {
+	if v != "" {
+		*dst = v
+	}
+}
+
 // Detect fills in everything that can be read off the machine.
 func Detect(env Env) Metadata {
 	remote := git("remote", "get-url", "origin")

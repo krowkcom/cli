@@ -195,7 +195,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	case positionals[0] == "claim":
 		err = claim(stdout, positionals[1:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "login":
-		err = authLogin(stdout, f.token, f, env)
+		err = authLogin(stdout, f.token, f, env, format, f.quiet, colour)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
 		err = authToken(stdout, env)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "verify":
@@ -486,7 +486,7 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 // What the registry said, when it said anything, is written alongside the
 // token, so nothing afterwards has to ask again which workspace this key acts
 // in.
-func authLogin(w io.Writer, token string, f flags, env runctx.Env) error {
+func authLogin(w io.Writer, token string, f flags, env runctx.Env, format output.Format, quiet, colour bool) error {
 	if token == "" {
 		return api.Fail("missing_token", "pass the key: `krowk auth login --token krowk_sk_...`")
 	}
@@ -516,14 +516,13 @@ func authLogin(w io.Writer, token string, f flags, env runctx.Env) error {
 		return api.Fail("credentials_unwritable", "could not write "+api.CredentialsPath()+": "+err.Error())
 	}
 
+	result := &output.Login{Path: path, Confirmed: verifyErr == nil}
 	if verifyErr != nil {
-		fmt.Fprintln(w, "✓ token stored in "+path)
-		fmt.Fprintln(w, "  unconfirmed — "+unconfirmedReason(verifyErr)+
-			"; run `krowk auth verify` once the registry is reachable")
-		return nil
+		result.Reason = unconfirmedReason(verifyErr)
+	} else {
+		result.KeyID, result.Workspace = key.KeyID, key.Workspace
 	}
-	fmt.Fprintf(w, "✓ key %s stored in %s\n", key.KeyID, path)
-	fmt.Fprintln(w, "  uploads land in "+key.Workspace)
+	fmt.Fprintln(w, output.StoredKey(result, format, quiet, colour))
 	return nil
 }
 

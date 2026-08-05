@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/krowkcom/cli/internal/api"
+	"github.com/krowkcom/cli/internal/output"
 )
 
 // loginHarness is the harness without a key in the environment, and the path
@@ -149,6 +150,55 @@ func TestAuthLoginStoresWhenTheAnswerIsNotARegistrys(t *testing.T) {
 	}
 }
 
+// Output is JSON when piped, which is how an agent reads a command it did not
+// run interactively. Login had been printing prose regardless, so the one thing
+// an agent needs from it — whether the key was actually confirmed — was only
+// available as a sentence.
+func TestAuthLoginIsMachineReadableWhenAskedFor(t *testing.T) {
+	h, path := loginHarness(t)
+
+	e := loginEnvelope(t, h, "auth", "login", "--token", "krowk_sk_pasted", "--json")
+	if !e.OK {
+		t.Fatalf("login = %+v", e)
+	}
+	got := e.Data
+	if !got.Confirmed {
+		t.Errorf("confirmed = false against a reachable registry: %+v", got)
+	}
+	if got.KeyID == "" || !strings.HasPrefix(got.Workspace, "ws_") {
+		t.Errorf("login named no key or workspace: %+v", got)
+	}
+	if got.Path != path {
+		t.Errorf("path = %q, want %q", got.Path, path)
+	}
+	if got.Reason != "" {
+		t.Errorf("reason = %q, want none — the registry confirmed it", got.Reason)
+	}
+}
+
+// The unconfirmed case is the one that has to be machine-readable: the command
+// succeeded, the token is stored, and whether it works is still unknown.
+func TestAuthLoginReportsBeingUnconfirmedInJSON(t *testing.T) {
+	h, _ := loginHarness(t)
+	h.env["KROWK_API_URL"] = "http://127.0.0.1:1/v1"
+
+	e := loginEnvelope(t, h, "auth", "login", "--token", "krowk_sk_offline", "--json")
+	got := e.Data
+	if got.Confirmed {
+		t.Errorf("confirmed = true with nothing listening: %+v", got)
+	}
+	if got.Reason == "" {
+		t.Errorf("nothing says why it is unconfirmed: %+v", got)
+	}
+	// Inventing a key here would be the whole bug this field exists to avoid.
+	if got.KeyID != "" {
+		t.Errorf("key_id = %q, want none — the registry never named one", got.KeyID)
+	}
+	if !strings.Contains(e.Summary, "unconfirmed") {
+		t.Errorf("summary = %q, want it to say so", e.Summary)
+	}
+}
+
 // Login without a key never reaches the registry — there is nothing to ask
 // about.
 func TestAuthLoginWithoutAKeySaysWhatToPaste(t *testing.T) {
@@ -217,4 +267,28 @@ func doctorReport(t *testing.T, h *harness) map[string]any {
 		t.Fatalf("not JSON: %v\n%s", err, stdout)
 	}
 	return report
+}
+
+// loginEnvelope decodes login's own envelope. The shared harness envelope has a
+// fixed Data shape that drops anything it does not know, which would make these
+// assertions pass against no output at all.
+func loginEnvelope(t *testing.T, h *harness, args ...string) struct {
+	OK      bool         `json:"ok"`
+	Data    output.Login `json:"data"`
+	Summary string       `json:"summary"`
+} {
+	t.Helper()
+	code, stdout, stderr := h.run(args...)
+	if code != 0 {
+		t.Fatalf("`krowk %s` exited %d, stderr:\n%s", strings.Join(args, " "), code, stderr)
+	}
+	var e struct {
+		OK      bool         `json:"ok"`
+		Data    output.Login `json:"data"`
+		Summary string       `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &e); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	return e
 }

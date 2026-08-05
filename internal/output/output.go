@@ -439,6 +439,57 @@ func Key(k *api.Key, f Format, quiet, colour bool) string {
 	return strings.Join(lines, "\n")
 }
 
+// Login is the result of storing a key: where it landed, and whether the
+// registry confirmed it on the way in.
+//
+// Confirmed is the field worth reading. A login that could not reach the
+// registry still stores the token, so "it worked" and "it is going to work" are
+// different answers, and an agent capturing stdout has no other way to tell them
+// apart. There is no link to a login, so markdown and url fall back to the JSON
+// envelope.
+type Login struct {
+	Path      string `json:"path"`
+	Confirmed bool   `json:"confirmed"`
+	KeyID     string `json:"key_id,omitempty"`
+	Workspace string `json:"workspace,omitempty"`
+	// Reason says why the registry did not confirm the key, and is empty when it
+	// did.
+	Reason string `json:"reason,omitempty"`
+}
+
+// StoredKey renders what `auth login` just did.
+func StoredKey(l *Login, f Format, quiet, colour bool) string {
+	if f != Human {
+		if quiet {
+			return encode(l)
+		}
+		summary := fmt.Sprintf("%s stored, uploads land in %s", l.KeyID, l.Workspace)
+		crumb := Breadcrumb{Action: "push", Cmd: "krowk push screenshot.png"}
+		if !l.Confirmed {
+			summary = "token stored, unconfirmed — " + l.Reason
+			crumb = Breadcrumb{Action: "verify", Cmd: "krowk auth verify"}
+		}
+		return encode(Envelope{
+			OK:          true,
+			Data:        l,
+			Summary:     summary,
+			Breadcrumbs: []Breadcrumb{crumb},
+		})
+	}
+
+	if !l.Confirmed {
+		return strings.Join([]string{
+			fmt.Sprintf("%s token stored in %s", paint(colour, green, "✓"), l.Path),
+			"  " + paint(colour, dim, "unconfirmed") + " — " + l.Reason +
+				"; run `krowk auth verify` once the registry is reachable",
+		}, "\n")
+	}
+	return strings.Join([]string{
+		fmt.Sprintf("%s key %s stored in %s", paint(colour, green, "✓"), l.KeyID, l.Path),
+		"  uploads land in " + l.Workspace,
+	}, "\n")
+}
+
 func humanArtifact(a *api.Artifact, colour bool, now time.Time) string {
 	head := fmt.Sprintf("%s  %s", a.Filename, HumanBytes(a.ByteSize))
 	if a.State != "" {

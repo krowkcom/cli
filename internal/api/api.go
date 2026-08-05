@@ -14,7 +14,8 @@
 //
 // The registry's API is resourceful all the way down, so what would be a verb
 // hanging off an artifact is a nested resource instead — the finalization of an
-// artifact, the claim on one, the completion of a run. The verb follows from
+// artifact, the claim on one, the run it belongs to, the completion of a run.
+// The verb follows from
 // whether the call can be repeated: finalizing and completing are idempotent, so
 // they are PUTs; claiming spends a one-shot token, so it is a POST. Checking a
 // key is the same rule read the other way — GET /v1/key names the key this
@@ -456,6 +457,23 @@ func (c *Client) ClaimArtifact(ctx context.Context, slug, claimToken string) (*A
 	return &artifact, nil
 }
 
+// AttachRun puts an artifact under a run after it was uploaded, which is the
+// only way an upload that started out anonymous ever gets one: a keyless upload
+// cannot name a run at create time, and claiming it does not give it one.
+//
+// A PUT for the same reason finalizing is one: the artifact ends up under the
+// same run however many times it is asked for, so a retry is a success rather
+// than an error. Both slugs resolve in the key's workspace, so an artifact has
+// to be claimed before it can be attached.
+func (c *Client) AttachRun(ctx context.Context, artifactSlug, runSlug string) (*Artifact, error) {
+	var artifact Artifact
+	body := map[string]any{"run": runSlug}
+	if err := c.call(ctx, http.MethodPut, "/artifacts/"+artifactSlug+"/run", body, &artifact); err != nil {
+		return nil, err
+	}
+	return &artifact, nil
+}
+
 // CreateRun opens a run to hang artifacts off. Needs a key: a run belongs to a
 // workspace, and a keyless upload has none.
 //
@@ -804,7 +822,10 @@ func fixFor(code string, status int) string {
 	case "unauthorized":
 		return "the registry rejected the key — check KROWK_TOKEN, or run `krowk auth login --token krowk_sk_...`"
 	case "run_needs_key":
-		return "attaching an upload to a run needs an API key — authenticate, or upload without --run"
+		// Reached from a push naming a run and from an attach alike, so it says what
+		// is missing rather than which flag to drop.
+		return "a run belongs to a workspace, so attaching an upload to one needs an API key — " +
+			"run `krowk auth login --token krowk_sk_...`, or leave the run off"
 	case "upload_missing":
 		return "the bytes had not landed when the upload was finalized — retry the upload"
 	case "checksum_mismatch":

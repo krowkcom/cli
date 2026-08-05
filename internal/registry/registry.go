@@ -143,6 +143,12 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	mux.HandleFunc("PATCH /v1/artifacts/{slug}/finalization", s.finalizeArtifact)
 	mux.HandleFunc("POST /v1/artifacts/{slug}/claim", s.claimArtifact)
 
+	// The run an artifact belongs to is a singular nested resource, so it is set
+	// with a PUT rather than posted to: an artifact ends up under the same run
+	// however many times it is asked for.
+	mux.HandleFunc("PUT /v1/artifacts/{slug}/run", s.attachRun)
+	mux.HandleFunc("PATCH /v1/artifacts/{slug}/run", s.attachRun)
+
 	// The key the request is made with — a singular resource, read with a GET.
 	mux.HandleFunc("GET /v1/key", showKey)
 
@@ -565,6 +571,54 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 	a.workspace = workspace
 	a.ExpiresAt = nil
 	a.claimed = true // a token is good once
+	writeJSON(w, http.StatusOK, serializeArtifact(a))
+}
+
+// attachRun puts an artifact under a run after the fact, which is how an upload
+// that was anonymous at create time ever gets one: it could not name a run then,
+// and claiming it does not give it one.
+//
+// Keyless is refused with the same run_needs_key createArtifact answers with
+// rather than a 401: what is wrong is not the missing key by itself but that a
+// run belongs to a workspace and a keyless request has none.
+func (s *store) attachRun(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := authenticate(w, r)
+	if !ok {
+		return
+	}
+	if workspace == "" {
+		writeError(w, http.StatusUnprocessableEntity, "run_needs_key",
+			"Attaching an artifact to a run needs an API key — a keyless upload has no workspace.", nil)
+		return
+	}
+
+	var body struct {
+		Run string `json:"run"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+	if body.Run == "" {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: run.", nil)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Both slugs are looked up in the request's own workspace, so another
+	// workspace's artifact and another workspace's run both read as not existing —
+	// and an unclaimed anonymous artifact is not attachable at all.
+	a := s.find(workspace, r.PathValue("slug"))
+	if a == nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+	if existing, ok := s.runs[body.Run]; !ok || existing.workspace != workspace {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+
+	a.Run = body.Run
 	writeJSON(w, http.StatusOK, serializeArtifact(a))
 }
 

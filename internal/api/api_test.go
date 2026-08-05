@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -201,5 +202,81 @@ func TestPutBytesStopsAtTheAttemptCap(t *testing.T) {
 	}
 	if len(*slept) != maxAttempts-1 {
 		t.Errorf("slept %v, want a backoff between each attempt and none after the last", *slept)
+	}
+}
+
+// Attaching is a PUT because it is idempotent: the artifact ends up under the
+// same run however many times it is asked for, so a CI step that runs twice sees
+// the same success rather than a spent-token error.
+func TestAttachRunIsAnIdempotentPut(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		bodies = append(bodies, string(body))
+		mu.Unlock()
+		fmt.Fprint(w, `{"slug":"art_x","state":"ready","run":"run_y"}`)
+	}))
+	t.Cleanup(server.Close)
+
+	c, _ := testClient(server)
+	for i := range 2 {
+		artifact, err := c.AttachRun(context.Background(), "art_x", "run_y")
+		if err != nil {
+			t.Fatalf("attach %d = %v", i+1, err)
+		}
+		if artifact.Run != "run_y" {
+			t.Errorf("attach %d returned run %q, want run_y", i+1, artifact.Run)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i, call := range calls {
+		if call != "PUT /v1/artifacts/art_x/run" {
+			t.Errorf("call %d = %q, want PUT /v1/artifacts/art_x/run", i, call)
+		}
+		if bodies[i] != `{"run":"run_y"}` {
+			t.Errorf("body %d = %s, want the run slug", i, bodies[i])
+		}
+	}
+}
+
+// A slug from another workspace reads as not existing, and the fix says so
+// without confirming whether it is the artifact or the run that is unknown.
+func TestAttachRunOnAForeignSlugIsNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":{"code":"not_found","message":"No such record."}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	c, slept := testClient(server)
+	_, err := c.AttachRun(context.Background(), "art_someone_else", "run_y")
+
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "not_found" {
+		t.Fatalf("AttachRun = %v, want not_found", err)
+	}
+	if !strings.Contains(apiErr.Fix(), "artifact or run") {
+		t.Errorf("fix = %q, want it to cover both slugs", apiErr.Fix())
+	}
+	if len(*slept) != 0 {
+		t.Errorf("slept %v — a 404 is not worth retrying", *slept)
+	}
+}
+
+// The keyless refusal is reached by an attach as well as by a push naming a run,
+// so its fix must not tell the caller to drop a flag an attach does not have.
+func TestRunNeedsKeyFixIsNotPushSpecific(t *testing.T) {
+	fix := fixFor("run_needs_key", http.StatusUnprocessableEntity)
+	if !strings.Contains(fix, "API key") {
+		t.Errorf("fix = %q, want it to name the key", fix)
+	}
+	if strings.Contains(fix, "--run") {
+		t.Errorf("fix = %q, want no push-only flag in it", fix)
 	}
 }

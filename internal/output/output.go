@@ -236,10 +236,25 @@ func summary(r Result) string {
 		noun = "artifact"
 	}
 	s := fmt.Sprintf("%d %s, %s", len(r.Artifacts), noun, HumanBytes(r.Bytes()))
-	if r.Run != nil {
-		s += ", run " + r.Run.Slug
+	if run := summaryRun(r); run != "" {
+		s += ", run " + run
 	}
 	return s
+}
+
+// summaryRun names the run the summary line should carry. An upload has the run
+// it opened; a lone artifact read back — or one just attached to a run — has only
+// the slug recorded on itself, and that is the fact `uploads attach` and
+// `claim --run` exist to report, so the summary must not omit it while the human
+// line prints it.
+func summaryRun(r Result) string {
+	if r.Run != nil {
+		return r.Run.Slug
+	}
+	if len(r.Artifacts) == 1 {
+		return r.Artifacts[0].Run
+	}
+	return ""
 }
 
 // breadcrumbs name the calls left to make. A claim token is the one that matters

@@ -360,9 +360,14 @@ func TestClaimAttachesTheAdoptedUploadToARun(t *testing.T) {
 	uploaded := only(t, h.ok("push", h.fixture))
 	h.env["KROWK_TOKEN"] = "krowk_sk_test"
 
-	claimed := only(t, h.ok("claim", uploaded.Slug, uploaded.ClaimToken, "--run="+started.Data.Slug))
+	e := h.ok("claim", uploaded.Slug, uploaded.ClaimToken, "--run="+started.Data.Slug)
+	claimed := only(t, e)
 	if claimed.Run != started.Data.Slug {
 		t.Errorf("claimed artifact run = %q, want %q", claimed.Run, started.Data.Slug)
+	}
+	// The run is what the flag was for, so the line an agent reads first says so.
+	if !strings.Contains(e.Summary, "run "+started.Data.Slug) {
+		t.Errorf("summary = %q, want the run named", e.Summary)
 	}
 	if claimed.ExpiresAt != "" {
 		t.Errorf("expires_at = %q, want empty once claimed", claimed.ExpiresAt)

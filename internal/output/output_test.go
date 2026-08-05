@@ -312,3 +312,34 @@ func TestStoredKeyDistinguishesAConfirmedLoginFromAnUnconfirmedOne(t *testing.T)
 		t.Errorf("--quiet should drop the envelope, got %s", got)
 	}
 }
+
+// The run is the whole point of `uploads attach` and of `claim --run`, and both
+// answer through Artifact. The human line already prints it, so the envelope an
+// agent reads must not be the one place it goes missing.
+func TestAttachedRunReachesTheSummaryAndTheHumanLine(t *testing.T) {
+	attached := &api.Artifact{
+		Slug: "art_x", State: "ready", Filename: "shot.png", ByteSize: 15,
+		Run: "run_y", URL: "https://cdn.example/art_x/shot.png",
+	}
+	now := time.Now()
+
+	var e struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(Artifact(attached, JSON, false, false, now)), &e); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if !strings.Contains(e.Summary, "run run_y") {
+		t.Errorf("summary = %q, want the run named", e.Summary)
+	}
+	if human := Artifact(attached, Human, false, false, now); !strings.Contains(human, "run run_y") {
+		t.Errorf("human = %q, want the run named", human)
+	}
+
+	// An artifact with no run says nothing about one rather than trailing a comma.
+	loose := *attached
+	loose.Run = ""
+	if got := Artifact(&loose, JSON, false, false, now); strings.Contains(got, "run ") {
+		t.Errorf("envelope = %s, want no run mentioned", got)
+	}
+}

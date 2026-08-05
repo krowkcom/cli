@@ -6,21 +6,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/krowkcom/cli/internal/api"
 )
 
-// loginHarness is the harness with the two things a login test needs on top of
-// it: a credentials file of its own, and no key already in the environment —
-// KROWK_TOKEN would otherwise outrank everything login writes.
+// loginHarness is the harness without a key in the environment, and the path
+// login will write to. KROWK_TOKEN would otherwise outrank everything stored,
+// which is the one thing these tests are trying to observe. The config
+// directory is already a scratch one — newHarness gives every test its own.
 func loginHarness(t *testing.T) (*harness, string) {
 	t.Helper()
-	config := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", config)
-	return newHarness(t, 0).anonymous(), filepath.Join(config, "krowk", "credentials.json")
+	return newHarness(t, 0).anonymous(), api.CredentialsPath()
 }
 
 // stored reads the credentials file the way the next command would.

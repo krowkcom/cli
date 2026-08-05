@@ -401,14 +401,19 @@ func withProgress(err error, done []*api.Artifact, runSlug string, ownRun bool) 
 // withClaimed says what a failed attach leaves behind: the claim succeeded and
 // the token is spent, so re-running the whole command would fail on the claim and
 // look like the artifact was lost. Only the attach is left to retry.
-func withClaimed(err error, claimed *api.Artifact, runSlug string) error {
+//
+// The artifact slug is spelled out because it is the fact that would otherwise be
+// lost — the error body is all the caller sees of it. The run is left as a
+// placeholder: quoting back the slug that just 404'd would contradict the same
+// sentence's advice to check it.
+func withClaimed(err error, claimed *api.Artifact) error {
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) {
 		return err
 	}
 	apiErr.Body["claimed"] = claimed.Slug
 	retry := "the upload is claimed and kept, only the run is not attached — retry `krowk uploads attach " +
-		claimed.Slug + " --run " + runSlug + "`"
+		claimed.Slug + " --run <run>` with a run this workspace holds"
 	if fix, _ := apiErr.Body["fix"].(string); fix != "" {
 		retry = fix + "; " + retry
 	}
@@ -522,7 +527,7 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 		// and only the run is missing.
 		attached, err := client.AttachRun(ctx, artifact.Slug, f.run)
 		if err != nil {
-			return withClaimed(err, artifact, f.run)
+			return withClaimed(err, artifact)
 		}
 		artifact = attached
 	}

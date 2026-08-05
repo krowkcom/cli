@@ -396,8 +396,14 @@ func TestAFailedAttachSaysTheClaimStillLanded(t *testing.T) {
 		t.Errorf("claimed = %v, want %q", body["claimed"], uploaded.Slug)
 	}
 	fix, _ := body["fix"].(string)
+	// The artifact slug is named, because the error body is all the caller sees of
+	// it. The run that just 404'd is not quoted back as the one to retry with — the
+	// same sentence says to check the slug, and it must not then hand it over.
 	if !strings.Contains(fix, "uploads attach "+uploaded.Slug) {
 		t.Errorf("fix = %q, want the attach to retry", fix)
+	}
+	if strings.Contains(fix, "--run run_nosuchrunatall00000") {
+		t.Errorf("fix = %q, want the failed run left as a placeholder", fix)
 	}
 
 	// And the claim really did land: the artifact is in the workspace, unexpiring.

@@ -684,7 +684,9 @@ func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string
 		return "", nil, err
 	}
 	if runSlug != "" {
-		// Said the way renderPush says it, since it is the same fact.
+		// renderPush's line, without the status it puts in brackets: attaching answers
+		// with the artifact, so the run's state is not among the facts in hand, and a
+		// second call to fetch it would buy nothing the agent asked for.
 		text += "\n\nGrouped under run " + runSlug + "."
 	}
 	return text, structured, nil

@@ -248,11 +248,16 @@ The claim URL is a **capability**: anyone holding it can adopt the upload. So:
 - it is printed for whoever ran the push, and kept out of both paste forms;
 - `GET /v1/artifacts/{id}` never returns it — the ID is public, since it is in
   the shareable link, and knowing it must not be enough to claim the upload;
-- it is handed back exactly once, to the call that created the artifact. Identity
-  is derived from the bytes, so anyone holding a copy of the same file derives
-  the same key; without this, pushing a file someone else had already shared
-  anonymously would hand you their upload and its metadata. A retry that lost the
-  original response gets the link but not the claim URL.
+- it is handed back exactly once, on the single response that finalizes the
+  artifact — completing the upload earns the claim. Identity is derived from the
+  bytes, so anyone holding a copy of the same file derives the same key; once an
+  artifact exists, a replay gets the link but not the claim URL, so pushing a
+  file someone else had already shared anonymously cannot adopt their upload.
+  The one caveat is an *interrupted* anonymous handshake: it resumes for anyone
+  anonymous with the same bytes, and whoever finalizes first gets the claim URL
+  (and the opener's metadata). There is no opener identity to check against —
+  that is the deliberate price of anonymous, content-derived identity being
+  resumable.
 
 **3. Finalize.**
 
@@ -293,15 +298,25 @@ body alone:
 - **Idempotency** — the key is a SHA-256 fold over each file's name, size and
   content digest, in order: `sha256(name \0 size \0 digest \0 …)`. It is
   derived from the bytes, so a retry, a crash-and-rerun, or the same push from
-  another machine all converge on one artifact and one link. All three steps
-  carry it; the registry verifies each blob against its declared digest on
-  arrival, so agreeing on the key really does mean agreeing on the bytes.
+  another machine all converge on one artifact and one link. Declare and
+  finalize carry it — the blob `PUT` does not, being identified by the token in
+  its presigned URL — and the registry verifies each blob against its declared
+  digest on arrival, so agreeing on the key really does mean agreeing on the
+  bytes. The body field is normative; the `Idempotency-Key` header the client
+  also sends is a courtesy copy for middleware, and a registry may reject a
+  request where the two disagree.
 - **Resumable** — declaring the same key again before finalizing returns the
   same ID and the same upload targets, so blobs already stored stay stored.
+  Resumability is bounded by inactivity: a registry may reclaim a pending
+  handshake that has seen no declaration or blob for an hour, after which the
+  same key starts a fresh handshake. A registry at its pending-handshake
+  capacity may also refuse a new declaration with a retryable 503
+  `too_many_pending_uploads`.
 - **The ID authorises nothing.** It is the last segment of every link that gets
   pasted anywhere, so `finalize` requires the idempotency key and rejects a
-  request without one. Only the caller that opened a handshake can complete it,
-  or replay it to get the artifact back.
+  request without one. Only a caller in the same ownership class — no key for
+  anonymous uploads, a valid write-scoped key in the same workspace for keyed
+  ones — can complete a handshake, or replay it to get the artifact back.
 - **IDs lengthen on collision.** Seven hex characters is 28 bits, so two
   unrelated uploads collide after a few thousand — inside a real registry's
   first week. A collision extends the new ID rather than letting it take over an

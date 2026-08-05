@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -254,5 +255,71 @@ func TestGarbageRunBodyIsRejected(t *testing.T) {
 	// An empty body is still fine: a run needs no metadata.
 	if status, _ := request(t, http.MethodPost, server.URL+"/v1/runs", "krowk_sk_test", "", ""); status != http.StatusCreated {
 		t.Errorf("empty run body = %d, want 201", status)
+	}
+}
+
+// Finalizing is documented as idempotent because agents retry: the second
+// finalize is the same success carrying the same artifact, not an error and
+// not a fresh state transition.
+func TestFinalizeTwiceReturnsTheSameArtifact(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	payload := declare(t, server, "krowk_sk_test", "shot.txt", "the bytes")
+	if status := put(t, uploadURL(t, payload), "the bytes"); status != http.StatusOK {
+		t.Fatalf("put = %d", status)
+	}
+
+	status, first := finalize(t, server, "krowk_sk_test", payload)
+	if status != http.StatusOK {
+		t.Fatalf("first finalize = %d %v", status, first)
+	}
+	status, second := finalize(t, server, "krowk_sk_test", payload)
+	if status != http.StatusOK {
+		t.Fatalf("second finalize = %d %v", status, second)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("second finalize answered differently:\nfirst:  %v\nsecond: %v", first, second)
+	}
+	if first["state"] != "ready" {
+		t.Errorf("state = %v, want ready", first["state"])
+	}
+}
+
+// Completing a run is idempotent too, and the record keeps the moment it first
+// finished — a CI cleanup step that runs twice gets the same success both
+// times, with the same finished_at.
+func TestFinishRunTwiceKeepsTheFirstFinishedAt(t *testing.T) {
+	server, clk := newClockedServer(t)
+
+	status, created := request(t, http.MethodPost, server.URL+"/v1/runs",
+		"krowk_sk_test", "application/json", `{"run":{}}`)
+	if status != http.StatusCreated {
+		t.Fatalf("create run = %d %v", status, created)
+	}
+	slug, _ := created["slug"].(string)
+
+	status, first := request(t, http.MethodPut, server.URL+"/v1/runs/"+slug+"/completion",
+		"krowk_sk_test", "", "")
+	if status != http.StatusOK || first["status"] != "finished" {
+		t.Fatalf("first completion = %d %v", status, first)
+	}
+	finishedAt, _ := first["finished_at"].(string)
+	if finishedAt == "" {
+		t.Fatal("no finished_at on the first completion")
+	}
+
+	// Enough time passes for a second completion to be visibly a different
+	// moment — the answer must keep the first one anyway.
+	clk.advance(time.Hour)
+	status, second := request(t, http.MethodPut, server.URL+"/v1/runs/"+slug+"/completion",
+		"krowk_sk_test", "", "")
+	if status != http.StatusOK {
+		t.Fatalf("second completion = %d %v", status, second)
+	}
+	if got, _ := second["finished_at"].(string); got != finishedAt {
+		t.Errorf("finished_at moved from %q to %q on a retry", finishedAt, got)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("second completion answered differently:\nfirst:  %v\nsecond: %v", first, second)
 	}
 }

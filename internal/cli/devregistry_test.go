@@ -120,6 +120,37 @@ func TestAuthVerifyRejectsAKeyTheRegistryDoesNotKnow(t *testing.T) {
 	}
 }
 
+// A rejected key is exactly the moment the self-check earns its keep, so the
+// fix points at `auth verify` — and a keyless rejection points at `auth login`
+// instead, since there is no key to verify.
+func TestRejectedKeyOnPushPointsAtVerify(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"error":{"code":"unauthorized","message":"Provide a valid API key."}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	h := newHarness(t, 0)
+	h.env["KROWK_API_URL"] = srv.URL + "/v1"
+
+	body := h.fails("push", h.fixture)
+	fix, _ := body["fix"].(string)
+	if body["error"] != "unauthorized" || !strings.Contains(fix, "auth verify") {
+		t.Errorf("keyed 401 fix = %q, want it to point at `krowk auth verify`", fix)
+	}
+
+	// No key sent: nothing to verify, so the advice is to log in.
+	body = h.anonymous().fails("push", h.fixture)
+	fix, _ = body["fix"].(string)
+	if body["error"] != "unauthorized" || !strings.Contains(fix, "auth login") {
+		t.Errorf("keyless 401 fix = %q, want it to point at `krowk auth login`", fix)
+	}
+	if strings.Contains(fix, "auth verify") {
+		t.Errorf("keyless 401 fix = %q, must not suggest verifying a key that does not exist", fix)
+	}
+}
+
 func TestDoctorReportsTheKeyAndReachability(t *testing.T) {
 	h := newHarness(t, 0)
 

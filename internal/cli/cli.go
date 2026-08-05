@@ -330,18 +330,20 @@ func resolveRun(ctx context.Context, client *api.Client, f flags, env runctx.Env
 }
 
 // metadataFor is everything worth remembering about where an upload came from.
-// Flags win; the rest is detected so the agent never has to type it.
+// Flags win; the rest is detected so the agent never has to type it. Resolve is
+// the shared path — the MCP server goes through it too, so a new metadata field
+// lands in both or neither.
 func metadataFor(f flags, env runctx.Env) runctx.Metadata {
-	metadata := runctx.Detect(env)
-	overrideString(&metadata.Repo, f.repo)
-	overrideString(&metadata.Commit, f.commit)
-	overrideString(&metadata.Agent, f.agent)
-	overrideString(&metadata.PullRequest, f.pullRequest)
-	metadata.Reference = f.references
-	metadata.Session = f.session
-	metadata.Title = f.title
-	metadata.Client = "krowk-cli/" + Version
-	return metadata
+	return runctx.Resolve(env, runctx.Overrides{
+		Repo:        f.repo,
+		Commit:      f.commit,
+		Agent:       f.agent,
+		PullRequest: f.pullRequest,
+		Reference:   f.references,
+		Session:     f.session,
+		Title:       f.title,
+		Client:      "krowk-cli/" + Version,
+	})
 }
 
 // anonymousMetadataNote says plainly that metadata asked for by name was not
@@ -764,12 +766,6 @@ func isLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
-}
-
-func overrideString(dst *string, v string) {
-	if v != "" {
-		*dst = v
-	}
 }
 
 func clip[T any](s []T, n int) []T {

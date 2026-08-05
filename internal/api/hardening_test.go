@@ -109,18 +109,22 @@ func TestLocalRegistryMayUseLocalUploadTargets(t *testing.T) {
 }
 
 // The contract documents one method. Honouring upload.method would let a
-// response body choose what request this process makes.
-func TestUploadAlwaysUsesPUT(t *testing.T) {
+// response body choose what request this process makes. And the token stays
+// off this leg entirely: a presigned URL carries its own authorisation and may
+// point at any host the registry names, so Authorization must never ride along.
+func TestUploadAlwaysUsesPUTAndKeepsTheTokenOffStorage(t *testing.T) {
 	var mu sync.Mutex
-	var methods []string
+	var methods, auths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		methods = append(methods, r.Method)
+		auths = append(auths, r.Header.Get("Authorization"))
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
 
+	// testClient holds a token, which is the point: it must not be forwarded.
 	c, _ := testClient(srv)
 	path := write(t, t.TempDir(), "shot.png", "bytes")
 
@@ -133,6 +137,11 @@ func TestUploadAlwaysUsesPUT(t *testing.T) {
 	defer mu.Unlock()
 	if len(methods) != 1 || methods[0] != http.MethodPut {
 		t.Errorf("methods = %v, want a single PUT regardless of what the registry asked for", methods)
+	}
+	for _, auth := range auths {
+		if auth != "" {
+			t.Errorf("Authorization = %q reached the storage leg, want it kept off", auth)
+		}
 	}
 }
 

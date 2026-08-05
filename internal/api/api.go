@@ -704,8 +704,20 @@ func (c *Client) doOnce(req *http.Request, out any, status *int) error {
 		err := responseError(res, payload, readErr)
 		// A 401 with no key sent is a missing key, not a rejected one — and
 		// "check your token" is unhelpful advice when there is no token to check.
-		if err.Code() == "unauthorized" && c.Token == "" {
-			err.Body["fix"] = "this endpoint needs an API key — run `krowk auth login --token krowk_sk_...`, or set KROWK_TOKEN"
+		if err.Code() == "unauthorized" {
+			if c.Token == "" {
+				err.Body["fix"] = "this endpoint needs an API key — run `krowk auth login --token krowk_sk_...`, or set KROWK_TOKEN"
+			} else {
+				// A key was sent and rejected, which is exactly the moment the
+				// self-check earns its keep — the registry cannot know the CLI has
+				// a verify command, so the client adds that half of the fix itself.
+				hint := "run `krowk auth verify` to see what this key is allowed to do"
+				if fix, _ := err.Body["fix"].(string); fix != "" {
+					err.Body["fix"] = fix + " — " + hint
+				} else {
+					err.Body["fix"] = hint
+				}
+			}
 		}
 		return err
 	}

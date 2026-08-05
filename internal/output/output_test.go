@@ -99,9 +99,9 @@ func TestHumanOutputShowsBothFormsLabelled(t *testing.T) {
 	got := Artifact(a, Human, "", false, false, time.Now())
 	for _, want := range []string{
 		"✓ uploaded  foobar.jpg  412 KB",
-		embedSurfaces,
+		EmbedSurfaces,
 		"[![foobar.jpg](https://krowk.com/a/9f3c2e1/preview.png)](https://krowk.com/a/9f3c2e1)",
-		linkSurfaces,
+		LinkSurfaces,
 		"https://krowk.com/a/9f3c2e1",
 	} {
 		if !strings.Contains(got, want) {
@@ -213,11 +213,11 @@ func TestMarkdownFallsBackToALinkWithoutAPreview(t *testing.T) {
 
 	// The human label must not promise an image the markdown does not carry.
 	got := Artifact(a, Human, "Checkout", false, false, time.Now())
-	if strings.Contains(got, embedSurfaces) {
-		t.Errorf("human output claims %q without a preview:\n%s", embedSurfaces, got)
+	if strings.Contains(got, EmbedSurfaces) {
+		t.Errorf("human output claims %q without a preview:\n%s", EmbedSurfaces, got)
 	}
-	if !strings.Contains(got, plainSurfaces) {
-		t.Errorf("human output is missing %q:\n%s", plainSurfaces, got)
+	if !strings.Contains(got, PlainSurfaces) {
+		t.Errorf("human output is missing %q:\n%s", PlainSurfaces, got)
 	}
 }
 

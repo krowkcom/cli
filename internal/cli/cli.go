@@ -180,15 +180,16 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 		return api.Fail("no_file", "pass at least one path: `krowk uploads create screenshot.png`")
 	}
 
-	metadata := runctx.Detect(env)
-	overrideString(&metadata.Repo, f.repo)
-	overrideString(&metadata.Commit, f.commit)
-	overrideString(&metadata.Agent, f.agent)
-	overrideString(&metadata.PullRequest, f.pullRequest)
-	metadata.Reference = f.references
-	metadata.Session = f.session
-	metadata.Title = f.title
-	metadata.Client = "krowk-cli/" + Version
+	metadata := runctx.Resolve(env, runctx.Overrides{
+		Repo:        f.repo,
+		Commit:      f.commit,
+		Agent:       f.agent,
+		PullRequest: f.pullRequest,
+		Reference:   f.references,
+		Session:     f.session,
+		Title:       f.title,
+		Client:      "krowk-cli/" + Version,
+	})
 
 	client := api.New(env("KROWK_API_URL"), api.ReadToken(env))
 	artifact, err := client.CreateArtifact(context.Background(), files, metadata)
@@ -338,12 +339,6 @@ func keySummary(token string, key *api.Key, err error) string {
 		scopes = "no scopes"
 	}
 	return fmt.Sprintf("%s (%s) %s", key.KeyID, key.Workspace, scopes)
-}
-
-func overrideString(dst *string, v string) {
-	if v != "" {
-		*dst = v
-	}
 }
 
 func clip[T any](s []T, n int) []T {

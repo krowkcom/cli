@@ -37,13 +37,14 @@ type Paste struct {
 	URL string `json:"url"`
 }
 
-// Surfaces name where each form belongs, so the choice never has to be guessed.
+// EmbedSurfaces and LinkSurfaces name where each form belongs, so the choice
+// never has to be guessed. Exported because the MCP server says the same thing.
 const (
-	embedSurfaces = "GitHub, Linear, Notion — renders the image"
-	// plainSurfaces replaces embedSurfaces when there is no preview to embed and
+	EmbedSurfaces = "GitHub, Linear, Notion — renders the image"
+	// PlainSurfaces replaces EmbedSurfaces when there is no preview to embed and
 	// the markdown form is only a plain link, so the label stays honest.
-	plainSurfaces = "GitHub, Linear, Notion — plain link, no preview to embed"
-	linkSurfaces  = "Slack, Basecamp — they unfurl the link themselves"
+	PlainSurfaces = "GitHub, Linear, Notion — plain link, no preview to embed"
+	LinkSurfaces  = "Slack, Basecamp — they unfurl the link themselves"
 )
 
 // PasteFor builds both forms for one artifact.
@@ -237,16 +238,16 @@ func humanArtifact(a *api.Artifact, paste Paste, title string, colour bool, now 
 	}
 	// Both paste forms, labelled, because the right one depends on where it is
 	// going and neither surface renders the other's.
-	markdownSurfaces := embedSurfaces
+	markdownSurfaces := EmbedSurfaces
 	if a.PreviewURL == "" {
-		markdownSurfaces = plainSurfaces
+		markdownSurfaces = PlainSurfaces
 	}
 	lines = append(lines,
 		"",
 		paint(colour, dim, "  "+markdownSurfaces),
 		"  "+paste.Markdown,
 		"",
-		paint(colour, dim, "  "+linkSurfaces),
+		paint(colour, dim, "  "+LinkSurfaces),
 		"  "+paste.URL,
 	)
 	// Kept well clear of the paste blocks: anyone holding the claim URL can

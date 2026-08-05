@@ -195,6 +195,41 @@ func (c *Client) VerifyKey(ctx context.Context) (*Key, error) {
 	return &key, nil
 }
 
+// GetArtifact looks up a finalized artifact. The claim URL of an anonymous
+// upload is deliberately not part of this response: the ID travels in the
+// shareable link, so knowing it must not be enough to adopt the upload.
+func (c *Client) GetArtifact(ctx context.Context, id string) (*Artifact, error) {
+	if id == "" {
+		return nil, Fail("missing_id", "pass the artifact ID, the last part of the link — e.g. 9f3c2e1")
+	}
+	endpoint, err := c.sameOrigin(c.BaseURL + "/artifacts/" + url.PathEscape(id))
+	if err != nil {
+		return nil, err
+	}
+
+	var artifact Artifact
+	err = c.retry(ctx, func() error {
+		req, err := c.request(ctx, http.MethodGet, endpoint, nil, "")
+		if err != nil {
+			return err
+		}
+		artifact = Artifact{}
+		res, err := c.decode(req, &artifact)
+		if err != nil {
+			return err
+		}
+		artifact.RateLimitRemaining = res.Header.Get("X-RateLimit-Remaining")
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if artifact.URL == "" {
+		return nil, malformed("the registry returned an artifact without a canonical URL")
+	}
+	return &artifact, nil
+}
+
 // ManifestFile declares one file before any bytes are sent. Digest lets the
 // registry verify each blob on arrival rather than trusting the client.
 type ManifestFile struct {

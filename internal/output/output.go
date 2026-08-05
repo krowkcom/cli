@@ -41,6 +41,9 @@ type Paste struct {
 // never has to be guessed. Exported because the MCP server says the same thing.
 const (
 	EmbedSurfaces = "GitHub, Linear, Notion — renders the image"
+	// PlainSurfaces replaces EmbedSurfaces when there is no preview to embed and
+	// the markdown form is only a plain link, so the label stays honest.
+	PlainSurfaces = "GitHub, Linear, Notion — plain link, no preview to embed"
 	LinkSurfaces  = "Slack, Basecamp — they unfurl the link themselves"
 )
 
@@ -116,6 +119,11 @@ func RelativeExpiry(iso string, now time.Time) string {
 	return fmt.Sprintf("expires in %dd", int(d.Round(24*time.Hour).Hours()/24))
 }
 
+// labelEscaper escapes the characters that end or nest a link label, and folds
+// newlines to spaces because CommonMark link text cannot span lines. Parens
+// are legal in link text, so they stay.
+var labelEscaper = strings.NewReplacer(`\`, `\\`, `[`, `\[`, `]`, `\]`, "\n", " ", "\r", " ")
+
 // MarkdownLink is the paste-ready preview link.
 func MarkdownLink(a *api.Artifact, title string) string {
 	label := title
@@ -125,6 +133,7 @@ func MarkdownLink(a *api.Artifact, title string) string {
 	if label == "" {
 		label = a.ID
 	}
+	label = labelEscaper.Replace(label)
 	if a.PreviewURL == "" {
 		return fmt.Sprintf("[%s](%s)", label, a.URL)
 	}
@@ -162,15 +171,26 @@ func Artifact(a *api.Artifact, f Format, title string, quiet, colour bool, now t
 
 func summarise(a *api.Artifact) string {
 	s := fmt.Sprintf("%d artifact(s), %s", max(len(a.Files), 1), HumanBytes(a.Bytes))
-	if a.Anonymous {
+	// The claim advice only belongs where there is a claim URL to act on. A
+	// replay deliberately omits it — the claim URL was handed out once, to the
+	// push that created the artifact — so telling this caller to claim would
+	// point at nothing.
+	if a.ClaimURL != "" {
 		return s + ", anonymous — claim it to keep it"
+	}
+	if a.Anonymous {
+		return s + ", anonymous"
 	}
 	return s
 }
 
-// Key renders a verified API key: who it belongs to and what it may do.
-func Key(k *api.Key, f Format, colour bool) string {
+// Key renders a verified API key: who it belongs to and what it may do. There
+// is no link to a key, so markdown and url fall back to the JSON envelope.
+func Key(k *api.Key, f Format, quiet, colour bool) string {
 	if f != Human {
+		if quiet {
+			return encode(k)
+		}
 		return encode(Envelope{
 			OK:      true,
 			Data:    k,
@@ -218,9 +238,13 @@ func humanArtifact(a *api.Artifact, paste Paste, title string, colour bool, now 
 	}
 	// Both paste forms, labelled, because the right one depends on where it is
 	// going and neither surface renders the other's.
+	markdownSurfaces := EmbedSurfaces
+	if a.PreviewURL == "" {
+		markdownSurfaces = PlainSurfaces
+	}
 	lines = append(lines,
 		"",
-		paint(colour, dim, "  "+EmbedSurfaces),
+		paint(colour, dim, "  "+markdownSurfaces),
 		"  "+paste.Markdown,
 		"",
 		paint(colour, dim, "  "+LinkSurfaces),

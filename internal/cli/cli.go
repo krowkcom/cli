@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"net/http"
 	"runtime"
 	"strings"
 	"time"
@@ -49,6 +48,7 @@ Upload flags
 
 Global flags
   --format <fmt>         human | json | markdown | url (default: human on a TTY, json when piped)
+                         markdown and url describe an upload; other commands fall back to json
   --json                 Shorthand for --format json
   --quiet                Raw JSON, no envelope
   -h, --help             Show this
@@ -141,7 +141,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
 		err = authToken(stdout, env)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "verify":
-		err = authVerify(stdout, format, env, colour)
+		err = authVerify(stdout, format, env, f.quiet, colour)
 	case positionals[0] == "doctor":
 		err = doctor(stdout, format, env)
 	default:
@@ -203,12 +203,17 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 
 // authHint points a rejected upload at the self-check. The registry cannot know
 // the CLI has a verify command, so the CLI adds that half of the fix itself.
+// It keys on the error code, not the HTTP status: a 403 can also come off a
+// presigned storage URL mid-upload, where the key is fine and pointing the
+// agent at auth would be a dead end.
 func authHint(err error, authenticated bool) error {
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) {
 		return err
 	}
-	if apiErr.Status != http.StatusUnauthorized && apiErr.Status != http.StatusForbidden {
+	switch apiErr.Code() {
+	case "no_key", "invalid_key", "insufficient_scope":
+	default:
 		return err
 	}
 
@@ -249,7 +254,7 @@ func authToken(w io.Writer, env runctx.Env) error {
 
 // authVerify reports what the stored key can actually do, rather than trusting
 // that a token-shaped string is a working key.
-func authVerify(w io.Writer, format output.Format, env runctx.Env, colour bool) error {
+func authVerify(w io.Writer, format output.Format, env runctx.Env, quiet, colour bool) error {
 	client := api.New(env("KROWK_API_URL"), api.ReadToken(env))
 	if client.Token == "" {
 		return api.Fail("not_authenticated",
@@ -260,7 +265,7 @@ func authVerify(w io.Writer, format output.Format, env runctx.Env, colour bool) 
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.Key(key, format, colour))
+	fmt.Fprintln(w, output.Key(key, format, quiet, colour))
 	return nil
 }
 
@@ -275,7 +280,7 @@ func doctor(w io.Writer, format output.Format, env runctx.Env) error {
 		"version":       Version,
 		"runtime":       runtime.Version() + " " + runtime.GOOS + "/" + runtime.GOARCH,
 		"api":           client.BaseURL,
-		"api_status":    reachability(keyErr),
+		"api_status":    reachability(key, keyErr),
 		"authenticated": client.Token != "",
 		"key":           keySummary(client.Token, key, keyErr),
 		"credentials":   api.CredentialsPath(),
@@ -297,9 +302,11 @@ func doctor(w io.Writer, format output.Format, env runctx.Env) error {
 }
 
 // reachability separates "the registry answered" from "nothing is listening".
-func reachability(err error) string {
+func reachability(key *api.Key, err error) string {
 	if err == nil {
-		return "reachable (HTTP 200)"
+		// The status the verification actually answered with — send accepts any
+		// 2xx, so the diagnostic must not assume 200.
+		return fmt.Sprintf("reachable (HTTP %d)", key.Status)
 	}
 	var apiErr *api.Error
 	if errors.As(err, &apiErr) {
@@ -309,8 +316,8 @@ func reachability(err error) string {
 		if detail, ok := apiErr.Body["detail"].(string); ok {
 			return "unreachable — " + detail
 		}
-		// A client-side verdict, e.g. a 200 that said valid:false.
-		return "reachable (" + apiErr.Code() + ")"
+		// A verdict formed before any HTTP exchange, e.g. an unparseable URL.
+		return "unreachable — " + apiErr.Code()
 	}
 	return "unreachable — " + err.Error()
 }

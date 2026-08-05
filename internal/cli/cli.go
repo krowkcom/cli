@@ -12,7 +12,9 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,8 +28,13 @@ import (
 var Version = "0.1.0"
 
 // defaultRegistryAddr is where `registry serve` listens, matching api.DevBaseURL
-// so --dev finds it with no configuration. Loopback only: the registry accepts
-// anonymous uploads, so by default it must not be reachable from the LAN.
+// so --dev finds it with no configuration.
+//
+// Loopback, not ":8787". This registry takes uploads without a key and will
+// answer a lookup for any artifact ID — seven characters, enumerable — with the
+// repository, branch, commit and pull request the upload came from. On a café or
+// office network, binding every interface hands that to whoever is nearby. A
+// wider bind stays possible, but it has to be asked for.
 const defaultRegistryAddr = "127.0.0.1:8787"
 
 const helpTemplate = `krowk %s — permalinks for agent output
@@ -258,8 +265,12 @@ func registryServe(w io.Writer, f flags) error {
 	}
 
 	addr := f.addr
+	// The flag carries the default, but a direct caller may pass the zero value.
 	if addr == "" {
 		addr = defaultRegistryAddr
+	}
+	if err := usableAddr(addr); err != nil {
+		return err
 	}
 
 	// Bind before announcing anything, so a script keying off the banner never
@@ -274,7 +285,7 @@ func registryServe(w io.Writer, f flags) error {
 // serveOn runs the registry on an already-bound listener. Split from
 // registryServe so a test can hold the listener and close it to stop serving.
 func serveOn(w io.Writer, ln net.Listener, addr string, f flags) error {
-	fmt.Fprint(w, serveBanner(localBase(ln.Addr().String(), addr)))
+	fmt.Fprint(w, registryBanner(ln.Addr().String(), addr))
 
 	server := &http.Server{
 		Handler: registry.Handler(f.limitBytes, f.site),
@@ -287,14 +298,34 @@ func serveOn(w io.Writer, ln net.Listener, addr string, f flags) error {
 	return nil
 }
 
-// serveBanner says where the registry is and how to point a push at it. --dev
-// only knows the default address, so any other base gets the explicit form.
-func serveBanner(base string) string {
-	banner := "krowk registry listening on " + base + "\n"
-	if base+"/v1" == api.DevBaseURL {
-		return banner + "  krowk push screenshot.png --dev\n"
+// registryBanner is what `registry serve` prints once the listener is bound:
+// where the registry is, how to point a push at it, and — bound wider than this
+// machine — that it is open. Kept separate so it can be checked without a bind.
+func registryBanner(bound, asked string) string {
+	base := localBase(bound, asked)
+
+	lines := []string{"krowk registry listening on " + base}
+	if reachableByDev(asked) {
+		lines = append(lines, "  krowk push screenshot.png --dev")
+	} else {
+		// --dev only knows the default address, so say what to use instead.
+		lines = append(lines, "  KROWK_API_URL="+base+"/v1 krowk push screenshot.png")
 	}
-	return banner + "  KROWK_API_URL=" + base + "/v1 krowk push screenshot.png\n"
+	// Bound wider than this machine, deliberately or not, it is worth saying out
+	// loud: this registry takes uploads without a key, and will answer a lookup
+	// for any artifact ID with the repo, branch and commit behind it.
+	if host := listenHost(asked); !isLoopbackHost(host) {
+		lines = append(lines,
+			"  ! reachable from the network on "+bindDescription(host)+" — it needs no key to accept uploads")
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func bindDescription(host string) string {
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return "every interface"
+	}
+	return host
 }
 
 // localBase turns a listen address into a URL a client can call. bound is what
@@ -320,6 +351,80 @@ func localBase(bound, asked string) string {
 		host = "localhost"
 	}
 	return "http://" + net.JoinHostPort(host, port)
+}
+
+// reachableByDev reports whether --dev, which knows only one address, will find
+// a registry listening here.
+func reachableByDev(addr string) bool {
+	dev, err := url.Parse(api.DevBaseURL)
+	if err != nil {
+		return false
+	}
+	if listenPort(addr) != dev.Port() {
+		return false
+	}
+	// --dev dials localhost, which lands on 127.0.0.1 or ::1 — so only those
+	// hosts, their name, and every-interface binds qualify. The rest of
+	// 127.0.0.0/8 is loopback too, but localhost does not reach it, so the
+	// advice for 127.0.0.2 is KROWK_API_URL, not a --dev that cannot connect.
+	switch listenHost(addr) {
+	case "", "0.0.0.0", "::", "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
+func listenHost(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
+func listenPort(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return port
+}
+
+// usableAddr rejects what net.Listen would reject anyway, so the banner does not
+// print "http://localhost:" and a network warning for an address that never
+// binds. --addr 8787 is the easy mistake.
+// An empty port is accepted by SplitHostPort but binds a kernel-picked port the
+// banner has no name for — ":0" is the explicit spelling of that request, and it
+// is welcome: the bind happens before the banner, which then reports the port
+// the kernel picked. An empty host is fine: that is what ":8787" means.
+func usableAddr(addr string) error {
+	if _, port, err := net.SplitHostPort(addr); err != nil || !bindablePort(port) {
+		return fmt.Errorf("--addr %q needs a host and a numeric port, like 127.0.0.1:8787 or :8787", addr)
+	}
+	return nil
+}
+
+// bindablePort reports whether port is one the listener can take as given: all
+// digits (net.Listen also resolves signs and service names like "http", which
+// the banner would print verbatim), within 0-65535 — 99999 announces itself and
+// then fails to bind — and spelled the way it binds, since ":08787" binds 8787.
+// Port 0 asks the kernel to pick, and the banner reports what it picked.
+func bindablePort(port string) bool {
+	for _, r := range port {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	n, err := strconv.Atoi(port)
+	return err == nil && n <= 65535 && strconv.Itoa(n) == port
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // authHint points a rejected upload at the self-check. The registry cannot know

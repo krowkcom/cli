@@ -112,6 +112,42 @@ The upload handshake is not exposed as separate begin/finalize tools: the `PUT`
 step needs access to the local file, which the MCP client does not have, so the
 handshake stays behind `krowk_push` where it belongs.
 
+**`krowk_push` is confined to a root** — the working directory, or `--root` /
+`KROWK_MCP_ROOT`. Paths are resolved with symlinks followed *before* the check,
+and anything landing outside is refused. This matters more here than in the CLI:
+there a person types the path, here a model picks it, and a model reads
+repository files, web pages and issue bodies. An artifact is published at a URL
+that needs no credential to read, so without the boundary an instruction hidden
+in any of those would turn `krowk_push` into "read any file on this machine and
+publish it somewhere I can fetch". Symlink order is the subtle half — a link
+inside the repo pointing at `~/.ssh/id_rsa` sails through a prefix test done
+before resolving.
+
+Two things a plain prefix check gets wrong, both worth stating because both are
+the common case rather than the exotic one:
+
+- **The root may not be the home directory, or `/`.** It defaults to the working
+  directory, so an agent started outside a checkout would otherwise take `$HOME`
+  as its boundary — and `~/.ssh`, `~/.aws` and `~/.config/krowk` are all inside
+  that. A root that broad is refused with a message saying to pass `--root`.
+- **Credential files are refused inside the root too.** A checkout is not free of
+  secrets: `.env` files live in them, and so do stray keys and service-account
+  JSON. `.env*`, `.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker`, `.netrc`, `.npmrc`,
+  `.pypirc`, `.git-credentials`, `credentials.json` and `id_rsa` / `id_ed25519` /
+  `id_ecdsa` are refused wherever they sit. Nobody publishes these on purpose, so
+  the cost of refusing is an error message and the cost of allowing is a secret
+  with a permalink.
+- **A file with more than one name is refused.** Resolving symlinks catches a link
+  pointing out of the root, but a hard link is not a link to anything — it is a
+  second name for the same inode, so a path inside the root can be a key outside
+  it with nothing to resolve. Nothing reports where the other names are, so a file
+  with any is refused; copy it in and push the copy. In practice this rejects
+  package-store files and nothing anyone wanted to publish.
+
+The boundary constrains `krowk_push`; it is not a sandbox around the agent. An
+agent that can also run a shell can read whatever it likes — this stops the tool
+from being the thing that publishes it.
+
 ## Metadata
 
 Flags win; everything else is detected so the agent never has to type it.
@@ -290,9 +326,44 @@ body alone:
 - **Retries** — each step retries up to 3 times on `retryable: true` (default
   for 429 and 5xx), honouring `Retry-After`.
 - **Same-origin** — `finalize_url` must be on the API's own origin. The client
-  refuses to send the token anywhere else, and never follows a redirect — a
-  3xx from any step fails the upload — so a compromised registry response
-  cannot redirect the key. Upload URLs may point anywhere `http(s)`.
+  refuses to send the token anywhere else, so a compromised registry response
+  cannot redirect the key.
+- **Upload targets are storage, not anything reachable.** A presigned URL names a
+  foreign host by design, but the client requires `https`, ignores `method` and
+  always sends `PUT`, and refuses loopback, link-local, private and carrier-grade
+  NAT addresses. Otherwise a response body would choose the method, host, path,
+  headers and body of a request the CLI makes from its own network position —
+  which in CI reaches a great deal the registry cannot. Two origins are exempt
+  because the user chose them: a local registry, where local targets are the
+  whole point, and the host `KROWK_API_URL` itself names — a self-hosted
+  registry on a private network serves blobs on its own host, and that host is
+  configuration, not the registry steering the client.
+
+  The check is on the connection, not only on the URL, because a URL check alone
+  has two ways past it. An upload target that answers with a redirect is refused
+  outright — a presigned URL is where the bytes belong, and a `302` would change
+  the host and arrive as a `GET`, taking the method restriction with it. The one
+  exception is an upload URL on the API's own origin, which may redirect within
+  it the way the API itself may; the https-downgrade check and the dial check
+  still apply to the hop. And the address is judged as it is dialled rather than
+  by resolving the name first, since whoever returned the name can answer the
+  check and the dial differently.
+
+  "Inside the network" means more than the obvious four shapes: carrier-grade NAT
+  (`100.64.0.0/10`, where Tailscale lives), `240.0.0.0/4`, multicast, and the
+  NAT64 prefix `64:ff9b::/96`, which on an IPv6-only runner is how you reach the
+  metadata service without naming a link-local address at all.
+
+  **The proxy a request goes through is exempt, and only at its own address.**
+  Corporate proxies sit on private addresses, so refusing those outright would
+  refuse every upload from the environments this tool is for — but the exemption
+  is the address of the proxy the transport selected for that request, not any
+  proxy configured in the environment and not a switch that turns the boundary
+  off. A request that skipped the proxy — `NO_PROXY` covers its host, or its
+  scheme names a different variable — is judged like any other, even when its
+  dial lands on a configured proxy's address. One thing does stay out of reach:
+  where a proxy sends the bytes is the proxy's business, so a name that resolves
+  differently for it than for the URL check is not something this client can see.
 - **Expiry** — an expired free link returns `410 Gone` carrying the original
   filename and upload time.
 
@@ -319,6 +390,20 @@ server at it too. Precedence, most to least specific: `--dev`, then
 `registry serve` takes `--addr`, `--site` (the origin baked into returned links,
 for demoing production-looking URLs) and `--limit-bytes` (to exercise the
 too-large path).
+
+It binds `127.0.0.1:8787` — **loopback by default**, because it accepts uploads
+without a key and will answer a lookup for any artifact ID with the repo, branch,
+commit and pull request behind it. Artifact IDs are seven characters and
+enumerable, so on a café or office network a wider bind hands that to whoever is
+nearby. `--addr` can still open it up, and the banner says so when you do.
+
+Pending state is bounded, because declaring an upload needs no key and sends no
+bytes — so it is the cheapest request here and the one worth abusing. A handshake
+that never finalizes expires after an hour, swept on the next declaration; at most
+256 may be in flight at once (`503`, retryable); and one manifest may declare at
+most 64 files, since each mints a blob token and the body limit alone would allow
+thousands. Finishing an upload releases its handshake too — only the artifact and
+its ID reservation are kept, so a live link can never be handed to a later upload.
 
 ## Development
 

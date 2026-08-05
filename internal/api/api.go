@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -75,22 +77,62 @@ func New(baseURL, token string) *Client {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
-	return &Client{
+	c := &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Token:   token,
-		HTTP: &http.Client{
-			Timeout: 5 * time.Minute,
-			// Never follow a redirect. sameOrigin vets the URL a request starts
-			// at, not where a 302 sends it next — and Go forwards Authorization
-			// on any same-host hop, so a redirect to another port, a subdomain,
-			// or an https→http downgrade still carries the token. send turns the
-			// 3xx this leaves behind into an error.
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
-		Sleep: time.Sleep,
+		Sleep:   time.Sleep,
 	}
+	// The upload boundary lives here, on the connection, not only on the URL the
+	// registry returned. Checking the URL alone leaves two ways past it: a
+	// redirect off the vetted host, and a name that resolves once for the check
+	// and again for the dial.
+	//
+	// The transport is cloned rather than built fresh, to keep the proxy, timeout
+	// and HTTP/2 defaults; only the dial is ours. The clone is wrapped so each
+	// round trip records which proxy the transport selected for that request —
+	// the dial hook needs it, and by dial time the request is out of sight.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// ControlContext rather than DialContext: the transport hands DialContext the
+	// URL's host:port before resolution, so a judgement there never sees where a
+	// name actually lands. ControlContext runs inside the dialer, per resolved
+	// candidate address, and still carries the request context the proxy
+	// exemption needs.
+	transport.DialContext = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		ControlContext: func(ctx context.Context, network, address string, _ syscall.RawConn) error {
+			return c.permitDial(ctx, address)
+		},
+	}).DialContext
+	c.HTTP = &http.Client{
+		Timeout:       5 * time.Minute,
+		Transport:     &proxyStamp{base: transport},
+		CheckRedirect: c.checkRedirect,
+	}
+	return c
+}
+
+// proxyKey carries the proxy the transport selected for one request from the
+// round trip, where the request is visible, to the dial, where it is not.
+type proxyKey struct{}
+
+// proxyStamp asks the transport which proxy it will use for a request and stamps
+// the answer on the request's context before handing it over. permitDial reads
+// it back, so the exemption it grants is for the proxy this request actually
+// goes through — not for any proxy configured somewhere in the environment.
+type proxyStamp struct{ base *http.Transport }
+
+func (t *proxyStamp) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.base.Proxy != nil {
+		u, err := t.base.Proxy(req)
+		if err != nil {
+			return nil, err
+		}
+		if u != nil {
+			req = req.WithContext(context.WithValue(req.Context(), proxyKey{}, u))
+		}
+	}
+	return t.base.RoundTrip(req)
 }
 
 // File is one uploaded file as the registry reports it back.
@@ -431,14 +473,16 @@ func (c *Client) putAll(ctx context.Context, paths []string, manifest []Manifest
 }
 
 func (c *Client) put(ctx context.Context, path string, declared ManifestFile, target UploadTarget) error {
-	endpoint, err := storageOrigin(target.URL)
+	endpoint, err := c.storageOrigin(target.URL)
 	if err != nil {
 		return err
 	}
-	method := target.Method
-	if method == "" {
-		method = http.MethodPut
-	}
+	// Always PUT, whatever target.Method says. The contract documents one method,
+	// and letting a response body choose it would hand a compromised registry the
+	// method, host, path, headers and body of a request this process issues from
+	// its own network position — a CI runner can reach a great deal that the
+	// registry cannot.
+	method := http.MethodPut
 
 	return c.retry(ctx, func() error {
 		// Reopened per attempt: the body streams off disk and cannot be rewound
@@ -528,6 +572,13 @@ type response struct {
 func (c *Client) send(req *http.Request) (*response, error) {
 	res, err := c.HTTP.Do(req)
 	if err != nil {
+		// checkRedirect and permitDial refuse with an *Error of their own, which
+		// the client hands back wrapped. Why the request was refused is more use
+		// to the caller than "cannot reach the registry".
+		var refused *Error
+		if errors.As(err, &refused) {
+			return nil, refused
+		}
 		origin := req.URL.Scheme + "://" + req.URL.Host
 		// "check KROWK_API_URL" is only good advice when the API is what failed;
 		// a blob PUT goes to whatever storage host the registry named.
@@ -692,15 +743,286 @@ func (c *Client) sameOrigin(raw string) (string, error) {
 	return u.String(), nil
 }
 
-// storageOrigin accepts any http(s) host, because that is the whole point of a
-// presigned URL, but nothing else — a file:// or data: target would make the
-// client read or leak something local.
-func storageOrigin(raw string) (string, error) {
+// onAPIOrigin reports whether u is on the origin the user configured, counting
+// the https upgrade of an http base — same host, default https port, upgrade
+// direction only. It is the one judgement of "the API's own origin" shared by
+// the upload-URL check, the redirect gate and (via isAPIAddress) the dial hook,
+// so a URL one layer permits is not refused by the next.
+func (c *Client) onAPIOrigin(u *url.URL) bool {
+	base, err := url.Parse(c.BaseURL)
+	if err != nil || base.Hostname() == "" || u.Hostname() != base.Hostname() {
+		return false
+	}
+	if u.Scheme == base.Scheme && defaultedPort(u) == defaultedPort(base) {
+		return true
+	}
+	return base.Scheme == "http" && u.Scheme == "https" && defaultedPort(u) == "443"
+}
+
+// defaultedPort is the port a dial to u would use: the explicit one, or the
+// scheme's default — so https://host and https://host:443 name one origin, the
+// way the dial layer already treats them.
+func defaultedPort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	if u.Scheme == "https" {
+		return "443"
+	}
+	return "80"
+}
+
+// storageOrigin accepts the object-storage host a presigned URL names — that is
+// the whole point of presigning — but only a host worth sending bytes to.
+//
+// A file:// or data: target would make the client read something local. An
+// address inside the machine or its network is worse: it turns the client into a
+// confused deputy, issuing requests from a position the registry could not reach
+// on its own. Plaintext http is refused too, since the bytes are the artifact.
+// Two origins are exempt because the user chose them: the local registry, and
+// the API's own origin — a self-hosted registry serves blobs on its own host.
+func (c *Client) storageOrigin(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return "", malformed("the registry returned an upload URL that is not http(s): " + raw)
 	}
+
+	// Talking to a local registry means local upload targets, by definition.
+	if c.isLocal() {
+		return u.String(), nil
+	}
+	// A registry that serves blobs on its own host — this repository's own does —
+	// points the upload at the origin the user already configured. That host is
+	// trusted on the API's own terms, so a self-hosted registry on a private
+	// network keeps working, https upgrade included.
+	if c.onAPIOrigin(u) {
+		return u.String(), nil
+	}
+	if u.Scheme != "https" {
+		return "", Fail("insecure_upload_url",
+			"the registry asked for a plaintext upload to "+u.Host+" — refusing to send the artifact over http")
+	}
+	if internalHost(u.Hostname()) {
+		return "", Fail("untrusted_endpoint",
+			"the registry pointed the upload at "+u.Host+", which is inside this machine or its network — refusing")
+	}
 	return u.String(), nil
+}
+
+// checkRedirect refuses to follow a redirect away from an upload target.
+//
+// storageOrigin vets the URL the registry returned; it cannot vet where that URL
+// points next. Following one hop hands back everything the vetting took away —
+// the host, the path, and the method too, since a 302 arrives at the next host as
+// a GET. A presigned URL is a final destination and does not redirect, so a
+// redirect here means the registry is aiming this process somewhere, and the
+// honest answer is to fail the upload rather than complete it against whatever
+// answered. The API's own origin may still redirect (http -> https in front of a
+// self-hosted registry is ordinary), and that allowance covers upload URLs on
+// that origin too — a registry serving its own blobs may reshuffle its paths —
+// but every hop stays on that host; the allowance is the origin the user
+// configured, not a first hop that launders the rest.
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	if !c.onAPIOrigin(via[0].URL) {
+		return Fail("upload_redirected",
+			"the upload target "+via[0].URL.Host+" redirected to "+req.URL.Host+
+				" — a presigned URL is where the bytes belong, so this is not followed")
+	}
+	// The request started on the API's own origin, so it stays on that host, hop
+	// after hop. The scheme may change — http -> https in front of a self-hosted
+	// registry is the ordinary case — and the downgrade below is refused anyway.
+	// onAPIOrigin above already proved BaseURL parses with a host.
+	if base, _ := url.Parse(c.BaseURL); req.URL.Hostname() != base.Hostname() {
+		return Fail("untrusted_redirect",
+			"the registry redirected a request from its own origin to "+req.URL.Host+
+				" — a request to the API's origin stays there")
+	}
+	// Go forwards Authorization to the same host on a redirect, and judges "same"
+	// by host alone — so https -> http on one host keeps carrying the token, in
+	// the clear. Refuse the downgrade rather than rely on nobody arranging it.
+	if last := via[len(via)-1].URL; last.Scheme == "https" && req.URL.Scheme != "https" {
+		return Fail("insecure_redirect",
+			"the registry redirected from https to "+req.URL.Scheme+" — refusing, the token would go in the clear")
+	}
+	if len(via) >= 10 {
+		return Fail("too_many_redirects",
+			"gave up after 10 redirects from "+via[0].URL.Host+" — the registry is looping")
+	}
+	// Same hostname is not the same origin: Go forwards Authorization to any port
+	// on the host, so a hop to another port would deliver the token to a
+	// different server. onAPIOrigin counts the https upgrade and nothing wider;
+	// anything else hands the 3xx back and send reports it as unexpected_redirect.
+	if !c.onAPIOrigin(req.URL) {
+		return http.ErrUseLastResponse
+	}
+	return nil
+}
+
+// permitDial is the boundary applied to the address actually being connected to,
+// after the resolver has had its say.
+//
+// internalHost judges a name by resolving it, but the transport resolves again
+// when it dials, and the registry owns the name in the case that matters — so a
+// zero-TTL record can answer public for the check and internal for the dial.
+// Deciding here instead leaves nothing between the check and the connection.
+//
+// With an HTTP proxy in play this sees the proxy's address rather than the
+// target's; the URL-level checks still stand in that case.
+func (c *Client) permitDial(ctx context.Context, address string) error {
+	// A local registry means local addresses throughout — that is the point of it.
+	if c.isLocal() {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil
+	}
+	// A zone makes an address unparseable — "fe80::1%eth0" — and an unparseable
+	// address would otherwise be waved through.
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host = host[:i]
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !reservedIP(ip) {
+		return nil
+	}
+	// The host the user typed into KROWK_API_URL is trusted the way isLocal
+	// already trusts loopback: a self-hosted registry on a private network is
+	// configuration, not the registry steering this process somewhere.
+	if c.isAPIAddress(address) {
+		return nil
+	}
+	// One other reserved address is legitimate: the proxy this request goes
+	// through. Corporate proxies sit on private addresses, so refusing this
+	// outright would refuse every upload from the CI environments this tool
+	// exists for. Only the proxy the transport selected for this request earns
+	// the exemption though — a request that skipped the proxy, because NO_PROXY
+	// covers its host or its scheme names a different variable, is judged like
+	// any other, even when its target resolves to a configured proxy's address.
+	if proxy, ok := ctx.Value(proxyKey{}).(*url.URL); ok &&
+		slices.Contains(hostAddresses(proxy.Hostname(), proxy.Port(), proxy.Scheme), address) {
+		return nil
+	}
+	return Fail("untrusted_endpoint",
+		"refusing to connect to "+address+", which is inside this machine or its network")
+}
+
+// isAPIAddress reports whether address is where BaseURL's own host lives.
+//
+// Resolved here rather than cached at startup, and only on the path that is about
+// to refuse a connection: a registry that moved to a new address would otherwise
+// break every upload until the process restarted, which is a bad trade for
+// saving a lookup on a path taken a handful of times per run.
+func (c *Client) isAPIAddress(address string) bool {
+	base, err := url.Parse(c.BaseURL)
+	if err != nil || base.Hostname() == "" {
+		return false
+	}
+	if slices.Contains(hostAddresses(base.Hostname(), base.Port(), base.Scheme), address) {
+		return true
+	}
+	// checkRedirect permits an API-origin request to upgrade its scheme —
+	// http -> https in front of a self-hosted registry is the ordinary case —
+	// and the upgraded hop dials port 443, not the base's. Cover exactly that
+	// hop: the same host's addresses, one extra port, upgrade direction only.
+	return base.Scheme == "http" &&
+		slices.Contains(hostAddresses(base.Hostname(), "443", "https"), address)
+}
+
+// hostAddresses turns a host into the addresses a dial to it would use — the
+// literal host:port, and the resolved ones, since a dial happens after
+// resolution. An empty port falls back to the scheme's default, the way a URL
+// without one is dialled.
+func hostAddresses(hostname, port, scheme string) []string {
+	if port == "" {
+		switch scheme {
+		case "https":
+			port = "443"
+		case "socks5", "socks5h":
+			port = "1080"
+		default:
+			port = "80"
+		}
+	}
+	out := []string{net.JoinHostPort(hostname, port)}
+	if ips, err := net.LookupIP(hostname); err == nil {
+		for _, ip := range ips {
+			out = append(out, net.JoinHostPort(ip.String(), port))
+		}
+	}
+	return out
+}
+
+// isLocal reports whether this client is pointed at a registry on this machine,
+// where loopback upload targets are expected rather than suspicious.
+func (c *Client) isLocal() bool {
+	base, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return false
+	}
+	return isLoopback(base.Hostname())
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// internalHost reports whether a host names something only reachable from where
+// this process happens to be sitting. A literal IP is judged directly; a name is
+// resolved, because "metadata.internal" is a name.
+func internalHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return reservedIP(ip)
+	}
+	// A name that will not resolve is not obviously internal; let the request
+	// fail on its own rather than guessing. A name that resolves to anything
+	// reserved is refused, so a single bad answer is enough to stop it.
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		return false
+	}
+	for _, ip := range addrs {
+		if reservedIP(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// What Go's own predicates leave out. Each of these reaches somewhere an
+// artifact upload has no business going.
+var reservedRanges = []net.IPNet{
+	// Carrier-grade NAT: not private by Go's reckoning, and where Tailscale and
+	// several CI providers put their internal hosts.
+	{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)},
+	{IP: net.IPv4(198, 18, 0, 0), Mask: net.CIDRMask(15, 32)},
+	{IP: net.IPv4(192, 0, 0, 0), Mask: net.CIDRMask(24, 32)},
+	// 240.0.0.0/4, reserved, and it carries the broadcast address with it.
+	{IP: net.IPv4(240, 0, 0, 0), Mask: net.CIDRMask(4, 32)},
+	// NAT64. On an IPv6-only network 64:ff9b::a9fe:a9fe is the metadata service,
+	// and it is neither loopback, private nor link-local to Go — this is the
+	// standard way past a check that only knows the IPv4 shapes.
+	{IP: net.ParseIP("64:ff9b::"), Mask: net.CIDRMask(96, 128)},
+}
+
+func reservedIP(ip net.IP) bool {
+	if ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() ||
+		ip.IsMulticast() ||
+		ip.IsInterfaceLocalMulticast() {
+		return true
+	}
+	return slices.ContainsFunc(reservedRanges, func(n net.IPNet) bool { return n.Contains(ip) })
 }
 
 func malformed(detail string) *Error {

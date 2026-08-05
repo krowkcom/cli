@@ -17,6 +17,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,7 +50,14 @@ other's form, so choose deliberately.
 
 If the push comes back anonymous it carries a claim_url. That link adopts the
 upload, so treat it as a secret: give it to the human, never paste it into a
-pull request, an issue or a chat message.`
+pull request, an issue or a chat message.
+
+krowk_push only uploads files from the working directory and below. Anything
+outside it is refused, symlinks included, and credential files are refused even
+inside it — .env, .ssh, .aws, .netrc, private keys, credentials.json. An artifact
+is published at a URL that needs no credential to read, so do not try to route
+around this: if a file you were asked to share sits elsewhere, say so and let the
+human move it.`
 
 // Server speaks MCP over a pair of streams.
 type Server struct {
@@ -58,8 +67,137 @@ type Server struct {
 	Env runctx.Env
 	// Version is reported to the client and recorded on every upload.
 	Version string
+	// Root confines which files may be uploaded. Paths are resolved, symlinks
+	// and all, and anything landing outside is refused.
+	//
+	// This matters more here than in the CLI. There a person types the path; here
+	// a model chooses it, and a model reads repository files, web pages and issue
+	// bodies — so an instruction hidden in any of them would otherwise turn
+	// krowk_push into "read any file on this machine and publish it at a URL I can
+	// fetch without credentials". Empty means the working directory.
+	Root string
 	// Now is swapped out in tests so expiry text is stable.
 	Now func() time.Time
+}
+
+// resolveRoot is the confinement boundary, fully resolved on every call — so a
+// process that changes directory moves the boundary with it.
+func (s *Server) resolveRoot() (string, error) {
+	root := s.Root
+	if root == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", api.Fail("no_working_directory", "cannot determine the working directory: "+err.Error())
+		}
+		root = wd
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", api.Fail("bad_root", "cannot resolve "+root+": "+err.Error())
+	}
+	// Resolve the root too: on macOS the working directory is often under
+	// /var, which is a symlink to /private/var, and comparing a resolved path
+	// against an unresolved root would reject everything.
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = real
+	}
+	// A root of / or the home directory is not a boundary. The home directory is
+	// the one that happens by accident: an agent started outside a checkout takes
+	// its working directory as the root, and then ~/.ssh/id_rsa, ~/.aws and
+	// ~/.config/krowk are all inside it — exactly the reach confinement is here to
+	// remove. Better to refuse and be told where the files are.
+	if abs == string(filepath.Separator) {
+		return "", api.Fail("root_too_broad",
+			"the upload root is / — start the server in a project directory, or pass --root")
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if resolved, err := filepath.EvalSymlinks(home); err == nil {
+			home = resolved
+		}
+		if abs == home {
+			return "", api.Fail("root_too_broad",
+				"the upload root is the home directory, which holds ~/.ssh and ~/.aws — "+
+					"start the server in a project directory, or pass --root")
+		}
+	}
+	// A root sitting inside a secret-named directory is no boundary either:
+	// secretPath only inspects components below the root, so a server started in
+	// ~/.ssh would otherwise make config and authorized_keys pushable.
+	if name := secretComponent(abs); name != "" {
+		return "", api.Fail("root_too_broad",
+			"the upload root is inside "+name+", which holds credentials — "+
+				"start the server in a project directory, or pass --root")
+	}
+	return abs, nil
+}
+
+// secretNames are refused wherever they sit, root or no root, because a
+// repository is not free of credentials either: .env files live in checkouts, and
+// so do stray keys and service-account JSON. An artifact is published at a URL
+// that needs no credential to read, and nobody publishes these on purpose — so
+// the cost of refusing them is a clear error, and the cost of not refusing them
+// is a leaked secret with a permalink.
+var secretNames = map[string]bool{
+	".ssh": true, ".aws": true, ".gnupg": true, ".kube": true, ".docker": true,
+	".env": true, ".netrc": true, ".npmrc": true, ".pypirc": true, ".git-credentials": true,
+	"credentials.json": true, "id_rsa": true, "id_ed25519": true, "id_ecdsa": true,
+}
+
+// secretPath reports whether any part of the path below root is one of those
+// names, so a directory match covers everything under it.
+func secretPath(root, resolved string) string {
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil {
+		return ""
+	}
+	return secretComponent(rel)
+}
+
+// secretComponent returns the first path component that names a secret, if any.
+func secretComponent(path string) string {
+	for part := range strings.SplitSeq(path, string(filepath.Separator)) {
+		lower := strings.ToLower(part)
+		// .env.local and .env.production are the same file by another name.
+		if secretNames[lower] || strings.HasPrefix(lower, ".env.") {
+			return part
+		}
+	}
+	return ""
+}
+
+// permit resolves one requested path and confirms it lies inside root.
+func permit(root, path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", api.Fail("file_unreadable", "cannot resolve `"+path+"`: "+err.Error())
+	}
+	// Symlinks are resolved before the check, not after: a link inside the root
+	// pointing at ~/.ssh/id_rsa would sail through a plain prefix test.
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", api.Fail("file_unreadable",
+			"cannot read `"+path+"` — paths resolve from the working directory")
+	}
+	rel, err := filepath.Rel(root, real)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", api.Fail("outside_root",
+			"`"+path+"` is outside "+root+" — krowk_push only uploads files from the working directory")
+	}
+	if name := secretPath(root, real); name != "" {
+		return "", api.Fail("secret_path",
+			"`"+path+"` is a credential file (`"+name+"`) — refusing to publish it at a public URL")
+	}
+	// A hard link is the one escape resolving symlinks cannot see: a second name
+	// for the same inode, so a path inside the root can be a key outside it with
+	// nothing to resolve. Nothing says where the other names are, so a file with
+	// any is refused. Screenshots do not have them; package stores do, which is
+	// why this rejects node_modules rather than anything worth publishing.
+	if info, err := os.Stat(real); err == nil && info.Mode().IsRegular() && multiplyLinked(info) {
+		return "", api.Fail("hard_linked",
+			"`"+path+"` has more than one name on disk, so it may be a file from outside "+root+
+				" — copy it in and push the copy")
+	}
+	return real, nil
 }
 
 // Serve reads requests until the stream ends or the context is cancelled.
@@ -326,6 +464,21 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		return "", nil, api.Fail("no_file", "pass at least one path in `files`")
 	}
 
+	// Confine before reading anything: an instruction the model picked up from a
+	// repository file or a web page must not be able to name ~/.ssh/id_rsa here.
+	root, err := s.resolveRoot()
+	if err != nil {
+		return "", nil, err
+	}
+	files := make([]string, 0, len(a.Files))
+	for _, path := range a.Files {
+		allowed, err := permit(root, path)
+		if err != nil {
+			return "", nil, err
+		}
+		files = append(files, allowed)
+	}
+
 	metadata := runctx.Resolve(s.Env, runctx.Overrides{
 		Repo:        a.Repo,
 		Commit:      a.Commit,
@@ -337,7 +490,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Client:      "krowk-mcp/" + s.Version,
 	})
 
-	artifact, err := s.Client.CreateArtifact(ctx, a.Files, metadata)
+	artifact, err := s.Client.CreateArtifact(ctx, files, metadata)
 	if err != nil {
 		return "", nil, err
 	}
@@ -453,10 +606,13 @@ func toolSchemas() []map[string]any {
 				"required": []string{"files"},
 				"properties": map[string]any{
 					"files": map[string]any{
-						"type":        "array",
-						"items":       map[string]any{"type": "string"},
-						"minItems":    1,
-						"description": "Paths to upload, resolved from the working directory.",
+						"type":     "array",
+						"items":    map[string]any{"type": "string"},
+						"minItems": 1,
+						"description": "Paths to upload, resolved from the working directory. Must be " +
+							"inside it — paths outside are refused, symlinks included, and credential " +
+							"files are refused even inside it, because an artifact is readable by " +
+							"anyone with the link.",
 					},
 					"title": map[string]any{
 						"type":        "string",

@@ -20,6 +20,8 @@ import (
 
 func main() {
 	version := flag.Bool("version", false, "print the version and exit")
+	root := flag.String("root", "",
+		"only upload files under this directory (default: the working directory)")
 	flag.Parse()
 
 	if *version {
@@ -33,8 +35,12 @@ func main() {
 	server := &mcp.Server{
 		// Same registry precedence as the CLI, so KROWK_DEV points both at a
 		// local registry without either needing its own plumbing.
-		Client:  api.New(api.BaseURLFor(false, os.Getenv), api.ReadToken(os.Getenv)),
-		Env:     runctx.Env(os.Getenv),
+		Client: api.New(api.BaseURLFor(false, os.Getenv), api.ReadToken(os.Getenv)),
+		Env:    runctx.Env(os.Getenv),
+		// Uploads are confined here. An artifact needs no credential to read, and
+		// the model picks the paths, so the boundary is what keeps an instruction
+		// hidden in a repository file from publishing something else entirely.
+		Root:    firstNonEmpty(*root, os.Getenv("KROWK_MCP_ROOT")),
 		Version: cli.Version,
 	}
 
@@ -42,4 +48,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "krowk-mcp:", err)
 		os.Exit(1)
 	}
+}
+
+// firstNonEmpty prefers the flag, then the environment, then the default.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

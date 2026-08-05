@@ -166,6 +166,44 @@ func TestMarkdownFormatIsPasteReady(t *testing.T) {
 	}
 }
 
+// Slack renders no markdown image embeds but unfurls a bare URL itself, so the
+// plain link has to be obtainable on its own.
+func TestURLFormatIsJustTheLink(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, stdout, stderr := h.run("push", h.fixture, "--format=url")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	got := strings.TrimSpace(stdout)
+	if !regexp.MustCompile(`^http://127\.0\.0\.1:\d+/a/[0-9a-f]+$`).MatchString(got) {
+		t.Errorf("url = %q, want the bare link and nothing else", got)
+	}
+}
+
+func TestJSONOutputCarriesBothPasteForms(t *testing.T) {
+	h := newHarness(t, 0)
+
+	_, stdout, _ := h.run("push", h.fixture, "--title=Checkout")
+
+	var e struct {
+		Paste struct {
+			Markdown string `json:"markdown"`
+			URL      string `json:"url"`
+		} `json:"paste"`
+		Data artifact `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &e); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	if !strings.HasPrefix(e.Paste.Markdown, "[![Checkout](") {
+		t.Errorf("paste.markdown = %q, want the image embed", e.Paste.Markdown)
+	}
+	if e.Paste.URL != e.Data.URL {
+		t.Errorf("paste.url = %q, want the artifact URL %q", e.Paste.URL, e.Data.URL)
+	}
+}
+
 func TestMissingFileFailsBeforeUploading(t *testing.T) {
 	h := newHarness(t, 0)
 	h.env["KROWK_API_URL"] = "http://127.0.0.1:1/v1" // any upload attempt would fail loudly

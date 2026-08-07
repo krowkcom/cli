@@ -725,3 +725,40 @@ func TestTakedownSpendsAnOutstandingUploadURL(t *testing.T) {
 		t.Errorf("GET %s after takedown = %d, want 404", public, status)
 	}
 }
+
+// A retry still succeeds after the artifact it claimed was taken down.
+//
+// The registry answers a retry from `Current.workspace.artifacts.find_by`, which
+// is not scoped to `live` — so this is 200 with the tombstone, while a *fresh*
+// claim on a tombstone is the 404 the test above pins. The two live one line
+// apart here, and only the order between them keeps both right: moving the
+// tombstone check ahead of the retry branch leaves every other test passing and
+// turns this case into a 404, which is the same --dev-versus-production split
+// the 404 was introduced to close.
+func TestAClaimRetryStillSucceedsAfterTheArtifactWasTakenDown(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_test"
+
+	payload := readyArtifact(t, server, "", "the bytes")
+	slug, _ := payload["slug"].(string)
+	claimToken, _ := payload["claim_token"].(string)
+	claim := func() (int, map[string]any) {
+		return request(t, http.MethodPost, server.URL+"/v1/artifacts/"+slug+"/claim",
+			key, "application/json", fmt.Sprintf(`{"claim_token":%q}`, claimToken))
+	}
+
+	if status, body := claim(); status != http.StatusOK {
+		t.Fatalf("claim = %d %v", status, body)
+	}
+	if status, body := takeDown(t, server, key, slug, ""); status != http.StatusNoContent {
+		t.Fatalf("takedown = %d %v", status, body)
+	}
+
+	status, body := claim()
+	if status != http.StatusOK {
+		t.Fatalf("claim retry after takedown = %d %v, want 200", status, body)
+	}
+	if got, _ := body["slug"].(string); got != slug {
+		t.Errorf("retry answered with %q, want the artifact itself", got)
+	}
+}

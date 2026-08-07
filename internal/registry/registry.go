@@ -674,10 +674,24 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 	a := s.artifacts[r.PathValue("slug")]
 	// The token is checked before anything else: even an artifact the workspace
 	// already holds does not answer 200 to a token that was never its own.
+	//
+	// Stricter than the registry, deliberately and not by oversight. There the
+	// retry is a bare `find_by(slug:)` in the caller's workspace — no token read
+	// at all — so a wrong token, a missing one, and an artifact that was never
+	// anonymous all answer 200. Requiring the token here means a garbage one
+	// cannot ride the retry-after-success affordance, which is the property worth
+	// testing; the cost is that these four cases answer 404 or 400 against --dev
+	// where production answers 200. Nothing the CLI does reaches them.
 	match := a != nil && a.claimHash != "" && a.claimHash == sha256Hex([]byte(body.ClaimToken))
 	// A retry after a successful claim is the same success rather than a 404 —
 	// the hash is kept, not cleared, so the retry can still be told apart from
 	// a wrong token.
+	//
+	// This has to stay ahead of the 404 gate below, tombstone check included. The
+	// registry answers a retry from `Current.workspace.artifacts.find_by`, which
+	// is not scoped to `live`, so an artifact this workspace claimed and later
+	// took down still answers 200 here — the `live` scope only governs the branch
+	// that spends a token, which a retry no longer reaches.
 	if match && a.claimed && a.workspace == workspace {
 		writeJSON(w, http.StatusOK, serializeArtifact(a))
 		return

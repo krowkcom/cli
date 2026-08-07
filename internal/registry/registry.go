@@ -19,6 +19,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -533,7 +534,12 @@ func (s *store) listArtifacts(w http.ResponseWriter, r *http.Request) {
 // gets the default rather than being read as zero.
 func pageLimit(r *http.Request) int {
 	requested, err := strconv.Atoi(r.URL.Query().Get("limit"))
-	if err != nil {
+	// A number too large to hold is still a number asked for. Ruby has no such
+	// ceiling, so the registry parses it and clamps it like any other — and Atoi
+	// saturates rather than losing it, reporting ErrRange, so clamping the
+	// saturated value lands in the same place. Only something that is not a
+	// number at all takes the default.
+	if err != nil && !errors.Is(err, strconv.ErrRange) {
 		return defaultPageSize
 	}
 	return min(max(requested, 1), maxPageSize)

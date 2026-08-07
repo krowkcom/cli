@@ -3,6 +3,7 @@
 package output
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -705,23 +706,53 @@ func metadataValue(v any) string {
 		return value
 	case bool:
 		return strconv.FormatBool(value)
-	case float64:
-		// JSON has one number type, and Go decodes it to float64 — so an integer
-		// has to be printed without the exponent and trailing zero it would
-		// otherwise pick up.
-		return strconv.FormatFloat(value, 'f', -1, 64)
+	case json.Number:
+		// Printed exactly as it was written, digits and all.
+		return value.String()
 	case []any:
-		parts := make([]string, 0, len(value))
-		for _, item := range value {
-			parts = append(parts, metadataValue(item))
+		// A list of plain values reads better as a line than as JSON — `reference`
+		// is the field this exists for. Anything deeper is not a list of values
+		// but a structure, and flattening it would render [[1,2],[3]] and [1,2,3]
+		// identically, so it goes out as JSON instead.
+		if parts, ok := scalarList(value); ok {
+			return strings.Join(parts, "; ")
 		}
-		return strings.Join(parts, "; ")
 	}
-	encoded, err := json.Marshal(v)
-	if err != nil {
+	return encodeCompact(v)
+}
+
+// scalarList reports the elements of a list that holds only plain values, and
+// whether it is one at all. An empty list is not: it would render as nothing,
+// which is what a null and an empty string already render as.
+func scalarList(items []any) ([]string, bool) {
+	if len(items) == 0 {
+		return nil, false
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		switch item.(type) {
+		case string, bool, json.Number:
+			parts = append(parts, metadataValue(item))
+		default:
+			// A null among them included: rendering it as an empty entry would
+			// hide that anything was there.
+			return nil, false
+		}
+	}
+	return parts, true
+}
+
+// encodeCompact is JSON for a person to read, so `&`, `<` and `>` stay
+// themselves. encoding/json escapes them by default, for embedding in HTML,
+// which turns an ordinary CI URL into something that cannot be pasted.
+func encodeCompact(v any) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		return ""
 	}
-	return string(encoded)
+	return strings.TrimRight(buf.String(), "\n")
 }
 
 // runFields is a run's metadata as plain keys and values. A run that recorded
@@ -730,7 +761,14 @@ func metadataValue(v any) string {
 func runFields(r *api.Run) map[string]any {
 	var fields map[string]any
 	if len(r.Metadata) > 0 {
-		_ = json.Unmarshal(r.Metadata, &fields)
+		dec := json.NewDecoder(bytes.NewReader(r.Metadata))
+		// Numbers are kept as they were written rather than decoded to float64,
+		// which silently rounds anything past 2^53 — a build number, a Unix time
+		// in nanoseconds, a snowflake id. Rounding here would print a different
+		// number than --format=json reports for the same run, with nothing to say
+		// the digits had changed.
+		dec.UseNumber()
+		_ = dec.Decode(&fields)
 	}
 	return fields
 }
@@ -746,21 +784,27 @@ func runLabel(r *api.Run) string {
 		// One row, one run. A title is free text — `--title "$(git log -1
 		// --pretty=%B)"` is an ordinary thing for an agent to do — and a newline
 		// in it would split the row, reading as extra runs that do not exist.
-		// Control characters go for the same reason: an escape sequence in a
-		// title must not repaint the terminal.
-		return clipLabel(oneLine(s))
+		// Invisible characters go for the same reason: neither an escape sequence
+		// nor a bidi override in a title may repaint the row.
+		return oneLine(s)
 	}
+
+	var label string
 	switch {
 	case text("title") != "":
-		return text("title")
+		label = text("title")
 	case text("pull_request") != "":
-		return text("pull_request")
+		label = text("pull_request")
 	case text("repo") != "" && text("branch") != "":
-		return text("repo") + "@" + text("branch")
+		label = text("repo") + "@" + text("branch")
 	case text("repo") != "":
-		return text("repo")
+		label = text("repo")
+	default:
+		label = text("agent")
 	}
-	return text("agent")
+	// Clipped once, on the way out. Clipping each field instead would let the
+	// repo@branch rung join two capped values and reach twice the cap.
+	return clipLabel(label)
 }
 
 // maxLabelRunes keeps a listing's last column from swallowing the terminal. A
@@ -776,7 +820,7 @@ func oneLine(s string) string {
 		switch {
 		case unicode.IsSpace(r):
 			space = true
-		case unicode.IsControl(r):
+		case unicode.IsControl(r), reordering(r):
 			// Dropped outright rather than folded to a space: an escape sequence
 			// arrives as ESC plus ordinary letters, and spacing it out would leave
 			// the letters behind as text.
@@ -789,6 +833,34 @@ func oneLine(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// reordering reports the characters that move or hide text while occupying no
+// space of their own: the bidi overrides and isolates, the zero-width spaces,
+// and the byte order mark.
+//
+// A right-to-left override in a title reverses everything drawn after it, which
+// is the same "a label must not repaint the row" problem as an escape sequence
+// reached a different way — and unicode.IsControl does not cover it, since these
+// are format characters rather than control ones.
+//
+// U+200D ZERO WIDTH JOINER is deliberately kept: it is what holds a multi-part
+// emoji together, so dropping it would break one glyph into several.
+//
+// Spelled as code points rather than literals, since written literally they
+// would be invisible here too — in the one function whose job is knowing they
+// exist.
+func reordering(r rune) bool {
+	switch {
+	case r == '\u200d': // ZERO WIDTH JOINER
+		return false
+	case r == '\ufeff', // BYTE ORDER MARK
+		r >= '\u200b' && r <= '\u200f', // zero-width spaces, LRM, RLM
+		r >= '\u202a' && r <= '\u202e', // bidi embeddings and overrides
+		r >= '\u2066' && r <= '\u2069': // bidi isolates
+		return true
+	}
+	return false
 }
 
 // clipLabel truncates on runes rather than bytes, so a multi-byte character is

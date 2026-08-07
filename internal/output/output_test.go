@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/krowkcom/cli/internal/api"
 )
@@ -388,34 +389,80 @@ func TestHumanAndJSONAgreeOnACallerSuppliedRun(t *testing.T) {
 
 // The registry stores run metadata verbatim from whichever client wrote it, and
 // `runs show` exists to read that back — so it meets values krowk itself never
-// records. Rendering those with fmt would leak Go's own syntax at a person.
+// records. Rendering those with fmt would print Go's own syntax at a person.
 func TestRunDetailRendersMetadataThatIsNotAString(t *testing.T) {
 	run := &api.Run{
 		Slug:   "run_x",
 		Status: "finished",
 		Metadata: json.RawMessage(`{
-			"nothing": null, "flag": true, "count": 3, "big": 1e21,
-			"nested": {"a": 1}, "list": ["one", 2, null]
+			"nothing": null, "flag": true, "count": 3, "ratio": 3.5,
+			"nested": {"a": 1}, "refs": ["one", "two"], "holes": ["one", null],
+			"empty": [], "url": {"ci": "https://ci/job?a=1&b=2"}
 		}`),
 	}
 
 	got := RunDetail(run, Human, false, false)
+	field := func(name string) string {
+		for _, line := range strings.Split(got, "\n") {
+			if fields := strings.SplitN(strings.TrimSpace(line), " ", 2); fields[0] == name {
+				return strings.TrimSpace(fields[1])
+			}
+		}
+		t.Fatalf("no %q field in:\n%s", name, got)
+		return ""
+	}
 
-	for _, leak := range []string{"<nil>", "map[", "1e+21", "%!"} {
-		if strings.Contains(got, leak) {
-			t.Errorf("output leaks Go syntax %q:\n%s", leak, got)
+	for name, want := range map[string]string{
+		"flag":  "true",
+		"count": "3",
+		"ratio": "3.5",
+		// A list of plain values reads as a line; anything deeper is a structure,
+		// and flattening it would render [[1,2],[3]] and [1,2,3] alike.
+		"refs":   "one; two",
+		"nested": `{"a":1}`,
+		// A null among the values must not vanish into an empty entry, and an
+		// empty list must not read the same as a null or an empty string.
+		"holes": `["one",null]`,
+		"empty": "[]",
+		// `&` is itself here. encoding/json escapes it for embedding in HTML,
+		// which would make an ordinary CI URL unpasteable.
+		"url": `{"ci":"https://ci/job?a=1&b=2"}`,
+	} {
+		if got := field(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
 		}
 	}
-	for _, want := range []string{
-		"flag          true",
-		"count         3",
-		"big           1000000000000000000000",
-		`nested        {"a":1}`,
-		"list          one; 2; ",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("missing %q in:\n%s", want, got)
-		}
+	// A null renders as nothing rather than as the word null.
+	if !strings.Contains(got, "nothing       \n") && !strings.HasSuffix(got, "nothing       ") {
+		t.Errorf("a null should render as an empty value:\n%q", got)
+	}
+}
+
+// A person and an agent have to be told the same number. Metadata decoded into
+// float64 silently rounds past 2^53 — build numbers, Unix times in nanoseconds
+// and snowflake ids all live up there — so the digits would differ between
+// `--format=human` and `--format=json` with nothing to say so.
+func TestALargeNumberSurvivesTheHumanRendering(t *testing.T) {
+	const exact = "1754582400123456789"
+	run := &api.Run{
+		Slug:     "run_x",
+		Status:   "open",
+		Metadata: json.RawMessage(`{"build_id": ` + exact + `, "huge": 1e300}`),
+	}
+
+	human := RunDetail(run, Human, false, false)
+	if !strings.Contains(human, exact) {
+		t.Errorf("human output lost precision, want %s in:\n%s", exact, human)
+	}
+	// And a number written in exponent form stays in it, rather than expanding
+	// to the 301 digits that would swallow the row.
+	if !strings.Contains(human, "1e300") {
+		t.Errorf("want 1e300 kept as written, got:\n%s", human)
+	}
+
+	// The JSON form carries the raw metadata, so the two must agree.
+	if encoded := RunDetail(run, JSON, false, false); !strings.Contains(encoded, exact) {
+		t.Errorf("json output = %s, want %s", encoded, exact)
 	}
 }
 
@@ -423,38 +470,80 @@ func TestRunDetailRendersMetadataThatIsNotAString(t *testing.T) {
 // ordinary thing for an agent to do — a newline in it would split the row and
 // read as runs that do not exist.
 func TestARunLabelStaysOnItsOwnRow(t *testing.T) {
-	runWith := func(title string) *api.Run {
-		encoded, err := json.Marshal(map[string]string{"title": title})
+	label := func(fields map[string]string) string {
+		encoded, err := json.Marshal(fields)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return &api.Run{Slug: "run_x", Status: "open", Metadata: encoded}
+		row := RunList(&api.RunPage{Runs: []*api.Run{{
+			Slug: "run_x", Status: "open", Metadata: encoded,
+		}}}, Human, false, false)
+		if strings.Count(row, "\n") != 0 {
+			t.Fatalf("the label split the row:\n%s", row)
+		}
+		return strings.TrimPrefix(row, "run_x  open  ")
 	}
 
-	multiline := RunList(
-		&api.RunPage{Runs: []*api.Run{runWith("Fix checkout\n\nThe button did nothing.\n")}},
-		Human, false, false)
-	if strings.Count(multiline, "\n") != 0 {
-		t.Errorf("a multi-line title split the row:\n%s", multiline)
+	if got := label(map[string]string{"title": "Fix checkout\n\nThe button did nothing.\n"}); got != "Fix checkout The button did nothing." {
+		t.Errorf("multi-line title = %q", got)
 	}
-	if !strings.Contains(multiline, "Fix checkout The button did nothing.") {
-		t.Errorf("title not folded onto one line:\n%s", multiline)
+	// Neither an escape sequence nor a bidi override may repaint the row. The
+	// override is the subtler one: it reverses everything drawn after it, so a
+	// title can make a row read as something it is not.
+	if got := label(map[string]string{"title": "\x1b[31mred\x1b[0m"}); strings.ContainsRune(got, '\x1b') {
+		t.Errorf("escape sequence survived: %q", got)
+	}
+	if got := label(map[string]string{"title": "safe ‮gnp.txt"}); strings.ContainsRune(got, '‮') {
+		t.Errorf("bidi override survived: %q", got)
+	}
+	// A joiner is kept, or a multi-part emoji breaks into its pieces.
+	if got := label(map[string]string{"title": "ship \U0001f469‍\U0001f4bb"}); !strings.Contains(got, "‍") {
+		t.Errorf("zero width joiner dropped, emoji split: %q", got)
+	}
+}
+
+// The cap is on the label, and the repo@branch rung joins two fields — clipping
+// each of them instead of the result would let a row reach twice the cap.
+func TestARunLabelIsClippedOnceWhateverItIsBuiltFrom(t *testing.T) {
+	label := func(fields map[string]string) string {
+		encoded, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		row := RunList(&api.RunPage{Runs: []*api.Run{{
+			Slug: "run_x", Status: "open", Metadata: encoded,
+		}}}, Human, false, false)
+		return strings.TrimPrefix(row, "run_x  open  ")
 	}
 
-	// An escape sequence must not repaint the terminal from a title.
-	escaped := RunList(
-		&api.RunPage{Runs: []*api.Run{runWith("\x1b[31mred\x1b[0m")}},
-		Human, false, false)
-	if strings.Contains(escaped, "\x1b") {
-		t.Errorf("escape sequence survived into the row: %q", escaped)
+	for name, fields := range map[string]map[string]string{
+		"title": {"title": strings.Repeat("x", 300)},
+		"joined": {
+			"repo":   strings.Repeat("r", 100),
+			"branch": strings.Repeat("b", 100),
+		},
+	} {
+		got := label(fields)
+		if n := len([]rune(got)); n > maxLabelRunes+1 {
+			t.Errorf("%s label is %d runes, want at most %d plus the ellipsis", name, n, maxLabelRunes)
+		}
+		if !strings.HasSuffix(got, "…") {
+			t.Errorf("%s label was not clipped: %q", name, got)
+		}
 	}
 
-	// And a commit message pasted whole is truncated rather than swallowing the
-	// terminal.
-	long := RunList(
-		&api.RunPage{Runs: []*api.Run{runWith(strings.Repeat("x", 300))}},
-		Human, false, false)
-	if !strings.Contains(long, "…") || len([]rune(long)) > 140 {
-		t.Errorf("long title not clipped (%d runes):\n%s", len([]rune(long)), long)
+	// Clipped on runes, not bytes, so a multi-byte character is never cut in
+	// half and the row stays valid UTF-8.
+	//
+	// The leading "x" is what makes this bite. Without it a byte-slice at the cap
+	// would land on a character boundary anyway — the cap divides evenly by every
+	// UTF-8 width — and the bug would go unnoticed. One odd byte in front puts the
+	// cut in the middle of a character.
+	got := label(map[string]string{"title": "x" + strings.Repeat("é", 300)})
+	if !utf8.ValidString(got) {
+		t.Errorf("clipping produced invalid UTF-8: %q", got)
+	}
+	if n := len([]rune(got)); n > maxLabelRunes+1 {
+		t.Errorf("multi-byte label is %d runes, want at most %d plus the ellipsis", n, maxLabelRunes)
 	}
 }

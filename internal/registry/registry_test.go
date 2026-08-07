@@ -948,8 +948,14 @@ func TestPageSizeIsClampedRatherThanRefused(t *testing.T) {
 		// An unreadable or out-of-range limit is the default; a readable one is
 		// clamped into the served range. Neither is ever unbounded.
 		want := defaultPageSize
-		if limit == "0" || limit == "-1" {
+		switch limit {
+		case "0", "-1":
 			want = 1
+		case "999999999999999999999":
+			// Not refused for being unrepresentable: the registry parses it as a
+			// bignum and clamps it like any other number, so this has to land on
+			// the ceiling rather than quietly fall back to the default.
+			want = maxPageSize
 		}
 		if got != want {
 			t.Errorf("limit=%q served %d rows, want %d", limit, got, want)

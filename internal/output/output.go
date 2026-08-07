@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/krowkcom/cli/internal/api"
 )
@@ -680,10 +682,46 @@ func RunDetail(r *api.Run, f Format, quiet, colour bool) string {
 	// Metadata is whatever the caller chose to record, so it is printed as it
 	// arrived rather than interpreted into fields this command would have to know
 	// about. Sorted, so the same run always prints the same way.
-	for _, k := range slices.Sorted(maps.Keys(runFields(r))) {
-		lines = append(lines, fmt.Sprintf("  %-13s %s", k, joinValues(runFields(r)[k])))
+	fields := runFields(r)
+	for _, k := range slices.Sorted(maps.Keys(fields)) {
+		lines = append(lines, fmt.Sprintf("  %-13s %s", k, metadataValue(fields[k])))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// metadataValue renders one recorded value for a person.
+//
+// The registry stores metadata verbatim from whichever client wrote it, and this
+// command exists to read that back — so the value is not necessarily a string or
+// a list of them, which is all krowk itself records. Printing an arbitrary value
+// with fmt leaks Go's own syntax: a JSON null becomes `<nil>`, an object becomes
+// `map[a:1]`. Anything that is not a scalar or a list of them goes back out as
+// the JSON it arrived as.
+func metadataValue(v any) string {
+	switch value := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return value
+	case bool:
+		return strconv.FormatBool(value)
+	case float64:
+		// JSON has one number type, and Go decodes it to float64 — so an integer
+		// has to be printed without the exponent and trailing zero it would
+		// otherwise pick up.
+		return strconv.FormatFloat(value, 'f', -1, 64)
+	case []any:
+		parts := make([]string, 0, len(value))
+		for _, item := range value {
+			parts = append(parts, metadataValue(item))
+		}
+		return strings.Join(parts, "; ")
+	}
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
 }
 
 // runFields is a run's metadata as plain keys and values. A run that recorded
@@ -705,7 +743,12 @@ func runLabel(r *api.Run) string {
 	fields := runFields(r)
 	text := func(key string) string {
 		s, _ := fields[key].(string)
-		return s
+		// One row, one run. A title is free text — `--title "$(git log -1
+		// --pretty=%B)"` is an ordinary thing for an agent to do — and a newline
+		// in it would split the row, reading as extra runs that do not exist.
+		// Control characters go for the same reason: an escape sequence in a
+		// title must not repaint the terminal.
+		return clipLabel(oneLine(s))
 	}
 	switch {
 	case text("title") != "":
@@ -718,6 +761,44 @@ func runLabel(r *api.Run) string {
 		return text("repo")
 	}
 	return text("agent")
+}
+
+// maxLabelRunes keeps a listing's last column from swallowing the terminal. A
+// title long enough to hit this is a commit message, not a label.
+const maxLabelRunes = 72
+
+// oneLine folds every run of whitespace to a single space and drops the control
+// characters that would otherwise move the cursor or recolour the row.
+func oneLine(s string) string {
+	var b strings.Builder
+	space := false
+	for _, r := range strings.TrimSpace(s) {
+		switch {
+		case unicode.IsSpace(r):
+			space = true
+		case unicode.IsControl(r):
+			// Dropped outright rather than folded to a space: an escape sequence
+			// arrives as ESC plus ordinary letters, and spacing it out would leave
+			// the letters behind as text.
+		default:
+			if space && b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			space = false
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// clipLabel truncates on runes rather than bytes, so a multi-byte character is
+// never cut in half.
+func clipLabel(s string) string {
+	runes := []rune(s)
+	if len(runes) <= maxLabelRunes {
+		return s
+	}
+	return string(runes[:maxLabelRunes]) + "…"
 }
 
 // Error renders a failure. Human output leads with the code and ends with the

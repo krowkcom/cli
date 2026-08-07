@@ -1,6 +1,9 @@
 package registry
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -453,5 +456,49 @@ func TestAttachRunIsScopedToTheKeysWorkspace(t *testing.T) {
 		server.URL+"/v1/artifacts/"+anonSlug+"/run", owner, "application/json",
 		fmt.Sprintf(`{"run":%q}`, run)); status != http.StatusNotFound {
 		t.Errorf("an unclaimed anonymous upload was attachable: %d %v", status, payload)
+	}
+}
+
+// The real presign signs the digest as a header, so storage refuses the PUT
+// outright when it is missing — the signature does not verify without it. The
+// header therefore has to be handed over and has to be required, or a client
+// that ignores upload.headers passes here and fails against R2.
+func TestUploadRequiresTheChecksumHeaderItWasHanded(t *testing.T) {
+	server, _ := newClockedServer(t)
+	body := "the bytes"
+	sum := sha256.Sum256([]byte(body))
+	encoded := base64.StdEncoding.EncodeToString(sum[:])
+
+	status, payload := request(t, http.MethodPost, server.URL+"/v1/artifacts", "", "application/json",
+		fmt.Sprintf(`{"artifact":{"filename":"a.txt","content_type":"text/plain","byte_size":%d,"checksum":%q}}`,
+			len(body), hex.EncodeToString(sum[:])))
+	if status != http.StatusCreated {
+		t.Fatalf("declare = %d %v", status, payload)
+	}
+
+	up, _ := payload["upload"].(map[string]any)
+	headers, _ := up["headers"].(map[string]any)
+	if got, _ := headers["x-amz-checksum-sha256"].(string); got != encoded {
+		t.Errorf("upload.headers[x-amz-checksum-sha256] = %q, want %q", got, encoded)
+	}
+
+	url := uploadURL(t, payload)
+	if got := put(t, url, body); got != http.StatusForbidden {
+		t.Errorf("PUT without the checksum header = %d, want 403", got)
+	}
+
+	req, err := http.NewRequest(http.MethodPut, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("x-amz-checksum-sha256", encoded)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("PUT with the checksum header = %d, want 200", res.StatusCode)
 	}
 }

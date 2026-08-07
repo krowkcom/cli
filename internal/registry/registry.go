@@ -16,6 +16,7 @@ package registry
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -275,10 +276,17 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	for k, v := range serializeArtifact(a) {
 		payload[k] = v
 	}
+	uploadHeaders := map[string]string{"Content-Type": a.ContentType, "Content-Length": itoa(a.ByteSize)}
+	// Handed over because the real presign signs it as a header: storage reads the
+	// checksum from there, not from the query string, and refuses the PUT without
+	// it. A client that sends the headers it is given needs no change for it.
+	if a.Checksum != "" {
+		uploadHeaders["x-amz-checksum-sha256"] = base64Sum(a.Checksum)
+	}
 	payload["upload"] = map[string]any{
 		"method":     "PUT",
 		"url":        url + "?upload_token=" + a.uploadTok,
-		"headers":    map[string]string{"Content-Type": a.ContentType, "Content-Length": itoa(a.ByteSize)},
+		"headers":    uploadHeaders,
 		"expires_at": a.uploadTil.Format(time.RFC3339Nano),
 	}
 	payload["next_step"] = "PUT the file to upload.url with the headers in upload.headers, " +
@@ -327,6 +335,14 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if got := r.Header.Get("Content-Type"); got != wantType {
+		writeXMLError(w, http.StatusForbidden, "SignatureDoesNotMatch")
+		return
+	}
+	// The digest is signed as a header, so real storage refuses the PUT before it
+	// reads the body when that header is missing or altered — the signature does
+	// not verify without it. A client that ignores upload.headers has to fail here
+	// too, or it passes against this and fails against R2.
+	if wantSum != "" && r.Header.Get("x-amz-checksum-sha256") != base64Sum(wantSum) {
 		writeXMLError(w, http.StatusForbidden, "SignatureDoesNotMatch")
 		return
 	}
@@ -863,6 +879,16 @@ func randomToken() string {
 func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// Checksums travel as lowercase hex in the API — readable, and what sha256sum
+// prints — but S3 wants them base64 encoded, so the upload header carries that.
+func base64Sum(hexSum string) string {
+	raw, err := hex.DecodeString(hexSum)
+	if err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(raw)
 }
 
 func itoa(n int64) string { return fmt.Sprintf("%d", n) }

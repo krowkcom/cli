@@ -734,8 +734,16 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Object storage is not part of the registry's API surface.
 		if !strings.HasPrefix(r.URL.Path, "/_storage") {
+			call := r.Method + " " + normalizeSlugs(r.URL.Path)
+			// The header is part of the shared contract, so it is pinned with the
+			// method and the path rather than tested somewhere off to the side: a
+			// create that stops naming its attempt goes back to charging for every
+			// retry, and nothing else here would notice.
+			if r.Header.Get("Idempotency-Key") != "" {
+				call += " +key"
+			}
 			mu.Lock()
-			calls = append(calls, r.Method+" "+normalizeSlugs(r.URL.Path))
+			calls = append(calls, call)
 			mu.Unlock()
 		}
 		inner.ServeHTTP(w, r)
@@ -769,9 +777,11 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	h.ok("uploads", "delete", anonymous.Slug)
 
 	want := []string{
-		// push, with a key: open a run, declare, finalize, close the run.
-		"POST /v1/runs",
-		"POST /v1/artifacts",
+		// push, with a key: open a run, declare, finalize, close the run. The two
+		// creates name their attempt so a retry of either costs nothing; +key marks
+		// the ones that carry an Idempotency-Key, and only those two do.
+		"POST /v1/runs +key",
+		"POST /v1/artifacts +key",
 		"PUT /v1/artifacts/{slug}/finalization",
 		"PUT /v1/runs/{slug}/completion",
 		"GET /v1/artifacts",
@@ -783,7 +793,7 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 		"GET /",
 		"GET /v1/key",
 		// push, keyless: no run to open or close.
-		"POST /v1/artifacts",
+		"POST /v1/artifacts +key",
 		"PUT /v1/artifacts/{slug}/finalization",
 		"POST /v1/artifacts/{slug}/claim",
 		// and the run it never had, set afterwards.
@@ -910,18 +920,23 @@ func TestUnfinishedRunIsReportedNotSwallowed(t *testing.T) {
 	}
 }
 
-// Opening a run is not idempotent: a run committed under a lost response would
-// be duplicated by a retry, and the first slug orphaned. So it gets one attempt.
-func TestCreateRunIsNotRetried(t *testing.T) {
+// Opening a run used to get exactly one attempt: it is a POST, and a run
+// committed under a lost response would be duplicated by the retry, orphaning the
+// first slug. An Idempotency-Key removes that trade — the retry is answered with
+// the run the first attempt opened — so this is retried like anything else, and a
+// transient failure on the way to opening a run no longer costs the whole upload.
+//
+// Every attempt has to carry the same key. A retry under a fresh one is a second
+// create by another name, and the duplicate this used to avoid is back.
+func TestCreateRunIsRetriedUnderOneKey(t *testing.T) {
 	var mu sync.Mutex
-	var runPosts int
+	var keys []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs" {
 			mu.Lock()
-			runPosts++
+			keys = append(keys, r.Header.Get("Idempotency-Key"))
 			mu.Unlock()
 		}
-		// Retryable by policy — which is exactly why this endpoint must opt out.
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprint(w, `{"error":{"code":"boom","message":"transient"}}`)
 	}))
@@ -937,8 +952,16 @@ func TestCreateRunIsNotRetried(t *testing.T) {
 	h.fails("push", h.fixture)
 	mu.Lock()
 	defer mu.Unlock()
-	if runPosts != 1 {
-		t.Errorf("POST /v1/runs was sent %d times, want exactly 1", runPosts)
+	if len(keys) != 3 {
+		t.Fatalf("POST /v1/runs was sent %d times, want 3 attempts", len(keys))
+	}
+	for i, key := range keys {
+		if key == "" {
+			t.Fatalf("attempt %d carried no Idempotency-Key", i+1)
+		}
+		if key != keys[0] {
+			t.Errorf("attempt %d used key %q, want the first attempt's %q", i+1, key, keys[0])
+		}
 	}
 }
 

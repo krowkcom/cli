@@ -25,6 +25,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -391,10 +392,15 @@ func (c *Client) Push(ctx context.Context, spec Spec) (*Artifact, error) {
 }
 
 // PrepareArtifact records the artifact and returns the presigned upload.
+//
+// Named with an Idempotency-Key, because this is the call a lost response makes
+// expensive: without one a retry declares a second artifact, the first is left to
+// expire, and both count as uploads. With one, the retry is answered with the
+// artifact the first attempt already made.
 func (c *Client) PrepareArtifact(ctx context.Context, spec Spec) (*Artifact, error) {
 	var artifact Artifact
 	body := map[string]any{"artifact": spec}
-	if err := c.call(ctx, http.MethodPost, "/artifacts", body, &artifact); err != nil {
+	if err := c.callIdempotent(ctx, http.MethodPost, "/artifacts", body, &artifact); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
@@ -578,14 +584,16 @@ func (c *Client) TakeDownArtifact(ctx context.Context, slug, claimToken string) 
 // CreateRun opens a run to hang artifacts off. Needs a key: a run belongs to a
 // workspace, and a keyless upload has none.
 //
-// Not retried: the POST is not idempotent, and a run committed under a lost
-// response would be duplicated by the retry — an orphan whose slug never
-// surfaces anywhere. Declaring an artifact is the same mechanics, but a stray
-// pending record is harmless where a stray open run is not.
+// Retried, now that an Idempotency-Key makes it safe to. It used to be sent
+// once and only once: a run committed under a lost response would be duplicated
+// by the retry, an orphan whose slug never surfaces anywhere, and that was worse
+// than failing the push outright. The key removes the choice — the retry is
+// answered with the run the first attempt opened — so a transient 502 on the way
+// to opening a run no longer costs the whole upload.
 func (c *Client) CreateRun(ctx context.Context, metadata any) (*Run, error) {
 	var run Run
 	body := map[string]any{"run": map[string]any{"metadata": metadata}}
-	if err := c.callOnce(ctx, http.MethodPost, "/runs", body, &run); err != nil {
+	if err := c.callIdempotent(ctx, http.MethodPost, "/runs", body, &run); err != nil {
 		return nil, err
 	}
 	return &run, nil
@@ -729,26 +737,69 @@ func (c *Client) putOnce(req *http.Request) error {
 
 // call makes one registry request, with retries, decoding into out.
 func (c *Client) call(ctx context.Context, method, path string, body any, out any) error {
-	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, maxAttempts, nil)
+	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, maxAttempts, nil, "")
 }
 
 // callStatus is call for the rare caller that needs the HTTP status a success
 // arrived with, not just the decoded body.
 func (c *Client) callStatus(ctx context.Context, method, path string, body any, out any, status *int) error {
-	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, maxAttempts, status)
+	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, maxAttempts, status, "")
 }
 
 // callOnce is call without the retry loop, for requests that must not be
 // repeated on a lost response.
 func (c *Client) callOnce(ctx context.Context, method, path string, body any, out any) error {
-	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, 1, nil)
+	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, 1, nil, "")
+}
+
+// callIdempotent is call for the two endpoints that create something. One key is
+// minted here and carried by every attempt of this one call, which is what makes
+// the retry loop safe on a POST: the registry answers a key it has already seen
+// with the record it made the first time, so a lost response costs a duplicate
+// artifact and a duplicate upload charge no longer.
+//
+// Deliberately per call rather than per `push`. A push declares one artifact per
+// file, and the registry matches a key against the payload it was first used with
+// — so one key spread across three files would have the second file refused as a
+// reuse. It does span the run and the artifact of the same call, since the
+// registry scopes a key by what it creates.
+//
+// A fresh `krowk push` mints fresh keys, and that is right: re-running the
+// command is a new attempt, not a retry of the old one.
+func (c *Client) callIdempotent(ctx context.Context, method, path string, body any, out any) error {
+	key, err := newIdempotencyKey()
+	if err != nil {
+		return err
+	}
+	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, maxAttempts, nil, key)
 }
 
 func (c *Client) do(ctx context.Context, method, url string, body any, out any) error {
-	return c.doAttempts(ctx, method, url, body, out, maxAttempts, nil)
+	return c.doAttempts(ctx, method, url, body, out, maxAttempts, nil, "")
 }
 
-func (c *Client) doAttempts(ctx context.Context, method, url string, body any, out any, attempts int, status *int) error {
+// newIdempotencyKey is 128 random bits, shaped as a version 4 UUID because that
+// is the shape the registry's documentation asks for.
+//
+// Unguessable rather than merely unique, and that part is load-bearing on a
+// keyless push. With no API key there is nothing else a retry can present to
+// prove it is the client that made the original call, so the registry scopes
+// keys by address — and a predictable key would let anyone sharing that address,
+// a NAT or a CI runner pool, replay this declare and be handed a URL to write
+// its bytes.
+func newIdempotencyKey() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", Fail("no_idempotency_key",
+			"this machine's random source is unreadable, so a retry could not be named safely")
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+func (c *Client) doAttempts(ctx context.Context, method, url string, body any, out any, attempts int, status *int, idempotencyKey string) error {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -776,6 +827,12 @@ func (c *Client) doAttempts(ctx context.Context, method, url string, body any, o
 		req.Header.Set("Accept", "application/json")
 		if c.Token != "" {
 			req.Header.Set("Authorization", "Bearer "+c.Token)
+		}
+		// Set inside the loop but the same value every time, which is the whole
+		// point: it is what tells the registry that attempt two is attempt one
+		// again rather than a second create.
+		if idempotencyKey != "" {
+			req.Header.Set("Idempotency-Key", idempotencyKey)
 		}
 
 		err = c.doOnce(req, out, status)

@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"path"
 	"slices"
@@ -101,14 +102,32 @@ type run struct {
 	seq int
 }
 
+// answered is a create this stand-in has already replied to, found again by the
+// Idempotency-Key a client named its attempt with.
+//
+// requestHash is what the key was first used for, because the same key arriving
+// with a different payload is a refusal rather than a replay. The record is held
+// by slug rather than by pointer so this cannot end up pointing at an artifact
+// that is gone.
+type answered struct {
+	requestHash string
+	artifact    string
+	run         string
+}
+
 type store struct {
 	mu        sync.Mutex
 	artifacts map[string]*artifact
 	runs      map[string]*run
 	objects   map[string][]byte
-	created   int
-	runsOpen  int
-	now       func() time.Time
+	// Keyed by what is being created, who is creating it, and the client's key —
+	// all three, as the real registry digests all three. Per kind so one key can
+	// cover the run and the artifact of a single push; per caller so one client's
+	// key cannot collide with, or be replayed by, another's.
+	idempotent map[string]*answered
+	created    int
+	runsOpen   int
+	now        func() time.Time
 }
 
 // Handler serves the stand-in registry. siteURL is the origin baked into the
@@ -126,10 +145,11 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 		limitBytes = DefaultLimitBytes
 	}
 	s := &store{
-		artifacts: map[string]*artifact{},
-		runs:      map[string]*run{},
-		objects:   map[string][]byte{},
-		now:       now,
+		artifacts:  map[string]*artifact{},
+		runs:       map[string]*run{},
+		objects:    map[string][]byte{},
+		idempotent: map[string]*answered{},
+		now:        now,
 	}
 
 	mux := http.NewServeMux()
@@ -249,8 +269,32 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		return
 	}
 
+	attempt, ok := idempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	// Who the key belongs to. A keyed request has a workspace the token proves; a
+	// keyless one has nothing to prove anything with, so it falls back to the
+	// address it came from — which makes the key itself the credential for a
+	// keyless caller.
+	scope := workspace
+	if anonymous {
+		scope = "ip:" + clientAddress(r)
+	}
+	requestHash := sha256Hex([]byte(fmt.Sprintf("%q", []string{
+		in.Filename, in.ContentType, itoa(in.ByteSize), strings.ToLower(in.Checksum), in.Run,
+	})))
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if attempt != "" {
+		if found, matches := s.replay("artifact", scope, attempt, requestHash); found != nil {
+			if s.replayDeclare(w, found, matches) {
+				return
+			}
+		}
+	}
 
 	if in.Run != "" {
 		if existing, ok := s.runs[in.Run]; !ok || existing.workspace != workspace {
@@ -286,7 +330,6 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	s.created++
 	a.seq = s.created
 
-	payload := map[string]any{}
 	var claimToken string
 	if anonymous {
 		a.ExpiresAt = now.Add(ephemeralLifetime).Format(time.RFC3339Nano)
@@ -295,9 +338,26 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	}
 	s.artifacts[slug] = a
 
+	if attempt != "" {
+		s.remember("artifact", scope, attempt, requestHash, &answered{artifact: slug})
+	}
+
+	writeJSON(w, http.StatusCreated, s.declared(a, claimToken))
+}
+
+// declared is what a create answers with: the artifact, where to put its bytes,
+// and what to do next.
+//
+// Split out because a replay answers the same shape over the record it already
+// made. The upload block is minted again there rather than repeated from the first
+// answer — a signature is good for 15 minutes while an artifact waits far longer,
+// so a stored one is usually dead by the time a retry asks.
+func (s *store) declared(a *artifact, claimToken string) map[string]any {
+	payload := map[string]any{}
 	for k, v := range serializeArtifact(a) {
 		payload[k] = v
 	}
+
 	uploadHeaders := map[string]string{"Content-Type": a.ContentType, "Content-Length": itoa(a.ByteSize)}
 	// Handed over because the real presign signs it as a header: storage reads the
 	// checksum from there, not from the query string, and refuses the PUT without
@@ -307,17 +367,57 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	}
 	payload["upload"] = map[string]any{
 		"method":     "PUT",
-		"url":        url + "?upload_token=" + a.uploadTok,
+		"url":        a.URL + "?upload_token=" + a.uploadTok,
 		"headers":    uploadHeaders,
 		"expires_at": a.uploadTil.Format(time.RFC3339Nano),
 	}
 	payload["next_step"] = "PUT the file to upload.url with the headers in upload.headers, " +
-		"then PUT /v1/artifacts/" + slug + "/finalization"
+		"then PUT /v1/artifacts/" + a.Slug + "/finalization"
 	if claimToken != "" {
 		payload["claim_token"] = claimToken
 	}
+	return payload
+}
 
-	writeJSON(w, http.StatusCreated, payload)
+// replayDeclare answers a retried declare with the artifact the first attempt
+// made, and reports whether it handled the request.
+//
+// The state is asked about before a URL is handed out, because a key outlives its
+// artifact's lifecycle: takedown keeps the row, so without this a replay would
+// mint a fresh PUT over the storage key of an artifact somebody deleted. Ready and
+// expired are refused for the same reason the represign endpoint refuses them.
+//
+// One place this stand-in is deliberately thinner than the real registry: a real
+// presign leaves earlier signatures valid until they expire, while re-minting here
+// revokes the previous token. Nothing a client does depends on the old one — the
+// retry uses the URL it was just handed — so the simpler model stays.
+func (s *store) replayDeclare(w http.ResponseWriter, found *answered, matches bool) bool {
+	a, ok := s.artifacts[found.artifact]
+	if !ok {
+		return false
+	}
+	if !matches {
+		keyReused(w, a.Slug)
+		return true
+	}
+	if s.refuseIfGone(w, a) {
+		return true
+	}
+	if a.State == "ready" {
+		writeError(w, http.StatusConflict, "already_finalized",
+			a.Slug+" is already finalized — declare a new artifact for new bytes", nil)
+		return true
+	}
+
+	now := s.now().UTC()
+	a.uploadTok = randomToken()
+	a.uploadTil = now.Add(uploadURLLifetime)
+
+	// The claim token is not re-issued. Re-minting one would void the token the
+	// first response may already have delivered, and the row keeps only its digest
+	// regardless — as in the real registry.
+	writeJSON(w, http.StatusCreated, s.declared(a, ""))
+	return true
 }
 
 // putObject is object storage. It enforces what the real presigned URL enforces
@@ -842,6 +942,12 @@ func (s *store) createRun(w http.ResponseWriter, r *http.Request) {
 		metadata = json.RawMessage("{}")
 	}
 
+	attempt, ok := idempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	requestHash := sha256Hex(metadata)
+
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	entry := &run{
 		Slug:      generateSlug("run"),
@@ -853,9 +959,28 @@ func (s *store) createRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	// A run has no upload to close and no tombstone to trip over, so a replay is
+	// simply the run the first attempt opened — however far through its lifecycle
+	// it has since gone.
+	if attempt != "" {
+		if found, matches := s.replay("run", workspace, attempt, requestHash); found != nil {
+			if opened, live := s.runs[found.run]; live {
+				s.mu.Unlock()
+				if !matches {
+					keyReused(w, opened.Slug)
+					return
+				}
+				writeJSON(w, http.StatusCreated, opened)
+				return
+			}
+		}
+	}
 	s.runsOpen++
 	entry.seq = s.runsOpen
 	s.runs[entry.Slug] = entry
+	if attempt != "" {
+		s.remember("run", workspace, attempt, requestHash, &answered{run: entry.Slug})
+	}
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusCreated, entry)
@@ -1164,6 +1289,70 @@ func randomToken() string {
 func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// clientAddress is where a request came from, which is the only identity a
+// keyless caller has to scope an Idempotency-Key by.
+func clientAddress(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+// idempotencyKey reads the header a client names its attempt with, and reports
+// whether the request may go on.
+//
+// A header sent empty is refused rather than treated as absent, exactly as the
+// real registry refuses it: the client asked for the guarantee and would not be
+// getting it, and a retry that quietly stops deduplicating surfaces as a
+// surprise on a bill rather than as an error.
+func idempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	values, sent := r.Header["Idempotency-Key"]
+	if !sent {
+		return "", true
+	}
+	key := ""
+	if len(values) > 0 {
+		key = strings.TrimSpace(values[0])
+	}
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: Idempotency-Key.", nil)
+		return "", false
+	}
+	return key, true
+}
+
+// replay finds what a key already created, and reports whether the payload it
+// arrived with is the one it was first used for.
+//
+// No expiry, deliberately. The real registry promises a key is honoured for *at
+// least* a day and sweeps it hourly after that, so a key it still answers for is
+// one this process must answer for too — cutting them off at exactly a day here
+// would have the stand-in refuse replays the registry allows, which is the drift
+// that matters. Honouring them for as long as the process lives errs the safe way,
+// and nothing a client does depends on a key going stale.
+func (s *store) replay(kind, scope, key, requestHash string) (*answered, bool) {
+	found, ok := s.idempotent[kind+"\n"+scope+"\n"+key]
+	if !ok {
+		return nil, false
+	}
+	return found, found.requestHash == requestHash
+}
+
+func (s *store) remember(kind, scope, key, requestHash string, entry *answered) {
+	entry.requestHash = requestHash
+	s.idempotent[kind+"\n"+scope+"\n"+key] = entry
+}
+
+// keyReused is the one refusal an Idempotency-Key adds to the wire. 409 rather
+// than 422 for the same reason already_finalized is one: nothing about the
+// payload is wrong, and what refuses it is a record that already exists.
+func keyReused(w http.ResponseWriter, slug string) {
+	writeError(w, http.StatusConflict, "idempotency_key_reused",
+		"this Idempotency-Key already created "+slug+
+			" from a different request — send a new key to create something else", nil)
 }
 
 // Checksums travel as lowercase hex in the API — readable, and what sha256sum

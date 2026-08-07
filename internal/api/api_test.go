@@ -345,3 +345,122 @@ func TestASlugCannotEscapeItsPathSegment(t *testing.T) {
 		}
 	}
 }
+
+// The whole point of the header: a retry of a lost create has to be recognisable
+// as the same attempt, so the key is minted once per call and repeated by every
+// attempt of it. A fresh key per attempt would make the retry a second create.
+func TestIdempotencyKeyIsOneKeyRepeatedAcrossAttempts(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		attempt := len(keys)
+		mu.Unlock()
+		if attempt < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"error":{"code":"overloaded","message":"try later"}}`)
+			return
+		}
+		fmt.Fprint(w, `{"slug":"art_x","state":"pending","upload":{"url":"http://x/y"}}`)
+	}))
+	defer server.Close()
+
+	client, _ := testClient(server)
+	if _, err := client.PrepareArtifact(context.Background(), Spec{
+		Filename: "a.txt", ContentType: "text/plain", ByteSize: 9,
+	}); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 3 {
+		t.Fatalf("attempts = %d, want 3", len(keys))
+	}
+	for i, key := range keys {
+		if key == "" {
+			t.Fatalf("attempt %d carried no Idempotency-Key", i+1)
+		}
+		if key != keys[0] {
+			t.Errorf("attempt %d sent %q, want the first attempt's %q", i+1, key, keys[0])
+		}
+	}
+}
+
+// Two calls are two attempts, not one retried — so they must not share a key, or
+// the second declare would be answered with the first one's artifact.
+func TestEachCreateGetsItsOwnKey(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		mu.Unlock()
+		fmt.Fprint(w, `{"slug":"art_x","state":"pending","upload":{"url":"http://x/y"}}`)
+	}))
+	defer server.Close()
+
+	client, _ := testClient(server)
+	spec := Spec{Filename: "a.txt", ContentType: "text/plain", ByteSize: 9}
+	for range 2 {
+		if _, err := client.PrepareArtifact(context.Background(), spec); err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 2 {
+		t.Fatalf("calls = %d, want 2", len(keys))
+	}
+	if keys[0] == keys[1] {
+		t.Error("two separate declares shared one key, so the second would replay the first")
+	}
+}
+
+// Unguessable rather than merely unique: on a keyless push the key is the only
+// thing a retry can present to prove it made the original call, and the registry
+// scopes keys by address, so a predictable one hands the declare to anyone sharing
+// that address.
+func TestIdempotencyKeysDoNotRepeat(t *testing.T) {
+	seen := map[string]bool{}
+	for range 200 {
+		key, err := newIdempotencyKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(key) != 36 {
+			t.Fatalf("key = %q, want a 36-character UUID", key)
+		}
+		if seen[key] {
+			t.Fatalf("key %q repeated", key)
+		}
+		seen[key] = true
+	}
+}
+
+// Reading an artifact is not a create, so it carries no key. Sending one would
+// mean a GET could be refused as a reuse.
+func TestReadsCarryNoIdempotencyKey(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		mu.Unlock()
+		fmt.Fprint(w, `{"slug":"art_x","state":"ready"}`)
+	}))
+	defer server.Close()
+
+	client, _ := testClient(server)
+	if _, err := client.ShowArtifact(context.Background(), "art_x"); err != nil {
+		t.Fatalf("show: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if keys[0] != "" {
+		t.Errorf("a read sent Idempotency-Key %q, want none", keys[0])
+	}
+}

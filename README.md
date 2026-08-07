@@ -40,11 +40,13 @@ advertises all land with the first tagged release — see the prerequisites belo
 | --- | --- |
 | `krowk push <file...>` | Upload files, get a link for each |
 | `krowk uploads create <file...>` | The same thing, spelled out |
-| `krowk uploads list` | List the workspace's uploads, newest first (`--limit`, `--before`) |
+| `krowk uploads list` | List uploads, newest first — the workspace's, or one run's with `--run` (`--limit`, `--before`) |
 | `krowk uploads show <artifact>` | Read one artifact back |
 | `krowk uploads attach <artifact> --run <run>` | Put an upload under a run after it was uploaded |
 | `krowk uploads delete <artifact> [claim-token]` | Take an upload down — the bytes go at once, and it cannot be undone |
 | `krowk runs start` | Open a run to group later uploads under |
+| `krowk runs list` | List the workspace's runs, newest first (`--limit`, `--before`) |
+| `krowk runs show <run>` | Read one run back, with everything recorded on it |
 | `krowk runs finish <run>` | Close a run |
 | `krowk claim <artifact> <claim-token>` | Keep an anonymous upload past its expiry (`--run` groups it while claiming) |
 | `krowk auth login --token <token>` | Check a token against the registry, then store it in `~/.config/krowk/credentials.json` (0600) |
@@ -226,7 +228,10 @@ DELETE     /v1/artifacts/:slug                take it down (needs a key or its c
 PUT|PATCH  /v1/artifacts/:slug/finalization   confirm the bytes landed
 POST       /v1/artifacts/:slug/claim          spend a claim token (needs a key)
 PUT|PATCH  /v1/artifacts/:slug/run            put it under a run (needs a key)
+GET        /v1/runs                           list runs, newest first (needs a key)
 POST       /v1/runs                           open a run (needs a key)
+GET        /v1/runs/:slug                     read one back, metadata and all (needs a key)
+GET        /v1/runs/:slug/artifacts           what one run produced (needs a key)
 PUT|PATCH  /v1/runs/:slug/completion          close a run (needs a key)
 ```
 
@@ -295,7 +300,12 @@ thing to actually do, so `krowk`'s own errors and the registry's read alike.
   the same success, and the record keeps the moment it first reached that state.
 - **Listing is cursor-paged** — `next` carries the slug to pass back as `before`,
   and is null on the last page. It is present whenever a page came back full, so a
-  total that is an exact multiple of `--limit` costs one extra empty page.
+  total that is an exact multiple of `--limit` costs one extra empty page. Runs and
+  a run's artifacts page the same way, off the same cursor.
+- **A run's uploads are a collection of the run, not a filter** — `krowk uploads
+  list --run <run>` reads `/v1/runs/:slug/artifacts`, so a run that does not exist
+  is a `404` from the run itself. A filter would answer an empty page, which no
+  caller can tell apart from a run that genuinely produced nothing.
 - **Retries** — up to 3 attempts on a retryable failure (429, 5xx,
   `upload_missing`, `storage_unavailable`), honouring `Retry-After` in either
   spelling the HTTP spec allows, capped at 60 seconds so a header cannot wedge

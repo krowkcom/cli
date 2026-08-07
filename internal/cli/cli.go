@@ -44,8 +44,7 @@ const helpTemplate = `krowk %s — permalinks for agent output
 Usage
   krowk push <file...> [flags]              Upload files, get a link for each
   krowk uploads create <file...> [flags]    The same thing, spelled out
-  krowk uploads list [--run --limit --before]
-                                            List uploads, newest first — a run's, or the workspace's
+  krowk uploads list [flags]                List uploads, newest first — a run's, or the workspace's
   krowk uploads show <artifact>             Read one artifact back
   krowk uploads attach <art> --run <run>    Put an upload under a run afterwards
   krowk uploads delete <art> [token]        Take an upload down — immediate, cannot be undone

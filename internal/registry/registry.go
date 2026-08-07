@@ -930,12 +930,15 @@ func (s *store) listRunArtifacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The run's own artifacts are scope enough: a run belongs to a workspace, and
-	// an artifact only ever joins one through a keyed request in that same
-	// workspace, so there is nothing here another tenant could reach.
+	// Belonging to the run is what selects these, and the workspace is checked
+	// anyway. It cannot currently differ — an artifact only joins a run through a
+	// keyed request in that same workspace, and a keyless upload is refused a run
+	// outright — so the second half never fires today. It is here because this is
+	// the boundary between tenants, and a boundary that holds by invariant fails
+	// silently when the invariant moves.
 	var made []*artifact
 	for _, a := range s.artifacts {
-		if a.Run == runSlug && a.deletedAt.IsZero() {
+		if a.Run == runSlug && a.workspace == workspace && a.deletedAt.IsZero() {
 			made = append(made, a)
 		}
 	}

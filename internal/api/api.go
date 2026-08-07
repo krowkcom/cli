@@ -483,7 +483,7 @@ func (c *Client) ListRuns(ctx context.Context, before string, limit int) (*RunPa
 // lives since the registry keeps none on the artifact itself.
 func (c *Client) ShowRun(ctx context.Context, slug string) (*Run, error) {
 	var run Run
-	if err := c.call(ctx, http.MethodGet, "/runs/"+slug, nil, &run); err != nil {
+	if err := c.call(ctx, http.MethodGet, "/runs/"+slugPath(slug), nil, &run); err != nil {
 		return nil, err
 	}
 	return &run, nil
@@ -497,7 +497,7 @@ func (c *Client) ShowRun(ctx context.Context, slug string) (*Run, error) {
 // caller cannot tell that apart from a run that genuinely produced nothing.
 func (c *Client) ListRunArtifacts(ctx context.Context, runSlug, before string, limit int) (*Page, error) {
 	var page Page
-	path := paged("/runs/"+runSlug+"/artifacts", before, limit)
+	path := paged("/runs/"+slugPath(runSlug)+"/artifacts", before, limit)
 	if err := c.call(ctx, http.MethodGet, path, nil, &page); err != nil {
 		return nil, err
 	}

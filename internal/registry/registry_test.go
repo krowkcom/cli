@@ -885,3 +885,134 @@ func TestRunArtifactsAreACollectionOfTheRunRatherThanAFilter(t *testing.T) {
 		t.Errorf("another workspace's run = %d, want 404", status)
 	}
 }
+
+// The `next` rule is the one part of the pagination contract a client cannot
+// discover for itself, and it is deliberately not "next when rows were
+// truncated": it is present whenever the page came back full, so a total that is
+// an exact multiple of the limit costs one extra empty page rather than a count
+// query on every listing. Rows == limit exactly is the only case that tells the
+// two rules apart.
+func TestAFullPageAlwaysCarriesACursorEvenWhenItIsTheLast(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_test"
+
+	first := openRun(t, server, key)
+	second := openRun(t, server, key)
+
+	status, page := request(t, http.MethodGet, server.URL+"/v1/runs?limit=2", key, "", "")
+	if status != http.StatusOK {
+		t.Fatalf("list = %d %v", status, page)
+	}
+	if got := slugsOf(t, page, "runs"); len(got) != 2 {
+		t.Fatalf("page = %v, want both runs", got)
+	}
+	// Exactly as many rows as asked for, and nothing behind them — the cursor is
+	// still handed over rather than withheld.
+	next, _ := page["next"].(string)
+	if next != first {
+		t.Fatalf("next = %v, want %q even though this is the last page", page["next"], first)
+	}
+
+	_, beyond := request(t, http.MethodGet, server.URL+"/v1/runs?limit=2&before="+next, key, "", "")
+	if got := slugsOf(t, beyond, "runs"); len(got) != 0 {
+		t.Errorf("page after the cursor = %v, want it empty", got)
+	}
+	if beyond["next"] != nil {
+		t.Errorf("next = %v, want null once the rows run out", beyond["next"])
+	}
+	_ = second
+}
+
+// The page size is the caller's to ask for and the registry's to bound. Asking
+// for more than is served gets the most that is served — which is what was
+// wanted — and anything that is not a number is not a request for one.
+func TestPageSizeIsClampedRatherThanRefused(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_test"
+
+	for range maxPageSize + 2 {
+		openRun(t, server, key)
+	}
+
+	for _, limit := range []string{"", "0", "-1", "abc", "999999999999999999999"} {
+		url := server.URL + "/v1/runs"
+		if limit != "" {
+			url += "?limit=" + limit
+		}
+		status, page := request(t, http.MethodGet, url, key, "", "")
+		if status != http.StatusOK {
+			t.Errorf("limit=%q = %d %v, want 200", limit, status, page)
+			continue
+		}
+		got := len(slugsOf(t, page, "runs"))
+		// An unreadable or out-of-range limit is the default; a readable one is
+		// clamped into the served range. Neither is ever unbounded.
+		want := defaultPageSize
+		if limit == "0" || limit == "-1" {
+			want = 1
+		}
+		if got != want {
+			t.Errorf("limit=%q served %d rows, want %d", limit, got, want)
+		}
+	}
+
+	_, page := request(t, http.MethodGet, server.URL+"/v1/runs?limit=999", key, "", "")
+	if got := len(slugsOf(t, page, "runs")); got != maxPageSize {
+		t.Errorf("limit=999 served %d rows, want the %d ceiling", got, maxPageSize)
+	}
+}
+
+// A run's artifact listing is scoped three ways, and each one is a separate way
+// to serve the wrong rows: the cursor has to belong to this run, an unknown
+// cursor is a 404 rather than a silent first page, and a tombstone is not
+// something the run still holds.
+func TestARunsArtifactListingIsScopedToTheRunAndToWhatItStillHolds(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_test"
+
+	mine := openRun(t, server, key)
+	other := openRun(t, server, key)
+
+	attach := func(runSlug, name string) string {
+		payload := readyArtifact(t, server, key, "bytes for "+name)
+		slug, _ := payload["slug"].(string)
+		status, body := request(t, http.MethodPut, server.URL+"/v1/artifacts/"+slug+"/run",
+			key, "application/json", fmt.Sprintf(`{"run":%q}`, runSlug))
+		if status != http.StatusOK {
+			t.Fatalf("attach %s = %d %v", name, status, body)
+		}
+		return slug
+	}
+	older := attach(mine, "older")
+	newer := attach(mine, "newer")
+	elsewhere := attach(other, "elsewhere")
+
+	listing := func(query string) (int, map[string]any) {
+		return request(t, http.MethodGet, server.URL+"/v1/runs/"+mine+"/artifacts"+query, key, "", "")
+	}
+
+	// A cursor from another run is not a cursor for this one.
+	if status, _ := listing("?before=" + elsewhere); status != http.StatusNotFound {
+		t.Errorf("cursor from another run = %d, want 404", status)
+	}
+	// Nor is one that names nothing at all — answering the first page instead
+	// would silently ignore the caller's position.
+	if status, _ := listing("?before=art_nosuchartifact00001"); status != http.StatusNotFound {
+		t.Errorf("unknown cursor = %d, want 404", status)
+	}
+	// A cursor of this run's own pages within it.
+	_, page := listing("?before=" + newer)
+	if got := slugsOf(t, page, "artifacts"); !reflect.DeepEqual(got, []string{older}) {
+		t.Errorf("page after the newest = %v, want the older one alone", got)
+	}
+
+	// A tombstone is not part of what the run still holds, exactly as it is not
+	// part of what the workspace holds.
+	if status, body := takeDown(t, server, key, older, ""); status != http.StatusNoContent {
+		t.Fatalf("takedown = %d %v", status, body)
+	}
+	_, remaining := listing("")
+	if got := slugsOf(t, remaining, "artifacts"); !reflect.DeepEqual(got, []string{newer}) {
+		t.Errorf("run listing after a takedown = %v, want the tombstone gone", got)
+	}
+}

@@ -301,7 +301,9 @@ func TestASlugCannotEscapeItsPathSegment(t *testing.T) {
 	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.RequestURI)
-		w.WriteHeader(http.StatusNoContent)
+		// An empty object satisfies every decode here. What is under test is where
+		// the request landed, not what came back.
+		fmt.Fprint(w, "{}")
 	}))
 	defer server.Close()
 
@@ -315,11 +317,24 @@ func TestASlugCannotEscapeItsPathSegment(t *testing.T) {
 		}
 	}
 
+	// The run reads matter most of the three: their responses decode into the
+	// wrong type without erroring, so a mis-routed one is not a failure but a
+	// confident wrong answer. `GET /runs/run_A` answering `runs show` decodes
+	// cleanly into a Page, which reads as "this run produced nothing".
+	if _, err := client.ShowRun(context.Background(), "run_A#x"); err != nil {
+		t.Fatalf("show run: %v", err)
+	}
+	if _, err := client.ListRunArtifacts(context.Background(), "run_A#", "", 0); err != nil {
+		t.Fatalf("list run artifacts: %v", err)
+	}
+
 	want := []string{
 		"/artifacts/art_A%23",
 		"/artifacts/art_A%23%2Ffinalization",
 		"/artifacts/art_A%3Fx=1",
 		"/artifacts/art_A%2F..%2Fart_B",
+		"/runs/run_A%23x",
+		"/runs/run_A%23/artifacts",
 	}
 	if len(paths) != len(want) {
 		t.Fatalf("paths = %v", paths)

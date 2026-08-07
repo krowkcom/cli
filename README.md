@@ -43,6 +43,7 @@ advertises all land with the first tagged release — see the prerequisites belo
 | `krowk uploads list` | List the workspace's uploads, newest first (`--limit`, `--before`) |
 | `krowk uploads show <artifact>` | Read one artifact back |
 | `krowk uploads attach <artifact> --run <run>` | Put an upload under a run after it was uploaded |
+| `krowk uploads delete <artifact> [claim-token]` | Take an upload down — the bytes go at once, and it cannot be undone |
 | `krowk runs start` | Open a run to group later uploads under |
 | `krowk runs finish <run>` | Close a run |
 | `krowk claim <artifact> <claim-token>` | Keep an anonymous upload past its expiry (`--run` groups it while claiming) |
@@ -221,6 +222,7 @@ GET        /v1/key                            the key this request is made with
 GET        /v1/artifacts                      list, newest first (needs a key)
 POST       /v1/artifacts                      declare an upload
 GET        /v1/artifacts/:slug                read one back
+DELETE     /v1/artifacts/:slug                take it down (needs a key or its claim token)
 PUT|PATCH  /v1/artifacts/:slug/finalization   confirm the bytes landed
 POST       /v1/artifacts/:slug/claim          spend a claim token (needs a key)
 PUT|PATCH  /v1/artifacts/:slug/run            put it under a run (needs a key)
@@ -231,6 +233,15 @@ PUT|PATCH  /v1/runs/:slug/completion          close a run (needs a key)
 Everything but listing, claiming, attaching, the key and the run endpoints works
 without a key: for a keyless request the slug *is* the capability, since slugs
 are 21 random base58 characters and the bytes are public on the CDN regardless.
+
+Taking one down is the exception, and it is keyed differently than it looks. A
+slug travels in whatever the link was pasted into, so a reader of a link must not
+be able to destroy what they read — a keyless takedown is authorised by the claim
+token instead. The client sends that token *instead of* the key rather than
+alongside it: offered both, the registry reads the key and looks in its
+workspace, where an upload still sitting in the anonymous one is simply not
+found. Withholding the key is what lets a logged-in machine take down what a CI
+job pushed anonymously.
 
 ```
 POST {KROWK_API_URL}/artifacts
@@ -290,6 +301,13 @@ thing to actually do, so `krowk`'s own errors and the registry's read alike.
   spelling the HTTP spec allows, capped at 60 seconds so a header cannot wedge
   the CLI.
 - **Expiry** — an anonymous artifact past its expiry answers `410 Gone`.
+- **Takedown is immediate and unrecoverable** — the bytes leave storage at once
+  and what stays behind is a tombstone, so the slug answers `410 taken_down`
+  rather than `404`: the link is already pasted somewhere, and its reader deserves
+  to know the artifact was removed rather than to go hunting for a typo. It is
+  deliberately not routed through a trash or a recovery window, because the case
+  it exists for is a secret uploaded by accident, and a secret that can be
+  restored is still leaked. Taking down what is already down is a success.
 - **Upload targets are storage, not anything reachable.** A presigned URL names a
   foreign host by design, but the client requires `https`, ignores `method` and
   always sends `PUT`, and refuses loopback, link-local, private and carrier-grade

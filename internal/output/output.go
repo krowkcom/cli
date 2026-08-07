@@ -537,6 +537,38 @@ func humanArtifact(a *api.Artifact, colour bool, now time.Time) string {
 	return strings.Join(lines, "\n")
 }
 
+// TakenDown is what a takedown leaves to report. The registry answers 204 and
+// there is no artifact left to render — a url and markdown naming bytes that are
+// gone would be a lie — so the slug and the fact are the whole result.
+//
+// The fact is its own field rather than a `state`, because the API's `state` says
+// whether an upload landed (pending, ready) and a tombstone keeps whichever it
+// had. Spelling a takedown as a state would make the two disagree.
+type TakenDown struct {
+	Slug      string `json:"slug"`
+	TakenDown bool   `json:"taken_down"`
+}
+
+// Removed renders a completed takedown. There is no link left to paste, so
+// markdown and url fall back to the JSON envelope.
+func Removed(slug string, f Format, quiet, colour bool) string {
+	if f != Human {
+		data := TakenDown{Slug: slug, TakenDown: true}
+		if quiet {
+			return encode(data)
+		}
+		return encode(Envelope{
+			OK:      true,
+			Data:    data,
+			Summary: slug + " taken down",
+		})
+	}
+	return strings.Join([]string{
+		fmt.Sprintf("%s taken down  %s", paint(colour, green, "✓"), slug),
+		paint(colour, dim, "  the bytes are gone for good; the link now reports it was taken down"),
+	}, "\n")
+}
+
 // Run renders a run without its artifacts, for `runs start` and `runs finish`.
 func Run(r *api.Run, f Format, quiet, colour bool) string {
 	switch f {

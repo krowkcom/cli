@@ -475,6 +475,48 @@ func (c *Client) AttachRun(ctx context.Context, artifactSlug, runSlug string) (*
 	return &artifact, nil
 }
 
+// TakeDownArtifact removes an artifact's bytes and leaves a tombstone behind, so
+// the link answers 410 rather than 404 — it is already pasted somewhere, and its
+// reader deserves to be told the artifact was removed rather than sent hunting
+// for a typo.
+//
+// Immediate and unrecoverable, which is the point rather than a limitation. This
+// is what someone reaches for when a secret was uploaded by accident, and a
+// secret that can be restored is still leaked — so nothing here routes through a
+// window that could hand the bytes back.
+//
+// Two authorities take an artifact down, and which one is used decides how the
+// request is made. A key's authority is the workspace it acts in. A claim
+// token's is the one artifact it was issued for, and it is needed at all because
+// a slug travels in whatever the link was pasted into: authorising a takedown by
+// slug alone would let every reader of the paste destroy what they read.
+//
+// Nothing comes back but a 204. There is no artifact left to report, and a url
+// and markdown naming bytes that are gone would be a lie.
+//
+// Retried like any other call: taking down what is already down is a success on
+// both sides, so a lost response costs nothing to ask again.
+func (c *Client) TakeDownArtifact(ctx context.Context, slug, claimToken string) error {
+	if claimToken == "" {
+		return c.call(ctx, http.MethodDelete, "/artifacts/"+slug, nil, nil)
+	}
+
+	// A claim token is the authority for this call, and it is the only one the
+	// registry will read: offered alongside a key, the key wins outright and the
+	// lookup happens in that key's workspace — where an artifact still sitting in
+	// the anonymous one is simply not found. So the key is withheld rather than
+	// sent and ignored, which is what makes taking down a CI job's anonymous
+	// upload work from a machine that happens to be logged in.
+	//
+	// The token goes in the body rather than the query string for the same reason
+	// a claim's does: a query string ends up in access logs, and this token is a
+	// capability.
+	keyless := New(c.BaseURL, "")
+	keyless.Sleep = c.Sleep
+	body := map[string]any{"claim_token": claimToken}
+	return keyless.call(ctx, http.MethodDelete, "/artifacts/"+slug, body, nil)
+}
+
 // CreateRun opens a run to hang artifacts off. Needs a key: a run belongs to a
 // workspace, and a keyless upload has none.
 //
@@ -835,6 +877,12 @@ func fixFor(code string, status int) string {
 		return "what arrived held no bytes — check the file is not being written while it is uploaded"
 	case "expired":
 		return "this artifact was anonymous and has passed its expiry — upload it again, and claim it with a key to keep it"
+	case "taken_down":
+		// 410 rather than 404 because the link is already pasted somewhere, so the
+		// fix says the artifact existed and is gone rather than sending someone
+		// hunting for a typo. A takedown is unrecoverable by design; uploading
+		// again is the only way forward, and it is a new slug and a new link.
+		return "this artifact was taken down and its bytes are gone for good — upload it again if the link is still needed"
 	case "storage_unavailable":
 		return "object storage is temporarily unreachable — retry shortly"
 	case "not_found":
@@ -863,7 +911,7 @@ func retryableFor(code string) (bool, bool) {
 	// Nothing about retrying these changes the answer, and an agent that keeps
 	// trying is worse than one that stops.
 	case "invalid", "parameter_missing", "unauthorized", "not_found", "expired",
-		"checksum_mismatch", "empty_upload", "run_needs_key":
+		"taken_down", "checksum_mismatch", "empty_upload", "run_needs_key":
 		return false, true
 	}
 	return false, false

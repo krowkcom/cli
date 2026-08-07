@@ -437,6 +437,17 @@ type Page struct {
 // registry rather than here, so asking for more than it serves gets the most it
 // serves.
 func (c *Client) ListArtifacts(ctx context.Context, before string, limit int) (*Page, error) {
+	var page Page
+	if err := c.call(ctx, http.MethodGet, paged("/artifacts", before, limit), nil, &page); err != nil {
+		return nil, err
+	}
+	return &page, nil
+}
+
+// paged adds the cursor and page size every listing takes. One spelling for all
+// of them, because the registry decides both in one place too — a client that
+// paged one listing differently from another would only ever do so by accident.
+func paged(path, before string, limit int) string {
 	query := url.Values{}
 	if before != "" {
 		query.Set("before", before)
@@ -444,12 +455,49 @@ func (c *Client) ListArtifacts(ctx context.Context, before string, limit int) (*
 	if limit > 0 {
 		query.Set("limit", strconv.Itoa(limit))
 	}
-	path := "/artifacts"
-	if len(query) > 0 {
-		path += "?" + query.Encode()
+	if len(query) == 0 {
+		return path
 	}
+	return path + "?" + query.Encode()
+}
 
+// RunPage is one page of a workspace's runs, newest first. Next carries the slug
+// to pass back as before for the following page, and is empty on the last.
+type RunPage struct {
+	Runs []*Run `json:"runs"`
+	Next string `json:"next,omitempty"`
+}
+
+// ListRuns reads a page of the key's runs. Needs a key: a run belongs to a
+// workspace, and a keyless caller has none of its own.
+func (c *Client) ListRuns(ctx context.Context, before string, limit int) (*RunPage, error) {
+	var page RunPage
+	if err := c.call(ctx, http.MethodGet, paged("/runs", before, limit), nil, &page); err != nil {
+		return nil, err
+	}
+	return &page, nil
+}
+
+// ShowRun reads one run back — its status, when it started and finished, and the
+// metadata recorded on it, which is where everything about an upload's origin
+// lives since the registry keeps none on the artifact itself.
+func (c *Client) ShowRun(ctx context.Context, slug string) (*Run, error) {
+	var run Run
+	if err := c.call(ctx, http.MethodGet, "/runs/"+slugPath(slug), nil, &run); err != nil {
+		return nil, err
+	}
+	return &run, nil
+}
+
+// ListRunArtifacts reads a page of what one run produced.
+//
+// A collection of the run rather than a filter on the workspace listing, which
+// is the registry's shape and worth keeping: the run is looked up first, so an
+// unknown slug is a 404. A filter would answer an empty page instead, and a
+// caller cannot tell that apart from a run that genuinely produced nothing.
+func (c *Client) ListRunArtifacts(ctx context.Context, runSlug, before string, limit int) (*Page, error) {
 	var page Page
+	path := paged("/runs/"+slugPath(runSlug)+"/artifacts", before, limit)
 	if err := c.call(ctx, http.MethodGet, path, nil, &page); err != nil {
 		return nil, err
 	}

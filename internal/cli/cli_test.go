@@ -126,6 +126,7 @@ type envelope struct {
 // data covers both shapes a command returns: an upload result, and a bare run.
 type data struct {
 	Artifacts []artifact     `json:"artifacts"`
+	Runs      []run          `json:"runs"`
 	Run       *run           `json:"run"`
 	Notes     []string       `json:"notes"`
 	Next      string         `json:"next"`
@@ -751,6 +752,11 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	pushed := only(t, h.ok("push", h.fixture))
 	h.ok("uploads", "list")
 	h.ok("uploads", "show", pushed.Slug)
+	h.ok("runs", "list")
+	h.ok("runs", "show", pushed.Run)
+	// A run's artifacts are a collection of the run, not a filter on the listing
+	// above — so --run is a different endpoint rather than a query parameter.
+	h.ok("uploads", "list", "--run="+pushed.Run)
 	h.run("doctor")
 
 	// Claiming needs an anonymous artifact to claim.
@@ -770,6 +776,9 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 		"PUT /v1/runs/{slug}/completion",
 		"GET /v1/artifacts",
 		"GET /v1/artifacts/{slug}",
+		"GET /v1/runs",
+		"GET /v1/runs/{slug}",
+		"GET /v1/runs/{slug}/artifacts",
 		// doctor: the reachability probe, then the key check.
 		"GET /",
 		"GET /v1/key",
@@ -1115,5 +1124,114 @@ func TestASecondWordThatIsNotAClaimTokenIsRefused(t *testing.T) {
 		if status, _ := h.get(a.URL); status != http.StatusOK {
 			t.Errorf("GET %s = %d, want the upload untouched", a.URL, status)
 		}
+	}
+}
+
+// A run listing of bare slugs is unreadable, and the metadata is where a run's
+// identity actually lives — the registry keeps none on the artifact.
+func TestRunsListNamesEachRunByWhatItWasFor(t *testing.T) {
+	h := newHarness(t, 0)
+
+	h.ok("push", h.fixture, "--title=Checkout — mobile")
+	h.ok("push", h.fixture, "--repo=acme/storefront", "--commit=a1b2c3d")
+
+	e := h.ok("runs", "list")
+	if len(e.Data.Runs) != 2 {
+		t.Fatalf("want two runs, got %d", len(e.Data.Runs))
+	}
+	// Newest first, so the second push leads.
+	if e.Data.Runs[0].Metadata["repo"] != "acme/storefront" {
+		t.Errorf("first row = %v, want the newest run", e.Data.Runs[0].Metadata)
+	}
+
+	_, human, _ := h.run("runs", "list", "--format=human")
+	if !strings.Contains(human, "Checkout — mobile") || !strings.Contains(human, "acme/storefront") {
+		t.Errorf("human listing = %q, want each run labelled by its metadata", human)
+	}
+}
+
+// A run is the only place an upload's origin is recorded, so reading one back
+// has to carry the whole of it.
+func TestRunsShowCarriesTheMetadataAnUploadDoesNot(t *testing.T) {
+	h := newHarness(t, 0)
+
+	pushed := h.ok("push", h.fixture,
+		"--pull-request=https://github.com/acme/storefront/pull/412",
+		"--session=sess_abc123")
+	runSlug := pushed.Data.Run.Slug
+
+	e := h.ok("runs", "show", runSlug)
+	if e.Data.Slug != runSlug || e.Data.Status != "finished" {
+		t.Errorf("show = %+v", e.Data)
+	}
+	if e.Data.Metadata["pull_request"] != "https://github.com/acme/storefront/pull/412" {
+		t.Errorf("metadata = %v", e.Data.Metadata)
+	}
+
+	_, human, _ := h.run("runs", "show", runSlug, "--format=human")
+	for _, want := range []string{runSlug, "finished", "pull_request", "sess_abc123"} {
+		if !strings.Contains(human, want) {
+			t.Errorf("human detail missing %q:\n%s", want, human)
+		}
+	}
+	if got := h.fails("runs", "show", "run_nosuchrun0000000000")["error"]; got != "not_found" {
+		t.Errorf("unknown run = %v, want not_found", got)
+	}
+}
+
+// --run narrows the listing to what one run produced. The registry serves that
+// as a collection of the run, so an unknown run is a 404 rather than an empty
+// page — which a caller could not tell apart from a run that made nothing.
+func TestUploadsListNarrowsToOneRun(t *testing.T) {
+	h := newHarness(t, 0)
+
+	mine := h.ok("push", h.fixture, "--title=in the run")
+	runSlug := mine.Data.Run.Slug
+	h.ok("push", h.write("elsewhere.png", "other bytes")) // its own run
+
+	if got := h.ok("uploads", "list").Data.Artifacts; len(got) != 2 {
+		t.Fatalf("workspace listing = %d artifacts, want both", len(got))
+	}
+
+	scoped := h.ok("uploads", "list", "--run="+runSlug).Data.Artifacts
+	if len(scoped) != 1 || scoped[0].Slug != only(t, mine).Slug {
+		t.Errorf("run listing = %+v, want only what that run made", scoped)
+	}
+
+	if got := h.fails("uploads", "list", "--run=run_nosuchrun0000000000")["error"]; got != "not_found" {
+		t.Errorf("unknown run = %v, want not_found rather than an empty page", got)
+	}
+}
+
+// The cursor has to carry whatever scoped the page. Paging a run's uploads on
+// without --run would silently widen to the whole workspace, which reads as the
+// run having produced far more than it did.
+func TestPagingARunsUploadsStaysScopedToTheRun(t *testing.T) {
+	h := newHarness(t, 0)
+
+	started := h.ok("runs", "start")
+	runSlug := started.Data.Slug
+	for _, name := range []string{"one.png", "two.png"} {
+		h.ok("push", h.write(name, "bytes for "+name), "--run="+runSlug)
+	}
+	h.ok("push", h.write("unrelated.png", "not in the run"))
+
+	e := h.ok("uploads", "list", "--run="+runSlug, "--limit=1")
+	if e.Data.Next == "" {
+		t.Fatal("want a cursor: the page came back full")
+	}
+	if len(e.Breadcrumbs) == 0 || !strings.Contains(e.Breadcrumbs[0].Cmd, "--run "+runSlug) {
+		t.Errorf("next-page breadcrumb = %+v, want it to keep --run", e.Breadcrumbs)
+	}
+
+	_, human, _ := h.run("uploads", "list", "--run="+runSlug, "--limit=1", "--format=human")
+	if !strings.Contains(human, "--run "+runSlug) {
+		t.Errorf("human cursor line = %q, want it to keep --run", human)
+	}
+
+	// And the command it suggests really does stay inside the run.
+	second := h.ok("uploads", "list", "--run="+runSlug, "--before="+e.Data.Next)
+	if len(second.Data.Artifacts) != 1 {
+		t.Errorf("second page = %d artifacts, want the run's other one alone", len(second.Data.Artifacts))
 	}
 }

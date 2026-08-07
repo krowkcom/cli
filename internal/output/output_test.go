@@ -385,3 +385,76 @@ func TestHumanAndJSONAgreeOnACallerSuppliedRun(t *testing.T) {
 		t.Errorf("summary = %q, want the run named", e.Summary)
 	}
 }
+
+// The registry stores run metadata verbatim from whichever client wrote it, and
+// `runs show` exists to read that back — so it meets values krowk itself never
+// records. Rendering those with fmt would leak Go's own syntax at a person.
+func TestRunDetailRendersMetadataThatIsNotAString(t *testing.T) {
+	run := &api.Run{
+		Slug:   "run_x",
+		Status: "finished",
+		Metadata: json.RawMessage(`{
+			"nothing": null, "flag": true, "count": 3, "big": 1e21,
+			"nested": {"a": 1}, "list": ["one", 2, null]
+		}`),
+	}
+
+	got := RunDetail(run, Human, false, false)
+
+	for _, leak := range []string{"<nil>", "map[", "1e+21", "%!"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("output leaks Go syntax %q:\n%s", leak, got)
+		}
+	}
+	for _, want := range []string{
+		"flag          true",
+		"count         3",
+		"big           1000000000000000000000",
+		`nested        {"a":1}`,
+		"list          one; 2; ",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+// One row, one run. A title is free text, and `--title "$(git log -1)"` is an
+// ordinary thing for an agent to do — a newline in it would split the row and
+// read as runs that do not exist.
+func TestARunLabelStaysOnItsOwnRow(t *testing.T) {
+	runWith := func(title string) *api.Run {
+		encoded, err := json.Marshal(map[string]string{"title": title})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &api.Run{Slug: "run_x", Status: "open", Metadata: encoded}
+	}
+
+	multiline := RunList(
+		&api.RunPage{Runs: []*api.Run{runWith("Fix checkout\n\nThe button did nothing.\n")}},
+		Human, false, false)
+	if strings.Count(multiline, "\n") != 0 {
+		t.Errorf("a multi-line title split the row:\n%s", multiline)
+	}
+	if !strings.Contains(multiline, "Fix checkout The button did nothing.") {
+		t.Errorf("title not folded onto one line:\n%s", multiline)
+	}
+
+	// An escape sequence must not repaint the terminal from a title.
+	escaped := RunList(
+		&api.RunPage{Runs: []*api.Run{runWith("\x1b[31mred\x1b[0m")}},
+		Human, false, false)
+	if strings.Contains(escaped, "\x1b") {
+		t.Errorf("escape sequence survived into the row: %q", escaped)
+	}
+
+	// And a commit message pasted whole is truncated rather than swallowing the
+	// terminal.
+	long := RunList(
+		&api.RunPage{Runs: []*api.Run{runWith(strings.Repeat("x", 300))}},
+		Human, false, false)
+	if !strings.Contains(long, "…") || len([]rune(long)) > 140 {
+		t.Errorf("long title not clipped (%d runes):\n%s", len([]rune(long)), long)
+	}
+}

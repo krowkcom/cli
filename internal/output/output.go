@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/krowkcom/cli/internal/api"
 )
@@ -345,8 +347,9 @@ func humanResult(r Result, colour bool, now time.Time) string {
 	return strings.Join(lines, "\n")
 }
 
-// List renders a page of a workspace's artifacts.
-func List(p *api.Page, f Format, quiet, colour bool, now time.Time) string {
+// List renders a page of artifacts. runSlug names the run they were scoped to,
+// and is empty for a whole workspace's listing.
+func List(p *api.Page, runSlug string, f Format, quiet, colour bool, now time.Time) string {
 	switch f {
 	case Markdown:
 		lines := make([]string, 0, len(p.Artifacts))
@@ -357,7 +360,7 @@ func List(p *api.Page, f Format, quiet, colour bool, now time.Time) string {
 	case URL:
 		return urlResult(Result{Artifacts: p.Artifacts})
 	case Human:
-		return humanList(p, colour, now)
+		return humanList(p, runSlug, colour, now)
 	}
 
 	if quiet {
@@ -367,13 +370,24 @@ func List(p *api.Page, f Format, quiet, colour bool, now time.Time) string {
 	// The cursor is only worth mentioning when there is another page behind it.
 	if p.Next != "" {
 		env.Breadcrumbs = []Breadcrumb{
-			{Action: "next page", Cmd: "krowk uploads list --before " + p.Next},
+			{Action: "next page", Cmd: nextPageCmd(runSlug, p.Next)},
 		}
 	}
 	return encode(env)
 }
 
-func humanList(p *api.Page, colour bool, now time.Time) string {
+// nextPageCmd carries whatever scoped this page into the command for the one
+// after it. A run's listing paged on without --run would silently widen to the
+// whole workspace, which reads as the run having produced far more than it did.
+func nextPageCmd(runSlug, next string) string {
+	cmd := "krowk uploads list"
+	if runSlug != "" {
+		cmd += " --run " + runSlug
+	}
+	return cmd + " --before " + next
+}
+
+func humanList(p *api.Page, runSlug string, colour bool, now time.Time) string {
 	if len(p.Artifacts) == 0 {
 		return paint(colour, dim, "no artifacts")
 	}
@@ -401,8 +415,7 @@ func humanList(p *api.Page, colour bool, now time.Time) string {
 		lines = append(lines, line)
 	}
 	if p.Next != "" {
-		lines = append(lines, paint(colour, dim,
-			"more: krowk uploads list --before "+p.Next))
+		lines = append(lines, paint(colour, dim, "more: "+nextPageCmd(runSlug, p.Next)))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -591,6 +604,201 @@ func Run(r *api.Run, f Format, quiet, colour bool) string {
 			{Action: "close", Cmd: "krowk runs finish " + r.Slug},
 		},
 	})
+}
+
+// RunList renders a page of a workspace's runs, newest first. There is no link
+// to a run, so markdown and url fall back to the JSON envelope.
+func RunList(p *api.RunPage, f Format, quiet, colour bool) string {
+	if f != Human {
+		if quiet {
+			return encode(p)
+		}
+		noun := "runs"
+		if len(p.Runs) == 1 {
+			noun = "run"
+		}
+		env := Envelope{OK: true, Data: p, Summary: fmt.Sprintf("%d %s", len(p.Runs), noun)}
+		if p.Next != "" {
+			env.Breadcrumbs = []Breadcrumb{
+				{Action: "next page", Cmd: "krowk runs list --before " + p.Next},
+			}
+		}
+		return encode(env)
+	}
+
+	if len(p.Runs) == 0 {
+		return paint(colour, dim, "no runs")
+	}
+	var slugWidth, statusWidth int
+	for _, r := range p.Runs {
+		slugWidth = max(slugWidth, len(r.Slug))
+		statusWidth = max(statusWidth, len(r.Status))
+	}
+
+	lines := make([]string, 0, len(p.Runs)+1)
+	for _, r := range p.Runs {
+		line := fmt.Sprintf("%-*s  %-*s", slugWidth, r.Slug, statusWidth, r.Status)
+		if label := runLabel(r); label != "" {
+			line += "  " + label
+		}
+		lines = append(lines, strings.TrimRight(line, " "))
+	}
+	if p.Next != "" {
+		lines = append(lines, paint(colour, dim, "more: krowk runs list --before "+p.Next))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// RunDetail renders one run and everything recorded on it. Unlike Run, which
+// reports what just happened to one, this is the whole record — the metadata
+// included, since a run is where all of it lives and the registry keeps none on
+// the artifacts themselves.
+func RunDetail(r *api.Run, f Format, quiet, colour bool) string {
+	if f != Human {
+		if quiet {
+			return encode(r)
+		}
+		crumbs := []Breadcrumb{
+			{Action: "what it made", Cmd: "krowk uploads list --run " + r.Slug},
+		}
+		if r.Status != "finished" {
+			crumbs = append(crumbs, Breadcrumb{Action: "close", Cmd: "krowk runs finish " + r.Slug})
+		}
+		return encode(Envelope{
+			OK:          true,
+			Data:        r,
+			Summary:     fmt.Sprintf("run %s is %s", r.Slug, r.Status),
+			Breadcrumbs: crumbs,
+		})
+	}
+
+	lines := []string{fmt.Sprintf("%s  %s", r.Slug, paint(colour, dim, r.Status))}
+	if r.StartedAt != "" {
+		lines = append(lines, fmt.Sprintf("  %-13s %s", "started", r.StartedAt))
+	}
+	if r.FinishedAt != "" {
+		lines = append(lines, fmt.Sprintf("  %-13s %s", "finished", r.FinishedAt))
+	}
+	// Metadata is whatever the caller chose to record, so it is printed as it
+	// arrived rather than interpreted into fields this command would have to know
+	// about. Sorted, so the same run always prints the same way.
+	fields := runFields(r)
+	for _, k := range slices.Sorted(maps.Keys(fields)) {
+		lines = append(lines, fmt.Sprintf("  %-13s %s", k, metadataValue(fields[k])))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// metadataValue renders one recorded value for a person.
+//
+// The registry stores metadata verbatim from whichever client wrote it, and this
+// command exists to read that back — so the value is not necessarily a string or
+// a list of them, which is all krowk itself records. Printing an arbitrary value
+// with fmt leaks Go's own syntax: a JSON null becomes `<nil>`, an object becomes
+// `map[a:1]`. Anything that is not a scalar or a list of them goes back out as
+// the JSON it arrived as.
+func metadataValue(v any) string {
+	switch value := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return value
+	case bool:
+		return strconv.FormatBool(value)
+	case float64:
+		// JSON has one number type, and Go decodes it to float64 — so an integer
+		// has to be printed without the exponent and trailing zero it would
+		// otherwise pick up.
+		return strconv.FormatFloat(value, 'f', -1, 64)
+	case []any:
+		parts := make([]string, 0, len(value))
+		for _, item := range value {
+			parts = append(parts, metadataValue(item))
+		}
+		return strings.Join(parts, "; ")
+	}
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+// runFields is a run's metadata as plain keys and values. A run that recorded
+// none, or something that is not an object, reads as having no fields rather
+// than as an error: metadata is stored verbatim, so this cannot assume a shape.
+func runFields(r *api.Run) map[string]any {
+	var fields map[string]any
+	if len(r.Metadata) > 0 {
+		_ = json.Unmarshal(r.Metadata, &fields)
+	}
+	return fields
+}
+
+// runLabel is the most identifying thing a run knows about itself, for a listing
+// that would otherwise be a column of opaque slugs. The metadata is where a
+// run's identity lives, since the registry keeps none on the artifact — so this
+// reads back the fields the CLI itself records, most specific first.
+func runLabel(r *api.Run) string {
+	fields := runFields(r)
+	text := func(key string) string {
+		s, _ := fields[key].(string)
+		// One row, one run. A title is free text — `--title "$(git log -1
+		// --pretty=%B)"` is an ordinary thing for an agent to do — and a newline
+		// in it would split the row, reading as extra runs that do not exist.
+		// Control characters go for the same reason: an escape sequence in a
+		// title must not repaint the terminal.
+		return clipLabel(oneLine(s))
+	}
+	switch {
+	case text("title") != "":
+		return text("title")
+	case text("pull_request") != "":
+		return text("pull_request")
+	case text("repo") != "" && text("branch") != "":
+		return text("repo") + "@" + text("branch")
+	case text("repo") != "":
+		return text("repo")
+	}
+	return text("agent")
+}
+
+// maxLabelRunes keeps a listing's last column from swallowing the terminal. A
+// title long enough to hit this is a commit message, not a label.
+const maxLabelRunes = 72
+
+// oneLine folds every run of whitespace to a single space and drops the control
+// characters that would otherwise move the cursor or recolour the row.
+func oneLine(s string) string {
+	var b strings.Builder
+	space := false
+	for _, r := range strings.TrimSpace(s) {
+		switch {
+		case unicode.IsSpace(r):
+			space = true
+		case unicode.IsControl(r):
+			// Dropped outright rather than folded to a space: an escape sequence
+			// arrives as ESC plus ordinary letters, and spacing it out would leave
+			// the letters behind as text.
+		default:
+			if space && b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			space = false
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// clipLabel truncates on runes rather than bytes, so a multi-byte character is
+// never cut in half.
+func clipLabel(s string) string {
+	runes := []rune(s)
+	if len(runes) <= maxLabelRunes {
+		return s
+	}
+	return string(runes[:maxLabelRunes]) + "…"
 }
 
 // Error renders a failure. Human output leads with the code and ends with the

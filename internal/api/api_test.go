@@ -286,3 +286,47 @@ func TestRunNeedsKeyFixNamesTheFlagThatCausedIt(t *testing.T) {
 		t.Errorf("fix = %q, want the flag that caused it", fix)
 	}
 }
+
+// A slug goes into the URL as one path segment, whatever it contains.
+//
+// This is not about rejecting bad input — it is that an unescaped slug does not
+// fail, it addresses a *different* endpoint. `#` ends the path and makes the
+// rest a fragment, so `art_A#/finalization` is a request to `/artifacts/art_A`.
+// On a takedown that destroys an artifact other than the one named, which is
+// unrecoverable, and no error is reported either way.
+func TestASlugCannotEscapeItsPathSegment(t *testing.T) {
+	// RequestURI is the raw wire form, which is the only thing that decides which
+	// endpoint this reaches. r.URL.Path is already decoded, so reading that would
+	// hide the very difference under test.
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.RequestURI)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := New(server.URL, "krowk_sk_test")
+	client.Sleep = func(time.Duration) {}
+
+	// Each of these would otherwise land somewhere other than where it says.
+	for _, slug := range []string{"art_A#", "art_A#/finalization", "art_A?x=1", "art_A/../art_B"} {
+		if err := client.TakeDownArtifact(context.Background(), slug, ""); err != nil {
+			t.Fatalf("takedown %q: %v", slug, err)
+		}
+	}
+
+	want := []string{
+		"/artifacts/art_A%23",
+		"/artifacts/art_A%23%2Ffinalization",
+		"/artifacts/art_A%3Fx=1",
+		"/artifacts/art_A%2F..%2Fart_B",
+	}
+	if len(paths) != len(want) {
+		t.Fatalf("paths = %v", paths)
+	}
+	for i, w := range want {
+		if paths[i] != w {
+			t.Errorf("path %d = %q, want %q", i, paths[i], w)
+		}
+	}
+}

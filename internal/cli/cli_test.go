@@ -132,6 +132,7 @@ type data struct {
 	Slug      string         `json:"slug"`
 	Status    string         `json:"status"`
 	Metadata  map[string]any `json:"metadata"`
+	TakenDown bool           `json:"taken_down"`
 }
 
 type artifact struct {
@@ -758,6 +759,8 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	h.env["KROWK_TOKEN"] = "krowk_sk_test"
 	h.ok("claim", anonymous.Slug, anonymous.ClaimToken)
 	h.ok("uploads", "attach", anonymous.Slug, "--run="+pushed.Run)
+	// Taking it down again: a claimed artifact answers to the key that holds it.
+	h.ok("uploads", "delete", anonymous.Slug)
 
 	want := []string{
 		// push, with a key: open a run, declare, finalize, close the run.
@@ -776,6 +779,9 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 		"POST /v1/artifacts/{slug}/claim",
 		// and the run it never had, set afterwards.
 		"PUT /v1/artifacts/{slug}/run",
+		// Takedown is the REST delete of the artifact, not a nested resource:
+		// destroying it is what the verb already means.
+		"DELETE /v1/artifacts/{slug}",
 	}
 
 	mu.Lock()
@@ -976,5 +982,138 @@ func TestReadyArtifactRejectsAnotherUpload(t *testing.T) {
 	}
 	if _, body := h.get(a.URL); body != "fake png bytes for the test" {
 		t.Errorf("stored bytes changed to %q", body)
+	}
+}
+
+// A takedown is what someone reaches for when a secret was published by
+// accident, so the whole of it has to hold: the bytes stop serving, and the link
+// reports that it was taken down rather than that it never existed.
+func TestUploadsDeleteTakesTheBytesDownAndLeavesATombstone(t *testing.T) {
+	h := newHarness(t, 0)
+
+	pushed := only(t, h.ok("push", h.fixture))
+	if status, _ := h.get(pushed.URL); status != http.StatusOK {
+		t.Fatalf("the upload never served: %d", status)
+	}
+
+	e := h.ok("uploads", "delete", pushed.Slug)
+	if !e.OK || e.Data.Slug != pushed.Slug || !e.Data.TakenDown {
+		t.Errorf("delete = %+v", e)
+	}
+
+	if status, _ := h.get(pushed.URL); status != http.StatusNotFound {
+		t.Errorf("GET %s after takedown = %d, want 404", pushed.URL, status)
+	}
+	if got := h.fails("uploads", "show", pushed.Slug)["error"]; got != "taken_down" {
+		t.Errorf("show after takedown = %v, want taken_down", got)
+	}
+	// A tombstone is not something the workspace still holds.
+	if artifacts := h.ok("uploads", "list").Data.Artifacts; len(artifacts) != 0 {
+		t.Errorf("listing still holds the tombstone: %+v", artifacts)
+	}
+}
+
+// 410 is not 404 on purpose, so the client has to have something to say about
+// it: the artifact existed and is gone, rather than a slug worth re-checking.
+func TestTakenDownReadsAsGoneForGoodRatherThanAsATypo(t *testing.T) {
+	h := newHarness(t, 0)
+
+	pushed := only(t, h.ok("push", h.fixture))
+	h.ok("uploads", "delete", pushed.Slug)
+
+	body := h.fails("uploads", "show", pushed.Slug)
+	fix, _ := body["fix"].(string)
+	if !strings.Contains(fix, "taken down") || !strings.Contains(fix, "upload it again") {
+		t.Errorf("fix = %q, want it to say the artifact is gone and uploading again is the way back", fix)
+	}
+	// Nothing about retrying changes the answer, and an agent that keeps trying
+	// is worse than one that stops. The verdict has to be stated, not merely
+	// absent: a missing key reads as false to anything asserting on it, so
+	// "not retryable" and "nothing said" would look identical here.
+	retryable, stated := body["retryable"].(bool)
+	if !stated || retryable {
+		t.Errorf("retryable = %v (stated %v), want an explicit false", retryable, stated)
+	}
+}
+
+// The case that decides how the request is made. An agent pushes anonymously
+// from CI; the person cleaning up is logged in. Offered alongside a key the
+// registry reads the key and nothing else, and looks in that key's workspace —
+// where an artifact still sitting in the anonymous one is simply not found. So a
+// claim token has to be sent as the authority it is, with the key withheld.
+func TestClaimTokenTakesDownAnAnonymousUploadFromALoggedInMachine(t *testing.T) {
+	h := newHarness(t, 0)
+
+	anonymous := only(t, h.anonymous().ok("push", h.fixture))
+	if anonymous.ClaimToken == "" {
+		t.Fatal("an anonymous push should come back with a claim token")
+	}
+	h.env["KROWK_TOKEN"] = "krowk_sk_test"
+
+	e := h.ok("uploads", "delete", anonymous.Slug, anonymous.ClaimToken)
+	if !e.Data.TakenDown {
+		t.Errorf("delete = %+v", e)
+	}
+	if status, _ := h.get(anonymous.URL); status != http.StatusNotFound {
+		t.Errorf("GET %s after takedown = %d, want 404", anonymous.URL, status)
+	}
+}
+
+// Without a key and without a token there is no authority at all, and saying so
+// beats a 400 from the registry naming a parameter the caller never saw.
+func TestDeletingAnonymouslyWithoutATokenNamesWhatIsMissing(t *testing.T) {
+	h := newHarness(t, 0).anonymous()
+
+	pushed := only(t, h.ok("push", h.fixture))
+	body := h.fails("uploads", "delete", pushed.Slug)
+	if body["error"] != "missing_claim" {
+		t.Errorf("error = %v, want missing_claim", body["error"])
+	}
+	// The upload is still there: refusing locally must not half-do the takedown.
+	if status, _ := h.get(pushed.URL); status != http.StatusOK {
+		t.Errorf("GET %s = %d, want the upload untouched", pushed.URL, status)
+	}
+}
+
+// A 404 from a takedown covers three different mistakes, and which of them are
+// possible depends on the authority the caller sent — so the advice has to name
+// the one it actually used rather than the standing "check your key".
+func TestTakedownNotFoundNamesTheAuthorityThatWasUsed(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// Asserted on wording only this command produces. The registry's standing
+	// not_found advice already mentions the key, so looking for "key" would pass
+	// whether or not the keyed branch ran at all.
+	byKey, _ := h.fails("uploads", "delete", "art_nosuchartifact00001")["fix"].(string)
+	if !strings.Contains(byKey, "still anonymous") {
+		t.Errorf("keyed fix = %q, want it to point at the claim token as the other way in", byKey)
+	}
+	byToken, _ := h.fails("uploads", "delete", "art_nosuchartifact00001", "krowk_claim_nope")["fix"].(string)
+	if strings.Contains(byToken, "the key matches") {
+		t.Errorf("token fix = %q, want it to talk about the token rather than the key", byToken)
+	}
+	if !strings.Contains(byToken, "token") {
+		t.Errorf("token fix = %q, want it to name the token", byToken)
+	}
+}
+
+// A second positional that is not a token is not a wrong token. Taking it as one
+// would withhold the key, so `uploads delete art_a art_b` — meaning two
+// artifacts — would quietly become an unauthorised takedown reported as a 404.
+func TestASecondWordThatIsNotAClaimTokenIsRefused(t *testing.T) {
+	h := newHarness(t, 0)
+
+	first := only(t, h.ok("push", h.fixture))
+	second := only(t, h.ok("push", h.write("second.png", "more bytes")))
+
+	body := h.fails("uploads", "delete", first.Slug, second.Slug)
+	if body["error"] != "bad_claim_token" {
+		t.Errorf("error = %v, want bad_claim_token", body["error"])
+	}
+	// Neither is touched: a refusal here must not half-do the takedown.
+	for _, a := range []artifact{first, second} {
+		if status, _ := h.get(a.URL); status != http.StatusOK {
+			t.Errorf("GET %s = %d, want the upload untouched", a.URL, status)
+		}
 	}
 }

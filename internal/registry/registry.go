@@ -72,6 +72,10 @@ type artifact struct {
 	uploadTok  string
 	uploadTil  time.Time
 	claimed    bool
+	// deletedAt turns the record into a tombstone: the bytes are gone but the row
+	// stays, so a slug that was taken down answers 410 rather than 404. Zero means
+	// it is still live.
+	deletedAt time.Time
 	// storageKey is pinned at declare time: claiming moves the artifact to a
 	// new workspace, but the bytes stay where the presigned URL was signed for.
 	storageKey string
@@ -136,6 +140,10 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	})
 	mux.HandleFunc("GET /v1/artifacts", s.listArtifacts)
 	mux.HandleFunc("GET /v1/artifacts/{slug}", s.showArtifact)
+
+	// Takedown, and a hard purge: the bytes go at once rather than into anything
+	// that could hand them back.
+	mux.HandleFunc("DELETE /v1/artifacts/{slug}", s.destroyArtifact)
 
 	// Finalizing and completing are nested resources reached with PUT, because
 	// they are idempotent; claiming spends a one-shot token, so it is a POST.
@@ -418,13 +426,14 @@ func (s *store) finalizeArtifact(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
-	if a.State == "ready" {
-		writeJSON(w, http.StatusOK, serializeArtifact(a))
+	// Gone is checked before the idempotent success, because a taken-down artifact
+	// is normally a ready one: answering 200 for it would hand back a url and a
+	// markdown snippet pointing at bytes that are no longer there.
+	if s.refuseIfGone(w, a) {
 		return
 	}
-	if s.expired(a) {
-		writeError(w, http.StatusGone, "expired",
-			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+	if a.State == "ready" {
+		writeJSON(w, http.StatusOK, serializeArtifact(a))
 		return
 	}
 	// 409 rather than 422: the request is well formed, it just arrived before the
@@ -479,9 +488,12 @@ func (s *store) listArtifacts(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Tombstones are not part of what a workspace holds: a tombstone records that
+	// something used to be at a slug, not something still there, so it belongs in
+	// the answer to "what is at this slug" and nowhere else.
 	var owned []*artifact
 	for _, a := range s.artifacts {
-		if a.workspace == workspace {
+		if a.workspace == workspace && a.deletedAt.IsZero() {
 			owned = append(owned, a)
 		}
 	}
@@ -531,12 +543,111 @@ func (s *store) showArtifact(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
-	if s.expired(a) {
-		writeError(w, http.StatusGone, "expired",
-			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+	if s.refuseIfGone(w, a) {
 		return
 	}
 	writeJSON(w, http.StatusOK, serializeArtifact(a))
+}
+
+// destroyArtifact is the takedown. The bytes leave storage at once and what
+// stays behind is a tombstone, so a read afterwards is a 410 rather than a 404 —
+// the link is already pasted somewhere, and its reader deserves the difference.
+//
+// Immediate and unrecoverable by design. This is the path someone reaches for
+// when a secret was uploaded by accident, so it must not route through any
+// window that could give the bytes back.
+//
+// 204 rather than the artifact: there is nothing left to serialize, and a url
+// and markdown naming bytes that are gone would be a lie.
+func (s *store) destroyArtifact(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := authenticate(w, r)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		ClaimToken string `json:"claim_token"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+
+	// A keyless caller's authority is the claim token, and the slug will not do
+	// even though it does for reading: a slug travels in whatever the link was
+	// pasted into, so a reader of the paste must not be able to destroy what they
+	// read.
+	if workspace == "" && body.ClaimToken == "" {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: claim_token.", nil)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a := s.artifacts[r.PathValue("slug")]
+	if !authorizedToTakeDown(a, workspace, body.ClaimToken) {
+		// A slug that does not exist, one belonging to another workspace, and a
+		// token that does not match are all the same answer: a wrong guess learns
+		// nothing from the difference.
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+
+	// Idempotent, like finalizing: taking down what is already down is a success,
+	// and the deleted_at already recorded is the one that is true.
+	if a.deletedAt.IsZero() {
+		delete(s.objects, a.storageKey)
+		a.deletedAt = s.now().UTC()
+		// A takedown spends whatever upload URL is outstanding, so bytes cannot
+		// land under a tombstone and resurrect the link. Real storage governs that
+		// with the signature's own window instead, which a stand-in has no way to
+		// reach — refusing outright is the stricter of the two, and no client that
+		// takes an artifact down goes on to upload to it.
+		a.uploadTok = ""
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// authorizedToTakeDown reports whether the request carries an authority over
+// this artifact. A key's is the workspace it acts in; a claim token's is the one
+// artifact it was issued for.
+//
+// A spent token is no authority at all: claiming clears the digest in the real
+// registry, and the artifact has left the anonymous workspace by then anyway, so
+// a claimed artifact answers only to the key that now holds it.
+//
+// A tombstone still answers to both, which is what makes a retried takedown a
+// success rather than a 404.
+func authorizedToTakeDown(a *artifact, workspace, claimToken string) bool {
+	switch {
+	case a == nil:
+		return false
+	case workspace != "":
+		return a.workspace == workspace
+	default:
+		return a.claimHash != "" && !a.claimed &&
+			a.claimHash == sha256Hex([]byte(claimToken))
+	}
+}
+
+// refuseIfGone answers for an artifact the API will not act on any further, and
+// reports whether it did. Reading, finalizing, claiming and naming a run all go
+// through here, so gone means the same thing on every one of them.
+//
+// Takedown is reported first because an artifact can be both, and the one
+// somebody decided is the truer answer.
+func (s *store) refuseIfGone(w http.ResponseWriter, a *artifact) bool {
+	switch {
+	case !a.deletedAt.IsZero():
+		writeError(w, http.StatusGone, "taken_down",
+			fmt.Sprintf("%s was taken down at %s", a.Slug,
+				a.deletedAt.Format(time.RFC3339Nano)), nil)
+	case s.expired(a):
+		writeError(w, http.StatusGone, "expired",
+			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+	default:
+		return false
+	}
+	return true
 }
 
 // claimArtifact moves an anonymous artifact into the key's workspace, where it
@@ -572,15 +683,21 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A slug that does not exist, a token that does not match it, an artifact
-	// that was never anonymous, and one already claimed by someone else are all
-	// the same answer.
-	if !match || a.claimed {
+	// that was never anonymous, one already claimed by someone else, and a
+	// tombstone are all the same answer.
+	//
+	// A tombstone belongs in that list rather than in the gone check below,
+	// because the registry reaches this through Artifact.claimable, which narrows
+	// to `live` — so a taken-down artifact is not found rather than gone. Nothing
+	// claims an artifact back out of a takedown, and answering `taken_down` here
+	// would have the client branch differently against --dev than production.
+	if !match || a.claimed || !a.deletedAt.IsZero() {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
-	if s.expired(a) {
-		writeError(w, http.StatusGone, "expired",
-			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+	// Only an expiry reaches this now, which is all claim! can meet for the same
+	// reason: the takedown case never gets past the live scope above.
+	if s.refuseIfGone(w, a) {
 		return
 	}
 
@@ -631,14 +748,13 @@ func (s *store) attachRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
-	// Past its expiry an artifact is gone as far as the API is concerned, on every
-	// endpoint rather than only the ones that can meet an expiring one today.
-	// Nothing here produces this state — only a keyless upload gets an expiry, and
-	// this route needs a key — but the meaning of an expiry has to be uniform if an
-	// ephemeral artifact ever does reach a keyed workspace.
-	if s.expired(a) {
-		writeError(w, http.StatusGone, "expired",
-			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+	// Gone is gone on every endpoint rather than only the ones that can meet a
+	// gone artifact today. A takedown is reachable here — this route needs a key,
+	// and so does taking down a workspace's own artifact — while an expiry is not,
+	// since only a keyless upload gets one. Both go through the same check anyway,
+	// so the meaning stays uniform if an ephemeral artifact ever does reach a keyed
+	// workspace.
+	if s.refuseIfGone(w, a) {
 		return
 	}
 	if existing, ok := s.runs[body.Run]; !ok || existing.workspace != workspace {

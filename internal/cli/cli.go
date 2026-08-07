@@ -35,6 +35,10 @@ var Version = "0.1.0"
 // but it has to be asked for.
 const defaultRegistryAddr = "127.0.0.1:8787"
 
+// claimTokenPrefix is what the registry mints every claim token with, so a
+// second positional either looks like one or is a mistake worth naming.
+const claimTokenPrefix = "krowk_claim_"
+
 const helpTemplate = `krowk %s — permalinks for agent output
 
 Usage
@@ -43,6 +47,7 @@ Usage
   krowk uploads list [--limit --before]     List the workspace's uploads, newest first
   krowk uploads show <artifact>             Read one artifact back
   krowk uploads attach <art> --run <run>    Put an upload under a run afterwards
+  krowk uploads delete <art> [token]        Take an upload down — immediate, cannot be undone
   krowk runs start [flags]                  Open a run to group uploads under
   krowk runs finish <run>                   Close a run
   krowk claim <artifact> <token> [--run]    Keep an anonymous upload past expiry
@@ -94,6 +99,12 @@ Run metadata — the pull request, references and session — is recorded on a r
 and a run belongs to a workspace, so it needs an API key. Without one an upload
 still works: it lands anonymously, expires within a day, and comes back with a
 claim token that ` + "`krowk claim`" + ` spends to keep it.
+
+Taking an upload down removes the bytes at once and leaves the link reporting
+that it was taken down. There is no undo and no confirmation — it is what to
+reach for when something was published by accident. A key takes down anything in
+its workspace; an upload that is still anonymous is taken down with the claim
+token it came back with, passed after the slug.
 
 Credentials live in %s (0600).
 `
@@ -193,6 +204,8 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		err = uploadsShow(stdout, positionals[2:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "uploads" && positionals[1] == "attach":
 		err = uploadsAttach(stdout, positionals[2:], f, format, env, colour)
+	case len(positionals) > 1 && positionals[0] == "uploads" && positionals[1] == "delete":
+		err = uploadsDelete(stdout, positionals[2:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "runs" && positionals[1] == "start":
 		err = runsStart(stdout, f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "runs" && positionals[1] == "finish":
@@ -475,6 +488,79 @@ func uploadsAttach(w io.Writer, args []string, f flags, format output.Format, en
 	}
 	fmt.Fprintln(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()))
 	return nil
+}
+
+// uploadsDelete takes an upload down: the bytes leave storage at once and the
+// link reports it afterwards rather than answering as though it never existed.
+//
+// Not confirmed and not undoable, both deliberately. This is the command reached
+// for when a secret was published by accident — a secret that can be restored is
+// still leaked, and a prompt in the way is one more moment it stays up. The
+// caller is usually an agent or a script, which cannot answer a prompt at all.
+//
+// The claim token is optional because there are two authorities and they belong
+// to different callers: a key speaks for everything in its workspace, and a
+// claim token speaks for the one anonymous upload it was issued with.
+func uploadsDelete(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if len(args) == 0 {
+		return api.Fail("no_artifact", "pass the artifact: `krowk uploads delete art_...`")
+	}
+	slug := args[0]
+	var claimToken string
+	if len(args) > 1 {
+		// Checked rather than taken as given, because a second word that is not a
+		// token is not a wrong token — and passing one withholds the key, so a
+		// stray argument would quietly turn an authorised takedown into an
+		// unauthorised one and report it as a 404. `uploads delete art_a art_b`,
+		// meaning two artifacts, is the way that happens.
+		if !strings.HasPrefix(args[1], claimTokenPrefix) {
+			return api.Fail("bad_claim_token",
+				"`"+args[1]+"` is not a claim token — takedown takes one artifact and, after it, "+
+					"only the `"+claimTokenPrefix+"...` token that upload came back with")
+		}
+		claimToken = args[1]
+	}
+
+	client := newClient(f, env)
+	// An anonymous upload's only authority is its claim token, so saying plainly
+	// that there is none beats a 400 from the registry naming a parameter the
+	// caller never saw a flag for.
+	if claimToken == "" && !client.Authenticated() {
+		return api.Fail("missing_claim",
+			"taking down an anonymous upload needs the claim token it came back with: "+
+				"`krowk uploads delete "+slug+" krowk_claim_...` — with an API key, the key is authority enough")
+	}
+
+	if err := client.TakeDownArtifact(context.Background(), slug, claimToken); err != nil {
+		return withTakedownAuthority(err, claimToken != "")
+	}
+	fmt.Fprintln(w, output.Removed(slug, format, f.quiet, colour))
+	return nil
+}
+
+// withTakedownAuthority says what a 404 from a takedown actually means. The
+// registry answers the same "no such record" for a slug that does not exist, one
+// held by another workspace, and a claim token that does not match — a wrong
+// guess learns nothing from the difference — so the client is what names the
+// possibilities, and which of them apply depends on the authority it sent.
+//
+// The standing advice for a 404 names the key and its workspace, which is the
+// wrong thing to check when the caller authorised with a token instead.
+func withTakedownAuthority(err error, byToken bool) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "not_found" {
+		return err
+	}
+	if byToken {
+		apiErr.Body["fix"] = "no anonymous upload answers to that slug and token — check both were " +
+			"copied whole, and note that claiming one spends the token, after which the key that " +
+			"claimed it is what takes it down"
+	} else {
+		apiErr.Body["fix"] = "this workspace holds no such upload — check the slug, and that the key " +
+			"matches the workspace it was uploaded to; an upload that is still anonymous is taken " +
+			"down with its claim token instead"
+	}
+	return apiErr
 }
 
 func runsStart(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {

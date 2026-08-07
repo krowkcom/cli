@@ -502,3 +502,226 @@ func TestUploadRequiresTheChecksumHeaderItWasHanded(t *testing.T) {
 		t.Errorf("PUT with the checksum header = %d, want 200", res.StatusCode)
 	}
 }
+
+// takeDown issues the takedown, with a claim token when one is given.
+func takeDown(t *testing.T, server *httptest.Server, token, slug, claimToken string) (int, map[string]any) {
+	t.Helper()
+	body, contentType := "", ""
+	if claimToken != "" {
+		body = fmt.Sprintf(`{"claim_token":%q}`, claimToken)
+		contentType = "application/json"
+	}
+	return request(t, http.MethodDelete, server.URL+"/v1/artifacts/"+slug, token, contentType, body)
+}
+
+// readyArtifact declares, uploads and finalizes, so a test starts from the state
+// a takedown actually meets in practice.
+func readyArtifact(t *testing.T, server *httptest.Server, token, body string) map[string]any {
+	t.Helper()
+	payload := declare(t, server, token, "a.txt", body)
+	if put(t, uploadURL(t, payload), body) != http.StatusOK {
+		t.Fatal("upload failed")
+	}
+	if status, final := finalize(t, server, token, payload); status != http.StatusOK {
+		t.Fatalf("finalize = %d %v", status, final)
+	}
+	return payload
+}
+
+// Takedown is the path someone reaches for when a secret was published by
+// accident, so the bytes have to be gone at once — and what stays behind is a
+// tombstone, because the link is already pasted somewhere and its reader
+// deserves 410 rather than being sent hunting for a typo.
+func TestTakedownRemovesTheBytesAndAnswersGoneEverywhere(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_test"
+
+	payload := readyArtifact(t, server, key, "a secret")
+	slug, _ := payload["slug"].(string)
+	url, _ := payload["url"].(string)
+
+	if status, body := takeDown(t, server, key, slug, ""); status != http.StatusNoContent {
+		t.Fatalf("takedown = %d %v, want 204", status, body)
+	}
+
+	// The bytes go first, and they go for good: a takedown that could be undone
+	// would leave a leaked secret leaked.
+	if status, _ := request(t, http.MethodGet, url, "", "", ""); status != http.StatusNotFound {
+		t.Errorf("GET %s after takedown = %d, want 404", url, status)
+	}
+	if status, body := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, key, "", ""); status != http.StatusGone || errorCode(body) != "taken_down" {
+		t.Errorf("show after takedown = %d %v, want 410 taken_down", status, body)
+	}
+	// Finalizing has to report the takedown rather than its own idempotent
+	// success: a taken-down artifact is normally a ready one, and answering 200
+	// would hand back a url pointing at bytes that are no longer there.
+	if status, body := finalize(t, server, key, payload); status != http.StatusGone || errorCode(body) != "taken_down" {
+		t.Errorf("finalize after takedown = %d %v, want 410 taken_down", status, body)
+	}
+
+	status, created := request(t, http.MethodPost, server.URL+"/v1/runs", key, "application/json", `{"run":{}}`)
+	if status != http.StatusCreated {
+		t.Fatalf("create run = %d %v", status, created)
+	}
+	runSlug, _ := created["slug"].(string)
+	status, body := request(t, http.MethodPut, server.URL+"/v1/artifacts/"+slug+"/run",
+		key, "application/json", fmt.Sprintf(`{"run":%q}`, runSlug))
+	if status != http.StatusGone || errorCode(body) != "taken_down" {
+		t.Errorf("attach after takedown = %d %v, want 410 taken_down", status, body)
+	}
+
+	// A tombstone is not something the workspace still holds, so it answers for
+	// its own slug and nowhere else.
+	status, listing := request(t, http.MethodGet, server.URL+"/v1/artifacts", key, "", "")
+	if status != http.StatusOK {
+		t.Fatalf("list = %d %v", status, listing)
+	}
+	if artifacts, _ := listing["artifacts"].([]any); len(artifacts) != 0 {
+		t.Errorf("listing still holds the tombstone: %v", artifacts)
+	}
+
+	// Idempotent, like finalizing: taking down what is already down is a success,
+	// so a retry after a lost response is not a 404.
+	if status, body := takeDown(t, server, key, slug, ""); status != http.StatusNoContent {
+		t.Errorf("second takedown = %d %v, want 204", status, body)
+	}
+}
+
+// For a keyless caller the claim token is the authority and the slug is not.
+// Reading by slug alone is right — the bytes are public on the CDN regardless —
+// but a slug travels in whatever the link was pasted into, so a takedown
+// authorised by slug would let any reader of the paste destroy what they read.
+func TestKeylessTakedownNeedsTheClaimTokenAndNotJustTheSlug(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	payload := readyArtifact(t, server, "", "the bytes")
+	slug, _ := payload["slug"].(string)
+	claimToken, _ := payload["claim_token"].(string)
+
+	if status, body := takeDown(t, server, "", slug, ""); status != http.StatusBadRequest || errorCode(body) != "parameter_missing" {
+		t.Errorf("takedown with no token = %d %v, want 400 parameter_missing", status, body)
+	}
+	if status, body := takeDown(t, server, "", slug, "krowk_claim_wrong"); status != http.StatusNotFound || errorCode(body) != "not_found" {
+		t.Errorf("takedown with a wrong token = %d %v, want 404", status, body)
+	}
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "", "", ""); status != http.StatusOK {
+		t.Error("a refused takedown took the artifact down anyway")
+	}
+
+	if status, body := takeDown(t, server, "", slug, claimToken); status != http.StatusNoContent {
+		t.Fatalf("takedown with the real token = %d %v, want 204", status, body)
+	}
+	if status, body := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "", "", ""); status != http.StatusGone || errorCode(body) != "taken_down" {
+		t.Errorf("show after takedown = %d %v, want 410 taken_down", status, body)
+	}
+}
+
+// A key's authority is the workspace it acts in, so another tenant's slug reads
+// as simply not existing rather than as forbidden — which would confirm it does.
+func TestTakedownIsScopedToTheKeysWorkspace(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	payload := readyArtifact(t, server, "krowk_sk_mine", "the bytes")
+	slug, _ := payload["slug"].(string)
+
+	if status, body := takeDown(t, server, "krowk_sk_theirs", slug, ""); status != http.StatusNotFound {
+		t.Errorf("takedown across workspaces = %d %v, want 404", status, body)
+	}
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "krowk_sk_mine", "", ""); status != http.StatusOK {
+		t.Error("another workspace's takedown went through")
+	}
+}
+
+// Claiming spends the token and moves the artifact into a real workspace, so
+// from then on the key that claimed it is what takes it down. A token that no
+// longer speaks for anything must not keep speaking for this.
+func TestSpentClaimTokenNoLongerTakesAnArtifactDown(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_test"
+
+	payload := readyArtifact(t, server, "", "the bytes")
+	slug, _ := payload["slug"].(string)
+	claimToken, _ := payload["claim_token"].(string)
+
+	status, claimed := request(t, http.MethodPost, server.URL+"/v1/artifacts/"+slug+"/claim",
+		key, "application/json", fmt.Sprintf(`{"claim_token":%q}`, claimToken))
+	if status != http.StatusOK {
+		t.Fatalf("claim = %d %v", status, claimed)
+	}
+
+	if status, body := takeDown(t, server, "", slug, claimToken); status != http.StatusNotFound {
+		t.Errorf("takedown with a spent token = %d %v, want 404", status, body)
+	}
+	if status, body := takeDown(t, server, key, slug, ""); status != http.StatusNoContent {
+		t.Errorf("takedown by the claiming key = %d %v, want 204", status, body)
+	}
+}
+
+// Nothing claims an artifact back out of a takedown, and the registry says so as
+// a 404 rather than a 410: it reaches the artifact through Artifact.claimable,
+// which narrows to `live`, so a tombstone is not found rather than gone. Getting
+// this wrong would have a client branch differently against --dev than against
+// production, which is the whole failure a stand-in exists to prevent.
+func TestATakenDownArtifactCannotBeClaimedBack(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	payload := readyArtifact(t, server, "", "the bytes")
+	slug, _ := payload["slug"].(string)
+	claimToken, _ := payload["claim_token"].(string)
+
+	if status, body := takeDown(t, server, "", slug, claimToken); status != http.StatusNoContent {
+		t.Fatalf("takedown = %d %v", status, body)
+	}
+
+	status, body := request(t, http.MethodPost, server.URL+"/v1/artifacts/"+slug+"/claim",
+		"krowk_sk_test", "application/json", fmt.Sprintf(`{"claim_token":%q}`, claimToken))
+	if status != http.StatusNotFound || errorCode(body) != "not_found" {
+		t.Errorf("claim after takedown = %d %v, want 404 not_found", status, body)
+	}
+}
+
+// An artifact can be both taken down and past its expiry, and the one somebody
+// decided is the truer answer — so the order the two are reported in is load
+// bearing rather than incidental.
+func TestTakedownIsReportedAheadOfAnExpiry(t *testing.T) {
+	server, clk := newClockedServer(t)
+
+	payload := readyArtifact(t, server, "", "the bytes")
+	slug, _ := payload["slug"].(string)
+	claimToken, _ := payload["claim_token"].(string)
+
+	if status, _ := takeDown(t, server, "", slug, claimToken); status != http.StatusNoContent {
+		t.Fatal("takedown failed")
+	}
+	clk.advance(ephemeralLifetime + time.Minute)
+
+	if status, body := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "", "", ""); status != http.StatusGone || errorCode(body) != "taken_down" {
+		t.Errorf("show = %d %v, want 410 taken_down rather than expired", status, body)
+	}
+}
+
+// A takedown spends whatever upload URL is still outstanding. Without that, an
+// artifact taken down before its bytes arrived would accept them afterwards and
+// resurrect the public link under a tombstone.
+func TestTakedownSpendsAnOutstandingUploadURL(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const body = "the bytes"
+
+	// Declared but deliberately not uploaded, so the presigned PUT is still live.
+	payload := declare(t, server, "", "a.txt", body)
+	slug, _ := payload["slug"].(string)
+	claimToken, _ := payload["claim_token"].(string)
+	url := uploadURL(t, payload)
+
+	if status, got := takeDown(t, server, "", slug, claimToken); status != http.StatusNoContent {
+		t.Fatalf("takedown = %d %v", status, got)
+	}
+
+	if status := put(t, url, body); status != http.StatusForbidden {
+		t.Errorf("PUT after takedown = %d, want 403 — the URL is spent", status)
+	}
+	public, _ := payload["url"].(string)
+	if status, _ := request(t, http.MethodGet, public, "", "", ""); status != http.StatusNotFound {
+		t.Errorf("GET %s after takedown = %d, want 404", public, status)
+	}
+}

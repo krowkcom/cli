@@ -725,3 +725,126 @@ func TestTakedownSpendsAnOutstandingUploadURL(t *testing.T) {
 		t.Errorf("GET %s after takedown = %d, want 404", public, status)
 	}
 }
+
+func slugsOf(t *testing.T, payload map[string]any, key string) []string {
+	t.Helper()
+	rows, _ := payload[key].([]any)
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		record, _ := row.(map[string]any)
+		slug, _ := record["slug"].(string)
+		out = append(out, slug)
+	}
+	return out
+}
+
+// Runs page the way artifacts do — newest first, "older than this one" rather
+// than an offset, so rows are neither skipped nor repeated when one is opened
+// mid-listing.
+func TestRunListingPagesNewestFirst(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_test"
+
+	var opened []string
+	for range 3 {
+		opened = append(opened, openRun(t, server, key))
+	}
+	newest, middle, oldest := opened[2], opened[1], opened[0]
+
+	status, first := request(t, http.MethodGet, server.URL+"/v1/runs?limit=2", key, "", "")
+	if status != http.StatusOK {
+		t.Fatalf("list runs = %d %v", status, first)
+	}
+	if got := slugsOf(t, first, "runs"); !reflect.DeepEqual(got, []string{newest, middle}) {
+		t.Errorf("first page = %v, want the two newest in order", got)
+	}
+	// next is present because the page came back full, and carries the cursor.
+	if got, _ := first["next"].(string); got != middle {
+		t.Errorf("next = %q, want %q", got, middle)
+	}
+
+	_, second := request(t, http.MethodGet, server.URL+"/v1/runs?limit=2&before="+middle, key, "", "")
+	if got := slugsOf(t, second, "runs"); !reflect.DeepEqual(got, []string{oldest}) {
+		t.Errorf("second page = %v, want the oldest alone", got)
+	}
+	if second["next"] != nil {
+		t.Errorf("next = %v, want null on the last page", second["next"])
+	}
+
+	// Another key sees none of them.
+	_, theirs := request(t, http.MethodGet, server.URL+"/v1/runs", "krowk_sk_theirs", "", "")
+	if got := slugsOf(t, theirs, "runs"); len(got) != 0 {
+		t.Errorf("another workspace's listing = %v, want empty", got)
+	}
+}
+
+func TestShowRunIsScopedToTheKeysWorkspace(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	status, opened := request(t, http.MethodPost, server.URL+"/v1/runs", "krowk_sk_mine",
+		"application/json", `{"run":{"metadata":{"repo":"acme/storefront"}}}`)
+	if status != http.StatusCreated {
+		t.Fatalf("open run = %d %v", status, opened)
+	}
+	slug, _ := opened["slug"].(string)
+
+	status, payload := request(t, http.MethodGet, server.URL+"/v1/runs/"+slug, "krowk_sk_mine", "", "")
+	if status != http.StatusOK {
+		t.Fatalf("show run = %d %v", status, payload)
+	}
+	metadata, _ := payload["metadata"].(map[string]any)
+	if metadata["repo"] != "acme/storefront" {
+		t.Errorf("metadata = %v, want the run's own", payload["metadata"])
+	}
+
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/runs/"+slug, "krowk_sk_theirs", "", ""); status != http.StatusNotFound {
+		t.Errorf("show across workspaces = %d, want 404", status)
+	}
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/runs/"+slug, "", "", ""); status != http.StatusUnauthorized {
+		t.Errorf("show without a key = %d, want 401", status)
+	}
+}
+
+// A run's artifacts are a collection of the run, not a filter on the workspace
+// listing. The difference is the whole reason for the endpoint: an unknown run
+// is a 404 from the run itself, where a filter would answer an empty page — and
+// a caller cannot tell that apart from a run that produced nothing.
+func TestRunArtifactsAreACollectionOfTheRunRatherThanAFilter(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_test"
+
+	mine := openRun(t, server, key)
+	other := openRun(t, server, key)
+
+	inRun := declare(t, server, key, "a.txt", "aa")
+	slug, _ := inRun["slug"].(string)
+	status, body := request(t, http.MethodPut, server.URL+"/v1/artifacts/"+slug+"/run",
+		key, "application/json", fmt.Sprintf(`{"run":%q}`, mine))
+	if status != http.StatusOK {
+		t.Fatalf("attach = %d %v", status, body)
+	}
+	declare(t, server, key, "loose.txt", "bb") // in the workspace, in no run
+
+	status, page := request(t, http.MethodGet, server.URL+"/v1/runs/"+mine+"/artifacts", key, "", "")
+	if status != http.StatusOK {
+		t.Fatalf("run artifacts = %d %v", status, page)
+	}
+	if got := slugsOf(t, page, "artifacts"); !reflect.DeepEqual(got, []string{slug}) {
+		t.Errorf("run artifacts = %v, want only what the run made", got)
+	}
+
+	// A run that made nothing is an empty page, and it is answerable.
+	_, empty := request(t, http.MethodGet, server.URL+"/v1/runs/"+other+"/artifacts", key, "", "")
+	if got := slugsOf(t, empty, "artifacts"); len(got) != 0 {
+		t.Errorf("empty run = %v, want no artifacts", got)
+	}
+	// A run that does not exist is not the same thing, and must not read as one.
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/runs/run_nosuchrun0000000000/artifacts", key, "", ""); status != http.StatusNotFound {
+		t.Errorf("unknown run = %d, want 404 rather than an empty page", status)
+	}
+	// Nor is another workspace's run, which reads as not existing rather than as
+	// forbidden — which would confirm that it does.
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/runs/"+mine+"/artifacts", "krowk_sk_theirs", "", ""); status != http.StatusNotFound {
+		t.Errorf("another workspace's run = %d, want 404", status)
+	}
+}

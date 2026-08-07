@@ -94,6 +94,10 @@ type run struct {
 	CreatedAt  string          `json:"created_at"`
 
 	workspace string
+	// seq orders a listing, for the same reason an artifact's does: a timestamp
+	// would tie two runs opened in the same instant, and a page has to be totally
+	// ordered or rows swap places between pages.
+	seq int
 }
 
 type store struct {
@@ -102,6 +106,7 @@ type store struct {
 	runs      map[string]*run
 	objects   map[string][]byte
 	created   int
+	runsOpen  int
 	now       func() time.Time
 }
 
@@ -162,8 +167,16 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	mux.HandleFunc("GET /v1/key", showKey)
 
 	mux.HandleFunc("POST /v1/runs", s.createRun)
+	mux.HandleFunc("GET /v1/runs", s.listRuns)
+	mux.HandleFunc("GET /v1/runs/{slug}", s.showRun)
 	mux.HandleFunc("PUT /v1/runs/{slug}/completion", s.finishRun)
 	mux.HandleFunc("PATCH /v1/runs/{slug}/completion", s.finishRun)
+
+	// What one run produced, served as a collection of the run rather than as a
+	// filter on the artifact listing: the run is looked up first, so an unknown
+	// slug is a 404 where a filter would answer an empty page — which a client
+	// cannot tell apart from a run that genuinely produced nothing.
+	mux.HandleFunc("GET /v1/runs/{slug}/artifacts", s.listRunArtifacts)
 
 	// Object storage, standing in for R2. PUT is the presigned upload target;
 	// GET is the CDN, so a link this stand-in hands out actually resolves.
@@ -478,12 +491,7 @@ func (s *store) listArtifacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit := defaultPageSize
-	if requested, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil {
-		// Clamped rather than refused: a caller asking for more than we serve gets
-		// the most we serve, which is what it wanted.
-		limit = min(max(requested, 1), maxPageSize)
-	}
+	limit := pageLimit(r)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -510,23 +518,43 @@ func (s *store) listArtifacts(w http.ResponseWriter, r *http.Request) {
 		owned = slices.DeleteFunc(owned, func(a *artifact) bool { return a.seq >= cursor.seq })
 	}
 
-	// next is the slug to pass back as before, and is null on the last page.
-	// Present whenever the page came back full, as the registry's own does — so a
-	// total that is an exact multiple of the limit costs one extra empty page
-	// rather than a count query on every listing.
-	if len(owned) > limit {
-		owned = owned[:limit]
-	}
-	var next any
-	if len(owned) == limit {
-		next = owned[len(owned)-1].Slug
-	}
+	owned, next := paginate(owned, limit, func(a *artifact) string { return a.Slug })
 
 	page := make([]map[string]any, 0, len(owned))
 	for _, a := range owned {
 		page = append(page, serializeArtifact(a))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"artifacts": page, "next": next})
+}
+
+// pageLimit is how many rows a listing serves, clamped rather than refused: a
+// caller asking for more than we serve gets the most we serve, which is what it
+// wanted. Anything that is not a number at all is not a request for one, so it
+// gets the default rather than being read as zero.
+func pageLimit(r *http.Request) int {
+	requested, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil {
+		return defaultPageSize
+	}
+	return min(max(requested, 1), maxPageSize)
+}
+
+// paginate cuts a newest-first slice down to one page and names the cursor for
+// the next one.
+//
+// next is present whenever the page came back full, as the registry's own
+// listings are — so a total that is an exact multiple of the limit costs one
+// extra empty page rather than a count query on every listing. Shared by every
+// listing here, because a client that learned the rule from one of them has to
+// be right about the next.
+func paginate[T any](rows []T, limit int, slug func(T) string) ([]T, any) {
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	if len(rows) < limit {
+		return rows, nil
+	}
+	return rows, slug(rows[len(rows)-1])
 }
 
 func (s *store) showArtifact(w http.ResponseWriter, r *http.Request) {
@@ -805,10 +833,128 @@ func (s *store) createRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	s.runsOpen++
+	entry.seq = s.runsOpen
 	s.runs[entry.Slug] = entry
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusCreated, entry)
+}
+
+// listRuns is one page of a workspace's runs, newest first.
+func (s *store) listRuns(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+	limit := pageLimit(r)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var owned []*run
+	for _, entry := range s.runs {
+		if entry.workspace == workspace {
+			owned = append(owned, entry)
+		}
+	}
+	slices.SortFunc(owned, func(x, y *run) int { return y.seq - x.seq })
+
+	if before := r.URL.Query().Get("before"); before != "" {
+		// Looked up in the same workspace as the page, so a cursor from another
+		// tenant reads as simply not existing.
+		cursor := s.findRun(workspace, before)
+		if cursor == nil {
+			writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+			return
+		}
+		owned = slices.DeleteFunc(owned, func(entry *run) bool { return entry.seq >= cursor.seq })
+	}
+
+	owned, next := paginate(owned, limit, func(entry *run) string { return entry.Slug })
+	// Serialized as itself rather than through a map, since a run's JSON shape is
+	// the struct's own tags.
+	page := make([]*run, 0, len(owned))
+	page = append(page, owned...)
+	writeJSON(w, http.StatusOK, map[string]any{"runs": page, "next": next})
+}
+
+func (s *store) showRun(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry := s.findRun(workspace, r.PathValue("slug"))
+	if entry == nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
+}
+
+// listRunArtifacts is what one run produced — a collection of the run rather
+// than a filter on the workspace listing, so the run is looked up first and an
+// unknown slug is a 404. A filter would answer an empty page instead, which a
+// client cannot tell apart from a run that genuinely produced nothing.
+func (s *store) listRunArtifacts(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+	limit := pageLimit(r)
+	runSlug := r.PathValue("slug")
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.findRun(workspace, runSlug) == nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+
+	// The run's own artifacts are scope enough: a run belongs to a workspace, and
+	// an artifact only ever joins one through a keyed request in that same
+	// workspace, so there is nothing here another tenant could reach.
+	var made []*artifact
+	for _, a := range s.artifacts {
+		if a.Run == runSlug && a.deletedAt.IsZero() {
+			made = append(made, a)
+		}
+	}
+	slices.SortFunc(made, func(x, y *artifact) int { return y.seq - x.seq })
+
+	if before := r.URL.Query().Get("before"); before != "" {
+		// Looked up among the run's own, so a cursor from outside this run reads as
+		// simply not existing.
+		cursor := s.artifacts[before]
+		if cursor == nil || cursor.Run != runSlug {
+			writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+			return
+		}
+		made = slices.DeleteFunc(made, func(a *artifact) bool { return a.seq >= cursor.seq })
+	}
+
+	made, next := paginate(made, limit, func(a *artifact) string { return a.Slug })
+	page := make([]map[string]any, 0, len(made))
+	for _, a := range made {
+		page = append(page, serializeArtifact(a))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"artifacts": page, "next": next})
+}
+
+// findRun scopes a lookup to the workspace the request belongs to, so a slug
+// from another one reads as simply not existing rather than as forbidden —
+// which would confirm that it does.
+func (s *store) findRun(workspace, slug string) *run {
+	entry := s.runs[slug]
+	if entry == nil || entry.workspace != workspace {
+		return nil
+	}
+	return entry
 }
 
 func (s *store) finishRun(w http.ResponseWriter, r *http.Request) {
@@ -820,8 +966,8 @@ func (s *store) finishRun(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	entry := s.runs[r.PathValue("slug")]
-	if entry == nil || entry.workspace != workspace {
+	entry := s.findRun(workspace, r.PathValue("slug"))
+	if entry == nil {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}

@@ -44,11 +44,14 @@ const helpTemplate = `krowk %s — permalinks for agent output
 Usage
   krowk push <file...> [flags]              Upload files, get a link for each
   krowk uploads create <file...> [flags]    The same thing, spelled out
-  krowk uploads list [--limit --before]     List the workspace's uploads, newest first
+  krowk uploads list [--run --limit --before]
+                                            List uploads, newest first — a run's, or the workspace's
   krowk uploads show <artifact>             Read one artifact back
   krowk uploads attach <art> --run <run>    Put an upload under a run afterwards
   krowk uploads delete <art> [token]        Take an upload down — immediate, cannot be undone
   krowk runs start [flags]                  Open a run to group uploads under
+  krowk runs list [--limit --before]        List the workspace's runs, newest first
+  krowk runs show <run>                     Read one run back, with its metadata
   krowk runs finish <run>                   Close a run
   krowk claim <artifact> <token> [--run]    Keep an anonymous upload past expiry
   krowk auth login --token <token>          Check an API token, then store it
@@ -70,8 +73,9 @@ Upload flags
   --agent <name>         Override the detected agent
 
 List flags
-  --limit <n>            Artifacts per page (1–100, default 50)
-  --before <artifact>    Start after this artifact — the ` + "`next`" + ` of the last page
+  --limit <n>            Rows per page (1–100, default 50)
+  --before <slug>        Start after this row — the ` + "`next`" + ` of the last page
+  --run <slug>           On ` + "`uploads list`" + `, narrow it to what one run produced
 
 Local registry flags
   --addr <host:port>     Listen address for ` + "`registry serve`" + ` (default %s, loopback only)
@@ -208,6 +212,10 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		err = uploadsDelete(stdout, positionals[2:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "runs" && positionals[1] == "start":
 		err = runsStart(stdout, f, format, env, colour)
+	case len(positionals) > 1 && positionals[0] == "runs" && positionals[1] == "list":
+		err = runsList(stdout, f, format, env, colour)
+	case len(positionals) > 1 && positionals[0] == "runs" && positionals[1] == "show":
+		err = runsShow(stdout, positionals[2:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "runs" && positionals[1] == "finish":
 		err = runsFinish(stdout, positionals[2:], f, format, env, colour)
 	case positionals[0] == "claim":
@@ -445,14 +453,56 @@ func errCode(err error) string {
 
 // uploadsList pages through the key's workspace. Needs a key: keyless requests
 // all share the anonymous workspace, so there is nothing of one's own to list.
+//
+// --run narrows it to what one run produced, which the registry serves as a
+// collection of that run rather than as a filter here. The difference is worth
+// keeping: an unknown run is a 404 from the run itself, where a filter would
+// answer an empty page — and a caller cannot tell that apart from a run that
+// genuinely produced nothing.
 func uploadsList(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
 	client := newClient(f, env)
+	ctx := context.Background()
 
-	page, err := client.ListArtifacts(context.Background(), f.before, f.limit)
+	var page *api.Page
+	var err error
+	if f.run != "" {
+		page, err = client.ListRunArtifacts(ctx, f.run, f.before, f.limit)
+	} else {
+		page, err = client.ListArtifacts(ctx, f.before, f.limit)
+	}
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.List(page, format, f.quiet, colour, time.Now()))
+	fmt.Fprintln(w, output.List(page, f.run, format, f.quiet, colour, time.Now()))
+	return nil
+}
+
+// runsList pages through the key's runs, newest first.
+func runsList(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
+	client := newClient(f, env)
+
+	page, err := client.ListRuns(context.Background(), f.before, f.limit)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, output.RunList(page, format, f.quiet, colour))
+	return nil
+}
+
+// runsShow reads one run back with everything recorded on it. That is where an
+// upload's origin lives — the pull request, the commit, the session — since the
+// registry keeps none of it on the artifact.
+func runsShow(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if len(args) == 0 {
+		return api.Fail("no_run", "pass the run: `krowk runs show run_...`")
+	}
+	client := newClient(f, env)
+
+	run, err := client.ShowRun(context.Background(), args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, output.RunDetail(run, format, f.quiet, colour))
 	return nil
 }
 

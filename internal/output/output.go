@@ -345,8 +345,9 @@ func humanResult(r Result, colour bool, now time.Time) string {
 	return strings.Join(lines, "\n")
 }
 
-// List renders a page of a workspace's artifacts.
-func List(p *api.Page, f Format, quiet, colour bool, now time.Time) string {
+// List renders a page of artifacts. runSlug names the run they were scoped to,
+// and is empty for a whole workspace's listing.
+func List(p *api.Page, runSlug string, f Format, quiet, colour bool, now time.Time) string {
 	switch f {
 	case Markdown:
 		lines := make([]string, 0, len(p.Artifacts))
@@ -357,7 +358,7 @@ func List(p *api.Page, f Format, quiet, colour bool, now time.Time) string {
 	case URL:
 		return urlResult(Result{Artifacts: p.Artifacts})
 	case Human:
-		return humanList(p, colour, now)
+		return humanList(p, runSlug, colour, now)
 	}
 
 	if quiet {
@@ -367,13 +368,24 @@ func List(p *api.Page, f Format, quiet, colour bool, now time.Time) string {
 	// The cursor is only worth mentioning when there is another page behind it.
 	if p.Next != "" {
 		env.Breadcrumbs = []Breadcrumb{
-			{Action: "next page", Cmd: "krowk uploads list --before " + p.Next},
+			{Action: "next page", Cmd: nextPageCmd(runSlug, p.Next)},
 		}
 	}
 	return encode(env)
 }
 
-func humanList(p *api.Page, colour bool, now time.Time) string {
+// nextPageCmd carries whatever scoped this page into the command for the one
+// after it. A run's listing paged on without --run would silently widen to the
+// whole workspace, which reads as the run having produced far more than it did.
+func nextPageCmd(runSlug, next string) string {
+	cmd := "krowk uploads list"
+	if runSlug != "" {
+		cmd += " --run " + runSlug
+	}
+	return cmd + " --before " + next
+}
+
+func humanList(p *api.Page, runSlug string, colour bool, now time.Time) string {
 	if len(p.Artifacts) == 0 {
 		return paint(colour, dim, "no artifacts")
 	}
@@ -401,8 +413,7 @@ func humanList(p *api.Page, colour bool, now time.Time) string {
 		lines = append(lines, line)
 	}
 	if p.Next != "" {
-		lines = append(lines, paint(colour, dim,
-			"more: krowk uploads list --before "+p.Next))
+		lines = append(lines, paint(colour, dim, "more: "+nextPageCmd(runSlug, p.Next)))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -591,6 +602,122 @@ func Run(r *api.Run, f Format, quiet, colour bool) string {
 			{Action: "close", Cmd: "krowk runs finish " + r.Slug},
 		},
 	})
+}
+
+// RunList renders a page of a workspace's runs, newest first. There is no link
+// to a run, so markdown and url fall back to the JSON envelope.
+func RunList(p *api.RunPage, f Format, quiet, colour bool) string {
+	if f != Human {
+		if quiet {
+			return encode(p)
+		}
+		noun := "runs"
+		if len(p.Runs) == 1 {
+			noun = "run"
+		}
+		env := Envelope{OK: true, Data: p, Summary: fmt.Sprintf("%d %s", len(p.Runs), noun)}
+		if p.Next != "" {
+			env.Breadcrumbs = []Breadcrumb{
+				{Action: "next page", Cmd: "krowk runs list --before " + p.Next},
+			}
+		}
+		return encode(env)
+	}
+
+	if len(p.Runs) == 0 {
+		return paint(colour, dim, "no runs")
+	}
+	var slugWidth, statusWidth int
+	for _, r := range p.Runs {
+		slugWidth = max(slugWidth, len(r.Slug))
+		statusWidth = max(statusWidth, len(r.Status))
+	}
+
+	lines := make([]string, 0, len(p.Runs)+1)
+	for _, r := range p.Runs {
+		line := fmt.Sprintf("%-*s  %-*s", slugWidth, r.Slug, statusWidth, r.Status)
+		if label := runLabel(r); label != "" {
+			line += "  " + label
+		}
+		lines = append(lines, strings.TrimRight(line, " "))
+	}
+	if p.Next != "" {
+		lines = append(lines, paint(colour, dim, "more: krowk runs list --before "+p.Next))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// RunDetail renders one run and everything recorded on it. Unlike Run, which
+// reports what just happened to one, this is the whole record — the metadata
+// included, since a run is where all of it lives and the registry keeps none on
+// the artifacts themselves.
+func RunDetail(r *api.Run, f Format, quiet, colour bool) string {
+	if f != Human {
+		if quiet {
+			return encode(r)
+		}
+		crumbs := []Breadcrumb{
+			{Action: "what it made", Cmd: "krowk uploads list --run " + r.Slug},
+		}
+		if r.Status != "finished" {
+			crumbs = append(crumbs, Breadcrumb{Action: "close", Cmd: "krowk runs finish " + r.Slug})
+		}
+		return encode(Envelope{
+			OK:          true,
+			Data:        r,
+			Summary:     fmt.Sprintf("run %s is %s", r.Slug, r.Status),
+			Breadcrumbs: crumbs,
+		})
+	}
+
+	lines := []string{fmt.Sprintf("%s  %s", r.Slug, paint(colour, dim, r.Status))}
+	if r.StartedAt != "" {
+		lines = append(lines, fmt.Sprintf("  %-13s %s", "started", r.StartedAt))
+	}
+	if r.FinishedAt != "" {
+		lines = append(lines, fmt.Sprintf("  %-13s %s", "finished", r.FinishedAt))
+	}
+	// Metadata is whatever the caller chose to record, so it is printed as it
+	// arrived rather than interpreted into fields this command would have to know
+	// about. Sorted, so the same run always prints the same way.
+	for _, k := range slices.Sorted(maps.Keys(runFields(r))) {
+		lines = append(lines, fmt.Sprintf("  %-13s %s", k, joinValues(runFields(r)[k])))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// runFields is a run's metadata as plain keys and values. A run that recorded
+// none, or something that is not an object, reads as having no fields rather
+// than as an error: metadata is stored verbatim, so this cannot assume a shape.
+func runFields(r *api.Run) map[string]any {
+	var fields map[string]any
+	if len(r.Metadata) > 0 {
+		_ = json.Unmarshal(r.Metadata, &fields)
+	}
+	return fields
+}
+
+// runLabel is the most identifying thing a run knows about itself, for a listing
+// that would otherwise be a column of opaque slugs. The metadata is where a
+// run's identity lives, since the registry keeps none on the artifact — so this
+// reads back the fields the CLI itself records, most specific first.
+func runLabel(r *api.Run) string {
+	fields := runFields(r)
+	text := func(key string) string {
+		s, _ := fields[key].(string)
+		return s
+	}
+	switch {
+	case text("title") != "":
+		return text("title")
+	case text("pull_request") != "":
+		return text("pull_request")
+	case text("repo") != "" && text("branch") != "":
+		return text("repo") + "@" + text("branch")
+	case text("repo") != "":
+		return text("repo")
+	}
+	return text("agent")
 }
 
 // Error renders a failure. Human output leads with the code and ends with the

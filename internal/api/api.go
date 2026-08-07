@@ -289,6 +289,16 @@ func Fail(code, fix string) *Error {
 	return &Error{Body: map[string]any{"error": code, "fix": fix, "retryable": false}}
 }
 
+// slugPath escapes a slug into a URL path segment.
+//
+// A real slug is letters and digits, so this changes nothing for one. It is here
+// for everything else a caller can type: `#` ends the path and makes the rest a
+// fragment, `?` starts a query, and `/` invents a segment — so an unescaped slug
+// does not fail, it silently addresses a *different* endpoint. On a takedown
+// that means destroying an artifact other than the one named, and on a read it
+// means an answer about something the caller never asked for.
+func slugPath(slug string) string { return url.PathEscape(slug) }
+
 // Spec is a file the client is about to upload, measured and digested so the
 // registry can sign an upload URL that only these exact bytes fit.
 //
@@ -395,7 +405,7 @@ func (c *Client) PrepareArtifact(ctx context.Context, spec Spec) (*Artifact, err
 // retry is a success rather than an error.
 func (c *Client) FinalizeArtifact(ctx context.Context, slug string) (*Artifact, error) {
 	var artifact Artifact
-	if err := c.call(ctx, http.MethodPut, "/artifacts/"+slug+"/finalization", nil, &artifact); err != nil {
+	if err := c.call(ctx, http.MethodPut, "/artifacts/"+slugPath(slug)+"/finalization", nil, &artifact); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
@@ -406,7 +416,7 @@ func (c *Client) FinalizeArtifact(ctx context.Context, slug string) (*Artifact, 
 // workspace.
 func (c *Client) ShowArtifact(ctx context.Context, slug string) (*Artifact, error) {
 	var artifact Artifact
-	if err := c.call(ctx, http.MethodGet, "/artifacts/"+slug, nil, &artifact); err != nil {
+	if err := c.call(ctx, http.MethodGet, "/artifacts/"+slugPath(slug), nil, &artifact); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
@@ -451,7 +461,7 @@ func (c *Client) ListArtifacts(ctx context.Context, before string, limit int) (*
 func (c *Client) ClaimArtifact(ctx context.Context, slug, claimToken string) (*Artifact, error) {
 	var artifact Artifact
 	body := map[string]any{"claim_token": claimToken}
-	if err := c.call(ctx, http.MethodPost, "/artifacts/"+slug+"/claim", body, &artifact); err != nil {
+	if err := c.call(ctx, http.MethodPost, "/artifacts/"+slugPath(slug)+"/claim", body, &artifact); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
@@ -469,7 +479,7 @@ func (c *Client) ClaimArtifact(ctx context.Context, slug, claimToken string) (*A
 func (c *Client) AttachRun(ctx context.Context, artifactSlug, runSlug string) (*Artifact, error) {
 	var artifact Artifact
 	body := map[string]any{"run": runSlug}
-	if err := c.call(ctx, http.MethodPut, "/artifacts/"+artifactSlug+"/run", body, &artifact); err != nil {
+	if err := c.call(ctx, http.MethodPut, "/artifacts/"+slugPath(artifactSlug)+"/run", body, &artifact); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
@@ -498,7 +508,7 @@ func (c *Client) AttachRun(ctx context.Context, artifactSlug, runSlug string) (*
 // both sides, so a lost response costs nothing to ask again.
 func (c *Client) TakeDownArtifact(ctx context.Context, slug, claimToken string) error {
 	if claimToken == "" {
-		return c.call(ctx, http.MethodDelete, "/artifacts/"+slug, nil, nil)
+		return c.call(ctx, http.MethodDelete, "/artifacts/"+slugPath(slug), nil, nil)
 	}
 
 	// A claim token is the authority for this call, and it is the only one the
@@ -514,7 +524,7 @@ func (c *Client) TakeDownArtifact(ctx context.Context, slug, claimToken string) 
 	keyless := New(c.BaseURL, "")
 	keyless.Sleep = c.Sleep
 	body := map[string]any{"claim_token": claimToken}
-	return keyless.call(ctx, http.MethodDelete, "/artifacts/"+slug, body, nil)
+	return keyless.call(ctx, http.MethodDelete, "/artifacts/"+slugPath(slug), body, nil)
 }
 
 // CreateRun opens a run to hang artifacts off. Needs a key: a run belongs to a
@@ -538,7 +548,7 @@ func (c *Client) CreateRun(ctx context.Context, metadata any) (*Run, error) {
 // run keeps the moment it first finished.
 func (c *Client) FinishRun(ctx context.Context, slug string) (*Run, error) {
 	var run Run
-	if err := c.call(ctx, http.MethodPut, "/runs/"+slug+"/completion", nil, &run); err != nil {
+	if err := c.call(ctx, http.MethodPut, "/runs/"+slugPath(slug)+"/completion", nil, &run); err != nil {
 		return nil, err
 	}
 	return &run, nil

@@ -1027,9 +1027,12 @@ func TestTakenDownReadsAsGoneForGoodRatherThanAsATypo(t *testing.T) {
 		t.Errorf("fix = %q, want it to say the artifact is gone and uploading again is the way back", fix)
 	}
 	// Nothing about retrying changes the answer, and an agent that keeps trying
-	// is worse than one that stops.
-	if retryable, _ := body["retryable"].(bool); retryable {
-		t.Error("taken_down should not be retryable")
+	// is worse than one that stops. The verdict has to be stated, not merely
+	// absent: a missing key reads as false to anything asserting on it, so
+	// "not retryable" and "nothing said" would look identical here.
+	retryable, stated := body["retryable"].(bool)
+	if !stated || retryable {
+		t.Errorf("retryable = %v (stated %v), want an explicit false", retryable, stated)
 	}
 }
 
@@ -1078,9 +1081,12 @@ func TestDeletingAnonymouslyWithoutATokenNamesWhatIsMissing(t *testing.T) {
 func TestTakedownNotFoundNamesTheAuthorityThatWasUsed(t *testing.T) {
 	h := newHarness(t, 0)
 
+	// Asserted on wording only this command produces. The registry's standing
+	// not_found advice already mentions the key, so looking for "key" would pass
+	// whether or not the keyed branch ran at all.
 	byKey, _ := h.fails("uploads", "delete", "art_nosuchartifact00001")["fix"].(string)
-	if !strings.Contains(byKey, "key") {
-		t.Errorf("keyed fix = %q, want it to name the key and its workspace", byKey)
+	if !strings.Contains(byKey, "still anonymous") {
+		t.Errorf("keyed fix = %q, want it to point at the claim token as the other way in", byKey)
 	}
 	byToken, _ := h.fails("uploads", "delete", "art_nosuchartifact00001", "krowk_claim_nope")["fix"].(string)
 	if strings.Contains(byToken, "the key matches") {
@@ -1088,5 +1094,26 @@ func TestTakedownNotFoundNamesTheAuthorityThatWasUsed(t *testing.T) {
 	}
 	if !strings.Contains(byToken, "token") {
 		t.Errorf("token fix = %q, want it to name the token", byToken)
+	}
+}
+
+// A second positional that is not a token is not a wrong token. Taking it as one
+// would withhold the key, so `uploads delete art_a art_b` — meaning two
+// artifacts — would quietly become an unauthorised takedown reported as a 404.
+func TestASecondWordThatIsNotAClaimTokenIsRefused(t *testing.T) {
+	h := newHarness(t, 0)
+
+	first := only(t, h.ok("push", h.fixture))
+	second := only(t, h.ok("push", h.write("second.png", "more bytes")))
+
+	body := h.fails("uploads", "delete", first.Slug, second.Slug)
+	if body["error"] != "bad_claim_token" {
+		t.Errorf("error = %v, want bad_claim_token", body["error"])
+	}
+	// Neither is touched: a refusal here must not half-do the takedown.
+	for _, a := range []artifact{first, second} {
+		if status, _ := h.get(a.URL); status != http.StatusOK {
+			t.Errorf("GET %s = %d, want the upload untouched", a.URL, status)
+		}
 	}
 }

@@ -683,12 +683,20 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A slug that does not exist, a token that does not match it, an artifact
-	// that was never anonymous, and one already claimed by someone else are all
-	// the same answer.
-	if !match || a.claimed {
+	// that was never anonymous, one already claimed by someone else, and a
+	// tombstone are all the same answer.
+	//
+	// A tombstone belongs in that list rather than in the gone check below,
+	// because the registry reaches this through Artifact.claimable, which narrows
+	// to `live` — so a taken-down artifact is not found rather than gone. Nothing
+	// claims an artifact back out of a takedown, and answering `taken_down` here
+	// would have the client branch differently against --dev than production.
+	if !match || a.claimed || !a.deletedAt.IsZero() {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
+	// Only an expiry reaches this now, which is all claim! can meet for the same
+	// reason: the takedown case never gets past the live scope above.
 	if s.refuseIfGone(w, a) {
 		return
 	}

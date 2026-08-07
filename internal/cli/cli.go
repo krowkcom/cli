@@ -35,6 +35,10 @@ var Version = "0.1.0"
 // but it has to be asked for.
 const defaultRegistryAddr = "127.0.0.1:8787"
 
+// claimTokenPrefix is what the registry mints every claim token with, so a
+// second positional either looks like one or is a mistake worth naming.
+const claimTokenPrefix = "krowk_claim_"
+
 const helpTemplate = `krowk %s — permalinks for agent output
 
 Usage
@@ -504,6 +508,16 @@ func uploadsDelete(w io.Writer, args []string, f flags, format output.Format, en
 	slug := args[0]
 	var claimToken string
 	if len(args) > 1 {
+		// Checked rather than taken as given, because a second word that is not a
+		// token is not a wrong token — and passing one withholds the key, so a
+		// stray argument would quietly turn an authorised takedown into an
+		// unauthorised one and report it as a 404. `uploads delete art_a art_b`,
+		// meaning two artifacts, is the way that happens.
+		if !strings.HasPrefix(args[1], claimTokenPrefix) {
+			return api.Fail("bad_claim_token",
+				"`"+args[1]+"` is not a claim token — takedown takes one artifact and, after it, "+
+					"only the `"+claimTokenPrefix+"...` token that upload came back with")
+		}
 		claimToken = args[1]
 	}
 

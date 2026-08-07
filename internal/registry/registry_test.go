@@ -656,3 +656,72 @@ func TestSpentClaimTokenNoLongerTakesAnArtifactDown(t *testing.T) {
 		t.Errorf("takedown by the claiming key = %d %v, want 204", status, body)
 	}
 }
+
+// Nothing claims an artifact back out of a takedown, and the registry says so as
+// a 404 rather than a 410: it reaches the artifact through Artifact.claimable,
+// which narrows to `live`, so a tombstone is not found rather than gone. Getting
+// this wrong would have a client branch differently against --dev than against
+// production, which is the whole failure a stand-in exists to prevent.
+func TestATakenDownArtifactCannotBeClaimedBack(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	payload := readyArtifact(t, server, "", "the bytes")
+	slug, _ := payload["slug"].(string)
+	claimToken, _ := payload["claim_token"].(string)
+
+	if status, body := takeDown(t, server, "", slug, claimToken); status != http.StatusNoContent {
+		t.Fatalf("takedown = %d %v", status, body)
+	}
+
+	status, body := request(t, http.MethodPost, server.URL+"/v1/artifacts/"+slug+"/claim",
+		"krowk_sk_test", "application/json", fmt.Sprintf(`{"claim_token":%q}`, claimToken))
+	if status != http.StatusNotFound || errorCode(body) != "not_found" {
+		t.Errorf("claim after takedown = %d %v, want 404 not_found", status, body)
+	}
+}
+
+// An artifact can be both taken down and past its expiry, and the one somebody
+// decided is the truer answer — so the order the two are reported in is load
+// bearing rather than incidental.
+func TestTakedownIsReportedAheadOfAnExpiry(t *testing.T) {
+	server, clk := newClockedServer(t)
+
+	payload := readyArtifact(t, server, "", "the bytes")
+	slug, _ := payload["slug"].(string)
+	claimToken, _ := payload["claim_token"].(string)
+
+	if status, _ := takeDown(t, server, "", slug, claimToken); status != http.StatusNoContent {
+		t.Fatal("takedown failed")
+	}
+	clk.advance(ephemeralLifetime + time.Minute)
+
+	if status, body := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "", "", ""); status != http.StatusGone || errorCode(body) != "taken_down" {
+		t.Errorf("show = %d %v, want 410 taken_down rather than expired", status, body)
+	}
+}
+
+// A takedown spends whatever upload URL is still outstanding. Without that, an
+// artifact taken down before its bytes arrived would accept them afterwards and
+// resurrect the public link under a tombstone.
+func TestTakedownSpendsAnOutstandingUploadURL(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const body = "the bytes"
+
+	// Declared but deliberately not uploaded, so the presigned PUT is still live.
+	payload := declare(t, server, "", "a.txt", body)
+	slug, _ := payload["slug"].(string)
+	claimToken, _ := payload["claim_token"].(string)
+	url := uploadURL(t, payload)
+
+	if status, got := takeDown(t, server, "", slug, claimToken); status != http.StatusNoContent {
+		t.Fatalf("takedown = %d %v", status, got)
+	}
+
+	if status := put(t, url, body); status != http.StatusForbidden {
+		t.Errorf("PUT after takedown = %d, want 403 — the URL is spent", status)
+	}
+	public, _ := payload["url"].(string)
+	if status, _ := request(t, http.MethodGet, public, "", "", ""); status != http.StatusNotFound {
+		t.Errorf("GET %s after takedown = %d, want 404", public, status)
+	}
+}

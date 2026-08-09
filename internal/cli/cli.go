@@ -666,7 +666,11 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 		}
 		artifact = attached
 	}
-	fmt.Fprintln(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()))
+	// Claimed rather than Artifact: a claim that named no run leaves the upload
+	// in a workspace and under nothing, and `uploads attach` is the only way it
+	// ever gets one. That is worth handing back as a command rather than leaving
+	// to be discovered in the help.
+	fmt.Fprintln(w, output.Claimed(artifact, format, f.quiet, colour, time.Now()))
 	return nil
 }
 

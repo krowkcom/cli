@@ -157,8 +157,9 @@ type run struct {
 }
 
 type breadcrumb struct {
-	Action string `json:"action"`
-	Cmd    string `json:"cmd"`
+	Action      string `json:"action"`
+	Cmd         string `json:"cmd"`
+	Description string `json:"description"`
 }
 
 func decode(t *testing.T, s string) envelope {

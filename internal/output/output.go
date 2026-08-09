@@ -64,10 +64,27 @@ func MarkdownSurfacesFor(p Paste) string {
 	return PlainSurfaces
 }
 
-// Breadcrumb suggests the next command, the way the Basecamp CLI does.
+// Breadcrumb is one call left to make, spelled out well enough to run without
+// consulting anything: what it would do, the command that does it with this
+// result's own slugs and tokens already in it, and why it is worth doing.
+//
+// The three fields are a contract, so all three are always present. An agent
+// reading this decides on the description and pastes the cmd — a breadcrumb
+// that leaves either to be worked out is one it has to go and read the help for,
+// which is the cost this exists to remove.
+//
+// Cmd carries real arguments, never placeholders, wherever the result knows
+// them. The one exception is a slug this side genuinely does not have — the run
+// to attach a freshly claimed upload to is the caller's to choose — and there
+// the placeholder is angle-bracketed so it cannot be mistaken for a value.
 type Breadcrumb struct {
+	// Action is the short verb phrase, for a menu or a log line.
 	Action string `json:"action"`
-	Cmd    string `json:"cmd"`
+	// Cmd is the whole command, ready to run.
+	Cmd string `json:"cmd"`
+	// Description says what running it achieves, and what happens if it is not
+	// run when that is the point.
+	Description string `json:"description"`
 }
 
 // Envelope wraps every JSON result.
@@ -204,13 +221,21 @@ func Upload(r Result, f Format, quiet, colour bool, now time.Time) string {
 	if quiet {
 		return encode(r)
 	}
-	return encode(Envelope{
+	return encode(uploadEnvelope(r))
+}
+
+// uploadEnvelope is the JSON shape an upload and every command that renders one
+// artifact share, so an agent parses one thing whichever it ran. extra carries
+// the breadcrumbs only the calling command knows about — what to do after a
+// claim is not something the artifact itself can say.
+func uploadEnvelope(r Result, extra ...Breadcrumb) Envelope {
+	return Envelope{
 		OK:          true,
 		Data:        r,
 		Paste:       pasteForResult(r),
 		Summary:     summary(r),
-		Breadcrumbs: breadcrumbs(r),
-	})
+		Breadcrumbs: append(breadcrumbs(r), extra...),
+	}
 }
 
 // pasteForResult carries both paste forms in the envelope, so an agent picks by
@@ -271,20 +296,38 @@ func summaryRun(r Result) string {
 
 // breadcrumbs name the calls left to make. A claim token is the one that matters
 // most: without spending it, an anonymous upload is gone within the day.
+//
+// One per artifact, because a token belongs to exactly one upload and a push of
+// three files comes back with three of them. Collapsing them into a single
+// "claim them" line would leave two uploads to expire.
 func breadcrumbs(r Result) []Breadcrumb {
 	var crumbs []Breadcrumb
 	for _, a := range r.Artifacts {
 		if a.ClaimToken != "" {
-			crumbs = append(crumbs, Breadcrumb{
-				Action: "keep past expiry",
-				Cmd:    fmt.Sprintf("krowk claim %s %s", a.Slug, a.ClaimToken),
-			})
+			crumbs = append(crumbs, ClaimCrumb(a))
 		}
 	}
 	if len(r.Artifacts) > 0 {
-		crumbs = append(crumbs, Breadcrumb{Action: "share", Cmd: "open " + r.Artifacts[0].URL})
+		crumbs = append(crumbs, Breadcrumb{
+			Action:      "share",
+			Cmd:         "open " + r.Artifacts[0].URL,
+			Description: "the link is public and needs no key to read",
+		})
 	}
 	return crumbs
+}
+
+// ClaimCrumb is the command that keeps one anonymous upload, with its own token
+// already in it. Exported because it is the breadcrumb the human format prints
+// too, and the two must not drift into quoting different commands.
+func ClaimCrumb(a *api.Artifact) Breadcrumb {
+	return Breadcrumb{
+		Action: "keep past expiry",
+		Cmd:    fmt.Sprintf("krowk claim %s %s", a.Slug, a.ClaimToken),
+		Description: "this upload is anonymous and expires within the day; " +
+			"claiming it with a key keeps it and moves it into that key's workspace. " +
+			"The token is shown once and spent once",
+	}
 }
 
 func markdownResult(r Result) string {
@@ -345,6 +388,19 @@ func humanResult(r Result, colour bool, now time.Time) string {
 	for _, note := range r.Notes {
 		lines = append(lines, paint(colour, dim, "  ! "+note))
 	}
+	// The claim command, spelled out. It is the one breadcrumb worth printing to
+	// a person: the token is shown exactly once, by this response, and an upload
+	// whose token scrolled past is gone within the day. Everything else the
+	// envelope suggests can be worked out later from the slug.
+	//
+	// The label is dimmed and the command is not, because the command is what
+	// gets selected and pasted.
+	for _, a := range r.Artifacts {
+		if a.ClaimToken == "" {
+			continue
+		}
+		lines = append(lines, paint(colour, dim, "  keep it:")+"  "+ClaimCrumb(a).Cmd)
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -370,9 +426,11 @@ func List(p *api.Page, runSlug string, f Format, quiet, colour bool, now time.Ti
 	env := Envelope{OK: true, Data: p, Summary: summaryOf(len(p.Artifacts))}
 	// The cursor is only worth mentioning when there is another page behind it.
 	if p.Next != "" {
-		env.Breadcrumbs = []Breadcrumb{
-			{Action: "next page", Cmd: nextPageCmd(runSlug, p.Next)},
-		}
+		env.Breadcrumbs = []Breadcrumb{{
+			Action:      "next page",
+			Cmd:         nextPageCmd(runSlug, p.Next),
+			Description: "this page is full; the rows after the last one are behind that cursor",
+		}}
 	}
 	return encode(env)
 }
@@ -449,6 +507,41 @@ func Artifact(a *api.Artifact, f Format, quiet, colour bool, now time.Time) stri
 	return Upload(result, f, quiet, colour, now)
 }
 
+// Claimed renders an artifact that has just been claimed. It is Artifact plus
+// the one thing a claim leaves undone: a claimed upload belongs to a workspace
+// but to no run, and `uploads attach` is the only way it ever gets one — the
+// upload could not name a run when it was created, and claiming does not give it
+// one. Saying so here is the difference between an agent knowing that and
+// having to read the help to find out.
+//
+// Silent when the artifact already has a run, which is what `claim --run` does
+// in one step. Human, markdown and url are untouched: the human line already
+// prints the run, or its absence.
+func Claimed(a *api.Artifact, f Format, quiet, colour bool, now time.Time) string {
+	// Spelled as the formats that opt out rather than as "only JSON", so a format
+	// added later goes through the envelope by default — the same way Upload
+	// treats anything it does not recognise.
+	switch {
+	case f == Human, f == Markdown, f == URL, quiet, a.Run != "":
+		return Artifact(a, f, quiet, colour, now)
+	}
+	return encode(uploadEnvelope(Result{Artifacts: []*api.Artifact{a}}, AttachCrumb(a)))
+}
+
+// AttachCrumb is the command that puts a claimed upload under a run. The run is
+// the one argument this side cannot fill in: the caller holding the claim token
+// is the one that knows which run the upload came from, and guessing at one
+// would be a command that fails.
+func AttachCrumb(a *api.Artifact) Breadcrumb {
+	return Breadcrumb{
+		Action: "group under a run",
+		Cmd:    "krowk uploads attach " + a.Slug + " --run <run>",
+		Description: "a claimed upload belongs to a workspace but to no run, and a run is " +
+			"where the pull request, commit and session are recorded — `krowk runs start` " +
+			"opens one, and its slug goes in place of <run>",
+	}
+}
+
 // Key renders a verified API key: which key it is, and the workspace every call
 // with it lands in — the fact worth confirming before an upload. There is no
 // link to a key, so markdown and url fall back to the JSON envelope.
@@ -461,9 +554,11 @@ func Key(k *api.Key, f Format, quiet, colour bool) string {
 			OK:      true,
 			Data:    k,
 			Summary: fmt.Sprintf("%s in %s", k.KeyID, k.Workspace),
-			Breadcrumbs: []Breadcrumb{
-				{Action: "push", Cmd: "krowk push screenshot.png"},
-			},
+			Breadcrumbs: []Breadcrumb{{
+				Action:      "push",
+				Cmd:         "krowk push screenshot.png",
+				Description: "the key works, so an upload with it lands in that workspace and does not expire",
+			}},
 		})
 	}
 
@@ -505,10 +600,19 @@ func StoredKey(l *Login, f Format, quiet, colour bool) string {
 			return encode(l)
 		}
 		summary := fmt.Sprintf("%s stored, uploads land in %s", l.KeyID, l.Workspace)
-		crumb := Breadcrumb{Action: "push", Cmd: "krowk push screenshot.png"}
+		crumb := Breadcrumb{
+			Action:      "push",
+			Cmd:         "krowk push screenshot.png",
+			Description: "the key is stored and accepted, so nothing else is needed before uploading",
+		}
 		if !l.Confirmed {
 			summary = "token stored, unconfirmed — " + l.Reason
-			crumb = Breadcrumb{Action: "verify", Cmd: "krowk auth verify"}
+			crumb = Breadcrumb{
+				Action: "verify",
+				Cmd:    "krowk auth verify",
+				Description: "the token was written down but the registry never confirmed it, " +
+					"so whether it works is still unknown",
+			}
 		}
 		return encode(Envelope{
 			OK:          true,
@@ -597,14 +701,44 @@ func Run(r *api.Run, f Format, quiet, colour bool) string {
 		return encode(r)
 	}
 	return encode(Envelope{
-		OK:      true,
-		Data:    r,
-		Summary: fmt.Sprintf("run %s is %s", r.Slug, r.Status),
-		Breadcrumbs: []Breadcrumb{
-			{Action: "attach uploads", Cmd: "krowk push <file> --run " + r.Slug},
-			{Action: "close", Cmd: "krowk runs finish " + r.Slug},
-		},
+		OK:          true,
+		Data:        r,
+		Summary:     fmt.Sprintf("run %s is %s", r.Slug, r.Status),
+		Breadcrumbs: runCrumbs(r),
 	})
+}
+
+// runCrumbs are the calls a run leaves to make, which depend on whether it is
+// still open. `runs start` and `runs finish` render through the same function,
+// so a fixed pair would have told a caller that had just closed a run to close
+// it again.
+func runCrumbs(r *api.Run) []Breadcrumb {
+	if r.Status == "finished" {
+		return []Breadcrumb{{
+			Action:      "what it made",
+			Cmd:         "krowk uploads list --run " + r.Slug,
+			Description: "the run is closed; its artifacts and their links are read back separately",
+		}}
+	}
+	return []Breadcrumb{
+		{
+			Action: "attach uploads",
+			Cmd:    "krowk push <file> --run " + r.Slug,
+			Description: "every push naming this run is grouped under it and inherits the " +
+				"metadata recorded on it; <file> is the path to upload",
+		},
+		finishCrumb(r),
+	}
+}
+
+// finishCrumb closes a run. A run left open is not a failure — its artifacts are
+// up and their links work — but nothing else closes it.
+func finishCrumb(r *api.Run) Breadcrumb {
+	return Breadcrumb{
+		Action:      "close",
+		Cmd:         "krowk runs finish " + r.Slug,
+		Description: "marks the run finished; a run stays open until something says so",
+	}
 }
 
 // RunList renders a page of a workspace's runs, newest first. There is no link
@@ -620,9 +754,11 @@ func RunList(p *api.RunPage, f Format, quiet, colour bool) string {
 		}
 		env := Envelope{OK: true, Data: p, Summary: fmt.Sprintf("%d %s", len(p.Runs), noun)}
 		if p.Next != "" {
-			env.Breadcrumbs = []Breadcrumb{
-				{Action: "next page", Cmd: "krowk runs list --before " + p.Next},
-			}
+			env.Breadcrumbs = []Breadcrumb{{
+				Action:      "next page",
+				Cmd:         "krowk runs list --before " + p.Next,
+				Description: "this page is full; the runs older than the last one are behind that cursor",
+			}}
 		}
 		return encode(env)
 	}
@@ -659,11 +795,13 @@ func RunDetail(r *api.Run, f Format, quiet, colour bool) string {
 		if quiet {
 			return encode(r)
 		}
-		crumbs := []Breadcrumb{
-			{Action: "what it made", Cmd: "krowk uploads list --run " + r.Slug},
-		}
+		crumbs := []Breadcrumb{{
+			Action:      "what it made",
+			Cmd:         "krowk uploads list --run " + r.Slug,
+			Description: "a run holds the metadata; its artifacts are listed separately",
+		}}
 		if r.Status != "finished" {
-			crumbs = append(crumbs, Breadcrumb{Action: "close", Cmd: "krowk runs finish " + r.Slug})
+			crumbs = append(crumbs, finishCrumb(r))
 		}
 		return encode(Envelope{
 			OK:          true,

@@ -78,6 +78,12 @@ release:
   # A tag like v0.1.0-rc1 becomes a GitHub pre-release, and npm publishes it
   # under the `next` dist-tag rather than `latest`.
   prerelease: auto
+  # Re-running the release workflow on a tag whose release already exists would
+  # otherwise fail with a 422 already_exists on the first asset it re-uploads.
+  # `replace` overwrites the assets instead, so a half-finished release — npm
+  # published, GitHub upload interrupted, or the other way round — can be
+  # finished by re-running the workflow rather than by deleting the release.
+  mode: replace
   footer: |
     ## Install
 

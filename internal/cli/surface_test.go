@@ -264,6 +264,13 @@ func TestEveryEnvironmentVariableInTheCatalogIsRead(t *testing.T) {
 			if !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
 				continue
 			}
+			// Not catalog.go. It is the thing being checked: every name this test
+			// looks for is written down there as an Environment entry, so scanning
+			// it makes the promise its own evidence and the test passes whether or
+			// not anything reads the variable.
+			if entry.Name() == "catalog.go" {
+				continue
+			}
 			b, err := os.ReadFile(filepath.Join(pkg, entry.Name()))
 			if err != nil {
 				t.Fatal(err)

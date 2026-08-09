@@ -17,11 +17,11 @@ const path = require("node:path");
 
 // Keyed by `${process.platform}-${process.arch}`, so the lookup is the identity.
 const PACKAGES = {
-  "darwin-arm64": "@krowk/darwin-arm64",
-  "darwin-x64": "@krowk/darwin-x64",
-  "linux-arm64": "@krowk/linux-arm64",
-  "linux-x64": "@krowk/linux-x64",
-  "win32-x64": "@krowk/win32-x64",
+  "darwin-arm64": "@krowk/cli-darwin-arm64",
+  "darwin-x64": "@krowk/cli-darwin-x64",
+  "linux-arm64": "@krowk/cli-linux-arm64",
+  "linux-x64": "@krowk/cli-linux-x64",
+  "win32-x64": "@krowk/cli-win32-x64",
 };
 
 const BINARY = "krowk";
@@ -59,7 +59,7 @@ function locate() {
       "--no-optional, --omit=optional and --ignore-optional. A lockfile",
       "written on another platform does the same thing.",
       "",
-      "  npm install krowk --include=optional",
+      "  npm install @krowk/cli --include=optional",
       "",
       "Or take the binary straight from the release, no Node involved:",
       "",

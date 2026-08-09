@@ -3,7 +3,7 @@
 //
 // Seven packages come out of one release: five that carry nothing but the two
 // binaries for one platform, and the two launchers people actually name —
-// `krowk` and `@krowk/mcp` — which depend on all five as optionalDependencies
+// `@krowk/cli` and `@krowk/mcp` — which depend on all five as optionalDependencies
 // and use whichever npm decided applies. That is the esbuild pattern.
 //
 // The bytes are the release's bytes, read out of dist/, not a second `go build`
@@ -26,11 +26,11 @@ const repo = path.resolve(here, "..");
 // tables are checked against it below, so adding a platform in one place and
 // forgetting the others fails the build instead of the release.
 const PLATFORMS = [
-  { npm: "@krowk/darwin-arm64", goos: "darwin", goarch: "arm64", os: "darwin", cpu: "arm64" },
-  { npm: "@krowk/darwin-x64", goos: "darwin", goarch: "amd64", os: "darwin", cpu: "x64" },
-  { npm: "@krowk/linux-arm64", goos: "linux", goarch: "arm64", os: "linux", cpu: "arm64" },
-  { npm: "@krowk/linux-x64", goos: "linux", goarch: "amd64", os: "linux", cpu: "x64" },
-  { npm: "@krowk/win32-x64", goos: "windows", goarch: "amd64", os: "win32", cpu: "x64" },
+  { npm: "@krowk/cli-darwin-arm64", goos: "darwin", goarch: "arm64", os: "darwin", cpu: "arm64" },
+  { npm: "@krowk/cli-darwin-x64", goos: "darwin", goarch: "amd64", os: "darwin", cpu: "x64" },
+  { npm: "@krowk/cli-linux-arm64", goos: "linux", goarch: "arm64", os: "linux", cpu: "arm64" },
+  { npm: "@krowk/cli-linux-x64", goos: "linux", goarch: "amd64", os: "linux", cpu: "x64" },
+  { npm: "@krowk/cli-win32-x64", goos: "windows", goarch: "amd64", os: "win32", cpu: "x64" },
 ];
 
 // GoReleaser build ids, which are also the binary names.
@@ -40,7 +40,7 @@ const BINARIES = ["krowk", "krowk-mcp"];
 // stamped on the way out; what is checked in stays at a version that cannot be
 // mistaken for a real one.
 const LAUNCHERS = [
-  { dir: "npm/krowk", name: "krowk", bin: "bin/krowk.js" },
+  { dir: "npm/krowk", name: "@krowk/cli", bin: "bin/krowk.js" },
   { dir: "npm/mcp", name: "@krowk/mcp", bin: "bin/krowk-mcp.js" },
 ];
 
@@ -154,7 +154,7 @@ for (const platform of PLATFORMS) {
       {
         name: platform.npm,
         version,
-        description: "krowk binaries for " + platform.os + " " + platform.cpu + ".",
+        description: "krowk CLI + MCP binaries for " + platform.os + " " + platform.cpu + ".",
         homepage: "https://krowk.com",
         repository: { type: "git", url: "git+https://github.com/krowkcom/cli.git" },
         license: "MIT",
@@ -173,7 +173,7 @@ for (const platform of PLATFORMS) {
     "# " + platform.npm + "\n\n" +
       "The `krowk` and `krowk-mcp` binaries for " + platform.os + " " + platform.cpu +
       ", and nothing else.\n\n" +
-      "Do not install this directly. Install [`krowk`](https://www.npmjs.com/package/krowk)\n" +
+      "Do not install this directly. Install [`@krowk/cli`](https://www.npmjs.com/package/@krowk/cli)\n" +
       "or [`@krowk/mcp`](https://www.npmjs.com/package/@krowk/mcp) and npm will pick the\n" +
       "one that matches the machine.\n\n" +
       "MIT.\n",

@@ -43,8 +43,10 @@ curl -fsSL https://krowk.com/install | bash
 curl -sSfL https://github.com/krowkcom/cli/releases/latest/download/krowk_0.1.0_linux_amd64.tar.gz \
   | tar -xz -C /usr/local/bin krowk krowk-mcp
 
-# npm, for people already in Node
-npx krowk push screenshot.png
+# npm, for people already in Node. The bare `krowk` name is blocked by npm's
+# typosquat filter ("too similar to growl"), so the wrapper is scoped; npx runs
+# a package's only bin, and this one's is still called `krowk`.
+npx @krowk/cli push screenshot.png
 ```
 
 Linux and macOS on amd64 and arm64, Windows on amd64; `checksums.txt` on each
@@ -680,10 +682,13 @@ of it come:
 - **`checksums.txt`**, sha256 over every archive.
 - **A GitHub Release**, with the commit subjects since the last tag. A tag with a
   `-rc1` on it becomes a pre-release automatically.
-- **Seven npm packages**: `@krowk/{linux,darwin}-{x64,arm64}` and
-  `@krowk/win32-x64`, each carrying nothing but that platform's two binaries, and
-  the two names people actually type — `krowk` and `@krowk/mcp` — which are
-  launcher scripts depending on all five as `optionalDependencies`.
+- **Seven npm packages**: `@krowk/cli-{linux,darwin}-{x64,arm64}` and
+  `@krowk/cli-win32-x64`, each carrying nothing but that platform's two binaries,
+  and the two names people actually type — `@krowk/cli` and `@krowk/mcp` — which
+  are launcher scripts depending on all five as `optionalDependencies`. The
+  platform packages are named for the CLI even though `@krowk/mcp` depends on
+  them too: one package per platform carries both binaries, rather than ten
+  packages carrying one each.
 
 The version the binaries report, the archive names and the npm version are one
 string, taken from the tag with the `v` removed. `make build` strips it the same
@@ -712,10 +717,12 @@ secrets, so it stays green whether or not anything is claimed on npm.
 
 ### What a human still has to do
 
-1. **Claim the names on npm** — `krowk`, and the `@krowk` scope, which covers
-   `@krowk/mcp` and the five platform packages.
+1. **Claim the names on npm** — the `@krowk` scope, which covers `@krowk/cli`,
+   `@krowk/mcp` and the five platform packages. The unscoped `krowk` is not
+   available: npm's typosquat filter permanently refuses it as too similar to the
+   existing `growl` package, so nobody should spend another release trying.
 2. **Add `NPM_TOKEN`** as a repository secret: an automation token with publish
-   rights on both. Until it exists, the publish step skips with a notice on the
+   rights on the scope. Until it exists, the publish step skips with a notice on the
    run and the GitHub Release happens anyway, so a tag pushed today still
    produces working binaries.
 
@@ -730,11 +737,10 @@ Blocking, in order:
    download, not a card with the run metadata on it. That means a
    `krowk.com/a/{slug}` page serving OpenGraph tags plus a rendered preview, and
    a Slack app for Slack's own unfurl path.
-2. **Distribution.** The pipeline is built — see [Releasing](#releasing) — and no
-   tag has been pushed through it. What is left is not code: `krowk` and the
-   `@krowk` scope are still unclaimed on npm, and there is no `NPM_TOKEN` secret,
-   so the site's `npx krowk push` does not resolve to anything yet. Binaries
-   would publish today.
+2. **Distribution.** The pipeline is built — see [Releasing](#releasing). What is
+   left is not code: the `@krowk` scope has to carry `@krowk/cli`, `@krowk/mcp`
+   and the five platform packages before the site's `npx @krowk/cli push`
+   resolves. Binaries publish today.
 3. **Getting a token.** Keys exist in the registry and the dashboard can issue
    them, but there is no device flow, so an agent in a container still needs a
    human to paste one in.

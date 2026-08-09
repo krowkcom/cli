@@ -11,7 +11,7 @@ import (
 //
 // It exists because the help text was the only description of the surface, and
 // a hand-written paragraph cannot be checked against the code that routes the
-// commands. Once `npx krowk` puts this in front of tooling that reads the
+// commands. Once `npx @krowk/cli` puts this in front of tooling that reads the
 // surface instead of a person, a help text that has drifted from the routing is
 // not a documentation bug — it is an interface that lies.
 //

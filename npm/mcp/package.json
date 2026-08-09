@@ -28,10 +28,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@krowk/darwin-arm64": "0.0.0-unpublished",
-    "@krowk/darwin-x64": "0.0.0-unpublished",
-    "@krowk/linux-arm64": "0.0.0-unpublished",
-    "@krowk/linux-x64": "0.0.0-unpublished",
-    "@krowk/win32-x64": "0.0.0-unpublished"
+    "@krowk/cli-darwin-arm64": "0.0.0-unpublished",
+    "@krowk/cli-darwin-x64": "0.0.0-unpublished",
+    "@krowk/cli-linux-arm64": "0.0.0-unpublished",
+    "@krowk/cli-linux-x64": "0.0.0-unpublished",
+    "@krowk/cli-win32-x64": "0.0.0-unpublished"
   }
 }

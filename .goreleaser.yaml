@@ -82,8 +82,8 @@ release:
     ## Install
 
     ```bash
-    # npm, once the names are claimed
-    npx krowk push screenshot.png
+    # npm — the bare `krowk` name is blocked by npm's typosquat filter
+    npx @krowk/cli push screenshot.png
 
     # Direct download — no runtime, no package manager
     curl -sSfL https://github.com/krowkcom/cli/releases/download/{{ .Tag }}/krowk_{{ .Version }}_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz \

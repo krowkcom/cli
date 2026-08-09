@@ -360,7 +360,7 @@ Flags win; everything else is detected so the agent never has to type it.
 | `branch` | `git rev-parse --abbrev-ref HEAD` |
 | `agent` | `KROWK_AGENT`, else `CLAUDECODE` → `claude-code`, `CURSOR_TRACE_ID` → `cursor`, `GITHUB_ACTIONS` → `github-actions` |
 | `pull_request` | `--pull-request`, else derived from `GITHUB_REF` in a PR build |
-| `reference`, `session`, `title` | Flags only |
+| `references` (a list, from repeated `--reference`), `session`, `title` | Flags only |
 
 Metadata is recorded on the **run**, because the registry keeps none on an
 artifact. A run belongs to a workspace, so it needs an API key:
@@ -415,7 +415,9 @@ PUT|PATCH  /v1/runs/:slug/completion          close a run (needs a key)
 
 Everything but listing, claiming, attaching, the key and the run endpoints works
 without a key: for a keyless request the slug *is* the capability, since slugs
-are 21 random base58 characters and the bytes are public on the CDN regardless.
+are 24 random lowercase base36 characters — lowercase because a slug becomes a
+DNS label at `art-{slug}.krowkusercontent.com` — and the bytes are public on the
+CDN regardless.
 
 Taking one down is the exception, and it is keyed differently than it looks. A
 slug travels in whatever the link was pasted into, so a reader of a link must not

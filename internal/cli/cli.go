@@ -387,7 +387,7 @@ func metadataFor(f flags, env runctx.Env) runctx.Metadata {
 		Commit:      f.commit,
 		Agent:       f.agent,
 		PullRequest: f.pullRequest,
-		Reference:   f.references,
+		References:  f.references,
 		Session:     f.session,
 		Title:       f.title,
 		Client:      "krowk-cli/" + Version,

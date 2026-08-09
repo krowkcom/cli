@@ -10,15 +10,18 @@ import (
 // Metadata is the JSON blob that rides along with an upload. Flags override
 // every detected field; omitempty does the pruning.
 type Metadata struct {
-	Repo        string   `json:"repo,omitempty"`
-	Commit      string   `json:"commit,omitempty"`
-	Branch      string   `json:"branch,omitempty"`
-	Agent       string   `json:"agent,omitempty"`
-	PullRequest string   `json:"pull_request,omitempty"`
-	Reference   []string `json:"reference,omitempty"`
-	Session     string   `json:"session,omitempty"`
-	Title       string   `json:"title,omitempty"`
-	Client      string   `json:"client,omitempty"`
+	Repo        string `json:"repo,omitempty"`
+	Commit      string `json:"commit,omitempty"`
+	Branch      string `json:"branch,omitempty"`
+	Agent       string `json:"agent,omitempty"`
+	PullRequest string `json:"pull_request,omitempty"`
+	// Plural, and a list, because --reference repeats and canon's glossary names
+	// the run's field `references`. Metadata is an opaque blob on the registry
+	// side, so this key is the whole contract — nothing validates it but readers.
+	References []string `json:"references,omitempty"`
+	Session    string   `json:"session,omitempty"`
+	Title      string   `json:"title,omitempty"`
+	Client     string   `json:"client,omitempty"`
 }
 
 // Env is a lookup function, so tests do not have to touch the process
@@ -33,7 +36,7 @@ type Overrides struct {
 	Commit      string
 	Agent       string
 	PullRequest string
-	Reference   []string
+	References  []string
 	Session     string
 	Title       string
 	Client      string
@@ -47,7 +50,7 @@ func Resolve(env Env, o Overrides) Metadata {
 	override(&m.Commit, o.Commit)
 	override(&m.Agent, o.Agent)
 	override(&m.PullRequest, o.PullRequest)
-	m.Reference = o.Reference
+	m.References = o.References
 	m.Session = o.Session
 	m.Title = o.Title
 	m.Client = o.Client

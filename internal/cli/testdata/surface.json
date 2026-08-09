@@ -520,7 +520,7 @@
         "commit",
         "files",
         "pull_request",
-        "reference",
+        "references",
         "repo",
         "run",
         "session",

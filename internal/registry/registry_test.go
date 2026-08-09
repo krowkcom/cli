@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1304,5 +1305,34 @@ func TestCardPageOffersNoImageForANonImage(t *testing.T) {
 	_, page := requestText(t, card)
 	if strings.Contains(page, "og:image") {
 		t.Errorf("a log's card offers an image:\n%s", page)
+	}
+}
+
+// Canon fixes a slug at a type prefix plus 24 random lowercase base36
+// characters, because a slug becomes a DNS label at
+// art-{slug}.krowkusercontent.com and labels are case-insensitive. Readers hold
+// the stand-in to it: the website validates /^art_[a-z0-9]{24}$/ before it ever
+// calls the registry, so a locally minted slug of any other shape is refused by
+// a dev site before anyone finds out why.
+func TestMintedSlugsHaveTheCanonicalShape(t *testing.T) {
+	server, _ := newClockedServer(t)
+	shape := regexp.MustCompile(`^(art|run|ws)_[a-z0-9]{24}$`)
+
+	artifact, _ := declare(t, server, "krowk_sk_test", "shot.png", "some bytes")["slug"].(string)
+	run := openRun(t, server, "krowk_sk_test")
+
+	_, key := request(t, http.MethodGet, server.URL+"/v1/key", "krowk_sk_test", "", "")
+	workspace, _ := key["workspace"].(string)
+
+	for _, slug := range []string{artifact, run, workspace, anonymousWorkspace} {
+		if !shape.MatchString(slug) {
+			t.Errorf("slug %q is not prefix + 24 lowercase base36", slug)
+		}
+	}
+
+	// Random, not sequential: two artifacts in a row must not share a slug.
+	second, _ := declare(t, server, "krowk_sk_test", "shot.png", "some bytes")["slug"].(string)
+	if second == artifact {
+		t.Errorf("two artifacts share the slug %q", artifact)
 	}
 }

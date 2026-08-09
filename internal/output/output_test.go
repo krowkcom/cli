@@ -204,20 +204,9 @@ func TestClaimTokenIsSurfacedButNeverPasteable(t *testing.T) {
 	r := Result{Artifacts: []*api.Artifact{a}}
 
 	// Visible to whoever ran the push, as the breadcrumb that spends it...
-	var e struct {
-		Breadcrumbs []Breadcrumb `json:"breadcrumbs"`
-	}
-	if err := json.Unmarshal([]byte(Upload(r, JSON, false, false, time.Now())), &e); err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, b := range e.Breadcrumbs {
-		if strings.Contains(b.Cmd, a.ClaimToken) {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("breadcrumbs = %+v, want the claim command carrying the token", e.Breadcrumbs)
+	crumbs := crumbsOf(t, Upload(r, JSON, false, false, time.Now()))
+	if _, ok := find(crumbs, a.ClaimToken); !ok {
+		t.Errorf("breadcrumbs = %+v, want the claim command carrying the token", crumbs)
 	}
 
 	// ...but never in either paste form.
@@ -477,7 +466,7 @@ func TestARunLabelStaysOnItsOwnRow(t *testing.T) {
 		}
 		row := RunList(&api.RunPage{Runs: []*api.Run{{
 			Slug: "run_x", Status: "open", Metadata: encoded,
-		}}}, Human, false, false)
+		}}}, Listing{}, Human, false, false)
 		if strings.Count(row, "\n") != 0 {
 			t.Fatalf("the label split the row:\n%s", row)
 		}
@@ -512,7 +501,7 @@ func TestARunLabelIsClippedOnceWhateverItIsBuiltFrom(t *testing.T) {
 		}
 		row := RunList(&api.RunPage{Runs: []*api.Run{{
 			Slug: "run_x", Status: "open", Metadata: encoded,
-		}}}, Human, false, false)
+		}}}, Listing{}, Human, false, false)
 		return strings.TrimPrefix(row, "run_x  open  ")
 	}
 

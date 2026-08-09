@@ -3,6 +3,8 @@ package cli
 import (
 	"strings"
 	"testing"
+
+	"github.com/krowkcom/cli/internal/output"
 )
 
 // The breadcrumbs are only worth anything if the commands they name work when
@@ -132,11 +134,47 @@ func TestClaimingIntoARunSuggestsNoAttach(t *testing.T) {
 	}
 }
 
-func findCrumb(crumbs []breadcrumb, substring string) (breadcrumb, bool) {
+// The interactive default is the one a person sees, and it prints nothing about
+// a run an upload does not have — so without this line, claiming by hand never
+// mentions that `uploads attach` exists.
+func TestTheHumanClaimPrintsTheAttachCommand(t *testing.T) {
+	h := newHarness(t, 0)
+	runSlug := h.ok("runs", "start").Data.Slug
+
+	h.anonymous()
+	uploaded := only(t, h.ok("push", h.fixture))
+	h.env["KROWK_TOKEN"] = "krowk_sk_test"
+
+	_, stdout, _ := h.run("claim", uploaded.Slug, uploaded.ClaimToken, "--format=human")
+	want := "krowk uploads attach " + uploaded.Slug + " --run <run>"
+	if !strings.Contains(stdout, want) {
+		t.Errorf("human claim does not print %q:\n%s", want, stdout)
+	}
+
+	// And what it printed works, once the run is substituted for the placeholder.
+	attached := only(t, h.ok(strings.Fields(strings.Replace(want, "<run>", runSlug, 1))[1:]...))
+	if attached.Run != runSlug {
+		t.Errorf("the printed attach put it in %q, want %q", attached.Run, runSlug)
+	}
+}
+
+// --quiet asks for the record and nothing suggested, whichever format renders
+// it. The human path is where this leaked: the format was dispatched on before
+// quiet was read at all.
+func TestQuietPrintsNoBreadcrumbLineForAPerson(t *testing.T) {
+	h := newHarness(t, 0).anonymous()
+
+	_, stdout, _ := h.run("push", h.fixture, "--format=human", "--quiet")
+	if strings.Contains(stdout, "krowk claim") || strings.Contains(stdout, "keep it") {
+		t.Errorf("--quiet on a terminal printed the claim line:\n%s", stdout)
+	}
+}
+
+func findCrumb(crumbs []output.Breadcrumb, substring string) (output.Breadcrumb, bool) {
 	for _, c := range crumbs {
 		if strings.Contains(c.Cmd, substring) {
 			return c, true
 		}
 	}
-	return breadcrumb{}, false
+	return output.Breadcrumb{}, false
 }

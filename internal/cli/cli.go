@@ -472,7 +472,11 @@ func uploadsList(w io.Writer, f flags, format output.Format, env runctx.Env, col
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.List(page, f.run, format, f.quiet, colour, time.Now()))
+	// The listing's own scope travels into the next-page command, --limit
+	// included: an agent paging by 10 that was handed a crumb paging by 50 would
+	// change stride halfway through the walk without being told.
+	listing := output.Listing{Run: f.run, Limit: f.limit}
+	fmt.Fprintln(w, output.List(page, listing, format, f.quiet, colour, time.Now()))
 	return nil
 }
 
@@ -484,7 +488,7 @@ func runsList(w io.Writer, f flags, format output.Format, env runctx.Env, colour
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.RunList(page, format, f.quiet, colour))
+	fmt.Fprintln(w, output.RunList(page, output.Listing{Limit: f.limit}, format, f.quiet, colour))
 	return nil
 }
 

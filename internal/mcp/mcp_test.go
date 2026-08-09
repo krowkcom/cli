@@ -586,6 +586,12 @@ func TestClaimAdoptsAnAnonymousPushIntoTheWorkspace(t *testing.T) {
 	if claimed["isError"] == true {
 		t.Fatalf("claim failed: %s", text(t, claimed))
 	}
+	// A claim with no run leaves the upload under nothing, and this tool is the
+	// only way it ever gets one — the same gap the CLI closes with a breadcrumb.
+	// There are no breadcrumbs here, so it has to be in the text.
+	if body := text(t, claimed); !strings.Contains(body, "It belongs to no run") {
+		t.Errorf("a claim with no run says nothing about grouping it:\n%s", body)
+	}
 
 	listed := keyed.callTool("krowk_list_artifacts", nil)
 	if listed["isError"] == true {
@@ -620,6 +626,10 @@ func TestClaimGroupsTheAdoptedUploadUnderARun(t *testing.T) {
 	})
 	if claimed["isError"] == true {
 		t.Fatalf("claim with a run failed: %s", text(t, claimed))
+	}
+	// And a claim that did name a run is not told to go and find one.
+	if body := text(t, claimed); strings.Contains(body, "It belongs to no run") {
+		t.Errorf("an upload already grouped was told it belongs to no run:\n%s", body)
 	}
 	if body := text(t, claimed); !strings.Contains(body, "Grouped under run "+run) {
 		t.Errorf("text = %q, want the grouping named the way a push names it", body)

@@ -129,25 +129,33 @@ the code, the `fix` line and `retryable`.
 Breadcrumbs are commands, not hints. `cmd` is ready to run, with this result's
 own slugs and tokens already in it — `action` is the short label, `description`
 says what running it achieves and what happens if it is not run. All three
-fields are always present. The only placeholder is a value this side genuinely
-does not have, and it is spelled in angle brackets so it cannot be mistaken for
-one: `<file>` in the push a new run suggests, `<run>` in the attach a claim
-suggests.
+fields are always present.
 
-What each command hands back:
+A `<placeholder>` in a `cmd` is a value this side genuinely does not have: the
+run to attach a claimed upload to, the file a freshly opened run is to be fed.
+**Substitute it — never paste one into a shell as it stands.** `<` and `>` are
+redirection there, so a verbatim paste runs something other than what was
+suggested. Every placeholder is named in its own `description`.
+
+The one `cmd` that is not a krowk command is `share`, which carries the link
+itself: no OS agrees on a command for handing a link to a person, so a crumb
+that ran `open` would fail everywhere but macOS.
+
+What each command hands back, one line each — the wording lives in the code:
 
 | After | Breadcrumbs |
 | --- | --- |
-| A keyless `push` | `krowk claim <artifact> <token>`, **one per file** — a token belongs to one upload, and a push of three files comes back with three of them. Also printed for a person, since the token is shown exactly once |
-| `runs start` | The push that groups uploads under the new run, and the `runs finish` that closes it |
+| A keyless `push` | The claim that keeps each upload, **one per file**, plus the link to share; also printed for a person, since the token is shown exactly once |
+| `runs start` | The push that feeds the new run, and the `runs finish` that closes it |
 | `runs finish` | What the run made — never a second `runs finish` |
-| `claim` without `--run` | The `krowk uploads attach <artifact> --run <run>` that puts it under one. A claimed upload belongs to a workspace but to no run, and this is the only way it ever gets one. `claim --run` has already done it, and says nothing |
-| A page with more behind it | The same listing with `--before`, keeping `--run` if it had one |
+| `runs show` | What the run made, plus the finish if it is still open |
+| `claim` without `--run` | The `uploads attach` that puts it under one — the only way a claimed upload ever gets a run; `claim --run` has already done it and says nothing |
+| A page that came back full | The same listing with `--before`, keeping the `--run` and `--limit` it was given |
 | `auth login` / `auth verify` | The push it just made possible, or the `auth verify` an unconfirmed login still needs |
 
 `--quiet` is the raw record with no envelope, so it carries no breadcrumbs at
-all; `--format markdown` and `--format url` are the paste forms and are
-untouched.
+all — in human output either, where the claim and attach lines are suppressed;
+`--format markdown` and `--format url` are the paste forms and are untouched.
 
 ## MCP server
 

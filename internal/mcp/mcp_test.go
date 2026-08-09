@@ -203,7 +203,9 @@ func TestPushReturnsBothPasteFormsLabelled(t *testing.T) {
 	paste, _ := pastes[0].(map[string]any)
 	markdown, _ := paste["markdown"].(string)
 	url, _ := paste["url"].(string)
-	if !strings.HasPrefix(markdown, "![Checkout — mobile](") {
+	// The embed names the bytes and is wrapped in a link to the card page, so
+	// it starts with the wrapping link rather than with the bang.
+	if !strings.HasPrefix(markdown, "[![Checkout — mobile](") {
 		t.Errorf("paste.markdown = %q", markdown)
 	}
 	if url == "" || strings.Contains(url, "![") {
@@ -636,7 +638,7 @@ func TestClaimGroupsTheAdoptedUploadUnderARun(t *testing.T) {
 	}
 	structured, _ := claimed["structuredContent"].(map[string]any)
 	artifact, _ := structured["artifact"].(map[string]any)
-	if artifact["run"] != run {
+	if runSlugOf(artifact) != run {
 		t.Errorf("artifact run = %v, want %q", artifact["run"], run)
 	}
 }
@@ -682,7 +684,7 @@ func TestAFailedAttachSaysTheClaimStillLanded(t *testing.T) {
 	}
 	structured, _ = retried["structuredContent"].(map[string]any)
 	artifact, _ := structured["artifact"].(map[string]any)
-	if artifact["run"] != run {
+	if runSlugOf(artifact) != run {
 		t.Errorf("retry left run = %v, want %q", artifact["run"], run)
 	}
 }
@@ -876,4 +878,13 @@ func TestEveryLineOnStdoutIsAJSONRPCResponse(t *testing.T) {
 			t.Errorf("response has no id: %q", line)
 		}
 	}
+}
+
+// runSlugOf digs the slug out of the run an artifact reports. The run rides on
+// an artifact as a nested object rather than as a bare slug, so a client
+// reading one back learns what produced it without a second call.
+func runSlugOf(artifact map[string]any) string {
+	run, _ := artifact["run"].(map[string]any)
+	slug, _ := run["slug"].(string)
+	return slug
 }

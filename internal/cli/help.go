@@ -22,8 +22,9 @@ import (
 // follows the CLI's standing rule rather than a special case for help — human
 // on a terminal, JSON when the output is piped or asked for — so a script that
 // captures `krowk help` gets something it can parse for the same reason
-// `krowk push` does. markdown and url describe an artifact and have nothing to
-// say about a command, so they fall back to the text a person would read.
+// `krowk push` does. markdown and url are the two paste forms of an artifact's
+// link — an embed and the card page's URL — and have nothing to say about a
+// command, so they fall back to the text a person would read.
 func showHelp(w io.Writer, topic []string, format output.Format) error {
 	c := Surface()
 

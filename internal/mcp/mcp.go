@@ -688,7 +688,7 @@ func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string
 		// with the artifact, so the run's state is not among the facts in hand, and a
 		// second call to fetch it would buy nothing the agent asked for.
 		text += "\n\nGrouped under run " + runSlug + "."
-	} else if artifact.Run == "" {
+	} else if artifact.RunSlug() == "" {
 		// The same thing the CLI's claim hands back: the upload is kept but belongs
 		// to no run, and nothing else will ever put it in one. There are no
 		// breadcrumbs on this transport, so it is a line rather than a crumb — but

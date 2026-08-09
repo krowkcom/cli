@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -53,6 +54,32 @@ func request(t *testing.T, method, url, token, contentType, body string) (int, m
 	return res.StatusCode, decoded
 }
 
+// requestText is a plain keyless GET whose body is not JSON — the card page. An
+// unfurler makes exactly this request and nothing else, so it is the one worth
+// making here.
+func requestText(t *testing.T, url string) (int, string) {
+	t.Helper()
+	res, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res.StatusCode, string(body)
+}
+
+// runSlugOf digs the slug out of the run an artifact reports. The run is a
+// nested object rather than a bare slug, so a client reading an artifact back
+// learns what produced it without a second call.
+func runSlugOf(payload map[string]any) string {
+	nested, _ := payload["run"].(map[string]any)
+	slug, _ := nested["slug"].(string)
+	return slug
+}
+
 func errorCode(payload map[string]any) string {
 	e, _ := payload["error"].(map[string]any)
 	code, _ := e["code"].(string)
@@ -62,9 +89,17 @@ func errorCode(payload map[string]any) string {
 // declare posts an artifact and returns its payload, keyless when token is "".
 func declare(t *testing.T, server *httptest.Server, token, filename, body string) map[string]any {
 	t.Helper()
+	return declareTyped(t, server, token, filename, "text/plain", body)
+}
+
+// declareTyped is declare with the content type named, which matters wherever
+// being an image is the thing under test — the card page's og:image is decided
+// by it, and a screenshot declared as text/plain would quietly not be one.
+func declareTyped(t *testing.T, server *httptest.Server, token, filename, contentType, body string) map[string]any {
+	t.Helper()
 	status, payload := request(t, http.MethodPost, server.URL+"/v1/artifacts", token, "application/json",
-		fmt.Sprintf(`{"artifact":{"filename":%q,"content_type":"text/plain","byte_size":%d}}`,
-			filename, len(body)))
+		fmt.Sprintf(`{"artifact":{"filename":%q,"content_type":%q,"byte_size":%d}}`,
+			filename, contentType, len(body)))
 	if status != http.StatusCreated {
 		t.Fatalf("declare = %d %v", status, payload)
 	}
@@ -133,11 +168,17 @@ func TestEphemeralExpiryAnswersGoneEverywhere(t *testing.T) {
 	if status, body := presign(t, server, "", slug, claimToken); status != http.StatusGone || errorCode(body) != "expired" {
 		t.Errorf("represign after expiry = %d %v, want 410 expired", status, body)
 	}
-	// The promise covers the bytes too: the public URL stops serving, as the
+	// The promise covers the bytes too: the file URL stops serving, as the
 	// real registry's lifecycle rule deletes the object.
-	url, _ := payload["url"].(string)
-	if status, _ := request(t, http.MethodGet, url, "", "", ""); status != http.StatusNotFound {
-		t.Errorf("GET %s after expiry = %d, want 404", url, status)
+	fileURL, _ := payload["file_url"].(string)
+	if status, _ := request(t, http.MethodGet, fileURL, "", "", ""); status != http.StatusNotFound {
+		t.Errorf("GET %s after expiry = %d, want 404", fileURL, status)
+	}
+	// The card page is what was pasted, so it does not go missing — it says the
+	// artifact expired, which is a different thing to tell a reader than 404.
+	card, _ := payload["url"].(string)
+	if status, _ := request(t, http.MethodGet, card, "", "", ""); status != http.StatusGone {
+		t.Errorf("GET %s after expiry = %d, want 410", card, status)
 	}
 }
 
@@ -462,19 +503,19 @@ func TestAttachRunPutsAnOwnedArtifactUnderARun(t *testing.T) {
 	url := server.URL + "/v1/artifacts/" + slug + "/run"
 	status, payload := request(t, http.MethodPut, url, token, "application/json",
 		fmt.Sprintf(`{"run":%q}`, run))
-	if status != http.StatusOK || payload["run"] != run {
+	if status != http.StatusOK || runSlugOf(payload) != run {
 		t.Fatalf("attach = %d %v, want the artifact under %s", status, payload, run)
 	}
 
 	// Idempotent, because agents retry: the same PUT is the same success.
 	if again, body := request(t, http.MethodPut, url, token, "application/json",
-		fmt.Sprintf(`{"run":%q}`, run)); again != http.StatusOK || body["run"] != run {
+		fmt.Sprintf(`{"run":%q}`, run)); again != http.StatusOK || runSlugOf(body) != run {
 		t.Errorf("second attach = %d %v", again, body)
 	}
 
 	// PATCH is routed alongside PUT, as the registry's own routes are.
 	if status, body := request(t, http.MethodPatch, url, token, "application/json",
-		fmt.Sprintf(`{"run":%q}`, run)); status != http.StatusOK || body["run"] != run {
+		fmt.Sprintf(`{"run":%q}`, run)); status != http.StatusOK || runSlugOf(body) != run {
 		t.Errorf("PATCH alias = %d %v", status, body)
 	}
 
@@ -494,7 +535,7 @@ func TestAttachRunPutsAnOwnedArtifactUnderARun(t *testing.T) {
 	laterSlug, _ := second["slug"].(string)
 	if status, payload := request(t, http.MethodPut,
 		server.URL+"/v1/artifacts/"+laterSlug+"/run", token, "application/json",
-		fmt.Sprintf(`{"run":%q}`, run)); status != http.StatusOK || payload["run"] != run {
+		fmt.Sprintf(`{"run":%q}`, run)); status != http.StatusOK || runSlugOf(payload) != run {
 		t.Errorf("attach to a finished run = %d %v, want it allowed", status, payload)
 	}
 }
@@ -649,7 +690,7 @@ func TestTakedownRemovesTheBytesAndAnswersGoneEverywhere(t *testing.T) {
 
 	payload := readyArtifact(t, server, key, "a secret")
 	slug, _ := payload["slug"].(string)
-	url, _ := payload["url"].(string)
+	fileURL, _ := payload["file_url"].(string)
 
 	if status, body := takeDown(t, server, key, slug, ""); status != http.StatusNoContent {
 		t.Fatalf("takedown = %d %v, want 204", status, body)
@@ -657,8 +698,19 @@ func TestTakedownRemovesTheBytesAndAnswersGoneEverywhere(t *testing.T) {
 
 	// The bytes go first, and they go for good: a takedown that could be undone
 	// would leave a leaked secret leaked.
-	if status, _ := request(t, http.MethodGet, url, "", "", ""); status != http.StatusNotFound {
-		t.Errorf("GET %s after takedown = %d, want 404", url, status)
+	if status, _ := request(t, http.MethodGet, fileURL, "", "", ""); status != http.StatusNotFound {
+		t.Errorf("GET %s after takedown = %d, want 404", fileURL, status)
+	}
+	// The card stays and reports the takedown, without naming the file: a
+	// takedown is somebody asking for it to be gone, and echoing the filename
+	// back out of the page would undo half of that.
+	card, _ := payload["url"].(string)
+	status, page := requestText(t, card)
+	if status != http.StatusGone {
+		t.Errorf("GET %s after takedown = %d, want 410", card, status)
+	}
+	if strings.Contains(page, "a.txt") {
+		t.Errorf("the taken-down card names the file:\n%s", page)
 	}
 	if status, body := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, key, "", ""); status != http.StatusGone || errorCode(body) != "taken_down" {
 		t.Errorf("show after takedown = %d %v, want 410 taken_down", status, body)
@@ -831,7 +883,7 @@ func TestTakedownSpendsAnOutstandingUploadURL(t *testing.T) {
 	if status := put(t, url, body); status != http.StatusForbidden {
 		t.Errorf("PUT after takedown = %d, want 403 — the URL is spent", status)
 	}
-	public, _ := payload["url"].(string)
+	public, _ := payload["file_url"].(string)
 	if status, _ := request(t, http.MethodGet, public, "", "", ""); status != http.StatusNotFound {
 		t.Errorf("GET %s after takedown = %d, want 404", public, status)
 	}
@@ -1188,5 +1240,69 @@ func TestABodyThatDoesNotParseIsRefusedAsOne(t *testing.T) {
 		"krowk_sk_owner", "application/json", ""); status != http.StatusBadRequest ||
 		errorCode(payload) != "parameter_missing" {
 		t.Errorf("empty body = %d %s, want 400 parameter_missing", status, errorCode(payload))
+	}
+}
+
+// The card page is what `url` now points at, and the whole reason it stopped
+// pointing at the object: a paste destination fetches it, reads the OpenGraph
+// tags and renders a preview. So the tags are the contract, and og:image has to
+// name the bytes — an unfurler fetching og:image expects image bytes back and
+// would otherwise get this page.
+func TestCardPageCarriesTheOpenGraphTags(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_test"
+
+	payload := declareTyped(t, server, key, "shot.png", "image/png", "some bytes")
+	// A declared artifact has no bytes yet. It renders as pending rather than as
+	// an image that is not there: a card built on it would otherwise carry a
+	// broken image for as long as the upload takes.
+	card, _ := payload["url"].(string)
+	status, page := requestText(t, card)
+	if status != http.StatusOK || !strings.Contains(page, "pending") {
+		t.Fatalf("pending card = %d\n%s", status, page)
+	}
+	if strings.Contains(page, `property="og:image"`) {
+		t.Errorf("a pending card promises an image that is not there:\n%s", page)
+	}
+
+	if status, _ := request(t, http.MethodPut, uploadURL(t, payload), "", "image/png", "some bytes"); status != http.StatusOK {
+		t.Fatal("upload failed")
+	}
+	if status, body := finalize(t, server, key, payload); status != http.StatusOK {
+		t.Fatalf("finalize = %d %v", status, body)
+	}
+
+	fileURL, _ := payload["file_url"].(string)
+	status, page = requestText(t, card)
+	if status != http.StatusOK {
+		t.Fatalf("card = %d\n%s", status, page)
+	}
+	for _, want := range []string{
+		`<meta property="og:image" content="` + fileURL + `">`,
+		`<meta property="og:title" content="shot.png">`,
+		`<meta property="og:url" content="` + card + `">`,
+		`<meta property="og:type"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("card is missing %s:\n%s", want, page)
+		}
+	}
+
+	// A slug nobody ever issued is a 404 rather than a blank card.
+	if status, _ := requestText(t, server.URL+"/a/art_nosuchartifact00000"); status != http.StatusNotFound {
+		t.Errorf("unknown slug = %d, want 404", status)
+	}
+}
+
+// Only an image gets an og:image. A log with one would have every card built
+// from it carrying a broken thumbnail.
+func TestCardPageOffersNoImageForANonImage(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	payload := declare(t, server, "krowk_sk_test", "build.log", "some bytes")
+	card, _ := payload["url"].(string)
+	_, page := requestText(t, card)
+	if strings.Contains(page, "og:image") {
+		t.Errorf("a log's card offers an image:\n%s", page)
 	}
 }

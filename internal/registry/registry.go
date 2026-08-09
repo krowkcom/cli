@@ -21,7 +21,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"path"
@@ -64,11 +66,20 @@ type artifact struct {
 	ByteSize    int64  `json:"byte_size"`
 	Checksum    string `json:"checksum,omitempty"`
 	Region      string `json:"region"`
-	Run         any    `json:"run"`
-	URL         string `json:"url"`
-	Markdown    string `json:"markdown"`
-	ExpiresAt   any    `json:"expires_at"`
-	CreatedAt   string `json:"created_at"`
+	// Run is the slug of the run this artifact belongs to, empty for none. On
+	// the wire it goes out as the nested run object serializeArtifact builds,
+	// which is why this field is not serialized from here.
+	Run string `json:"-"`
+	// URL is the card page and FileURL is the object in storage. Two fields
+	// because they are two different things: the card is what gets pasted and
+	// unfurled, the file is where the bytes are and what an image embed has to
+	// name. Only one host serves both here; in production they are krowk.com
+	// and the CDN.
+	URL       string `json:"url"`
+	FileURL   string `json:"file_url"`
+	Markdown  string `json:"markdown"`
+	ExpiresAt any    `json:"expires_at"`
+	CreatedAt string `json:"created_at"`
 
 	// Not serialized: what the stand-in has to remember between calls.
 	workspace  string
@@ -220,6 +231,14 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	mux.HandleFunc("PUT /_storage/{workspace}/{slug}/{filename}", s.putObject)
 	mux.HandleFunc("GET /_storage/{workspace}/{slug}/{filename}", s.getObject)
 
+	// The card page: what `url` now points at, and the whole reason it stopped
+	// pointing at the object. Server-rendered, sessionless and keyless, because
+	// an unfurler is an HTTP client with no credentials that reads the tags out
+	// of the first response and never runs any script. In production the Nuxt
+	// site serves this off the registry's data; here it is the same origin, so
+	// a paste out of `krowk registry serve` unfurls the way production does.
+	mux.HandleFunc("GET /a/{slug}", s.artifactPage)
+
 	// A path that matches nothing, which includes a known path asked for with a
 	// verb it does not serve — Go's mux falls through to this pattern rather
 	// than answering 405, and so does the Rails router the real registry runs.
@@ -332,7 +351,12 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 
 	slug := generateSlug("art")
 	key := path.Join(workspace, slug, safeFilename(in.Filename))
-	url := site + "/_storage/" + key
+	// The card page is the link, the storage path is where the bytes are. The
+	// real registry serves the first from krowk.com and the second from the
+	// CDN; here one origin serves both, which is enough for a paste against
+	// `krowk registry serve` to behave the way a paste against production does.
+	fileURL := site + "/_storage/" + key
+	url := site + "/a/" + slug
 	now := s.now().UTC()
 
 	a := &artifact{
@@ -344,7 +368,8 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		Checksum:    strings.ToLower(in.Checksum),
 		Region:      "weur",
 		URL:         url,
-		Markdown:    markdown(in.Filename, in.ContentType, url),
+		FileURL:     fileURL,
+		Markdown:    markdown(in.Filename, in.ContentType, fileURL, url),
 		CreatedAt:   now.Format(time.RFC3339Nano),
 		workspace:   workspace,
 		uploadTok:   randomToken(),
@@ -381,7 +406,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 // so a stored one is usually dead by the time a retry asks.
 func (s *store) declared(a *artifact, claimToken string) map[string]any {
 	payload := map[string]any{}
-	for k, v := range serializeArtifact(a) {
+	for k, v := range s.serializeArtifact(a) {
 		payload[k] = v
 	}
 
@@ -394,7 +419,7 @@ func (s *store) declared(a *artifact, claimToken string) map[string]any {
 	}
 	payload["upload"] = map[string]any{
 		"method":     "PUT",
-		"url":        a.URL + "?upload_token=" + a.uploadTok,
+		"url":        a.FileURL + "?upload_token=" + a.uploadTok,
 		"headers":    uploadHeaders,
 		"expires_at": a.uploadTil.Format(time.RFC3339Nano),
 	}
@@ -614,11 +639,15 @@ func (s *store) getObject(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	bytes, ok := s.objects[key]
+	var contentType string
 	// The 24-hour promise covers the bytes, not just the record: an expired
 	// artifact's public URL stops serving, as the real registry's lifecycle
 	// rule deletes the object. Gone reads as never-there, the way storage does.
-	if a := s.artifacts[r.PathValue("slug")]; a != nil && s.expired(a) {
-		ok = false
+	if a := s.artifacts[r.PathValue("slug")]; a != nil {
+		if s.expired(a) {
+			ok = false
+		}
+		contentType = a.ContentType
 	}
 	s.mu.Unlock()
 
@@ -626,7 +655,134 @@ func (s *store) getObject(w http.ResponseWriter, r *http.Request) {
 		writeXMLError(w, http.StatusNotFound, "NoSuchKey")
 		return
 	}
+	// Storage serves the type the object was stored with, and the card page's
+	// og:image is only an image to an unfurler if this says so — without it Go
+	// sniffs, which is close but not the contract the CDN honours.
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
 	_, _ = w.Write(bytes)
+}
+
+// artifactPage is the card at /a/{slug} — the page `url` names, and the one the
+// whole change exists for. It is deliberately plain: an unfurler fetches it
+// once with no credentials, reads the OpenGraph tags out of the markup and runs
+// nothing, so there is no styling and no script here to be worth having.
+//
+// Public and keyless, because the slug is the capability: it is unguessable and
+// the bytes behind it are public on the CDN regardless, so demanding a key here
+// would only stop Slack from ever seeing the page.
+func (s *store) artifactPage(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+
+	s.mu.Lock()
+	a := s.artifacts[slug]
+	var (
+		gone     string
+		filename string
+		fileURL  string
+		cardURL  string
+		image    bool
+		pending  bool
+		size     int64
+	)
+	if a != nil {
+		switch {
+		case !a.deletedAt.IsZero():
+			gone = "taken_down"
+		case s.expired(a):
+			gone = "expired"
+		}
+		filename, fileURL, cardURL = a.Filename, a.FileURL, a.URL
+		image = strings.HasPrefix(a.ContentType, "image/")
+		pending = a.State != "ready"
+		size = a.ByteSize
+	}
+	s.mu.Unlock()
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	if a == nil {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, page("Not found", nil, "<p>No such artifact.</p>"))
+		return
+	}
+	// 410 rather than 404 on a page for the same reason as on the API: the link
+	// is already pasted somewhere, and "this existed and is gone" is a different
+	// thing to tell a reader than "check your typo". A taken-down artifact does
+	// not name its file — that is half of what a takedown is for.
+	if gone != "" {
+		w.WriteHeader(http.StatusGone)
+		title, body := "Taken down", "<p>This artifact was taken down.</p>"
+		if gone == "expired" {
+			title = filename
+			body = "<p>" + html.EscapeString(filename) + " has expired.</p>"
+		}
+		_, _ = io.WriteString(w, page(title, map[string]string{
+			"og:title": title, "og:type": "website", "og:url": cardURL,
+		}, body))
+		return
+	}
+
+	// A pending artifact says so. Naming its bytes in og:image would put a
+	// broken image in every card built from this page, and the upload may still
+	// be on its way — which is worth saying rather than rendering as breakage.
+	if pending {
+		_, _ = io.WriteString(w, page(filename, map[string]string{
+			"og:title":       filename,
+			"og:type":        "website",
+			"og:url":         cardURL,
+			"og:description": "Upload pending — the bytes have not landed yet.",
+		}, "<p>"+html.EscapeString(filename)+" — upload pending.</p>"))
+		return
+	}
+
+	tags := map[string]string{
+		"og:title":       filename,
+		"og:type":        "website",
+		"og:url":         cardURL,
+		"og:description": humanBytes(size) + " · krowk",
+	}
+	body := `<p><a href="` + html.EscapeString(fileURL) + `">` + html.EscapeString(filename) + `</a></p>`
+	if image {
+		// The image tag names the bytes, never this page: an unfurler fetches
+		// og:image expecting to get image bytes back, and would get this HTML.
+		tags["og:image"] = fileURL
+		tags["twitter:card"] = "summary_large_image"
+		body = `<p><img src="` + html.EscapeString(fileURL) + `" alt="` + html.EscapeString(filename) + `"></p>` + body
+	}
+	_, _ = io.WriteString(w, page(filename, tags, body))
+}
+
+// page is the whole of this stand-in's HTML: a title, the meta tags in a stable
+// order so a test can read them, and a body. Sorted because Go's map iteration
+// is not, and a page whose markup reshuffles between requests is one no
+// assertion can pin.
+func page(title string, tags map[string]string, body string) string {
+	var meta strings.Builder
+	for _, k := range slices.Sorted(maps.Keys(tags)) {
+		meta.WriteString(`<meta property="` + html.EscapeString(k) +
+			`" content="` + html.EscapeString(tags[k]) + `">` + "\n")
+	}
+	return "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>" +
+		html.EscapeString(title) + "</title>\n" + meta.String() + "</head>\n<body>\n" + body + "\n</body>\n</html>\n"
+}
+
+// humanBytes is the size as a card would say it. The CLI has its own, and this
+// one is not shared with it: importing the output package into the stand-in
+// registry would point the dependency the wrong way round — the stand-in exists
+// to be something the CLI is tested against, not something it is built on.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for n/div >= unit && exp < 3 {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.0f %s", float64(n)/float64(div), []string{"KB", "MB", "GB", "TB"}[exp])
 }
 
 // finalizeArtifact verifies what landed and marks the artifact ready. Idempotent,
@@ -652,7 +808,7 @@ func (s *store) finalizeArtifact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.State == "ready" {
-		writeJSON(w, http.StatusOK, serializeArtifact(a))
+		writeJSON(w, http.StatusOK, s.serializeArtifact(a))
 		return
 	}
 	// 409 rather than 422: the request is well formed, it just arrived before the
@@ -682,7 +838,7 @@ func (s *store) finalizeArtifact(w http.ResponseWriter, r *http.Request) {
 		a.Checksum = a.storedSum
 	}
 	a.uploadTok = ""
-	writeJSON(w, http.StatusOK, serializeArtifact(a))
+	writeJSON(w, http.StatusOK, s.serializeArtifact(a))
 }
 
 // listArtifacts is one page of a workspace's artifacts, newest first. It needs a
@@ -728,7 +884,7 @@ func (s *store) listArtifacts(w http.ResponseWriter, r *http.Request) {
 
 	page := make([]map[string]any, 0, len(owned))
 	for _, a := range owned {
-		page = append(page, serializeArtifact(a))
+		page = append(page, s.serializeArtifact(a))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"artifacts": page, "next": next})
 }
@@ -785,7 +941,7 @@ func (s *store) showArtifact(w http.ResponseWriter, r *http.Request) {
 	if s.refuseIfGone(w, a) {
 		return
 	}
-	writeJSON(w, http.StatusOK, serializeArtifact(a))
+	writeJSON(w, http.StatusOK, s.serializeArtifact(a))
 }
 
 // destroyArtifact is the takedown. The bytes leave storage at once and what
@@ -882,6 +1038,12 @@ func authorizedToWrite(a *artifact, workspace, claimToken string) bool {
 //
 // Takedown is reported first because an artifact can be both, and the one
 // somebody decided is the truer answer.
+//
+// An expiry carries the filename and when it was created, because the link is
+// already pasted somewhere and the card page rendering the refusal has nothing
+// else left to name the thing that used to be there. A takedown carries
+// nothing: somebody asked for it to be gone, and echoing the filename back
+// would undo half of that.
 func (s *store) refuseIfGone(w http.ResponseWriter, a *artifact) bool {
 	switch {
 	case !a.deletedAt.IsZero():
@@ -890,7 +1052,8 @@ func (s *store) refuseIfGone(w http.ResponseWriter, a *artifact) bool {
 				a.deletedAt.Format(time.RFC3339Nano)), nil)
 	case s.expired(a):
 		writeError(w, http.StatusGone, "expired",
-			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt),
+			map[string]any{"filename": a.Filename, "created_at": a.CreatedAt})
 	default:
 		return false
 	}
@@ -942,7 +1105,7 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 	// took down still answers 200 here — the `live` scope only governs the branch
 	// that spends a token, which a retry no longer reaches.
 	if match && a.claimed && a.workspace == workspace {
-		writeJSON(w, http.StatusOK, serializeArtifact(a))
+		writeJSON(w, http.StatusOK, s.serializeArtifact(a))
 		return
 	}
 	// A slug that does not exist, a token that does not match it, an artifact
@@ -967,7 +1130,7 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 	a.workspace = workspace
 	a.ExpiresAt = nil
 	a.claimed = true // a token is good once
-	writeJSON(w, http.StatusOK, serializeArtifact(a))
+	writeJSON(w, http.StatusOK, s.serializeArtifact(a))
 }
 
 // attachRun puts an artifact under a run after the fact, which is how an upload
@@ -1032,7 +1195,7 @@ func (s *store) attachRun(w http.ResponseWriter, r *http.Request) {
 	// idempotent, and it is the only reading under which a retry whose first
 	// response was lost is a success.
 	a.Run = body.Run
-	writeJSON(w, http.StatusOK, serializeArtifact(a))
+	writeJSON(w, http.StatusOK, s.serializeArtifact(a))
 }
 
 func (s *store) createRun(w http.ResponseWriter, r *http.Request) {
@@ -1209,7 +1372,7 @@ func (s *store) listRunArtifacts(w http.ResponseWriter, r *http.Request) {
 	made, next := paginate(made, limit, func(a *artifact) string { return a.Slug })
 	page := make([]map[string]any, 0, len(made))
 	for _, a := range made {
-		page = append(page, serializeArtifact(a))
+		page = append(page, s.serializeArtifact(a))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"artifacts": page, "next": next})
 }
@@ -1338,7 +1501,10 @@ func (s *store) expired(a *artifact) bool {
 	return err == nil && at.Before(s.now())
 }
 
-func serializeArtifact(a *artifact) map[string]any {
+// serializeArtifact is the artifact as the API reports it. A method rather than
+// a free function because `run` is now the run itself rather than its slug, and
+// the run lives in the store — every caller already holds the lock.
+func (s *store) serializeArtifact(a *artifact) map[string]any {
 	return map[string]any{
 		"slug":         a.Slug,
 		"state":        a.State,
@@ -1347,22 +1513,61 @@ func serializeArtifact(a *artifact) map[string]any {
 		"byte_size":    a.ByteSize,
 		"checksum":     a.Checksum,
 		"region":       a.Region,
-		"run":          a.Run,
+		"run":          s.serializeArtifactRun(a),
 		"url":          a.URL,
+		"file_url":     a.FileURL,
 		"markdown":     a.Markdown,
 		"expires_at":   a.ExpiresAt,
 		"created_at":   a.CreatedAt,
 	}
 }
 
-// markdown is ready to paste into a pull request: an image embeds, anything else
-// becomes a plain link.
-func markdown(filename, contentType, url string) string {
-	if strings.HasPrefix(contentType, "image/") {
-		return fmt.Sprintf("![%s](%s)", filename, url)
+// serializeArtifactRun is the run nested inside an artifact: null when it
+// belongs to none, and otherwise the slug, the metadata and when it was opened.
+// Nested rather than a bare slug so a client reading an artifact back knows
+// what produced it without a second call.
+//
+// The run being missing from the store is not possible today — an artifact only
+// ever names one this store minted — but it answers null rather than a
+// half-object if it ever becomes so.
+func (s *store) serializeArtifactRun(a *artifact) any {
+	if a.Run == "" {
+		return nil
 	}
-	return fmt.Sprintf("[%s](%s)", filename, url)
+	r, ok := s.runs[a.Run]
+	if !ok {
+		return nil
+	}
+	metadata := r.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage("{}")
+	}
+	return map[string]any{
+		"slug":       r.Slug,
+		"metadata":   metadata,
+		"created_at": r.CreatedAt,
+	}
 }
+
+// markdown is ready to paste into a pull request. An image embeds and the embed
+// links through to the card page — the embed has to name the bytes, because a
+// paste destination renders an image only where the link resolves to one, but
+// clicking it should land on the page with the run metadata rather than on a
+// bare file. Anything that cannot be embedded is a plain link to the card.
+func markdown(filename, contentType, fileURL, cardURL string) string {
+	label := labelEscaper.Replace(filename)
+	if strings.HasPrefix(contentType, "image/") {
+		return fmt.Sprintf("[![%s](%s)](%s)", label, fileURL, cardURL)
+	}
+	return fmt.Sprintf("[%s](%s)", label, cardURL)
+}
+
+// labelEscaper escapes what would end or nest a CommonMark link label, and
+// folds newlines because link text cannot span lines. A filename is whatever
+// the client sent, so a name like `frame[0].png` has to leave here escaped or
+// the link breaks wherever it is pasted. It mirrors the CLI's own escaper, and
+// the real registry's.
+var labelEscaper = strings.NewReplacer(`\`, `\\`, `[`, `\[`, `]`, `\]`, "\n", " ", "\r", " ")
 
 // safeFilename mirrors the real registry's: keys are attacker-influenced, so a
 // name like "../../other" must not let one artifact write over another's key.

@@ -5,8 +5,8 @@ GitHub, Slack, Basecamp and Linear with the run metadata attached.
 
 Proof of concept. The CLI speaks the registry's real protocol and is tested
 against both a local stand-in and a running
-[krowk-registry](../krowk-registry); what is still missing is the unfurl layer,
-and a first tag (see [What the POC still needs](#what-the-poc-still-needs)).
+[krowk-registry](../krowk-registry); what is still missing is a Slack app and a
+first tag (see [What the POC still needs](#what-the-poc-still-needs)).
 
 ```bash
 krowk push ../../tmp/screenshots/foobar.jpg \
@@ -17,9 +17,14 @@ krowk push ../../tmp/screenshots/foobar.jpg \
 
 ```
 ✓ uploaded  foobar.jpg  412 KB
-  https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg
+  https://krowk.com/a/art_2e1d
   run run_8Kd2wq · expires in 24h
 ```
+
+That link is the **card page**: an HTML page carrying the artifact and its run
+metadata in OpenGraph tags, which is what a paste destination unfurls into a
+preview. The bytes themselves live on the CDN and come back as `file_url` — it
+is what an image embed has to name, and it is not the link to hand to a person.
 
 Go, standard library only. One static binary, no runtime to install — agent
 containers rarely have Node, and the whole point is that the upload step never
@@ -200,7 +205,7 @@ There is no single paste-ready string, because the surfaces disagree.
 
 | Destination | Use | Why |
 | --- | --- | --- |
-| GitHub, Linear, Notion | `--format markdown` | GitHub builds preview cards only for its own resources, so a bare third-party link renders as a plain blue anchor no matter what OpenGraph tags the page carries. It *does* render image URLs inline, so the image embed is what actually shows the artifact in a PR comment. |
+| GitHub, Linear, Notion | `--format markdown` | GitHub builds preview cards only for its own resources, so a bare third-party link renders as a plain blue anchor no matter what OpenGraph tags the card page carries. It *does* render image URLs inline, so the image embed is what actually shows the artifact in a PR comment — which is why the embed names `file_url` and is wrapped in a link to the card, `[![name](file_url)](url)`: it renders *and* clicks through to the run metadata. A file that is not an image has nothing to embed, so it is a plain link to the card. |
 | Slack, Basecamp | `--format url` | Both unfurl a bare URL into a card of their own. Slack renders no markdown image embeds at all — pasting the embed form there shows raw text. |
 
 `--json` carries both forms under `paste`, one line per artifact:
@@ -210,8 +215,8 @@ There is no single paste-ready string, because the surfaces disagree.
   "ok": true,
   "data": { },
   "paste": {
-    "markdown": "![foobar.jpg](https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg)",
-    "url": "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg"
+    "markdown": "[![foobar.jpg](https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg)](https://krowk.com/a/art_2e1d)",
+    "url": "https://krowk.com/a/art_2e1d"
   }
 }
 ```
@@ -442,8 +447,10 @@ Content-Type: application/json
 // 201 Created
 {
   "slug": "art_2e1d…", "state": "pending",
-  "url": "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
-  "markdown": "![foobar.jpg](https://cdn.krowk.com/…)",
+  "url": "https://krowk.com/a/art_2e1d",                          // the card page — the link to paste
+  "file_url": "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg", // the bytes on the CDN
+  "markdown": "[![foobar.jpg](https://cdn.krowk.com/…)](https://krowk.com/a/art_2e1d)",
+  "run": null,                                // or { "slug": "run_…", "metadata": {…}, "created_at": … }
   "expires_at": "2026-08-05T14:32:00Z",       // anonymous uploads only
   "upload": {
     "method": "PUT", "url": "https://…?X-Amz-Signature=…",
@@ -599,7 +606,9 @@ server at it too. Precedence, most to least specific: `--dev`, then
 
 `registry serve` takes `--addr`, `--site` (the origin baked into returned links,
 for demoing production-looking URLs) and `--limit-bytes` (to exercise the
-too-large path).
+too-large path). It serves the card page at `/a/{slug}` too — the same
+OpenGraph tags production serves, unstyled — so a link it hands out unfurls
+rather than 404ing when it is pasted somewhere.
 
 It binds `127.0.0.1:8787` — **loopback by default**, because it accepts uploads
 without a key and serves their bytes to anyone who can reach it. On a café or
@@ -732,11 +741,11 @@ Nothing else is wired to a secret. `GITHUB_TOKEN` is the one Actions provides.
 
 Blocking, in order:
 
-1. **The unfurl layer.** The whole pitch is the preview card. Today `url` points
-   straight at the CDN object, so pasting it gets you an image or a file
-   download, not a card with the run metadata on it. That means a
-   `krowk.com/a/{slug}` page serving OpenGraph tags plus a rendered preview, and
-   a Slack app for Slack's own unfurl path.
+1. **A Slack app.** The card page is done: `url` is `krowk.com/a/{slug}`, which
+   serves the OpenGraph tags and a rendered preview, and the stand-in registry
+   serves the same page so a local `krowk registry serve` paste behaves like
+   production. What is left of the unfurl layer is Slack's own path, which
+   needs an app rather than tags on a page.
 2. **Distribution.** The pipeline is built — see [Releasing](#releasing). What is
    left is not code: the `@krowk` scope has to carry `@krowk/cli`, `@krowk/mcp`
    and the five platform packages before the site's `npx @krowk/cli push`

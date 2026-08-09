@@ -196,7 +196,7 @@ func TestClaimingWithoutARunSaysHowToGroupIt(t *testing.T) {
 // `claim --run` already did it, so saying it again would be advice to repeat a
 // call that has already succeeded.
 func TestClaimingIntoARunSuggestsNoAttach(t *testing.T) {
-	a := &api.Artifact{Slug: "art_2e1d", Filename: "shot.png", URL: "https://cdn/x", Run: "run_7f"}
+	a := &api.Artifact{Slug: "art_2e1d", Filename: "shot.png", URL: "https://cdn/x", Run: &api.ArtifactRun{Slug: "run_7f"}}
 
 	if _, ok := find(crumbsOf(t, Claimed(a, JSON, false, false, time.Now())), "uploads attach"); ok {
 		t.Error("an upload already in a run was told to attach it")
@@ -242,7 +242,7 @@ func TestAPersonClaimingWithoutARunIsToldHowToGroupIt(t *testing.T) {
 	}
 
 	// `claim --run` already grouped it, and says nothing.
-	grouped := Claimed(&api.Artifact{Slug: "art_2e1d", URL: "https://cdn/x", Run: "run_7f"},
+	grouped := Claimed(&api.Artifact{Slug: "art_2e1d", URL: "https://cdn/x", Run: &api.ArtifactRun{Slug: "run_7f"}},
 		Human, false, false, time.Now())
 	if strings.Contains(grouped, "uploads attach") {
 		t.Errorf("an upload already in a run was told to attach it:\n%s", grouped)

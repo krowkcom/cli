@@ -201,9 +201,10 @@ func TestHumanHelpIsStillHumanOnATerminal(t *testing.T) {
 	}
 }
 
-// markdown and url describe an artifact and have nothing to say about a
-// command, so they fall back to what a person would read rather than to
-// something shaped like a paste.
+// markdown and url are the two paste forms of an artifact's link — an embed and
+// the card page's URL — and have nothing to say about a command, so they fall
+// back to what a person would read rather than to something shaped like a
+// paste.
 func TestHelpInAPasteFormatFallsBackToTheText(t *testing.T) {
 	for _, format := range []string{"markdown", "url"} {
 		code, stdout, _ := runHelp(t, false, "help", "--format="+format)

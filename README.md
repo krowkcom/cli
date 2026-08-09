@@ -35,7 +35,11 @@ The release pipeline is built but no tag has been cut yet, so nothing below
 works today. Once one is:
 
 ```bash
-# Binary, no runtime. Both binaries are in one archive per platform.
+# The installer: picks the platform, verifies the checksum, installs both
+# binaries and drops the agent skill in ~/.claude/skills if that exists.
+curl -fsSL https://krowk.com/install | bash
+
+# Or the archive by hand. Both binaries are in one per platform.
 curl -sSfL https://github.com/krowkcom/cli/releases/latest/download/krowk_0.1.0_linux_amd64.tar.gz \
   | tar -xz -C /usr/local/bin krowk krowk-mcp
 
@@ -44,10 +48,34 @@ npx krowk push screenshot.png
 ```
 
 Linux and macOS on amd64 and arm64, Windows on amd64; `checksums.txt` on each
-release covers every archive. A Homebrew tap and `curl | bash` come off the same
-build and are not wired up yet. See [Releasing](#releasing) for how a tag becomes
-those files, and [What the POC still needs](#what-the-poc-still-needs) for what a
-human has to do before the npm half of it can publish.
+release covers every archive. A Homebrew tap comes off the same build and is not
+wired up yet. See [Releasing](#releasing) for how a tag becomes those files, and
+[What the POC still needs](#what-the-poc-still-needs) for what a human has to do
+before the npm half of it can publish.
+
+`https://krowk.com/install` is a redirect to
+[`scripts/install.sh`](scripts/install.sh) on `main`, so the bytes come from
+GitHub and the site never serves a stale installer. It reads `KROWK_BIN_DIR`,
+`KROWK_VERSION` and `KROWK_SKIP_SKILL=1`, verifies the SHA-256 against the
+release's `checksums.txt` before anything becomes executable, and asks nothing:
+there is no wizard, because a keyless push works the moment the binary lands.
+`scripts/install_test.sh` runs it end to end against a release built locally and
+served over loopback.
+
+## The agent skill
+
+[`skills/krowk/SKILL.md`](skills/krowk/SKILL.md) is what an agent reads to know
+which krowk command to reach for — the invariants (`--json` for anything parsed,
+breadcrumbs are commands, a claim token is a one-shot secret that never goes in a
+PR comment), a task-to-command table, the decision trees, and the exit codes.
+
+The installer copies it into `~/.claude/skills/krowk/SKILL.md` when that
+directory exists. Copy it yourself for any other agent.
+
+It is prose about a command surface, so it is held to the surface:
+`internal/skill` parses every `krowk …` in the file's code spans and blocks and
+resolves each against the same catalog `krowk help --json` serialises, flags
+included. A renamed flag fails the build rather than failing an agent.
 
 ## Commands
 
@@ -711,9 +739,10 @@ Blocking, in order:
    them, but there is no device flow, so an agent in a container still needs a
    human to paste one in.
 
-Non-blocking, in rough value order: a Homebrew tap and a `curl | bash` installer,
-both of which come off the archives the release already produces; a Claude Code
-`PostToolUse` hook so screenshots upload with no prompting; a GitHub Action.
+Non-blocking, in rough value order: a Homebrew tap, which comes off the archives
+the release already produces; a Claude Code `PostToolUse` hook so screenshots
+upload with no prompting; a GitHub Action. The `curl | bash` installer is
+written — it has never run against a real release, because there is not one.
 
 ## Open questions
 

@@ -9,6 +9,8 @@ on:
     paths:
       - .goreleaser.yaml
       - npm/**
+      - scripts/install.sh
+      - scripts/install_test.sh
       - .github/workflows/packaging.yml
       - .github/workflows/release.yml
       - Makefile
@@ -18,6 +20,8 @@ on:
     paths:
       - .goreleaser.yaml
       - npm/**
+      - scripts/install.sh
+      - scripts/install_test.sh
       - .github/workflows/packaging.yml
       - .github/workflows/release.yml
       - Makefile
@@ -101,3 +105,11 @@ jobs:
           test "$(./node_modules/.bin/krowk --version)" = "$version"
           test "$(./node_modules/.bin/krowk-mcp --version)" = "$version"
           ./node_modules/.bin/krowk --help >/dev/null
+
+      # Serves the dist/ the snapshot step above wrote — GoReleaser's own
+      # archive and its own checksums.txt — and installs out of it, so what is
+      # tested is the release rather than a tarball the test rolled itself.
+      # That is why this lives here and not in the test suite: this is the only
+      # job that already has a release to install from.
+      - name: Install from the snapshot built above
+        run: scripts/install_test.sh

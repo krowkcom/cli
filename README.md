@@ -5,8 +5,8 @@ GitHub, Slack, Basecamp and Linear with the run metadata attached.
 
 Proof of concept. The CLI speaks the registry's real protocol and is tested
 against both a local stand-in and a running
-[krowk-registry](../krowk-registry); what is still missing is the unfurl layer
-and distribution (see [What the POC still needs](#what-the-poc-still-needs)).
+[krowk-registry](../krowk-registry); what is still missing is the unfurl layer,
+and a first tag (see [What the POC still needs](#what-the-poc-still-needs)).
 
 ```bash
 krowk push ../../tmp/screenshots/foobar.jpg \
@@ -31,8 +31,23 @@ fails for boring reasons.
 go install github.com/krowkcom/cli/cmd/krowk@latest
 ```
 
-Release binaries, a Homebrew tap and the `npx krowk` wrapper the website
-advertises all land with the first tagged release — see the prerequisites below.
+The release pipeline is built but no tag has been cut yet, so nothing below
+works today. Once one is:
+
+```bash
+# Binary, no runtime. Both binaries are in one archive per platform.
+curl -sSfL https://github.com/krowkcom/cli/releases/latest/download/krowk_0.1.0_linux_amd64.tar.gz \
+  | tar -xz -C /usr/local/bin krowk krowk-mcp
+
+# npm, for people already in Node
+npx krowk push screenshot.png
+```
+
+Linux and macOS on amd64 and arm64, Windows on amd64; `checksums.txt` on each
+release covers every archive. A Homebrew tap and `curl | bash` come off the same
+build and are not wired up yet. See [Releasing](#releasing) for how a tag becomes
+those files, and [What the POC still needs](#what-the-poc-still-needs) for what a
+human has to do before the npm half of it can publish.
 
 ## Commands
 
@@ -437,11 +452,16 @@ open it up, and the banner says so when you do.
 ## Development
 
 ```bash
-make check       # go vet + go test ./...
-make build       # → bin/krowk and bin/krowk-mcp, versions stamped from git describe
-make mock        # the same registry as `krowk registry serve`, from the checkout
-make install     # → $GOPATH/bin/{krowk,krowk-mcp}
+make check          # go vet + go test ./...
+make build          # → bin/krowk and bin/krowk-mcp, versions stamped from git describe
+make mock           # the same registry as `krowk registry serve`, from the checkout
+make install        # → $GOPATH/bin/{krowk,krowk-mcp}
+make release-check  # validate .goreleaser.yaml and the npm launchers
+make dist           # the whole release, locally, publishing nothing
 ```
+
+`mise.toml` pins Go for the first four and GoReleaser and Node for the last two.
+Nothing here needs a network beyond fetching those.
 
 Against the real registry, with [krowk-registry](../krowk-registry) up on port
 3000 — note the hostname, because that app routes by it:
@@ -484,6 +504,68 @@ registry checkout when either side moves.
 
 Environment: `KROWK_TOKEN`, `KROWK_API_URL`, `KROWK_AGENT`.
 
+## Releasing
+
+A tag is the whole trigger.
+
+```bash
+git tag -a v0.1.0 -m "First release"
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` then runs `make check`, hands
+[`.goreleaser.yaml`](.goreleaser.yaml) to GoReleaser, and publishes to npm. Out
+of it come:
+
+- **Five archives**, `krowk_0.1.0_{linux,darwin}_{amd64,arm64}.tar.gz` and
+  `krowk_0.1.0_windows_amd64.zip`, each holding both `krowk` and `krowk-mcp` —
+  static (`CGO_ENABLED=0`), trimmed, and stamped with the same
+  `internal/cli.Version` ldflag the Makefile uses. Predictable names, because a
+  script that constructs the URL should not have to scrape the release page.
+- **`checksums.txt`**, sha256 over every archive.
+- **A GitHub Release**, with the commit subjects since the last tag. A tag with a
+  `-rc1` on it becomes a pre-release automatically.
+- **Seven npm packages**: `@krowk/{linux,darwin}-{x64,arm64}` and
+  `@krowk/win32-x64`, each carrying nothing but that platform's two binaries, and
+  the two names people actually type — `krowk` and `@krowk/mcp` — which are
+  launcher scripts depending on all five as `optionalDependencies`.
+
+The version the binaries report, the archive names and the npm version are one
+string, taken from the tag with the `v` removed. `make build` strips it the same
+way, so a checkout and a release never disagree about what version this is.
+
+`npm/build.mjs` reads the binaries out of `dist/` rather than compiling its own,
+so the bytes on npm are the bytes the checksums cover. It also holds the one
+platform table the rest is checked against: add a platform to `.goreleaser.yaml`
+and forget one of the two launchers, and the build stops rather than shipping a
+launcher that cannot find its binary.
+
+**Why optionalDependencies and not a postinstall download.** The binary has to
+arrive through the npm registry the machine is already pointed at — one host, the
+one already configured, already mirrored, already allowed through the proxy. A
+postinstall script fetching from GitHub Releases adds a second host that CI
+firewalls block, that `npm ci --ignore-scripts` disables outright, and whose
+bytes npm's own `integrity` hashes do not cover. The cost is five more published
+packages per release and about 6 MB per platform. Worth it: an upload tool whose
+install fails behind a corporate proxy has failed for exactly the boring reason
+the whole thing exists to avoid.
+
+`.github/workflows/packaging.yml` runs the same build on any pull request that
+touches the packaging — config check, snapshot build, npm assembly, then it
+installs the packed tarballs and runs both binaries through the launchers. No
+secrets, so it stays green whether or not anything is claimed on npm.
+
+### What a human still has to do
+
+1. **Claim the names on npm** — `krowk`, and the `@krowk` scope, which covers
+   `@krowk/mcp` and the five platform packages.
+2. **Add `NPM_TOKEN`** as a repository secret: an automation token with publish
+   rights on both. Until it exists, the publish step skips with a notice on the
+   run and the GitHub Release happens anyway, so a tag pushed today still
+   produces working binaries.
+
+Nothing else is wired to a secret. `GITHUB_TOKEN` is the one Actions provides.
+
 ## What the POC still needs
 
 Blocking, in order:
@@ -493,18 +575,18 @@ Blocking, in order:
    download, not a card with the run metadata on it. That means a
    `krowk.com/a/{slug}` page serving OpenGraph tags plus a rendered preview, and
    a Slack app for Slack's own unfurl path.
-2. **Distribution.** `krowk` and `@krowk/mcp` are unclaimed on npm. The site
-   tells people to run `npx krowk push`, so the first release needs GoReleaser
-   for the binaries plus a thin npm wrapper that pulls the right one through
-   per-platform `optionalDependencies` — the pattern esbuild uses. A Homebrew
-   tap and `curl | bash` come off the same build.
+2. **Distribution.** The pipeline is built — see [Releasing](#releasing) — and no
+   tag has been pushed through it. What is left is not code: `krowk` and the
+   `@krowk` scope are still unclaimed on npm, and there is no `NPM_TOKEN` secret,
+   so the site's `npx krowk push` does not resolve to anything yet. Binaries
+   would publish today.
 3. **Getting a token.** Keys exist in the registry and the dashboard can issue
    them, but there is no device flow, so an agent in a container still needs a
    human to paste one in.
 
-Non-blocking, in rough value order: a Claude Code `PostToolUse` hook so
-screenshots upload with no prompting; a GitHub Action. The MCP server itself
-already ships as `krowk-mcp`; what `@krowk/mcp` still needs is the npm wrapper.
+Non-blocking, in rough value order: a Homebrew tap and a `curl | bash` installer,
+both of which come off the archives the release already produces; a Claude Code
+`PostToolUse` hook so screenshots upload with no prompting; a GitHub Action.
 
 ## Open questions
 

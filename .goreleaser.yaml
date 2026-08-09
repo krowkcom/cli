@@ -1,0 +1,96 @@
+# How a tag becomes downloadable bytes. `make release-check` validates this file;
+# `make dist` runs the whole thing locally against a fake version.
+#
+# Both binaries ship in one archive per platform: an agent container that wants
+# krowk usually wants krowk-mcp too, and one download is one thing to get wrong.
+version: 2
+
+project_name: krowk
+
+builds:
+  - id: krowk
+    binary: krowk
+    main: ./cmd/krowk
+    # Static, because the binary lands in containers we did not build and must
+    # not need a libc that matches ours.
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    # The same stamp the Makefile applies, so `krowk --version` says the same
+    # thing whether it came from a release or from a checkout.
+    ldflags:
+      - -s -w -X github.com/krowkcom/cli/internal/cli.Version={{ .Version }}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      # Nobody is running an agent container on Windows ARM yet. Add it when
+      # somebody asks.
+      - goos: windows
+        goarch: arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+  - id: krowk-mcp
+    binary: krowk-mcp
+    main: ./cmd/krowk-mcp
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/krowkcom/cli/internal/cli.Version={{ .Version }}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: krowk
+    ids: [krowk, krowk-mcp]
+    # krowk_0.1.0_linux_amd64.tar.gz — predictable enough to construct in a
+    # shell script without reading the release page first.
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  # No `sort`, so the commits stay in the order they were made. GoReleaser's
+  # asc/desc sort them by subject, which reads like an index.
+  filters:
+    exclude:
+      - "^Merge pull request"
+      - "^Merge branch"
+
+release:
+  # Owner and repo come from the git remote, so a fork releases to the fork.
+  #
+  # A tag like v0.1.0-rc1 becomes a GitHub pre-release, and npm publishes it
+  # under the `next` dist-tag rather than `latest`.
+  prerelease: auto
+  footer: |
+    ## Install
+
+    ```bash
+    # npm, once the names are claimed
+    npx krowk push screenshot.png
+
+    # Direct download — no runtime, no package manager
+    curl -sSfL https://github.com/krowkcom/cli/releases/download/{{ .Tag }}/krowk_{{ .Version }}_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz \
+      | tar -xz -C /usr/local/bin krowk krowk-mcp
+
+    # From source
+    go install github.com/krowkcom/cli/cmd/krowk@{{ .Tag }}
+    ```
+
+    `checksums.txt` covers every archive on this release.

@@ -69,15 +69,15 @@ environment variable — so never guess at a spelling this file does not carry.
    are redirection, so a verbatim paste runs something other than what was
    suggested. Each placeholder is explained in that breadcrumb's `description`.
 5. **A claim token is a bearer secret, and it is shown once.** `claim_token`
-   comes back from a keyless upload and is the only authority over that upload —
+   comes back from a keyless push and is the only authority over that artifact —
    whoever holds it can keep it, re-upload over it, or destroy it. Never write one
    into a PR comment, a commit message, a log line, a chat message or a file the
    repository tracks. Hand it to `krowk claim` and let it be spent.
-6. **Keyless works right now; runs need a key.** With no key an upload lands in
+6. **Keyless works right now; runs need a key.** With no key an artifact lands in
    the shared anonymous workspace, expires in 24 hours, and has no run — metadata
    flags are *not* recorded, and `data.notes` says so. Do not invent a login step
    the task did not ask for: push first, and mention the key only when the person
-   wants the link to outlive the day or wants the uploads grouped.
+   wants the link to outlive the day or wants the artifacts grouped.
 7. **Paste the right form for the destination.** `paste.markdown` for GitHub,
    Linear and Notion — those render an image URL inline and a third-party link as
    a plain anchor. `paste.url`, bare, for Slack and Basecamp — both unfurl a bare
@@ -102,15 +102,15 @@ environment variable — so never guess at a spelling this file does not carry.
 | Close a run | `krowk runs finish run_8Kd2wq --json` |
 | What a run produced | `krowk runs show run_8Kd2wq --json` |
 | Recent runs | `krowk runs list --limit 10 --json` |
-| Recent uploads | `krowk uploads list --limit 10 --json` |
-| One run's uploads | `krowk uploads list --run run_8Kd2wq --json` |
+| Recent artifacts | `krowk uploads list --limit 10 --json` |
+| One run's artifacts | `krowk uploads list --run run_8Kd2wq --json` |
 | Next page of a listing | `krowk uploads list --before <next> --json` |
-| Read one upload back | `krowk uploads show art_2e1d --json` |
-| Keep an anonymous upload | `krowk claim art_2e1d <claim-token> --json` |
+| Read one artifact back | `krowk uploads show art_2e1d --json` |
+| Keep an anonymous artifact | `krowk claim art_2e1d <claim-token> --json` |
 | Keep it and group it at once | `krowk claim art_2e1d <claim-token> --run run_8Kd2wq --json` |
-| Group an upload afterwards | `krowk uploads attach art_2e1d --run run_8Kd2wq --json` |
-| Take an upload down | `krowk uploads delete art_2e1d --json` |
-| Take down a keyless upload | `krowk uploads delete art_2e1d <claim-token> --json` |
+| Group an artifact afterwards | `krowk uploads attach art_2e1d --run run_8Kd2wq --json` |
+| Take an artifact down | `krowk uploads delete art_2e1d --json` |
+| Take down a keyless artifact | `krowk uploads delete art_2e1d <claim-token> --json` |
 | Store an API key | `krowk auth login --token krowk_sk_… --json` |
 | Which key is this, whose workspace | `krowk auth verify --json` |
 | Diagnose a failure | `krowk doctor --json` |
@@ -127,7 +127,7 @@ therefore no breadcrumbs), `--dev`, `--help`, `--version`.
 
 ```
 krowk auth verify --json
-├── ok:true  → keyed. Uploads keep, group under runs, and are listable.
+├── ok:true  → keyed. Artifacts keep, group under runs, and are listable.
 │              Use runs for anything producing more than one file.
 └── ok:false, exit 3 → keyless. Push still works:
                  • the link is live immediately
@@ -151,7 +151,7 @@ Files produced over a session  → krowk runs start --json
 `push` with no `--run` and a key opens a run, attaches everything, and closes it
 on the way out. `--run` names a run you opened, and leaves closing it to you.
 
-### An upload has a claim token and needs to survive
+### An artifact has a claim token and needs to survive
 
 ```
 Do you now have a key?
@@ -161,20 +161,20 @@ Do you now have a key?
           └── yes → krowk claim <artifact> <token> --run <run> --json
 ```
 
-Claiming moves the upload into the key's workspace and does **not** move the
-link. A claim without `--run` leaves the upload with no run at all — that is what
+Claiming moves the artifact into the key's workspace and does **not** move the
+link. A claim without `--run` leaves the artifact with no run at all — that is what
 the `krowk uploads attach` breadcrumb in its result is for.
 
 ### Something must come down now
 
 ```
 Pushed a secret, or the wrong file?
-├── the upload is in your workspace  → krowk uploads delete <artifact> --json
-└── it was pushed keylessly          → krowk uploads delete <artifact> <claim-token> --json
+├── the artifact is in your workspace → krowk uploads delete <artifact> --json
+└── it was pushed keylessly           → krowk uploads delete <artifact> <claim-token> --json
 ```
 
 Immediate and irreversible: the bytes go at once. Withhold the key when using a
-claim token — a keyless upload sits in the anonymous workspace, so a request that
+claim token — a keyless artifact sits in the anonymous workspace, so a request that
 carries a key looks there instead and finds nothing. Then rotate whatever was in
 the file: it was readable at a public URL for as long as it was up.
 
@@ -210,7 +210,7 @@ Metadata is recorded on the run, once, when it is opened — repo, commit, branc
 and agent are detected, so pass only what detection cannot know. Afterwards,
 `krowk runs show run_8Kd2wq --json` lists everything the run produced.
 
-### Keep an upload that was pushed before signing in
+### Keep an artifact that was pushed before signing in
 
 ```bash
 krowk push diagram.png --json
@@ -267,7 +267,7 @@ answer.
 - **Anything unexplained:** `krowk doctor --json` reports the version, whether
   the registry is reachable, whether a key is configured and what run context was
   detected. Run it before reporting a bug, and include its output.
-- **A link that 404s or is gone:** the upload expired (keyless, 24 hours) or was
+- **A link that 404s or is gone:** the artifact expired (keyless, 24 hours) or was
   taken down. Exit 8. No retry brings it back; push again.
 - **`krowk help <command> --json`** settles any question about a flag, and cannot
   be out of date — it is generated from the same catalog that routes the command.
@@ -280,7 +280,7 @@ answer.
 | 1 | The command was wrong, or krowk failed on its own — bad flag, unknown command, unreadable file. Also anything unclassified | Fix the command; `krowk help <command> --json` |
 | 2 | Not found — no such artifact or run in this workspace, or an unrecognised claim token | Check the slug and the token, or `KROWK_API_URL` |
 | 3 | Refused for want of credentials — no key where one is needed, a rejected key, or no claim token where that is the only authority | `krowk auth login --token …`, or pass the claim token |
-| 4 | Understood and refused — validation, an upload already finalized, a run that needs a key | Change something; retrying unchanged answers the same |
+| 4 | Understood and refused — validation, an artifact already finalized, a run that needs a key | Change something; retrying unchanged answers the same |
 | 5 | Rate limited | Wait `error.retry_after` seconds, then retry |
 | 6 | The bytes did not move — registry or object storage unreachable | Retry; `krowk doctor --json` |
 | 7 | The registry failed on its side, or answered something this client could not read | Retry, and report it if it persists |

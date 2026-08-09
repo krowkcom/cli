@@ -54,8 +54,9 @@ const (
 	maxPageSize     = 100
 
 	// The workspace slug keyless uploads land in. One shared workspace, as in
-	// the real registry, so the storage keys look the same.
-	anonymousWorkspace = "ws_anonymous00000000"
+	// the real registry, so the storage keys look the same — padded to canon's
+	// 24 characters so it reads as a slug rather than as an exception to one.
+	anonymousWorkspace = "ws_anonymous000000000000000"
 )
 
 type artifact struct {
@@ -1460,9 +1461,10 @@ func bearer(header string) (string, bool) {
 }
 
 // workspaceFor derives a stable workspace from the token, so two different keys
-// cannot see each other's artifacts — which is the property worth testing.
+// cannot see each other's artifacts — which is the property worth testing. Hex
+// is a subset of lowercase base36, so 24 of it is a slug of canon's shape.
 func workspaceFor(token string) string {
-	return "ws_" + sha256Hex([]byte(token))[:20]
+	return "ws_" + sha256Hex([]byte(token))[:slugRandomLength]
 }
 
 // showKey lets the CLI self-check its key before doing any work. No key is a
@@ -1588,12 +1590,20 @@ func safeFilename(filename string) string {
 	return cleaned
 }
 
-const slugAlphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+// Lowercase base36, because a slug has to be legal as a DNS label: an artifact
+// is hosted at art-{slug}.krowkusercontent.com, and DNS labels are
+// case-insensitive, so a case-sensitive alphabet would collide there.
+const slugAlphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
 
-// generateSlug matches the real registry's shape: a prefix and 21 base58
-// characters, so a slug is recognisable and never guessable.
+// slugRandomLength is canon's slug shape: the type prefix plus exactly this
+// many random characters. Pinned by TestMintedSlugsHaveTheCanonicalShape,
+// because readers validate it — the website refuses /^art_[a-z0-9]{24}$/
+// misses before it ever calls the registry, so a stand-in minting a different
+// shape hands out slugs a dev site will not accept.
+const slugRandomLength = 24
+
 func generateSlug(prefix string) string {
-	b := make([]byte, 21)
+	b := make([]byte, slugRandomLength)
 	if _, err := rand.Read(b); err != nil {
 		panic(err) // a stand-in with no randomness cannot issue slugs
 	}

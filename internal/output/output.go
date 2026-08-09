@@ -960,7 +960,7 @@ func metadataValue(v any) string {
 		// Printed exactly as it was written, digits and all.
 		return value.String()
 	case []any:
-		// A list of plain values reads better as a line than as JSON — `reference`
+		// A list of plain values reads better as a line than as JSON — `references`
 		// is the field this exists for. Anything deeper is not a list of values
 		// but a structure, and flattening it would render [[1,2],[3]] and [1,2,3]
 		// identically, so it goes out as JSON instead.

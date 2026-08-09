@@ -276,9 +276,12 @@ func TestMetadataIsRecordedOnTheRun(t *testing.T) {
 	if got := meta["client"]; got != "krowk-cli/"+Version {
 		t.Errorf("client = %v", got)
 	}
-	refs, _ := meta["reference"].([]any)
+	// Plural, and a list: --reference repeats, and canon names the run's field
+	// `references`. The registry stores metadata verbatim, so this key is the
+	// contract every reader of a run pins against.
+	refs, _ := meta["references"].([]any)
 	if len(refs) != 2 || refs[1] != "https://sentry.io/issues/1" {
-		t.Errorf("reference = %v, want both links in order", meta["reference"])
+		t.Errorf("references = %v, want both links in order", meta["references"])
 	}
 	// Detected without a flag: the CLI's own repository.
 	if commit, _ := meta["commit"].(string); !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(commit) {

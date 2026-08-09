@@ -458,7 +458,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Run         string   `json:"run"`
 		Title       string   `json:"title"`
 		PullRequest string   `json:"pull_request"`
-		Reference   []string `json:"reference"`
+		References  []string `json:"references"`
 		Session     string   `json:"session"`
 		Repo        string   `json:"repo"`
 		Commit      string   `json:"commit"`
@@ -506,7 +506,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 			Commit:      a.Commit,
 			Agent:       a.Agent,
 			PullRequest: a.PullRequest,
-			Reference:   a.Reference,
+			References:  a.References,
 			Session:     a.Session,
 			Title:       a.Title,
 			Client:      "krowk-mcp/" + s.Version,
@@ -517,8 +517,8 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		}
 		run, runSlug, ownRun = created, created.Slug, true
 	}
-	if runSlug == "" && (a.PullRequest != "" || len(a.Reference) > 0 || a.Session != "") {
-		notes = append(notes, "pull_request, reference and session were not recorded: run metadata "+
+	if runSlug == "" && (a.PullRequest != "" || len(a.References) > 0 || a.Session != "") {
+		notes = append(notes, "pull_request, references and session were not recorded: run metadata "+
 			"lives on a run, and opening a run needs an API key")
 	}
 
@@ -886,7 +886,7 @@ func toolSchemas() []map[string]any {
 						"type":        "string",
 						"description": "URL of the pull request this work belongs to.",
 					},
-					"reference": map[string]any{
+					"references": map[string]any{
 						"type":        "array",
 						"items":       map[string]any{"type": "string"},
 						"description": "Related links, e.g. the issue being fixed.",
@@ -931,7 +931,7 @@ func toolSchemas() []map[string]any {
 				"properties": map[string]any{
 					"slug": map[string]any{
 						"type":        "string",
-						"description": "Artifact slug, e.g. art_9f3c2e1abcdEFGH123456.",
+						"description": "Artifact slug, e.g. art_9f3c2e1a7b04d6c8e5f1a2b3.",
 					},
 				},
 				"additionalProperties": false,
@@ -949,7 +949,7 @@ func toolSchemas() []map[string]any {
 				"properties": map[string]any{
 					"slug": map[string]any{
 						"type":        "string",
-						"description": "Artifact slug, e.g. art_9f3c2e1abcdEFGH123456.",
+						"description": "Artifact slug, e.g. art_9f3c2e1a7b04d6c8e5f1a2b3.",
 					},
 					"claim_token": map[string]any{
 						"type":        "string",

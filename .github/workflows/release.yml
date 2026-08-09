@@ -1,0 +1,67 @@
+name: Release
+
+# A tag is the whole trigger. `git tag -a v0.1.0 -m ... && git push origin v0.1.0`
+# builds both binaries for five platforms, opens the GitHub Release with the
+# archives and checksums on it, and publishes the seven npm packages.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      # GoReleaser creates the release and uploads the archives to it.
+      contents: write
+      # setup-go needs this to save its build cache; without it every run
+      # ends in "cache write denied: token has no writable scopes".
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # GoReleaser reads the tag and the commits since the last one to build
+          # the changelog, so a shallow clone gives it nothing to work with.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The same gate as a pull request. A tag that cannot pass it should not
+      # become bytes anyone downloads.
+      - name: Check
+        run: make check
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Build the release
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Reads the binaries GoReleaser just built out of dist/, so the npm
+      # packages carry the same bytes the checksums cover.
+      - name: Assemble the npm packages
+        run: node npm/build.mjs
+
+      # Skips with a notice when NPM_TOKEN is unset, which it is until somebody
+      # claims the names. The release above has already happened by then.
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node npm/publish.mjs

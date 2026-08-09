@@ -88,7 +88,7 @@ func TestAReplayIsHandedAFreshUploadURL(t *testing.T) {
 	server, clk := newClockedServer(t)
 
 	_, first := declareKeyed(t, server, "krowk_sk_test", "push-1", "a.txt")
-	clk.advance(uploadURLLifetime + 1)
+	clk.advance(UploadURLLifetime + 1)
 	_, second := declareKeyed(t, server, "krowk_sk_test", "push-1", "a.txt")
 
 	if uploadURL(t, first) == uploadURL(t, second) {

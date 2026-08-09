@@ -225,6 +225,7 @@ GET        /v1/artifacts                      list, newest first (needs a key)
 POST       /v1/artifacts                      declare an upload
 GET        /v1/artifacts/:slug                read one back
 DELETE     /v1/artifacts/:slug                take it down (needs a key or its claim token)
+POST       /v1/artifacts/:slug/upload         mint its presigned PUT again (needs a key or its claim token)
 PUT|PATCH  /v1/artifacts/:slug/finalization   confirm the bytes landed
 POST       /v1/artifacts/:slug/claim          spend a claim token (needs a key)
 PUT|PATCH  /v1/artifacts/:slug/run            put it under a run (needs a key)
@@ -247,6 +248,13 @@ alongside it: offered both, the registry reads the key and looks in its
 workspace, where an upload still sitting in the anonymous one is simply not
 found. Withholding the key is what lets a logged-in machine take down what a CI
 job pushed anonymously.
+
+Minting an upload URL again is the same exception, for the same reason. A
+presigned `PUT` is not a read: it decides what the bytes behind the link *are*,
+so a slug that is public the moment the link is pasted cannot be all it takes.
+The claim token is sent the same way and withheld the same way, and it costs the
+honest caller nothing — it came back in the same response as the slug and the URL
+being replaced.
 
 ```
 POST {KROWK_API_URL}/artifacts
@@ -312,6 +320,19 @@ thing to actually do, so `krowk`'s own errors and the registry's read alike.
   the CLI. The two calls that create something carry an `Idempotency-Key` naming
   the attempt, so retrying one is free rather than a second record — which is what
   lets opening a run be retried at all.
+- **A lapsed signature is re-presigned, never re-declared.** A presigned URL is
+  good for 15 minutes while the artifact it belongs to waits for its bytes far
+  longer, so an upload can reach storage with a signature that has already gone
+  stale — a large file to digest, a slow network, a retry after a crash. When the
+  URL's own `expires_at` has passed, or storage answers the `403` it answers a
+  signature it will not honour with, the client posts
+  `/v1/artifacts/:slug/upload` for a fresh one and sends the bytes again: same
+  slug, same storage key, same declared size and digest. Declaring the file again
+  would also produce a working URL, and it is the wrong answer — a second declare
+  is a second slug, and the first link is already pasted somewhere. It fires on
+  failure only, so an upload that lands first time makes no such call. A finalized
+  artifact refuses it with `409 already_finalized`: its bytes are a permalink, and
+  the way to different bytes is a different artifact.
 - **Expiry** — an anonymous artifact past its expiry answers `410 Gone`.
 - **Takedown is immediate and unrecoverable** — the bytes leave storage at once
   and what stays behind is a tombstone, so the slug answers `410 taken_down`

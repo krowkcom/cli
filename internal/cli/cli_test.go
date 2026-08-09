@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/krowkcom/cli/internal/registry"
 )
@@ -732,16 +733,7 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 
 	inner := registry.Handler(0, "")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Object storage is not part of the registry's API surface.
-		if !strings.HasPrefix(r.URL.Path, "/_storage") {
-			call := r.Method + " " + normalizeSlugs(r.URL.Path)
-			// The header is part of the shared contract, so it is pinned with the
-			// method and the path rather than tested somewhere off to the side: a
-			// create that stops naming its attempt goes back to charging for every
-			// retry, and nothing else here would notice.
-			if r.Header.Get("Idempotency-Key") != "" {
-				call += " +key"
-			}
+		if call := wireCall(r); call != "" {
 			mu.Lock()
 			calls = append(calls, call)
 			mu.Unlock()
@@ -824,6 +816,165 @@ func normalizeSlugs(path string) string {
 	return slugPattern.ReplaceAllString(path, "{slug}")
 }
 
+// wireCall names one request the way the pins read it, and answers empty for a
+// request that is not part of the registry's API surface — object storage is not.
+//
+// The Idempotency-Key is part of the shared contract, so it is pinned with the
+// method and the path rather than tested somewhere off to the side: a create that
+// stops naming its attempt goes back to charging for every retry, and nothing else
+// here would notice.
+func wireCall(r *http.Request) string {
+	if strings.HasPrefix(r.URL.Path, "/_storage") {
+		return ""
+	}
+	call := r.Method + " " + normalizeSlugs(r.URL.Path)
+	if r.Header.Get("Idempotency-Key") != "" {
+		call += " +key"
+	}
+	return call
+}
+
+// clock is a movable now, which is the only way a test reaches an expiry: a
+// 15-minute signature window is not going to elapse inside one. Guarded, because
+// the registry reads it from the server's goroutine while the CLI runs in this
+// one.
+type clock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+func (c *clock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
+}
+
+func (c *clock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at = c.at.Add(d)
+}
+
+// lapsingHarness runs the CLI against a registry whose presigned URL is dead by
+// the time the bytes reach it: the clock jumps past the signature's window as the
+// declare is answered. That is the shape of an agent that digested a large file,
+// met a slow network, or came back to a push after a crash — the artifact is still
+// waiting, and only the signature over it has gone stale.
+//
+// calls answers the API surface the push touched, as the wire-shape pin reads it.
+func lapsingHarness(t *testing.T) (h *harness, calls func() []string) {
+	t.Helper()
+
+	var mu sync.Mutex
+	var recorded []string
+	clk := &clock{at: time.Now()}
+	inner := registry.HandlerWithClock(0, "", clk.now)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if call := wireCall(r); call != "" {
+			mu.Lock()
+			recorded = append(recorded, call)
+			mu.Unlock()
+		}
+		declaring := r.Method == http.MethodPost && r.URL.Path == "/v1/artifacts"
+		inner.ServeHTTP(w, r)
+		// After the answer, so the URL the client is handed advertises the window
+		// it was minted with — and is past it by the time the PUT arrives.
+		if declaring {
+			clk.advance(registry.UploadURLLifetime + time.Minute)
+		}
+	}))
+	t.Cleanup(server.Close)
+	isolateConfig(t)
+
+	h = &harness{t: t, server: server, env: map[string]string{
+		"KROWK_API_URL": server.URL + "/v1",
+		"KROWK_TOKEN":   "krowk_sk_test",
+	}}
+	h.fixture = h.write("checkout-after.png", "fake png bytes for the test")
+
+	return h, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), recorded...)
+	}
+}
+
+// A push whose bytes meet a lapsed signature recovers by minting a fresh one over
+// the same artifact. It matters that it is the same one: the alternative is
+// declaring the file again, and that is a second slug — so the link the first push
+// printed, and whatever it was already pasted into, would resolve to nothing
+// forever.
+//
+// This also pins the wire shape of the recovery call, which the happy-path pin
+// never sees: a represign fires on a failed upload only.
+func TestPushRecoversFromALapsedSignatureUnderOneSlug(t *testing.T) {
+	h, calls := lapsingHarness(t)
+
+	pushed := only(t, h.ok("push", h.fixture))
+	got := calls()
+
+	if pushed.State != "ready" {
+		t.Fatalf("state = %q, want the upload to have completed", pushed.State)
+	}
+	// The link is the product: it has to serve the bytes that were pushed.
+	if status, body := h.get(pushed.URL); status != 200 || body != "fake png bytes for the test" {
+		t.Errorf("GET %s = %d %q", pushed.URL, status, body)
+	}
+
+	want := []string{
+		"POST /v1/runs +key",
+		"POST /v1/artifacts +key",
+		// The recovery. No Idempotency-Key: it creates nothing, it re-mints a
+		// capability over a record that already exists.
+		"POST /v1/artifacts/{slug}/upload",
+		"PUT /v1/artifacts/{slug}/finalization",
+		"PUT /v1/runs/{slug}/completion",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("calls:\n  %s\nwant:\n  %s",
+			strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// The keyless half of the same recovery, and the one that needs the claim token:
+// there is no key to fall back on, and the registry will not re-presign on the
+// slug alone. The client is holding the token — it came back with the slug — so
+// the recovery is available to exactly the caller the one-shot flow is built for.
+func TestKeylessPushRecoversFromALapsedSignature(t *testing.T) {
+	h, calls := lapsingHarness(t)
+	h.anonymous()
+
+	pushed := only(t, h.ok("push", h.fixture))
+	got := calls()
+
+	if pushed.State != "ready" {
+		t.Fatalf("state = %q, want the upload to have completed", pushed.State)
+	}
+	// Still the only way to keep it, and the recovery must not have cost it.
+	if !strings.HasPrefix(pushed.ClaimToken, "krowk_claim_") {
+		t.Errorf("claim_token = %q, want the one the declare handed over", pushed.ClaimToken)
+	}
+	if status, body := h.get(pushed.URL); status != 200 || body != "fake png bytes for the test" {
+		t.Errorf("GET %s = %d %q", pushed.URL, status, body)
+	}
+	// One declare, so one slug: the recovery went through the artifact that was
+	// already declared rather than round it.
+	want := []string{
+		"POST /v1/artifacts +key",
+		"POST /v1/artifacts/{slug}/upload",
+		"PUT /v1/artifacts/{slug}/finalization",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls:\n  %s\nwant:\n  %s",
+			strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
 func TestHelpAndVersion(t *testing.T) {
 	h := newHarness(t, 0)
 
@@ -849,8 +1000,12 @@ func faultyHarness(t *testing.T, breaks func(r *http.Request, n int) bool) *harn
 		broken := breaks(r, n)
 		mu.Unlock()
 		if broken {
-			// 403 rather than 500, so the client does not sit out retry backoffs.
-			w.WriteHeader(http.StatusForbidden)
+			// 400 rather than 500, so the client does not sit out retry backoffs —
+			// and rather than 403, which on the storage leg is what a lapsed
+			// signature looks like: the client answers that by minting a fresh URL
+			// and sending the bytes again, so a test that wants an upload to stay
+			// dead has to break it in a way that is not that.
+			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprint(w, `{"error":{"code":"injected_fault","message":"injected fault"}}`)
 			return
 		}

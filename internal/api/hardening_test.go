@@ -129,7 +129,7 @@ func TestUploadAlwaysUsesPUTAndKeepsTheTokenOffStorage(t *testing.T) {
 	path := write(t, t.TempDir(), "shot.png", "bytes")
 
 	// A registry asking for something else entirely.
-	up := &Upload{Method: http.MethodDelete, URL: srv.URL + "/_storage/ws/art/shot.png"}
+	up := &Artifact{Upload: &Upload{Method: http.MethodDelete, URL: srv.URL + "/_storage/ws/art/shot.png"}}
 	if err := c.PutBytes(context.Background(), up, Spec{Path: path, ByteSize: 5}); err != nil {
 		t.Fatalf("PutBytes = %v", err)
 	}
@@ -173,7 +173,7 @@ func TestAnUploadTargetMayNotRedirect(t *testing.T) {
 	c, _ := testClient(registry)
 	path := write(t, t.TempDir(), "shot.png", "bytes")
 
-	err := c.PutBytes(context.Background(), &Upload{URL: storage.URL + "/blobs/tok"},
+	err := c.PutBytes(context.Background(), &Artifact{Upload: &Upload{URL: storage.URL + "/blobs/tok"}},
 		Spec{Path: path, ByteSize: 5})
 	if err == nil {
 		t.Fatal("a redirect away from the upload target was followed, and the upload reported success")
@@ -214,7 +214,7 @@ func TestAnUploadTargetOnTheAPIHostMayRedirect(t *testing.T) {
 	c, _ := testClient(srv)
 	path := write(t, t.TempDir(), "shot.png", "bytes")
 
-	if err := c.PutBytes(context.Background(), &Upload{URL: srv.URL + "/blobs/tok"},
+	if err := c.PutBytes(context.Background(), &Artifact{Upload: &Upload{URL: srv.URL + "/blobs/tok"}},
 		Spec{Path: path, ByteSize: 5}); err != nil {
 		t.Fatalf("a same-origin redirect on the upload leg was refused: %v", err)
 	}

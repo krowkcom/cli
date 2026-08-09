@@ -51,8 +51,9 @@ pass "scripts/install.sh parses"
 
 # Sourced, not re-implemented: the helpers below are the installer's own, so the
 # checksum this test writes is made by whatever tool the installer would have
-# reached for. Sourcing runs nothing — install.sh only calls main when it is the
-# program being run.
+# reached for, and the platform table it checks is the one detect_platform
+# actually routes on. Sourcing runs nothing — install.sh only calls main when it
+# is the program being run.
 # shellcheck source=scripts/install.sh
 source scripts/install.sh
 resolve_sha256
@@ -76,6 +77,94 @@ name_template=$(sed -n 's/^ *name_template: *"\(.*\)"$/\1/p' .goreleaser.yaml | 
 grep -q 'name_template: checksums.txt' .goreleaser.yaml \
   || fail ".goreleaser.yaml no longer writes checksums.txt, which scripts/install.sh downloads"
 pass "the archive and checksum names still match what the installer builds"
+
+# The other half of that agreement is the platform table. install.sh writes it
+# out as case arms and .goreleaser.yaml as goos/goarch lists, and a table kept
+# in two places drifts: a platform added to the release that the installer will
+# not name 404s, and a platform the installer names that the release never
+# built 404s the same way, with the same wrong-looking error. So the lists are
+# read out of the config and diffed against the arms.
+yaml_goos=$(sed -n 's/^ *goos: *\[\(.*\)\].*/\1/p' .goreleaser.yaml | tr -d ' ' | tr ',' '\n' | sort -u)
+yaml_goarch=$(sed -n 's/^ *goarch: *\[\(.*\)\].*/\1/p' .goreleaser.yaml | tr -d ' ' | tr ',' '\n' | sort -u)
+[[ -n "$yaml_goos" && -n "$yaml_goarch" ]] \
+  || fail "no goos/goarch lists found in .goreleaser.yaml, so this check is reading nothing"
+
+# What the case arms in detect_platform can answer with, as opposed to what they
+# accept: `mingw*|msys*|cygwin*) os="windows"` is three spellings of one goos.
+sh_goos=$(sed -n 's/^ *[^ ]*) *os="\([a-z0-9]*\)".*/\1/p' scripts/install.sh | sort -u)
+sh_goarch=$(sed -n 's/^ *[^ ]*) *arch="\([a-z0-9]*\)".*/\1/p' scripts/install.sh | sort -u)
+
+[[ "$yaml_goos" == "$sh_goos" ]] \
+  || fail ".goreleaser.yaml builds for [$(echo "$yaml_goos" | tr '\n' ' ')] and scripts/install.sh names [$(echo "$sh_goos" | tr '\n' ' ')]"
+[[ "$yaml_goarch" == "$sh_goarch" ]] \
+  || fail ".goreleaser.yaml builds for [$(echo "$yaml_goarch" | tr '\n' ' ')] and scripts/install.sh names [$(echo "$sh_goarch" | tr '\n' ' ')]"
+pass "the platform lists still agree: $(echo "$yaml_goos" | tr '\n' ' ')× $(echo "$yaml_goarch" | tr '\n' ' ')"
+
+# The ignore list is the third piece: a combination the config refuses to build
+# must be one the installer refuses to offer, and every combination it does
+# build must be one detect_platform can name.
+yaml_ignored=$(awk '
+  $1 == "ignore:" { in_ignore = 1; next }
+  in_ignore && $1 == "-" && $2 == "goos:" { os = $3; next }
+  in_ignore && $1 == "goarch:" { print os "_" $2; next }
+  in_ignore && /^ *[a-z_]+:/ { in_ignore = 0 }
+' .goreleaser.yaml | sort -u)
+
+# detect_platform reads uname, so uname is what this stands in for. The stub is
+# only live while FAKE_UNAME_* are set, and the installer itself runs in its own
+# process, where it is not.
+FAKE_UNAME_S=""
+FAKE_UNAME_M=""
+uname() {
+  if [[ "${1:-}" == "-s" && -n "$FAKE_UNAME_S" ]]; then echo "$FAKE_UNAME_S"; return 0; fi
+  if [[ "${1:-}" == "-m" && -n "$FAKE_UNAME_M" ]]; then echo "$FAKE_UNAME_M"; return 0; fi
+  command uname "$@"
+}
+
+# How each goos and goarch reaches a machine as `uname -s` and `uname -m`. A
+# platform the config gains and this table has not heard of fails loudly rather
+# than going unchecked.
+uname_s_for() {
+  case "$1" in
+    linux) echo "Linux" ;;
+    darwin) echo "Darwin" ;;
+    windows) echo "MINGW64_NT-10.0-22631" ;;
+    *) return 1 ;;
+  esac
+}
+uname_m_for() {
+  case "$1" in
+    amd64) echo "x86_64" ;;
+    arm64) echo "aarch64" ;;
+    *) return 1 ;;
+  esac
+}
+
+for goos in $yaml_goos; do
+  for goarch in $yaml_goarch; do
+    want="${goos}_${goarch}"
+    fake_s=$(uname_s_for "$goos") || fail "this test has no uname -s spelling for $goos; add one beside the others"
+    fake_m=$(uname_m_for "$goarch") || fail "this test has no uname -m spelling for $goarch; add one beside the others"
+
+    got=""
+    if got=$(FAKE_UNAME_S="$fake_s" FAKE_UNAME_M="$fake_m" detect_platform 2>/dev/null); then
+      named=yes
+    else
+      named=no
+    fi
+
+    if grep -qx "$want" <<<"$yaml_ignored"; then
+      [[ "$named" == "no" ]] \
+        || fail ".goreleaser.yaml does not build $want, but scripts/install.sh offers it as $got"
+    else
+      [[ "$named" == "yes" ]] \
+        || fail ".goreleaser.yaml builds $want, but scripts/install.sh refuses to name it"
+      [[ "$got" == "$want" ]] \
+        || fail ".goreleaser.yaml builds $want, but scripts/install.sh calls that platform $got"
+    fi
+  done
+done
+pass "every platform the release builds is one the installer names, and no others"
 
 # The release to install from.
 echo

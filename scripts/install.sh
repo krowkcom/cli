@@ -35,6 +35,9 @@ BASE_URL_OVERRIDE="${KROWK_INSTALL_BASE_URL:-}"
 CURL_SCHANNEL_FALLBACK_FLAG=""
 CURL_LAST_ERROR=""
 CURL_FALLBACK_NOTED=0
+# The SHA-256 command, as an array because `shasum -a 256` is three words.
+# resolve_sha256 fills it once, before anything is downloaded.
+SHA256_CMD=()
 
 # The binaries this installs. krowk is first because it is the one that gets
 # checked afterwards, and the one the next steps talk about.
@@ -57,16 +60,20 @@ step()  { echo "  $(bold "→") $1"; }
 note()  { echo "    $1"; }
 error() { echo "  $(red "✗") $1" >&2; exit 1; }
 
-# sha256_cmd answers as an array, because `shasum -a 256` is three words and a
-# bare command substitution would either lose the flag to quoting or need the
-# unquoted expansion that shellcheck rightly complains about.
-sha256_cmd() {
+# resolve_sha256 assigns SHA256_CMD rather than printing it, and main calls it
+# before the first download. Printing it would put this failure inside a command
+# substitution, where error's exit ends the subshell and nothing else: the caller
+# would carry on with an empty command, compute an empty digest, and report a
+# checksum mismatch that never happened. Assigning to a global keeps the failure
+# where the reader is — at top level, under set -e — and keeps it early, before
+# any bytes have been fetched to verify.
+resolve_sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
-    echo "sha256sum"
+    SHA256_CMD=(sha256sum)
   elif command -v shasum >/dev/null 2>&1; then
-    echo "shasum -a 256"
+    SHA256_CMD=(shasum -a 256)
   else
-    error "No SHA-256 tool here (sha256sum or shasum). The download cannot be verified, so it is not installed."
+    error "No SHA-256 tool here, so the download could not be verified and nothing was installed: install sha256sum or shasum, then run this again."
   fi
 }
 
@@ -241,9 +248,7 @@ verify_checksum() {
     error "checksums.txt does not mention ${archive}, so there is nothing to check it against. Report this at https://github.com/${REPO}/issues"
   fi
 
-  local -a digest
-  read -r -a digest <<<"$(sha256_cmd)"
-  actual=$(cd "$tmp_dir" && "${digest[@]}" "$archive" | awk '{print $1}')
+  actual=$(cd "$tmp_dir" && "${SHA256_CMD[@]}" "$archive" | awk '{print $1}')
 
   if [[ "$expected" != "$actual" ]]; then
     error "${archive} is not the file the release signed for (expected ${expected}, got ${actual}). Nothing is installed. Retry, and if it happens again report it at https://github.com/${REPO}/issues"
@@ -430,6 +435,9 @@ main() {
   echo ""
 
   command -v curl >/dev/null 2>&1 || error "curl is needed and is not installed"
+  # Before the network, not after it: a machine with no way to check a checksum
+  # should hear that instead of downloading an archive it cannot verify.
+  resolve_sha256
 
   local platform version tmp_dir
   platform=$(detect_platform)

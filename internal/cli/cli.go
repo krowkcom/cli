@@ -39,25 +39,14 @@ const defaultRegistryAddr = "127.0.0.1:8787"
 // second positional either looks like one or is a mistake worth naming.
 const claimTokenPrefix = "krowk_claim_"
 
+// helpTemplate is the human help. Its Usage block is not written here: it is
+// rendered from the catalog, so a command cannot exist in the JSON surface and
+// not in the text, or the other way round. Everything after it is prose, which
+// is the half a struct has no way to say.
 const helpTemplate = `krowk %s — permalinks for agent output
 
 Usage
-  krowk push <file...> [flags]              Upload files, get a link for each
-  krowk uploads create <file...> [flags]    The same thing, spelled out
-  krowk uploads list [flags]                List uploads, newest first — a run's, or the workspace's
-  krowk uploads show <artifact>             Read one artifact back
-  krowk uploads attach <art> --run <run>    Put an upload under a run afterwards
-  krowk uploads delete <art> [token]        Take an upload down — immediate, cannot be undone
-  krowk runs start [flags]                  Open a run to group uploads under
-  krowk runs list [--limit --before]        List the workspace's runs, newest first
-  krowk runs show <run>                     Read one run back, with its metadata
-  krowk runs finish <run>                   Close a run
-  krowk claim <artifact> <token> [--run]    Keep an anonymous upload past expiry
-  krowk auth login --token <token>          Check an API token, then store it
-  krowk auth token                          Print the stored token
-  krowk auth verify                         Check the key and its workspace
-  krowk doctor                              Check the local setup
-  krowk registry serve                      Run a local registry to develop against
+%s
 
 Upload flags
   --run <slug>           Attach to an existing run instead of opening one. On
@@ -140,9 +129,11 @@ type stringSlice []string
 func (s *stringSlice) String() string     { return strings.Join(*s, ",") }
 func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
 
-// Run executes one invocation and returns the process exit code.
-func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY bool) int {
-	var f flags
+// newFlagSet registers every flag krowk takes, against the struct that receives
+// them. Split out of Run so the surface catalog can be held to it: the flag set
+// is what actually parses a command line, so it — not a list written down
+// somewhere — is the answer to which flags exist.
+func newFlagSet(f *flags) *flag.FlagSet {
 	fs := flag.NewFlagSet("krowk", flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // errors go through the krowk envelope, not flag's
 
@@ -168,6 +159,13 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	fs.BoolVar(&f.help, "h", false, "")
 	fs.BoolVar(&f.version, "version", false, "")
 	fs.BoolVar(&f.version, "v", false, "")
+	return fs
+}
+
+// Run executes one invocation and returns the process exit code.
+func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY bool) int {
+	var f flags
+	fs := newFlagSet(&f)
 
 	// Go's flag package stops at the first positional, so parse in a loop and
 	// collect them. Lets flags follow filenames, the way agents write commands.
@@ -190,8 +188,16 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		fmt.Fprintln(stdout, Version)
 		return 0
 	case f.help, len(positionals) == 0, positionals[0] == "help":
-		fmt.Fprintf(stdout, helpTemplate, Version,
-			defaultRegistryAddr, api.DevBaseURL, api.DefaultBaseURL, api.CredentialsPath())
+		// What was asked about: `krowk help uploads attach` and
+		// `krowk uploads attach --help` are the same question, so the words are
+		// taken from wherever they were typed and the leading `help` dropped.
+		topic := positionals
+		if len(topic) > 0 && topic[0] == "help" {
+			topic = topic[1:]
+		}
+		if err := showHelp(stdout, topic, format); err != nil {
+			return report(stderr, err, format, f.quiet, colour)
+		}
 		return 0
 	}
 

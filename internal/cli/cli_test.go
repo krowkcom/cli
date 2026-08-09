@@ -91,11 +91,28 @@ func (h *harness) ok(args ...string) envelope {
 }
 
 // fails runs a command that is expected to fail and returns its error body.
+//
+// It checks only that the exit was non-zero, because which non-zero number a
+// failure earns is the exit-code taxonomy's business: exitcode_test.go pins
+// every case, and failsWith below is how a test says the number is the point.
+// Asserting 1 here instead would make every classified failure look like a
+// regression in the test that happened to provoke it.
 func (h *harness) fails(args ...string) map[string]any {
 	h.t.Helper()
 	code, stdout, stderr := h.run(args...)
-	if code != 1 {
-		h.t.Fatalf("`krowk %s` exited %d, want 1, stdout:\n%s", strings.Join(args, " "), code, stdout)
+	if code == 0 {
+		h.t.Fatalf("`krowk %s` succeeded, want a failure, stdout:\n%s", strings.Join(args, " "), stdout)
+	}
+	return decode(h.t, stderr).Error
+}
+
+// failsWith is fails for a test whose subject is the exit code itself.
+func (h *harness) failsWith(want int, args ...string) map[string]any {
+	h.t.Helper()
+	code, stdout, stderr := h.run(args...)
+	if code != want {
+		h.t.Fatalf("`krowk %s` exited %d, want %d, stdout:\n%s",
+			strings.Join(args, " "), code, want, stdout)
 	}
 	return decode(h.t, stderr).Error
 }

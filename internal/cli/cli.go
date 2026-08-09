@@ -85,6 +85,20 @@ Environment
   KROWK_DEV              1/true/yes/on — same as --dev
   KROWK_AGENT            Agent name to report
 
+Exit codes
+  0  it worked
+  1  the command was wrong, or krowk failed on its own — also anything unclassified
+  2  not found — no such artifact or run in this workspace, or no such endpoint
+  3  refused for want of credentials — no key, a key the registry rejects, or no
+     claim token where that is the only authority (a claim token the registry
+     does not recognise is 2, since it answers that as no such record)
+  4  refused by the registry on the request or the state of things — retrying
+     unchanged answers the same
+  5  rate limited — wait and retry
+  6  the bytes did not move — the registry or object storage could not be reached
+  7  the registry failed on its side, or answered something unreadable
+  8  gone — the artifact expired or was taken down, and no retry brings it back
+
 Registry precedence: --dev, then KROWK_API_URL, then KROWK_DEV, then the default.
 
 Run metadata — the pull request, references and session — is recorded on a run,
@@ -246,9 +260,12 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	return 0
 }
 
+// report renders a failure and answers with the exit code that classifies it.
+// Every failing path in Run goes through here, so there is one place where a
+// failure becomes a number and no way to exit non-zero without printing why.
 func report(w io.Writer, err error, format output.Format, quiet, colour bool) int {
 	fmt.Fprintln(w, output.Error(err, format, quiet, colour))
-	return 1
+	return exitCodeFor(err)
 }
 
 // newClient is the one place a registry client gets built, so every command

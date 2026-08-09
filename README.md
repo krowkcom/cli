@@ -141,6 +141,29 @@ land in without a round trip. `KROWK_TOKEN` outranks that file, so when it is
 set the recorded workspace describes a different key and is withheld rather than
 reported.
 
+## Exit codes
+
+A script branching on the exit code should not have to parse anything, so the
+number says what class of failure it was. The taxonomy is small on purpose —
+what a caller *does* next is what separates the codes, not which of the
+registry's two dozen error codes came back, and the `error` field in the JSON
+envelope is still there when the exact one matters.
+
+| Code | Means | What to do |
+| --- | --- | --- |
+| 0 | It worked | — |
+| 1 | The command was wrong, or krowk failed on its own — a bad flag, an unknown command, an unreadable file, a port that will not bind. Also anything unclassified | Fix the command |
+| 2 | Not found — no such artifact or run in this workspace, no such endpoint at this base URL, or a claim token the registry does not recognise, which it answers as no such record so that guessing learns nothing | Check the slug and the token, or `KROWK_API_URL` |
+| 3 | Refused for want of credentials — no key where one is needed, a key the registry rejects, or no claim token where that is the only authority | `krowk auth login`, or pass the claim token |
+| 4 | The registry understood the request and refused it — validation, an upload already finalized, a run that needs a key | Change something; retrying unchanged answers the same |
+| 5 | Rate limited | Wait — the error body carries `retry_after` when the registry sent one |
+| 6 | The bytes did not move — the registry or object storage could not be reached, or storage refused the transfer | Retry |
+| 7 | The registry failed on its side (5xx), or answered a success this client could not read | Retry, and report it if it persists |
+| 8 | Gone — the artifact expired or was taken down | Upload again; no retry brings it back |
+
+1 stays the catch-all it always was, so anything checking `!= 0` keeps working
+and a failure that gains a class can only ever move *out* of 1.
+
 ## Pasting the result
 
 There is no single paste-ready string, because the surfaces disagree.

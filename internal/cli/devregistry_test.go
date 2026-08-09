@@ -89,8 +89,8 @@ func TestAuthVerifyWithoutAKeySaysSoWithoutCallingOut(t *testing.T) {
 	h.env["KROWK_API_URL"] = "http://127.0.0.1:1/v1" // any call would fail loudly
 
 	code, _, stderr := h.run("auth", "verify")
-	if code != 1 {
-		t.Fatalf("exit %d, want 1", code)
+	if code != 3 {
+		t.Fatalf("exit %d, want 3", code)
 	}
 	if got := decode(t, stderr).Error["error"]; got != "not_authenticated" {
 		t.Errorf("error = %v, want not_authenticated", got)
@@ -112,8 +112,8 @@ func TestAuthVerifyRejectsAKeyTheRegistryDoesNotKnow(t *testing.T) {
 	h.env["KROWK_TOKEN"] = "hunter2"
 
 	code, _, stderr := h.run("auth", "verify")
-	if code != 1 {
-		t.Fatalf("exit %d, want 1", code)
+	if code != 3 {
+		t.Fatalf("exit %d, want 3", code)
 	}
 	if got := decode(t, stderr).Error["error"]; got != "unauthorized" {
 		t.Errorf("error = %v, want unauthorized", got)
@@ -134,8 +134,8 @@ func TestAuthVerifyRejectsAnAnswerThatNamesNoKey(t *testing.T) {
 	h.env["KROWK_TOKEN"] = "hunter2"
 
 	code, _, stderr := h.run("auth", "verify")
-	if code != 1 {
-		t.Fatalf("exit %d, want 1", code)
+	if code != 7 {
+		t.Fatalf("exit %d, want 7", code)
 	}
 	if got := decode(t, stderr).Error["error"]; got != "malformed_response" {
 		t.Errorf("error = %v, want malformed_response", got)

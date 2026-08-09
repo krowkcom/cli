@@ -33,8 +33,10 @@ BIN_DIR="${KROWK_BIN_DIR:-}"
 VERSION="${KROWK_VERSION:-}"
 BASE_URL_OVERRIDE="${KROWK_INSTALL_BASE_URL:-}"
 CURL_SCHANNEL_FALLBACK_FLAG=""
-CURL_LAST_ERROR=""
-CURL_FALLBACK_NOTED=0
+# Both of these are files rather than variables, and main fills them in. See
+# curl_run for why.
+CURL_ERROR_FILE=""
+CURL_FALLBACK_NOTED_FILE=""
 # The SHA-256 command, as an array because `shasum -a 256` is three words.
 # resolve_sha256 fills it once, before anything is downloaded.
 SHA256_CMD=()
@@ -152,37 +154,49 @@ detect_curl_fallback() {
 # curl_run keeps curl's own words. Every failure this script reports is a failure
 # somebody has to act on, and "failed to download" without the reason sends them
 # to the wrong place.
+#
+# The reason goes to a file, not to a variable. Every caller here runs curl_run
+# inside `$(…)` to capture what came back, and a variable assigned in that
+# subshell dies with it — so a global would be empty in exactly the callers that
+# want to quote it. The file outlives the subshell; curl_reason reads it back.
+# The same goes for having said the Schannel line once: a marker file, because
+# the counter would reset with every subshell and repeat the line each time.
+# curl's status is taken on the same line as curl, with `|| status=$?`. Reading
+# it after an `if` would read the `if` instead: a compound command whose
+# condition was false and which has no else branch succeeds, so $? is 0 there
+# however curl exited, and every failed download would be reported as a working
+# one.
 curl_run() {
-  local err_file status err
-  err_file=$(mktemp "${TMPDIR:-/tmp}/krowk-curl.XXXXXX")
+  local status=0
 
-  if curl --show-error "$@" 2>"$err_file"; then
-    rm -f "$err_file"
-    CURL_LAST_ERROR=""
+  curl --show-error "$@" 2>"$CURL_ERROR_FILE" || status=$?
+  if ((status == 0)); then
+    : >"$CURL_ERROR_FILE"
     return 0
   fi
-  status=$?
-  err=$(<"$err_file")
-  rm -f "$err_file"
 
-  if [[ -n "$CURL_SCHANNEL_FALLBACK_FLAG" ]] && [[ "$err" == *"CRYPT_E_NO_REVOCATION_CHECK"* ]]; then
-    if [[ $CURL_FALLBACK_NOTED -eq 0 ]]; then
+  if [[ -n "$CURL_SCHANNEL_FALLBACK_FLAG" ]] &&
+    grep -q 'CRYPT_E_NO_REVOCATION_CHECK' "$CURL_ERROR_FILE"; then
+    if [[ ! -e "$CURL_FALLBACK_NOTED_FILE" ]]; then
       step "Windows cannot check certificate revocation here; retrying with ${CURL_SCHANNEL_FALLBACK_FLAG}" >&2
-      CURL_FALLBACK_NOTED=1
+      : >"$CURL_FALLBACK_NOTED_FILE"
     fi
-    err_file=$(mktemp "${TMPDIR:-/tmp}/krowk-curl.XXXXXX")
-    if curl --show-error "$CURL_SCHANNEL_FALLBACK_FLAG" "$@" 2>"$err_file"; then
-      rm -f "$err_file"
-      CURL_LAST_ERROR=""
+    status=0
+    curl --show-error "$CURL_SCHANNEL_FALLBACK_FLAG" "$@" 2>"$CURL_ERROR_FILE" || status=$?
+    if ((status == 0)); then
+      : >"$CURL_ERROR_FILE"
       return 0
     fi
-    status=$?
-    err=$(<"$err_file")
-    rm -f "$err_file"
   fi
 
-  CURL_LAST_ERROR="$err"
   return "$status"
+}
+
+# curl_reason is what curl last complained about, on one line so it can be read
+# inside a sentence, or nothing at all when the last call succeeded.
+curl_reason() {
+  [[ -n "$CURL_ERROR_FILE" && -s "$CURL_ERROR_FILE" ]] || return 0
+  tr '\n' ' ' <"$CURL_ERROR_FILE" | sed 's/  */ /g; s/ *$//'
 }
 
 is_semver() {
@@ -217,7 +231,9 @@ latest_version() {
     fi
   fi
 
-  error "Could not find the latest release of ${REPO}. ${CURL_LAST_ERROR:+curl said: ${CURL_LAST_ERROR}. }Name one with KROWK_VERSION, or install from source: go install github.com/${REPO}/cmd/krowk@latest"
+  local why
+  why=$(curl_reason)
+  error "Could not find the latest release of ${REPO}. ${why:+curl said: ${why}. }Name one with KROWK_VERSION, or install from source: go install github.com/${REPO}/cmd/krowk@latest"
 }
 
 release_base_url() {
@@ -234,12 +250,13 @@ release_base_url() {
 # through this function that installs an unverified binary.
 verify_checksum() {
   local base_url="$1" tmp_dir="$2" archive="$3"
-  local expected actual
+  local expected actual why
 
   step "Verifying the download"
 
   if ! curl_run -fsSL "${base_url}/checksums.txt" -o "${tmp_dir}/checksums.txt"; then
-    error "checksums.txt would not download from ${base_url}${CURL_LAST_ERROR:+ (${CURL_LAST_ERROR})}. Nothing is installed: an archive nobody can check is not one to run."
+    why=$(curl_reason)
+    error "checksums.txt would not download from ${base_url}${why:+ (${why})}. Nothing is installed: an archive nobody can check is not one to run."
   fi
 
   # GoReleaser writes `<digest>  <name>`; a binary-mode digest writes `*<name>`.
@@ -259,7 +276,7 @@ verify_checksum() {
 # download_binaries fetches one archive and installs both binaries out of it.
 download_binaries() {
   local version="$1" platform="$2" tmp_dir="$3"
-  local ext="tar.gz" archive base_url suffix=""
+  local ext="tar.gz" archive base_url why suffix=""
 
   if [[ "$platform" == windows_* ]]; then
     ext="zip"
@@ -272,7 +289,8 @@ download_binaries() {
 
   step "Downloading krowk ${version} for ${platform//_/ }"
   if ! curl_run -fsSL "${base_url}/${archive}" -o "${tmp_dir}/${archive}"; then
-    error "Could not download ${base_url}/${archive}${CURL_LAST_ERROR:+ (${CURL_LAST_ERROR})}. Check that ${version} is a released version: https://github.com/${REPO}/releases"
+    why=$(curl_reason)
+    error "Could not download ${base_url}/${archive}${why:+ (${why})}. Check that ${version} is a released version: https://github.com/${REPO}/releases"
   fi
 
   verify_checksum "$base_url" "$tmp_dir" "$archive"
@@ -443,6 +461,16 @@ main() {
   platform=$(detect_platform)
   detect_curl_fallback
 
+  # One directory for everything this run writes, removed on the way out. curl's
+  # complaints live here too, because curl_run is called from inside command
+  # substitutions and a file is the only place a reason survives one.
+  tmp_dir=$(mktemp -d)
+  # shellcheck disable=SC2064  # expand tmp_dir now: the trap must name this run's directory.
+  trap "rm -rf '${tmp_dir}'" EXIT
+  CURL_ERROR_FILE="${tmp_dir}/curl.err"
+  CURL_FALLBACK_NOTED_FILE="${tmp_dir}/curl.noted"
+  : >"$CURL_ERROR_FILE"
+
   if [[ -z "$BIN_DIR" ]]; then
     BIN_DIR=$(default_bin_dir "$platform")
   fi
@@ -455,10 +483,6 @@ main() {
   else
     version=$(latest_version)
   fi
-
-  tmp_dir=$(mktemp -d)
-  # shellcheck disable=SC2064  # expand tmp_dir now: the trap must name this run's directory.
-  trap "rm -rf '${tmp_dir}'" EXIT
 
   download_binaries "$version" "$platform" "$tmp_dir"
   setup_path

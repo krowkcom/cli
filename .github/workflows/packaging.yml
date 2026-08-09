@@ -9,6 +9,8 @@ on:
     paths:
       - .goreleaser.yaml
       - npm/**
+      - scripts/install.sh
+      - scripts/install_test.sh
       - .github/workflows/packaging.yml
       - .github/workflows/release.yml
       - Makefile
@@ -18,6 +20,8 @@ on:
     paths:
       - .goreleaser.yaml
       - npm/**
+      - scripts/install.sh
+      - scripts/install_test.sh
       - .github/workflows/packaging.yml
       - .github/workflows/release.yml
       - Makefile
@@ -101,3 +105,9 @@ jobs:
           test "$(./node_modules/.bin/krowk --version)" = "$version"
           test "$(./node_modules/.bin/krowk-mcp --version)" = "$version"
           ./node_modules/.bin/krowk --help >/dev/null
+
+      # The installer downloads exactly what the steps above build, so it is
+      # checked here rather than in the test suite: this is the only job that
+      # already has a release to install from.
+      - name: Install from a release built here
+        run: scripts/install_test.sh

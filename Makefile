@@ -29,10 +29,14 @@ mock: ## Local stand-in for api.krowk.com on :8787
 install:
 	go install -trimpath -ldflags "$(LDFLAGS)" ./cmd/krowk ./cmd/krowk-mcp
 
-release-check: ## Validate .goreleaser.yaml and the npm launchers, offline
+release-check: ## Validate .goreleaser.yaml, the npm launchers and the installer, offline
 	goreleaser check
 	node --check npm/krowk/bin/krowk.js
 	node --check npm/mcp/bin/krowk-mcp.js
+	# The installer downloads what this file produces, so it belongs to the
+	# release pipeline rather than to `check`: it needs goreleaser and python3,
+	# which a plain `go test` run has no business requiring.
+	scripts/install_test.sh
 
 dist: ## The whole release, locally: every binary, the archives, the npm packages
 	goreleaser release --snapshot --clean --skip=publish

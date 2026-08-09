@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -193,11 +194,20 @@ func TestTheCatalogAndTheFlagSetAgree(t *testing.T) {
 			t.Errorf("the catalog advertises --%s, which nothing parses", name)
 			continue
 		}
+		// The type is the flag set's too, so it is read back off the registered
+		// flag rather than trusted. A catalog that says `--before` takes a string
+		// while the flag set registers it as a bool is exactly the kind of lie a
+		// caller finds out about by having their command rejected.
+		if want := flagTypeOf(t, real); fl.Type != want {
+			t.Errorf("the catalog calls --%s a %s, and the flag set registers it as a %s",
+				name, fl.Type, want)
+		}
 		// The default is what the flag set will actually use, so the catalog may
-		// not claim a different one. An int flag whose zero means "the registry
-		// decides" is the one exception, and it says so by carrying the real
-		// default as documentation instead.
-		if fl.Type != typeInt && fl.Default != "" && fl.Default != real.DefValue {
+		// not claim a different one. --limit is the single exception: its zero
+		// means "let the registry decide", so the flag set cannot carry the real
+		// page size and the catalog documents it instead. No other flag gets to
+		// disagree, which is why this is a name and not a type.
+		if name != "limit" && fl.Default != "" && fl.Default != real.DefValue {
 			t.Errorf("--%s defaults to %q in the catalog and %q in the flag set",
 				name, fl.Default, real.DefValue)
 		}
@@ -206,6 +216,35 @@ func TestTheCatalogAndTheFlagSetAgree(t *testing.T) {
 		if _, ok := advertised[name]; !ok {
 			t.Errorf("--%s parses but is in no catalog entry, so nothing documents it", name)
 		}
+	}
+}
+
+// flagTypeOf answers what kind a registered flag really is, in the catalog's own
+// vocabulary. The flag package keeps the value types unexported, so there is no
+// `*flag.stringValue` to compare against — but the two things that distinguish a
+// flag at the command line are both reachable.
+//
+// A bool is the one whose spelling differs: `--dev` takes no value, and it is
+// IsBoolFlag, not the Go type, that tells the parser so. For the rest the
+// concrete type is the answer, and naming each one we know about means a flag
+// registered with a kind nobody has taught the catalog to spell fails here
+// rather than being described as whatever the nearest guess was.
+func flagTypeOf(t *testing.T, f *flag.Flag) string {
+	t.Helper()
+	if b, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && b.IsBoolFlag() {
+		return typeBool
+	}
+	switch kind := fmt.Sprintf("%T", f.Value); kind {
+	case "*flag.stringValue", "*cli.stringSlice":
+		// stringSlice is --reference: still a string to whoever types it, and the
+		// catalog says the repetition separately with Repeatable.
+		return typeString
+	case "*flag.intValue", "*flag.int64Value":
+		// Both are `int` to a reader of the surface. The width is a Go detail.
+		return typeInt
+	default:
+		t.Fatalf("--%s is registered as a %s, which the catalog has no word for", f.Name, kind)
+		return ""
 	}
 }
 

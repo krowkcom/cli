@@ -2,13 +2,20 @@
 # install_test.sh — run scripts/install.sh against a release that exists.
 #
 # No krowk release has been published yet, so the installer cannot be tried the
-# way a user will try it. What it *can* be tried against is a release built here:
-# GoReleaser produces the archives and checksums.txt from the same
-# .goreleaser.yaml a tag will use, a local HTTP server stands in for GitHub, and
+# way a user will try it. What it *can* be tried against is a release that
+# exists on this machine: a local HTTP server stands in for GitHub and
 # KROWK_INSTALL_BASE_URL points the installer at it. That exercises the archive
 # naming, the checksum verification, the extraction of both binaries, the bin
 # directory, the version check and the skill copy — everything except resolving
 # the latest tag, which needs a tag to resolve.
+#
+# Where the release comes from depends on what is already here. In CI the
+# packaging workflow has just run `goreleaser release --snapshot`, so dist/
+# holds GoReleaser's own archives and its own checksums.txt: those are served
+# as they are, which is the point — the archiving and the checksums are then
+# what gets tested, rather than a tarball this script rolled by hand. Only when
+# there is no such archive does it build one, and then without --clean, because
+# wiping dist/ would throw away the release it was supposed to be installing.
 #
 #   scripts/install_test.sh
 #
@@ -19,6 +26,13 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 REPO_ROOT=$(pwd)
+
+host_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+case "$(uname -m)" in
+  x86_64|amd64) host_arch=amd64 ;;
+  aarch64|arm64) host_arch=arm64 ;;
+  *) echo "  ✗ this test only installs for the host, and $(uname -m) is not one of the release's architectures" >&2; exit 1 ;;
+esac
 
 pass() { echo "  ✓ $1"; }
 fail() { echo "  ✗ $1" >&2; exit 1; }
@@ -35,6 +49,14 @@ echo "Syntax"
 bash -n scripts/install.sh || fail "scripts/install.sh does not parse"
 pass "scripts/install.sh parses"
 
+# Sourced, not re-implemented: the helpers below are the installer's own, so the
+# checksum this test writes is made by whatever tool the installer would have
+# reached for. Sourcing runs nothing — install.sh only calls main when it is the
+# program being run.
+# shellcheck source=scripts/install.sh
+source scripts/install.sh
+resolve_sha256
+
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck --severity=warning scripts/install.sh || fail "shellcheck"
   pass "shellcheck is happy"
@@ -42,40 +64,12 @@ else
   echo "  – shellcheck not installed, skipped"
 fi
 
-# The release, built the way a tag would build it.
-echo
-echo "Building a release to install from"
-RELEASE="$WORK/release"
-mkdir -p "$RELEASE"
-
-host_os=$(uname -s | tr '[:upper:]' '[:lower:]')
-case "$(uname -m)" in
-  x86_64|amd64) host_arch=amd64 ;;
-  aarch64|arm64) host_arch=arm64 ;;
-  *) fail "this test only builds for the host, and $(uname -m) is not one of the release's architectures" ;;
-esac
-
-mkdir -p "$WORK/build"
-if command -v goreleaser >/dev/null 2>&1; then
-  # --snapshot so it needs no tag, --skip=publish so it touches nothing remote.
-  # Single-target keeps it to the host's platform: this test is about the
-  # installer, and `goreleaser check` in `make release-check` is what holds the
-  # other nine platforms to the config.
-  goreleaser build --snapshot --clean --single-target -o "$WORK/build/krowk" --id krowk >"$WORK/goreleaser.log" 2>&1
-  goreleaser build --snapshot --clean --single-target -o "$WORK/build/krowk-mcp" --id krowk-mcp >>"$WORK/goreleaser.log" 2>&1
-  SOURCE="goreleaser"
-else
-  mkdir -p "$WORK/build"
-  go build -o "$WORK/build/krowk" ./cmd/krowk
-  go build -o "$WORK/build/krowk-mcp" ./cmd/krowk-mcp
-  SOURCE="go build"
-fi
-pass "built both binaries with $SOURCE"
-
 # The archive name and checksum file are read straight out of .goreleaser.yaml's
 # templates rather than reproduced from memory: this is the one place the
 # installer and the release pipeline have to agree, so a change to either that
 # the other does not follow should break here.
+echo
+echo "Holding the installer to .goreleaser.yaml"
 name_template=$(sed -n 's/^ *name_template: *"\(.*\)"$/\1/p' .goreleaser.yaml | head -1)
 [[ "$name_template" == '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}' ]] \
   || fail ".goreleaser.yaml's archive name_template is now '$name_template', which scripts/install.sh does not build"
@@ -83,12 +77,69 @@ grep -q 'name_template: checksums.txt' .goreleaser.yaml \
   || fail ".goreleaser.yaml no longer writes checksums.txt, which scripts/install.sh downloads"
 pass "the archive and checksum names still match what the installer builds"
 
-VERSION="9.9.9"
-ARCHIVE="krowk_${VERSION}_${host_os}_${host_arch}.tar.gz"
-tar -czf "$RELEASE/$ARCHIVE" -C "$WORK/build" krowk krowk-mcp
-(cd "$RELEASE" && sha256sum "$ARCHIVE" >checksums.txt)
+# The release to install from.
+echo
+echo "Laying out a release to install from"
+RELEASE="$WORK/release"
+mkdir -p "$RELEASE"
+
+# dist/ first. In CI the packaging workflow has already run a full snapshot two
+# steps up, so GoReleaser's own archive and its own checksums.txt are sitting
+# there — serving those is what makes this a test of the release rather than of
+# a tarball assembled here. They are copied rather than linked because the
+# tampering test below writes a byte into the archive it serves.
+dist_archive=""
+if [[ -f dist/checksums.txt ]]; then
+  for candidate in dist/krowk_*_"${host_os}"_"${host_arch}".tar.gz; do
+    if [[ -f "$candidate" ]]; then
+      dist_archive="$candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -n "$dist_archive" ]]; then
+  ARCHIVE=$(basename "$dist_archive")
+  VERSION=${ARCHIVE#krowk_}
+  VERSION=${VERSION%"_${host_os}_${host_arch}.tar.gz"}
+  cp "$dist_archive" "$RELEASE/$ARCHIVE"
+  cp dist/checksums.txt "$RELEASE/checksums.txt"
+  SOURCE="the release already in dist/"
+else
+  # No release here to install, so one gets built — and dist/ is left alone
+  # while doing it, because --clean would empty a directory this script does not
+  # own and a build without --clean refuses to write into one that is not empty.
+  # The way out of that is a copy of the config with dist pointed somewhere
+  # disposable: nothing to wipe, nothing to refuse, and the repository's dist/
+  # is neither read nor written. One invocation builds both ids, so there is no
+  # second one to find the first one's leftovers in the way.
+  mkdir -p "$WORK/build"
+  if command -v goreleaser >/dev/null 2>&1; then
+    # --snapshot so it needs no tag. Single-target keeps it to the host's
+    # platform: this test is about the installer, and `goreleaser check` in
+    # `make release-check` is what holds the other nine platforms to the config.
+    { cat .goreleaser.yaml; printf '\ndist: %s\n' "$WORK/dist"; } >"$WORK/goreleaser.yaml"
+    goreleaser build --snapshot --single-target --config "$WORK/goreleaser.yaml" \
+      >"$WORK/goreleaser.log" 2>&1 || { cat "$WORK/goreleaser.log"; fail "goreleaser could not build"; }
+    for binary in krowk krowk-mcp; do
+      built=$(find "$WORK/dist" -type f -name "$binary" -print -quit)
+      [[ -n "$built" ]] || fail "goreleaser built no $binary"
+      cp "$built" "$WORK/build/$binary"
+    done
+    SOURCE="goreleaser"
+  else
+    go build -o "$WORK/build/krowk" ./cmd/krowk
+    go build -o "$WORK/build/krowk-mcp" ./cmd/krowk-mcp
+    SOURCE="go build"
+  fi
+  VERSION="9.9.9"
+  ARCHIVE="krowk_${VERSION}_${host_os}_${host_arch}.tar.gz"
+  tar -czf "$RELEASE/$ARCHIVE" -C "$WORK/build" krowk krowk-mcp
+  (cd "$RELEASE" && "${SHA256_CMD[@]}" "$ARCHIVE" >checksums.txt)
+fi
+
 cp skills/krowk/SKILL.md "$RELEASE/SKILL.md"
-pass "release laid out: $ARCHIVE + checksums.txt"
+pass "serving $ARCHIVE + checksums.txt, from $SOURCE"
 
 # The server. Port 0 so parallel runs do not collide.
 python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$RELEASE" >"$WORK/server.log" 2>&1 &

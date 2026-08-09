@@ -74,7 +74,14 @@ func TestEveryCommandInTheSkillExists(t *testing.T) {
 	}
 
 	for _, call := range calls {
-		path, flags := split(call.words)
+		path, flags, stray := split(surface, call.words)
+
+		if stray != "" {
+			t.Errorf("SKILL.md:%d says `krowk %s %s`, and %s is not one of %s.\n  %s",
+				call.line, strings.Join(path, " "), stray, stray,
+				strings.Join(names(subcommandsOf(surface, path[0])), ", "), call.text)
+			continue
+		}
 
 		if len(path) == 0 {
 			// `krowk --version` and friends: global flags and no command.
@@ -126,28 +133,126 @@ func names(cmds []cli.Command) []string {
 	return out
 }
 
-// split separates the command path from the flags. The path is the leading
-// non-flag words, at most two deep because that is as deep as krowk goes; a
-// placeholder like `<command>` is not a command name, so it ends the path
-// without joining it and the flags are checked against the globals alone.
-func split(words []string) (path, flags []string) {
+// split separates the command path from the flags, and does it against the
+// catalog rather than against the shape of the words. The path is only the
+// leading run of words that name commands: the first word, when it names one,
+// and a second word only when the first is a group and the second is one of its
+// subcommands. Everything after that is arguments, or prose — a decision tree
+// writes `krowk push a.png b.png --json (one run, closed for you)`, and reading
+// on would take `closed` for a command path. `krowk push closed` is a path
+// Find answers, because a leaf command answers for whatever follows it, so the
+// tolerance that makes `krowk help push shot.png` work would make that garbage
+// pass. Stopping at the first word that is not a command is what keeps both
+// honest.
+//
+// stray is a word that followed a group without naming one of its subcommands
+// — `krowk uploads purge`. It is returned rather than folded into the path so
+// the failure can name the word it objected to.
+func split(surface cli.Catalog, words []string) (path, flags []string, stray string) {
 	for _, word := range words {
-		switch {
-		case strings.HasPrefix(word, "--"):
-			name := strings.TrimPrefix(word, "--")
-			if i := strings.IndexByte(name, '='); i >= 0 {
-				name = name[:i]
-			}
-			// Prose punctuation rides along on the last word of a sentence.
-			name = strings.TrimRight(name, ".,;:)\"'`")
-			if name != "" {
-				flags = append(flags, name)
-			}
-		case len(path) < 2 && isCommandWord(word):
-			path = append(path, word)
+		if !strings.HasPrefix(word, "--") {
+			continue
+		}
+		name := strings.TrimPrefix(word, "--")
+		if i := strings.IndexByte(name, '='); i >= 0 {
+			name = name[:i]
+		}
+		// Prose punctuation rides along on the last word of a sentence.
+		name = strings.TrimRight(name, ".,;:)\"'`")
+		if name != "" {
+			flags = append(flags, name)
 		}
 	}
-	return path, flags
+
+	// A placeholder like `<command>`, a filename or a flag in the first
+	// position means there is no command here: `krowk --version` is global
+	// flags and nothing else, and its flags are checked against the globals.
+	if len(words) == 0 || !isCommandWord(words[0]) {
+		return nil, flags, ""
+	}
+	path = []string{words[0]}
+
+	cmd, ok := topLevel(surface, words[0])
+	if !ok || len(cmd.Subcommands) == 0 {
+		// Unknown, or a leaf: either way the path ends here. The caller reports
+		// the unknown one; a leaf's arguments are not the path's business.
+		return path, flags, ""
+	}
+
+	// A group. Only one of its own subcommands may join the path — the caller
+	// reports the bare group, and anything else is the stray.
+	if len(words) < 2 || !isCommandWord(words[1]) {
+		return path, flags, ""
+	}
+	for _, sub := range cmd.Subcommands {
+		if sub.Name == words[1] {
+			return append(path, words[1]), flags, ""
+		}
+	}
+	return path, flags, words[1]
+}
+
+// TestSplitStopsWhereTheCommandDoes holds the parser to both directions at once,
+// because a parser that is wrong in either one is a test that passes for the
+// wrong reason: prose after a real command must not extend the path, and a word
+// that is not a command must never be read as one.
+func TestSplitStopsWhereTheCommandDoes(t *testing.T) {
+	surface := cli.Surface()
+
+	for _, c := range []struct {
+		words, path, flags, stray string
+	}{
+		// The decision tree's own line: everything after --json is prose.
+		{words: "push a.png b.png --json (one run, closed for you)", path: "push", flags: "json"},
+		{words: "push shot.png --title \"Cart after the fix\" --json", path: "push", flags: "title json"},
+		// A group and one of its subcommands is two words deep, and no deeper.
+		{words: "uploads list --limit 10 --json", path: "uploads list", flags: "limit json"},
+		{words: "auth login --token krowk_sk_…", path: "auth login", flags: "token"},
+		// A group followed by something that is not one of its subcommands.
+		{words: "uploads purge", path: "uploads", stray: "purge"},
+		{words: "uploads soon list", path: "uploads", stray: "soon"},
+		// A bare group is caught by the caller, not here.
+		{words: "uploads", path: "uploads"},
+		// A leaf answers for its arguments, however they are spelled.
+		{words: "claim art_2e1d <claim-token> --run <run> --json", path: "claim", flags: "run json"},
+		{words: "help uploads attach --json", path: "help", flags: "json"},
+		// No command at all: global flags, and a placeholder that names none.
+		{words: "--version", flags: "version"},
+		{words: "<command> --json", flags: "json"},
+		// An unknown first word stays in the path, so the caller can say so.
+		{words: "publish shot.png", path: "publish"},
+	} {
+		path, flags, stray := split(surface, strings.Fields(c.words))
+		if got := strings.Join(path, " "); got != c.path {
+			t.Errorf("split(%q) path = %q, want %q", c.words, got, c.path)
+		}
+		if got := strings.Join(flags, " "); got != c.flags {
+			t.Errorf("split(%q) flags = %q, want %q", c.words, got, c.flags)
+		}
+		if stray != c.stray {
+			t.Errorf("split(%q) stray = %q, want %q", c.words, stray, c.stray)
+		}
+	}
+}
+
+// topLevel is the command a first word names, if it names one.
+func topLevel(surface cli.Catalog, word string) (cli.Command, bool) {
+	for _, cmd := range surface.Commands {
+		if cmd.Name == word {
+			return cmd, true
+		}
+	}
+	return cli.Command{}, false
+}
+
+// subcommandsOf is what a group offers, for the message that says a word is not
+// one of them.
+func subcommandsOf(surface cli.Catalog, word string) []cli.Command {
+	cmd, ok := topLevel(surface, word)
+	if !ok {
+		return nil
+	}
+	return cmd.Subcommands
 }
 
 // isCommandWord is true for the lowercase words krowk routes on, and false for

@@ -630,7 +630,7 @@ export KROWK_API_URL=http://api.krowk.localhost:3000/v1
 
 # For the keyed flow, mint a key in the registry checkout:
 #   bin/rails runner 'puts Workspace.find_or_create_by!(name: "Local Dev") \
-#     .api_keys.create!(name: "krowk-cli local").token'
+#     .keys.create!(name: "krowk-cli local").token'
 export KROWK_TOKEN=krowk_sk_...
 ./bin/krowk push screenshot.png --pull-request=https://github.com/acme/x/pull/1
 ```

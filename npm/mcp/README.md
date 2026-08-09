@@ -25,8 +25,10 @@ publishing something else entirely.
 ## What this package is
 
 A launcher. The server itself is a single static Go binary, `krowk-mcp`.
-Installing this package pulls one more package — `@krowk/linux-x64` or whichever
-matches your machine — through the same npm registry as everything else. There
+Installing this package pulls one more package — `@krowk/cli-linux-x64` or
+whichever matches your machine — through the same npm registry as everything
+else. The platform packages carry both binaries, which is why the one this
+server needs is named for the CLI. There
 is no postinstall script and no download from a second host, so it works behind
 a proxy, under `npm ci --ignore-scripts`, and off a private mirror.
 

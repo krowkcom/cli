@@ -5,7 +5,7 @@
 //
 // Two things this handles that a `for` loop in the workflow would not:
 //
-//   No token — the npm names are not claimed yet, and a release that cannot
+//   No token — the npm names may not be claimed yet, and a release that cannot
 //   publish should still be a release. Missing credentials skip the publish and
 //   say so; they do not fail the tag.
 //
@@ -57,13 +57,13 @@ const token = process.env.NODE_AUTH_TOKEN || process.env.NPM_TOKEN;
 if (!token && !dryRun) {
   notice(
     "NPM_TOKEN is not set — skipping npm publish for " + manifest.version + ". " +
-      "The GitHub release is unaffected. Set the NPM_TOKEN repo secret once the " +
-      "krowk and @krowk names are claimed, then re-run this workflow.",
+      "The GitHub release is unaffected. Set the NPM_TOKEN repo secret with " +
+      "publish rights on the @krowk scope, then re-run this workflow.",
   );
   process.exit(0);
 }
 
-// A prerelease under `latest` would hand every `npx krowk` an rc. Park it on
+// A prerelease under `latest` would hand every `npx @krowk/cli` an rc. Park it on
 // `next` and leave `latest` where it was.
 const tag = manifest.prerelease ? "next" : "latest";
 

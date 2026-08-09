@@ -90,7 +90,7 @@ jobs:
           done
 
       # The launcher can only be exercised on the runner's own platform, but
-      # that is the path every `npx krowk` takes, so it is worth taking.
+      # that is the path every `npx @krowk/cli` takes, so it is worth taking.
       - name: Run both binaries through the npm launchers
         run: |
           set -eux
@@ -99,8 +99,8 @@ jobs:
           cd "$work"
           npm init -y >/dev/null
           npm install --no-audit --no-fund \
-            "$GITHUB_WORKSPACE/dist/npm-tarballs/krowk-linux-x64-$version.tgz" \
-            "$GITHUB_WORKSPACE/dist/npm-tarballs/krowk-$version.tgz" \
+            "$GITHUB_WORKSPACE/dist/npm-tarballs/krowk-cli-linux-x64-$version.tgz" \
+            "$GITHUB_WORKSPACE/dist/npm-tarballs/krowk-cli-$version.tgz" \
             "$GITHUB_WORKSPACE/dist/npm-tarballs/krowk-mcp-$version.tgz"
           test "$(./node_modules/.bin/krowk --version)" = "$version"
           test "$(./node_modules/.bin/krowk-mcp --version)" = "$version"

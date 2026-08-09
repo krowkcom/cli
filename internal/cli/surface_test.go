@@ -38,7 +38,7 @@ type snapshot struct {
 // It is not here to catch mistakes — the parity tests below do that. It is here
 // so that changing the surface is visible in review as a diff of what krowk
 // promises, rather than buried inside a change to how a command works. Once
-// `npx krowk` ships, someone else's script is on the other end of this file.
+// `npx @krowk/cli` ships, someone else's script is on the other end of this file.
 func TestSurface(t *testing.T) {
 	current := snapshot{CLI: catalog(), MCP: mcp.Surface()}
 	// catalog() rather than Surface(): the version is a build stamp, not surface.

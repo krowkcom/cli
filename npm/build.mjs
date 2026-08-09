@@ -1,0 +1,239 @@
+#!/usr/bin/env node
+// Assemble the npm packages from the binaries GoReleaser just built.
+//
+// Seven packages come out of one release: five that carry nothing but the two
+// binaries for one platform, and the two launchers people actually name —
+// `krowk` and `@krowk/mcp` — which depend on all five as optionalDependencies
+// and use whichever npm decided applies. That is the esbuild pattern.
+//
+// The bytes are the release's bytes, read out of dist/, not a second `go build`
+// that could differ from what the checksums cover.
+//
+//   node npm/build.mjs [--dist dist] [--out dist/npm]
+//
+// Node's standard library only, matching the Go module's own rule.
+
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repo = path.resolve(here, "..");
+
+// The one platform table. .goreleaser.yaml's matrix and the launchers' own
+// tables are checked against it below, so adding a platform in one place and
+// forgetting the others fails the build instead of the release.
+const PLATFORMS = [
+  { npm: "@krowk/darwin-arm64", goos: "darwin", goarch: "arm64", os: "darwin", cpu: "arm64" },
+  { npm: "@krowk/darwin-x64", goos: "darwin", goarch: "amd64", os: "darwin", cpu: "x64" },
+  { npm: "@krowk/linux-arm64", goos: "linux", goarch: "arm64", os: "linux", cpu: "arm64" },
+  { npm: "@krowk/linux-x64", goos: "linux", goarch: "amd64", os: "linux", cpu: "x64" },
+  { npm: "@krowk/win32-x64", goos: "windows", goarch: "amd64", os: "win32", cpu: "x64" },
+];
+
+// GoReleaser build ids, which are also the binary names.
+const BINARIES = ["krowk", "krowk-mcp"];
+
+// The launchers, in the repo. Their versions and optionalDependencies are
+// stamped on the way out; what is checked in stays at a version that cannot be
+// mistaken for a real one.
+const LAUNCHERS = [
+  { dir: "npm/krowk", name: "krowk", bin: "bin/krowk.js" },
+  { dir: "npm/mcp", name: "@krowk/mcp", bin: "bin/krowk-mcp.js" },
+];
+
+function die(message) {
+  process.stderr.write("npm/build.mjs: " + message + "\n");
+  process.exit(1);
+}
+
+function flag(name, fallback) {
+  const at = process.argv.indexOf("--" + name);
+  return at === -1 ? fallback : process.argv[at + 1];
+}
+
+const distDir = path.resolve(repo, flag("dist", "dist"));
+const outDir = path.resolve(repo, flag("out", path.join(distDir, "npm")));
+
+function readJSON(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (err) {
+    die("cannot read " + path.relative(repo, file) + ": " + err.message +
+      "\n  Run `goreleaser release --snapshot --clean` first, or point --dist at a finished build.");
+  }
+}
+
+// GoReleaser records what it built and at which version. Taking both from there
+// means the npm version is the released version by construction — there is no
+// second place to get it wrong.
+const metadata = readJSON(path.join(distDir, "metadata.json"));
+const artifacts = readJSON(path.join(distDir, "artifacts.json"));
+const version = metadata.version;
+
+if (!version) die("no version in " + path.join(distDir, "metadata.json"));
+
+// npm has no opinion about a leading v; a tag does. GoReleaser strips it, and
+// this is the assertion that it stayed stripped.
+if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/.test(version)) {
+  die("version " + JSON.stringify(version) + " is not a version npm will accept");
+}
+
+const prerelease = version.includes("-");
+
+// --- Check the three copies of the platform list agree ----------------------
+
+const built = artifacts.filter((a) => a.type === "Binary");
+const wanted = new Set(PLATFORMS.map((p) => p.goos + "/" + p.goarch));
+const extra = new Set(
+  built.map((a) => a.goos + "/" + a.goarch).filter((k) => !wanted.has(k)),
+);
+if (extra.size > 0) {
+  die("GoReleaser built " + [...extra].sort().join(", ") +
+    ", which no npm package covers.\n  Add it to PLATFORMS here and to PACKAGES in both launchers, or drop it from .goreleaser.yaml.");
+}
+
+for (const launcher of LAUNCHERS) {
+  const source = fs.readFileSync(path.join(repo, launcher.dir, launcher.bin), "utf8");
+  const named = new Set(source.match(/@krowk\/[a-z0-9-]+/g) || []);
+  for (const p of PLATFORMS) {
+    if (!named.has(p.npm)) {
+      die(launcher.dir + " never mentions " + p.npm + ", so it cannot run there.");
+    }
+  }
+  for (const name of named) {
+    // A launcher naming itself is the install hint in its own error message.
+    if (name === launcher.name) continue;
+    if (!PLATFORMS.some((p) => p.npm === name)) {
+      die(launcher.dir + " mentions " + name + ", which nothing publishes.");
+    }
+  }
+}
+
+// --- Write the platform packages --------------------------------------------
+
+fs.rmSync(outDir, { recursive: true, force: true });
+fs.mkdirSync(outDir, { recursive: true });
+
+// Directory names are for us, not for npm — it reads the name out of
+// package.json — so they stay flat and shell-safe.
+function stage(name) {
+  const dir = path.join(outDir, name.replace("@", "").replace("/", "-"));
+  fs.mkdirSync(path.join(dir, "bin"), { recursive: true });
+  return dir;
+}
+
+const published = [];
+
+for (const platform of PLATFORMS) {
+  const dir = stage(platform.npm);
+
+  for (const binary of BINARIES) {
+    const artifact = built.find(
+      (a) => a.extra?.ID === binary && a.goos === platform.goos && a.goarch === platform.goarch,
+    );
+    if (!artifact) {
+      die("GoReleaser built no " + binary + " for " + platform.goos + "/" + platform.goarch);
+    }
+    const ext = platform.os === "win32" ? ".exe" : "";
+    const to = path.join(dir, "bin", binary + ext);
+    fs.copyFileSync(path.resolve(repo, artifact.path), to);
+    // npm preserves the mode it finds in the tarball, so set it here rather
+    // than discover on some other machine that it did not survive.
+    fs.chmodSync(to, 0o755);
+  }
+
+  // `os` and `cpu` make npm skip the four that do not apply instead of
+  // downloading five binaries onto every machine. `preferUnplugged` keeps Yarn
+  // PnP from zipping the binary, which would leave nothing to exec.
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify(
+      {
+        name: platform.npm,
+        version,
+        description: "krowk binaries for " + platform.os + " " + platform.cpu + ".",
+        homepage: "https://krowk.com",
+        repository: { type: "git", url: "git+https://github.com/krowkcom/cli.git" },
+        license: "MIT",
+        os: [platform.os],
+        cpu: [platform.cpu],
+        preferUnplugged: true,
+        files: ["bin"],
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+
+  fs.writeFileSync(
+    path.join(dir, "README.md"),
+    "# " + platform.npm + "\n\n" +
+      "The `krowk` and `krowk-mcp` binaries for " + platform.os + " " + platform.cpu +
+      ", and nothing else.\n\n" +
+      "Do not install this directly. Install [`krowk`](https://www.npmjs.com/package/krowk)\n" +
+      "or [`@krowk/mcp`](https://www.npmjs.com/package/@krowk/mcp) and npm will pick the\n" +
+      "one that matches the machine.\n\n" +
+      "MIT.\n",
+  );
+
+  published.push({ name: platform.npm, dir });
+}
+
+// --- Write the launchers -----------------------------------------------------
+
+for (const launcher of LAUNCHERS) {
+  const from = path.join(repo, launcher.dir);
+  const dir = stage(launcher.name);
+  fs.cpSync(from, dir, { recursive: true });
+
+  const manifest = readJSON(path.join(dir, "package.json"));
+  if (manifest.name !== launcher.name) {
+    die(launcher.dir + " is named " + manifest.name + ", not " + launcher.name);
+  }
+  if (!Object.values(manifest.bin ?? {}).includes(launcher.bin)) {
+    die(launcher.dir + " has no bin entry for " + launcher.bin + ", so npx has nothing to run");
+  }
+
+  manifest.version = version;
+  // Pinned exactly. A launcher and its binaries are one release cut in two, and
+  // a range would let npm pair a new launcher with an old binary.
+  manifest.optionalDependencies = Object.fromEntries(
+    PLATFORMS.map((p) => [p.npm, version]),
+  );
+  fs.writeFileSync(
+    path.join(dir, "package.json"),
+    JSON.stringify(manifest, null, 2) + "\n",
+  );
+
+  // The launcher is the one file that runs on a user's machine before anything
+  // of ours does. A syntax error in it is a broken release, so parse it here.
+  const check = spawnSync(process.execPath, ["--check", path.join(dir, launcher.bin)], {
+    stdio: "inherit",
+  });
+  if (check.status !== 0) die(launcher.dir + " does not parse");
+
+  published.push({ name: launcher.name, dir });
+}
+
+// Order is the publish order: a launcher whose optionalDependencies do not
+// exist yet installs "successfully" with no binary, which is the one failure
+// mode this whole arrangement is meant to avoid.
+fs.writeFileSync(
+  path.join(outDir, "manifest.json"),
+  JSON.stringify(
+    { version, prerelease, packages: published.map((p) => ({ name: p.name, dir: path.relative(outDir, p.dir) })) },
+    null,
+    2,
+  ) + "\n",
+);
+
+process.stdout.write(
+  "npm/build.mjs: staged " + published.length + " packages at version " + version +
+    (prerelease ? " (prerelease)" : "") + "\n",
+);
+for (const p of published) {
+  process.stdout.write("  " + p.name + " → " + path.relative(repo, p.dir) + "\n");
+}

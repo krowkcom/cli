@@ -69,6 +69,7 @@ human has to do before the npm half of it can publish.
 | `krowk auth verify` | Ask the registry which key this is, and the workspace it acts in |
 | `krowk doctor` | Report version, API reachability, auth and detected run context |
 | `krowk registry serve` | Run the local stand-in registry to develop against |
+| `krowk help [command]` | Show the help, or one command's own — `--json` for the machine-readable surface |
 
 Upload flags: `--run`, `--pull-request`, `--reference` (repeatable), `--session`,
 `--title`, plus `--repo` / `--commit` / `--agent` to override detection. Flags
@@ -77,6 +78,54 @@ may follow the filenames.
 Global flags: `--dev`, `--format human|json|markdown|url`, `--json`, `--quiet`,
 `--help`, `--version`. Output is human on a TTY and JSON when piped, so an agent
 that captures stdout gets structured data without asking for it.
+
+## The command surface, as data
+
+`krowk help --json` answers with the whole surface — every command, its usage,
+its arguments, its flags with their types and defaults, the global flags and the
+environment variables — so an agent discovers what krowk can do without parsing
+a help text written for a person:
+
+```jsonc
+{
+  "name": "krowk",
+  "version": "0.1.0",
+  "commands": [
+    { "name": "push",
+      "usage": "krowk push <file...> [flags]",
+      "summary": "Upload files, get a link for each",
+      "args": [ { "name": "file", "required": true, "repeated": true } ],
+      "flags": [ { "name": "run", "type": "string", "default": "",
+                   "usage": "Attach to an existing run instead of opening one" } ] }
+  ],
+  "global_flags": [ ],
+  "environment": [ { "name": "KROWK_TOKEN", "usage": "API token — wins over the credentials file" } ]
+}
+```
+
+`krowk help <command> --json` narrows it to one entry — `krowk <command> --help
+--json` is the same question and the same answer. Like every other command, help
+is human on a terminal and JSON when piped, and `--json` or `--format json` asks
+for it outright.
+
+**It cannot lie about the real surface.** The command list in the human help is
+*rendered from the same catalog* the JSON serialises, and tests hold that
+catalog to the code rather than to itself: every command in it must have a case
+in the routing switch and every routed command must be in it; every flag it
+advertises must be one the flag set actually parses, with the same default, and
+every flag that parses must be documented; every environment variable it
+promises must be one something reads.
+
+The whole surface — the CLI's and the MCP server's six tools — is also pinned to
+`internal/cli/testdata/surface.json`. Changing it is a diff of what krowk
+promises rather than a line buried in a change to how a command works:
+
+```bash
+go test ./internal/cli -run TestSurface -update   # regenerate, deliberately
+```
+
+Regenerating means updating the command table above, and the MCP tool table
+below, in the same commit.
 
 **One file, one artifact, one link.** Pushing three files creates three
 artifacts with three URLs. What groups them is a run, not an artifact.

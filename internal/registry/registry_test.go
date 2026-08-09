@@ -93,6 +93,18 @@ func finalize(t *testing.T, server *httptest.Server, token string, payload map[s
 	return request(t, http.MethodPut, server.URL+"/v1/artifacts/"+slug+"/finalization", token, "", "")
 }
 
+// presign asks for the upload of an artifact again — keyless when token is "",
+// and with no claim token at all when claimToken is.
+func presign(t *testing.T, server *httptest.Server, token, slug, claimToken string) (int, map[string]any) {
+	t.Helper()
+	body := ""
+	if claimToken != "" {
+		body = fmt.Sprintf(`{"claim_token":%q}`, claimToken)
+	}
+	return request(t, http.MethodPost, server.URL+"/v1/artifacts/"+slug+"/upload",
+		token, "application/json", body)
+}
+
 // The 24-hour promise and "claim before expiry or lose it" are core behaviour:
 // past the lifetime, every endpoint that can meet the artifact answers 410.
 func TestEphemeralExpiryAnswersGoneEverywhere(t *testing.T) {
@@ -117,6 +129,9 @@ func TestEphemeralExpiryAnswersGoneEverywhere(t *testing.T) {
 		"krowk_sk_test", "application/json", fmt.Sprintf(`{"claim_token":%q}`, claimToken))
 	if status != http.StatusGone || errorCode(body) != "expired" {
 		t.Errorf("claim after expiry = %d %v, want 410 expired", status, body)
+	}
+	if status, body := presign(t, server, "", slug, claimToken); status != http.StatusGone || errorCode(body) != "expired" {
+		t.Errorf("represign after expiry = %d %v, want 410 expired", status, body)
 	}
 	// The promise covers the bytes too: the public URL stops serving, as the
 	// real registry's lifecycle rule deletes the object.
@@ -153,10 +168,105 @@ func TestLateUploadIsRefused(t *testing.T) {
 	server, clk := newClockedServer(t)
 
 	payload := declare(t, server, "", "a.txt", "the bytes")
-	clk.advance(uploadURLLifetime + time.Minute)
+	clk.advance(UploadURLLifetime + time.Minute)
 
 	if status := put(t, uploadURL(t, payload), "the bytes"); status != http.StatusForbidden {
 		t.Errorf("late PUT = %d, want 403", status)
+	}
+}
+
+// And the recovery from it, which is the whole reason the endpoint exists: a
+// fresh URL over the same artifact. Declaring the file again would also produce
+// one, and it would be a second slug — a dead link in whatever the first was
+// pasted into.
+func TestARepresignRecoversALapsedUpload(t *testing.T) {
+	server, clk := newClockedServer(t)
+
+	declared := declare(t, server, "krowk_sk_test", "a.txt", "the bytes")
+	slug, _ := declared["slug"].(string)
+
+	clk.advance(UploadURLLifetime + time.Minute)
+	if status := put(t, uploadURL(t, declared), "the bytes"); status != http.StatusForbidden {
+		t.Fatalf("late PUT = %d, want the 403 this recovers from", status)
+	}
+
+	status, fresh := presign(t, server, "krowk_sk_test", slug, "")
+	if status != http.StatusOK {
+		t.Fatalf("represign = %d %v, want 200", status, fresh)
+	}
+	// Nothing the link depends on moves: same slug, same URL, same declared size.
+	// Only the signature is new.
+	if fresh["slug"] != slug || fresh["url"] != declared["url"] || fresh["byte_size"] != declared["byte_size"] {
+		t.Errorf("represign moved the artifact: %v, want %v", fresh, declared)
+	}
+	if uploadURL(t, fresh) == uploadURL(t, declared) {
+		t.Error("the fresh upload URL is the one that just lapsed")
+	}
+
+	if status := put(t, uploadURL(t, fresh), "the bytes"); status != http.StatusOK {
+		t.Fatalf("PUT to the fresh URL = %d, want 200", status)
+	}
+	if status, body := finalize(t, server, "krowk_sk_test", declared); status != http.StatusOK {
+		t.Fatalf("finalize = %d %v", status, body)
+	}
+}
+
+// The slug is the capability for *reading* a keyless artifact, because the bytes
+// are public on the CDN regardless. A presigned PUT is not a read: it decides
+// what those bytes are. A slug travels in whatever the link was pasted into, so
+// on its own it must not buy the power to overwrite what somebody is reading.
+func TestRepresigningAKeylessArtifactNeedsItsClaimToken(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	declared := declare(t, server, "", "a.txt", "the bytes")
+	slug, _ := declared["slug"].(string)
+	token, _ := declared["claim_token"].(string)
+
+	if status, body := presign(t, server, "", slug, ""); status != http.StatusBadRequest ||
+		errorCode(body) != "parameter_missing" {
+		t.Errorf("represign on the slug alone = %d %v, want 400 parameter_missing", status, body)
+	}
+	if status, body := presign(t, server, "", slug, "krowk_claim_garbage"); status != http.StatusNotFound ||
+		errorCode(body) != "not_found" {
+		t.Errorf("represign with a wrong token = %d %v, want 404", status, body)
+	}
+	// A key is no authority over an artifact in the anonymous workspace either:
+	// the lookup happens in that key's own workspace, where it does not exist.
+	if status, _ := presign(t, server, "krowk_sk_test", slug, ""); status != http.StatusNotFound {
+		t.Errorf("represign with an unrelated key = %d, want 404", status)
+	}
+
+	status, fresh := presign(t, server, "", slug, token)
+	if status != http.StatusOK {
+		t.Fatalf("represign with the token = %d %v", status, fresh)
+	}
+	if uploadURL(t, fresh) == uploadURL(t, declared) {
+		t.Error("the fresh upload URL is the one it replaced")
+	}
+	// The token is shown once, by the call that minted it, and the row keeps only
+	// a digest. Spending it here must not become a second chance to read it.
+	if _, reissued := fresh["claim_token"]; reissued {
+		t.Error("the represign re-issued the claim token")
+	}
+}
+
+// A ready artifact is a permalink: a URL over its key would be permission to
+// swap the bytes a link already resolves to.
+func TestRepresigningAFinalizedArtifactIsRefused(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	declared := declare(t, server, "krowk_sk_test", "a.txt", "the bytes")
+	slug, _ := declared["slug"].(string)
+	if put(t, uploadURL(t, declared), "the bytes") != http.StatusOK {
+		t.Fatal("upload failed")
+	}
+	if status, body := finalize(t, server, "krowk_sk_test", declared); status != http.StatusOK {
+		t.Fatalf("finalize = %d %v", status, body)
+	}
+
+	status, body := presign(t, server, "krowk_sk_test", slug, "")
+	if status != http.StatusConflict || errorCode(body) != "already_finalized" {
+		t.Errorf("represign of a ready artifact = %d %v, want 409 already_finalized", status, body)
 	}
 }
 

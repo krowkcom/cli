@@ -36,10 +36,15 @@ const (
 	// DefaultLimitBytes matches the registry's own max_upload_bytes.
 	DefaultLimitBytes int64 = 100 << 20
 
+	// UploadURLLifetime is how long a presigned URL this stand-in hands out stays
+	// good, matching the real 15 minutes. Exported alongside HandlerWithClock
+	// because the two together are how a test invalidates a signature: no other
+	// seam makes 15 minutes elapse inside one, and the recovery from a lapsed
+	// signature is a path worth exercising from outside this package.
+	UploadURLLifetime = 15 * time.Minute
+
 	// How long a keyless upload survives, matching Artifact::EPHEMERAL_LIFETIME.
 	ephemeralLifetime = 24 * time.Hour
-
-	uploadURLLifetime = 15 * time.Minute
 
 	// How many artifacts a page holds, mirroring the registry's own bounds. The
 	// caller picks, so the ceiling is enforced rather than trusted.
@@ -170,6 +175,17 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	// Takedown, and a hard purge: the bytes go at once rather than into anything
 	// that could hand them back.
 	mux.HandleFunc("DELETE /v1/artifacts/{slug}", s.destroyArtifact)
+
+	// The upload of an artifact, handed out again. A presigned URL lasts 15
+	// minutes while the artifact waits for its bytes far longer, so a lapsed
+	// signature has to be recoverable without declaring a second artifact — which
+	// would be a second slug, and a dead link in whatever the first was pasted
+	// into.
+	//
+	// A POST though nothing is recorded: what comes back is a new capability, and
+	// asking for one means presenting a credential — which for a keyless caller is
+	// the claim token, and a secret belongs in a body.
+	mux.HandleFunc("POST /v1/artifacts/{slug}/upload", s.presignUpload)
 
 	// Finalizing and completing are nested resources reached with PUT, because
 	// they are idempotent; claiming spends a one-shot token, so it is a POST.
@@ -332,7 +348,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		CreatedAt:   now.Format(time.RFC3339Nano),
 		workspace:   workspace,
 		uploadTok:   randomToken(),
-		uploadTil:   now.Add(uploadURLLifetime),
+		uploadTil:   now.Add(UploadURLLifetime),
 		storageKey:  key,
 	}
 	if in.Run != "" {
@@ -382,8 +398,20 @@ func (s *store) declared(a *artifact, claimToken string) map[string]any {
 		"headers":    uploadHeaders,
 		"expires_at": a.uploadTil.Format(time.RFC3339Nano),
 	}
+	// The recovery is spelled out, because the caller is often an agent following
+	// instructions rather than a client written against documentation — and the
+	// instruction it needs when a signature lapses is the one call that keeps the
+	// slug. Whether it has to carry a claim token follows from the artifact being
+	// ephemeral, not from a token being in hand: this same payload is served on
+	// every represign, where the plaintext token is long gone.
+	withToken := ""
+	if a.ExpiresAt != nil {
+		withToken = " with claim_token"
+	}
 	payload["next_step"] = "PUT the file to upload.url with the headers in upload.headers, " +
-		"then PUT /v1/artifacts/" + a.Slug + "/finalization"
+		"then PUT /v1/artifacts/" + a.Slug + "/finalization. " +
+		"If upload.url expires first, POST /v1/artifacts/" + a.Slug + "/upload" + withToken +
+		" for a fresh one — the slug does not change"
 	if claimToken != "" {
 		payload["claim_token"] = claimToken
 	}
@@ -422,13 +450,79 @@ func (s *store) replayDeclare(w http.ResponseWriter, found *answered, matches bo
 
 	now := s.now().UTC()
 	a.uploadTok = randomToken()
-	a.uploadTil = now.Add(uploadURLLifetime)
+	a.uploadTil = now.Add(UploadURLLifetime)
 
 	// The claim token is not re-issued. Re-minting one would void the token the
 	// first response may already have delivered, and the row keeps only its digest
 	// regardless — as in the real registry.
 	writeJSON(w, http.StatusCreated, s.declared(a, ""))
 	return true
+}
+
+// presignUpload mints the upload of an artifact again: same slug, same storage
+// key, same declared size and digest, so the link that may already be pasted
+// somewhere is the one the bytes land behind.
+//
+// 200 rather than 201, and the artifact rather than an upload of its own: what
+// comes back is what a create answers with, minted again. The upload is not a
+// record to point at.
+func (s *store) presignUpload(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := authenticate(w, r)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		ClaimToken string `json:"claim_token"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); unreadableBody(w, err) {
+		return
+	}
+
+	// A keyless caller's authority is the claim token, and the slug will not do
+	// even though it does for reading. Reading a keyless artifact goes on the slug
+	// because the bytes are public on the CDN regardless — but a presigned PUT is
+	// not a read, it is permission to decide what those bytes are, and the slug is
+	// in whatever the link was pasted into.
+	if workspace == "" && body.ClaimToken == "" {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: claim_token.", nil)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a := s.artifacts[r.PathValue("slug")]
+	if !authorizedToWrite(a, workspace, body.ClaimToken) {
+		// A slug that does not exist, one belonging to another workspace, and a
+		// token that does not match are all the same answer: a wrong guess learns
+		// nothing from the difference.
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+	if s.refuseIfGone(w, a) {
+		return
+	}
+	// A ready artifact is a permalink, so there is nothing here to presign: a URL
+	// over its key would be permission to swap the bytes a link already resolves
+	// to.
+	if a.State == "ready" {
+		writeError(w, http.StatusConflict, "already_finalized",
+			a.Slug+" is already finalized — declare a new artifact for new bytes", nil)
+		return
+	}
+
+	// Nothing here touches created_at, and the finalize deadline is measured from
+	// it: asking for a URL is not evidence the upload is coming, and a deadline any
+	// client can push out by asking is not a deadline.
+	a.uploadTok = randomToken()
+	a.uploadTil = s.now().UTC().Add(UploadURLLifetime)
+
+	// The claim token is not re-issued. It is shown once, by the call that minted
+	// it, and the row keeps only its digest — as in the real registry, where
+	// spending it here must not become a second chance to read it.
+	writeJSON(w, http.StatusOK, s.declared(a, ""))
 }
 
 // putObject is object storage. It enforces what the real presigned URL enforces
@@ -731,7 +825,7 @@ func (s *store) destroyArtifact(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 
 	a := s.artifacts[r.PathValue("slug")]
-	if !authorizedToTakeDown(a, workspace, body.ClaimToken) {
+	if !authorizedToWrite(a, workspace, body.ClaimToken) {
 		// A slug that does not exist, one belonging to another workspace, and a
 		// token that does not match are all the same answer: a wrong guess learns
 		// nothing from the difference.
@@ -754,17 +848,23 @@ func (s *store) destroyArtifact(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// authorizedToTakeDown reports whether the request carries an authority over
-// this artifact. A key's is the workspace it acts in; a claim token's is the one
+// authorizedToWrite reports whether the request carries an authority over this
+// artifact. A key's is the workspace it acts in; a claim token's is the one
 // artifact it was issued for.
+//
+// Shared by taking an artifact down and by minting its upload URL again, because
+// they are the same question: both decide what a link resolves to, and a slug
+// travels in whatever that link was pasted into. The real registry gives them one
+// answer too, off the same held_by_claim_token scope.
 //
 // A spent token is no authority at all: claiming clears the digest in the real
 // registry, and the artifact has left the anonymous workspace by then anyway, so
 // a claimed artifact answers only to the key that now holds it.
 //
 // A tombstone still answers to both, which is what makes a retried takedown a
-// success rather than a 404.
-func authorizedToTakeDown(a *artifact, workspace, claimToken string) bool {
+// success rather than a 404 — and what makes a represign of one a 410 saying it
+// was taken down rather than a 404 sending someone hunting for a typo.
+func authorizedToWrite(a *artifact, workspace, claimToken string) bool {
 	switch {
 	case a == nil:
 		return false

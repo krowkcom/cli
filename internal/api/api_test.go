@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -141,14 +142,14 @@ func TestPutBytesRetrySendsTheFullBodyAgain(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	c, slept := testClient(server)
-	up := &Upload{
+	prepared := &Artifact{Slug: "art_x", Upload: &Upload{
 		Method:  http.MethodPut,
 		URL:     server.URL + "/_storage/ws/art/shot.png",
 		Headers: map[string]string{"Content-Type": "image/png"},
-	}
+	}}
 	spec := Spec{Path: path, ByteSize: int64(len(contents))}
 
-	if err := c.PutBytes(context.Background(), up, spec); err != nil {
+	if err := c.PutBytes(context.Background(), prepared, spec); err != nil {
 		t.Fatalf("PutBytes = %v, want the retry to succeed", err)
 	}
 	mu.Lock()
@@ -186,8 +187,9 @@ func TestPutBytesStopsAtTheAttemptCap(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	c, slept := testClient(server)
-	up := &Upload{Method: http.MethodPut, URL: server.URL + "/_storage/ws/art/shot.png"}
-	err := c.PutBytes(context.Background(), up, Spec{Path: path, ByteSize: int64(len("bytes"))})
+	prepared := &Artifact{Slug: "art_x",
+		Upload: &Upload{Method: http.MethodPut, URL: server.URL + "/_storage/ws/art/shot.png"}}
+	err := c.PutBytes(context.Background(), prepared, Spec{Path: path, ByteSize: int64(len("bytes"))})
 	if err == nil {
 		t.Fatal("want the exhausted failure back")
 	}
@@ -519,5 +521,231 @@ func TestAnUnreadableBodyKeepsTheRegistrysOwnMessage(t *testing.T) {
 	}
 	if apiErr.Retryable() {
 		t.Error("a body the registry could not read reads the same the second time")
+	}
+}
+
+// presignFake is a registry and its object storage on one origin, the way this
+// repository's own stand-in serves them.
+//
+// The URL a declare handed out is refused with the 403 real storage answers a
+// signature it will not honour with; the URL that POST /v1/artifacts/{slug}/upload
+// mints works. What each request carried is recorded, because the whole point of
+// the recovery is which call is made and what it presents.
+type presignFake struct {
+	mu     sync.Mutex
+	calls  []string
+	bodies []string
+	auth   []string
+	claims []string
+	// refuse is the error body the represign answers with, empty to mint a URL.
+	refuse string
+	server *httptest.Server
+}
+
+func newPresignFake(t *testing.T) *presignFake {
+	t.Helper()
+	fake := &presignFake{}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /_storage/{signature}/shot.png", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		signature := r.PathValue("signature")
+		fake.mu.Lock()
+		fake.calls = append(fake.calls, "PUT /_storage/"+signature)
+		fake.bodies = append(fake.bodies, string(body))
+		fake.mu.Unlock()
+
+		if signature != "fresh" {
+			// Storage speaks XML rather than the registry's envelope, and answers
+			// a lapsed window and an altered signature alike with a 403.
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code></Error>`)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("POST /v1/artifacts/{slug}/upload", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		fake.mu.Lock()
+		fake.calls = append(fake.calls, "POST /v1/artifacts/"+r.PathValue("slug")+"/upload")
+		fake.auth = append(fake.auth, r.Header.Get("Authorization"))
+		fake.claims = append(fake.claims, string(body))
+		refuse := fake.refuse
+		fake.mu.Unlock()
+
+		if refuse != "" {
+			w.WriteHeader(http.StatusConflict)
+			fmt.Fprint(w, refuse)
+			return
+		}
+		// The same shape a create answers with, over the same artifact: only the
+		// signature moved.
+		fmt.Fprintf(w, `{"slug":%q,"state":"pending","upload":{"method":"PUT","url":%q,`+
+			`"headers":{"Content-Type":"image/png"},"expires_at":%q}}`,
+			r.PathValue("slug"), fake.server.URL+"/_storage/fresh/shot.png",
+			time.Now().Add(15*time.Minute).Format(time.RFC3339))
+	})
+
+	fake.server = httptest.NewServer(mux)
+	t.Cleanup(fake.server.Close)
+	return fake
+}
+
+func (f *presignFake) recorded() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+// pending is the artifact a declare just answered with, pointing at a signature
+// storage will not honour.
+func (f *presignFake) pending() *Artifact {
+	return &Artifact{Slug: "art_x", Upload: &Upload{
+		Method:  http.MethodPut,
+		URL:     f.server.URL + "/_storage/lapsed/shot.png",
+		Headers: map[string]string{"Content-Type": "image/png"},
+	}}
+}
+
+// The recovery a lapsed signature needs. Retrying it is attempts spent proving a
+// URL is dead, ending in advice to push again — and pushing again declares a
+// second artifact, which is a second slug and a dead link in whatever the first
+// one was pasted into.
+func TestPutBytesRepresignsARefusedSignature(t *testing.T) {
+	fake := newPresignFake(t)
+	c, slept := testClient(fake.server)
+	contents := "the whole file, every attempt"
+	path := write(t, t.TempDir(), "shot.png", contents)
+
+	prepared := fake.pending()
+	err := c.PutBytes(context.Background(), prepared, Spec{Path: path, ByteSize: int64(len(contents))})
+	if err != nil {
+		t.Fatalf("PutBytes = %v, want the fresh signature to carry it", err)
+	}
+
+	want := []string{"PUT /_storage/lapsed", "POST /v1/artifacts/art_x/upload", "PUT /_storage/fresh"}
+	if got := fake.recorded(); !slices.Equal(got, want) {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+	// The same artifact throughout: a recovery that moved the slug would be the
+	// dead link this exists to prevent.
+	if prepared.Slug != "art_x" {
+		t.Errorf("slug = %q, want the artifact that was declared", prepared.Slug)
+	}
+	if prepared.Upload.URL != fake.server.URL+"/_storage/fresh/shot.png" {
+		t.Errorf("upload url = %q, want the fresh one", prepared.Upload.URL)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for i, body := range fake.bodies {
+		if body != contents {
+			t.Errorf("attempt %d sent %q, want the whole file", i+1, body)
+		}
+	}
+	// A signature storage will not honour is not a transient failure, so there is
+	// nothing to wait out before asking for another.
+	if len(*slept) != 0 {
+		t.Errorf("slept %v, want the fresh URL asked for at once", *slept)
+	}
+}
+
+// A URL whose window has already closed cannot be met by sending the bytes
+// faster, so the attempt goes on one that could work instead.
+func TestPutBytesDoesNotSpendAnAttemptOnALapsedURL(t *testing.T) {
+	fake := newPresignFake(t)
+	c, _ := testClient(fake.server)
+	path := write(t, t.TempDir(), "shot.png", "bytes")
+
+	prepared := fake.pending()
+	prepared.Upload.ExpiresAt = time.Now().Add(-time.Minute).Format(time.RFC3339)
+
+	if err := c.PutBytes(context.Background(), prepared, Spec{Path: path, ByteSize: 5}); err != nil {
+		t.Fatalf("PutBytes = %v", err)
+	}
+	want := []string{"POST /v1/artifacts/art_x/upload", "PUT /_storage/fresh"}
+	if got := fake.recorded(); !slices.Equal(got, want) {
+		t.Errorf("calls = %v, want the lapsed URL never tried: %v", got, want)
+	}
+}
+
+// A keyless artifact's authority is the claim token, and it is sent instead of
+// the key rather than alongside it — offered both, the registry reads the key and
+// looks in that key's workspace, where an artifact still sitting in the anonymous
+// one is simply not found. So this client holds a key, and must withhold it.
+func TestRepresigningAKeylessUploadSendsTheTokenAndWithholdsTheKey(t *testing.T) {
+	fake := newPresignFake(t)
+	c, _ := testClient(fake.server)
+	path := write(t, t.TempDir(), "shot.png", "bytes")
+
+	prepared := fake.pending()
+	prepared.ClaimToken = "krowk_claim_secret"
+
+	if err := c.PutBytes(context.Background(), prepared, Spec{Path: path, ByteSize: 5}); err != nil {
+		t.Fatalf("PutBytes = %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.auth) != 1 || fake.auth[0] != "" {
+		t.Errorf("Authorization = %q, want the key withheld", fake.auth)
+	}
+	// In the body rather than the query string: a query string ends up in access
+	// logs, and this token is a capability.
+	if len(fake.claims) != 1 || !strings.Contains(fake.claims[0], `"claim_token":"krowk_claim_secret"`) {
+		t.Errorf("represign body = %q, want the claim token in it", fake.claims)
+	}
+}
+
+// The registry's account of why these bytes have no URL beats storage's. A 403
+// alone reads as "retry the upload", and retrying an upload the registry has
+// closed means declaring a second artifact under a second slug.
+func TestARefusedRepresignExplainsTheFailedUpload(t *testing.T) {
+	fake := newPresignFake(t)
+	fake.refuse = `{"error":{"code":"already_finalized",` +
+		`"message":"art_x is already finalized — declare a new artifact for new bytes"}}`
+	c, _ := testClient(fake.server)
+	path := write(t, t.TempDir(), "shot.png", "bytes")
+
+	err := c.PutBytes(context.Background(), fake.pending(), Spec{Path: path, ByteSize: 5})
+
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "already_finalized" {
+		t.Fatalf("PutBytes = %v, want the registry's refusal", err)
+	}
+	if !strings.Contains(apiErr.Fix(), "new link") {
+		t.Errorf("fix = %q, want it to say the way on is a new artifact and a new link", apiErr.Fix())
+	}
+	// Stated rather than merely absent: a missing verdict reads as false to
+	// anything asserting on it, so the two would look identical to an agent.
+	retryable, stated := apiErr.Body["retryable"].(bool)
+	if !stated || retryable {
+		t.Errorf("retryable = %v (stated %v), want an explicit false — the bytes are settled",
+			retryable, stated)
+	}
+	// The bytes were not sent at a URL the registry has closed.
+	want := []string{"PUT /_storage/lapsed", "POST /v1/artifacts/art_x/upload"}
+	if got := fake.recorded(); !slices.Equal(got, want) {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+}
+
+// A caller holding an upload URL and nothing else has no artifact to ask about,
+// and inventing a slug would be a request against something that is not this
+// upload. The 403 comes back as itself.
+func TestAnUploadWithNoSlugIsNotRepresigned(t *testing.T) {
+	fake := newPresignFake(t)
+	c, _ := testClient(fake.server)
+	path := write(t, t.TempDir(), "shot.png", "bytes")
+
+	prepared := fake.pending()
+	prepared.Slug = ""
+
+	err := c.PutBytes(context.Background(), prepared, Spec{Path: path, ByteSize: 5})
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "storage_rejected_upload" {
+		t.Fatalf("PutBytes = %v, want storage's own refusal", err)
+	}
+	if got := fake.recorded(); !slices.Equal(got, []string{"PUT /_storage/lapsed"}) {
+		t.Errorf("calls = %v, want the one attempt and no represign", got)
 	}
 }

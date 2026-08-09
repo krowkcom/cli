@@ -12,6 +12,15 @@
 // streaming: they are part of what gets signed, so they have to be known before
 // the first call is made.
 //
+// A fourth call recovers step two rather than repeating step one:
+//
+//	POST /v1/artifacts/{slug}/upload            mint the presigned PUT again
+//
+// A signature is good for 15 minutes and the artifact waits far longer, so an
+// upload can reach storage with one that has already lapsed. Declaring the file
+// again would work and is the wrong answer — a second declare is a second slug,
+// and the first link is already pasted somewhere.
+//
 // The registry's API is resourceful all the way down, so what would be a verb
 // hanging off an artifact is a nested resource instead — the finalization of an
 // artifact, the claim on one, the run it belongs to, the completion of a run. The
@@ -374,12 +383,8 @@ func (c *Client) Push(ctx context.Context, spec Spec) (*Artifact, error) {
 	if err != nil {
 		return nil, err
 	}
-	if prepared.Upload == nil || prepared.Upload.URL == "" {
-		return nil, Fail("no_upload_url",
-			"the registry accepted the artifact but did not say where to put the bytes")
-	}
 
-	if err := c.PutBytes(ctx, prepared.Upload, spec); err != nil {
+	if err := c.PutBytes(ctx, prepared, spec); err != nil {
 		return nil, err
 	}
 
@@ -401,6 +406,50 @@ func (c *Client) PrepareArtifact(ctx context.Context, spec Spec) (*Artifact, err
 	var artifact Artifact
 	body := map[string]any{"artifact": spec}
 	if err := c.callIdempotent(ctx, http.MethodPost, "/artifacts", body, &artifact); err != nil {
+		return nil, err
+	}
+	return &artifact, nil
+}
+
+// PresignUpload mints the upload of an artifact again — a fresh presigned PUT
+// over the same slug, the same storage key and the same declared size and digest,
+// so the link that may already be pasted somewhere is the one the bytes land
+// behind.
+//
+// It exists because two clocks disagree. A presigned URL is good for 15 minutes,
+// while an artifact waits for its bytes with no deadline shorter than a day, so a
+// client that digests a large file, meets a slow network or retries after a crash
+// can arrive at the PUT with a signature that has already lapsed. Declaring the
+// file again would also produce a working URL, and it is the wrong answer: a
+// second declare is a second slug, and the first one is dead in whatever it was
+// pasted into.
+//
+// A POST though nothing is recorded — the one place the verb does not follow the
+// record. What comes back is a new capability, permission to write these bytes for
+// another 15 minutes, and asking for it means presenting a credential.
+//
+// Which credential depends on the artifact. A key's authority is the workspace it
+// acts in, so a keyed caller needs nothing else. A keyless caller's is the claim
+// token, and the slug will not do: a slug travels in whatever the link was pasted
+// into, and a reader of a link must not be able to decide what they are reading.
+// It costs the honest caller nothing — the token came back in the same response as
+// the slug and the URL being replaced.
+func (c *Client) PresignUpload(ctx context.Context, slug, claimToken string) (*Artifact, error) {
+	caller, body := c, any(nil)
+	if claimToken != "" {
+		// Sent instead of the key rather than alongside it, exactly as a keyless
+		// takedown is: offered both, the registry reads the key and looks in that
+		// key's workspace, where an artifact still sitting in the anonymous one is
+		// simply not found. And in a body rather than a query string, because a
+		// query string ends up in access logs and this token is a capability.
+		keyless := New(c.BaseURL, "")
+		keyless.Sleep = c.Sleep
+		caller, body = keyless, map[string]any{"claim_token": claimToken}
+	}
+
+	var artifact Artifact
+	path := "/artifacts/" + slugPath(slug) + "/upload"
+	if err := caller.call(ctx, http.MethodPost, path, body, &artifact); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
@@ -633,8 +682,20 @@ func (c *Client) Root(ctx context.Context) (*Service, error) {
 // PutBytes streams the file to object storage using exactly the headers the URL
 // was signed for. Anything else — an unsigned header, a different length — and
 // the signature no longer matches what arrives.
-func (c *Client) PutBytes(ctx context.Context, up *Upload, spec Spec) error {
-	endpoint, err := c.storageOrigin(up.URL)
+//
+// The presign is treated as perishable rather than as a fixed address. It is good
+// for 15 minutes and the artifact it belongs to waits far longer, so an upload can
+// meet a URL whose window has already closed — and retrying a dead URL is three
+// attempts spent proving it is dead, ending in advice to push again, which mints a
+// second slug and kills the first link. Where a failure looks like that, a fresh
+// presign is fetched between attempts and the bytes are sent again: same artifact,
+// same slug, same storage key, so nothing about where the link points moves.
+func (c *Client) PutBytes(ctx context.Context, prepared *Artifact, spec Spec) error {
+	if prepared.Upload == nil || prepared.Upload.URL == "" {
+		return Fail("no_upload_url",
+			"the registry accepted the artifact but did not say where to put the bytes")
+	}
+	endpoint, err := c.storageOrigin(prepared.Upload.URL)
 	if err != nil {
 		return err
 	}
@@ -650,6 +711,19 @@ func (c *Client) PutBytes(ctx context.Context, up *Upload, spec Spec) error {
 		if err := ctx.Err(); err != nil {
 			return Fail("cancelled", err.Error())
 		}
+		// A window that has already closed does not open by sending the bytes
+		// faster, so the attempt goes on a URL that could work rather than on one
+		// certain to be refused. A registry that will not mint one is not fatal
+		// here: this is our own clock's judgement of a deadline the registry set,
+		// and a clock that runs fast would otherwise fail a push whose URL was
+		// fine. The attempt goes ahead against the URL in hand, and storage's own
+		// answer decides — which is the branch below.
+		if lapsed(prepared.Upload, time.Now()) {
+			if fresh, err := c.represign(ctx, prepared); err == nil {
+				endpoint = fresh
+			}
+		}
+
 		// The body is a file handle, so it has to be reopened for every attempt.
 		f, err := os.Open(spec.Path)
 		if err != nil {
@@ -661,7 +735,7 @@ func (c *Client) PutBytes(ctx context.Context, up *Upload, spec Spec) error {
 			f.Close()
 			return Fail("bad_upload_url", err.Error())
 		}
-		for k, v := range up.Headers {
+		for k, v := range prepared.Upload.Headers {
 			// Content-Length is signed too, but Go will not send it from the
 			// header map — it comes off ContentLength below, which is the same
 			// size that was signed.
@@ -680,12 +754,84 @@ func (c *Client) PutBytes(ctx context.Context, up *Upload, spec Spec) error {
 		last = err
 
 		var apiErr *Error
-		if !errors.As(err, &apiErr) || !apiErr.Retryable() || attempt == maxAttempts {
+		if !errors.As(err, &apiErr) {
+			return err
+		}
+		// Storage refuses a signature it will not honour with a 403, and no
+		// number of retries makes it honour one. A fresh presign is the only
+		// thing that can, so the remaining attempts are spent against that
+		// instead. A slug is what one is asked for, so a caller that handed over
+		// an upload URL and nothing else has nothing to ask about.
+		if signatureRefused(apiErr) && prepared.Slug != "" && attempt < maxAttempts {
+			fresh, err := c.represign(ctx, prepared)
+			if err != nil {
+				// The registry's account of why these bytes have no URL beats
+				// storage's: a 403 alone reads as "retry the upload", and
+				// retrying an upload the registry has closed means declaring a
+				// second artifact — a second slug, and a dead link in whatever
+				// the first one was pasted into.
+				return err
+			}
+			endpoint = fresh
+			continue
+		}
+		if !apiErr.Retryable() || attempt == maxAttempts {
 			return err
 		}
 		c.Sleep(backoff(apiErr, attempt))
 	}
 	return last
+}
+
+// represign mints a fresh upload over the same artifact and answers where the
+// next attempt should send the bytes.
+//
+// The new URL is vetted exactly as the first one was. It arrives from the same
+// place and carries the same power to aim this process somewhere, so it goes
+// through storageOrigin — and the dial hook and redirect gate on the client cover
+// it either way.
+func (c *Client) represign(ctx context.Context, prepared *Artifact) (string, error) {
+	fresh, err := c.PresignUpload(ctx, prepared.Slug, prepared.ClaimToken)
+	if err != nil {
+		return "", err
+	}
+	if fresh.Upload == nil || fresh.Upload.URL == "" {
+		return "", Fail("no_upload_url",
+			"the registry re-presigned "+prepared.Slug+" without saying where to put the bytes")
+	}
+	endpoint, err := c.storageOrigin(fresh.Upload.URL)
+	if err != nil {
+		return "", err
+	}
+	// Headers and all: a presign signs what it signs, and sending the previous
+	// answer's headers with this answer's URL is a signature mismatch.
+	prepared.Upload = fresh.Upload
+	return endpoint, nil
+}
+
+// lapsed reports whether a presigned URL's own window has already closed. The
+// registry states the deadline in the response and storage enforces it, so this
+// is only ever a way to avoid asking storage a question we know the answer to.
+//
+// An expiry that cannot be read is not a lapsed one: a URL is worth trying on the
+// strength of the registry having just handed it over.
+func lapsed(up *Upload, now time.Time) bool {
+	if up.ExpiresAt == "" {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339, up.ExpiresAt)
+	return err == nil && now.After(at)
+}
+
+// signatureRefused reports whether a failed PUT looks like a signature storage
+// will not honour, rather than like bytes it would not take.
+//
+// S3 and R2 answer a lapsed window and an altered signature alike with a 403, and
+// neither is something the same URL recovers from. The 4xx that are about the body
+// — a length or digest that does not match what was signed — arrive as 400s, and
+// re-presigning would not help them: the same body would be refused again.
+func signatureRefused(e *Error) bool {
+	return e.Status == http.StatusForbidden && e.Code() == "storage_rejected_upload"
 }
 
 func (c *Client) putOnce(req *http.Request) error {
@@ -728,9 +874,13 @@ func (c *Client) putOnce(req *http.Request) error {
 	// reported as a snippet rather than parsed into a code we would be inventing.
 	snippet, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
 	return &Error{Status: res.StatusCode, Body: map[string]any{
-		"error":     "storage_rejected_upload",
-		"detail":    clip(strings.TrimSpace(string(snippet)), 300),
-		"fix":       "object storage refused the bytes — most often the file changed after it was measured, or the upload URL expired; retry the upload",
+		"error":  "storage_rejected_upload",
+		"detail": clip(strings.TrimSpace(string(snippet)), 300),
+		// A lapsed signature is no longer part of this advice: PutBytes mints a
+		// fresh URL over the same artifact and sends the bytes again, so a 403
+		// that survives that is not one, and "retry the upload" would send
+		// someone to `krowk push` — a second slug, and a dead first link.
+		"fix":       "object storage refused the bytes — most often the file changed after it was measured, so it no longer matches the size and digest the URL was signed for",
 		"retryable": res.StatusCode >= 500,
 	}}
 }
@@ -990,6 +1140,12 @@ func fixFor(code string, status int) string {
 		return "the file changed while it was being uploaded — retry the upload"
 	case "empty_upload":
 		return "what arrived held no bytes — check the file is not being written while it is uploaded"
+	case "already_finalized":
+		// Reached by asking for an upload URL over an artifact whose bytes are
+		// already stored. A ready artifact is a permalink, so there is no way to
+		// replace what it holds — and the new upload is a new artifact, which is
+		// worth saying out loud rather than leaving to be discovered.
+		return "this artifact's bytes are already stored and a link cannot be pointed at new ones — push again for a new artifact, which is a new link"
 	case "expired":
 		return "this artifact was anonymous and has passed its expiry — upload it again, and claim it with a key to keep it"
 	case "taken_down":
@@ -1055,6 +1211,9 @@ func retryableFor(code string) (bool, bool) {
 	// trying is worse than one that stops.
 	case "invalid", "parameter_missing", "unauthorized", "not_found", "expired",
 		"taken_down", "checksum_mismatch", "empty_upload", "run_needs_key",
+		// A finalized artifact's bytes are settled. Asking for a URL over them
+		// again answers the same however many times it is asked.
+		"already_finalized",
 		// The request itself is what is wrong in both: a body the registry could
 		// not read, and a URL it does not serve. Sending either again unchanged
 		// gets the same answer.

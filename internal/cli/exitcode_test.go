@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/krowkcom/cli/internal/api"
+	"github.com/krowkcom/cli/internal/output"
 )
 
 // Every case the taxonomy claims to answer, pinned. A change to any number here
@@ -179,11 +180,16 @@ func TestNoCodeIsInBothTables(t *testing.T) {
 }
 
 // The help text is where a person reads the taxonomy, so it has to name every
-// code the mapping can actually produce.
+// code the mapping can actually produce. Rendered through showHelp rather than
+// the template directly, so the test reads what a person reads and survives the
+// template growing arguments.
 func TestHelpDocumentsEveryExitCode(t *testing.T) {
-	help := fmt.Sprintf(helpTemplate, "1.0.0", "127.0.0.1:8787", "http://x/v1", "http://y/v1", "/tmp/creds")
+	var help strings.Builder
+	if err := showHelp(&help, nil, output.Human); err != nil {
+		t.Fatalf("showHelp: %v", err)
+	}
 	for exit := exitOK; exit <= exitGone; exit++ {
-		if !strings.Contains(help, fmt.Sprintf("\n  %d  ", exit)) {
+		if !strings.Contains(help.String(), fmt.Sprintf("\n  %d  ", exit)) {
 			t.Errorf("help text does not document exit code %d", exit)
 		}
 	}

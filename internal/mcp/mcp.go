@@ -688,6 +688,21 @@ func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string
 		// with the artifact, so the run's state is not among the facts in hand, and a
 		// second call to fetch it would buy nothing the agent asked for.
 		text += "\n\nGrouped under run " + runSlug + "."
+	} else if artifact.Run == "" {
+		// The same thing the CLI's claim hands back: the upload is kept but belongs
+		// to no run, and nothing else will ever put it in one. There are no
+		// breadcrumbs on this transport, so it is a line rather than a crumb — but
+		// it is said, instead of being left in the tool schema for an agent that has
+		// already stopped reading it.
+		//
+		// The way out named here is this tool again, the same as withClaimed's: an
+		// agent on this transport cannot shell out to `uploads attach`, and a repeat
+		// claim with the same key and token is the same success rather than a
+		// spent-token error, so the whole call can simply be made again with a run.
+		text += "\n\nIt belongs to no run. A run is where the pull request, commit and " +
+			"session are recorded — call krowk_claim_artifact again with the same slug and " +
+			"claim_token and a `run` this workspace holds to group it under one; claiming " +
+			"twice with the same key is the same success."
 	}
 	return text, structured, nil
 }
@@ -819,6 +834,10 @@ func pasteLines(paste output.Paste) []string {
 
 // claimLines carries the one-shot claim token of an anonymous upload, with the
 // warning it deserves.
+//
+// The command comes from output.ClaimCrumb, which is exported for exactly this:
+// the CLI's envelope, the CLI's human line and this server all name the same
+// call, and spelling it out a fourth time here is how the four drift apart.
 func claimLines(a *api.Artifact) []string {
 	if a.ClaimToken == "" {
 		return nil
@@ -827,7 +846,7 @@ func claimLines(a *api.Artifact) []string {
 		"",
 		"This upload is anonymous and nobody owns it yet. The command below adopts it —",
 		"the token is a secret, so hand it to the human and do not paste it anywhere public:",
-		"krowk claim " + a.Slug + " " + a.ClaimToken,
+		output.ClaimCrumb(a).Cmd,
 	}
 }
 

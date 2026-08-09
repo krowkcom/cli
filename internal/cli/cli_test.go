@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/krowkcom/cli/internal/output"
 	"github.com/krowkcom/cli/internal/registry"
 )
 
@@ -117,11 +118,13 @@ func (h *harness) get(url string) (int, string) {
 
 // envelope is the JSON shape every non-human result comes back in.
 type envelope struct {
-	OK          bool           `json:"ok"`
-	Data        data           `json:"data"`
-	Summary     string         `json:"summary"`
-	Breadcrumbs []breadcrumb   `json:"breadcrumbs"`
-	Error       map[string]any `json:"error"`
+	OK      bool   `json:"ok"`
+	Data    data   `json:"data"`
+	Summary string `json:"summary"`
+	// The output package's own type, so a field added there is one these tests
+	// see rather than one they silently drop.
+	Breadcrumbs []output.Breadcrumb `json:"breadcrumbs"`
+	Error       map[string]any      `json:"error"`
 }
 
 // data covers both shapes a command returns: an upload result, and a bare run.
@@ -155,11 +158,6 @@ type run struct {
 	Slug     string         `json:"slug"`
 	Status   string         `json:"status"`
 	Metadata map[string]any `json:"metadata"`
-}
-
-type breadcrumb struct {
-	Action string `json:"action"`
-	Cmd    string `json:"cmd"`
 }
 
 func decode(t *testing.T, s string) envelope {
@@ -303,14 +301,9 @@ func TestAnonymousUploadWorksAndSaysWhatItDropped(t *testing.T) {
 	if !strings.HasPrefix(a.ClaimToken, "krowk_claim_") {
 		t.Errorf("claim_token = %q", a.ClaimToken)
 	}
-	var claimCmd string
-	for _, c := range e.Breadcrumbs {
-		if strings.HasPrefix(c.Cmd, "krowk claim ") {
-			claimCmd = c.Cmd
-		}
-	}
-	if claimCmd != "krowk claim "+a.Slug+" "+a.ClaimToken {
-		t.Errorf("claim breadcrumb = %q", claimCmd)
+	crumb, _ := findCrumb(e.Breadcrumbs, "krowk claim ")
+	if crumb.Cmd != "krowk claim "+a.Slug+" "+a.ClaimToken {
+		t.Errorf("claim breadcrumb = %q", crumb.Cmd)
 	}
 }
 
@@ -1398,13 +1391,18 @@ func TestPagingARunsUploadsStaysScopedToTheRun(t *testing.T) {
 	if e.Data.Next == "" {
 		t.Fatal("want a cursor: the page came back full")
 	}
-	if len(e.Breadcrumbs) == 0 || !strings.Contains(e.Breadcrumbs[0].Cmd, "--run "+runSlug) {
-		t.Errorf("next-page breadcrumb = %+v, want it to keep --run", e.Breadcrumbs)
+	// Both the scope and the stride: a crumb that dropped --limit would page on
+	// in 50s having been asked for 1, and one that dropped --run would widen to
+	// the whole workspace.
+	want := "krowk uploads list --run " + runSlug + " --limit 1 --before " + e.Data.Next
+	crumb, ok := findCrumb(e.Breadcrumbs, "uploads list")
+	if !ok || crumb.Cmd != want {
+		t.Errorf("next-page breadcrumb = %+v, want %q", e.Breadcrumbs, want)
 	}
 
 	_, human, _ := h.run("uploads", "list", "--run="+runSlug, "--limit=1", "--format=human")
-	if !strings.Contains(human, "--run "+runSlug) {
-		t.Errorf("human cursor line = %q, want it to keep --run", human)
+	if !strings.Contains(human, want) {
+		t.Errorf("human cursor line = %q, want %q", human, want)
 	}
 
 	// And the command it suggests really does stay inside the run.

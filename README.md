@@ -117,6 +117,61 @@ There is no single paste-ready string, because the surfaces disagree.
 Link labels — the title or the filename — are escaped for CommonMark, so
 `frame[0].png` pastes as a working link rather than a broken one.
 
+## The JSON envelope
+
+Every command that succeeds answers in the same envelope, so an agent parses one
+shape whichever command it ran:
+
+```jsonc
+{
+  "ok": true,
+  "data": { },                  // the command's own result
+  "paste": { },                 // both paste forms, where there is a link to paste
+  "summary": "1 artifact, 27 B, run run_7f3a",
+  "breadcrumbs": [              // the calls left to make — omitted when there are none
+    {
+      "action": "keep past expiry",
+      "cmd": "krowk claim art_2e1d krowk_claim_2b7f",
+      "description": "this upload is anonymous and expires within the day; claiming it with a key keeps it and moves it into that key's workspace. The token is shown once and spent once"
+    }
+  ]
+}
+```
+
+A failure is the same envelope with `"ok": false` and an `error` object carrying
+the code, the `fix` line and `retryable`.
+
+Breadcrumbs are commands, not hints. `cmd` is ready to run, with this result's
+own slugs and tokens already in it — `action` is the short label, `description`
+says what running it achieves and what happens if it is not run. All three
+fields are always present.
+
+A `<placeholder>` in a `cmd` is a value this side genuinely does not have: the
+run to attach a claimed upload to, the file a freshly opened run is to be fed.
+**Substitute it — never paste one into a shell as it stands.** `<` and `>` are
+redirection there, so a verbatim paste runs something other than what was
+suggested. Every placeholder is named in its own `description`.
+
+The one `cmd` that is not a krowk command is `share`, which carries the link
+itself: no OS agrees on a command for handing a link to a person, so a crumb
+that ran `open` would fail everywhere but macOS.
+
+What each command hands back, one line each — the wording lives in the code:
+
+| After | Breadcrumbs |
+| --- | --- |
+| A keyless `push` | The claim that keeps each upload, **one per file**, plus the link to share; also printed for a person, since the token is shown exactly once |
+| `runs start` | The push that feeds the new run, and the `runs finish` that closes it |
+| `runs finish` | What the run made — never a second `runs finish` |
+| `runs show` | What the run made, plus the finish if it is still open |
+| `claim` without `--run` | The `uploads attach` that puts it under one — the only way a claimed upload ever gets a run; `claim --run` has already done it and says nothing |
+| A page that came back full | The same listing with `--before`, keeping the `--run` and `--limit` it was given |
+| `auth login` / `auth verify` | The push it just made possible, or the `auth verify` an unconfirmed login still needs |
+
+`--quiet` is the raw record with no envelope, so it carries no breadcrumbs at
+all — in human output either, where the claim and attach lines are suppressed;
+`--format markdown` and `--format url` are the paste forms and are untouched.
+
 ## MCP server
 
 `krowk-mcp` is the same thing for agents that cannot shell out — a thin client

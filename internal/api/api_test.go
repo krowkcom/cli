@@ -286,3 +286,238 @@ func TestRunNeedsKeyFixNamesTheFlagThatCausedIt(t *testing.T) {
 		t.Errorf("fix = %q, want the flag that caused it", fix)
 	}
 }
+
+// A slug goes into the URL as one path segment, whatever it contains.
+//
+// This is not about rejecting bad input — it is that an unescaped slug does not
+// fail, it addresses a *different* endpoint. `#` ends the path and makes the
+// rest a fragment, so `art_A#/finalization` is a request to `/artifacts/art_A`.
+// On a takedown that destroys an artifact other than the one named, which is
+// unrecoverable, and no error is reported either way.
+func TestASlugCannotEscapeItsPathSegment(t *testing.T) {
+	// RequestURI is the raw wire form, which is the only thing that decides which
+	// endpoint this reaches. r.URL.Path is already decoded, so reading that would
+	// hide the very difference under test.
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.RequestURI)
+		// An empty object satisfies every decode here. What is under test is where
+		// the request landed, not what came back.
+		fmt.Fprint(w, "{}")
+	}))
+	defer server.Close()
+
+	client := New(server.URL, "krowk_sk_test")
+	client.Sleep = func(time.Duration) {}
+
+	// Each of these would otherwise land somewhere other than where it says.
+	for _, slug := range []string{"art_A#", "art_A#/finalization", "art_A?x=1", "art_A/../art_B"} {
+		if err := client.TakeDownArtifact(context.Background(), slug, ""); err != nil {
+			t.Fatalf("takedown %q: %v", slug, err)
+		}
+	}
+
+	// The run reads matter most of the three: their responses decode into the
+	// wrong type without erroring, so a mis-routed one is not a failure but a
+	// confident wrong answer. `GET /runs/run_A` answering `runs show` decodes
+	// cleanly into a Page, which reads as "this run produced nothing".
+	if _, err := client.ShowRun(context.Background(), "run_A#x"); err != nil {
+		t.Fatalf("show run: %v", err)
+	}
+	if _, err := client.ListRunArtifacts(context.Background(), "run_A#", "", 0); err != nil {
+		t.Fatalf("list run artifacts: %v", err)
+	}
+
+	want := []string{
+		"/artifacts/art_A%23",
+		"/artifacts/art_A%23%2Ffinalization",
+		"/artifacts/art_A%3Fx=1",
+		"/artifacts/art_A%2F..%2Fart_B",
+		"/runs/run_A%23x",
+		"/runs/run_A%23/artifacts",
+	}
+	if len(paths) != len(want) {
+		t.Fatalf("paths = %v", paths)
+	}
+	for i, w := range want {
+		if paths[i] != w {
+			t.Errorf("path %d = %q, want %q", i, paths[i], w)
+		}
+	}
+}
+
+// The whole point of the header: a retry of a lost create has to be recognisable
+// as the same attempt, so the key is minted once per call and repeated by every
+// attempt of it. A fresh key per attempt would make the retry a second create.
+func TestIdempotencyKeyIsOneKeyRepeatedAcrossAttempts(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		attempt := len(keys)
+		mu.Unlock()
+		if attempt < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"error":{"code":"overloaded","message":"try later"}}`)
+			return
+		}
+		fmt.Fprint(w, `{"slug":"art_x","state":"pending","upload":{"url":"http://x/y"}}`)
+	}))
+	defer server.Close()
+
+	client, _ := testClient(server)
+	if _, err := client.PrepareArtifact(context.Background(), Spec{
+		Filename: "a.txt", ContentType: "text/plain", ByteSize: 9,
+	}); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 3 {
+		t.Fatalf("attempts = %d, want 3", len(keys))
+	}
+	for i, key := range keys {
+		if key == "" {
+			t.Fatalf("attempt %d carried no Idempotency-Key", i+1)
+		}
+		if key != keys[0] {
+			t.Errorf("attempt %d sent %q, want the first attempt's %q", i+1, key, keys[0])
+		}
+	}
+}
+
+// Two calls are two attempts, not one retried — so they must not share a key, or
+// the second declare would be answered with the first one's artifact.
+func TestEachCreateGetsItsOwnKey(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		mu.Unlock()
+		fmt.Fprint(w, `{"slug":"art_x","state":"pending","upload":{"url":"http://x/y"}}`)
+	}))
+	defer server.Close()
+
+	client, _ := testClient(server)
+	spec := Spec{Filename: "a.txt", ContentType: "text/plain", ByteSize: 9}
+	for range 2 {
+		if _, err := client.PrepareArtifact(context.Background(), spec); err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 2 {
+		t.Fatalf("calls = %d, want 2", len(keys))
+	}
+	if keys[0] == keys[1] {
+		t.Error("two separate declares shared one key, so the second would replay the first")
+	}
+}
+
+// Unguessable rather than merely unique: on a keyless push the key is the only
+// thing a retry can present to prove it made the original call, and the registry
+// scopes keys by address, so a predictable one hands the declare to anyone sharing
+// that address.
+func TestIdempotencyKeysDoNotRepeat(t *testing.T) {
+	seen := map[string]bool{}
+	for range 200 {
+		key, err := newIdempotencyKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(key) != 36 {
+			t.Fatalf("key = %q, want a 36-character UUID", key)
+		}
+		if seen[key] {
+			t.Fatalf("key %q repeated", key)
+		}
+		seen[key] = true
+	}
+}
+
+// Reading an artifact is not a create, so it carries no key. Sending one would
+// mean a GET could be refused as a reuse.
+func TestReadsCarryNoIdempotencyKey(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		mu.Unlock()
+		fmt.Fprint(w, `{"slug":"art_x","state":"ready"}`)
+	}))
+	defer server.Close()
+
+	client, _ := testClient(server)
+	if _, err := client.ShowArtifact(context.Background(), "art_x"); err != nil {
+		t.Fatalf("show: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if keys[0] != "" {
+		t.Errorf("a read sent Idempotency-Key %q, want none", keys[0])
+	}
+}
+
+// The other 404 the registry answers, and the reason it spells them
+// differently: this one is about the URL rather than about anything in it, so
+// the fix has to name KROWK_API_URL and the method rather than a slug and a
+// workspace. Getting these two the wrong way round is the failure the split
+// exists to prevent.
+func TestNoSuchEndpointIsFixedByTheURLRatherThanTheSlug(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":{"code":"no_such_endpoint","message":"No such endpoint."}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	c, slept := testClient(server)
+	_, err := c.ShowArtifact(context.Background(), "art_whatever")
+
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "no_such_endpoint" {
+		t.Fatalf("ShowArtifact = %v, want no_such_endpoint", err)
+	}
+	if !strings.Contains(apiErr.Fix(), "KROWK_API_URL") {
+		t.Errorf("fix = %q, want it to name the base URL", apiErr.Fix())
+	}
+	if strings.Contains(apiErr.Fix(), "workspace") {
+		t.Errorf("fix = %q, want it not to send anyone hunting for a slug", apiErr.Fix())
+	}
+	if apiErr.Retryable() {
+		t.Error("a URL the registry does not serve is not worth asking for twice")
+	}
+	if len(*slept) != 0 {
+		t.Errorf("slept %v — a 404 is not worth retrying", *slept)
+	}
+}
+
+// A body the registry could not read carries its own fix in the message, so the
+// client adds none — the same reason parameter_missing and invalid add none.
+func TestAnUnreadableBodyKeepsTheRegistrysOwnMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":{"code":"bad_request","message":"The request body is not valid JSON."}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	c, _ := testClient(server)
+	_, err := c.ShowArtifact(context.Background(), "art_whatever")
+
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "bad_request" {
+		t.Fatalf("ShowArtifact = %v, want bad_request", err)
+	}
+	if apiErr.Fix() != "" {
+		t.Errorf("fix = %q, want none — the registry's message already names it", apiErr.Fix())
+	}
+	if apiErr.Retryable() {
+		t.Error("a body the registry could not read reads the same the second time")
+	}
+}

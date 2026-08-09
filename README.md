@@ -40,10 +40,13 @@ advertises all land with the first tagged release — see the prerequisites belo
 | --- | --- |
 | `krowk push <file...>` | Upload files, get a link for each |
 | `krowk uploads create <file...>` | The same thing, spelled out |
-| `krowk uploads list` | List the workspace's uploads, newest first (`--limit`, `--before`) |
+| `krowk uploads list` | List uploads, newest first — the workspace's, or one run's with `--run` (`--limit`, `--before`) |
 | `krowk uploads show <artifact>` | Read one artifact back |
 | `krowk uploads attach <artifact> --run <run>` | Put an upload under a run after it was uploaded |
+| `krowk uploads delete <artifact> [claim-token]` | Take an upload down — the bytes go at once, and it cannot be undone |
 | `krowk runs start` | Open a run to group later uploads under |
+| `krowk runs list` | List the workspace's runs, newest first (`--limit`, `--before`) |
+| `krowk runs show <run>` | Read one run back, with everything recorded on it |
 | `krowk runs finish <run>` | Close a run |
 | `krowk claim <artifact> <claim-token>` | Keep an anonymous upload past its expiry (`--run` groups it while claiming) |
 | `krowk auth login --token <token>` | Check a token against the registry, then store it in `~/.config/krowk/credentials.json` (0600) |
@@ -221,16 +224,29 @@ GET        /v1/key                            the key this request is made with
 GET        /v1/artifacts                      list, newest first (needs a key)
 POST       /v1/artifacts                      declare an upload
 GET        /v1/artifacts/:slug                read one back
+DELETE     /v1/artifacts/:slug                take it down (needs a key or its claim token)
 PUT|PATCH  /v1/artifacts/:slug/finalization   confirm the bytes landed
 POST       /v1/artifacts/:slug/claim          spend a claim token (needs a key)
 PUT|PATCH  /v1/artifacts/:slug/run            put it under a run (needs a key)
+GET        /v1/runs                           list runs, newest first (needs a key)
 POST       /v1/runs                           open a run (needs a key)
+GET        /v1/runs/:slug                     read one back, metadata and all (needs a key)
+GET        /v1/runs/:slug/artifacts           what one run produced (needs a key)
 PUT|PATCH  /v1/runs/:slug/completion          close a run (needs a key)
 ```
 
 Everything but listing, claiming, attaching, the key and the run endpoints works
 without a key: for a keyless request the slug *is* the capability, since slugs
 are 21 random base58 characters and the bytes are public on the CDN regardless.
+
+Taking one down is the exception, and it is keyed differently than it looks. A
+slug travels in whatever the link was pasted into, so a reader of a link must not
+be able to destroy what they read — a keyless takedown is authorised by the claim
+token instead. The client sends that token *instead of* the key rather than
+alongside it: offered both, the registry reads the key and looks in its
+workspace, where an upload still sitting in the anonymous one is simply not
+found. Withholding the key is what lets a logged-in machine take down what a CI
+job pushed anonymously.
 
 ```
 POST {KROWK_API_URL}/artifacts
@@ -284,12 +300,26 @@ thing to actually do, so `krowk`'s own errors and the registry's read alike.
   the same success, and the record keeps the moment it first reached that state.
 - **Listing is cursor-paged** — `next` carries the slug to pass back as `before`,
   and is null on the last page. It is present whenever a page came back full, so a
-  total that is an exact multiple of `--limit` costs one extra empty page.
+  total that is an exact multiple of `--limit` costs one extra empty page. Runs and
+  a run's artifacts page the same way, off the same cursor.
+- **A run's uploads are a collection of the run, not a filter** — `krowk uploads
+  list --run <run>` reads `/v1/runs/:slug/artifacts`, so a run that does not exist
+  is a `404` from the run itself. A filter would answer an empty page, which no
+  caller can tell apart from a run that genuinely produced nothing.
 - **Retries** — up to 3 attempts on a retryable failure (429, 5xx,
   `upload_missing`, `storage_unavailable`), honouring `Retry-After` in either
   spelling the HTTP spec allows, capped at 60 seconds so a header cannot wedge
-  the CLI.
+  the CLI. The two calls that create something carry an `Idempotency-Key` naming
+  the attempt, so retrying one is free rather than a second record — which is what
+  lets opening a run be retried at all.
 - **Expiry** — an anonymous artifact past its expiry answers `410 Gone`.
+- **Takedown is immediate and unrecoverable** — the bytes leave storage at once
+  and what stays behind is a tombstone, so the slug answers `410 taken_down`
+  rather than `404`: the link is already pasted somewhere, and its reader deserves
+  to know the artifact was removed rather than to go hunting for a typo. It is
+  deliberately not routed through a trash or a recovery window, because the case
+  it exists for is a secret uploaded by accident, and a secret that can be
+  restored is still leaked. Taking down what is already down is a success.
 - **Upload targets are storage, not anything reachable.** A presigned URL names a
   foreign host by design, but the client requires `https`, ignores `method` and
   always sends `PUT`, and refuses loopback, link-local, private and carrier-grade
@@ -327,15 +357,32 @@ thing to actually do, so `krowk`'s own errors and the registry's read alike.
   where a proxy sends the bytes is the proxy's business, so a name that resolves
   differently for it than for the URL check is not something this client can see.
 
-### Not idempotent across pushes
+### Retries dedupe, identical pushes do not
 
 Pushing the same bytes twice creates **two artifacts with two links**. An
-artifact's identity is a random slug, not a digest of its contents, so the
-registry cannot tell a retry from a second upload. The earlier draft of this CLI
-promised digest-derived IDs and one stable link per file; the registry does not
-work that way, and this client no longer claims it does. An agent that retries a
-whole `push` after a partial failure leaves the first attempt's artifacts behind
-to expire.
+artifact's identity is a random slug, never a digest of its contents. That is
+settled rather than pending: a digest slug would make an anonymous link guessable,
+and merging on content alone would join two people who happened to upload the same
+screenshot. The earlier draft of this CLI promised digest-derived IDs and one
+stable link per file; it does not work that way and will not.
+
+**A retry is the exception.** Each of the two calls that create something — opening
+a run, declaring an artifact — carries an `Idempotency-Key` naming that attempt, and
+every retry of the call repeats it, so the registry answers with the record the
+first attempt already made. An agent whose push fails halfway no longer leaves the
+first attempt's artifacts behind to expire, and eleven retries cost one upload
+rather than eleven.
+
+One key per call rather than per `push`: the registry matches a key against the
+payload it was first used with, so one key spread across three files would have the
+second file refused as a reuse. Re-running `krowk push` yourself mints fresh keys,
+because that is a new attempt rather than a retry of the old one.
+
+On a keyless push the key is a **credential**. With no API key there is nothing else
+a retry can present to prove it made the original call, so the registry scopes keys
+by the address they came from — and this client sends a random UUID for exactly that
+reason. A predictable one would let anyone sharing that address, a NAT or a CI
+runner pool, replay your declare and be handed a URL to write its bytes.
 
 ## Testing against a local registry
 
@@ -440,9 +487,11 @@ already ships as `krowk-mcp`; what `@krowk/mcp` still needs is the npm wrapper.
 
 ## Open questions
 
-- **Nothing dedupes.** See [above](#not-idempotent-across-pushes). Should the
-  registry key artifacts by digest within a workspace, or is a link per push the
-  intended behaviour?
+- ~~**Nothing dedupes.** Should the registry key artifacts by digest within a
+  workspace, or is a link per push the intended behaviour?~~ **Answered:** a link
+  per push, and retries named with an `Idempotency-Key` — not digests. See
+  [above](#retries-dedupe-identical-pushes-do-not), and canon,
+  `glossary.md` → Identical bytes do not dedupe.
 - **A run per push.** With a key, every `push` that is not given `--run` opens
   and closes its own run, so ten screenshots from one agent session become ten
   runs. Should the CLI persist a run for the session — keyed on the agent's

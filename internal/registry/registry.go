@@ -19,8 +19,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"path"
 	"slices"
@@ -72,6 +74,10 @@ type artifact struct {
 	uploadTok  string
 	uploadTil  time.Time
 	claimed    bool
+	// deletedAt turns the record into a tombstone: the bytes are gone but the row
+	// stays, so a slug that was taken down answers 410 rather than 404. Zero means
+	// it is still live.
+	deletedAt time.Time
 	// storageKey is pinned at declare time: claiming moves the artifact to a
 	// new workspace, but the bytes stay where the presigned URL was signed for.
 	storageKey string
@@ -90,6 +96,23 @@ type run struct {
 	CreatedAt  string          `json:"created_at"`
 
 	workspace string
+	// seq orders a listing, for the same reason an artifact's does: a timestamp
+	// would tie two runs opened in the same instant, and a page has to be totally
+	// ordered or rows swap places between pages.
+	seq int
+}
+
+// answered is a create this stand-in has already replied to, found again by the
+// Idempotency-Key a client named its attempt with.
+//
+// requestHash is what the key was first used for, because the same key arriving
+// with a different payload is a refusal rather than a replay. The record is held
+// by slug rather than by pointer so this cannot end up pointing at an artifact
+// that is gone.
+type answered struct {
+	requestHash string
+	artifact    string
+	run         string
 }
 
 type store struct {
@@ -97,8 +120,14 @@ type store struct {
 	artifacts map[string]*artifact
 	runs      map[string]*run
 	objects   map[string][]byte
-	created   int
-	now       func() time.Time
+	// Keyed by what is being created, who is creating it, and the client's key —
+	// all three, as the real registry digests all three. Per kind so one key can
+	// cover the run and the artifact of a single push; per caller so one client's
+	// key cannot collide with, or be replayed by, another's.
+	idempotent map[string]*answered
+	created    int
+	runsOpen   int
+	now        func() time.Time
 }
 
 // Handler serves the stand-in registry. siteURL is the origin baked into the
@@ -116,10 +145,11 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 		limitBytes = DefaultLimitBytes
 	}
 	s := &store{
-		artifacts: map[string]*artifact{},
-		runs:      map[string]*run{},
-		objects:   map[string][]byte{},
-		now:       now,
+		artifacts:  map[string]*artifact{},
+		runs:       map[string]*run{},
+		objects:    map[string][]byte{},
+		idempotent: map[string]*answered{},
+		now:        now,
 	}
 
 	mux := http.NewServeMux()
@@ -136,6 +166,10 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	})
 	mux.HandleFunc("GET /v1/artifacts", s.listArtifacts)
 	mux.HandleFunc("GET /v1/artifacts/{slug}", s.showArtifact)
+
+	// Takedown, and a hard purge: the bytes go at once rather than into anything
+	// that could hand them back.
+	mux.HandleFunc("DELETE /v1/artifacts/{slug}", s.destroyArtifact)
 
 	// Finalizing and completing are nested resources reached with PUT, because
 	// they are idempotent; claiming spends a one-shot token, so it is a POST.
@@ -154,16 +188,32 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	mux.HandleFunc("GET /v1/key", showKey)
 
 	mux.HandleFunc("POST /v1/runs", s.createRun)
+	mux.HandleFunc("GET /v1/runs", s.listRuns)
+	mux.HandleFunc("GET /v1/runs/{slug}", s.showRun)
 	mux.HandleFunc("PUT /v1/runs/{slug}/completion", s.finishRun)
 	mux.HandleFunc("PATCH /v1/runs/{slug}/completion", s.finishRun)
+
+	// What one run produced, served as a collection of the run rather than as a
+	// filter on the artifact listing: the run is looked up first, so an unknown
+	// slug is a 404 where a filter would answer an empty page — which a client
+	// cannot tell apart from a run that genuinely produced nothing.
+	mux.HandleFunc("GET /v1/runs/{slug}/artifacts", s.listRunArtifacts)
 
 	// Object storage, standing in for R2. PUT is the presigned upload target;
 	// GET is the CDN, so a link this stand-in hands out actually resolves.
 	mux.HandleFunc("PUT /_storage/{workspace}/{slug}/{filename}", s.putObject)
 	mux.HandleFunc("GET /_storage/{workspace}/{slug}/{filename}", s.getObject)
 
+	// A path that matches nothing, which includes a known path asked for with a
+	// verb it does not serve — Go's mux falls through to this pattern rather
+	// than answering 405, and so does the Rails router the real registry runs.
+	//
+	// `no_such_endpoint` rather than `not_found`: an unknown slug and an unknown
+	// path are different mistakes, and a client that cannot tell them apart
+	// sends someone hunting for a typo in a slug when the base URL is wrong.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, http.StatusNotFound, "not_found", "No such endpoint.", nil)
+		writeError(w, http.StatusNotFound, "no_such_endpoint",
+			"No such endpoint. Check the path and the method — GET / lists the versions this API serves.", nil)
 	})
 
 	return mux
@@ -186,6 +236,9 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		} `json:"artifact"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		if unreadableBody(w, err) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "parameter_missing",
 			"Missing required parameter: artifact.", nil)
 		return
@@ -227,8 +280,32 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		return
 	}
 
+	attempt, ok := idempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	// Who the key belongs to. A keyed request has a workspace the token proves; a
+	// keyless one has nothing to prove anything with, so it falls back to the
+	// address it came from — which makes the key itself the credential for a
+	// keyless caller.
+	scope := workspace
+	if anonymous {
+		scope = "ip:" + clientAddress(r)
+	}
+	requestHash := sha256Hex([]byte(fmt.Sprintf("%q", []string{
+		in.Filename, in.ContentType, itoa(in.ByteSize), strings.ToLower(in.Checksum), in.Run,
+	})))
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if attempt != "" {
+		if found, matches := s.replay("artifact", scope, attempt, requestHash); found != nil {
+			if s.replayDeclare(w, found, matches) {
+				return
+			}
+		}
+	}
 
 	if in.Run != "" {
 		if existing, ok := s.runs[in.Run]; !ok || existing.workspace != workspace {
@@ -264,7 +341,6 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	s.created++
 	a.seq = s.created
 
-	payload := map[string]any{}
 	var claimToken string
 	if anonymous {
 		a.ExpiresAt = now.Add(ephemeralLifetime).Format(time.RFC3339Nano)
@@ -273,9 +349,26 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	}
 	s.artifacts[slug] = a
 
+	if attempt != "" {
+		s.remember("artifact", scope, attempt, requestHash, &answered{artifact: slug})
+	}
+
+	writeJSON(w, http.StatusCreated, s.declared(a, claimToken))
+}
+
+// declared is what a create answers with: the artifact, where to put its bytes,
+// and what to do next.
+//
+// Split out because a replay answers the same shape over the record it already
+// made. The upload block is minted again there rather than repeated from the first
+// answer — a signature is good for 15 minutes while an artifact waits far longer,
+// so a stored one is usually dead by the time a retry asks.
+func (s *store) declared(a *artifact, claimToken string) map[string]any {
+	payload := map[string]any{}
 	for k, v := range serializeArtifact(a) {
 		payload[k] = v
 	}
+
 	uploadHeaders := map[string]string{"Content-Type": a.ContentType, "Content-Length": itoa(a.ByteSize)}
 	// Handed over because the real presign signs it as a header: storage reads the
 	// checksum from there, not from the query string, and refuses the PUT without
@@ -285,17 +378,57 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	}
 	payload["upload"] = map[string]any{
 		"method":     "PUT",
-		"url":        url + "?upload_token=" + a.uploadTok,
+		"url":        a.URL + "?upload_token=" + a.uploadTok,
 		"headers":    uploadHeaders,
 		"expires_at": a.uploadTil.Format(time.RFC3339Nano),
 	}
 	payload["next_step"] = "PUT the file to upload.url with the headers in upload.headers, " +
-		"then PUT /v1/artifacts/" + slug + "/finalization"
+		"then PUT /v1/artifacts/" + a.Slug + "/finalization"
 	if claimToken != "" {
 		payload["claim_token"] = claimToken
 	}
+	return payload
+}
 
-	writeJSON(w, http.StatusCreated, payload)
+// replayDeclare answers a retried declare with the artifact the first attempt
+// made, and reports whether it handled the request.
+//
+// The state is asked about before a URL is handed out, because a key outlives its
+// artifact's lifecycle: takedown keeps the row, so without this a replay would
+// mint a fresh PUT over the storage key of an artifact somebody deleted. Ready and
+// expired are refused for the same reason the represign endpoint refuses them.
+//
+// One place this stand-in is deliberately thinner than the real registry: a real
+// presign leaves earlier signatures valid until they expire, while re-minting here
+// revokes the previous token. Nothing a client does depends on the old one — the
+// retry uses the URL it was just handed — so the simpler model stays.
+func (s *store) replayDeclare(w http.ResponseWriter, found *answered, matches bool) bool {
+	a, ok := s.artifacts[found.artifact]
+	if !ok {
+		return false
+	}
+	if !matches {
+		keyReused(w, a.Slug)
+		return true
+	}
+	if s.refuseIfGone(w, a) {
+		return true
+	}
+	if a.State == "ready" {
+		writeError(w, http.StatusConflict, "already_finalized",
+			a.Slug+" is already finalized — declare a new artifact for new bytes", nil)
+		return true
+	}
+
+	now := s.now().UTC()
+	a.uploadTok = randomToken()
+	a.uploadTil = now.Add(uploadURLLifetime)
+
+	// The claim token is not re-issued. Re-minting one would void the token the
+	// first response may already have delivered, and the row keeps only its digest
+	// regardless — as in the real registry.
+	writeJSON(w, http.StatusCreated, s.declared(a, ""))
+	return true
 }
 
 // putObject is object storage. It enforces what the real presigned URL enforces
@@ -418,13 +551,14 @@ func (s *store) finalizeArtifact(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
-	if a.State == "ready" {
-		writeJSON(w, http.StatusOK, serializeArtifact(a))
+	// Gone is checked before the idempotent success, because a taken-down artifact
+	// is normally a ready one: answering 200 for it would hand back a url and a
+	// markdown snippet pointing at bytes that are no longer there.
+	if s.refuseIfGone(w, a) {
 		return
 	}
-	if s.expired(a) {
-		writeError(w, http.StatusGone, "expired",
-			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+	if a.State == "ready" {
+		writeJSON(w, http.StatusOK, serializeArtifact(a))
 		return
 	}
 	// 409 rather than 422: the request is well formed, it just arrived before the
@@ -469,19 +603,17 @@ func (s *store) listArtifacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit := defaultPageSize
-	if requested, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil {
-		// Clamped rather than refused: a caller asking for more than we serve gets
-		// the most we serve, which is what it wanted.
-		limit = min(max(requested, 1), maxPageSize)
-	}
+	limit := pageLimit(r)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Tombstones are not part of what a workspace holds: a tombstone records that
+	// something used to be at a slug, not something still there, so it belongs in
+	// the answer to "what is at this slug" and nowhere else.
 	var owned []*artifact
 	for _, a := range s.artifacts {
-		if a.workspace == workspace {
+		if a.workspace == workspace && a.deletedAt.IsZero() {
 			owned = append(owned, a)
 		}
 	}
@@ -498,23 +630,48 @@ func (s *store) listArtifacts(w http.ResponseWriter, r *http.Request) {
 		owned = slices.DeleteFunc(owned, func(a *artifact) bool { return a.seq >= cursor.seq })
 	}
 
-	// next is the slug to pass back as before, and is null on the last page.
-	// Present whenever the page came back full, as the registry's own does — so a
-	// total that is an exact multiple of the limit costs one extra empty page
-	// rather than a count query on every listing.
-	if len(owned) > limit {
-		owned = owned[:limit]
-	}
-	var next any
-	if len(owned) == limit {
-		next = owned[len(owned)-1].Slug
-	}
+	owned, next := paginate(owned, limit, func(a *artifact) string { return a.Slug })
 
 	page := make([]map[string]any, 0, len(owned))
 	for _, a := range owned {
 		page = append(page, serializeArtifact(a))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"artifacts": page, "next": next})
+}
+
+// pageLimit is how many rows a listing serves, clamped rather than refused: a
+// caller asking for more than we serve gets the most we serve, which is what it
+// wanted. Anything that is not a number at all is not a request for one, so it
+// gets the default rather than being read as zero.
+func pageLimit(r *http.Request) int {
+	requested, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	// A number too large to hold is still a number asked for. Ruby has no such
+	// ceiling, so the registry parses it and clamps it like any other — and Atoi
+	// saturates rather than losing it, reporting ErrRange, so clamping the
+	// saturated value lands in the same place. Only something that is not a
+	// number at all takes the default.
+	if err != nil && !errors.Is(err, strconv.ErrRange) {
+		return defaultPageSize
+	}
+	return min(max(requested, 1), maxPageSize)
+}
+
+// paginate cuts a newest-first slice down to one page and names the cursor for
+// the next one.
+//
+// next is present whenever the page came back full, as the registry's own
+// listings are — so a total that is an exact multiple of the limit costs one
+// extra empty page rather than a count query on every listing. Shared by every
+// listing here, because a client that learned the rule from one of them has to
+// be right about the next.
+func paginate[T any](rows []T, limit int, slug func(T) string) ([]T, any) {
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	if len(rows) < limit {
+		return rows, nil
+	}
+	return rows, slug(rows[len(rows)-1])
 }
 
 func (s *store) showArtifact(w http.ResponseWriter, r *http.Request) {
@@ -531,12 +688,113 @@ func (s *store) showArtifact(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
-	if s.expired(a) {
-		writeError(w, http.StatusGone, "expired",
-			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+	if s.refuseIfGone(w, a) {
 		return
 	}
 	writeJSON(w, http.StatusOK, serializeArtifact(a))
+}
+
+// destroyArtifact is the takedown. The bytes leave storage at once and what
+// stays behind is a tombstone, so a read afterwards is a 410 rather than a 404 —
+// the link is already pasted somewhere, and its reader deserves the difference.
+//
+// Immediate and unrecoverable by design. This is the path someone reaches for
+// when a secret was uploaded by accident, so it must not route through any
+// window that could give the bytes back.
+//
+// 204 rather than the artifact: there is nothing left to serialize, and a url
+// and markdown naming bytes that are gone would be a lie.
+func (s *store) destroyArtifact(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := authenticate(w, r)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		ClaimToken string `json:"claim_token"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); unreadableBody(w, err) {
+		return
+	}
+
+	// A keyless caller's authority is the claim token, and the slug will not do
+	// even though it does for reading: a slug travels in whatever the link was
+	// pasted into, so a reader of the paste must not be able to destroy what they
+	// read.
+	if workspace == "" && body.ClaimToken == "" {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: claim_token.", nil)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a := s.artifacts[r.PathValue("slug")]
+	if !authorizedToTakeDown(a, workspace, body.ClaimToken) {
+		// A slug that does not exist, one belonging to another workspace, and a
+		// token that does not match are all the same answer: a wrong guess learns
+		// nothing from the difference.
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+
+	// Idempotent, like finalizing: taking down what is already down is a success,
+	// and the deleted_at already recorded is the one that is true.
+	if a.deletedAt.IsZero() {
+		delete(s.objects, a.storageKey)
+		a.deletedAt = s.now().UTC()
+		// A takedown spends whatever upload URL is outstanding, so bytes cannot
+		// land under a tombstone and resurrect the link. Real storage governs that
+		// with the signature's own window instead, which a stand-in has no way to
+		// reach — refusing outright is the stricter of the two, and no client that
+		// takes an artifact down goes on to upload to it.
+		a.uploadTok = ""
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// authorizedToTakeDown reports whether the request carries an authority over
+// this artifact. A key's is the workspace it acts in; a claim token's is the one
+// artifact it was issued for.
+//
+// A spent token is no authority at all: claiming clears the digest in the real
+// registry, and the artifact has left the anonymous workspace by then anyway, so
+// a claimed artifact answers only to the key that now holds it.
+//
+// A tombstone still answers to both, which is what makes a retried takedown a
+// success rather than a 404.
+func authorizedToTakeDown(a *artifact, workspace, claimToken string) bool {
+	switch {
+	case a == nil:
+		return false
+	case workspace != "":
+		return a.workspace == workspace
+	default:
+		return a.claimHash != "" && !a.claimed &&
+			a.claimHash == sha256Hex([]byte(claimToken))
+	}
+}
+
+// refuseIfGone answers for an artifact the API will not act on any further, and
+// reports whether it did. Reading, finalizing, claiming and naming a run all go
+// through here, so gone means the same thing on every one of them.
+//
+// Takedown is reported first because an artifact can be both, and the one
+// somebody decided is the truer answer.
+func (s *store) refuseIfGone(w http.ResponseWriter, a *artifact) bool {
+	switch {
+	case !a.deletedAt.IsZero():
+		writeError(w, http.StatusGone, "taken_down",
+			fmt.Sprintf("%s was taken down at %s", a.Slug,
+				a.deletedAt.Format(time.RFC3339Nano)), nil)
+	case s.expired(a):
+		writeError(w, http.StatusGone, "expired",
+			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+	default:
+		return false
+	}
+	return true
 }
 
 // claimArtifact moves an anonymous artifact into the key's workspace, where it
@@ -550,7 +808,9 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ClaimToken string `json:"claim_token"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); unreadableBody(w, err) {
+		return
+	}
 	if body.ClaimToken == "" {
 		writeError(w, http.StatusBadRequest, "parameter_missing",
 			"Missing required parameter: claim_token.", nil)
@@ -563,24 +823,44 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 	a := s.artifacts[r.PathValue("slug")]
 	// The token is checked before anything else: even an artifact the workspace
 	// already holds does not answer 200 to a token that was never its own.
+	//
+	// Stricter than the registry, deliberately and not by oversight. There the
+	// retry is a bare `find_by(slug:)` in the caller's workspace — no token read
+	// at all — so a wrong token, a missing one, and an artifact that was never
+	// anonymous all answer 200. Requiring the token here means a garbage one
+	// cannot ride the retry-after-success affordance, which is the property worth
+	// testing; the cost is that these four cases answer 404 or 400 against --dev
+	// where production answers 200. Nothing the CLI does reaches them.
 	match := a != nil && a.claimHash != "" && a.claimHash == sha256Hex([]byte(body.ClaimToken))
 	// A retry after a successful claim is the same success rather than a 404 —
 	// the hash is kept, not cleared, so the retry can still be told apart from
 	// a wrong token.
+	//
+	// This has to stay ahead of the 404 gate below, tombstone check included. The
+	// registry answers a retry from `Current.workspace.artifacts.find_by`, which
+	// is not scoped to `live`, so an artifact this workspace claimed and later
+	// took down still answers 200 here — the `live` scope only governs the branch
+	// that spends a token, which a retry no longer reaches.
 	if match && a.claimed && a.workspace == workspace {
 		writeJSON(w, http.StatusOK, serializeArtifact(a))
 		return
 	}
 	// A slug that does not exist, a token that does not match it, an artifact
-	// that was never anonymous, and one already claimed by someone else are all
-	// the same answer.
-	if !match || a.claimed {
+	// that was never anonymous, one already claimed by someone else, and a
+	// tombstone are all the same answer.
+	//
+	// A tombstone belongs in that list rather than in the gone check below,
+	// because the registry reaches this through Artifact.claimable, which narrows
+	// to `live` — so a taken-down artifact is not found rather than gone. Nothing
+	// claims an artifact back out of a takedown, and answering `taken_down` here
+	// would have the client branch differently against --dev than production.
+	if !match || a.claimed || !a.deletedAt.IsZero() {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
-	if s.expired(a) {
-		writeError(w, http.StatusGone, "expired",
-			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+	// Only an expiry reaches this now, which is all claim! can meet for the same
+	// reason: the takedown case never gets past the live scope above.
+	if s.refuseIfGone(w, a) {
 		return
 	}
 
@@ -613,7 +893,9 @@ func (s *store) attachRun(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Run string `json:"run"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); unreadableBody(w, err) {
+		return
+	}
 	if body.Run == "" {
 		writeError(w, http.StatusBadRequest, "parameter_missing",
 			"Missing required parameter: run.", nil)
@@ -631,14 +913,13 @@ func (s *store) attachRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
-	// Past its expiry an artifact is gone as far as the API is concerned, on every
-	// endpoint rather than only the ones that can meet an expiring one today.
-	// Nothing here produces this state — only a keyless upload gets an expiry, and
-	// this route needs a key — but the meaning of an expiry has to be uniform if an
-	// ephemeral artifact ever does reach a keyed workspace.
-	if s.expired(a) {
-		writeError(w, http.StatusGone, "expired",
-			fmt.Sprintf("%s expired at %v", a.Slug, a.ExpiresAt), nil)
+	// Gone is gone on every endpoint rather than only the ones that can meet a
+	// gone artifact today. A takedown is reachable here — this route needs a key,
+	// and so does taking down a workspace's own artifact — while an expiry is not,
+	// since only a keyless upload gets one. Both go through the same check anyway,
+	// so the meaning stays uniform if an ephemeral artifact ever does reach a keyed
+	// workspace.
+	if s.refuseIfGone(w, a) {
 		return
 	}
 	if existing, ok := s.runs[body.Run]; !ok || existing.workspace != workspace {
@@ -668,6 +949,9 @@ func (s *store) createRun(w http.ResponseWriter, r *http.Request) {
 	// A body that does not parse is refused, exactly as createArtifact refuses
 	// one — an empty body is fine, a run needs no metadata.
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil && err != io.EOF {
+		if unreadableBody(w, err) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "parameter_missing",
 			"Missing required parameter: run.", nil)
 		return
@@ -677,6 +961,12 @@ func (s *store) createRun(w http.ResponseWriter, r *http.Request) {
 	if !json.Valid(metadata) {
 		metadata = json.RawMessage("{}")
 	}
+
+	attempt, ok := idempotencyKey(w, r)
+	if !ok {
+		return
+	}
+	requestHash := sha256Hex(metadata)
 
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	entry := &run{
@@ -689,10 +979,150 @@ func (s *store) createRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	// A run has no upload to close and no tombstone to trip over, so a replay is
+	// simply the run the first attempt opened — however far through its lifecycle
+	// it has since gone.
+	if attempt != "" {
+		if found, matches := s.replay("run", workspace, attempt, requestHash); found != nil {
+			if opened, live := s.runs[found.run]; live {
+				s.mu.Unlock()
+				if !matches {
+					keyReused(w, opened.Slug)
+					return
+				}
+				writeJSON(w, http.StatusCreated, opened)
+				return
+			}
+		}
+	}
+	s.runsOpen++
+	entry.seq = s.runsOpen
 	s.runs[entry.Slug] = entry
+	if attempt != "" {
+		s.remember("run", workspace, attempt, requestHash, &answered{run: entry.Slug})
+	}
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusCreated, entry)
+}
+
+// listRuns is one page of a workspace's runs, newest first.
+func (s *store) listRuns(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+	limit := pageLimit(r)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var owned []*run
+	for _, entry := range s.runs {
+		if entry.workspace == workspace {
+			owned = append(owned, entry)
+		}
+	}
+	slices.SortFunc(owned, func(x, y *run) int { return y.seq - x.seq })
+
+	if before := r.URL.Query().Get("before"); before != "" {
+		// Looked up in the same workspace as the page, so a cursor from another
+		// tenant reads as simply not existing.
+		cursor := s.findRun(workspace, before)
+		if cursor == nil {
+			writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+			return
+		}
+		owned = slices.DeleteFunc(owned, func(entry *run) bool { return entry.seq >= cursor.seq })
+	}
+
+	owned, next := paginate(owned, limit, func(entry *run) string { return entry.Slug })
+	// Serialized as itself rather than through a map, since a run's JSON shape is
+	// the struct's own tags.
+	page := make([]*run, 0, len(owned))
+	page = append(page, owned...)
+	writeJSON(w, http.StatusOK, map[string]any{"runs": page, "next": next})
+}
+
+func (s *store) showRun(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry := s.findRun(workspace, r.PathValue("slug"))
+	if entry == nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
+}
+
+// listRunArtifacts is what one run produced — a collection of the run rather
+// than a filter on the workspace listing, so the run is looked up first and an
+// unknown slug is a 404. A filter would answer an empty page instead, which a
+// client cannot tell apart from a run that genuinely produced nothing.
+func (s *store) listRunArtifacts(w http.ResponseWriter, r *http.Request) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+	limit := pageLimit(r)
+	runSlug := r.PathValue("slug")
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.findRun(workspace, runSlug) == nil {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+
+	// Belonging to the run is what selects these, and the workspace is checked
+	// anyway. It cannot currently differ — an artifact only joins a run through a
+	// keyed request in that same workspace, and a keyless upload is refused a run
+	// outright — so the second half never fires today. It is here because this is
+	// the boundary between tenants, and a boundary that holds by invariant fails
+	// silently when the invariant moves.
+	var made []*artifact
+	for _, a := range s.artifacts {
+		if a.Run == runSlug && a.workspace == workspace && a.deletedAt.IsZero() {
+			made = append(made, a)
+		}
+	}
+	slices.SortFunc(made, func(x, y *artifact) int { return y.seq - x.seq })
+
+	if before := r.URL.Query().Get("before"); before != "" {
+		// Looked up among the run's own, so a cursor from outside this run reads as
+		// simply not existing.
+		cursor := s.artifacts[before]
+		if cursor == nil || cursor.Run != runSlug {
+			writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+			return
+		}
+		made = slices.DeleteFunc(made, func(a *artifact) bool { return a.seq >= cursor.seq })
+	}
+
+	made, next := paginate(made, limit, func(a *artifact) string { return a.Slug })
+	page := make([]map[string]any, 0, len(made))
+	for _, a := range made {
+		page = append(page, serializeArtifact(a))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"artifacts": page, "next": next})
+}
+
+// findRun scopes a lookup to the workspace the request belongs to, so a slug
+// from another one reads as simply not existing rather than as forbidden —
+// which would confirm that it does.
+func (s *store) findRun(workspace, slug string) *run {
+	entry := s.runs[slug]
+	if entry == nil || entry.workspace != workspace {
+		return nil
+	}
+	return entry
 }
 
 func (s *store) finishRun(w http.ResponseWriter, r *http.Request) {
@@ -704,8 +1134,8 @@ func (s *store) finishRun(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	entry := s.runs[r.PathValue("slug")]
-	if entry == nil || entry.workspace != workspace {
+	entry := s.findRun(workspace, r.PathValue("slug"))
+	if entry == nil {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
@@ -881,6 +1311,70 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// clientAddress is where a request came from, which is the only identity a
+// keyless caller has to scope an Idempotency-Key by.
+func clientAddress(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+// idempotencyKey reads the header a client names its attempt with, and reports
+// whether the request may go on.
+//
+// A header sent empty is refused rather than treated as absent, exactly as the
+// real registry refuses it: the client asked for the guarantee and would not be
+// getting it, and a retry that quietly stops deduplicating surfaces as a
+// surprise on a bill rather than as an error.
+func idempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	values, sent := r.Header["Idempotency-Key"]
+	if !sent {
+		return "", true
+	}
+	key := ""
+	if len(values) > 0 {
+		key = strings.TrimSpace(values[0])
+	}
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: Idempotency-Key.", nil)
+		return "", false
+	}
+	return key, true
+}
+
+// replay finds what a key already created, and reports whether the payload it
+// arrived with is the one it was first used for.
+//
+// No expiry, deliberately. The real registry promises a key is honoured for *at
+// least* a day and sweeps it hourly after that, so a key it still answers for is
+// one this process must answer for too — cutting them off at exactly a day here
+// would have the stand-in refuse replays the registry allows, which is the drift
+// that matters. Honouring them for as long as the process lives errs the safe way,
+// and nothing a client does depends on a key going stale.
+func (s *store) replay(kind, scope, key, requestHash string) (*answered, bool) {
+	found, ok := s.idempotent[kind+"\n"+scope+"\n"+key]
+	if !ok {
+		return nil, false
+	}
+	return found, found.requestHash == requestHash
+}
+
+func (s *store) remember(kind, scope, key, requestHash string, entry *answered) {
+	entry.requestHash = requestHash
+	s.idempotent[kind+"\n"+scope+"\n"+key] = entry
+}
+
+// keyReused is the one refusal an Idempotency-Key adds to the wire. 409 rather
+// than 422 for the same reason already_finalized is one: nothing about the
+// payload is wrong, and what refuses it is a record that already exists.
+func keyReused(w http.ResponseWriter, slug string) {
+	writeError(w, http.StatusConflict, "idempotency_key_reused",
+		"this Idempotency-Key already created "+slug+
+			" from a different request — send a new key to create something else", nil)
+}
+
 // Checksums travel as lowercase hex in the API — readable, and what sha256sum
 // prints — but S3 wants them base64 encoded, so the upload header carries that.
 func base64Sum(hexSum string) string {
@@ -902,6 +1396,28 @@ func site(r *http.Request, override string) string {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host
+}
+
+// unreadableBody answers the body that never parsed, and reports whether it did.
+//
+// Split out from the missing-parameter refusals it sits next to because the two
+// are different failures with different fixes: a body the registry could not
+// read has nothing to name a parameter from, so saying one is absent sends a
+// client looking for a field when the whole payload is broken. The real
+// registry raises this out of Rails' parser, before an action reads a single
+// parameter, and answers `bad_request` for it.
+//
+// A truncated body is io.ErrUnexpectedEOF rather than a SyntaxError, and it is
+// the likelier of the two in the wild — a connection that dropped mid-write.
+// An empty body is neither, and stays the caller's own handler's business.
+func unreadableBody(w http.ResponseWriter, err error) bool {
+	var syntax *json.SyntaxError
+	if !errors.As(err, &syntax) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return false
+	}
+
+	writeError(w, http.StatusBadRequest, "bad_request", "The request body is not valid JSON.", nil)
+	return true
 }
 
 // writeError is the one error envelope the whole API answers in, so a client can

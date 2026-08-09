@@ -25,6 +25,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -289,6 +290,16 @@ func Fail(code, fix string) *Error {
 	return &Error{Body: map[string]any{"error": code, "fix": fix, "retryable": false}}
 }
 
+// slugPath escapes a slug into a URL path segment.
+//
+// A real slug is letters and digits, so this changes nothing for one. It is here
+// for everything else a caller can type: `#` ends the path and makes the rest a
+// fragment, `?` starts a query, and `/` invents a segment — so an unescaped slug
+// does not fail, it silently addresses a *different* endpoint. On a takedown
+// that means destroying an artifact other than the one named, and on a read it
+// means an answer about something the caller never asked for.
+func slugPath(slug string) string { return url.PathEscape(slug) }
+
 // Spec is a file the client is about to upload, measured and digested so the
 // registry can sign an upload URL that only these exact bytes fit.
 //
@@ -381,10 +392,15 @@ func (c *Client) Push(ctx context.Context, spec Spec) (*Artifact, error) {
 }
 
 // PrepareArtifact records the artifact and returns the presigned upload.
+//
+// Named with an Idempotency-Key, because this is the call a lost response makes
+// expensive: without one a retry declares a second artifact, the first is left to
+// expire, and both count as uploads. With one, the retry is answered with the
+// artifact the first attempt already made.
 func (c *Client) PrepareArtifact(ctx context.Context, spec Spec) (*Artifact, error) {
 	var artifact Artifact
 	body := map[string]any{"artifact": spec}
-	if err := c.call(ctx, http.MethodPost, "/artifacts", body, &artifact); err != nil {
+	if err := c.callIdempotent(ctx, http.MethodPost, "/artifacts", body, &artifact); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
@@ -395,7 +411,7 @@ func (c *Client) PrepareArtifact(ctx context.Context, spec Spec) (*Artifact, err
 // retry is a success rather than an error.
 func (c *Client) FinalizeArtifact(ctx context.Context, slug string) (*Artifact, error) {
 	var artifact Artifact
-	if err := c.call(ctx, http.MethodPut, "/artifacts/"+slug+"/finalization", nil, &artifact); err != nil {
+	if err := c.call(ctx, http.MethodPut, "/artifacts/"+slugPath(slug)+"/finalization", nil, &artifact); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
@@ -406,7 +422,7 @@ func (c *Client) FinalizeArtifact(ctx context.Context, slug string) (*Artifact, 
 // workspace.
 func (c *Client) ShowArtifact(ctx context.Context, slug string) (*Artifact, error) {
 	var artifact Artifact
-	if err := c.call(ctx, http.MethodGet, "/artifacts/"+slug, nil, &artifact); err != nil {
+	if err := c.call(ctx, http.MethodGet, "/artifacts/"+slugPath(slug), nil, &artifact); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
@@ -427,6 +443,17 @@ type Page struct {
 // registry rather than here, so asking for more than it serves gets the most it
 // serves.
 func (c *Client) ListArtifacts(ctx context.Context, before string, limit int) (*Page, error) {
+	var page Page
+	if err := c.call(ctx, http.MethodGet, paged("/artifacts", before, limit), nil, &page); err != nil {
+		return nil, err
+	}
+	return &page, nil
+}
+
+// paged adds the cursor and page size every listing takes. One spelling for all
+// of them, because the registry decides both in one place too — a client that
+// paged one listing differently from another would only ever do so by accident.
+func paged(path, before string, limit int) string {
 	query := url.Values{}
 	if before != "" {
 		query.Set("before", before)
@@ -434,12 +461,49 @@ func (c *Client) ListArtifacts(ctx context.Context, before string, limit int) (*
 	if limit > 0 {
 		query.Set("limit", strconv.Itoa(limit))
 	}
-	path := "/artifacts"
-	if len(query) > 0 {
-		path += "?" + query.Encode()
+	if len(query) == 0 {
+		return path
 	}
+	return path + "?" + query.Encode()
+}
 
+// RunPage is one page of a workspace's runs, newest first. Next carries the slug
+// to pass back as before for the following page, and is empty on the last.
+type RunPage struct {
+	Runs []*Run `json:"runs"`
+	Next string `json:"next,omitempty"`
+}
+
+// ListRuns reads a page of the key's runs. Needs a key: a run belongs to a
+// workspace, and a keyless caller has none of its own.
+func (c *Client) ListRuns(ctx context.Context, before string, limit int) (*RunPage, error) {
+	var page RunPage
+	if err := c.call(ctx, http.MethodGet, paged("/runs", before, limit), nil, &page); err != nil {
+		return nil, err
+	}
+	return &page, nil
+}
+
+// ShowRun reads one run back — its status, when it started and finished, and the
+// metadata recorded on it, which is where everything about an upload's origin
+// lives since the registry keeps none on the artifact itself.
+func (c *Client) ShowRun(ctx context.Context, slug string) (*Run, error) {
+	var run Run
+	if err := c.call(ctx, http.MethodGet, "/runs/"+slugPath(slug), nil, &run); err != nil {
+		return nil, err
+	}
+	return &run, nil
+}
+
+// ListRunArtifacts reads a page of what one run produced.
+//
+// A collection of the run rather than a filter on the workspace listing, which
+// is the registry's shape and worth keeping: the run is looked up first, so an
+// unknown slug is a 404. A filter would answer an empty page instead, and a
+// caller cannot tell that apart from a run that genuinely produced nothing.
+func (c *Client) ListRunArtifacts(ctx context.Context, runSlug, before string, limit int) (*Page, error) {
 	var page Page
+	path := paged("/runs/"+slugPath(runSlug)+"/artifacts", before, limit)
 	if err := c.call(ctx, http.MethodGet, path, nil, &page); err != nil {
 		return nil, err
 	}
@@ -451,7 +515,7 @@ func (c *Client) ListArtifacts(ctx context.Context, before string, limit int) (*
 func (c *Client) ClaimArtifact(ctx context.Context, slug, claimToken string) (*Artifact, error) {
 	var artifact Artifact
 	body := map[string]any{"claim_token": claimToken}
-	if err := c.call(ctx, http.MethodPost, "/artifacts/"+slug+"/claim", body, &artifact); err != nil {
+	if err := c.call(ctx, http.MethodPost, "/artifacts/"+slugPath(slug)+"/claim", body, &artifact); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
@@ -469,23 +533,67 @@ func (c *Client) ClaimArtifact(ctx context.Context, slug, claimToken string) (*A
 func (c *Client) AttachRun(ctx context.Context, artifactSlug, runSlug string) (*Artifact, error) {
 	var artifact Artifact
 	body := map[string]any{"run": runSlug}
-	if err := c.call(ctx, http.MethodPut, "/artifacts/"+artifactSlug+"/run", body, &artifact); err != nil {
+	if err := c.call(ctx, http.MethodPut, "/artifacts/"+slugPath(artifactSlug)+"/run", body, &artifact); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
 }
 
+// TakeDownArtifact removes an artifact's bytes and leaves a tombstone behind, so
+// the link answers 410 rather than 404 — it is already pasted somewhere, and its
+// reader deserves to be told the artifact was removed rather than sent hunting
+// for a typo.
+//
+// Immediate and unrecoverable, which is the point rather than a limitation. This
+// is what someone reaches for when a secret was uploaded by accident, and a
+// secret that can be restored is still leaked — so nothing here routes through a
+// window that could hand the bytes back.
+//
+// Two authorities take an artifact down, and which one is used decides how the
+// request is made. A key's authority is the workspace it acts in. A claim
+// token's is the one artifact it was issued for, and it is needed at all because
+// a slug travels in whatever the link was pasted into: authorising a takedown by
+// slug alone would let every reader of the paste destroy what they read.
+//
+// Nothing comes back but a 204. There is no artifact left to report, and a url
+// and markdown naming bytes that are gone would be a lie.
+//
+// Retried like any other call: taking down what is already down is a success on
+// both sides, so a lost response costs nothing to ask again.
+func (c *Client) TakeDownArtifact(ctx context.Context, slug, claimToken string) error {
+	if claimToken == "" {
+		return c.call(ctx, http.MethodDelete, "/artifacts/"+slugPath(slug), nil, nil)
+	}
+
+	// A claim token is the authority for this call, and it is the only one the
+	// registry will read: offered alongside a key, the key wins outright and the
+	// lookup happens in that key's workspace — where an artifact still sitting in
+	// the anonymous one is simply not found. So the key is withheld rather than
+	// sent and ignored, which is what makes taking down a CI job's anonymous
+	// upload work from a machine that happens to be logged in.
+	//
+	// The token goes in the body rather than the query string for the same reason
+	// a claim's does: a query string ends up in access logs, and this token is a
+	// capability.
+	keyless := New(c.BaseURL, "")
+	keyless.Sleep = c.Sleep
+	body := map[string]any{"claim_token": claimToken}
+	return keyless.call(ctx, http.MethodDelete, "/artifacts/"+slugPath(slug), body, nil)
+}
+
 // CreateRun opens a run to hang artifacts off. Needs a key: a run belongs to a
 // workspace, and a keyless upload has none.
 //
-// Not retried: the POST is not idempotent, and a run committed under a lost
-// response would be duplicated by the retry — an orphan whose slug never
-// surfaces anywhere. Declaring an artifact is the same mechanics, but a stray
-// pending record is harmless where a stray open run is not.
+// Retried, now that an Idempotency-Key makes it safe to. It used to be sent
+// once and only once: a run committed under a lost response would be duplicated
+// by the retry, an orphan whose slug never surfaces anywhere, and that was worse
+// than failing the push outright. The key removes the choice — the retry is
+// answered with the run the first attempt opened — so a transient 502 on the way
+// to opening a run no longer costs the whole upload.
 func (c *Client) CreateRun(ctx context.Context, metadata any) (*Run, error) {
 	var run Run
 	body := map[string]any{"run": map[string]any{"metadata": metadata}}
-	if err := c.callOnce(ctx, http.MethodPost, "/runs", body, &run); err != nil {
+	if err := c.callIdempotent(ctx, http.MethodPost, "/runs", body, &run); err != nil {
 		return nil, err
 	}
 	return &run, nil
@@ -496,7 +604,7 @@ func (c *Client) CreateRun(ctx context.Context, metadata any) (*Run, error) {
 // run keeps the moment it first finished.
 func (c *Client) FinishRun(ctx context.Context, slug string) (*Run, error) {
 	var run Run
-	if err := c.call(ctx, http.MethodPut, "/runs/"+slug+"/completion", nil, &run); err != nil {
+	if err := c.call(ctx, http.MethodPut, "/runs/"+slugPath(slug)+"/completion", nil, &run); err != nil {
 		return nil, err
 	}
 	return &run, nil
@@ -629,26 +737,69 @@ func (c *Client) putOnce(req *http.Request) error {
 
 // call makes one registry request, with retries, decoding into out.
 func (c *Client) call(ctx context.Context, method, path string, body any, out any) error {
-	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, maxAttempts, nil)
+	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, maxAttempts, nil, "")
 }
 
 // callStatus is call for the rare caller that needs the HTTP status a success
 // arrived with, not just the decoded body.
 func (c *Client) callStatus(ctx context.Context, method, path string, body any, out any, status *int) error {
-	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, maxAttempts, status)
+	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, maxAttempts, status, "")
 }
 
 // callOnce is call without the retry loop, for requests that must not be
 // repeated on a lost response.
 func (c *Client) callOnce(ctx context.Context, method, path string, body any, out any) error {
-	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, 1, nil)
+	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, 1, nil, "")
+}
+
+// callIdempotent is call for the two endpoints that create something. One key is
+// minted here and carried by every attempt of this one call, which is what makes
+// the retry loop safe on a POST: the registry answers a key it has already seen
+// with the record it made the first time, so a lost response costs a duplicate
+// artifact and a duplicate upload charge no longer.
+//
+// Deliberately per call rather than per `push`. A push declares one artifact per
+// file, and the registry matches a key against the payload it was first used with
+// — so one key spread across three files would have the second file refused as a
+// reuse. It does span the run and the artifact of the same call, since the
+// registry scopes a key by what it creates.
+//
+// A fresh `krowk push` mints fresh keys, and that is right: re-running the
+// command is a new attempt, not a retry of the old one.
+func (c *Client) callIdempotent(ctx context.Context, method, path string, body any, out any) error {
+	key, err := newIdempotencyKey()
+	if err != nil {
+		return err
+	}
+	return c.doAttempts(ctx, method, c.BaseURL+path, body, out, maxAttempts, nil, key)
 }
 
 func (c *Client) do(ctx context.Context, method, url string, body any, out any) error {
-	return c.doAttempts(ctx, method, url, body, out, maxAttempts, nil)
+	return c.doAttempts(ctx, method, url, body, out, maxAttempts, nil, "")
 }
 
-func (c *Client) doAttempts(ctx context.Context, method, url string, body any, out any, attempts int, status *int) error {
+// newIdempotencyKey is 128 random bits, shaped as a version 4 UUID because that
+// is the shape the registry's documentation asks for.
+//
+// Unguessable rather than merely unique, and that part is load-bearing on a
+// keyless push. With no API key there is nothing else a retry can present to
+// prove it is the client that made the original call, so the registry scopes
+// keys by address — and a predictable key would let anyone sharing that address,
+// a NAT or a CI runner pool, replay this declare and be handed a URL to write
+// its bytes.
+func newIdempotencyKey() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", Fail("no_idempotency_key",
+			"this machine's random source is unreadable, so a retry could not be named safely")
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+func (c *Client) doAttempts(ctx context.Context, method, url string, body any, out any, attempts int, status *int, idempotencyKey string) error {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -676,6 +827,12 @@ func (c *Client) doAttempts(ctx context.Context, method, url string, body any, o
 		req.Header.Set("Accept", "application/json")
 		if c.Token != "" {
 			req.Header.Set("Authorization", "Bearer "+c.Token)
+		}
+		// Set inside the loop but the same value every time, which is the whole
+		// point: it is what tells the registry that attempt two is attempt one
+		// again rather than a second create.
+		if idempotencyKey != "" {
+			req.Header.Set("Idempotency-Key", idempotencyKey)
 		}
 
 		err = c.doOnce(req, out, status)
@@ -835,6 +992,12 @@ func fixFor(code string, status int) string {
 		return "what arrived held no bytes — check the file is not being written while it is uploaded"
 	case "expired":
 		return "this artifact was anonymous and has passed its expiry — upload it again, and claim it with a key to keep it"
+	case "taken_down":
+		// 410 rather than 404 because the link is already pasted somewhere, so the
+		// fix says the artifact existed and is gone rather than sending someone
+		// hunting for a typo. A takedown is unrecoverable by design; uploading
+		// again is the only way forward, and it is a new slug and a new link.
+		return "this artifact was taken down and its bytes are gone for good — upload it again if the link is still needed"
 	case "storage_unavailable":
 		return "object storage is temporarily unreachable — retry shortly"
 	case "not_found":
@@ -842,8 +1005,36 @@ func fixFor(code string, status int) string {
 		// another workspace's slug rather than "forbidden", which would confirm it
 		// exists. So a wrong slug and someone else's slug read the same.
 		return "no such artifact or run in this workspace — check the slug, and that the key matches the workspace it was uploaded to"
-	case "parameter_missing", "invalid":
-		return "" // the registry's own message names the parameter
+	case "no_such_endpoint":
+		// The other 404, and the reason the registry spells them differently: this
+		// one is about the URL rather than about anything in it. The verb is named
+		// too, because a known path asked for with a verb it does not serve answers
+		// 404 rather than 405 — so "check the base URL" alone would send someone to
+		// confirm the one part that was already right.
+		return "the registry has no such endpoint — check KROWK_API_URL names the API host and version, and that the method is the one this call uses"
+	case "parameter_missing", "invalid", "bad_request":
+		return "" // the registry's own message names what it could not read
+	case "method_not_allowed":
+		// Only an HTTP method the registry does not answer at all reaches this: a
+		// verb it does not serve on a path it does answers 404. So the Allow header
+		// on the same response is the whole of the fix.
+		// Allow says what the path does answer, when the registry could work it
+		// out; it is absent when it could not, which is not the same as a path
+		// that answers nothing.
+		return "the registry does not answer that HTTP method — read the Allow header on this response, if it carries one, for the methods it does"
+	case "not_acceptable":
+		// The registry answers JSON and nothing else, so there is no other format
+		// to ask for: either header naming something else, or naming something it
+		// cannot read at all, arrives here.
+		return "the registry answers JSON only — send `application/json` in Accept and Content-Type, or send neither"
+	case "internal_server_error":
+		return "the registry failed on its side — retry, and report it if it persists"
+	case "unexpected_error":
+		// The registry's catch-all: a failure it has no specific code for, which
+		// it answers with the status and nothing else. Named here rather than left
+		// to the status fallback below, because that one only covers 404 and 5xx —
+		// a 405 or a 406 would otherwise reach a person with no fix line at all.
+		return "the registry refused this in a way it has no specific code for — check the status, and report it if it persists"
 	}
 	if status >= 500 {
 		return "the registry failed on its side — retry, and report it if it persists"
@@ -863,7 +1054,11 @@ func retryableFor(code string) (bool, bool) {
 	// Nothing about retrying these changes the answer, and an agent that keeps
 	// trying is worse than one that stops.
 	case "invalid", "parameter_missing", "unauthorized", "not_found", "expired",
-		"checksum_mismatch", "empty_upload", "run_needs_key":
+		"taken_down", "checksum_mismatch", "empty_upload", "run_needs_key",
+		// The request itself is what is wrong in both: a body the registry could
+		// not read, and a URL it does not serve. Sending either again unchanged
+		// gets the same answer.
+		"bad_request", "no_such_endpoint":
 		return false, true
 	}
 	return false, false

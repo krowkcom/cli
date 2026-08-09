@@ -126,12 +126,14 @@ type envelope struct {
 // data covers both shapes a command returns: an upload result, and a bare run.
 type data struct {
 	Artifacts []artifact     `json:"artifacts"`
+	Runs      []run          `json:"runs"`
 	Run       *run           `json:"run"`
 	Notes     []string       `json:"notes"`
 	Next      string         `json:"next"`
 	Slug      string         `json:"slug"`
 	Status    string         `json:"status"`
 	Metadata  map[string]any `json:"metadata"`
+	TakenDown bool           `json:"taken_down"`
 }
 
 type artifact struct {
@@ -732,8 +734,16 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Object storage is not part of the registry's API surface.
 		if !strings.HasPrefix(r.URL.Path, "/_storage") {
+			call := r.Method + " " + normalizeSlugs(r.URL.Path)
+			// The header is part of the shared contract, so it is pinned with the
+			// method and the path rather than tested somewhere off to the side: a
+			// create that stops naming its attempt goes back to charging for every
+			// retry, and nothing else here would notice.
+			if r.Header.Get("Idempotency-Key") != "" {
+				call += " +key"
+			}
 			mu.Lock()
-			calls = append(calls, r.Method+" "+normalizeSlugs(r.URL.Path))
+			calls = append(calls, call)
 			mu.Unlock()
 		}
 		inner.ServeHTTP(w, r)
@@ -750,6 +760,11 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	pushed := only(t, h.ok("push", h.fixture))
 	h.ok("uploads", "list")
 	h.ok("uploads", "show", pushed.Slug)
+	h.ok("runs", "list")
+	h.ok("runs", "show", pushed.Run)
+	// A run's artifacts are a collection of the run, not a filter on the listing
+	// above — so --run is a different endpoint rather than a query parameter.
+	h.ok("uploads", "list", "--run="+pushed.Run)
 	h.run("doctor")
 
 	// Claiming needs an anonymous artifact to claim.
@@ -758,24 +773,34 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	h.env["KROWK_TOKEN"] = "krowk_sk_test"
 	h.ok("claim", anonymous.Slug, anonymous.ClaimToken)
 	h.ok("uploads", "attach", anonymous.Slug, "--run="+pushed.Run)
+	// Taking it down again: a claimed artifact answers to the key that holds it.
+	h.ok("uploads", "delete", anonymous.Slug)
 
 	want := []string{
-		// push, with a key: open a run, declare, finalize, close the run.
-		"POST /v1/runs",
-		"POST /v1/artifacts",
+		// push, with a key: open a run, declare, finalize, close the run. The two
+		// creates name their attempt so a retry of either costs nothing; +key marks
+		// the ones that carry an Idempotency-Key, and only those two do.
+		"POST /v1/runs +key",
+		"POST /v1/artifacts +key",
 		"PUT /v1/artifacts/{slug}/finalization",
 		"PUT /v1/runs/{slug}/completion",
 		"GET /v1/artifacts",
 		"GET /v1/artifacts/{slug}",
+		"GET /v1/runs",
+		"GET /v1/runs/{slug}",
+		"GET /v1/runs/{slug}/artifacts",
 		// doctor: the reachability probe, then the key check.
 		"GET /",
 		"GET /v1/key",
 		// push, keyless: no run to open or close.
-		"POST /v1/artifacts",
+		"POST /v1/artifacts +key",
 		"PUT /v1/artifacts/{slug}/finalization",
 		"POST /v1/artifacts/{slug}/claim",
 		// and the run it never had, set afterwards.
 		"PUT /v1/artifacts/{slug}/run",
+		// Takedown is the REST delete of the artifact, not a nested resource:
+		// destroying it is what the verb already means.
+		"DELETE /v1/artifacts/{slug}",
 	}
 
 	mu.Lock()
@@ -895,18 +920,23 @@ func TestUnfinishedRunIsReportedNotSwallowed(t *testing.T) {
 	}
 }
 
-// Opening a run is not idempotent: a run committed under a lost response would
-// be duplicated by a retry, and the first slug orphaned. So it gets one attempt.
-func TestCreateRunIsNotRetried(t *testing.T) {
+// Opening a run used to get exactly one attempt: it is a POST, and a run
+// committed under a lost response would be duplicated by the retry, orphaning the
+// first slug. An Idempotency-Key removes that trade — the retry is answered with
+// the run the first attempt opened — so this is retried like anything else, and a
+// transient failure on the way to opening a run no longer costs the whole upload.
+//
+// Every attempt has to carry the same key. A retry under a fresh one is a second
+// create by another name, and the duplicate this used to avoid is back.
+func TestCreateRunIsRetriedUnderOneKey(t *testing.T) {
 	var mu sync.Mutex
-	var runPosts int
+	var keys []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs" {
 			mu.Lock()
-			runPosts++
+			keys = append(keys, r.Header.Get("Idempotency-Key"))
 			mu.Unlock()
 		}
-		// Retryable by policy — which is exactly why this endpoint must opt out.
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprint(w, `{"error":{"code":"boom","message":"transient"}}`)
 	}))
@@ -922,8 +952,16 @@ func TestCreateRunIsNotRetried(t *testing.T) {
 	h.fails("push", h.fixture)
 	mu.Lock()
 	defer mu.Unlock()
-	if runPosts != 1 {
-		t.Errorf("POST /v1/runs was sent %d times, want exactly 1", runPosts)
+	if len(keys) != 3 {
+		t.Fatalf("POST /v1/runs was sent %d times, want 3 attempts", len(keys))
+	}
+	for i, key := range keys {
+		if key == "" {
+			t.Fatalf("attempt %d carried no Idempotency-Key", i+1)
+		}
+		if key != keys[0] {
+			t.Errorf("attempt %d used key %q, want the first attempt's %q", i+1, key, keys[0])
+		}
 	}
 }
 
@@ -976,5 +1014,247 @@ func TestReadyArtifactRejectsAnotherUpload(t *testing.T) {
 	}
 	if _, body := h.get(a.URL); body != "fake png bytes for the test" {
 		t.Errorf("stored bytes changed to %q", body)
+	}
+}
+
+// A takedown is what someone reaches for when a secret was published by
+// accident, so the whole of it has to hold: the bytes stop serving, and the link
+// reports that it was taken down rather than that it never existed.
+func TestUploadsDeleteTakesTheBytesDownAndLeavesATombstone(t *testing.T) {
+	h := newHarness(t, 0)
+
+	pushed := only(t, h.ok("push", h.fixture))
+	if status, _ := h.get(pushed.URL); status != http.StatusOK {
+		t.Fatalf("the upload never served: %d", status)
+	}
+
+	e := h.ok("uploads", "delete", pushed.Slug)
+	if !e.OK || e.Data.Slug != pushed.Slug || !e.Data.TakenDown {
+		t.Errorf("delete = %+v", e)
+	}
+
+	if status, _ := h.get(pushed.URL); status != http.StatusNotFound {
+		t.Errorf("GET %s after takedown = %d, want 404", pushed.URL, status)
+	}
+	if got := h.fails("uploads", "show", pushed.Slug)["error"]; got != "taken_down" {
+		t.Errorf("show after takedown = %v, want taken_down", got)
+	}
+	// A tombstone is not something the workspace still holds.
+	if artifacts := h.ok("uploads", "list").Data.Artifacts; len(artifacts) != 0 {
+		t.Errorf("listing still holds the tombstone: %+v", artifacts)
+	}
+}
+
+// 410 is not 404 on purpose, so the client has to have something to say about
+// it: the artifact existed and is gone, rather than a slug worth re-checking.
+func TestTakenDownReadsAsGoneForGoodRatherThanAsATypo(t *testing.T) {
+	h := newHarness(t, 0)
+
+	pushed := only(t, h.ok("push", h.fixture))
+	h.ok("uploads", "delete", pushed.Slug)
+
+	body := h.fails("uploads", "show", pushed.Slug)
+	fix, _ := body["fix"].(string)
+	if !strings.Contains(fix, "taken down") || !strings.Contains(fix, "upload it again") {
+		t.Errorf("fix = %q, want it to say the artifact is gone and uploading again is the way back", fix)
+	}
+	// Nothing about retrying changes the answer, and an agent that keeps trying
+	// is worse than one that stops. The verdict has to be stated, not merely
+	// absent: a missing key reads as false to anything asserting on it, so
+	// "not retryable" and "nothing said" would look identical here.
+	retryable, stated := body["retryable"].(bool)
+	if !stated || retryable {
+		t.Errorf("retryable = %v (stated %v), want an explicit false", retryable, stated)
+	}
+}
+
+// The case that decides how the request is made. An agent pushes anonymously
+// from CI; the person cleaning up is logged in. Offered alongside a key the
+// registry reads the key and nothing else, and looks in that key's workspace —
+// where an artifact still sitting in the anonymous one is simply not found. So a
+// claim token has to be sent as the authority it is, with the key withheld.
+func TestClaimTokenTakesDownAnAnonymousUploadFromALoggedInMachine(t *testing.T) {
+	h := newHarness(t, 0)
+
+	anonymous := only(t, h.anonymous().ok("push", h.fixture))
+	if anonymous.ClaimToken == "" {
+		t.Fatal("an anonymous push should come back with a claim token")
+	}
+	h.env["KROWK_TOKEN"] = "krowk_sk_test"
+
+	e := h.ok("uploads", "delete", anonymous.Slug, anonymous.ClaimToken)
+	if !e.Data.TakenDown {
+		t.Errorf("delete = %+v", e)
+	}
+	if status, _ := h.get(anonymous.URL); status != http.StatusNotFound {
+		t.Errorf("GET %s after takedown = %d, want 404", anonymous.URL, status)
+	}
+}
+
+// Without a key and without a token there is no authority at all, and saying so
+// beats a 400 from the registry naming a parameter the caller never saw.
+func TestDeletingAnonymouslyWithoutATokenNamesWhatIsMissing(t *testing.T) {
+	h := newHarness(t, 0).anonymous()
+
+	pushed := only(t, h.ok("push", h.fixture))
+	body := h.fails("uploads", "delete", pushed.Slug)
+	if body["error"] != "missing_claim" {
+		t.Errorf("error = %v, want missing_claim", body["error"])
+	}
+	// The upload is still there: refusing locally must not half-do the takedown.
+	if status, _ := h.get(pushed.URL); status != http.StatusOK {
+		t.Errorf("GET %s = %d, want the upload untouched", pushed.URL, status)
+	}
+}
+
+// A 404 from a takedown covers three different mistakes, and which of them are
+// possible depends on the authority the caller sent — so the advice has to name
+// the one it actually used rather than the standing "check your key".
+func TestTakedownNotFoundNamesTheAuthorityThatWasUsed(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// Asserted on wording only this command produces. The registry's standing
+	// not_found advice already mentions the key, so looking for "key" would pass
+	// whether or not the keyed branch ran at all.
+	byKey, _ := h.fails("uploads", "delete", "art_nosuchartifact00001")["fix"].(string)
+	if !strings.Contains(byKey, "still anonymous") {
+		t.Errorf("keyed fix = %q, want it to point at the claim token as the other way in", byKey)
+	}
+	byToken, _ := h.fails("uploads", "delete", "art_nosuchartifact00001", "krowk_claim_nope")["fix"].(string)
+	if strings.Contains(byToken, "the key matches") {
+		t.Errorf("token fix = %q, want it to talk about the token rather than the key", byToken)
+	}
+	if !strings.Contains(byToken, "token") {
+		t.Errorf("token fix = %q, want it to name the token", byToken)
+	}
+}
+
+// A second positional that is not a token is not a wrong token. Taking it as one
+// would withhold the key, so `uploads delete art_a art_b` — meaning two
+// artifacts — would quietly become an unauthorised takedown reported as a 404.
+func TestASecondWordThatIsNotAClaimTokenIsRefused(t *testing.T) {
+	h := newHarness(t, 0)
+
+	first := only(t, h.ok("push", h.fixture))
+	second := only(t, h.ok("push", h.write("second.png", "more bytes")))
+
+	body := h.fails("uploads", "delete", first.Slug, second.Slug)
+	if body["error"] != "bad_claim_token" {
+		t.Errorf("error = %v, want bad_claim_token", body["error"])
+	}
+	// Neither is touched: a refusal here must not half-do the takedown.
+	for _, a := range []artifact{first, second} {
+		if status, _ := h.get(a.URL); status != http.StatusOK {
+			t.Errorf("GET %s = %d, want the upload untouched", a.URL, status)
+		}
+	}
+}
+
+// A run listing of bare slugs is unreadable, and the metadata is where a run's
+// identity actually lives — the registry keeps none on the artifact.
+func TestRunsListNamesEachRunByWhatItWasFor(t *testing.T) {
+	h := newHarness(t, 0)
+
+	h.ok("push", h.fixture, "--title=Checkout — mobile")
+	h.ok("push", h.fixture, "--repo=acme/storefront", "--commit=a1b2c3d")
+
+	e := h.ok("runs", "list")
+	if len(e.Data.Runs) != 2 {
+		t.Fatalf("want two runs, got %d", len(e.Data.Runs))
+	}
+	// Newest first, so the second push leads.
+	if e.Data.Runs[0].Metadata["repo"] != "acme/storefront" {
+		t.Errorf("first row = %v, want the newest run", e.Data.Runs[0].Metadata)
+	}
+
+	_, human, _ := h.run("runs", "list", "--format=human")
+	if !strings.Contains(human, "Checkout — mobile") || !strings.Contains(human, "acme/storefront") {
+		t.Errorf("human listing = %q, want each run labelled by its metadata", human)
+	}
+}
+
+// A run is the only place an upload's origin is recorded, so reading one back
+// has to carry the whole of it.
+func TestRunsShowCarriesTheMetadataAnUploadDoesNot(t *testing.T) {
+	h := newHarness(t, 0)
+
+	pushed := h.ok("push", h.fixture,
+		"--pull-request=https://github.com/acme/storefront/pull/412",
+		"--session=sess_abc123")
+	runSlug := pushed.Data.Run.Slug
+
+	e := h.ok("runs", "show", runSlug)
+	if e.Data.Slug != runSlug || e.Data.Status != "finished" {
+		t.Errorf("show = %+v", e.Data)
+	}
+	if e.Data.Metadata["pull_request"] != "https://github.com/acme/storefront/pull/412" {
+		t.Errorf("metadata = %v", e.Data.Metadata)
+	}
+
+	_, human, _ := h.run("runs", "show", runSlug, "--format=human")
+	for _, want := range []string{runSlug, "finished", "pull_request", "sess_abc123"} {
+		if !strings.Contains(human, want) {
+			t.Errorf("human detail missing %q:\n%s", want, human)
+		}
+	}
+	if got := h.fails("runs", "show", "run_nosuchrun0000000000")["error"]; got != "not_found" {
+		t.Errorf("unknown run = %v, want not_found", got)
+	}
+}
+
+// --run narrows the listing to what one run produced. The registry serves that
+// as a collection of the run, so an unknown run is a 404 rather than an empty
+// page — which a caller could not tell apart from a run that made nothing.
+func TestUploadsListNarrowsToOneRun(t *testing.T) {
+	h := newHarness(t, 0)
+
+	mine := h.ok("push", h.fixture, "--title=in the run")
+	runSlug := mine.Data.Run.Slug
+	h.ok("push", h.write("elsewhere.png", "other bytes")) // its own run
+
+	if got := h.ok("uploads", "list").Data.Artifacts; len(got) != 2 {
+		t.Fatalf("workspace listing = %d artifacts, want both", len(got))
+	}
+
+	scoped := h.ok("uploads", "list", "--run="+runSlug).Data.Artifacts
+	if len(scoped) != 1 || scoped[0].Slug != only(t, mine).Slug {
+		t.Errorf("run listing = %+v, want only what that run made", scoped)
+	}
+
+	if got := h.fails("uploads", "list", "--run=run_nosuchrun0000000000")["error"]; got != "not_found" {
+		t.Errorf("unknown run = %v, want not_found rather than an empty page", got)
+	}
+}
+
+// The cursor has to carry whatever scoped the page. Paging a run's uploads on
+// without --run would silently widen to the whole workspace, which reads as the
+// run having produced far more than it did.
+func TestPagingARunsUploadsStaysScopedToTheRun(t *testing.T) {
+	h := newHarness(t, 0)
+
+	started := h.ok("runs", "start")
+	runSlug := started.Data.Slug
+	for _, name := range []string{"one.png", "two.png"} {
+		h.ok("push", h.write(name, "bytes for "+name), "--run="+runSlug)
+	}
+	h.ok("push", h.write("unrelated.png", "not in the run"))
+
+	e := h.ok("uploads", "list", "--run="+runSlug, "--limit=1")
+	if e.Data.Next == "" {
+		t.Fatal("want a cursor: the page came back full")
+	}
+	if len(e.Breadcrumbs) == 0 || !strings.Contains(e.Breadcrumbs[0].Cmd, "--run "+runSlug) {
+		t.Errorf("next-page breadcrumb = %+v, want it to keep --run", e.Breadcrumbs)
+	}
+
+	_, human, _ := h.run("uploads", "list", "--run="+runSlug, "--limit=1", "--format=human")
+	if !strings.Contains(human, "--run "+runSlug) {
+		t.Errorf("human cursor line = %q, want it to keep --run", human)
+	}
+
+	// And the command it suggests really does stay inside the run.
+	second := h.ok("uploads", "list", "--run="+runSlug, "--before="+e.Data.Next)
+	if len(second.Data.Artifacts) != 1 {
+		t.Errorf("second page = %d artifacts, want the run's other one alone", len(second.Data.Artifacts))
 	}
 }

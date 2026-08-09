@@ -313,15 +313,24 @@ setup_path() {
   # the work is done is the worst place to fail.
   mkdir -p "$(dirname "$shell_rc")"
 
-  if [[ -f "$shell_rc" ]] && grep -qF "$BIN_DIR" "$shell_rc" 2>/dev/null; then
-    info "$BIN_DIR is already on PATH in $shell_rc"
+  # PATH itself has already answered "is this directory reachable?" above. All
+  # the profile can answer is the narrower question of whether this installer has
+  # written this line before, so that is the only thing looked for: the whole
+  # line, exactly. Searching the file for the directory name instead would count
+  # a comment, an alias, or a longer path that merely starts the same way, and
+  # then skip the export while PATH stays broken.
+  local export_line="export PATH=\"$BIN_DIR:\$PATH\""
+
+  if [[ -f "$shell_rc" ]] && grep -qxF "$export_line" "$shell_rc" 2>/dev/null; then
+    info "$BIN_DIR is already exported in $shell_rc"
+    note "This shell has not read that yet: source $shell_rc"
     return 0
   fi
 
   {
     echo ""
     echo "# Added by the krowk installer"
-    echo "export PATH=\"$BIN_DIR:\$PATH\""
+    echo "$export_line"
   } >>"$shell_rc"
   info "Added $BIN_DIR to PATH in $shell_rc"
   note "This shell has not read that yet: source $shell_rc"

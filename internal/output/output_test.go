@@ -83,46 +83,65 @@ func TestErrorRendersLimitAndFix(t *testing.T) {
 }
 
 // GitHub renders no card for a third-party link, so the image embed is the only
-// form that shows the artifact there. Labels are user-controlled, so delimiter
-// characters must arrive escaped or the embed breaks.
+// form that shows the artifact there — and the embed has to name the bytes,
+// because GitHub renders an image where a link resolves to one and the card
+// page resolves to HTML. The embed is wrapped in a link to the card so clicking
+// it lands on the page with the run metadata. Labels are user-controlled, so
+// delimiter characters must arrive escaped or the embed breaks.
 func TestPasteCarriesBothFormsAndEscapesLabels(t *testing.T) {
 	a := &api.Artifact{
 		Slug:        "art_2e1d",
 		Filename:    "foobar.jpg",
 		ContentType: "image/jpeg",
-		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+		URL:         "https://krowk.com/a/art_2e1d",
+		FileURL:     "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
 	}
-	url := a.URL
+	card, file := a.URL, a.FileURL
+	embed := func(label string) string { return "[![" + label + "](" + file + ")](" + card + ")" }
 
 	for _, tc := range []struct {
 		title    string
 		filename string
 		want     string
 	}{
-		{"Checkout", "foobar.jpg", "![Checkout](" + url + ")"},
-		{"Checkout [v2]", "foobar.jpg", `![Checkout \[v2\]](` + url + ")"},
-		{"", "frame[0].png", `![frame\[0\].png](` + url + ")"},
-		{`back\slash`, "foobar.jpg", `![back\\slash](` + url + ")"},
-		{"line1\nline2\r\nline3", "foobar.jpg", "![line1 line2  line3](" + url + ")"},
+		{"Checkout", "foobar.jpg", embed("Checkout")},
+		{"Checkout [v2]", "foobar.jpg", embed(`Checkout \[v2\]`)},
+		{"", "frame[0].png", embed(`frame\[0\].png`)},
+		{`back\slash`, "foobar.jpg", embed(`back\\slash`)},
+		{"line1\nline2\r\nline3", "foobar.jpg", embed("line1 line2  line3")},
 	} {
 		a.Filename = tc.filename
 		p := PasteFor(a, tc.title)
 		if p.Markdown != tc.want {
 			t.Errorf("PasteFor(%q/%q).Markdown = %q, want %q", tc.title, tc.filename, p.Markdown, tc.want)
 		}
-		// Slack renders no markdown image embeds, so it needs the plain link.
-		if p.URL != a.URL {
-			t.Errorf("url = %q, want the bare link", p.URL)
+		// Slack renders no markdown image embeds, so it needs the bare link —
+		// and the bare link is the card, which is the thing Slack unfurls.
+		if p.URL != card {
+			t.Errorf("url = %q, want the card page", p.URL)
 		}
 	}
 
 	a.Filename = "foobar.jpg"
 	r := Result{Artifacts: []*api.Artifact{a}, Title: "Checkout"}
-	if got := Upload(r, Markdown, false, false, time.Now()); got != "![Checkout]("+url+")" {
+	if got := Upload(r, Markdown, false, false, time.Now()); got != embed("Checkout") {
 		t.Errorf("--format markdown = %q, want just the embed", got)
 	}
-	if got := Upload(r, URL, false, false, time.Now()); got != url {
-		t.Errorf("--format url = %q, want just the link", got)
+	if got := Upload(r, URL, false, false, time.Now()); got != card {
+		t.Errorf("--format url = %q, want just the card link", got)
+	}
+}
+
+// An artifact this side assembled rather than read back has no byte URL, and an
+// embed pointing at nothing is worse than a link that works — so the card
+// stands in for it.
+func TestAnEmbedWithNoByteURLFallsBackToTheCard(t *testing.T) {
+	a := &api.Artifact{
+		Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
+		URL: "https://krowk.com/a/art_2e1d",
+	}
+	if got := MarkdownLink(a, "Checkout"); got != "[![Checkout]("+a.URL+")]("+a.URL+")" {
+		t.Errorf("MarkdownLink = %q, want the card in both slots", got)
 	}
 }
 
@@ -133,13 +152,18 @@ func TestRegistryMarkdownWinsWithoutATitle(t *testing.T) {
 		Slug:        "art_2e1d",
 		Filename:    "foobar.jpg",
 		ContentType: "image/jpeg",
-		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
-		Markdown:    "![foobar.jpg](https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg)",
+		URL:         "https://krowk.com/a/art_2e1d",
+		FileURL:     "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+		Markdown: "[![foobar.jpg](https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg)]" +
+			"(https://krowk.com/a/art_2e1d)",
 	}
 	if got := MarkdownLink(a, ""); got != a.Markdown {
 		t.Errorf("MarkdownLink = %q, want the registry's own markdown", got)
 	}
-	if got := MarkdownLink(a, "Checkout"); got != "![Checkout]("+a.URL+")" {
+	// The re-render is where the two URLs have to be kept apart by this side
+	// rather than by the registry: the embed names the bytes, the link around
+	// it names the card.
+	if got := MarkdownLink(a, "Checkout"); got != "[![Checkout]("+a.FileURL+")]("+a.URL+")" {
 		t.Errorf("MarkdownLink with a title = %q, want the title to win", got)
 	}
 }
@@ -149,7 +173,8 @@ func TestJSONEnvelopeCarriesBothPasteForms(t *testing.T) {
 		Slug:        "art_2e1d",
 		Filename:    "foobar.jpg",
 		ContentType: "image/jpeg",
-		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+		URL:         "https://krowk.com/a/art_2e1d",
+		FileURL:     "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
 	}
 	r := Result{Artifacts: []*api.Artifact{a}}
 
@@ -170,21 +195,39 @@ func TestJSONEnvelopeCarriesBothPasteForms(t *testing.T) {
 }
 
 // The surfaces label must not promise an image the markdown does not carry.
+//
+// The card page makes both halves of that harder to get right. An image embed
+// is now wrapped in a link to the card, so it no longer begins with the bang
+// and a check for one would call every screenshot a plain link. And a
+// non-image's markdown is a link to the card rather than to the file — which is
+// a better link, and still not a preview: GitHub, Linear and Notion build no
+// card for a third-party URL however good its OpenGraph tags are, so what shows
+// there is a blue anchor. Slack is where that link becomes a card, and Slack
+// takes the url form. So the label stays "no preview to embed".
 func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
 	image := PasteFor(&api.Artifact{
 		Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
-		URL: "https://cdn.krowk.com/a/shot.png",
+		URL: "https://krowk.com/a/art_2e1d", FileURL: "https://cdn.krowk.com/ws_9f3c/art_2e1d/shot.png",
 	}, "")
+	if !strings.Contains(image.Markdown, "![") {
+		t.Fatalf("markdown = %q, want an image embed", image.Markdown)
+	}
 	if got := MarkdownSurfacesFor(image); got != EmbedSurfaces {
 		t.Errorf("image label = %q, want %q", got, EmbedSurfaces)
 	}
 
 	log := PasteFor(&api.Artifact{
 		Slug: "art_9f3c", Filename: "build.log", ContentType: "text/plain",
-		URL: "https://cdn.krowk.com/a/build.log",
+		URL: "https://krowk.com/a/art_9f3c", FileURL: "https://cdn.krowk.com/ws_9f3c/art_9f3c/build.log",
 	}, "")
-	if !strings.HasPrefix(log.Markdown, "[") {
+	if strings.Contains(log.Markdown, "![") {
 		t.Fatalf("markdown = %q, want a plain link when there is nothing to embed", log.Markdown)
+	}
+	// And that plain link points at the card, not at the bytes: a reader
+	// clicking a log in a pull request should land on the page that says what
+	// run produced it rather than on a raw download.
+	if !strings.HasSuffix(log.Markdown, "(https://krowk.com/a/art_9f3c)") {
+		t.Errorf("markdown = %q, want it to link to the card page", log.Markdown)
 	}
 	if got := MarkdownSurfacesFor(log); got != PlainSurfaces {
 		t.Errorf("plain-link label = %q, want %q", got, PlainSurfaces)
@@ -198,7 +241,8 @@ func TestClaimTokenIsSurfacedButNeverPasteable(t *testing.T) {
 		Slug:        "art_2e1d",
 		Filename:    "foobar.jpg",
 		ContentType: "image/jpeg",
-		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+		URL:         "https://krowk.com/a/art_2e1d",
+		FileURL:     "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
 		ClaimToken:  "krowk_claim_2b7f",
 	}
 	r := Result{Artifacts: []*api.Artifact{a}}
@@ -309,7 +353,7 @@ func TestStoredKeyDistinguishesAConfirmedLoginFromAnUnconfirmedOne(t *testing.T)
 func TestAttachedRunReachesTheSummaryAndTheHumanLine(t *testing.T) {
 	attached := &api.Artifact{
 		Slug: "art_x", State: "ready", Filename: "shot.png", ByteSize: 15,
-		Run: "run_y", URL: "https://cdn.example/art_x/shot.png",
+		Run: &api.ArtifactRun{Slug: "run_y"}, URL: "https://krowk.com/a/art_x",
 	}
 	now := time.Now()
 
@@ -328,7 +372,7 @@ func TestAttachedRunReachesTheSummaryAndTheHumanLine(t *testing.T) {
 
 	// An artifact with no run says nothing about one rather than trailing a comma.
 	loose := *attached
-	loose.Run = ""
+	loose.Run = nil
 	if got := Artifact(&loose, JSON, false, false, now); strings.Contains(got, "run ") {
 		t.Errorf("envelope = %s, want no run mentioned", got)
 	}
@@ -337,9 +381,9 @@ func TestAttachedRunReachesTheSummaryAndTheHumanLine(t *testing.T) {
 // The summary speaks for the whole result, so a run it did not open is named only
 // when every artifact is in it — a push given --run, however many files it was.
 func TestSummaryNamesACallerSuppliedRunForEveryFileCount(t *testing.T) {
-	one := &api.Artifact{Slug: "art_a", Filename: "a.png", ByteSize: 10, Run: "run_y"}
-	two := &api.Artifact{Slug: "art_b", Filename: "b.png", ByteSize: 20, Run: "run_y"}
-	elsewhere := &api.Artifact{Slug: "art_c", Filename: "c.png", ByteSize: 30, Run: "run_z"}
+	one := &api.Artifact{Slug: "art_a", Filename: "a.png", ByteSize: 10, Run: &api.ArtifactRun{Slug: "run_y"}}
+	two := &api.Artifact{Slug: "art_b", Filename: "b.png", ByteSize: 20, Run: &api.ArtifactRun{Slug: "run_y"}}
+	elsewhere := &api.Artifact{Slug: "art_c", Filename: "c.png", ByteSize: 30, Run: &api.ArtifactRun{Slug: "run_z"}}
 
 	if got := summary(Result{Artifacts: []*api.Artifact{one}}); !strings.Contains(got, "run run_y") {
 		t.Errorf("one file = %q, want the run named", got)
@@ -358,7 +402,7 @@ func TestSummaryNamesACallerSuppliedRunForEveryFileCount(t *testing.T) {
 // read it from the same place.
 func TestHumanAndJSONAgreeOnACallerSuppliedRun(t *testing.T) {
 	r := Result{Artifacts: []*api.Artifact{
-		{Slug: "art_a", Filename: "a.png", ByteSize: 10, Run: "run_y", URL: "https://cdn.example/a.png"},
+		{Slug: "art_a", Filename: "a.png", ByteSize: 10, Run: &api.ArtifactRun{Slug: "run_y"}, URL: "https://krowk.com/a/art_a"},
 	}}
 	now := time.Now()
 

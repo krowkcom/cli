@@ -57,8 +57,15 @@ func PasteFor(a *api.Artifact, title string) Paste {
 
 // MarkdownSurfacesFor is the honest label for a paste's markdown form: it only
 // promises an image where the markdown actually embeds one.
+//
+// An image embed links through to the card page, so it is spelled
+// `[![…](file)](card)` and no longer starts with the bang. The embed is looked
+// for anywhere in the string rather than at the front, so this side does not
+// start calling every image a plain link the day the registry changes what it
+// wraps the embed in. A label cannot counterfeit one: the escaper turns a `[`
+// in a filename into `\[`.
 func MarkdownSurfacesFor(p Paste) string {
-	if strings.HasPrefix(p.Markdown, "!") {
+	if strings.Contains(p.Markdown, "![") {
 		return EmbedSurfaces
 	}
 	return PlainSurfaces
@@ -185,8 +192,9 @@ func RelativeExpiry(iso string, now time.Time) string {
 }
 
 // MarkdownLink is the paste-ready link for one artifact. The registry renders
-// this itself — an image embeds, anything else is a plain link — so its version
-// is used unless a title was asked for, which only the caller knows.
+// this itself — an image embed that clicks through to the card page, anything
+// else a plain link to the card — so its version is used unless a title was
+// asked for, which only the caller knows.
 func MarkdownLink(a *api.Artifact, title string) string {
 	if title == "" && a.Markdown != "" {
 		return a.Markdown
@@ -198,7 +206,7 @@ func MarkdownLink(a *api.Artifact, title string) string {
 	if label == "" {
 		label = a.Slug
 	}
-	return link(strings.HasPrefix(a.ContentType, "image/"), label, a.URL)
+	return link(strings.HasPrefix(a.ContentType, "image/"), label, a.FileURL, a.URL)
 }
 
 // labelEscaper escapes the characters that end or nest a link label, and folds
@@ -206,14 +214,27 @@ func MarkdownLink(a *api.Artifact, title string) string {
 // are legal in link text, so they stay.
 var labelEscaper = strings.NewReplacer(`\`, `\\`, `[`, `\[`, `]`, `\]`, "\n", " ", "\r", " ")
 
-func link(embed bool, label, url string) string {
+// link renders one artifact two ways, and the two URLs are not
+// interchangeable. An image embed has to name the bytes — a paste destination
+// renders an image only where the link resolves to image bytes, and the card
+// page resolves to HTML — but the image is then wrapped in a link to the card,
+// so clicking through lands on the page with the run metadata rather than on a
+// bare file. Anything that cannot be embedded is a plain link to the card.
+//
+// fileURL empty falls back to the card: an artifact assembled on this side
+// rather than read from the registry has no byte URL, and an embed pointing at
+// nothing is worse than a link that works.
+func link(embed bool, label, fileURL, cardURL string) string {
 	// Labels are user-controlled — a title, a filename — so delimiter
 	// characters must leave here escaped or the link breaks where it is pasted.
 	label = labelEscaper.Replace(label)
 	if embed {
-		return fmt.Sprintf("![%s](%s)", label, url)
+		if fileURL == "" {
+			fileURL = cardURL
+		}
+		return fmt.Sprintf("[![%s](%s)](%s)", label, fileURL, cardURL)
 	}
-	return fmt.Sprintf("[%s](%s)", label, url)
+	return fmt.Sprintf("[%s](%s)", label, cardURL)
 }
 
 // Upload renders a successful upload.
@@ -297,9 +318,9 @@ func summaryRun(r Result) string {
 	if len(r.Artifacts) == 0 {
 		return ""
 	}
-	shared := r.Artifacts[0].Run
+	shared := r.Artifacts[0].RunSlug()
 	for _, a := range r.Artifacts[1:] {
-		if a.Run != shared {
+		if a.RunSlug() != shared {
 			return ""
 		}
 	}
@@ -587,7 +608,7 @@ func Claimed(a *api.Artifact, f Format, quiet, colour bool, now time.Time) strin
 	switch {
 	// Nothing to add: the upload is already under a run, or the caller asked for
 	// the bare record, or the format is a paste form carrying only a link.
-	case a.Run != "", quiet, f == Markdown, f == URL:
+	case a.RunSlug() != "", quiet, f == Markdown, f == URL:
 		return Artifact(a, f, quiet, colour, now)
 	case f == Human:
 		return Artifact(a, f, quiet, colour, now) + "\n" +
@@ -720,8 +741,8 @@ func humanArtifact(a *api.Artifact, colour bool, now time.Time) string {
 	lines := []string{head, "  " + a.URL}
 
 	var facts []string
-	if a.Run != "" {
-		facts = append(facts, "run "+a.Run)
+	if run := a.RunSlug(); run != "" {
+		facts = append(facts, "run "+run)
 	}
 	if expiry := RelativeExpiry(a.ExpiresAt, now); expiry != "" {
 		facts = append(facts, expiry)

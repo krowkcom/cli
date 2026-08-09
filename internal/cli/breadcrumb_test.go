@@ -78,8 +78,8 @@ func TestTheBreadcrumbsFromRunsStartRun(t *testing.T) {
 
 	// <file> is the one placeholder, and it is the caller's to fill in.
 	uploaded := only(t, h.ok(strings.Fields(strings.Replace(push.Cmd, "<file>", h.fixture, 1))[1:]...))
-	if uploaded.Run != slug {
-		t.Errorf("the push breadcrumb put the upload in %q, want %q", uploaded.Run, slug)
+	if uploaded.runSlug() != slug {
+		t.Errorf("the push breadcrumb put the upload in %q, want %q", uploaded.runSlug(), slug)
 	}
 
 	closed := h.ok(strings.Fields(finish.Cmd)[1:]...)
@@ -113,8 +113,8 @@ func TestClaimingWithoutARunHandsBackTheAttach(t *testing.T) {
 	}
 
 	attached := only(t, h.ok(strings.Fields(strings.Replace(crumb.Cmd, "<run>", run, 1))[1:]...))
-	if attached.Run != run {
-		t.Errorf("the attach breadcrumb put it in %q, want %q", attached.Run, run)
+	if attached.runSlug() != run {
+		t.Errorf("the attach breadcrumb put it in %q, want %q", attached.runSlug(), run)
 	}
 }
 
@@ -153,8 +153,8 @@ func TestTheHumanClaimPrintsTheAttachCommand(t *testing.T) {
 
 	// And what it printed works, once the run is substituted for the placeholder.
 	attached := only(t, h.ok(strings.Fields(strings.Replace(want, "<run>", runSlug, 1))[1:]...))
-	if attached.Run != runSlug {
-		t.Errorf("the printed attach put it in %q, want %q", attached.Run, runSlug)
+	if attached.runSlug() != runSlug {
+		t.Errorf("the printed attach put it in %q, want %q", attached.runSlug(), runSlug)
 	}
 }
 

@@ -164,11 +164,27 @@ type artifact struct {
 	ContentType string `json:"content_type"`
 	ByteSize    int64  `json:"byte_size"`
 	Checksum    string `json:"checksum"`
-	Run         string `json:"run"`
-	URL         string `json:"url"`
-	Markdown    string `json:"markdown"`
-	ExpiresAt   string `json:"expires_at"`
-	ClaimToken  string `json:"claim_token"`
+	// Run is the run this artifact belongs to, nested rather than a bare slug:
+	// the registry reports the run itself, metadata and all, so reading an
+	// artifact back says what produced it without a second call.
+	Run *run `json:"run"`
+	// URL is the card page and FileURL is the object. Two fields because they
+	// are two different links, and confusing them is the failure this whole
+	// change exists to make impossible.
+	URL        string `json:"url"`
+	FileURL    string `json:"file_url"`
+	Markdown   string `json:"markdown"`
+	ExpiresAt  string `json:"expires_at"`
+	ClaimToken string `json:"claim_token"`
+}
+
+// runSlug is "" when the artifact belongs to no run, which is what a keyless
+// upload always is.
+func (a artifact) runSlug() string {
+	if a.Run == nil {
+		return ""
+	}
+	return a.Run.Slug
 }
 
 type run struct {
@@ -221,9 +237,9 @@ func TestPushUploadsTheBytesAndFinalizes(t *testing.T) {
 
 	// The link is the product. If it does not serve the bytes, nothing else here
 	// matters.
-	status, body := h.get(a.URL)
+	status, body := h.get(a.FileURL)
 	if status != 200 || body != "fake png bytes for the test" {
-		t.Errorf("GET %s = %d %q", a.URL, status, body)
+		t.Errorf("GET %s = %d %q", a.FileURL, status, body)
 	}
 }
 
@@ -246,7 +262,7 @@ func TestMetadataIsRecordedOnTheRun(t *testing.T) {
 	if e.Data.Run.Status != "finished" {
 		t.Errorf("run status = %q, want finished", e.Data.Run.Status)
 	}
-	if got := only(t, e).Run; got != e.Data.Run.Slug {
+	if got := only(t, e).runSlug(); got != e.Data.Run.Slug {
 		t.Errorf("artifact run = %q, want %q", got, e.Data.Run.Slug)
 	}
 
@@ -283,13 +299,13 @@ func TestEveryFileGetsItsOwnLinkUnderOneRun(t *testing.T) {
 	if first.URL == last.URL {
 		t.Errorf("both files share a link: %q", first.URL)
 	}
-	if e.Data.Run == nil || first.Run != last.Run || first.Run != e.Data.Run.Slug {
-		t.Errorf("artifacts are not grouped under one run: %q and %q", first.Run, last.Run)
+	if e.Data.Run == nil || first.runSlug() != last.runSlug() || first.runSlug() != e.Data.Run.Slug {
+		t.Errorf("artifacts are not grouped under one run: %q and %q", first.runSlug(), last.runSlug())
 	}
 	if last.ContentType != "text/plain" {
 		t.Errorf("log.txt content type = %q", last.ContentType)
 	}
-	if _, body := h.get(last.URL); body != "the build log" {
+	if _, body := h.get(last.FileURL); body != "the build log" {
 		t.Errorf("second file served %q", body)
 	}
 }
@@ -375,8 +391,8 @@ func TestClaimAttachesTheAdoptedUploadToARun(t *testing.T) {
 
 	e := h.ok("claim", uploaded.Slug, uploaded.ClaimToken, "--run="+started.Data.Slug)
 	claimed := only(t, e)
-	if claimed.Run != started.Data.Slug {
-		t.Errorf("claimed artifact run = %q, want %q", claimed.Run, started.Data.Slug)
+	if claimed.runSlug() != started.Data.Slug {
+		t.Errorf("claimed artifact run = %q, want %q", claimed.runSlug(), started.Data.Slug)
 	}
 	// The run is what the flag was for, so the line an agent reads first says so.
 	if !strings.Contains(e.Summary, "run "+started.Data.Slug) {
@@ -433,12 +449,12 @@ func TestUploadsAttachPutsAnUploadUnderARun(t *testing.T) {
 
 	other := h.ok("runs", "start")
 	attached := only(t, h.ok("uploads", "attach", pushed.Slug, "--run="+other.Data.Slug))
-	if attached.Run != other.Data.Slug {
-		t.Errorf("attach = %q, want %q", attached.Run, other.Data.Slug)
+	if attached.runSlug() != other.Data.Slug {
+		t.Errorf("attach = %q, want %q", attached.runSlug(), other.Data.Slug)
 	}
 	// Idempotent, because agents retry.
-	if again := only(t, h.ok("uploads", "attach", pushed.Slug, "--run="+other.Data.Slug)); again.Run != other.Data.Slug {
-		t.Errorf("second attach = %q", again.Run)
+	if again := only(t, h.ok("uploads", "attach", pushed.Slug, "--run="+other.Data.Slug)); again.runSlug() != other.Data.Slug {
+		t.Errorf("second attach = %q", again.runSlug())
 	}
 }
 
@@ -491,7 +507,7 @@ func TestRunsStartGroupsLaterUploads(t *testing.T) {
 	}
 
 	e := h.ok("push", h.fixture, "--run="+started.Data.Slug)
-	if got := only(t, e).Run; got != started.Data.Slug {
+	if got := only(t, e).runSlug(); got != started.Data.Slug {
 		t.Errorf("artifact run = %q, want %q", got, started.Data.Slug)
 	}
 	// A run the caller opened is a run the caller closes, so pushing to it must
@@ -615,8 +631,10 @@ func TestMarkdownFormatIsPasteReady(t *testing.T) {
 
 	_, stdout, _ := h.run("push", h.fixture, "--title=Checkout", "--format=markdown")
 
-	// An image embeds, and the title labels it.
-	want := regexp.MustCompile(`^!\[Checkout]\(http.+checkout-after\.png\)$`)
+	// An image embeds and the title labels it — and the embed names the bytes
+	// while the link around it names the card page, which is the only pair of
+	// URLs that both renders in a pull request and clicks through to the run.
+	want := regexp.MustCompile(`^\[!\[Checkout]\(http.+checkout-after\.png\)]\(http.+/a/art_\w+\)$`)
 	if !want.MatchString(strings.TrimSpace(stdout)) {
 		t.Errorf("markdown = %q", stdout)
 	}
@@ -632,9 +650,15 @@ func TestMarkdownGivesOneLinePerFile(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("want a line per file, got %q", stdout)
 	}
-	// The image embeds; the log is a plain link.
-	if !strings.HasPrefix(lines[0], "![") || !strings.HasPrefix(lines[1], "[log.txt]") {
+	// The image embeds; the log is a plain link. Both are wrapped in, or are,
+	// a link to the card page.
+	if !strings.HasPrefix(lines[0], "[![") || !strings.HasPrefix(lines[1], "[log.txt](") {
 		t.Errorf("markdown = %q", stdout)
+	}
+	for i, line := range lines {
+		if !strings.HasSuffix(line, ")") || !strings.Contains(line, "/a/art_") {
+			t.Errorf("line %d = %q, want it to link to a card page", i, line)
+		}
 	}
 }
 
@@ -763,10 +787,10 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	h.ok("uploads", "list")
 	h.ok("uploads", "show", pushed.Slug)
 	h.ok("runs", "list")
-	h.ok("runs", "show", pushed.Run)
+	h.ok("runs", "show", pushed.runSlug())
 	// A run's artifacts are a collection of the run, not a filter on the listing
 	// above — so --run is a different endpoint rather than a query parameter.
-	h.ok("uploads", "list", "--run="+pushed.Run)
+	h.ok("uploads", "list", "--run="+pushed.runSlug())
 	h.run("doctor")
 
 	// Claiming needs an anonymous artifact to claim.
@@ -774,7 +798,7 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	anonymous := only(t, h.ok("push", h.fixture))
 	h.env["KROWK_TOKEN"] = "krowk_sk_test"
 	h.ok("claim", anonymous.Slug, anonymous.ClaimToken)
-	h.ok("uploads", "attach", anonymous.Slug, "--run="+pushed.Run)
+	h.ok("uploads", "attach", anonymous.Slug, "--run="+pushed.runSlug())
 	// Taking it down again: a claimed artifact answers to the key that holds it.
 	h.ok("uploads", "delete", anonymous.Slug)
 
@@ -927,8 +951,8 @@ func TestPushRecoversFromALapsedSignatureUnderOneSlug(t *testing.T) {
 		t.Fatalf("state = %q, want the upload to have completed", pushed.State)
 	}
 	// The link is the product: it has to serve the bytes that were pushed.
-	if status, body := h.get(pushed.URL); status != 200 || body != "fake png bytes for the test" {
-		t.Errorf("GET %s = %d %q", pushed.URL, status, body)
+	if status, body := h.get(pushed.FileURL); status != 200 || body != "fake png bytes for the test" {
+		t.Errorf("GET %s = %d %q", pushed.FileURL, status, body)
 	}
 
 	want := []string{
@@ -969,8 +993,8 @@ func TestKeylessPushRecoversFromALapsedSignature(t *testing.T) {
 	if !strings.HasPrefix(pushed.ClaimToken, "krowk_claim_") {
 		t.Errorf("claim_token = %q, want the one the declare handed over", pushed.ClaimToken)
 	}
-	if status, body := h.get(pushed.URL); status != 200 || body != "fake png bytes for the test" {
-		t.Errorf("GET %s = %d %q", pushed.URL, status, body)
+	if status, body := h.get(pushed.FileURL); status != 200 || body != "fake png bytes for the test" {
+		t.Errorf("GET %s = %d %q", pushed.FileURL, status, body)
 	}
 	// One declare, so one slug: the recovery went through the artifact that was
 	// already declared rather than round it.
@@ -1054,13 +1078,17 @@ func TestFailedKeyedPushNamesItsRunAndKeepsProgress(t *testing.T) {
 	if fix, _ := body["fix"].(string); !strings.Contains(fix, "krowk runs finish "+slug) {
 		t.Errorf("fix = %q, want it to name `krowk runs finish %s`", fix, slug)
 	}
-	// The first file made it up before the second died, and its link still works.
+	// The first file made it up before the second died, and its link still
+	// works. The link is the card page — that is what an agent would hand on —
+	// so what is checked is that the page resolves and names the file, not that
+	// the URL serves bytes.
 	urls, _ := body["uploaded_before_failure"].([]any)
 	if len(urls) != 1 {
 		t.Fatalf("uploaded_before_failure = %v, want the first file's URL", body["uploaded_before_failure"])
 	}
-	if status, bytes := h.get(urls[0].(string)); status != 200 || bytes != "fake png bytes for the test" {
-		t.Errorf("GET %v = %d %q", urls[0], status, bytes)
+	status, page := h.get(urls[0].(string))
+	if status != 200 || !strings.Contains(page, "checkout-after.png") {
+		t.Errorf("GET %v = %d %q", urls[0], status, page)
 	}
 	// The slug in the error is enough to actually close the run.
 	if e := h.ok("runs", "finish", slug); e.Data.Status != "finished" {
@@ -1164,7 +1192,7 @@ func TestReadyArtifactRejectsAnotherUpload(t *testing.T) {
 	// The upload URL is not surfaced by the CLI after a push, so reconstruct the
 	// PUT the way an attacker holding a leaked token would: any token is as good
 	// as none once finalization has spent it.
-	req, err := http.NewRequest(http.MethodPut, a.URL+"?upload_token=anything", strings.NewReader("swapped"))
+	req, err := http.NewRequest(http.MethodPut, a.FileURL+"?upload_token=anything", strings.NewReader("swapped"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1177,7 +1205,7 @@ func TestReadyArtifactRejectsAnotherUpload(t *testing.T) {
 	if res.StatusCode != http.StatusForbidden {
 		t.Errorf("re-PUT after finalize = %d, want 403", res.StatusCode)
 	}
-	if _, body := h.get(a.URL); body != "fake png bytes for the test" {
+	if _, body := h.get(a.FileURL); body != "fake png bytes for the test" {
 		t.Errorf("stored bytes changed to %q", body)
 	}
 }
@@ -1189,7 +1217,7 @@ func TestUploadsDeleteTakesTheBytesDownAndLeavesATombstone(t *testing.T) {
 	h := newHarness(t, 0)
 
 	pushed := only(t, h.ok("push", h.fixture))
-	if status, _ := h.get(pushed.URL); status != http.StatusOK {
+	if status, _ := h.get(pushed.FileURL); status != http.StatusOK {
 		t.Fatalf("the upload never served: %d", status)
 	}
 
@@ -1198,8 +1226,8 @@ func TestUploadsDeleteTakesTheBytesDownAndLeavesATombstone(t *testing.T) {
 		t.Errorf("delete = %+v", e)
 	}
 
-	if status, _ := h.get(pushed.URL); status != http.StatusNotFound {
-		t.Errorf("GET %s after takedown = %d, want 404", pushed.URL, status)
+	if status, _ := h.get(pushed.FileURL); status != http.StatusNotFound {
+		t.Errorf("GET %s after takedown = %d, want 404", pushed.FileURL, status)
 	}
 	if got := h.fails("uploads", "show", pushed.Slug)["error"]; got != "taken_down" {
 		t.Errorf("show after takedown = %v, want taken_down", got)
@@ -1251,8 +1279,8 @@ func TestClaimTokenTakesDownAnAnonymousUploadFromALoggedInMachine(t *testing.T) 
 	if !e.Data.TakenDown {
 		t.Errorf("delete = %+v", e)
 	}
-	if status, _ := h.get(anonymous.URL); status != http.StatusNotFound {
-		t.Errorf("GET %s after takedown = %d, want 404", anonymous.URL, status)
+	if status, _ := h.get(anonymous.FileURL); status != http.StatusNotFound {
+		t.Errorf("GET %s after takedown = %d, want 404", anonymous.FileURL, status)
 	}
 }
 
@@ -1267,8 +1295,8 @@ func TestDeletingAnonymouslyWithoutATokenNamesWhatIsMissing(t *testing.T) {
 		t.Errorf("error = %v, want missing_claim", body["error"])
 	}
 	// The upload is still there: refusing locally must not half-do the takedown.
-	if status, _ := h.get(pushed.URL); status != http.StatusOK {
-		t.Errorf("GET %s = %d, want the upload untouched", pushed.URL, status)
+	if status, _ := h.get(pushed.FileURL); status != http.StatusOK {
+		t.Errorf("GET %s = %d, want the upload untouched", pushed.FileURL, status)
 	}
 }
 
@@ -1309,8 +1337,8 @@ func TestASecondWordThatIsNotAClaimTokenIsRefused(t *testing.T) {
 	}
 	// Neither is touched: a refusal here must not half-do the takedown.
 	for _, a := range []artifact{first, second} {
-		if status, _ := h.get(a.URL); status != http.StatusOK {
-			t.Errorf("GET %s = %d, want the upload untouched", a.URL, status)
+		if status, _ := h.get(a.FileURL); status != http.StatusOK {
+			t.Errorf("GET %s = %d, want the upload untouched", a.FileURL, status)
 		}
 	}
 }

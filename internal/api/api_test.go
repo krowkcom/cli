@@ -220,7 +220,7 @@ func TestAttachRunIsAnIdempotentPut(t *testing.T) {
 		calls = append(calls, r.Method+" "+r.URL.Path)
 		bodies = append(bodies, string(body))
 		mu.Unlock()
-		fmt.Fprint(w, `{"slug":"art_x","state":"ready","run":"run_y"}`)
+		fmt.Fprint(w, `{"slug":"art_x","state":"ready","run":{"slug":"run_y","metadata":{}}}`)
 	}))
 	t.Cleanup(server.Close)
 
@@ -230,8 +230,8 @@ func TestAttachRunIsAnIdempotentPut(t *testing.T) {
 		if err != nil {
 			t.Fatalf("attach %d = %v", i+1, err)
 		}
-		if artifact.Run != "run_y" {
-			t.Errorf("attach %d returned run %q, want run_y", i+1, artifact.Run)
+		if artifact.RunSlug() != "run_y" {
+			t.Errorf("attach %d returned run %q, want run_y", i+1, artifact.RunSlug())
 		}
 	}
 

@@ -171,20 +171,41 @@ type Upload struct {
 	ExpiresAt string            `json:"expires_at"`
 }
 
+// ArtifactRun is the run an artifact belongs to, as the artifact reports it: a
+// nested object, not the bare slug it used to be. The run's metadata comes
+// along, so a read that wants to know what produced the file needs no second
+// call.
+//
+// A pointer on Artifact, because belonging to no run is a real state — a
+// keyless upload never has one — and null is how the registry says it.
+type ArtifactRun struct {
+	Slug      string          `json:"slug"`
+	Metadata  json.RawMessage `json:"metadata,omitempty"`
+	CreatedAt string          `json:"created_at,omitempty"`
+}
+
 // Artifact is one stored file, as the registry reports it.
 type Artifact struct {
-	Slug        string `json:"slug"`
-	State       string `json:"state"`
-	Filename    string `json:"filename"`
-	ContentType string `json:"content_type"`
-	ByteSize    int64  `json:"byte_size"`
-	Checksum    string `json:"checksum,omitempty"`
-	Region      string `json:"region,omitempty"`
-	Run         string `json:"run,omitempty"`
-	URL         string `json:"url"`
-	Markdown    string `json:"markdown,omitempty"`
-	ExpiresAt   string `json:"expires_at,omitempty"`
-	CreatedAt   string `json:"created_at,omitempty"`
+	Slug        string       `json:"slug"`
+	State       string       `json:"state"`
+	Filename    string       `json:"filename"`
+	ContentType string       `json:"content_type"`
+	ByteSize    int64        `json:"byte_size"`
+	Checksum    string       `json:"checksum,omitempty"`
+	Region      string       `json:"region,omitempty"`
+	Run         *ArtifactRun `json:"run,omitempty"`
+	// URL is the card page, krowk.com/a/{slug}: the link to paste. It is what
+	// unfurls into a preview card, and it stays a link to the artifact rather
+	// than to whatever object storage happens to be serving the bytes.
+	URL string `json:"url"`
+	// FileURL is the public byte URL on the CDN — what `url` used to be. Only
+	// an image embed should be built from it, because a paste destination
+	// renders an image only where the link resolves to image bytes; everything
+	// a person or an agent is handed points at the card instead.
+	FileURL   string `json:"file_url,omitempty"`
+	Markdown  string `json:"markdown,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
 
 	// Upload and NextStep only ever appear on the create response.
 	Upload   *Upload `json:"upload,omitempty"`
@@ -194,6 +215,16 @@ type Artifact struct {
 	// artifact. It is the only way to keep that artifact past its expiry, so it
 	// is carried through to the output rather than dropped here.
 	ClaimToken string `json:"claim_token,omitempty"`
+}
+
+// RunSlug names the run this artifact belongs to, or "" when it belongs to
+// none. Everything that only wants the slug goes through here, so a nil run
+// reads as absent rather than panicking on the way to finding that out.
+func (a *Artifact) RunSlug() string {
+	if a == nil || a.Run == nil {
+		return ""
+	}
+	return a.Run.Slug
 }
 
 // Run groups the artifacts one agent run produced, and is where run metadata

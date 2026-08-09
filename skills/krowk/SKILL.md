@@ -41,8 +41,10 @@ argument-hint: "[push <file> | runs start | claim <artifact> <token> | doctor]"
 # /krowk — permalinks for agent output
 
 krowk turns a local file into a URL that unfurls in GitHub, Slack, Basecamp and
-Linear. One file, one artifact, one link. What groups several links together is a
-**run**, not an artifact.
+Linear. One file, one artifact, one link. That link is a card page —
+`krowk.com/a/{slug}` — carrying the file and its run metadata; the bytes on the
+CDN are `file_url`, which only an image embed should ever name. What groups
+several links together is a **run**, not an artifact.
 
 Seventeen commands, one JSON envelope, and a surface you can read as data:
 `krowk help --json` is the whole thing — every command, argument, flag and
@@ -80,8 +82,10 @@ environment variable — so never guess at a spelling this file does not carry.
    wants the link to outlive the day or wants the artifacts grouped.
 7. **Paste the right form for the destination.** `paste.markdown` for GitHub,
    Linear and Notion — those render an image URL inline and a third-party link as
-   a plain anchor. `paste.url`, bare, for Slack and Basecamp — both unfurl a bare
-   URL into a card, and Slack renders no markdown image embeds at all.
+   a plain anchor, so an image comes as `[![name](file_url)](url)`: it renders,
+   and it clicks through to the card. `paste.url`, bare, for Slack and Basecamp —
+   both unfurl the card into a preview, and Slack renders no markdown image
+   embeds at all. Never assemble either form yourself; both come back ready.
 8. **Push what the person asked for, not what is nearby.** An artifact is public
    to anyone with the link. Never push `.env` files, key material, credential
    JSON or anything under `.ssh`/`.aws`, and never push a file you found rather
@@ -189,8 +193,9 @@ krowk push shot.png \
 ```
 
 Read `paste.markdown` from the envelope and put that line in the comment body —
-it is an image embed, so the screenshot renders inline rather than as a blue
-link. `data.artifacts[0].url` is the same link bare, for Slack.
+it is an image embed wrapped in a link to the card, so the screenshot renders
+inline and clicking it lands on the page with the run metadata.
+`data.artifacts[0].url` is that card page bare, for Slack.
 
 ### A whole session's output under one run
 

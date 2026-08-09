@@ -246,14 +246,15 @@ func TestClaimDoesNotInvalidateTheUploadURL(t *testing.T) {
 }
 
 // The stand-in must not be more forgiving than the real thing: a run body that
-// does not parse is refused, exactly as a garbage artifact body is.
+// does not parse is refused, exactly as a garbage artifact body is, and with
+// the same code — the payload is what is broken, not one field in it.
 func TestGarbageRunBodyIsRejected(t *testing.T) {
 	server, _ := newClockedServer(t)
 
 	status, body := request(t, http.MethodPost, server.URL+"/v1/runs",
 		"krowk_sk_test", "application/json", `{"run": not json`)
-	if status != http.StatusBadRequest || errorCode(body) != "parameter_missing" {
-		t.Errorf("garbage run body = %d %v, want 400 parameter_missing", status, body)
+	if status != http.StatusBadRequest || errorCode(body) != "bad_request" {
+		t.Errorf("garbage run body = %d %v, want 400 bad_request", status, body)
 	}
 	// An empty body is still fine: a run needs no metadata.
 	if status, _ := request(t, http.MethodPost, server.URL+"/v1/runs", "krowk_sk_test", "", ""); status != http.StatusCreated {
@@ -1020,5 +1021,62 @@ func TestARunsArtifactListingIsScopedToTheRunAndToWhatItStillHolds(t *testing.T)
 	_, remaining := listing("")
 	if got := slugsOf(t, remaining, "artifacts"); !reflect.DeepEqual(got, []string{newer}) {
 		t.Errorf("run listing after a takedown = %v, want the tombstone gone", got)
+	}
+}
+
+// The two 404s the registry tells apart, and the stand-in has to tell apart
+// with it: an unknown slug is about what was asked for, an unknown path is
+// about where it was asked. A client branching on the code gives one of them
+// the wrong advice if they arrive spelled the same.
+func TestUnroutedPathsAreNotTheSame404AsUnknownRecords(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	if status, payload := request(t, http.MethodGet, server.URL+"/v1/nothing-here",
+		"krowk_sk_owner", "", ""); status != http.StatusNotFound || errorCode(payload) != "no_such_endpoint" {
+		t.Errorf("unrouted path = %d %s, want 404 no_such_endpoint", status, errorCode(payload))
+	}
+	if status, payload := request(t, http.MethodGet, server.URL+"/v1/artifacts/art_nosuchartifact000",
+		"krowk_sk_owner", "", ""); status != http.StatusNotFound || errorCode(payload) != "not_found" {
+		t.Errorf("unknown slug = %d %s, want 404 not_found", status, errorCode(payload))
+	}
+}
+
+// A known path asked for with a verb it does not serve is the same answer, and
+// deliberately not a 405: it is what Go's mux does once a catch-all is
+// registered, and what the Rails router the real registry runs does on its own.
+func TestAVerbTheEndpointDoesNotServeIsNoSuchEndpoint(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	if status, payload := request(t, http.MethodPut, server.URL+"/v1/artifacts",
+		"krowk_sk_owner", "application/json", "{}"); status != http.StatusNotFound ||
+		errorCode(payload) != "no_such_endpoint" {
+		t.Errorf("wrong verb = %d %s, want 404 no_such_endpoint", status, errorCode(payload))
+	}
+}
+
+// A body the registry could not read has nothing to name a parameter from, so
+// it is refused as the broken payload it is rather than as a field that is
+// absent — which would send a client looking for one field in a body where
+// every field is unreadable.
+func TestABodyThatDoesNotParseIsRefusedAsOne(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	for name, body := range map[string]string{
+		"truncated": `{"artifact": `,
+		"not json":  `{not json at all`,
+	} {
+		status, payload := request(t, http.MethodPost, server.URL+"/v1/artifacts",
+			"krowk_sk_owner", "application/json", body)
+		if status != http.StatusBadRequest || errorCode(payload) != "bad_request" {
+			t.Errorf("%s body = %d %s, want 400 bad_request", name, status, errorCode(payload))
+		}
+	}
+
+	// An absent body is not an unreadable one: nothing was sent, so the missing
+	// parameter is exactly what to name.
+	if status, payload := request(t, http.MethodPost, server.URL+"/v1/artifacts",
+		"krowk_sk_owner", "application/json", ""); status != http.StatusBadRequest ||
+		errorCode(payload) != "parameter_missing" {
+		t.Errorf("empty body = %d %s, want 400 parameter_missing", status, errorCode(payload))
 	}
 }

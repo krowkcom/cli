@@ -204,8 +204,16 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	mux.HandleFunc("PUT /_storage/{workspace}/{slug}/{filename}", s.putObject)
 	mux.HandleFunc("GET /_storage/{workspace}/{slug}/{filename}", s.getObject)
 
+	// A path that matches nothing, which includes a known path asked for with a
+	// verb it does not serve — Go's mux falls through to this pattern rather
+	// than answering 405, and so does the Rails router the real registry runs.
+	//
+	// `no_such_endpoint` rather than `not_found`: an unknown slug and an unknown
+	// path are different mistakes, and a client that cannot tell them apart
+	// sends someone hunting for a typo in a slug when the base URL is wrong.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, http.StatusNotFound, "not_found", "No such endpoint.", nil)
+		writeError(w, http.StatusNotFound, "no_such_endpoint",
+			"No such endpoint. Check the path and the method — GET / lists the versions this API serves.", nil)
 	})
 
 	return mux
@@ -228,6 +236,9 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		} `json:"artifact"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		if unreadableBody(w, err) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "parameter_missing",
 			"Missing required parameter: artifact.", nil)
 		return
@@ -702,7 +713,9 @@ func (s *store) destroyArtifact(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ClaimToken string `json:"claim_token"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); unreadableBody(w, err) {
+		return
+	}
 
 	// A keyless caller's authority is the claim token, and the slug will not do
 	// even though it does for reading: a slug travels in whatever the link was
@@ -795,7 +808,9 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ClaimToken string `json:"claim_token"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); unreadableBody(w, err) {
+		return
+	}
 	if body.ClaimToken == "" {
 		writeError(w, http.StatusBadRequest, "parameter_missing",
 			"Missing required parameter: claim_token.", nil)
@@ -878,7 +893,9 @@ func (s *store) attachRun(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Run string `json:"run"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); unreadableBody(w, err) {
+		return
+	}
 	if body.Run == "" {
 		writeError(w, http.StatusBadRequest, "parameter_missing",
 			"Missing required parameter: run.", nil)
@@ -932,6 +949,9 @@ func (s *store) createRun(w http.ResponseWriter, r *http.Request) {
 	// A body that does not parse is refused, exactly as createArtifact refuses
 	// one — an empty body is fine, a run needs no metadata.
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil && err != io.EOF {
+		if unreadableBody(w, err) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "parameter_missing",
 			"Missing required parameter: run.", nil)
 		return
@@ -1376,6 +1396,28 @@ func site(r *http.Request, override string) string {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host
+}
+
+// unreadableBody answers the body that never parsed, and reports whether it did.
+//
+// Split out from the missing-parameter refusals it sits next to because the two
+// are different failures with different fixes: a body the registry could not
+// read has nothing to name a parameter from, so saying one is absent sends a
+// client looking for a field when the whole payload is broken. The real
+// registry raises this out of Rails' parser, before an action reads a single
+// parameter, and answers `bad_request` for it.
+//
+// A truncated body is io.ErrUnexpectedEOF rather than a SyntaxError, and it is
+// the likelier of the two in the wild — a connection that dropped mid-write.
+// An empty body is neither, and stays the caller's own handler's business.
+func unreadableBody(w http.ResponseWriter, err error) bool {
+	var syntax *json.SyntaxError
+	if !errors.As(err, &syntax) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return false
+	}
+
+	writeError(w, http.StatusBadRequest, "bad_request", "The request body is not valid JSON.", nil)
+	return true
 }
 
 // writeError is the one error envelope the whole API answers in, so a client can

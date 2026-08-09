@@ -464,3 +464,60 @@ func TestReadsCarryNoIdempotencyKey(t *testing.T) {
 		t.Errorf("a read sent Idempotency-Key %q, want none", keys[0])
 	}
 }
+
+// The other 404 the registry answers, and the reason it spells them
+// differently: this one is about the URL rather than about anything in it, so
+// the fix has to name KROWK_API_URL and the method rather than a slug and a
+// workspace. Getting these two the wrong way round is the failure the split
+// exists to prevent.
+func TestNoSuchEndpointIsFixedByTheURLRatherThanTheSlug(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":{"code":"no_such_endpoint","message":"No such endpoint."}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	c, slept := testClient(server)
+	_, err := c.ShowArtifact(context.Background(), "art_whatever")
+
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "no_such_endpoint" {
+		t.Fatalf("ShowArtifact = %v, want no_such_endpoint", err)
+	}
+	if !strings.Contains(apiErr.Fix(), "KROWK_API_URL") {
+		t.Errorf("fix = %q, want it to name the base URL", apiErr.Fix())
+	}
+	if strings.Contains(apiErr.Fix(), "workspace") {
+		t.Errorf("fix = %q, want it not to send anyone hunting for a slug", apiErr.Fix())
+	}
+	if apiErr.Retryable() {
+		t.Error("a URL the registry does not serve is not worth asking for twice")
+	}
+	if len(*slept) != 0 {
+		t.Errorf("slept %v — a 404 is not worth retrying", *slept)
+	}
+}
+
+// A body the registry could not read carries its own fix in the message, so the
+// client adds none — the same reason parameter_missing and invalid add none.
+func TestAnUnreadableBodyKeepsTheRegistrysOwnMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":{"code":"bad_request","message":"The request body is not valid JSON."}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	c, _ := testClient(server)
+	_, err := c.ShowArtifact(context.Background(), "art_whatever")
+
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "bad_request" {
+		t.Fatalf("ShowArtifact = %v, want bad_request", err)
+	}
+	if apiErr.Fix() != "" {
+		t.Errorf("fix = %q, want none — the registry's message already names it", apiErr.Fix())
+	}
+	if apiErr.Retryable() {
+		t.Error("a body the registry could not read reads the same the second time")
+	}
+}

@@ -218,7 +218,7 @@ func TestDoctorReportsTheStatusThatArrived(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprint(w, `{"error":{"code":"not_found","message":"No such endpoint."}}`)
+		fmt.Fprint(w, `{"error":{"code":"no_such_endpoint","message":"No such endpoint."}}`)
 	}))
 	t.Cleanup(srv.Close)
 

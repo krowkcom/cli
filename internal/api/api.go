@@ -1005,8 +1005,36 @@ func fixFor(code string, status int) string {
 		// another workspace's slug rather than "forbidden", which would confirm it
 		// exists. So a wrong slug and someone else's slug read the same.
 		return "no such artifact or run in this workspace — check the slug, and that the key matches the workspace it was uploaded to"
-	case "parameter_missing", "invalid":
-		return "" // the registry's own message names the parameter
+	case "no_such_endpoint":
+		// The other 404, and the reason the registry spells them differently: this
+		// one is about the URL rather than about anything in it. The verb is named
+		// too, because a known path asked for with a verb it does not serve answers
+		// 404 rather than 405 — so "check the base URL" alone would send someone to
+		// confirm the one part that was already right.
+		return "the registry has no such endpoint — check KROWK_API_URL names the API host and version, and that the method is the one this call uses"
+	case "parameter_missing", "invalid", "bad_request":
+		return "" // the registry's own message names what it could not read
+	case "method_not_allowed":
+		// Only an HTTP method the registry does not answer at all reaches this: a
+		// verb it does not serve on a path it does answers 404. So the Allow header
+		// on the same response is the whole of the fix.
+		// Allow says what the path does answer, when the registry could work it
+		// out; it is absent when it could not, which is not the same as a path
+		// that answers nothing.
+		return "the registry does not answer that HTTP method — read the Allow header on this response, if it carries one, for the methods it does"
+	case "not_acceptable":
+		// The registry answers JSON and nothing else, so there is no other format
+		// to ask for: either header naming something else, or naming something it
+		// cannot read at all, arrives here.
+		return "the registry answers JSON only — send `application/json` in Accept and Content-Type, or send neither"
+	case "internal_server_error":
+		return "the registry failed on its side — retry, and report it if it persists"
+	case "unexpected_error":
+		// The registry's catch-all: a failure it has no specific code for, which
+		// it answers with the status and nothing else. Named here rather than left
+		// to the status fallback below, because that one only covers 404 and 5xx —
+		// a 405 or a 406 would otherwise reach a person with no fix line at all.
+		return "the registry refused this in a way it has no specific code for — check the status, and report it if it persists"
 	}
 	if status >= 500 {
 		return "the registry failed on its side — retry, and report it if it persists"
@@ -1026,7 +1054,11 @@ func retryableFor(code string) (bool, bool) {
 	// Nothing about retrying these changes the answer, and an agent that keeps
 	// trying is worse than one that stops.
 	case "invalid", "parameter_missing", "unauthorized", "not_found", "expired",
-		"taken_down", "checksum_mismatch", "empty_upload", "run_needs_key":
+		"taken_down", "checksum_mismatch", "empty_upload", "run_needs_key",
+		// The request itself is what is wrong in both: a body the registry could
+		// not read, and a URL it does not serve. Sending either again unchanged
+		// gets the same answer.
+		"bad_request", "no_such_endpoint":
 		return false, true
 	}
 	return false, false

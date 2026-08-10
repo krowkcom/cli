@@ -29,6 +29,8 @@ func TestEveryBreadcrumbIsWholeAndRunnable(t *testing.T) {
 		"uploads list": List(&api.Page{Artifacts: []*api.Artifact{claimed}, Next: "art_1a"}, Listing{}, JSON, false, false, now),
 		"auth verify":  Key(&api.Key{KeyID: "key_1", Workspace: "ws_1"}, JSON, false, false),
 		"auth login":   StoredKey(&Login{Path: "/tmp/c", Confirmed: true, KeyID: "key_1", Workspace: "ws_1"}, JSON, false, false),
+		"auth login shadowed by KROWK_TOKEN": StoredKey(&Login{Path: "/tmp/c", Confirmed: true,
+			KeyID: "key_1", Workspace: "ws_1", Shadowed: true}, JSON, false, false),
 	}
 
 	for name, out := range rendered {

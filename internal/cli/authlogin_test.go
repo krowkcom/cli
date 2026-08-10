@@ -733,6 +733,39 @@ func TestAwaitingApprovalBlamesTheRegistryWhenItNeverAnswered(t *testing.T) {
 	}
 }
 
+// A registry that was there for the window and dropped at the very end is still a
+// login nobody approved: what would change the story is never having got the
+// question out, not the state of the connection at the last moment.
+func TestAwaitingApprovalBlamesNobodyApprovingWhenTheRegistryDroppedLate(t *testing.T) {
+	var polls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if polls.Add(1) == 1 {
+			fmt.Fprint(w, `{"slug":"aut_x","state":"pending"}`)
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, `{"error":{"code":"unexpected_error","message":"bad gateway"}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	start := time.Now()
+	ticks := 0
+	clock := func() time.Time {
+		defer func() { ticks++ }()
+		return start.Add(time.Duration(ticks) * 40 * time.Second)
+	}
+
+	client := api.New(srv.URL+"/v1", "")
+	client.Sleep = func(time.Duration) {}
+
+	_, err := awaitAuthorization(context.Background(), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, start.Add(time.Minute), clock, func(time.Duration) {})
+	if err == nil || err.Error() != "authorization_expired" {
+		t.Fatalf("err = %v, want authorization_expired — the question was asked and answered", err)
+	}
+}
+
 // And the other way round: a registry that answered, however badly at first, and
 // then went on saying pending until the window closed, really is a login nobody
 // approved.

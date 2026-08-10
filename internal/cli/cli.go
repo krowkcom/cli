@@ -910,18 +910,21 @@ func noBrowserLoginHere(err error) error {
 func awaitAuthorization(ctx context.Context, client *api.Client, auth *api.CLIAuthorization,
 	deadline time.Time, now func() time.Time, sleep func(time.Duration)) (*api.CLIAuthorization, error) {
 	interval := pollInterval(auth.Interval)
-	// The last failure worth waiting through, kept rather than dropped: a window
-	// that closes having never once reached the registry is a registry that could
-	// not be reached, and reporting it as nobody having approved would blame a
-	// person for a question krowk never managed to ask.
+	// Whether the registry ever answered at all, and the last failure worth waiting
+	// through. A window that closes having never once been asked is a registry that
+	// could not be reached, and reporting that as nobody approving would blame a
+	// person for a question krowk never managed to put — with exit 8, which says no
+	// retry will help, about the one case where retrying is the entire fix.
+	//
+	// Ever answered, rather than answered most recently. A registry that was there
+	// for the window and dropped at the end really is a login nobody approved; what
+	// changes the story is never having got the question out.
+	asked := false
 	var unanswered error
 
 	for {
-		if err := ctx.Err(); err != nil {
-			if unanswered != nil {
-				return nil, unanswered
-			}
-			return nil, api.Fail("cancelled", err.Error())
+		if ctx.Err() != nil {
+			return nil, lapsed(ctx, asked, unanswered)
 		}
 
 		granted, err := client.ReadCLIAuthorization(ctx, auth.Slug)
@@ -947,20 +950,30 @@ func awaitAuthorization(ctx context.Context, client *api.Client, auth *api.CLIAu
 		default:
 			// Anything else is pending, including a state this build has no word for:
 			// a newer registry inventing one is not grounds for abandoning a login
-			// that is still inside its window. The registry answered, so whatever
-			// went wrong earlier is no longer what is holding this up.
-			unanswered = nil
+			// that is still inside its window.
+			asked = true
 		}
 
 		if !now().Before(deadline) {
-			if unanswered != nil {
-				return nil, unanswered
-			}
-			return nil, api.Fail("authorization_expired",
-				"nobody approved this login before it lapsed — run `krowk auth login` to ask again")
+			return nil, lapsed(ctx, asked, unanswered)
 		}
 		sleep(interval)
 	}
+}
+
+// lapsed is what a closed window means, which depends on whether the question
+// ever reached the registry.
+func lapsed(ctx context.Context, asked bool, unanswered error) error {
+	if !asked && unanswered != nil {
+		return unanswered
+	}
+	// A cancelled context that is not the window closing is somebody stopping the
+	// command, which is not a login that lapsed.
+	if err := ctx.Err(); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		return api.Fail("cancelled", err.Error())
+	}
+	return api.Fail("authorization_expired",
+		"nobody approved this login before it lapsed — run `krowk auth login` to ask again")
 }
 
 // worthAnotherPoll reports whether a failed poll says nothing about the login. A

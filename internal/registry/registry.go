@@ -1578,17 +1578,23 @@ func (s *store) createCLIAuthorization(w http.ResponseWriter, site string) {
 		createdAt: s.now(),
 	}
 	s.authorizations[auth.slug] = auth
+	// Read out while the record is still held. The moment it is in the map another
+	// request can reach it and change its state, and building a response out of a
+	// struct this handler no longer holds is the same mistake wherever it is made —
+	// nobody can know the code yet, but that is a fact about this endpoint rather
+	// than about the lock.
+	slug, code, state := auth.slug, auth.code, auth.state
 	expires := auth.createdAt.Add(cliAuthorizationLifetime)
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"slug":  auth.slug,
-		"state": auth.state,
-		"code":  auth.code,
+		"slug":  slug,
+		"state": state,
+		"code":  code,
 		// Only the code travels in the URL. Putting the slug there would hand the
 		// browser — and its history, and whatever extension is reading it — the half
 		// that collects the key.
-		"verification_url": site + "/_approve/cli/authorizations/new?code=" + url.QueryEscape(auth.code),
+		"verification_url": site + "/_approve/cli/authorizations/new?code=" + url.QueryEscape(code),
 		"interval":         cliAuthorizationInterval,
 		"expires_at":       expires.UTC().Format(time.RFC3339),
 	})

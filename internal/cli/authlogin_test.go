@@ -766,6 +766,70 @@ func TestAwaitingApprovalStillBlamesNobodyApprovingAfterTheRegistryRecovers(t *t
 	}
 }
 
+// Approved with nothing to hand over is the registry's side of the contract
+// broken. Storing an empty token would leave a machine that looks logged in and
+// cannot upload, which is a worse state than a login that plainly failed.
+func TestAwaitingApprovalRefusesAnApprovalWithNoKeyInIt(t *testing.T) {
+	for _, missing := range []string{
+		`{"slug":"aut_x","state":"approved","key_id":"key_1","workspace":"ws_1"}`,
+		`{"slug":"aut_x","state":"approved","token":"krowk_sk_new","workspace":"ws_1"}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, missing)
+		}))
+
+		client := api.New(srv.URL+"/v1", "")
+		client.Sleep = func(time.Duration) {}
+
+		_, err := awaitAuthorization(context.Background(), client,
+			&api.CLIAuthorization{Slug: "aut_x"}, time.Now().Add(time.Hour),
+			time.Now, func(time.Duration) { t.Errorf("waited after %s", missing) })
+		srv.Close()
+
+		if err == nil || err.Error() != "malformed_response" {
+			t.Errorf("err = %v for %s, want malformed_response", err, missing)
+		}
+		if got := exitCodeFor(err); got != exitServer {
+			t.Errorf("exit = %d for %s, want %d", got, missing, exitServer)
+		}
+	}
+}
+
+// `spent` is the other 410 this endpoint answers, and the registry spells it the
+// same whatever the record is. Advice about an artifact would be nonsense here,
+// and so would advice about a window that closed — this key was collected.
+func TestAwaitingApprovalSaysWhenTheKeyWasAlreadyCollected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGone)
+		fmt.Fprint(w, `{"error":{"code":"spent","message":"Already collected."}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := api.New(srv.URL+"/v1", "")
+	client.Sleep = func(time.Duration) {}
+
+	_, err := awaitAuthorization(context.Background(), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, time.Now().Add(time.Hour),
+		time.Now, func(time.Duration) { t.Error("waited to ask again for a key already handed over") })
+
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "spent" {
+		t.Fatalf("err = %v, want spent", err)
+	}
+	fix := apiErr.Fix()
+	if !strings.Contains(fix, "already collected") || !strings.Contains(fix, "auth login") {
+		t.Errorf("fix = %q, which does not say the key is gone or what to do about it", fix)
+	}
+	if strings.Contains(fix, "lapsed") || strings.Contains(fix, "upload") {
+		t.Errorf("fix = %q, which is advice for a different 410", fix)
+	}
+	if got := exitCodeFor(err); got != exitGone {
+		t.Errorf("exit = %d, want %d", got, exitGone)
+	}
+}
+
 // The registry sets the pace and krowk bounds it, so a registry answering
 // something absurd cannot make the CLI hammer it or fall asleep against it.
 func TestPollIntervalIsTheRegistrysWithinBounds(t *testing.T) {

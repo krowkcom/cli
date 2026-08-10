@@ -115,8 +115,8 @@ environment variable — so never guess at a spelling this file does not carry.
 | Group an artifact afterwards | `krowk uploads attach art_2e1d --run run_8Kd2wq --json` |
 | Take an artifact down | `krowk uploads delete art_2e1d --json` |
 | Take down a keyless artifact | `krowk uploads delete art_2e1d <claim-token> --json` |
-| Sign in with nobody's key to paste | `krowk auth login --no-browser --json` |
 | Store an API key you were handed | `krowk auth login --token krowk_sk_… --json` |
+| Sign in when there is no key to paste | `krowk auth login --no-browser --json` |
 | Which key is this, whose workspace | `krowk auth verify --json` |
 | Diagnose a failure | `krowk doctor --json` |
 | The whole surface, as data | `krowk help --json` |
@@ -160,8 +160,8 @@ on the way out. `--run` names a run you opened, and leaves closing it to you.
 
 ```
 Do you now have a key?
-├── no  → krowk auth login --no-browser --json   (a person approves it; then continue)
-│         or krowk auth login --token krowk_sk_… --json if you were handed one
+├── no  → krowk auth login --token krowk_sk_… --json   (if you were handed one)
+│         else krowk auth login --no-browser --json     (a person approves it — see below)
 └── yes → does it belong under a run?
           ├── no  → krowk claim <artifact> <token> --json
           └── yes → krowk claim <artifact> <token> --run <run> --json
@@ -219,26 +219,47 @@ and agent are detected, so pass only what detection cannot know. Afterwards,
 
 ### Sign in when there is no key to paste
 
+**Never run this unprompted.** It blocks until a person approves it, up to a
+quarter of an hour, so a login started on your own initiative is a session that
+looks hung. A keyless push works now; reach for this only when the person asked
+for a key, or asked for something a key is required for.
+
+**It does not work against `api.krowk.com` yet.** The endpoints and the approval
+page are not built there, so the command answers `404 no_such_endpoint` with a fix
+line saying so. Against production, `--token` is the only way in. Use this flow
+against a registry that serves it — a local `krowk registry serve`, or
+`api.krowk.com` once the gap closes.
+
 ```bash
 krowk auth login --no-browser --json
 ```
 
-It blocks until a person approves it, up to a quarter of an hour. While it waits
-it writes `{"authorizing": {"code": …, "page": …}}` to **stderr** — capture both
-streams, show the person both fields, and say that the code on the page has to
-match the one you printed. That document carries no `ok`: it is not the outcome.
-stdout stays one document, the receipt, once the key is stored; on stderr the
-**last** document is the verdict.
+While it waits it writes `{"authorizing": {"code": …, "page": …}}` to **stderr** —
+capture both streams, show the person both fields, and say that the code on the
+page has to match the one you printed. That document carries no `ok`: it is not
+the outcome. stdout stays one document, the receipt, once the key is stored; on
+stderr the **last** document is the verdict.
 
-`--no-browser` is not optional for you. Over SSH or with no display it is what
-happens anyway, and **on CI a login without it is refused** (`no_one_to_approve`,
-exit 3) — the flag is how you say there is a person to hand the code to. Drop it
-only where the browser on this machine is that person's own.
+`--no-browser` is the flag for you to pass. Over SSH or with no display it is
+what happens anyway, and **on CI a login without it is refused**
+(`no_one_to_approve`, exit 3) — passing it is how you say there is a person to
+hand the code to. Drop it only where the browser on this machine is that person's
+own.
+
+The key goes behind `--token`, never as a bare argument.
+`krowk auth login krowk_sk_…` is refused with `token_not_a_positional` rather than
+silently ignored.
 
 The key itself is not yours to read. It lands in the credentials file at 0600 and
-every later command finds it there. If the receipt carries `shadowed_by_env`,
-`KROWK_TOKEN` is set and outranks what was just stored — uploads will use that
-key instead, so say so rather than reporting the workspace the receipt names.
+every later command finds it there. Two things in the receipt are worth reading
+rather than repeating:
+
+- `shadowed_by_env` — `KROWK_TOKEN` is set and outranks what was just stored, so
+  uploads use that key instead. Say so rather than reporting the workspace the
+  receipt names.
+- `confirmed: false` with a `reason` — the key is stored and works, but the
+  registry did not say which key it is or where it acts. Settle it with
+  `krowk auth verify --json` before telling the person where their uploads land.
 
 ### Keep an artifact that was pushed before signing in
 
@@ -299,6 +320,9 @@ answer.
   detected. Run it before reporting a bug, and include its output.
 - **A link that 404s or is gone:** the artifact expired (keyless, 24 hours) or was
   taken down. Exit 8. No retry brings it back; push again.
+- **Exit 8 on a login:** a browser login lapsed unapproved (`authorization_expired`)
+  or its key was already collected (`spent`). Same rule, different fix — nothing
+  brings that login back, so run `krowk auth login` again for a new one.
 - **`krowk help <command> --json`** settles any question about a flag, and cannot
   be out of date — it is generated from the same catalog that routes the command.
 

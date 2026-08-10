@@ -65,6 +65,11 @@ List flags
   --before <slug>        Start after this row — the ` + "`next`" + ` of the last page
   --run <slug>           On ` + "`uploads list`" + `, narrow it to what one run produced
 
+Auth flags
+  --token <key>          Store this key rather than asking the browser — how CI
+                         logs in, and it opens nothing
+  --no-browser           Print the code and the page instead of opening a browser
+
 Local registry flags
   --addr <host:port>     Listen address for ` + "`registry serve`" + ` (default %s, loopback only)
   --site <url>           Origin for the links it returns (default: the request host)
@@ -112,6 +117,12 @@ reach for when something was published by accident. A key takes down anything in
 its workspace; an upload that is still anonymous is taken down with the claim
 token it came back with, passed after the slug.
 
+Logging in goes through a browser. ` + "`krowk auth login`" + ` asks the registry to open
+an authorization, prints a short code and opens the page that approves it;
+approving mints a key and this command collects it, once. Over SSH or with no
+display it prints the code and the page instead of opening anything, which is
+what --no-browser asks for everywhere else.
+
 Credentials live in %s (0600).
 `
 
@@ -132,6 +143,7 @@ type flags struct {
 	site        string
 	limitBytes  int64
 	dev         bool
+	noBrowser   bool
 	json        bool
 	quiet       bool
 	help        bool
@@ -167,6 +179,7 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.StringVar(&f.site, "site", "", "")
 	fs.Int64Var(&f.limitBytes, "limit-bytes", 0, "")
 	fs.BoolVar(&f.dev, "dev", false, "")
+	fs.BoolVar(&f.noBrowser, "no-browser", false, "")
 	fs.BoolVar(&f.json, "json", false, "")
 	fs.BoolVar(&f.quiet, "quiet", false, "")
 	fs.BoolVar(&f.help, "help", false, "")
@@ -240,7 +253,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	case positionals[0] == "claim":
 		err = claim(stdout, positionals[1:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "login":
-		err = authLogin(stdout, f, format, env, colour)
+		err = authLogin(stdout, stderr, f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
 		err = authToken(stdout, env)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "verify":
@@ -701,10 +714,28 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 	return nil
 }
 
-// authLogin stores a key, but only once the registry has been given the chance
-// to reject it. Storing first and finding out later meant a mistyped key was
-// discovered by the next upload failing, at which point the paste buffer that
-// held the real one is long gone.
+// authLogin gets a key onto this machine, one of two ways, and which one is
+// asked for is decided by whether a key was handed over.
+//
+// With no --token the browser does the work: the registry opens an authorization,
+// someone approves it, and the key that approval mints comes back over the wire.
+// That is the default because it is the one that works from a container, where
+// the alternative was a person with a dashboard open pasting a key in.
+//
+// --token stores a key that already exists, which is how CI logs in and is
+// unchanged. --no-browser alongside it is not a contradiction and not an error:
+// it asks for no browser, and this path opens none.
+func authLogin(stdout, stderr io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if f.token == "" {
+		return authLoginInBrowser(stdout, stderr, f, format, env, colour)
+	}
+	return authLoginWithToken(stdout, f, format, env, colour)
+}
+
+// authLoginWithToken stores a key, but only once the registry has been given the
+// chance to reject it. Storing first and finding out later meant a mistyped key
+// was discovered by the next upload failing, at which point the paste buffer
+// that held the real one is long gone.
 //
 // A rejection is fatal, and deliberately so: keeping a key the registry has
 // just disowned achieves nothing, and writing it over a working key would leave
@@ -716,11 +747,7 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 // What the registry said, when it said anything, is written alongside the
 // token, so nothing afterwards has to ask again which workspace this key acts
 // in.
-func authLogin(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
-	if f.token == "" {
-		return api.Fail("missing_token", "pass the key: `krowk auth login --token krowk_sk_...`")
-	}
-
+func authLoginWithToken(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
 	// The key being stored, not the one already configured: verifying whatever
 	// is in the environment would happily bless a typo in the one that is about
 	// to be written to disk.
@@ -754,6 +781,195 @@ func authLogin(w io.Writer, f flags, format output.Format, env runctx.Env, colou
 	}
 	fmt.Fprintln(w, output.StoredKey(result, format, f.quiet, colour))
 	return nil
+}
+
+// How long a browser login is given, and how often it is asked about. Both are
+// the registry's to decide — it says `expires_at` and `interval` — and both are
+// bounded here, because a registry answering something absurd must not be able
+// to make krowk hammer it, fall asleep against it, or leave a forgotten terminal
+// polling for the rest of the afternoon.
+const (
+	defaultAuthorizationWindow = 15 * time.Minute
+	minAuthorizationWindow     = time.Minute
+	maxAuthorizationWindow     = 30 * time.Minute
+
+	defaultPollInterval = 5 * time.Second
+	minPollInterval     = time.Second
+	maxPollInterval     = 30 * time.Second
+)
+
+// authLoginInBrowser mints a key by having someone approve the request in a
+// browser, so a machine that has never held a key can get one without a person
+// pasting it in.
+//
+// Two capabilities, and keeping them apart is the design rather than a detail.
+// The registry answers with a slug and a short code: the slug is what this
+// process polls and is never shown in the browser, the code is what a person
+// confirms and can only approve or deny. So the half that travels — through a
+// terminal, a chat message, a colleague reading it out — cannot be turned into a
+// key by whoever sees it.
+//
+// The key arrives exactly once. After the read that collects it the registry has
+// no plaintext left, so nothing can ask for it a second time, including this
+// command run again by mistake.
+func authLoginInBrowser(stdout, stderr io.Writer, f flags, format output.Format,
+	env runctx.Env, colour bool) error {
+	base := api.BaseURLFor(f.dev, env)
+	// Keyless, whatever the environment holds — see StartCLIAuthorization. Built
+	// once and reused, so a poll that runs for a quarter hour is one connection
+	// rather than a fresh one every five seconds.
+	client := api.New(base, "")
+
+	ctx := context.Background()
+	auth, err := client.StartCLIAuthorization(ctx)
+	if err != nil {
+		return err
+	}
+	page, err := browsableURL(auth.VerificationURL, base)
+	if err != nil {
+		return err
+	}
+
+	// Opened first and reported after, so the line claiming a browser is opening
+	// is written once it actually is. Starting the handoff costs microseconds; the
+	// window takes far longer to appear than this print does.
+	opened := !f.noBrowser && !headless(env) && openBrowser(page)
+	// stderr, not stdout: the code and the page are what a person needs *during*
+	// the command, while stdout stays the single document a program parses. On a
+	// terminal both arrive in the same place regardless.
+	fmt.Fprint(stderr, output.Authorizing(auth.Code, page, opened, colour))
+
+	granted, err := awaitAuthorization(ctx, client, auth, time.Now, time.Sleep)
+	if err != nil {
+		return err
+	}
+
+	path, err := api.SaveCredentials(granted.Token, api.Identity{
+		KeyID: granted.KeyID, Workspace: granted.Workspace,
+	})
+	if err != nil {
+		return api.Fail("credentials_unwritable", "could not write "+api.CredentialsPath()+": "+err.Error())
+	}
+
+	// Confirmed with no round trip of its own. The key came from the registry
+	// inside this exchange rather than out of a paste buffer, so there is no typo
+	// for `/key` to catch and nothing it would report that the approval did not
+	// already say.
+	fmt.Fprintln(stdout, output.StoredKey(&output.Login{
+		Path: path, Confirmed: true, KeyID: granted.KeyID, Workspace: granted.Workspace,
+	}, format, f.quiet, colour))
+	return nil
+}
+
+// awaitAuthorization polls until someone answers or the window closes.
+//
+// What stops the loop and what does not is the whole of it. Approved and denied
+// are answers. A refusal about *this authorization* — gone, no such slug, no such
+// endpoint — is an answer too, and asking again cannot change it. Everything else
+// is about the moment rather than the login: a rate limit, a 502, a laptop whose
+// wifi dropped while its owner was reading the code off the screen. None of those
+// is evidence, so the loop keeps its window instead of throwing away an approval
+// that may already have happened.
+//
+// The clock and the sleep are arguments so a test can exercise a window that
+// takes a quarter of an hour to close in the real one.
+func awaitAuthorization(ctx context.Context, client *api.Client, auth *api.CLIAuthorization,
+	now func() time.Time, sleep func(time.Duration)) (*api.CLIAuthorization, error) {
+	deadline := authorizationDeadline(auth.ExpiresAt, now())
+	interval := pollInterval(auth.Interval)
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, api.Fail("cancelled", err.Error())
+		}
+
+		granted, err := client.ReadCLIAuthorization(ctx, auth.Slug)
+		switch {
+		case err != nil:
+			if !worthAnotherPoll(err) {
+				return nil, loginFix(err)
+			}
+		case granted.State == api.AuthorizationApproved:
+			// Approved with nothing to store is the registry's side of the contract
+			// broken, and storing an empty token would leave the machine looking
+			// logged in and unable to upload.
+			if granted.Token == "" || granted.KeyID == "" {
+				return nil, api.Fail("malformed_response",
+					"the registry approved this login without handing over a key — "+
+						"run `krowk auth login` again, and report it if it repeats")
+			}
+			return granted, nil
+		case granted.State == api.AuthorizationDenied:
+			return nil, api.Fail("authorization_denied",
+				"this login was denied in the browser — run `krowk auth login` to ask again")
+		}
+		// Anything else is pending, including a state this build has no word for: a
+		// newer registry inventing one is not grounds for abandoning a login that is
+		// still inside its window.
+
+		if !now().Before(deadline) {
+			return nil, api.Fail("authorization_expired",
+				"nobody approved this login before it lapsed — run `krowk auth login` to ask again")
+		}
+		sleep(interval)
+	}
+}
+
+// worthAnotherPoll reports whether a failed poll says nothing about the login. A
+// rate limit, a 5xx and a registry that did not answer at all are all the moment
+// rather than the authorization; everything else — a 404, a 410, a body this
+// client cannot read — is an answer, and repeating the question gets it again.
+func worthAnotherPoll(err error) bool {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.Code() == "network_unreachable" {
+		return true
+	}
+	return apiErr.Status == http.StatusTooManyRequests || apiErr.Status >= 500
+}
+
+// loginFix replaces advice written for artifacts when it arrives on a login. The
+// registry spells a lapsed record `expired` and a one-shot secret already handed
+// over `spent`, whatever the record is — and "upload it again, and claim it with
+// a key to keep it" is nonsense to someone who was trying to log in.
+func loginFix(err error) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusGone {
+		return err
+	}
+	switch apiErr.Code() {
+	case "expired":
+		apiErr.Body["fix"] = "this login lapsed before it was approved — run `krowk auth login` to ask again"
+	case "spent":
+		apiErr.Body["fix"] = "this login's key was already collected, and the registry keeps no second copy — " +
+			"run `krowk auth login` for a new one"
+	}
+	return err
+}
+
+// authorizationDeadline is when to give up. The registry's own expiry when it
+// gave a readable one, clamped: a machine whose clock is minutes off the
+// registry's would otherwise abandon a perfectly good login before its first
+// poll, and the registry stays the authority on whether the window has really
+// closed either way.
+func authorizationDeadline(expiresAt string, now time.Time) time.Time {
+	at, err := time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		return now.Add(defaultAuthorizationWindow)
+	}
+	return now.Add(min(max(at.Sub(now), minAuthorizationWindow), maxAuthorizationWindow))
+}
+
+// pollInterval is the registry's pace, bounded. It sets one because it is the
+// side that knows what its rate limit allows; zero or missing means it did not
+// say, and five seconds is what every other device flow settled on.
+func pollInterval(seconds int) time.Duration {
+	if seconds <= 0 {
+		return defaultPollInterval
+	}
+	return min(max(time.Duration(seconds)*time.Second, minPollInterval), maxPollInterval)
 }
 
 // unconfirmedReason says why a login went unchecked in the few words that fit

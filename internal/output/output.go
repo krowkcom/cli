@@ -733,6 +733,33 @@ func StoredKey(l *Login, f Format, quiet, colour bool) string {
 	}, "\n")
 }
 
+// Authorizing is what a person needs while `auth login` is still waiting: the
+// code to confirm, and the page to confirm it on.
+//
+// It takes no Format, because it is not a result — it is what the command says
+// about itself midway through, and it goes to stderr so that the one document on
+// stdout stays the receipt a program parses. Prose in every format for the same
+// reason: an agent that reaches this has to hand a person a URL and a code, and
+// there is nothing in either to branch on.
+//
+// The code is shown so it can be compared against the one on the page. That
+// comparison is the point of there being a code at all — the slug collects the
+// key and never appears in a browser, so what the page asks someone to approve
+// has to be identifiable as the request their own terminal made.
+func Authorizing(code, page string, opened, colour bool) string {
+	head := "Open this page and confirm the code"
+	if opened {
+		head = "Your browser is opening — confirm the code there"
+	}
+	return strings.Join([]string{
+		head,
+		"  " + paint(colour, dim, "code") + "  " + code,
+		"  " + paint(colour, dim, "page") + "  " + page,
+		paint(colour, dim, "  waiting for approval, Ctrl-C to stop"),
+		"",
+	}, "\n")
+}
+
 func humanArtifact(a *api.Artifact, colour bool, now time.Time) string {
 	head := fmt.Sprintf("%s  %s", a.Filename, HumanBytes(a.ByteSize))
 	if a.State != "" {

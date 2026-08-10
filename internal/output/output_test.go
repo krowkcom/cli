@@ -347,6 +347,33 @@ func TestStoredKeyDistinguishesAConfirmedLoginFromAnUnconfirmedOne(t *testing.T)
 	}
 }
 
+// The notice a browser login prints while it waits has one job: put the code and
+// the page in front of a person. It is prose in every format, because it is not a
+// result — the result is the receipt on stdout once somebody has approved it.
+func TestAuthorizingShowsTheCodeAndThePage(t *testing.T) {
+	page := "https://app.krowk.com/cli/authorizations/new?code=7K4M-2QXP"
+
+	waiting := Authorizing("7K4M-2QXP", page, true, false)
+	for _, want := range []string{"7K4M-2QXP", page, "browser is opening"} {
+		if !strings.Contains(waiting, want) {
+			t.Errorf("the notice is missing %q:\n%s", want, waiting)
+		}
+	}
+
+	// Nothing was opened, so nothing may claim it was: this is the SSH and
+	// container case, where reading the URL out of the terminal is the whole flow.
+	printed := Authorizing("7K4M-2QXP", page, false, false)
+	if strings.Contains(printed, "opening") {
+		t.Errorf("a login that opened nothing says it did:\n%s", printed)
+	}
+	if !strings.Contains(printed, "Open this page") {
+		t.Errorf("nothing tells the person to open it themselves:\n%s", printed)
+	}
+	if !strings.HasSuffix(printed, "\n") {
+		t.Errorf("the notice does not end its own line:\n%q", printed)
+	}
+}
+
 // The run is the whole point of `uploads attach` and of `claim --run`, and both
 // answer through Artifact. The human line already prints it, so the envelope an
 // agent reads must not be the one place it goes missing.

@@ -342,14 +342,20 @@
         "subcommands": [
           {
             "name": "login",
-            "usage": "krowk auth login --token \u003ctoken\u003e",
-            "summary": "Check an API token, then store it",
+            "usage": "krowk auth login [--token \u003ctoken\u003e]",
+            "summary": "Approve this machine in the browser, or store a key",
             "flags": [
               {
                 "name": "token",
                 "type": "string",
                 "default": "",
-                "usage": "The API key to check and store, e.g. krowk_sk_..."
+                "usage": "Check and store this key instead of asking the browser — how CI logs in, e.g. krowk_sk_..."
+              },
+              {
+                "name": "no-browser",
+                "type": "bool",
+                "default": "false",
+                "usage": "Print the code and the page instead of opening a browser — the default over SSH, or with no display"
               }
             ]
           },

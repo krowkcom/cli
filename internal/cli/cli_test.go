@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -775,6 +776,10 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 			calls = append(calls, call)
 			mu.Unlock()
 		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/cli/authorizations" {
+			approveOnCreate(t, inner, w, r)
+			return
+		}
 		inner.ServeHTTP(w, r)
 	}))
 	t.Cleanup(server.Close)
@@ -805,6 +810,9 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	// Taking it down again: a claimed artifact answers to the key that holds it.
 	h.ok("uploads", "delete", anonymous.Slug)
 
+	// A browser login, approved the instant it is opened so the poll happens once.
+	h.ok("auth", "login")
+
 	want := []string{
 		// push, with a key: open a run, declare, finalize, close the run. The two
 		// creates name their attempt so a retry of either costs nothing; +key marks
@@ -830,6 +838,14 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 		// Takedown is the REST delete of the artifact, not a nested resource:
 		// destroying it is what the verb already means.
 		"DELETE /v1/artifacts/{slug}",
+		// A browser login: open an authorization, then read it back until somebody
+		// has answered. No Idempotency-Key on the create, and that is the one
+		// exception in this list — a lost response means the code was never seen, so
+		// the authorization it belongs to can never be approved and nothing is
+		// charged for it. The collection is a GET because the key is a property of
+		// the authorization rather than something a second write produces.
+		"POST /v1/cli/authorizations",
+		"GET /v1/cli/authorizations/{slug}",
 	}
 
 	mu.Lock()
@@ -847,7 +863,40 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	}
 }
 
-var slugPattern = regexp.MustCompile(`(art|run|ws)_[0-9A-Za-z]+`)
+// approveOnCreate answers a browser login and approves it before the CLI has been
+// told the code, which is what keeps the sequence above exact: a real approval
+// arrives whenever the person gets to it, and the poll would be pinned at however
+// many times that took. Standing in for someone already looking at the page.
+//
+// The approval is pressed against the registry directly rather than through the
+// recorder, because it is not a call the CLI makes.
+func approveOnCreate(t *testing.T, inner http.Handler, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+
+	opened := httptest.NewRecorder()
+	inner.ServeHTTP(opened, r)
+
+	var login struct{ Code string }
+	if err := json.Unmarshal(opened.Body.Bytes(), &login); err != nil || login.Code == "" {
+		t.Fatalf("opening a browser login answered no code: %v\n%s", err, opened.Body)
+	}
+	pressed := httptest.NewRecorder()
+	inner.ServeHTTP(pressed, httptest.NewRequest(http.MethodPost,
+		"/_approve/cli/authorizations/"+url.PathEscape(login.Code)+"/approval", nil))
+	if pressed.Code != http.StatusOK {
+		t.Fatalf("approving %s answered %d", login.Code, pressed.Code)
+	}
+
+	for key, values := range opened.Header() {
+		w.Header()[key] = values
+	}
+	w.WriteHeader(opened.Code)
+	if _, err := w.Write(opened.Body.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+var slugPattern = regexp.MustCompile(`(art|aut|run|ws)_[0-9A-Za-z]+`)
 
 func normalizeSlugs(path string) string {
 	return slugPattern.ReplaceAllString(path, "{slug}")
@@ -861,7 +910,9 @@ func normalizeSlugs(path string) string {
 // stops naming its attempt goes back to charging for every retry, and nothing else
 // here would notice.
 func wireCall(r *http.Request) string {
-	if strings.HasPrefix(r.URL.Path, "/_storage") {
+	// Object storage is not the API, and neither is the approval page the stand-in
+	// serves in place of the app surface — the CLI calls neither.
+	if strings.HasPrefix(r.URL.Path, "/_storage") || strings.HasPrefix(r.URL.Path, "/_approve") {
 		return ""
 	}
 	call := r.Method + " " + normalizeSlugs(r.URL.Path)

@@ -37,8 +37,10 @@ func TestExitCodeFor(t *testing.T) {
 
 		// Missing credentials, known before anything is sent.
 		{"no key stored", api.Fail("not_authenticated", ""), 3},
-		{"login with no token", api.Fail("missing_token", ""), 3},
 		{"anonymous takedown with no claim token", api.Fail("missing_claim", ""), 3},
+		// A browser login somebody said no to leaves the machine as
+		// credential-less as never having asked.
+		{"browser login denied", api.Fail("authorization_denied", ""), 3},
 
 		// Transport, on either leg.
 		{"registry unreachable", registryErr(0, "network_unreachable"), 6},
@@ -69,6 +71,10 @@ func TestExitCodeFor(t *testing.T) {
 
 		{"expired", registryErr(410, "expired"), 8},
 		{"taken down", registryErr(410, "taken_down"), 8},
+		{"browser login's key already collected", registryErr(410, "spent"), 8},
+		// krowk deciding the login's window closed rather than being told, which
+		// must land on the same number as being told.
+		{"browser login lapsed", api.Fail("authorization_expired", ""), 8},
 
 		{"registry blew up", registryErr(500, "internal_server_error"), 7},
 		{"registry answered something unreadable", registryErr(200, "malformed_response"), 7},

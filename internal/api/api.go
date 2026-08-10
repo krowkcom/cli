@@ -380,6 +380,25 @@ func (c *Client) ReadCLIAuthorization(ctx context.Context, slug string) (*CLIAut
 	return &auth, nil
 }
 
+// RetryAfterFor reads the wait a failure asked for, when it asked for one.
+//
+// It exists for a caller pacing a loop of its own — `auth login` polling an
+// authorization — which would otherwise come straight back after its own interval
+// having just been told to slow down. Parsed and capped exactly as the retry loop
+// inside a single call parses it, so there is one policy about that header rather
+// than two.
+func RetryAfterFor(err error, now time.Time) (time.Duration, bool) {
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		return 0, false
+	}
+	asked, _ := apiErr.Body["retry_after"].(string)
+	if asked == "" {
+		return 0, false
+	}
+	return retryAfter(asked, now)
+}
+
 // Error carries a failure flattened into one map, so everything downstream reads
 // it the same way regardless of whether it came from the registry, from object
 // storage, or from this client.

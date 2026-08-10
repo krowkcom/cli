@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -207,6 +208,16 @@ func TestAuthLoginReportsBeingUnconfirmedInJSON(t *testing.T) {
 	if !strings.Contains(e.Summary, "unconfirmed") {
 		t.Errorf("summary = %q, want it to say so", e.Summary)
 	}
+}
+
+// windowOf is the authorization window a poll loop runs inside. It is the
+// context's deadline and nowhere else, so a test says how long the login has by
+// building the context the real caller builds.
+func windowOf(t *testing.T, closes time.Time) context.Context {
+	t.Helper()
+	ctx, stop := context.WithDeadline(context.Background(), closes)
+	t.Cleanup(stop)
+	return ctx
 }
 
 // codeShown is the code `auth login` prints for a person to compare against the
@@ -501,6 +512,80 @@ func TestAuthLoginTakesNoBrowserBesideAToken(t *testing.T) {
 	}
 }
 
+// A key typed without its flag is the mistake this command will see most, and
+// nothing reads a positional here — so it would be dropped on the floor and the
+// command would go and wait a quarter of an hour for a login nobody wanted.
+func TestAuthLoginRefusesAKeyPassedWithoutItsFlag(t *testing.T) {
+	h, _ := loginHarness(t)
+
+	code, stdout, stderr := h.run("auth", "login", "krowk_sk_pasted_without_the_flag", "--json")
+	if code == 0 {
+		t.Fatalf("a stray key was accepted, stdout:\n%s", stdout)
+	}
+	body := decode(t, stderr).Error
+	if body["error"] != "token_not_a_positional" {
+		t.Errorf("error = %v, want token_not_a_positional", body["error"])
+	}
+	fix, _ := body["fix"].(string)
+	if !strings.Contains(fix, "--token") {
+		t.Errorf("fix = %q, which does not say where the key goes", fix)
+	}
+	// The key is already in a shell history; it does not also belong in whatever
+	// captured this command's stderr.
+	if strings.Contains(stderr, "krowk_sk_pasted_without_the_flag") {
+		t.Errorf("the failure quoted the key back:\n%s", stderr)
+	}
+	// And nothing was opened or polled: the whole point is that it fails at once.
+	if strings.Contains(stderr, "authorizing") {
+		t.Errorf("a browser login was started anyway:\n%s", stderr)
+	}
+}
+
+// Any other stray argument is a mistyped command line, and it says so with the
+// argument quoted — there is nothing secret about a word that is not a key.
+func TestAuthLoginRefusesAnyOtherStrayArgument(t *testing.T) {
+	h, _ := loginHarness(t)
+
+	body := h.fails("auth", "login", "please")
+	if body["error"] != "unexpected_argument" {
+		t.Errorf("error = %v, want unexpected_argument", body["error"])
+	}
+	if fix, _ := body["fix"].(string); !strings.Contains(fix, "please") {
+		t.Errorf("fix = %q, which does not name what it objected to", fix)
+	}
+}
+
+// Nothing on CI can approve a browser login: no person, no browser. Waiting out
+// the window to then report that nobody approved it wastes fifteen minutes of a
+// build to say something knowable at once.
+func TestAuthLoginRefusesABrowserLoginOnCI(t *testing.T) {
+	for _, marker := range []string{"CI", "GITHUB_ACTIONS"} {
+		h, _ := loginHarness(t)
+		h.env[marker] = "true"
+
+		body := h.failsWith(exitAuth, "auth", "login")
+		if body["error"] != "no_one_to_approve" {
+			t.Errorf("with %s set, error = %v, want no_one_to_approve", marker, body["error"])
+		}
+		if fix, _ := body["fix"].(string); !strings.Contains(fix, "--token") {
+			t.Errorf("fix = %q, which does not name the way in that works on CI", fix)
+		}
+	}
+}
+
+// --token is how CI logs in, so that path must not be caught by the refusal above.
+func TestAuthLoginWithATokenStillWorksOnCI(t *testing.T) {
+	h, path := loginHarness(t)
+	h.env["CI"] = "true"
+
+	if code, _, stderr := h.run("auth", "login", "--token", "krowk_sk_pasted"); code != 0 {
+		t.Fatalf("exit %d on CI with a key, stderr: %s", code, stderr)
+	}
+	if c := stored(t, path); c["token"] != "krowk_sk_pasted" {
+		t.Errorf("token = %v, want the pasted key", c["token"])
+	}
+}
+
 // A registry with no browser login endpoint is the likeliest 404 here — the two
 // halves of this flow ship from two repositories, and a self-hosted registry may
 // never grow the second. Telling someone to check a base URL that is exactly
@@ -616,17 +701,18 @@ func TestAwaitingApprovalWaitsThroughFailuresThatAreNotAnswers(t *testing.T) {
 	client.Sleep = func(time.Duration) {}
 	waits := 0
 
-	granted, err := awaitAuthorization(context.Background(), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, time.Now().Add(time.Hour),
-		time.Now, func(time.Duration) { waits++ })
+	granted, err := awaitAuthorization(windowOf(t, time.Now().Add(time.Hour)), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, time.Now, func(time.Duration) { waits++ })
 	if err != nil {
 		t.Fatalf("a login that was approved after a bad patch failed: %v", err)
 	}
 	if granted.Token != "krowk_sk_new" {
 		t.Errorf("token = %q", granted.Token)
 	}
-	if waits != 1 {
-		t.Errorf("waited %d times, want once — one round of refusals, then the answer", waits)
+	// Two: once before the first read, since a login milliseconds old cannot have
+	// been approved, and once after the round of refusals.
+	if waits != 2 {
+		t.Errorf("waited %d times, want twice — before the first read, then after the refusals", waits)
 	}
 }
 
@@ -646,11 +732,8 @@ func TestAwaitingApprovalStopsWhenTheLoginIsGone(t *testing.T) {
 	client := api.New(srv.URL+"/v1", "")
 	client.Sleep = func(time.Duration) {}
 
-	_, err := awaitAuthorization(context.Background(), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, time.Now().Add(time.Hour),
-		time.Now, func(time.Duration) {
-			t.Error("waited to ask again about a login the registry said was gone")
-		})
+	_, err := awaitAuthorization(windowOf(t, time.Now().Add(time.Hour)), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, time.Now, func(time.Duration) {})
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusGone {
 		t.Fatalf("err = %v, want a 410", err)
@@ -686,8 +769,8 @@ func TestAwaitingApprovalGivesUpWhenTheWindowCloses(t *testing.T) {
 	client := api.New(srv.URL+"/v1", "")
 	client.Sleep = func(time.Duration) {}
 
-	_, err := awaitAuthorization(context.Background(), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, start.Add(time.Minute), clock, func(time.Duration) {})
+	_, err := awaitAuthorization(windowOf(t, start.Add(time.Minute)), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, clock, func(time.Duration) {})
 	if err == nil || err.Error() != "authorization_expired" {
 		t.Fatalf("err = %v, want authorization_expired", err)
 	}
@@ -719,8 +802,8 @@ func TestAwaitingApprovalBlamesTheRegistryWhenItNeverAnswered(t *testing.T) {
 	client := api.New(srv.URL+"/v1", "")
 	client.Sleep = func(time.Duration) {}
 
-	_, err := awaitAuthorization(context.Background(), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, start.Add(time.Minute), clock, func(time.Duration) {})
+	_, err := awaitAuthorization(windowOf(t, start.Add(time.Minute)), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, clock, func(time.Duration) {})
 	if err == nil {
 		t.Fatal("a window spent entirely against a broken registry succeeded")
 	}
@@ -733,10 +816,11 @@ func TestAwaitingApprovalBlamesTheRegistryWhenItNeverAnswered(t *testing.T) {
 	}
 }
 
-// A registry that was there for the window and dropped at the very end is still a
-// login nobody approved: what would change the story is never having got the
-// question out, not the state of the connection at the last moment.
-func TestAwaitingApprovalBlamesNobodyApprovingWhenTheRegistryDroppedLate(t *testing.T) {
+// A registry that answered once and was then down for the rest of the window is
+// an outage, not a person ignoring a request. Latching on "it answered at least
+// once" would report exit 8 — no retry brings it back — about a window krowk spent
+// unable to ask, where retrying is the entire fix.
+func TestAwaitingApprovalBlamesTheRegistryWhenItStoppedAnswering(t *testing.T) {
 	var polls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -759,10 +843,14 @@ func TestAwaitingApprovalBlamesNobodyApprovingWhenTheRegistryDroppedLate(t *test
 	client := api.New(srv.URL+"/v1", "")
 	client.Sleep = func(time.Duration) {}
 
-	_, err := awaitAuthorization(context.Background(), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, start.Add(time.Minute), clock, func(time.Duration) {})
-	if err == nil || err.Error() != "authorization_expired" {
-		t.Fatalf("err = %v, want authorization_expired — the question was asked and answered", err)
+	_, err := awaitAuthorization(windowOf(t, start.Add(time.Minute)), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, clock, func(time.Duration) {})
+	if err == nil || err.Error() == "authorization_expired" {
+		t.Fatalf("err = %v, which blames a person for a window krowk could not ask in", err)
+	}
+	if got := exitCodeFor(err); got != exitServer {
+		t.Errorf("exit = %d, want %d — the registry stopped answering, and retrying is the fix",
+			got, exitServer)
 	}
 }
 
@@ -792,8 +880,8 @@ func TestAwaitingApprovalStillBlamesNobodyApprovingAfterTheRegistryRecovers(t *t
 	client := api.New(srv.URL+"/v1", "")
 	client.Sleep = func(time.Duration) {}
 
-	_, err := awaitAuthorization(context.Background(), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, start.Add(time.Minute), clock, func(time.Duration) {})
+	_, err := awaitAuthorization(windowOf(t, start.Add(time.Minute)), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, clock, func(time.Duration) {})
 	if err == nil || err.Error() != "authorization_expired" {
 		t.Fatalf("err = %v, want authorization_expired — the registry did answer in the end", err)
 	}
@@ -804,8 +892,12 @@ func TestAwaitingApprovalStillBlamesNobodyApprovingAfterTheRegistryRecovers(t *t
 // cannot upload, which is a worse state than a login that plainly failed.
 func TestAwaitingApprovalRefusesAnApprovalWithNoKeyInIt(t *testing.T) {
 	for _, missing := range []string{
+		// No token: a machine that looks logged in and cannot upload.
 		`{"slug":"aut_x","state":"approved","key_id":"key_1","workspace":"ws_1"}`,
+		// No key id: nothing to record about the key that was just minted.
 		`{"slug":"aut_x","state":"approved","token":"krowk_sk_new","workspace":"ws_1"}`,
+		// No workspace: the receipt's one fact, blank — "uploads land in ".
+		`{"slug":"aut_x","state":"approved","token":"krowk_sk_new","key_id":"key_1"}`,
 	} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -815,9 +907,8 @@ func TestAwaitingApprovalRefusesAnApprovalWithNoKeyInIt(t *testing.T) {
 		client := api.New(srv.URL+"/v1", "")
 		client.Sleep = func(time.Duration) {}
 
-		_, err := awaitAuthorization(context.Background(), client,
-			&api.CLIAuthorization{Slug: "aut_x"}, time.Now().Add(time.Hour),
-			time.Now, func(time.Duration) { t.Errorf("waited after %s", missing) })
+		_, err := awaitAuthorization(windowOf(t, time.Now().Add(time.Hour)), client,
+			&api.CLIAuthorization{Slug: "aut_x"}, time.Now, func(time.Duration) {})
 		srv.Close()
 
 		if err == nil || err.Error() != "malformed_response" {
@@ -843,9 +934,8 @@ func TestAwaitingApprovalSaysWhenTheKeyWasAlreadyCollected(t *testing.T) {
 	client := api.New(srv.URL+"/v1", "")
 	client.Sleep = func(time.Duration) {}
 
-	_, err := awaitAuthorization(context.Background(), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, time.Now().Add(time.Hour),
-		time.Now, func(time.Duration) { t.Error("waited to ask again for a key already handed over") })
+	_, err := awaitAuthorization(windowOf(t, time.Now().Add(time.Hour)), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, time.Now, func(time.Duration) {})
 
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) || apiErr.Code() != "spent" {
@@ -987,4 +1077,53 @@ func loginEnvelope(t *testing.T, h *harness, args ...string) struct {
 		t.Fatalf("not JSON: %v\n%s", err, stdout)
 	}
 	return e
+}
+
+// A registry answering an absurd interval must not come out at the floor. The
+// multiply overflows time.Duration and wraps negative, which sails past the
+// ceiling and lands on the minimum — failing in exactly the hammering direction
+// the bound exists to prevent.
+func TestPollIntervalSurvivesAnAbsurdInterval(t *testing.T) {
+	for _, said := range []int{3601, 1 << 40, 10_000_000_000, math.MaxInt32} {
+		if got := pollInterval(said); got != maxPollInterval {
+			t.Errorf("pollInterval(%d) = %s, want the ceiling %s", said, got, maxPollInterval)
+		}
+	}
+}
+
+// A rate limit names the wait it wants, and this endpoint is one the registry
+// meters. Coming back after the interval regardless would be arguing with it.
+func TestAwaitingApprovalHonoursARetryAfterOnItsOwnLoop(t *testing.T) {
+	var polls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if polls.Add(1) <= 3 {
+			w.Header().Set("Retry-After", "45")
+			w.WriteHeader(http.StatusTooManyRequests)
+			fmt.Fprint(w, `{"error":{"code":"too_many_requests","message":"slow down"}}`)
+			return
+		}
+		fmt.Fprint(w, `{"slug":"aut_x","state":"approved","token":"krowk_sk_new",`+
+			`"key_id":"key_1","workspace":"ws_1"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := api.New(srv.URL+"/v1", "")
+	client.Sleep = func(time.Duration) {}
+	var waited []time.Duration
+
+	granted, err := awaitAuthorization(windowOf(t, time.Now().Add(time.Hour)), client,
+		&api.CLIAuthorization{Slug: "aut_x", Interval: 1},
+		time.Now, func(d time.Duration) { waited = append(waited, d) })
+	if err != nil {
+		t.Fatalf("a login approved after a rate limit failed: %v", err)
+	}
+	if granted.Token != "krowk_sk_new" {
+		t.Errorf("token = %q", granted.Token)
+	}
+	// The first wait is the interval, before the first read. The second is what the
+	// registry asked for rather than the one second it would otherwise have been.
+	if len(waited) != 2 || waited[0] != time.Second || waited[1] != 45*time.Second {
+		t.Errorf("waits = %v, want [1s 45s]", waited)
+	}
 }

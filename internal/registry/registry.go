@@ -265,7 +265,12 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	// that has none — and reading one back is authorised by its slug, which is a
 	// capability the caller was handed and nobody else ever sees.
 	mux.HandleFunc("POST /v1/cli/authorizations", func(w http.ResponseWriter, r *http.Request) {
-		s.createCLIAuthorization(w, site(r, siteURL))
+		// The request's own host, and deliberately not site(r, siteURL). --site names
+		// an origin production really serves, which is right for a card or a file
+		// link and wrong for the approval screen: that is served by this process and
+		// nothing else, so pointing a browser at krowk.com for it opens a 404 nobody
+		// can approve.
+		s.createCLIAuthorization(w, site(r, ""))
 	})
 	mux.HandleFunc("GET /v1/cli/authorizations/{slug}", s.showCLIAuthorization)
 
@@ -1611,10 +1616,16 @@ func (s *store) createCLIAuthorization(w http.ResponseWriter, site string) {
 // key — the window is the window.
 //
 // Delivery is one-shot, and the token is taken out under the lock so that two
-// polls arriving together cannot both be handed it. It goes back only if the
-// response never made it out: a key nobody received is not a key that was
-// collected, and losing a login to a dropped connection is a worse answer than
-// this is complicated.
+// polls arriving together cannot both be handed it. It goes back if writing the
+// response fails, because a key nobody received is not a key that was collected.
+//
+// Best-effort, and worth being honest about: a handler cannot know that a response
+// arrived. The writer buffers a few kilobytes and this body is a few hundred
+// bytes, so a peer that has gone away often produces no error at all and the key
+// stays consumed. What this catches is a write that fails outright; what nothing
+// here can catch is a connection that dies after the bytes were handed to the
+// kernel. The real registry has exactly the same limit, which is why the CLI reads
+// `410 spent` as "log in again" rather than as something to recover from.
 func (s *store) showCLIAuthorization(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 

@@ -789,10 +789,16 @@ type Authorization struct {
 // comparison is the whole reason a code exists — the slug collects the key and
 // never appears in a browser, so what the page asks somebody to approve has to
 // be identifiable as the request their own terminal made.
-func Authorizing(a Authorization, f Format, colour bool) string {
-	if f != Human {
+func Authorizing(a Authorization, f Format, quiet, colour bool) string {
+	// `f == JSON` rather than `f != Human`, matching Error: markdown and url fall
+	// back to the text a person reads, so those two never end up with a document on
+	// one line of a stream and coloured prose on the next.
+	if f == JSON {
 		// Its own line, so whatever is written to this stream next — the error
 		// envelope, if the login goes on to fail — starts a document of its own.
+		if quiet {
+			return encode(a) + "\n"
+		}
 		return encode(map[string]any{"authorizing": a}) + "\n"
 	}
 

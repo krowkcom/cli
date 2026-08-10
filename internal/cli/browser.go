@@ -104,7 +104,7 @@ func headless(env runctx.Env) bool {
 	if env("SSH_CONNECTION") != "" || env("SSH_CLIENT") != "" || env("SSH_TTY") != "" {
 		return true
 	}
-	if api.Truthy(env("CI")) || env("GITHUB_ACTIONS") != "" {
+	if inCI(env) {
 		return true
 	}
 	switch runtime.GOOS {
@@ -112,6 +112,14 @@ func headless(env runctx.Env) bool {
 		return false
 	}
 	return env("DISPLAY") == "" && env("WAYLAND_DISPLAY") == ""
+}
+
+// inCI reports whether this is a build rather than somebody's session. It decides
+// two things: that no browser is worth opening, and — because a build has nobody
+// in front of it to approve anything — that a browser login should be refused
+// outright rather than waited out.
+func inCI(env runctx.Env) bool {
+	return api.Truthy(env("CI")) || env("GITHUB_ACTIONS") != ""
 }
 
 // openBrowser asks the desktop to open the page, and reports whether the

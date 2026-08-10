@@ -181,9 +181,11 @@ disk, and desktops register schemes that start programs with arguments. So krowk
 opens `http` and `https` and nothing else, and `http` only where the registry
 itself is `http`: a local one, or a self-hosted one inside a private network.
 Over SSH, or with no display, it opens nothing and prints the code and the page
-instead — which is also what `--no-browser` asks for. Everything a person needs
-while the command waits goes to stderr, so stdout stays the single document a
-program parses.
+instead — which is also what `--no-browser` asks for. On CI it is refused
+outright: there is no person and no browser, so waiting out the window to then
+report that nobody approved it would burn a quarter of an hour saying something
+knowable at once. Everything a person needs while the command waits goes to
+stderr, so stdout stays the single document a program parses.
 
 **Logging in with a key asks first.** `--token` is unchanged, and it is how CI
 logs in: nothing is opened and nothing is polled. It reads the key back from the
@@ -210,11 +212,11 @@ envelope is still there when the exact one matters.
 | 0 | It worked | — |
 | 1 | The command was wrong, or krowk failed on its own — a bad flag, an unknown command, an unreadable file, a port that will not bind. Also anything unclassified | Fix the command |
 | 2 | Not found — no such artifact or run in this workspace, no such endpoint at this base URL, or a claim token the registry does not recognise, which it answers as no such record so that guessing learns nothing | Check the slug and the token, or `KROWK_API_URL` |
-| 3 | Refused for want of credentials — no key where one is needed, a key the registry rejects, a browser login somebody denied, or no claim token where that is the only authority | `krowk auth login`, or pass the claim token |
+| 3 | Refused for want of credentials — no key where one is needed, a key the registry rejects, a browser login somebody denied or that nothing on CI could approve, or no claim token where that is the only authority | `krowk auth login`, or pass the claim token |
 | 4 | The registry understood the request and refused it — validation, an upload already finalized, a run that needs a key | Change something; retrying unchanged answers the same |
 | 5 | Rate limited | Wait — the error body carries `retry_after` when the registry sent one |
 | 6 | The bytes did not move — the registry or object storage could not be reached, or storage refused the transfer | Retry |
-| 7 | The registry failed on its side (5xx), or answered a success this client could not read | Retry, and report it if it persists |
+| 7 | The registry failed on its side (5xx), answered a success this client could not read, or named a login page krowk will not open | Retry, and report it if it persists; for the login page, check `KROWK_API_URL` |
 | 8 | Gone — the artifact expired or was taken down, or a browser login lapsed before anybody approved it | Upload again, or log in again; no retry brings any of them back |
 
 1 stays the catch-all it always was, so anything checking `!= 0` keeps working

@@ -81,12 +81,13 @@ var clientCodes = map[string]int{
 	"not_authenticated": exitAuth,
 	"missing_claim":     exitAuth,
 
-	// krowk declining to open a page the registry named — a scheme that is not the
-	// web, or http where the API is https. Deliberately usage rather than a
-	// registry failure, the same call `unexpected_redirect` gets: it is a decision
-	// krowk made about a URL, not a verdict anything sent back, and there is no
-	// version of retrying that changes it.
-	"refused_verification_url": exitUsage,
+	// A page krowk will not hand to the desktop's URL handler: a scheme that is not
+	// the web, or http where the API itself is https. It sits with
+	// `malformed_response` because it is the same news — the registry answered
+	// something this client will not act on — and the other refusals from that same
+	// check already land there. A caller has nothing to fix in its own command,
+	// which is what would make it a usage failure.
+	"refused_verification_url": exitServer,
 
 	// A browser login that ended without a key. Denied is a person saying no,
 	// which leaves the machine exactly as credential-less as never having asked.
@@ -95,6 +96,10 @@ var clientCodes = map[string]int{
 	// deciding it locally must not classify differently than being told.
 	"authorization_denied":  exitAuth,
 	"authorization_expired": exitGone,
+	// A browser login asked for where nothing can approve one. The same class as no
+	// key being stored, and the same number the fast failure it replaces reported:
+	// the fix is a credential, and nothing else.
+	"no_one_to_approve": exitAuth,
 }
 
 // registryCodes map the registry's error codes, and are only consulted for an

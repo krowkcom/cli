@@ -34,10 +34,6 @@ func TestExitCodeFor(t *testing.T) {
 		// The one code krowk shares with the registry: raised here it is krowk
 		// failing to build a request, not the registry refusing one.
 		{"krowk cannot encode the body", api.Fail("bad_request", ""), 1},
-		// A page krowk will not hand to the desktop's URL handler. Its own decision
-		// about a URL rather than a verdict from anything, the same as the redirect
-		// below.
-		{"a login page krowk will not open", api.Fail("refused_verification_url", ""), 1},
 
 		// Missing credentials, known before anything is sent.
 		{"no key stored", api.Fail("not_authenticated", ""), 3},
@@ -82,6 +78,9 @@ func TestExitCodeFor(t *testing.T) {
 
 		{"registry blew up", registryErr(500, "internal_server_error"), 7},
 		{"registry answered something unreadable", registryErr(200, "malformed_response"), 7},
+		// The same news as a malformed answer: the registry said something this
+		// client will not act on, and the caller has nothing to fix in its command.
+		{"a login page krowk will not open", api.Fail("refused_verification_url", ""), 7},
 
 		// The registry's catch-all carries no class of its own, so the status it
 		// arrived with is what decides.

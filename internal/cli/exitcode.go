@@ -72,15 +72,34 @@ var clientCodes = map[string]int{
 	"malformed_response": exitServer,
 
 	// krowk knows there is no authority to send before it sends anything: no key
-	// stored, no --token passed to `auth login`, no claim token for an anonymous
-	// takedown or for `claim` itself. The registry would answer 401 to the first
-	// two; saying so without the round trip must not report a different exit code
-	// than making it. The last two are a credential the caller has to produce,
-	// which is what exitAuth means — as against a *malformed* second positional,
-	// which is `bad_claim_token` and stays a usage mistake.
+	// stored, no claim token for an anonymous takedown or for `claim` itself. The
+	// registry would answer 401 to the first; saying so without the round trip
+	// must not report a different exit code than making it. The others are a
+	// credential the caller has to produce, which is what exitAuth means — as
+	// against a *malformed* second positional, which is `bad_claim_token` and
+	// stays a usage mistake.
 	"not_authenticated": exitAuth,
-	"missing_token":     exitAuth,
 	"missing_claim":     exitAuth,
+
+	// A page krowk will not hand to the desktop's URL handler: a scheme that is not
+	// the web, or http where the API itself is https. It sits with
+	// `malformed_response` because it is the same news — the registry answered
+	// something this client will not act on — and the other refusals from that same
+	// check already land there. A caller has nothing to fix in its own command,
+	// which is what would make it a usage failure.
+	"refused_verification_url": exitServer,
+
+	// A browser login that ended without a key. Denied is a person saying no,
+	// which leaves the machine exactly as credential-less as never having asked.
+	// Lapsed is krowk concluding the window closed rather than the registry saying
+	// so — and it reports the same exitGone the registry's own 410 would, because
+	// deciding it locally must not classify differently than being told.
+	"authorization_denied":  exitAuth,
+	"authorization_expired": exitGone,
+	// A browser login asked for where nothing can approve one. The same class as no
+	// key being stored, and the same number the fast failure it replaces reported:
+	// the fix is a credential, and nothing else.
+	"no_one_to_approve": exitAuth,
 }
 
 // registryCodes map the registry's error codes, and are only consulted for an
@@ -120,6 +139,11 @@ var registryCodes = map[string]int{
 
 	"expired":    exitGone,
 	"taken_down": exitGone,
+	// A one-shot secret the registry has already handed over and keeps no second
+	// copy of: a browser login whose key was collected. Gone for the same reason a
+	// lapsed artifact is — it existed, it does not now, and no retry brings it
+	// back. Asking again means asking for a new one.
+	"spent": exitGone,
 
 	"internal_server_error": exitServer,
 

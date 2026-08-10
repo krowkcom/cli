@@ -5,10 +5,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"regexp"
 	"strings"
@@ -1334,5 +1336,279 @@ func TestMintedSlugsHaveTheCanonicalShape(t *testing.T) {
 	second, _ := declare(t, server, "krowk_sk_test", "shot.png", "some bytes")["slug"].(string)
 	if second == artifact {
 		t.Errorf("two artifacts share the slug %q", artifact)
+	}
+}
+
+// postText posts nothing and reads the answer as text. The approval endpoints are
+// what a browser form submits to, so they answer HTML rather than JSON.
+func postText(t *testing.T, url string) (int, string) {
+	t.Helper()
+	res, err := http.Post(url, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res.StatusCode, string(body)
+}
+
+// openLogin asks for a browser login and returns both halves of it.
+func openLogin(t *testing.T, server *httptest.Server) (slug, code string) {
+	t.Helper()
+	status, payload := request(t, http.MethodPost, server.URL+"/v1/cli/authorizations", "", "", "")
+	if status != http.StatusCreated {
+		t.Fatalf("opening a login answered %d: %v", status, payload)
+	}
+	slug, _ = payload["slug"].(string)
+	code, _ = payload["code"].(string)
+	if slug == "" || code == "" {
+		t.Fatalf("a login without both halves is not one: %v", payload)
+	}
+	return slug, code
+}
+
+// decide presses one of the two buttons on the approval page, which is what a
+// person does in production and what a test does instead.
+func decide(t *testing.T, server *httptest.Server, code, button string) (int, string) {
+	t.Helper()
+	return postText(t, server.URL+"/_approve/cli/authorizations/"+url.PathEscape(code)+"/"+button)
+}
+
+func pollLogin(t *testing.T, server *httptest.Server, slug string) (int, map[string]any) {
+	t.Helper()
+	return request(t, http.MethodGet, server.URL+"/v1/cli/authorizations/"+url.PathEscape(slug), "", "", "")
+}
+
+// A browser login hands the key over exactly once, and the key it hands over is
+// the same one every other endpoint will recognise — otherwise logging in would
+// succeed and the first upload would fail.
+func TestABrowserLoginHandsTheKeyOverOnce(t *testing.T) {
+	server, _ := newClockedServer(t)
+	slug, code := openLogin(t, server)
+
+	status, pending := pollLogin(t, server, slug)
+	if status != http.StatusOK || pending["state"] != authorizationPending {
+		t.Fatalf("a fresh login is %d %v, want a pending 200", status, pending)
+	}
+	if pending["token"] != nil {
+		t.Fatalf("a login nobody approved handed over a key: %v", pending)
+	}
+
+	if status, body := decide(t, server, code, "approval"); status != http.StatusOK {
+		t.Fatalf("approving answered %d: %s", status, body)
+	}
+
+	status, granted := pollLogin(t, server, slug)
+	token, _ := granted["token"].(string)
+	if status != http.StatusOK || !strings.HasPrefix(token, "krowk_sk_") {
+		t.Fatalf("an approved login is %d %v, want a key", status, granted)
+	}
+	// The key the approval minted has to be the key the rest of the registry
+	// knows, or `auth login` and the `auth verify` after it disagree.
+	_, key := request(t, http.MethodGet, server.URL+"/v1/key", token, "", "")
+	if key["key_id"] != granted["key_id"] || key["workspace"] != granted["workspace"] {
+		t.Errorf("the login named %v/%v and the key endpoint names %v/%v",
+			granted["key_id"], granted["workspace"], key["key_id"], key["workspace"])
+	}
+
+	// One shot: the plaintext left with the read above and no copy stayed behind.
+	status, spent := pollLogin(t, server, slug)
+	if status != http.StatusGone || errorCode(spent) != "spent" {
+		t.Fatalf("a second poll is %d %v, want 410 spent", status, spent)
+	}
+}
+
+// The code approves and nothing else. It travels through terminals, chat messages
+// and people reading it aloud, so anything it could be exchanged for is a hole:
+// the slug is what collects the key, and it never appears in a browser.
+func TestTheApprovalCodeNeverYieldsTheKey(t *testing.T) {
+	server, _ := newClockedServer(t)
+	slug, code := openLogin(t, server)
+
+	if status, body := pollLogin(t, server, code); status != http.StatusNotFound {
+		t.Errorf("polling by code answered %d %v, want 404 — the code is not the slug", status, body)
+	}
+
+	status, answer := decide(t, server, code, "approval")
+	if status != http.StatusOK {
+		t.Fatalf("approving answered %d: %s", status, answer)
+	}
+	// Approving is what mints the key, and the person approving is not who
+	// collects it.
+	if strings.Contains(answer, "krowk_sk_") {
+		t.Errorf("the approval answered with the key itself:\n%s", answer)
+	}
+	if _, granted := pollLogin(t, server, slug); granted["token"] == nil {
+		t.Errorf("the slug did not collect what the code approved: %v", granted)
+	}
+}
+
+// Denied is an answer, and it keeps being one until the window closes: a CLI that
+// went on polling after someone said no would sit there until it lapsed.
+func TestADeniedBrowserLoginKeepsSayingSo(t *testing.T) {
+	server, _ := newClockedServer(t)
+	slug, code := openLogin(t, server)
+
+	if status, body := decide(t, server, code, "denial"); status != http.StatusOK {
+		t.Fatalf("denying answered %d: %s", status, body)
+	}
+	for range 2 {
+		status, denied := pollLogin(t, server, slug)
+		if status != http.StatusOK || denied["state"] != authorizationDenied {
+			t.Fatalf("a denied login is %d %v, want a denied 200", status, denied)
+		}
+		if denied["token"] != nil {
+			t.Fatalf("a denied login handed over a key: %v", denied)
+		}
+	}
+	// And it cannot be talked round afterwards.
+	if status, _ := decide(t, server, code, "approval"); status != http.StatusConflict {
+		t.Errorf("approving a denied login answered %d, want 409", status)
+	}
+}
+
+// A lapsed login is gone the way a lapsed artifact is: 410, so a client can tell
+// "this existed and the window closed" from "no such login".
+func TestABrowserLoginExpires(t *testing.T) {
+	server, c := newClockedServer(t)
+	slug, code := openLogin(t, server)
+
+	c.advance(cliAuthorizationLifetime + time.Second)
+
+	status, gone := pollLogin(t, server, slug)
+	if status != http.StatusGone || errorCode(gone) != "expired" {
+		t.Fatalf("a lapsed login is %d %v, want 410 expired", status, gone)
+	}
+	// Expiry beats approval, rather than approval reviving the window.
+	if status, _ := decide(t, server, code, "approval"); status != http.StatusGone {
+		t.Errorf("approving a lapsed login answered %d, want 410", status)
+	}
+}
+
+// The approval page refuses a code that matches nothing, rather than offering
+// buttons that would answer 404 once pressed.
+func TestTheApprovalPageRefusesACodeThatMatchesNothing(t *testing.T) {
+	server, _ := newClockedServer(t)
+	_, code := openLogin(t, server)
+
+	status, shown := requestText(t, server.URL+"/_approve/cli/authorizations/new?code="+code)
+	if status != http.StatusOK || !strings.Contains(shown, code) {
+		t.Fatalf("the page for a live code is %d and does not show it:\n%s", status, shown)
+	}
+
+	for _, unknown := range []string{"", "ZZZZ-ZZZZ"} {
+		if status, _ := requestText(t,
+			server.URL+"/_approve/cli/authorizations/new?code="+unknown); status != http.StatusNotFound {
+			t.Errorf("the page for code %q answered %d, want 404", unknown, status)
+		}
+	}
+}
+
+// The code is read off one screen and typed into another, or read out loud, so
+// its alphabet leaves out the two pairs that get confused. 32 characters also
+// divides 256, which is what keeps the choice per byte unbiased.
+func TestApprovalCodesAvoidConfusableCharacters(t *testing.T) {
+	shape := regexp.MustCompile(`^[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}$`)
+	seen := map[string]bool{}
+	for range 200 {
+		code := generateCode()
+		if !shape.MatchString(code) {
+			t.Fatalf("code %q is not two groups of four from the unambiguous alphabet", code)
+		}
+		seen[code] = true
+	}
+	if len(seen) < 190 {
+		t.Errorf("200 codes produced only %d distinct ones", len(seen))
+	}
+	if strings.ContainsAny(codeAlphabet, "01OI") {
+		t.Errorf("the code alphabet %q keeps a confusable character", codeAlphabet)
+	}
+}
+
+// A key that was collected and then sat past its window was still collected. The
+// CLI's advice differs between the two — "this lapsed before it was approved" is a
+// lie about a key that is on somebody's disk — so spent has to outrank expiry.
+func TestASpentBrowserLoginKeepsSayingSpentAfterItLapses(t *testing.T) {
+	server, c := newClockedServer(t)
+	slug, code := openLogin(t, server)
+
+	if status, body := decide(t, server, code, "approval"); status != http.StatusOK {
+		t.Fatalf("approving answered %d: %s", status, body)
+	}
+	if _, granted := pollLogin(t, server, slug); granted["token"] == nil {
+		t.Fatalf("the key was never collected: %v", granted)
+	}
+
+	c.advance(cliAuthorizationLifetime + time.Second)
+
+	status, gone := pollLogin(t, server, slug)
+	if status != http.StatusGone || errorCode(gone) != "spent" {
+		t.Fatalf("a collected login that then lapsed is %d %v, want 410 spent", status, gone)
+	}
+}
+
+// One-shot means delivered once, not destroyed once. If the response never leaves,
+// nobody received the key — and the laptop-wifi case the CLI's poll loop is
+// written to survive must not be the case that makes a login unrecoverable.
+func TestABrowserLoginKeepsItsKeyWhenTheResponseNeverLands(t *testing.T) {
+	c := &clock{at: time.Now()}
+	handler := HandlerWithClock(0, "", c.now)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	slug, code := openLogin(t, server)
+	if status, body := decide(t, server, code, "approval"); status != http.StatusOK {
+		t.Fatalf("approving answered %d: %s", status, body)
+	}
+
+	// A writer that refuses the body is the one seam that stands in for a
+	// connection dropping between the status line and the payload.
+	handler.ServeHTTP(brokenWriter{header: http.Header{}}, httptest.NewRequest(
+		http.MethodGet, "/v1/cli/authorizations/"+url.PathEscape(slug), nil))
+
+	status, granted := pollLogin(t, server, slug)
+	token, _ := granted["token"].(string)
+	if status != http.StatusOK || !strings.HasPrefix(token, "krowk_sk_") {
+		t.Fatalf("the poll after a lost response is %d %v, want the key still collectable", status, granted)
+	}
+	// And it is one-shot again from there.
+	if status, spent := pollLogin(t, server, slug); status != http.StatusGone || errorCode(spent) != "spent" {
+		t.Fatalf("the poll after a delivered one is %d %v, want 410 spent", status, spent)
+	}
+}
+
+// brokenWriter accepts the status and refuses the body, which is what a dropped
+// connection looks like to a handler.
+type brokenWriter struct{ header http.Header }
+
+func (b brokenWriter) Header() http.Header       { return b.header }
+func (b brokenWriter) WriteHeader(int)           {}
+func (b brokenWriter) Write([]byte) (int, error) { return 0, errors.New("connection reset") }
+
+// Lapsed logins are swept, or a `registry serve` left up all week accumulates
+// every login it ever answered. The grace period is what keeps `410 expired`
+// meaningful: reaped at the window's edge, a client that polled a second late
+// would be told no such login rather than that the window closed.
+func TestLapsedBrowserLoginsAreSweptButNotImmediately(t *testing.T) {
+	server, c := newClockedServer(t)
+	justLapsed, _ := openLogin(t, server)
+
+	c.advance(cliAuthorizationLifetime + time.Minute)
+	// Opening another is what sweeps, since it is the only moment the set grows.
+	openLogin(t, server)
+
+	if status, body := pollLogin(t, server, justLapsed); status != http.StatusGone ||
+		errorCode(body) != "expired" {
+		t.Errorf("a login inside the grace period is %d %v, want 410 expired", status, body)
+	}
+
+	c.advance(cliAuthorizationGrace)
+	openLogin(t, server)
+
+	if status, body := pollLogin(t, server, justLapsed); status != http.StatusNotFound {
+		t.Errorf("a login past the grace period is %d %v, want it swept", status, body)
 	}
 }

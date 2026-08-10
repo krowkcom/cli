@@ -99,7 +99,7 @@ included. A renamed flag fails the build rather than failing an agent.
 | `krowk runs show <run>` | Read one run back, with everything recorded on it |
 | `krowk runs finish <run>` | Close a run |
 | `krowk claim <artifact> <claim-token>` | Keep an anonymous upload past its expiry (`--run` groups it while claiming) |
-| `krowk auth login --token <token>` | Check a token against the registry, then store it in `~/.config/krowk/credentials.json` (0600) |
+| `krowk auth login` | Approve this machine in a browser and store the key it mints, in `~/.config/krowk/credentials.json` (0600) — `--token <token>` stores one you already have, `--no-browser` prints the code and the page instead |
 | `krowk auth token` | Print the stored token, for scripts |
 | `krowk auth verify` | Ask the registry which key this is, and the workspace it acts in |
 | `krowk doctor` | Report version, API reachability, auth and detected run context |
@@ -165,9 +165,32 @@ below, in the same commit.
 **One file, one artifact, one link.** Pushing three files creates three
 artifacts with three URLs. What groups them is a run, not an artifact.
 
-**Logging in asks first.** `auth login` reads the key back from the registry
-before writing it down, so a mistyped token fails while the real one is still on
-the clipboard rather than at the next push. A key the registry rejects is not
+**Logging in goes through a browser, and the code cannot fetch the key.**
+`auth login` asks the registry to open an authorization and gets back two things:
+a slug and a short code. The slug is what the CLI polls, and it never appears in
+a browser; the code is what a person confirms on the page, and approving is all
+it can do. So the half that travels — printed in a terminal, pasted into a chat,
+read out over a call — is not exchangeable for a key by whoever sees it. The key
+is handed over exactly once: the registry keeps no plaintext after the poll that
+collects it, so a second one answers `410 spent`, and a login that lapses
+unanswered answers `410 expired`.
+
+The page comes out of a response body and is handed to the desktop's URL handler,
+which reaches much further than an HTTP client does — `file://` walks the local
+disk, and desktops register schemes that start programs with arguments. So krowk
+opens `http` and `https` and nothing else, and `http` only where the registry
+itself is `http`: a local one, or a self-hosted one inside a private network.
+Over SSH, or with no display, it opens nothing and prints the code and the page
+instead — which is also what `--no-browser` asks for. On CI it is refused
+outright: there is no person and no browser, so waiting out the window to then
+report that nobody approved it would burn a quarter of an hour saying something
+knowable at once. Everything a person needs while the command waits goes to
+stderr, so stdout stays the single document a program parses.
+
+**Logging in with a key asks first.** `--token` is unchanged, and it is how CI
+logs in: nothing is opened and nothing is polled. It reads the key back from the
+registry before writing it down, so a mistyped token fails while the real one is
+still on the clipboard rather than at the next push. A key the registry rejects is not
 stored, and never replaces a working one; a registry that cannot be reached is
 not evidence about the key, so the token is stored unconfirmed and `auth verify`
 settles it later. What came back — the key ID and the workspace — is kept
@@ -189,12 +212,12 @@ envelope is still there when the exact one matters.
 | 0 | It worked | — |
 | 1 | The command was wrong, or krowk failed on its own — a bad flag, an unknown command, an unreadable file, a port that will not bind. Also anything unclassified | Fix the command |
 | 2 | Not found — no such artifact or run in this workspace, no such endpoint at this base URL, or a claim token the registry does not recognise, which it answers as no such record so that guessing learns nothing | Check the slug and the token, or `KROWK_API_URL` |
-| 3 | Refused for want of credentials — no key where one is needed, a key the registry rejects, or no claim token where that is the only authority | `krowk auth login`, or pass the claim token |
+| 3 | Refused for want of credentials — no key where one is needed, a key the registry rejects, a browser login somebody denied or that nothing on CI could approve, or no claim token where that is the only authority | `krowk auth login`, or pass the claim token |
 | 4 | The registry understood the request and refused it — validation, an upload already finalized, a run that needs a key | Change something; retrying unchanged answers the same |
 | 5 | Rate limited | Wait — the error body carries `retry_after` when the registry sent one |
 | 6 | The bytes did not move — the registry or object storage could not be reached, or storage refused the transfer | Retry |
-| 7 | The registry failed on its side (5xx), or answered a success this client could not read | Retry, and report it if it persists |
-| 8 | Gone — the artifact expired or was taken down | Upload again; no retry brings it back |
+| 7 | The registry failed on its side (5xx), answered a success this client could not read, or named a login page krowk will not open | Retry, and report it if it persists; for the login page, check `KROWK_API_URL` |
+| 8 | Gone — the artifact expired or was taken down, or a browser login lapsed before anybody approved it | Upload again, or log in again; no retry brings any of them back |
 
 1 stays the catch-all it always was, so anything checking `!= 0` keeps working
 and a failure that gains a class can only ever move *out* of 1.
@@ -246,7 +269,15 @@ shape whichever command it ran:
 ```
 
 A failure is the same envelope with `"ok": false` and an `error` object carrying
-the code, the `fix` line and `retryable`.
+the code, the `fix` line and `retryable`. Results go to stdout, failures to
+stderr, one document each.
+
+`auth login` is the single exception, and only because a browser login has to
+speak before it knows its outcome: while it waits it writes what a person needs —
+the code and the page, as `{"authorizing": …}` in a machine format — to stderr,
+so a login that then fails leaves that document ahead of the error. **On that
+stream the last document is the verdict.** It deliberately carries no `ok`, so
+nothing about a login still waiting can be read as one that succeeded.
 
 Breadcrumbs are commands, not hints. `cmd` is ready to run, with this result's
 own slugs and tokens already in it — `action` is the short label, `description`
@@ -273,7 +304,7 @@ What each command hands back, one line each — the wording lives in the code:
 | `runs show` | What the run made, plus the finish if it is still open |
 | `claim` without `--run` | The `uploads attach` that puts it under one — the only way a claimed upload ever gets a run; `claim --run` has already done it and says nothing |
 | A page that came back full | The same listing with `--before`, keeping the `--run` and `--limit` it was given |
-| `auth login` / `auth verify` | The push it just made possible, or the `auth verify` an unconfirmed login still needs |
+| `auth login` / `auth verify` | The push it just made possible; the `auth verify` an unconfirmed login still needs, or the one that settles which key is in play when `KROWK_TOKEN` outranks the file just written |
 
 `--quiet` is the raw record with no envelope, so it carries no breadcrumbs at
 all — in human output either, where the claim and attach lines are suppressed;
@@ -398,6 +429,8 @@ resource reached with a `GET`:
 ```
 GET        /                                  service descriptor
 GET        /v1/key                            the key this request is made with
+POST       /v1/cli/authorizations             open a browser login (no key, rate limited)
+GET        /v1/cli/authorizations/:slug       poll it — hands the key over exactly once
 GET        /v1/artifacts                      list, newest first (needs a key)
 POST       /v1/artifacts                      declare an upload
 GET        /v1/artifacts/:slug                read one back
@@ -469,6 +502,43 @@ Then the two calls `next_step` names:
 PUT <upload.url>                                  # exactly the headers above, nothing more
 PUT {KROWK_API_URL}/artifacts/{slug}/finalization
 ```
+
+A browser login is two calls, and the split between them is the security
+property rather than a shape:
+
+```
+POST {KROWK_API_URL}/cli/authorizations       # no Authorization header, no body
+```
+
+```jsonc
+// 201 Created
+{
+  "slug": "aut_9k2f…", "state": "pending",
+  "code": "7K4M-2QXP",                        // what a person confirms; approve or deny, nothing else
+  "verification_url": "https://app.krowk.com/cli/authorizations/new?code=7K4M-2QXP",
+  "interval": 5,                              // seconds between polls — the registry sets the pace
+  "expires_at": "2026-08-10T14:47:00Z"
+}
+```
+
+```
+GET {KROWK_API_URL}/cli/authorizations/aut_9k2f…    # authorised by the slug, no key
+```
+
+```jsonc
+// 200 OK, once approved — and only once
+{ "slug": "aut_9k2f…", "state": "approved", "expires_at": "…",
+  "token": "krowk_sk_…", "key_id": "key_9f3c2e1d", "workspace": "ws_acme" }
+// 200 OK while nobody has answered: { "state": "pending" }, or "denied" once someone has
+// 410 Gone afterwards: `spent` once the key has been collected, `expired` once the window closes
+```
+
+The slug is the capability that collects the key and is never put in front of a
+browser; the code is the capability that approves, and knowing it yields nothing.
+`POST /v1/cli/authorizations` is the one create in this API that carries no
+`Idempotency-Key`: a lost response means the code was never seen, so the
+authorization it belongs to can never be approved — it charges nothing, reserves
+nothing, and lapses on its own.
 
 Every failure carries the same shape, so an agent can branch on the code:
 
@@ -612,6 +682,25 @@ too-large path). It serves the card page at `/a/{slug}` too — the same
 OpenGraph tags production serves, unstyled — so a link it hands out unfurls
 rather than 404ing when it is pasted somewhere.
 
+It answers the browser login as well, so `krowk auth login --dev` works end to
+end:
+
+```bash
+krowk auth login --dev                # opens the approval page, prints the code
+```
+
+The approval screen belongs to the app surface in production. What the stand-in
+serves is an unmistakably local substitute — a code to compare and two buttons,
+at `/_approve/cli/authorizations/new?code=…`, on a path that is neither the API
+nor a pretence at the website. Pressing Approve mints a key derived exactly as
+`GET /v1/key` derives one, so the login and the `auth verify` after it agree. A
+script can press it without a browser:
+
+```bash
+curl -X POST http://localhost:8787/_approve/cli/authorizations/7K4M-2QXP/approval
+curl -X POST http://localhost:8787/_approve/cli/authorizations/7K4M-2QXP/denial
+```
+
 It binds `127.0.0.1:8787` — **loopback by default**, because it accepts uploads
 without a key and serves their bytes to anyone who can reach it. On a café or
 office network a wider bind hands that to whoever is nearby. `--addr` can still
@@ -752,31 +841,17 @@ Blocking, in order:
    left is not code: the `@krowk` scope has to carry `@krowk/cli`, `@krowk/mcp`
    and the five platform packages before the site's `npx @krowk/cli push`
    resolves. Binaries publish today.
-3. **Getting a token.** Keys exist in the registry and the dashboard can issue
-   them, but there is no device flow, so an agent in a container still needs a
-   human to paste one in.
+3. **Getting a token.** The CLI half of the browser login is built — `krowk auth
+   login` opens an authorization, prints the code, opens the page and collects the
+   key, and the stand-in registry answers all of it. What is left is the registry
+   half: `POST /v1/cli/authorizations`, `GET /v1/cli/authorizations/:slug` with
+   its one-shot delivery and its sweep, and the approval page on the app surface.
+   Until those ship, `--token` is still the only way in against
+   `api.krowk.com`.
 
 Non-blocking, in rough value order: a Homebrew tap, which comes off the archives
 the release already produces; a Claude Code `PostToolUse` hook so screenshots
 upload with no prompting; a GitHub Action. The `curl | bash` installer is
 written — it has never run against a real release, because there is not one.
-
-## Open questions
-
-- ~~**Nothing dedupes.** Should the registry key artifacts by digest within a
-  workspace, or is a link per push the intended behaviour?~~ **Answered:** a link
-  per push, and retries named with an `Idempotency-Key` — not digests. See
-  [above](#retries-dedupe-identical-pushes-do-not), and canon,
-  `glossary.md` → Identical bytes do not dedupe.
-- **A run per push.** With a key, every `push` that is not given `--run` opens
-  and closes its own run, so ten screenshots from one agent session become ten
-  runs. Should the CLI persist a run for the session — keyed on the agent's
-  session ID — so they group without the caller threading `--run` through?
-- **Oversized files are read before they are refused.** The upload cap lives in
-  the registry, so the client digests a 2 GB file and only then hears it is too
-  large. Should the API root publish `max_upload_bytes` so the client can refuse
-  it locally?
-- **Anonymous uploads have no key to rate-limit against.** IP, or a
-  machine-scoped anonymous token minted on first push?
 
 MIT.

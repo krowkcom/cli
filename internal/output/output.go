@@ -693,6 +693,10 @@ type Login struct {
 	// Reason says why the registry did not confirm the key, and is empty when it
 	// did.
 	Reason string `json:"reason,omitempty"`
+	// Shadowed says KROWK_TOKEN is set, which outranks the file this login just
+	// wrote. Without it the receipt would name a workspace the next upload does not
+	// land in — the one fact a login is a receipt for, wrong.
+	Shadowed bool `json:"shadowed_by_env,omitempty"`
 }
 
 // StoredKey renders what `auth login` just did.
@@ -712,6 +716,10 @@ func StoredKey(l *Login, f Format, quiet, colour bool) string {
 					"so whether it works is still unknown",
 			}
 		}
+		if l.Shadowed {
+			summary += " — but KROWK_TOKEN is set and outranks it"
+			crumb = shadowedCrumb
+		}
 		return encode(Envelope{
 			OK:          true,
 			Data:        l,
@@ -720,16 +728,91 @@ func StoredKey(l *Login, f Format, quiet, colour bool) string {
 		})
 	}
 
+	var lines []string
 	if !l.Confirmed {
-		return strings.Join([]string{
+		lines = []string{
 			fmt.Sprintf("%s token stored in %s", paint(colour, green, "✓"), l.Path),
 			"  " + paint(colour, dim, "unconfirmed") + " — " + l.Reason +
 				"; run `krowk auth verify` once the registry is reachable",
-		}, "\n")
+		}
+	} else {
+		lines = []string{
+			fmt.Sprintf("%s key %s stored in %s", paint(colour, green, "✓"), l.KeyID, l.Path),
+			"  uploads land in " + l.Workspace,
+		}
+	}
+	if l.Shadowed {
+		lines = append(lines, "  "+paint(colour, dim,
+			"! KROWK_TOKEN is set and wins over this file, so uploads use that key instead — "+
+				"unset it to use the one just stored"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// shadowedCrumb replaces the push a login would otherwise suggest. Pushing would
+// work, and it would land somewhere other than where this login just said — so
+// the next step is settling which key is actually in play.
+var shadowedCrumb = Breadcrumb{
+	Action: "verify",
+	Cmd:    "krowk auth verify",
+	Description: "KROWK_TOKEN outranks the key just stored, so this reports the one that " +
+		"uploads will really use — unset KROWK_TOKEN to use the stored one instead",
+}
+
+// Authorization is what a browser login says about itself while it is still
+// waiting: the code to confirm, and the page to confirm it on.
+//
+// It is not wrapped in an Envelope, and that is deliberate. An envelope carries
+// `ok`, which is a verdict on a command that has finished — and this is written
+// before the command knows whether it worked at all. An agent that read `ok:
+// true` here would take a login that has not happened yet for one that has, so
+// the shape is different on purpose and says what it is instead.
+type Authorization struct {
+	Code string `json:"code"`
+	Page string `json:"page"`
+	// Opened says whether a browser was asked to open the page, so a caller knows
+	// whether the person in front of it has to do that part themselves.
+	Opened bool `json:"opened"`
+}
+
+// Authorizing renders that notice.
+//
+// It goes to stderr rather than stdout, which keeps the one document on stdout
+// the receipt a program parses — but it means that a login which then *fails*
+// leaves stderr carrying this notice ahead of the error envelope. That is
+// unavoidable for a command with something to say before it knows its outcome, so
+// it is said in the same format the rest of the output is in: prose for a person,
+// a JSON document for a program, which makes stderr a stream of documents whose
+// last one is the outcome rather than prose with JSON stuck to it.
+//
+// The code is shown so it can be compared against the one on the page. That
+// comparison is the whole reason a code exists — the slug collects the key and
+// never appears in a browser, so what the page asks somebody to approve has to
+// be identifiable as the request their own terminal made.
+// It takes no quiet: --quiet drops an envelope, and there is no envelope here to
+// drop. The `authorizing` key is not a wrapper around a result but the thing that
+// says this is not one, so removing it would take away the only field a reader has
+// to tell an interim notice from the verdict on the same stream.
+func Authorizing(a Authorization, f Format, colour bool) string {
+	// `f == JSON` rather than `f != Human`, matching Error: markdown and url fall
+	// back to the text a person reads, so those two never end up with a document on
+	// one line of a stream and coloured prose on the next.
+	if f == JSON {
+		// Its own line, so whatever is written to this stream next — the error
+		// envelope, if the login goes on to fail — starts a document of its own.
+		return encode(map[string]any{"authorizing": a}) + "\n"
+	}
+
+	head := "Open this page and confirm the code"
+	if a.Opened {
+		head = "Your browser is opening — confirm the code there"
 	}
 	return strings.Join([]string{
-		fmt.Sprintf("%s key %s stored in %s", paint(colour, green, "✓"), l.KeyID, l.Path),
-		"  uploads land in " + l.Workspace,
+		head,
+		"  " + paint(colour, dim, "code") + "  " + a.Code,
+		"  " + paint(colour, dim, "page") + "  " + a.Page,
+		paint(colour, dim, "  waiting for approval, Ctrl-C to stop"),
+		"",
 	}, "\n")
 }
 

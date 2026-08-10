@@ -235,10 +235,16 @@ func catalog() Catalog {
 				Subcommands: []Command{
 					{
 						Name:    "login",
-						Usage:   "krowk auth login --token <token>",
-						Summary: "Check an API token, then store it",
-						Flags: []Flag{{Name: "token", Type: typeString,
-							Usage: "The API key to check and store, e.g. krowk_sk_..."}},
+						Usage:   "krowk auth login [--token <token>] [--no-browser]",
+						Summary: "Approve this machine in the browser, or store a key",
+						Flags: []Flag{
+							{Name: "token", Type: typeString,
+								Usage: "Check and store this key instead of asking the browser — " +
+									"how CI logs in, e.g. krowk_sk_..."},
+							{Name: "no-browser", Type: typeBool, Default: "false",
+								Usage: "Print the code and the page instead of opening a browser — " +
+									"the default over SSH, or with no display"},
+						},
 					},
 					{Name: "token", Usage: "krowk auth token", Summary: "Print the stored token"},
 					{Name: "verify", Usage: "krowk auth verify", Summary: "Check the key and its workspace"},

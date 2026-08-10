@@ -347,6 +347,52 @@ func TestStoredKeyDistinguishesAConfirmedLoginFromAnUnconfirmedOne(t *testing.T)
 	}
 }
 
+// The notice a browser login prints while it waits has one job: put the code and
+// the page in front of a person. It is prose in every format, because it is not a
+// result — the result is the receipt on stdout once somebody has approved it.
+func TestAuthorizingShowsTheCodeAndThePage(t *testing.T) {
+	page := "https://app.krowk.com/cli/authorizations/new?code=7K4M-2QXP"
+	opened := Authorization{Code: "7K4M-2QXP", Page: page, Opened: true}
+
+	waiting := Authorizing(opened, Human, false)
+	for _, want := range []string{"7K4M-2QXP", page, "browser is opening"} {
+		if !strings.Contains(waiting, want) {
+			t.Errorf("the notice is missing %q:\n%s", want, waiting)
+		}
+	}
+
+	// Nothing was opened, so nothing may claim it was: this is the SSH and
+	// container case, where reading the URL out of the terminal is the whole flow.
+	printed := Authorizing(Authorization{Code: opened.Code, Page: page}, Human, false)
+	if strings.Contains(printed, "opening") {
+		t.Errorf("a login that opened nothing says it did:\n%s", printed)
+	}
+	if !strings.Contains(printed, "Open this page") {
+		t.Errorf("nothing tells the person to open it themselves:\n%s", printed)
+	}
+
+	// A program gets a document rather than prose, and one that cannot be mistaken
+	// for the command's outcome: no `ok` to read a verdict off.
+	machine := Authorizing(opened, JSON, false)
+	if !strings.HasSuffix(machine, "\n") {
+		t.Errorf("the notice does not end its own line, so the next document runs into it:\n%q", machine)
+	}
+	var doc struct {
+		Authorizing *Authorization `json:"authorizing"`
+		OK          *bool          `json:"ok"`
+		Error       map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(machine), &doc); err != nil {
+		t.Fatalf("the machine notice is not JSON: %v\n%s", err, machine)
+	}
+	if doc.Authorizing == nil || *doc.Authorizing != opened {
+		t.Errorf("authorizing = %+v, want %+v", doc.Authorizing, opened)
+	}
+	if doc.OK != nil {
+		t.Errorf("the notice carries a verdict on a login that has not happened yet:\n%s", machine)
+	}
+}
+
 // The run is the whole point of `uploads attach` and of `claim --run`, and both
 // answer through Artifact. The human line already prints it, so the envelope an
 // agent reads must not be the one place it goes missing.

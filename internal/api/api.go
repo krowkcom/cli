@@ -163,6 +163,20 @@ func (t *proxyStamp) RoundTrip(req *http.Request) (*http.Response, error) {
 // metadata — are only available to a keyed client.
 func (c *Client) Authenticated() bool { return c.Token != "" }
 
+// Insecure reports whether this registry is reached over plaintext http, which is
+// something the caller chose: a local registry, or a self-hosted one inside a
+// private network.
+//
+// It lives here rather than wherever the question gets asked, because every other
+// judgement about the base URL — whether it is local, whether a redirect stayed on
+// its origin, which schemes a storage host may use — is made here too, against
+// this same field. A second parse somewhere else is a second home for the same
+// policy.
+func (c *Client) Insecure() bool {
+	u, err := url.Parse(c.BaseURL)
+	return err == nil && u.Scheme == "http"
+}
+
 // Upload is where the bytes go, signed for one specific body.
 type Upload struct {
 	Method    string            `json:"method"`
@@ -290,6 +304,113 @@ func KeyRejected(err error) bool {
 		return false
 	}
 	return apiErr.Status == http.StatusUnauthorized || apiErr.Status == http.StatusForbidden
+}
+
+// CLIAuthorization is one browser login in progress: the CLI asks the registry
+// for one, a person approves it on the app surface, and the key that approval
+// mints is collected from here.
+//
+// Two capabilities, deliberately split. Slug is what collects the key and is
+// never shown in the browser; Code is what a person reads and can only approve
+// or deny. Knowing the code must therefore never yield the key — which is why
+// the poll is by slug and the page is by code.
+type CLIAuthorization struct {
+	Slug  string `json:"slug"`
+	State string `json:"state"`
+	// Code is the short pair a person matches against the terminal, so an
+	// authorization opened by something else cannot be approved by mistake. Its
+	// alphabet leaves out 0/O and 1/I, which is the pair a read-aloud code gets
+	// wrong.
+	Code string `json:"code,omitempty"`
+	// VerificationURL is the page that shows the code and mints the key. It
+	// arrives in a response body and is about to be handed to the desktop's URL
+	// handler, so the CLI judges it before opening it.
+	VerificationURL string `json:"verification_url,omitempty"`
+	// Interval is how many seconds to wait between polls. The registry sets the
+	// pace, because it is the side that knows what its rate limit allows.
+	Interval  int    `json:"interval,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+
+	// Token, KeyID and Workspace are the key itself, and appear on the one read
+	// that finds the authorization approved. The plaintext is gone from the
+	// registry after that read, so a second one answers 410 `spent`.
+	Token     string `json:"token,omitempty"`
+	KeyID     string `json:"key_id,omitempty"`
+	Workspace string `json:"workspace,omitempty"`
+}
+
+// The states an authorization reports while it still exists. Spent and expired
+// are not among them: both are gone, and the registry says so with a 410 rather
+// than with a body, the way it does for an artifact that has lapsed.
+const (
+	AuthorizationPending  = "pending"
+	AuthorizationApproved = "approved"
+	AuthorizationDenied   = "denied"
+)
+
+// StartCLIAuthorization opens a browser login and returns the code to show, the
+// page to open, and the slug to collect the key from.
+//
+// Retried like any other call, and without an Idempotency-Key — the one create
+// in this API that needs none. A lost response means the caller never saw the
+// code, so the authorization it belongs to can never be approved: it costs no
+// row worth deduplicating, reserves no storage, charges nothing, and lapses
+// within the quarter hour on its own.
+//
+// Call it on a keyless client. The endpoint exists for a machine that has no key
+// and takes none, and sending one would have the registry meter the request as
+// that key's rather than as this address's — so logging in again somewhere
+// already logged in would be counted against the key being replaced.
+func (c *Client) StartCLIAuthorization(ctx context.Context) (*CLIAuthorization, error) {
+	var auth CLIAuthorization
+	var status int
+	if err := c.callStatus(ctx, http.MethodPost, "/cli/authorizations", nil, &auth, &status); err != nil {
+		return nil, err
+	}
+	// A body with neither is some other service answering, the same judgement
+	// VerifyKey makes about a key lookup that names no key. Without both there is
+	// nothing to poll and nothing to show a person.
+	if auth.Slug == "" || auth.Code == "" {
+		return nil, &Error{Status: status, Body: map[string]any{
+			"error":     "malformed_response",
+			"fix":       "the registry opened a browser login without naming a code to confirm or a slug to poll — check KROWK_API_URL points at the API host, not the website",
+			"retryable": false,
+		}}
+	}
+	return &auth, nil
+}
+
+// ReadCLIAuthorization reads one back: still pending, approved — and carrying
+// the key, exactly once — or denied. A 410 means it is gone, spent or expired.
+//
+// Keyless for the same reason the create is: the authority for this call is the
+// slug, which is a capability the caller already holds, and a stale key in the
+// environment has no business deciding whether a login can finish.
+func (c *Client) ReadCLIAuthorization(ctx context.Context, slug string) (*CLIAuthorization, error) {
+	var auth CLIAuthorization
+	if err := c.call(ctx, http.MethodGet, "/cli/authorizations/"+slugPath(slug), nil, &auth); err != nil {
+		return nil, err
+	}
+	return &auth, nil
+}
+
+// RetryAfterFor reads the wait a failure asked for, when it asked for one.
+//
+// It exists for a caller pacing a loop of its own — `auth login` polling an
+// authorization — which would otherwise come straight back after its own interval
+// having just been told to slow down. Parsed and capped exactly as the retry loop
+// inside a single call parses it, so there is one policy about that header rather
+// than two.
+func RetryAfterFor(err error, now time.Time) (time.Duration, bool) {
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		return 0, false
+	}
+	asked, _ := apiErr.Body["retry_after"].(string)
+	if asked == "" {
+		return 0, false
+	}
+	return retryAfter(asked, now)
 }
 
 // Error carries a failure flattened into one map, so everything downstream reads

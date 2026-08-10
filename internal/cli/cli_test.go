@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -767,6 +768,10 @@ func TestUnknownCommandIsReadable(t *testing.T) {
 func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	var mu sync.Mutex
 	var calls []string
+	// Carried out of the server's goroutine rather than failed there: t.Fatalf off
+	// the test's own goroutine kills the connection instead of the test, so the CLI
+	// would see an EOF and the failure would be reported as a network error.
+	var approvalErr error
 
 	inner := registry.Handler(0, "")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -774,6 +779,14 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 			mu.Lock()
 			calls = append(calls, call)
 			mu.Unlock()
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/cli/authorizations" {
+			if err := approveOnCreate(inner, w, r); err != nil {
+				mu.Lock()
+				approvalErr = err
+				mu.Unlock()
+			}
+			return
 		}
 		inner.ServeHTTP(w, r)
 	}))
@@ -805,6 +818,17 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	// Taking it down again: a claimed artifact answers to the key that holds it.
 	h.ok("uploads", "delete", anonymous.Slug)
 
+	// A browser login, approved the instant it is opened so the poll happens once.
+	// --no-browser because a test must not reach for the desktop's URL handler: on
+	// macOS and Windows nothing else would stop it.
+	h.ok("auth", "login", "--no-browser")
+	mu.Lock()
+	failed := approvalErr
+	mu.Unlock()
+	if failed != nil {
+		t.Fatalf("standing in for the person at the browser: %v", failed)
+	}
+
 	want := []string{
 		// push, with a key: open a run, declare, finalize, close the run. The two
 		// creates name their attempt so a retry of either costs nothing; +key marks
@@ -830,6 +854,14 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 		// Takedown is the REST delete of the artifact, not a nested resource:
 		// destroying it is what the verb already means.
 		"DELETE /v1/artifacts/{slug}",
+		// A browser login: open an authorization, then read it back until somebody
+		// has answered. No Idempotency-Key on the create, and that is the one
+		// exception in this list — a lost response means the code was never seen, so
+		// the authorization it belongs to can never be approved and nothing is
+		// charged for it. The collection is a GET because the key is a property of
+		// the authorization rather than something a second write produces.
+		"POST /v1/cli/authorizations",
+		"GET /v1/cli/authorizations/{slug}",
 	}
 
 	mu.Lock()
@@ -847,7 +879,55 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	}
 }
 
-var slugPattern = regexp.MustCompile(`(art|run|ws)_[0-9A-Za-z]+`)
+// approveOnCreate answers a browser login and approves it before the CLI has been
+// told the code, which is what keeps the sequence above exact: a real approval
+// arrives whenever the person gets to it, and the poll would be pinned at however
+// many times that took. Standing in for someone already looking at the page.
+//
+// The approval is pressed against the registry directly rather than through the
+// recorder, because it is not a call the CLI makes. Failures are returned rather
+// than fataled: this runs on the server's goroutine, where FailNow would end that
+// goroutine instead of the test and leave the response unwritten.
+func approveOnCreate(inner http.Handler, w http.ResponseWriter, r *http.Request) error {
+	opened := httptest.NewRecorder()
+	inner.ServeHTTP(opened, r)
+
+	// Approved before the answer is handed on, which is the whole point: the CLI
+	// must not be able to poll a login nobody has answered yet, or the sequence
+	// grows a poll and the pins stop being exact.
+	problem := approveTheCode(opened.Body.Bytes(), inner)
+
+	// Answered either way, even when the approval went wrong, so the failure
+	// surfaces as the assertion above rather than as a dropped connection.
+	for key, values := range opened.Header() {
+		w.Header()[key] = values
+	}
+	w.WriteHeader(opened.Code)
+	if _, err := w.Write(opened.Body.Bytes()); err != nil && problem == nil {
+		problem = err
+	}
+	return problem
+}
+
+// approveTheCode finds the code a create answered with and approves it.
+func approveTheCode(created []byte, inner http.Handler) error {
+	var login struct{ Code string }
+	if err := json.Unmarshal(created, &login); err != nil {
+		return fmt.Errorf("opening a browser login answered no JSON: %w\n%s", err, created)
+	}
+	if login.Code == "" {
+		return fmt.Errorf("opening a browser login answered no code:\n%s", created)
+	}
+	pressed := httptest.NewRecorder()
+	inner.ServeHTTP(pressed, httptest.NewRequest(http.MethodPost,
+		"/_approve/cli/authorizations/"+url.PathEscape(login.Code)+"/approval", nil))
+	if pressed.Code != http.StatusOK {
+		return fmt.Errorf("approving %s answered %d", login.Code, pressed.Code)
+	}
+	return nil
+}
+
+var slugPattern = regexp.MustCompile(`(art|aut|run|ws)_[0-9A-Za-z]+`)
 
 func normalizeSlugs(path string) string {
 	return slugPattern.ReplaceAllString(path, "{slug}")
@@ -861,7 +941,9 @@ func normalizeSlugs(path string) string {
 // stops naming its attempt goes back to charging for every retry, and nothing else
 // here would notice.
 func wireCall(r *http.Request) string {
-	if strings.HasPrefix(r.URL.Path, "/_storage") {
+	// Object storage is not the API, and neither is the approval page the stand-in
+	// serves in place of the app surface — the CLI calls neither.
+	if strings.HasPrefix(r.URL.Path, "/_storage") || strings.HasPrefix(r.URL.Path, "/_approve") {
 		return ""
 	}
 	call := r.Method + " " + normalizeSlugs(r.URL.Path)

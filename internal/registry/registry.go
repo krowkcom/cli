@@ -26,6 +26,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"slices"
 	"strconv"
@@ -47,6 +48,21 @@ const (
 
 	// How long a keyless upload survives, matching Artifact::EPHEMERAL_LIFETIME.
 	ephemeralLifetime = 24 * time.Hour
+
+	// How long a browser login stays open, matching the real quarter hour: long
+	// enough to find the tab, short enough that an abandoned one is not still
+	// approvable after lunch.
+	cliAuthorizationLifetime = 15 * time.Minute
+
+	// How long a lapsed login is kept before it is swept, so that a client polling
+	// just after the window still learns the window closed rather than that no such
+	// login exists.
+	cliAuthorizationGrace = time.Hour
+
+	// How often this stand-in asks to be polled, in seconds. One rather than the
+	// real five, because everything here is on loopback and a developer watching
+	// the flow by hand should not spend most of it waiting.
+	cliAuthorizationInterval = 1
 
 	// How many artifacts a page holds, mirroring the registry's own bounds. The
 	// caller picks, so the ceiling is enforced rather than trusted.
@@ -132,11 +148,40 @@ type answered struct {
 	run         string
 }
 
+// authorization is one browser login in flight.
+//
+// Two capabilities, held apart on purpose. slug is what the CLI polls and is
+// never shown in a browser; code is what a person confirms on the page and can
+// only approve or deny. So the half that travels through a terminal cannot be
+// turned into a key by whoever reads it — which is only true if the code is
+// never accepted as authority to *collect*, and it is not: the poll is by slug
+// and nothing else.
+type authorization struct {
+	slug      string
+	code      string
+	state     string
+	createdAt time.Time
+
+	// token is the plaintext key, and the read that hands it over removes it.
+	// One-shot delivery is not a rule applied to the record — there is simply
+	// nothing left to hand over a second time.
+	token     string
+	keyID     string
+	workspace string
+	// spent records that the key has already been collected, because an empty
+	// token would otherwise be indistinguishable from one that was never minted.
+	spent bool
+}
+
 type store struct {
 	mu        sync.Mutex
 	artifacts map[string]*artifact
 	runs      map[string]*run
 	objects   map[string][]byte
+	// Browser logins, by slug. Looked up by code as well — the page a person
+	// approves on knows only that half — but a map keyed by slug and scanned for a
+	// code is the right shape for a handful of records that live a quarter hour.
+	authorizations map[string]*authorization
 	// Keyed by what is being created, who is creating it, and the client's key —
 	// all three, as the real registry digests all three. Per kind so one key can
 	// cover the run and the artifact of a single push; per caller so one client's
@@ -162,11 +207,12 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 		limitBytes = DefaultLimitBytes
 	}
 	s := &store{
-		artifacts:  map[string]*artifact{},
-		runs:       map[string]*run{},
-		objects:    map[string][]byte{},
-		idempotent: map[string]*answered{},
-		now:        now,
+		artifacts:      map[string]*artifact{},
+		runs:           map[string]*run{},
+		objects:        map[string][]byte{},
+		authorizations: map[string]*authorization{},
+		idempotent:     map[string]*answered{},
+		now:            now,
 	}
 
 	mux := http.NewServeMux()
@@ -214,6 +260,31 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 
 	// The key the request is made with — a singular resource, read with a GET.
 	mux.HandleFunc("GET /v1/key", showKey)
+
+	// A browser login. Creating one takes no key — the whole point is a machine
+	// that has none — and reading one back is authorised by its slug, which is a
+	// capability the caller was handed and nobody else ever sees.
+	mux.HandleFunc("POST /v1/cli/authorizations", func(w http.ResponseWriter, r *http.Request) {
+		// The request's own host, and deliberately not site(r, siteURL). --site names
+		// an origin production really serves, which is right for a card or a file
+		// link and wrong for the approval screen: that is served by this process and
+		// nothing else, so pointing a browser at krowk.com for it opens a 404 nobody
+		// can approve.
+		s.createCLIAuthorization(w, site(r, ""))
+	})
+	mux.HandleFunc("GET /v1/cli/authorizations/{slug}", s.showCLIAuthorization)
+
+	// The approval screen, which in production is a page on the app surface with a
+	// signed-in person in front of it. This is the stand-in's substitute: a code to
+	// compare and two buttons, on a path that says it is not the API and not the
+	// website either, so `make mock` gives a working flow by hand and a test has
+	// something to press. Mirroring the real screen any further would make this a
+	// second implementation of it, which is how a stand-in starts lying.
+	mux.HandleFunc("GET /_approve/cli/authorizations/new", s.cliAuthorizationPage)
+	mux.HandleFunc("POST /_approve/cli/authorizations/{code}/approval",
+		func(w http.ResponseWriter, r *http.Request) { s.decideCLIAuthorization(w, r, true) })
+	mux.HandleFunc("POST /_approve/cli/authorizations/{code}/denial",
+		func(w http.ResponseWriter, r *http.Request) { s.decideCLIAuthorization(w, r, false) })
 
 	mux.HandleFunc("POST /v1/runs", s.createRun)
 	mux.HandleFunc("GET /v1/runs", s.listRuns)
@@ -1494,6 +1565,277 @@ func writeUnauthorized(w http.ResponseWriter) {
 		"Provide a valid API key as `Authorization: Bearer krowk_sk_...`.", nil)
 }
 
+// createCLIAuthorization opens a browser login and answers with both halves: the
+// slug that collects the key, and the code a person confirms.
+//
+// No Idempotency-Key is read, and the real endpoint does not take one either. A
+// lost response means the caller never saw the code, so the authorization it
+// belongs to can never be approved — it charges nothing, reserves nothing, and
+// lapses on its own, which is the difference between this and every other create
+// here.
+func (s *store) createCLIAuthorization(w http.ResponseWriter, site string) {
+	s.mu.Lock()
+	s.sweepAuthorizations()
+	auth := &authorization{
+		slug:      generateSlug("aut"),
+		code:      s.freeCode(),
+		state:     authorizationPending,
+		createdAt: s.now(),
+	}
+	s.authorizations[auth.slug] = auth
+	// Read out while the record is still held. The moment it is in the map another
+	// request can reach it and change its state, and building a response out of a
+	// struct this handler no longer holds is the same mistake wherever it is made —
+	// nobody can know the code yet, but that is a fact about this endpoint rather
+	// than about the lock.
+	slug, code, state := auth.slug, auth.code, auth.state
+	expires := auth.createdAt.Add(cliAuthorizationLifetime)
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"slug":  slug,
+		"state": state,
+		"code":  code,
+		// Only the code travels in the URL. Putting the slug there would hand the
+		// browser — and its history, and whatever extension is reading it — the half
+		// that collects the key.
+		"verification_url": site + "/_approve/cli/authorizations/new?code=" + url.QueryEscape(code),
+		"interval":         cliAuthorizationInterval,
+		"expires_at":       expires.UTC().Format(time.RFC3339),
+	})
+}
+
+// showCLIAuthorization is the CLI's poll, and the only way the key is ever handed
+// over. It hands it over once.
+//
+// Spent is checked before expiry, because a client asking twice deserves to be
+// told which of the two happened: a key that was collected and then sat past its
+// window was still collected, and "this lapsed before it was approved" would be a
+// lie about a key that is on somebody's disk. Expiry is checked before the state,
+// so an approval that landed a moment too late reads as lapsed rather than as a
+// key — the window is the window.
+//
+// Delivery is one-shot, and the token is taken out under the lock so that two
+// polls arriving together cannot both be handed it. It goes back if writing the
+// response fails, because a key nobody received is not a key that was collected.
+//
+// Best-effort, and worth being honest about: a handler cannot know that a response
+// arrived. The writer buffers a few kilobytes and this body is a few hundred
+// bytes, so a peer that has gone away often produces no error at all and the key
+// stays consumed. What this catches is a write that fails outright; what nothing
+// here can catch is a connection that dies after the bytes were handed to the
+// kernel. The real registry has exactly the same limit, which is why the CLI reads
+// `410 spent` as "log in again" rather than as something to recover from.
+func (s *store) showCLIAuthorization(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+
+	s.mu.Lock()
+	auth := s.authorizations[slug]
+	switch {
+	case auth == nil:
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "not_found", "No such authorization.", nil)
+		return
+	case auth.spent:
+		s.mu.Unlock()
+		writeError(w, http.StatusGone, "spent",
+			"This authorization's key has already been collected, and no copy was kept.", nil)
+		return
+	case s.authorizationExpired(auth):
+		s.mu.Unlock()
+		writeError(w, http.StatusGone, "expired", "This authorization has expired.", nil)
+		return
+	}
+
+	body := map[string]any{
+		"slug":       auth.slug,
+		"state":      auth.state,
+		"expires_at": auth.createdAt.Add(cliAuthorizationLifetime).UTC().Format(time.RFC3339),
+	}
+	delivering := auth.state == authorizationApproved
+	token := auth.token
+	if delivering {
+		body["token"], body["key_id"], body["workspace"] = auth.token, auth.keyID, auth.workspace
+		auth.token, auth.spent = "", true
+	}
+	s.mu.Unlock()
+
+	if err := encodeJSON(w, http.StatusOK, body); err != nil && delivering {
+		// Nothing else can have taken it in the meantime — it was removed under the
+		// lock, and this is the only path that hands it out.
+		s.mu.Lock()
+		auth.token, auth.spent = token, false
+		s.mu.Unlock()
+	}
+}
+
+// cliAuthorizationPage is where a person confirms the code. A code matching no
+// login still waiting is refused outright rather than shown with buttons that
+// would answer 404 once pressed.
+//
+// What it renders is the code on file, not the one the query string carried, and
+// it is read out inside the lock: everything the page needs is copied while the
+// record is held, so nothing here touches a struct another request may be
+// deciding on.
+func (s *store) cliAuthorizationPage(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	auth := s.findAuthorizationByCode(r.URL.Query().Get("code"))
+	pending := auth != nil && auth.state == authorizationPending && !s.authorizationExpired(auth)
+	code := ""
+	if pending {
+		code = auth.code
+	}
+	s.mu.Unlock()
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if !pending {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, page("No such login",
+			nil, "<p>No login is waiting on that code.</p>"))
+		return
+	}
+
+	safe := url.PathEscape(code)
+	_, _ = io.WriteString(w, page("Approve this login", nil,
+		"<p>A terminal asked to sign in. Approve it only if this code is the one it printed.</p>\n"+
+			"<p><strong>"+html.EscapeString(code)+"</strong></p>\n"+
+			`<form method="post" action="/_approve/cli/authorizations/`+safe+
+			`/approval"><button type="submit">Approve</button></form>`+"\n"+
+			`<form method="post" action="/_approve/cli/authorizations/`+safe+
+			`/denial"><button type="submit">Deny</button></form>`))
+}
+
+// decideCLIAuthorization is what the two buttons post to, and what a test presses
+// instead of a person. Approving is what mints the key — the code's whole
+// authority, and it stops there: nothing about this response carries the key, so
+// knowing a code never yields one.
+//
+// The key is derived from its own token exactly as `GET /v1/key` derives one, so a
+// login here and an `auth verify` afterwards agree about which key this is and
+// which workspace it acts in.
+func (s *store) decideCLIAuthorization(w http.ResponseWriter, r *http.Request, approve bool) {
+	code := r.PathValue("code")
+
+	s.mu.Lock()
+	auth := s.findAuthorizationByCode(code)
+	switch {
+	case auth == nil:
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, "not_found", "No such authorization.", nil)
+		return
+	case s.authorizationExpired(auth):
+		s.mu.Unlock()
+		writeError(w, http.StatusGone, "expired", "This authorization has expired.", nil)
+		return
+	case auth.state != authorizationPending:
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "already_decided",
+			"This authorization was already answered.", nil)
+		return
+	}
+
+	decision := "denied"
+	if approve {
+		auth.state = authorizationApproved
+		auth.token = "krowk_sk_" + randomToken()[:32]
+		auth.keyID = "key_" + sha256Hex([]byte(auth.token))[:8]
+		auth.workspace = workspaceFor(auth.token)
+		decision = "approved"
+	} else {
+		auth.state = authorizationDenied
+	}
+	s.mu.Unlock()
+
+	// HTML because a browser is what posted it, and the person doing the posting is
+	// looking at the result. The key is not in here and never will be: it goes to
+	// whoever holds the slug.
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(w, page("Login "+decision, nil,
+		"<p>Login "+decision+". Back to your terminal.</p>"))
+}
+
+// The states an authorization reports. Spent and expired are not among them: both
+// are gone, and gone is a 410 rather than a body.
+const (
+	authorizationPending  = "pending"
+	authorizationApproved = "approved"
+	authorizationDenied   = "denied"
+)
+
+// authorizationExpired reports whether the window has closed. Caller holds the
+// lock — the clock is the store's, and every caller is already inside it.
+func (s *store) authorizationExpired(a *authorization) bool {
+	return s.now().After(a.createdAt.Add(cliAuthorizationLifetime))
+}
+
+// sweepAuthorizations drops what has been lapsed long enough that nobody is still
+// asking about it. The real registry sweeps on a schedule; here it runs when a
+// login is opened, which is the only moment this map can grow — otherwise a
+// `registry serve` left up all week accumulates every login it ever answered, and
+// the lookup by code walks all of them.
+//
+// The grace period is what keeps `410 expired` meaningful. Reaping at the window's
+// edge would have a client that polled a second too late get `404 no such
+// authorization`, which is a different thing to be told: one says the window
+// closed, the other says nothing was ever there. Caller holds the lock.
+func (s *store) sweepAuthorizations() {
+	// One instant for the whole sweep. Read inside the loop it would judge each
+	// record against a slightly different now, which is not what one decision means.
+	at := s.now()
+	for slug, auth := range s.authorizations {
+		if at.After(auth.createdAt.Add(cliAuthorizationLifetime + cliAuthorizationGrace)) {
+			delete(s.authorizations, slug)
+		}
+	}
+}
+
+// findAuthorizationByCode is the lookup the approval page needs, and the only
+// place a code resolves to a record. Caller holds the lock. An empty code matches
+// nothing, so a page asked for without one refuses rather than picking a login at
+// random.
+func (s *store) findAuthorizationByCode(code string) *authorization {
+	if code == "" {
+		return nil
+	}
+	for _, auth := range s.authorizations {
+		if auth.code == code {
+			return auth
+		}
+	}
+	return nil
+}
+
+// freeCode mints a code no live authorization is already using, since two logins
+// sharing one would have a person approving whichever was found first. Caller
+// holds the lock.
+func (s *store) freeCode() string {
+	for {
+		if code := generateCode(); s.findAuthorizationByCode(code) == nil {
+			return code
+		}
+	}
+}
+
+// codeAlphabet leaves out 0/O and 1/I. A code is read off a screen and typed
+// somewhere else, or read out loud, and those are the two pairs that get
+// confused. 32 characters also divides 256, so picking one per random byte is
+// unbiased.
+const codeAlphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+
+// generateCode is two groups of four, hyphenated: short enough to compare at a
+// glance, and 32^8 — over a trillion — is far more than a quarter-hour window
+// leaves room to guess at.
+func generateCode() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		panic(err) // a stand-in with no randomness cannot issue codes
+	}
+	for i, v := range b {
+		b[i] = codeAlphabet[int(v)%len(codeAlphabet)]
+	}
+	return string(b[:4]) + "-" + string(b[4:])
+}
+
 func (s *store) expired(a *artifact) bool {
 	iso, ok := a.ExpiresAt.(string)
 	if !ok {
@@ -1746,11 +2088,18 @@ func writeError(w http.ResponseWriter, status int, code, message string, details
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
+	_ = encodeJSON(w, status, body)
+}
+
+// encodeJSON is writeJSON for the one caller that has to know whether the bytes
+// went out: handing over a one-shot key is only a delivery if the response
+// actually left.
+func encodeJSON(w http.ResponseWriter, status int, body any) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(body)
+	return enc.Encode(body)
 }
 
 // writeXMLError is object storage's error shape, not the registry's.

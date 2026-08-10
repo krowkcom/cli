@@ -775,7 +775,7 @@ func authLoginWithToken(w io.Writer, f flags, format output.Format, env runctx.E
 		return api.Fail("credentials_unwritable", "could not write "+api.CredentialsPath()+": "+err.Error())
 	}
 
-	result := &output.Login{Path: path, Confirmed: verifyErr == nil}
+	result := &output.Login{Path: path, Confirmed: verifyErr == nil, Shadowed: env("KROWK_TOKEN") != ""}
 	if verifyErr != nil {
 		result.Reason = unconfirmedReason(verifyErr)
 	} else {
@@ -839,9 +839,18 @@ func authLoginInBrowser(stdout, stderr io.Writer, f flags, format output.Format,
 	// stderr, not stdout: the code and the page are what a person needs *during*
 	// the command, while stdout stays the single document a program parses. On a
 	// terminal both arrive in the same place regardless.
-	fmt.Fprint(stderr, output.Authorizing(auth.Code, page, opened, colour))
+	fmt.Fprint(stderr, output.Authorizing(
+		output.Authorization{Code: auth.Code, Page: page, Opened: opened}, format, colour))
 
-	granted, err := awaitAuthorization(ctx, client, auth, time.Now, time.Sleep)
+	// The window bounds the whole wait, so it bounds the context too. Without that
+	// it only bounds the gaps *between* polls: one call can spend three attempts
+	// against a five-minute client timeout with a Retry-After between them, which
+	// is longer than the window it is supposed to be inside.
+	deadline := authorizationDeadline(auth.ExpiresAt, time.Now())
+	ctx, stop := context.WithDeadline(ctx, deadline)
+	defer stop()
+
+	granted, err := awaitAuthorization(ctx, client, auth, deadline, time.Now, time.Sleep)
 	if err != nil {
 		return err
 	}
@@ -850,7 +859,13 @@ func authLoginInBrowser(stdout, stderr io.Writer, f flags, format output.Format,
 		KeyID: granted.KeyID, Workspace: granted.Workspace,
 	})
 	if err != nil {
-		return api.Fail("credentials_unwritable", "could not write "+api.CredentialsPath()+": "+err.Error())
+		// Worse news than the same failure on the --token path, and it has to say
+		// so. There the key is still in the paste buffer; here it was minted for
+		// this one delivery and the registry kept no copy, so a key that cannot be
+		// written down is a key that is gone.
+		return api.Fail("credentials_unwritable", "could not write "+api.CredentialsPath()+": "+
+			err.Error()+" — the approved key was handed over once and the registry keeps no copy, "+
+			"so fix the path and run `krowk auth login` again for a new one")
 	}
 
 	// Confirmed with no round trip of its own. The key came from the registry
@@ -859,6 +874,7 @@ func authLoginInBrowser(stdout, stderr io.Writer, f flags, format output.Format,
 	// already say.
 	fmt.Fprintln(stdout, output.StoredKey(&output.Login{
 		Path: path, Confirmed: true, KeyID: granted.KeyID, Workspace: granted.Workspace,
+		Shadowed: env("KROWK_TOKEN") != "",
 	}, format, f.quiet, colour))
 	return nil
 }
@@ -892,12 +908,19 @@ func noBrowserLoginHere(err error) error {
 // The clock and the sleep are arguments so a test can exercise a window that
 // takes a quarter of an hour to close in the real one.
 func awaitAuthorization(ctx context.Context, client *api.Client, auth *api.CLIAuthorization,
-	now func() time.Time, sleep func(time.Duration)) (*api.CLIAuthorization, error) {
-	deadline := authorizationDeadline(auth.ExpiresAt, now())
+	deadline time.Time, now func() time.Time, sleep func(time.Duration)) (*api.CLIAuthorization, error) {
 	interval := pollInterval(auth.Interval)
+	// The last failure worth waiting through, kept rather than dropped: a window
+	// that closes having never once reached the registry is a registry that could
+	// not be reached, and reporting it as nobody having approved would blame a
+	// person for a question krowk never managed to ask.
+	var unanswered error
 
 	for {
 		if err := ctx.Err(); err != nil {
+			if unanswered != nil {
+				return nil, unanswered
+			}
 			return nil, api.Fail("cancelled", err.Error())
 		}
 
@@ -907,6 +930,7 @@ func awaitAuthorization(ctx context.Context, client *api.Client, auth *api.CLIAu
 			if !worthAnotherPoll(err) {
 				return nil, loginFix(err)
 			}
+			unanswered = err
 		case granted.State == api.AuthorizationApproved:
 			// Approved with nothing to store is the registry's side of the contract
 			// broken, and storing an empty token would leave the machine looking
@@ -920,12 +944,18 @@ func awaitAuthorization(ctx context.Context, client *api.Client, auth *api.CLIAu
 		case granted.State == api.AuthorizationDenied:
 			return nil, api.Fail("authorization_denied",
 				"this login was denied in the browser — run `krowk auth login` to ask again")
+		default:
+			// Anything else is pending, including a state this build has no word for:
+			// a newer registry inventing one is not grounds for abandoning a login
+			// that is still inside its window. The registry answered, so whatever
+			// went wrong earlier is no longer what is holding this up.
+			unanswered = nil
 		}
-		// Anything else is pending, including a state this build has no word for: a
-		// newer registry inventing one is not grounds for abandoning a login that is
-		// still inside its window.
 
 		if !now().Before(deadline) {
+			if unanswered != nil {
+				return nil, unanswered
+			}
 			return nil, api.Fail("authorization_expired",
 				"nobody approved this login before it lapsed — run `krowk auth login` to ask again")
 		}

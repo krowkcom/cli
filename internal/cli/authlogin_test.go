@@ -257,7 +257,9 @@ func browserLogin(t *testing.T, h *harness, button string, args ...string) (exit
 	var out bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
-		done <- Run(append([]string{"auth", "login"}, args...), &out, shown,
+		// --no-browser always: a test must never reach for the desktop's URL
+		// handler, and on macOS and Windows nothing else here would stop it.
+		done <- Run(append([]string{"auth", "login", "--no-browser"}, args...), &out, shown,
 			func(k string) string { return h.env[k] }, false)
 	}()
 
@@ -320,14 +322,44 @@ func TestAuthLoginInTheBrowserStoresTheKeyTheApprovalMinted(t *testing.T) {
 	if !strings.Contains(stdout, workspace) {
 		t.Errorf("login output does not say where uploads land:\n%s", stdout)
 	}
-	if !strings.Contains(stderr, "waiting for approval") {
-		t.Errorf("nothing told the person what the command was doing:\n%s", stderr)
+	// The harness is not a terminal, so this is the machine notice; the prose one
+	// is TestAuthLoginInTheBrowserTellsAPersonWhatToDo below.
+	if !codeShown.MatchString(stderr) {
+		t.Errorf("nothing told the caller what it was waiting on:\n%s", stderr)
+	}
+	// Nothing in the environment outranks what was just written, so the receipt is
+	// about the key that will really be used.
+	if strings.Contains(stdout, "KROWK_TOKEN") {
+		t.Errorf("the receipt hedges about a variable that is not set:\n%s", stdout)
+	}
+}
+
+// KROWK_TOKEN wins over the credentials file, so a login that writes one while it
+// is set has just stored a key nothing will use. The receipt is a receipt for
+// where uploads land, and it may not name a workspace they will not land in.
+func TestAuthLoginSaysWhenTheEnvironmentOutranksWhatItStored(t *testing.T) {
+	h, path := loginHarness(t)
+	h.env["KROWK_TOKEN"] = "krowk_sk_from_ci"
+
+	exit, stdout, stderr := browserLogin(t, h, "approval")
+	if exit != 0 {
+		t.Fatalf("exit %d, stderr:\n%s", exit, stderr)
+	}
+	// It still stores it — unsetting the variable is the caller's to do, and a
+	// login that refused to write would leave nothing behind when they did.
+	if c := stored(t, path); c["key_id"] == nil {
+		t.Errorf("nothing was stored: %v", c)
+	}
+	if !strings.Contains(stdout, "KROWK_TOKEN") {
+		t.Errorf("the receipt names a workspace uploads will not land in:\n%s", stdout)
 	}
 }
 
 // What a person needs while the command waits goes to stderr, so stdout stays the
 // single document a program parses. An agent doing this reads one stream to hand
-// its human a code and parses the other for the result.
+// its human a code and parses the other for the result — and in a machine format
+// the notice is a document too, so nothing on either stream is prose it has to
+// scrape.
 func TestAuthLoginInTheBrowserKeepsStdoutParseable(t *testing.T) {
 	h, _ := loginHarness(t)
 
@@ -349,11 +381,83 @@ func TestAuthLoginInTheBrowserKeepsStdoutParseable(t *testing.T) {
 	if e.Data.KeyID == "" || !strings.HasPrefix(e.Data.Workspace, "ws_") {
 		t.Errorf("login named no key or workspace: %+v", e.Data)
 	}
-	if !codeShown.MatchString(stderr) {
-		t.Errorf("the code never reached the person:\n%s", stderr)
+
+	var notice struct {
+		Authorizing *output.Authorization `json:"authorizing"`
+		// An envelope's verdict, which this must not carry: an agent reading ok:true
+		// off a login that has not happened yet would take it for one that has.
+		OK *bool `json:"ok"`
 	}
-	if !strings.Contains(stderr, "/_approve/cli/authorizations/new") {
-		t.Errorf("the page to approve it on never reached the person:\n%s", stderr)
+	if err := json.Unmarshal([]byte(stderr), &notice); err != nil {
+		t.Fatalf("the notice on stderr is not one JSON document: %v\n%s", err, stderr)
+	}
+	if notice.Authorizing == nil {
+		t.Fatalf("stderr named no authorization to approve:\n%s", stderr)
+	}
+	if notice.OK != nil {
+		t.Errorf("the notice carries a verdict on a login that has not happened:\n%s", stderr)
+	}
+	if !codeShown.MatchString(notice.Authorizing.Code) {
+		t.Errorf("code = %q, want the one to confirm", notice.Authorizing.Code)
+	}
+	if !strings.Contains(notice.Authorizing.Page, "/_approve/cli/authorizations/new") {
+		t.Errorf("page = %q, want the one to approve it on", notice.Authorizing.Page)
+	}
+	if notice.Authorizing.Opened {
+		t.Error("opened = true with --no-browser")
+	}
+}
+
+// On a terminal the notice is prose, because the reader is a person comparing a
+// code against a page rather than a program branching on anything.
+func TestAuthLoginInTheBrowserTellsAPersonWhatToDo(t *testing.T) {
+	h, _ := loginHarness(t)
+
+	exit, _, stderr := browserLogin(t, h, "approval", "--format", "human")
+	if exit != 0 {
+		t.Fatalf("exit %d, stderr:\n%s", exit, stderr)
+	}
+	for _, want := range []string{"Open this page", "waiting for approval", "code", "page"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the notice is missing %q:\n%s", want, stderr)
+		}
+	}
+	// --no-browser was passed, so nothing may claim a browser is opening.
+	if strings.Contains(stderr, "browser is opening") {
+		t.Errorf("--no-browser still claimed to open one:\n%s", stderr)
+	}
+}
+
+// A login that fails has something on stderr ahead of the error, because the
+// command had to speak before it knew its outcome. So the rule for that stream is
+// that the *last* document is the verdict, and it has to be a whole envelope
+// rather than prose the error is stuck to.
+func TestAuthLoginInTheBrowserLeavesTheErrorLastOnStderr(t *testing.T) {
+	h, _ := loginHarness(t)
+
+	exit, _, stderr := browserLogin(t, h, "denial", "--json")
+	if exit == 0 {
+		t.Fatal("a denied login succeeded")
+	}
+
+	documents := json.NewDecoder(strings.NewReader(stderr))
+	var last map[string]any
+	for {
+		var doc map[string]any
+		if err := documents.Decode(&doc); err != nil {
+			break
+		}
+		last = doc
+	}
+	if last == nil {
+		t.Fatalf("stderr holds no JSON document at all:\n%s", stderr)
+	}
+	if last["ok"] != false {
+		t.Fatalf("the last document on stderr is not the verdict:\n%s", stderr)
+	}
+	failure, _ := last["error"].(map[string]any)
+	if failure["error"] != "authorization_denied" {
+		t.Errorf("error = %v, want authorization_denied", failure["error"])
 	}
 }
 
@@ -513,7 +617,8 @@ func TestAwaitingApprovalWaitsThroughFailuresThatAreNotAnswers(t *testing.T) {
 	waits := 0
 
 	granted, err := awaitAuthorization(context.Background(), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, time.Now, func(time.Duration) { waits++ })
+		&api.CLIAuthorization{Slug: "aut_x"}, time.Now().Add(time.Hour),
+		time.Now, func(time.Duration) { waits++ })
 	if err != nil {
 		t.Fatalf("a login that was approved after a bad patch failed: %v", err)
 	}
@@ -542,7 +647,8 @@ func TestAwaitingApprovalStopsWhenTheLoginIsGone(t *testing.T) {
 	client.Sleep = func(time.Duration) {}
 
 	_, err := awaitAuthorization(context.Background(), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, time.Now, func(time.Duration) {
+		&api.CLIAuthorization{Slug: "aut_x"}, time.Now().Add(time.Hour),
+		time.Now, func(time.Duration) {
 			t.Error("waited to ask again about a login the registry said was gone")
 		})
 	var apiErr *api.Error
@@ -580,15 +686,83 @@ func TestAwaitingApprovalGivesUpWhenTheWindowCloses(t *testing.T) {
 	client := api.New(srv.URL+"/v1", "")
 	client.Sleep = func(time.Duration) {}
 
-	_, err := awaitAuthorization(context.Background(), client, &api.CLIAuthorization{
-		Slug: "aut_x", ExpiresAt: start.Add(time.Minute).UTC().Format(time.RFC3339),
-	}, clock, func(time.Duration) {})
+	_, err := awaitAuthorization(context.Background(), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, start.Add(time.Minute), clock, func(time.Duration) {})
 	if err == nil || err.Error() != "authorization_expired" {
 		t.Fatalf("err = %v, want authorization_expired", err)
 	}
 	if exitCodeFor(err) != exitGone {
 		t.Errorf("exit = %d, want %d — deciding it locally must not classify differently "+
 			"than being told", exitCodeFor(err), exitGone)
+	}
+}
+
+// A window that closes having never once reached the registry is a registry that
+// could not be reached — not a person who ignored it. Blaming the person would be
+// wrong twice over: exit 8 says no retry will help, when retrying is the entire
+// fix.
+func TestAwaitingApprovalBlamesTheRegistryWhenItNeverAnswered(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, `{"error":{"code":"unexpected_error","message":"bad gateway"}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	start := time.Now()
+	ticks := 0
+	clock := func() time.Time {
+		defer func() { ticks++ }()
+		return start.Add(time.Duration(ticks) * 40 * time.Second)
+	}
+
+	client := api.New(srv.URL+"/v1", "")
+	client.Sleep = func(time.Duration) {}
+
+	_, err := awaitAuthorization(context.Background(), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, start.Add(time.Minute), clock, func(time.Duration) {})
+	if err == nil {
+		t.Fatal("a window spent entirely against a broken registry succeeded")
+	}
+	if err.Error() == "authorization_expired" {
+		t.Fatalf("err = %v, which blames a person for a question krowk never got to ask", err)
+	}
+	if got := exitCodeFor(err); got != exitServer {
+		t.Errorf("exit = %d, want %d — the registry failed on its side, and retrying is the fix",
+			got, exitServer)
+	}
+}
+
+// And the other way round: a registry that answered, however badly at first, and
+// then went on saying pending until the window closed, really is a login nobody
+// approved.
+func TestAwaitingApprovalStillBlamesNobodyApprovingAfterTheRegistryRecovers(t *testing.T) {
+	var polls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if polls.Add(1) <= 3 {
+			w.WriteHeader(http.StatusBadGateway)
+			fmt.Fprint(w, `{"error":{"code":"unexpected_error","message":"bad gateway"}}`)
+			return
+		}
+		fmt.Fprint(w, `{"slug":"aut_x","state":"pending"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	start := time.Now()
+	ticks := 0
+	clock := func() time.Time {
+		defer func() { ticks++ }()
+		return start.Add(time.Duration(ticks) * 25 * time.Second)
+	}
+
+	client := api.New(srv.URL+"/v1", "")
+	client.Sleep = func(time.Duration) {}
+
+	_, err := awaitAuthorization(context.Background(), client,
+		&api.CLIAuthorization{Slug: "aut_x"}, start.Add(time.Minute), clock, func(time.Duration) {})
+	if err == nil || err.Error() != "authorization_expired" {
+		t.Fatalf("err = %v, want authorization_expired — the registry did answer in the end", err)
 	}
 }
 

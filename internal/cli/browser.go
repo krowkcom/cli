@@ -40,7 +40,7 @@ func browsableURL(raw, apiBaseURL string) (string, error) {
 				"check KROWK_API_URL points at the API host, not the website")
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
+	if err != nil {
 		// The URL itself is deliberately not quoted back: it came from a response
 		// body, and a failure message is the last place to echo an arbitrary string
 		// of someone else's choosing at a terminal.
@@ -48,6 +48,12 @@ func browsableURL(raw, apiBaseURL string) (string, error) {
 			"the registry named a page for this login that is not a URL — "+
 				"check KROWK_API_URL points at the API host, not the website")
 	}
+
+	// The scheme is judged before anything else, because the schemes this exists to
+	// refuse are the ones with no host to check: `javascript:` and `data:` parse as
+	// opaque, so a missing-host test would reach them first and report a
+	// malformed response — sending someone to check a base URL that was right,
+	// about the one case that was actually an attempt at something.
 	switch u.Scheme {
 	case "https":
 	case "http":
@@ -62,6 +68,11 @@ func browsableURL(raw, apiBaseURL string) (string, error) {
 		return "", api.Fail("refused_verification_url",
 			"the registry named a "+u.Scheme+": page for this login, and krowk only opens http and https")
 	}
+	if u.Host == "" {
+		return "", api.Fail("malformed_response",
+			"the registry named a page for this login with no host — "+
+				"check KROWK_API_URL points at the API host, not the website")
+	}
 	return u.String(), nil
 }
 
@@ -75,19 +86,25 @@ func insecureRegistry(baseURL string) bool {
 
 // headless reports whether there is no browser here worth opening.
 //
-// Two answers, and they are different questions. A session reached over SSH has
+// Three answers, and they are different questions. A session reached over SSH has
 // a browser at the other end of the connection rather than on the machine
 // running krowk, so opening one locally either fails or — worse, on a shared
-// box — opens a window somebody else is looking at. A unix session with no
-// display server has nowhere to draw at all, which is a container and is the
-// case this whole flow exists for; macOS and Windows have no such variable, and
-// a graphical session there is the default rather than something to detect.
+// box — opens a window somebody else is looking at. A build on CI has nobody
+// sitting in front of it on any platform, which is the one case where the answer
+// cannot be read off a display variable: a macOS runner has no DISPLAY to be
+// missing and would happily shell out to `open` on a machine with no screen. A
+// unix session with no display server has nowhere to draw at all, which is a
+// container and is the case this whole flow exists for.
 //
-// It is a default, not a verdict: --no-browser forces this behaviour, and
-// nothing forces the opposite because a browser that cannot open is not worth
-// insisting on. The code and the URL are printed either way.
+// It is a default, not a verdict: --no-browser forces this behaviour, and nothing
+// forces the opposite, because a browser that cannot open is not worth insisting
+// on. The code and the page are printed either way, so the answer only ever
+// decides whether a window is *also* asked for.
 func headless(env runctx.Env) bool {
 	if env("SSH_CONNECTION") != "" || env("SSH_CLIENT") != "" || env("SSH_TTY") != "" {
+		return true
+	}
+	if api.Truthy(env("CI")) || env("GITHUB_ACTIONS") != "" {
 		return true
 	}
 	switch runtime.GOOS {

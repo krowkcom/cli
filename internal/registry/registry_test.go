@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1524,5 +1525,90 @@ func TestApprovalCodesAvoidConfusableCharacters(t *testing.T) {
 	}
 	if strings.ContainsAny(codeAlphabet, "01OI") {
 		t.Errorf("the code alphabet %q keeps a confusable character", codeAlphabet)
+	}
+}
+
+// A key that was collected and then sat past its window was still collected. The
+// CLI's advice differs between the two — "this lapsed before it was approved" is a
+// lie about a key that is on somebody's disk — so spent has to outrank expiry.
+func TestASpentBrowserLoginKeepsSayingSpentAfterItLapses(t *testing.T) {
+	server, c := newClockedServer(t)
+	slug, code := openLogin(t, server)
+
+	if status, body := decide(t, server, code, "approval"); status != http.StatusOK {
+		t.Fatalf("approving answered %d: %s", status, body)
+	}
+	if _, granted := pollLogin(t, server, slug); granted["token"] == nil {
+		t.Fatalf("the key was never collected: %v", granted)
+	}
+
+	c.advance(cliAuthorizationLifetime + time.Second)
+
+	status, gone := pollLogin(t, server, slug)
+	if status != http.StatusGone || errorCode(gone) != "spent" {
+		t.Fatalf("a collected login that then lapsed is %d %v, want 410 spent", status, gone)
+	}
+}
+
+// One-shot means delivered once, not destroyed once. If the response never leaves,
+// nobody received the key — and the laptop-wifi case the CLI's poll loop is
+// written to survive must not be the case that makes a login unrecoverable.
+func TestABrowserLoginKeepsItsKeyWhenTheResponseNeverLands(t *testing.T) {
+	c := &clock{at: time.Now()}
+	handler := HandlerWithClock(0, "", c.now)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	slug, code := openLogin(t, server)
+	if status, body := decide(t, server, code, "approval"); status != http.StatusOK {
+		t.Fatalf("approving answered %d: %s", status, body)
+	}
+
+	// A writer that refuses the body is the one seam that stands in for a
+	// connection dropping between the status line and the payload.
+	handler.ServeHTTP(brokenWriter{header: http.Header{}}, httptest.NewRequest(
+		http.MethodGet, "/v1/cli/authorizations/"+url.PathEscape(slug), nil))
+
+	status, granted := pollLogin(t, server, slug)
+	token, _ := granted["token"].(string)
+	if status != http.StatusOK || !strings.HasPrefix(token, "krowk_sk_") {
+		t.Fatalf("the poll after a lost response is %d %v, want the key still collectable", status, granted)
+	}
+	// And it is one-shot again from there.
+	if status, spent := pollLogin(t, server, slug); status != http.StatusGone || errorCode(spent) != "spent" {
+		t.Fatalf("the poll after a delivered one is %d %v, want 410 spent", status, spent)
+	}
+}
+
+// brokenWriter accepts the status and refuses the body, which is what a dropped
+// connection looks like to a handler.
+type brokenWriter struct{ header http.Header }
+
+func (b brokenWriter) Header() http.Header       { return b.header }
+func (b brokenWriter) WriteHeader(int)           {}
+func (b brokenWriter) Write([]byte) (int, error) { return 0, errors.New("connection reset") }
+
+// Lapsed logins are swept, or a `registry serve` left up all week accumulates
+// every login it ever answered. The grace period is what keeps `410 expired`
+// meaningful: reaped at the window's edge, a client that polled a second late
+// would be told no such login rather than that the window closed.
+func TestLapsedBrowserLoginsAreSweptButNotImmediately(t *testing.T) {
+	server, c := newClockedServer(t)
+	justLapsed, _ := openLogin(t, server)
+
+	c.advance(cliAuthorizationLifetime + time.Minute)
+	// Opening another is what sweeps, since it is the only moment the set grows.
+	openLogin(t, server)
+
+	if status, body := pollLogin(t, server, justLapsed); status != http.StatusGone ||
+		errorCode(body) != "expired" {
+		t.Errorf("a login inside the grace period is %d %v, want 410 expired", status, body)
+	}
+
+	c.advance(cliAuthorizationGrace)
+	openLogin(t, server)
+
+	if status, body := pollLogin(t, server, justLapsed); status != http.StatusNotFound {
+		t.Errorf("a login past the grace period is %d %v, want it swept", status, body)
 	}
 }

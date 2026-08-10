@@ -54,6 +54,11 @@ const (
 	// approvable after lunch.
 	cliAuthorizationLifetime = 15 * time.Minute
 
+	// How long a lapsed login is kept before it is swept, so that a client polling
+	// just after the window still learns the window closed rather than that no such
+	// login exists.
+	cliAuthorizationGrace = time.Hour
+
 	// How often this stand-in asks to be polled, in seconds. One rather than the
 	// real five, because everything here is on loopback and a developer watching
 	// the flow by hand should not spend most of it waiting.
@@ -1565,6 +1570,7 @@ func writeUnauthorized(w http.ResponseWriter) {
 // here.
 func (s *store) createCLIAuthorization(w http.ResponseWriter, site string) {
 	s.mu.Lock()
+	s.sweepAuthorizations()
 	auth := &authorization{
 		slug:      generateSlug("aut"),
 		code:      s.freeCode(),
@@ -1591,29 +1597,36 @@ func (s *store) createCLIAuthorization(w http.ResponseWriter, site string) {
 // showCLIAuthorization is the CLI's poll, and the only way the key is ever handed
 // over. It hands it over once.
 //
-// Expiry is checked before the state, so an approval that landed a moment too
-// late reads as lapsed rather than as a key — the window is the window. Spent is
-// checked before it too, because a client that somehow asks twice deserves to be
-// told which of the two happened.
+// Spent is checked before expiry, because a client asking twice deserves to be
+// told which of the two happened: a key that was collected and then sat past its
+// window was still collected, and "this lapsed before it was approved" would be a
+// lie about a key that is on somebody's disk. Expiry is checked before the state,
+// so an approval that landed a moment too late reads as lapsed rather than as a
+// key — the window is the window.
+//
+// Delivery is one-shot, and the token is taken out under the lock so that two
+// polls arriving together cannot both be handed it. It goes back only if the
+// response never made it out: a key nobody received is not a key that was
+// collected, and losing a login to a dropped connection is a worse answer than
+// this is complicated.
 func (s *store) showCLIAuthorization(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
 	s.mu.Lock()
 	auth := s.authorizations[slug]
-	if auth == nil {
+	switch {
+	case auth == nil:
 		s.mu.Unlock()
 		writeError(w, http.StatusNotFound, "not_found", "No such authorization.", nil)
 		return
-	}
-	if s.authorizationExpired(auth) {
-		s.mu.Unlock()
-		writeError(w, http.StatusGone, "expired", "This authorization has expired.", nil)
-		return
-	}
-	if auth.spent {
+	case auth.spent:
 		s.mu.Unlock()
 		writeError(w, http.StatusGone, "spent",
 			"This authorization's key has already been collected, and no copy was kept.", nil)
+		return
+	case s.authorizationExpired(auth):
+		s.mu.Unlock()
+		writeError(w, http.StatusGone, "expired", "This authorization has expired.", nil)
 		return
 	}
 
@@ -1622,15 +1635,21 @@ func (s *store) showCLIAuthorization(w http.ResponseWriter, r *http.Request) {
 		"state":      auth.state,
 		"expires_at": auth.createdAt.Add(cliAuthorizationLifetime).UTC().Format(time.RFC3339),
 	}
-	if auth.state == authorizationApproved {
+	delivering := auth.state == authorizationApproved
+	token := auth.token
+	if delivering {
 		body["token"], body["key_id"], body["workspace"] = auth.token, auth.keyID, auth.workspace
-		// The plaintext leaves with this response and the record keeps none, so the
-		// next poll has nothing to answer with but a 410.
 		auth.token, auth.spent = "", true
 	}
 	s.mu.Unlock()
 
-	writeJSON(w, http.StatusOK, body)
+	if err := encodeJSON(w, http.StatusOK, body); err != nil && delivering {
+		// Nothing else can have taken it in the meantime — it was removed under the
+		// lock, and this is the only path that hands it out.
+		s.mu.Lock()
+		auth.token, auth.spent = token, false
+		s.mu.Unlock()
+	}
 }
 
 // cliAuthorizationPage is where a person confirms the code. A code matching no
@@ -1730,6 +1749,24 @@ const (
 // lock — the clock is the store's, and every caller is already inside it.
 func (s *store) authorizationExpired(a *authorization) bool {
 	return s.now().After(a.createdAt.Add(cliAuthorizationLifetime))
+}
+
+// sweepAuthorizations drops what has been lapsed long enough that nobody is still
+// asking about it. The real registry sweeps on a schedule; here it runs when a
+// login is opened, which is the only moment this map can grow — otherwise a
+// `registry serve` left up all week accumulates every login it ever answered, and
+// the lookup by code walks all of them.
+//
+// The grace period is what keeps `410 expired` meaningful. Reaping at the window's
+// edge would have a client that polled a second too late get `404 no such
+// authorization`, which is a different thing to be told: one says the window
+// closed, the other says nothing was ever there. Caller holds the lock.
+func (s *store) sweepAuthorizations() {
+	for slug, auth := range s.authorizations {
+		if s.now().After(auth.createdAt.Add(cliAuthorizationLifetime + cliAuthorizationGrace)) {
+			delete(s.authorizations, slug)
+		}
+	}
 }
 
 // findAuthorizationByCode is the lookup the approval page needs, and the only
@@ -2031,11 +2068,18 @@ func writeError(w http.ResponseWriter, status int, code, message string, details
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
+	_ = encodeJSON(w, status, body)
+}
+
+// encodeJSON is writeJSON for the one caller that has to know whether the bytes
+// went out: handing over a one-shot key is only a delivery if the response
+// actually left.
+func encodeJSON(w http.ResponseWriter, status int, body any) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(body)
+	return enc.Encode(body)
 }
 
 // writeXMLError is object storage's error shape, not the registry's.

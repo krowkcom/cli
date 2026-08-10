@@ -163,6 +163,20 @@ func (t *proxyStamp) RoundTrip(req *http.Request) (*http.Response, error) {
 // metadata — are only available to a keyed client.
 func (c *Client) Authenticated() bool { return c.Token != "" }
 
+// Insecure reports whether this registry is reached over plaintext http, which is
+// something the caller chose: a local registry, or a self-hosted one inside a
+// private network.
+//
+// It lives here rather than wherever the question gets asked, because every other
+// judgement about the base URL — whether it is local, whether a redirect stayed on
+// its origin, which schemes a storage host may use — is made here too, against
+// this same field. A second parse somewhere else is a second home for the same
+// policy.
+func (c *Client) Insecure() bool {
+	u, err := url.Parse(c.BaseURL)
+	return err == nil && u.Scheme == "http"
+}
+
 // Upload is where the bytes go, signed for one specific body.
 type Upload struct {
 	Method    string            `json:"method"`

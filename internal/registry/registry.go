@@ -1779,8 +1779,11 @@ func (s *store) authorizationExpired(a *authorization) bool {
 // authorization`, which is a different thing to be told: one says the window
 // closed, the other says nothing was ever there. Caller holds the lock.
 func (s *store) sweepAuthorizations() {
+	// One instant for the whole sweep. Read inside the loop it would judge each
+	// record against a slightly different now, which is not what one decision means.
+	at := s.now()
 	for slug, auth := range s.authorizations {
-		if s.now().After(auth.createdAt.Add(cliAuthorizationLifetime + cliAuthorizationGrace)) {
+		if at.After(auth.createdAt.Add(cliAuthorizationLifetime + cliAuthorizationGrace)) {
 			delete(s.authorizations, slug)
 		}
 	}

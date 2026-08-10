@@ -210,6 +210,15 @@ func TestAuthLoginReportsBeingUnconfirmedInJSON(t *testing.T) {
 	}
 }
 
+// pollClock is a clock the poll loop moves itself: it advances when the loop
+// sleeps and not when it reads the time. Reading the time must not make it pass,
+// or a test's arithmetic depends on how many times the code under test happens to
+// look at its watch.
+type pollClock struct{ at time.Time }
+
+func (c *pollClock) now() time.Time        { return c.at }
+func (c *pollClock) sleep(d time.Duration) { c.at = c.at.Add(d) }
+
 // windowOf is the authorization window a poll loop runs inside. It is the
 // context's deadline and nowhere else, so a test says how long the login has by
 // building the context the real caller builds.
@@ -586,6 +595,61 @@ func TestAuthLoginWithATokenStillWorksOnCI(t *testing.T) {
 	}
 }
 
+// An approval that hands over a key but does not say which key, or where it acts,
+// has still handed over a key — and the plaintext is gone from the registry the
+// moment that read returns. Throwing it away over a receipt that would read blank
+// would leave a minted key nobody can ever collect.
+func TestAuthLoginStoresAKeyTheApprovalDidNotDescribe(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/cli/authorizations":
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"slug":"aut_x","state":"pending","code":"AAAA-BBBB",`+
+				`"verification_url":%q,"interval":1}`, srvPage)
+		default:
+			fmt.Fprint(w, `{"slug":"aut_x","state":"approved","token":"krowk_sk_undescribed"}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	h, path := loginHarness(t)
+	h.env["KROWK_API_URL"] = srv.URL + "/v1"
+
+	code, stdout, stderr := h.run("auth", "login", "--no-browser", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+	}
+	if c := stored(t, path); c["token"] != "krowk_sk_undescribed" {
+		t.Errorf("token = %v, want the key stored anyway", c["token"])
+	}
+	// Stored, and not claimed to be more than it is: the identity is what could not
+	// be confirmed, exactly as on the --token path against a silent registry.
+	var e struct {
+		OK   bool         `json:"ok"`
+		Data output.Login `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &e); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	if !e.OK {
+		t.Errorf("login = %+v, want ok — the key is on disk and works", e)
+	}
+	if e.Data.Confirmed {
+		t.Errorf("confirmed = true for a key the registry never described: %+v", e.Data)
+	}
+	if e.Data.Reason == "" {
+		t.Errorf("nothing says why it is unconfirmed: %+v", e.Data)
+	}
+	if !strings.Contains(stdout, "auth verify") {
+		t.Errorf("nothing points at the command that settles it:\n%s", stdout)
+	}
+}
+
+// srvPage is an http page on a host nothing serves. browsableURL only judges the
+// scheme, and these tests never open anything, so it just has to be a URL.
+const srvPage = "http://127.0.0.1:9/cli/authorizations/new?code=AAAA-BBBB"
+
 // A registry with no browser login endpoint is the likeliest 404 here — the two
 // halves of this flow ship from two repositories, and a self-hosted registry may
 // never grow the second. Telling someone to check a base URL that is exactly
@@ -626,7 +690,7 @@ func TestBrowserLoginOnlyOpensTheWeb(t *testing.T) {
 		"",
 		"http://app.krowk.com/cli/authorizations/new?code=AAAA-BBBB",
 	} {
-		if got, err := browsableURL(raw, "https://api.krowk.com/v1"); err == nil {
+		if got, err := browsableURL(raw, api.New("https://api.krowk.com/v1", "")); err == nil {
 			t.Errorf("browsableURL(%q) would open %q", raw, got)
 		}
 	}
@@ -635,11 +699,11 @@ func TestBrowserLoginOnlyOpensTheWeb(t *testing.T) {
 	// or a self-hosted one inside a private network — and its login page is on the
 	// same footing.
 	local := "http://127.0.0.1:8787/_approve/cli/authorizations/new?code=AAAA-BBBB"
-	if got, err := browsableURL(local, "http://localhost:8787/v1"); err != nil || got != local {
+	if got, err := browsableURL(local, api.New("http://localhost:8787/v1", "")); err != nil || got != local {
 		t.Errorf("browsableURL(local) = %q, %v — a local registry's own page was refused", got, err)
 	}
 	page := "https://app.krowk.com/cli/authorizations/new?code=AAAA-BBBB"
-	if got, err := browsableURL(page, "https://api.krowk.com/v1"); err != nil || got != page {
+	if got, err := browsableURL(page, api.New("https://api.krowk.com/v1", "")); err != nil || got != page {
 		t.Errorf("browsableURL(%q) = %q, %v", page, got, err)
 	}
 }
@@ -759,18 +823,13 @@ func TestAwaitingApprovalGivesUpWhenTheWindowCloses(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	start := time.Now()
-	ticks := 0
-	clock := func() time.Time {
-		defer func() { ticks++ }()
-		return start.Add(time.Duration(ticks) * 40 * time.Second)
-	}
+	clock := &pollClock{at: time.Now()}
 
 	client := api.New(srv.URL+"/v1", "")
 	client.Sleep = func(time.Duration) {}
 
-	_, err := awaitAuthorization(windowOf(t, start.Add(time.Minute)), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, clock, func(time.Duration) {})
+	_, err := awaitAuthorization(windowOf(t, clock.at.Add(time.Minute)), client,
+		&api.CLIAuthorization{Slug: "aut_x", Interval: 30}, clock.now, clock.sleep)
 	if err == nil || err.Error() != "authorization_expired" {
 		t.Fatalf("err = %v, want authorization_expired", err)
 	}
@@ -792,18 +851,13 @@ func TestAwaitingApprovalBlamesTheRegistryWhenItNeverAnswered(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	start := time.Now()
-	ticks := 0
-	clock := func() time.Time {
-		defer func() { ticks++ }()
-		return start.Add(time.Duration(ticks) * 40 * time.Second)
-	}
+	clock := &pollClock{at: time.Now()}
 
 	client := api.New(srv.URL+"/v1", "")
 	client.Sleep = func(time.Duration) {}
 
-	_, err := awaitAuthorization(windowOf(t, start.Add(time.Minute)), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, clock, func(time.Duration) {})
+	_, err := awaitAuthorization(windowOf(t, clock.at.Add(time.Minute)), client,
+		&api.CLIAuthorization{Slug: "aut_x", Interval: 30}, clock.now, clock.sleep)
 	if err == nil {
 		t.Fatal("a window spent entirely against a broken registry succeeded")
 	}
@@ -821,6 +875,8 @@ func TestAwaitingApprovalBlamesTheRegistryWhenItNeverAnswered(t *testing.T) {
 // once" would report exit 8 — no retry brings it back — about a window krowk spent
 // unable to ask, where retrying is the entire fix.
 func TestAwaitingApprovalBlamesTheRegistryWhenItStoppedAnswering(t *testing.T) {
+	// Fifteen seconds inside a one-minute window is three polls: enough for the
+	// answer to change partway through it.
 	var polls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -833,18 +889,13 @@ func TestAwaitingApprovalBlamesTheRegistryWhenItStoppedAnswering(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	start := time.Now()
-	ticks := 0
-	clock := func() time.Time {
-		defer func() { ticks++ }()
-		return start.Add(time.Duration(ticks) * 40 * time.Second)
-	}
+	clock := &pollClock{at: time.Now()}
 
 	client := api.New(srv.URL+"/v1", "")
 	client.Sleep = func(time.Duration) {}
 
-	_, err := awaitAuthorization(windowOf(t, start.Add(time.Minute)), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, clock, func(time.Duration) {})
+	_, err := awaitAuthorization(windowOf(t, clock.at.Add(time.Minute)), client,
+		&api.CLIAuthorization{Slug: "aut_x", Interval: 15}, clock.now, clock.sleep)
 	if err == nil || err.Error() == "authorization_expired" {
 		t.Fatalf("err = %v, which blames a person for a window krowk could not ask in", err)
 	}
@@ -870,34 +921,30 @@ func TestAwaitingApprovalStillBlamesNobodyApprovingAfterTheRegistryRecovers(t *t
 	}))
 	t.Cleanup(srv.Close)
 
-	start := time.Now()
-	ticks := 0
-	clock := func() time.Time {
-		defer func() { ticks++ }()
-		return start.Add(time.Duration(ticks) * 25 * time.Second)
-	}
+	clock := &pollClock{at: time.Now()}
 
 	client := api.New(srv.URL+"/v1", "")
 	client.Sleep = func(time.Duration) {}
 
-	_, err := awaitAuthorization(windowOf(t, start.Add(time.Minute)), client,
-		&api.CLIAuthorization{Slug: "aut_x"}, clock, func(time.Duration) {})
+	_, err := awaitAuthorization(windowOf(t, clock.at.Add(time.Minute)), client,
+		&api.CLIAuthorization{Slug: "aut_x", Interval: 15}, clock.now, clock.sleep)
 	if err == nil || err.Error() != "authorization_expired" {
 		t.Fatalf("err = %v, want authorization_expired — the registry did answer in the end", err)
 	}
 }
 
-// Approved with nothing to hand over is the registry's side of the contract
-// broken. Storing an empty token would leave a machine that looks logged in and
-// cannot upload, which is a worse state than a login that plainly failed.
+// An approval with no key in it is the registry's side of the contract broken, and
+// the one case where there is nothing to salvage: storing an empty token would
+// leave a machine that looks logged in and cannot upload.
+//
+// A missing key_id or workspace is deliberately *not* here. The plaintext has
+// already left the registry by the time this read returns, so refusing would throw
+// a working key away — see the login test below, which stores it and withholds the
+// claim about it instead.
 func TestAwaitingApprovalRefusesAnApprovalWithNoKeyInIt(t *testing.T) {
 	for _, missing := range []string{
-		// No token: a machine that looks logged in and cannot upload.
 		`{"slug":"aut_x","state":"approved","key_id":"key_1","workspace":"ws_1"}`,
-		// No key id: nothing to record about the key that was just minted.
-		`{"slug":"aut_x","state":"approved","token":"krowk_sk_new","workspace":"ws_1"}`,
-		// No workspace: the receipt's one fact, blank — "uploads land in ".
-		`{"slug":"aut_x","state":"approved","token":"krowk_sk_new","key_id":"key_1"}`,
+		`{"slug":"aut_x","state":"approved"}`,
 	} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")

@@ -342,7 +342,7 @@
         "subcommands": [
           {
             "name": "login",
-            "usage": "krowk auth login [--token \u003ctoken\u003e]",
+            "usage": "krowk auth login [--token \u003ctoken\u003e] [--no-browser]",
             "summary": "Approve this machine in the browser, or store a key",
             "flags": [
               {

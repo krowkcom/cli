@@ -235,7 +235,7 @@ func catalog() Catalog {
 				Subcommands: []Command{
 					{
 						Name:    "login",
-						Usage:   "krowk auth login [--token <token>]",
+						Usage:   "krowk auth login [--token <token>] [--no-browser]",
 						Summary: "Approve this machine in the browser, or store a key",
 						Flags: []Flag{
 							{Name: "token", Type: typeString,

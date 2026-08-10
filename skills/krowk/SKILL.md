@@ -228,9 +228,12 @@ it writes `{"authorizing": {"code": …, "page": …}}` to **stderr** — captur
 streams, show the person both fields, and say that the code on the page has to
 match the one you printed. That document carries no `ok`: it is not the outcome.
 stdout stays one document, the receipt, once the key is stored; on stderr the
-**last** document is the verdict. Drop `--no-browser` where the browser on this
-machine is that person's own; over SSH, in CI, or with no display it is what
-happens anyway.
+**last** document is the verdict.
+
+`--no-browser` is not optional for you. Over SSH or with no display it is what
+happens anyway, and **on CI a login without it is refused** (`no_one_to_approve`,
+exit 3) — the flag is how you say there is a person to hand the code to. Drop it
+only where the browser on this machine is that person's own.
 
 The key itself is not yours to read. It lands in the credentials file at 0600 and
 every later command finds it there. If the receipt carries `shadowed_by_env`,
@@ -306,12 +309,12 @@ answer.
 | 0 | It worked | — |
 | 1 | The command was wrong, or krowk failed on its own — bad flag, unknown command, unreadable file. Also anything unclassified | Fix the command; `krowk help <command> --json` |
 | 2 | Not found — no such artifact or run in this workspace, or an unrecognised claim token | Check the slug and the token, or `KROWK_API_URL` |
-| 3 | Refused for want of credentials — no key where one is needed, a rejected key, or no claim token where that is the only authority | `krowk auth login --token …`, or pass the claim token |
+| 3 | Refused for want of credentials — no key where one is needed, a rejected key, a browser login somebody denied or that CI could not approve, or no claim token where that is the only authority | `krowk auth login --token …`, or pass the claim token |
 | 4 | Understood and refused — validation, an artifact already finalized, a run that needs a key | Change something; retrying unchanged answers the same |
 | 5 | Rate limited | Wait `error.retry_after` seconds, then retry |
 | 6 | The bytes did not move — registry or object storage unreachable | Retry; `krowk doctor --json` |
-| 7 | The registry failed on its side, or answered something this client could not read | Retry, and report it if it persists |
-| 8 | Gone — expired or taken down | Push again; nothing brings it back |
+| 7 | The registry failed on its side, answered something this client could not read, or named a login page krowk will not open | Retry, and report it if it persists; for the login page, check `KROWK_API_URL` |
+| 8 | Gone — an artifact expired or was taken down, or a browser login lapsed or had its key collected already | Push again, or log in again; nothing brings the old one back |
 
 1 stays the catch-all, so a check for `!= 0` keeps working and a failure that
 gains a class can only move *out* of 1.

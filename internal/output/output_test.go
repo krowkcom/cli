@@ -354,7 +354,7 @@ func TestAuthorizingShowsTheCodeAndThePage(t *testing.T) {
 	page := "https://app.krowk.com/cli/authorizations/new?code=7K4M-2QXP"
 	opened := Authorization{Code: "7K4M-2QXP", Page: page, Opened: true}
 
-	waiting := Authorizing(opened, Human, false, false)
+	waiting := Authorizing(opened, Human, false)
 	for _, want := range []string{"7K4M-2QXP", page, "browser is opening"} {
 		if !strings.Contains(waiting, want) {
 			t.Errorf("the notice is missing %q:\n%s", want, waiting)
@@ -363,7 +363,7 @@ func TestAuthorizingShowsTheCodeAndThePage(t *testing.T) {
 
 	// Nothing was opened, so nothing may claim it was: this is the SSH and
 	// container case, where reading the URL out of the terminal is the whole flow.
-	printed := Authorizing(Authorization{Code: opened.Code, Page: page}, Human, false, false)
+	printed := Authorizing(Authorization{Code: opened.Code, Page: page}, Human, false)
 	if strings.Contains(printed, "opening") {
 		t.Errorf("a login that opened nothing says it did:\n%s", printed)
 	}
@@ -373,7 +373,7 @@ func TestAuthorizingShowsTheCodeAndThePage(t *testing.T) {
 
 	// A program gets a document rather than prose, and one that cannot be mistaken
 	// for the command's outcome: no `ok` to read a verdict off.
-	machine := Authorizing(opened, JSON, false, false)
+	machine := Authorizing(opened, JSON, false)
 	if !strings.HasSuffix(machine, "\n") {
 		t.Errorf("the notice does not end its own line, so the next document runs into it:\n%q", machine)
 	}

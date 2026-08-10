@@ -33,7 +33,7 @@ import (
 // required unless the API base URL is itself plain http, which is the caller
 // having made that choice too: a local registry, or a self-hosted one behind a
 // private network.
-func browsableURL(raw, apiBaseURL string) (string, error) {
+func browsableURL(raw string, registry *api.Client) (string, error) {
 	if raw == "" {
 		return "", api.Fail("malformed_response",
 			"the registry opened a browser login without naming a page to approve it on — "+
@@ -59,11 +59,19 @@ func browsableURL(raw, apiBaseURL string) (string, error) {
 	case "http":
 		// An https registry may not talk its own login page down to http; a caller
 		// who pointed krowk at an http registry already accepted that.
-		if !insecureRegistry(apiBaseURL) {
+		if !registry.Insecure() {
 			return "", api.Fail("refused_verification_url",
 				"the registry named an http page for this login while the API itself is https — "+
 					"krowk will not open it; check KROWK_API_URL")
 		}
+	case "":
+		// A relative or bare-host page, which is what a base URL pointing at the
+		// website answers with. Its own message, because "krowk only opens http and
+		// https" reads as a refusal when nothing was refused — there was no scheme to
+		// weigh — and the fix is the one every other malformed answer here names.
+		return "", api.Fail("malformed_response",
+			"the registry named a page for this login with no scheme — "+
+				"check KROWK_API_URL points at the API host, not the website")
 	default:
 		return "", api.Fail("refused_verification_url",
 			"the registry named a "+u.Scheme+": page for this login, and krowk only opens http and https")
@@ -74,14 +82,6 @@ func browsableURL(raw, apiBaseURL string) (string, error) {
 				"check KROWK_API_URL points at the API host, not the website")
 	}
 	return u.String(), nil
-}
-
-// insecureRegistry reports whether the registry being talked to is itself plain
-// http, which is what makes an http login page the caller's own choice rather
-// than the registry's.
-func insecureRegistry(baseURL string) bool {
-	u, err := url.Parse(baseURL)
-	return err == nil && u.Scheme == "http"
 }
 
 // headless reports whether there is no browser here worth opening.

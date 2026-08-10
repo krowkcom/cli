@@ -1633,16 +1633,22 @@ func (s *store) showCLIAuthorization(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, body)
 }
 
-// cliAuthorizationPage is where a person confirms the code. It shows the code the
-// URL named rather than the one on file, so that a code which matches nothing is
-// visibly a code which matches nothing — and refuses outright rather than
-// offering buttons that would do nothing.
+// cliAuthorizationPage is where a person confirms the code. A code matching no
+// login still waiting is refused outright rather than shown with buttons that
+// would answer 404 once pressed.
+//
+// What it renders is the code on file, not the one the query string carried, and
+// it is read out inside the lock: everything the page needs is copied while the
+// record is held, so nothing here touches a struct another request may be
+// deciding on.
 func (s *store) cliAuthorizationPage(w http.ResponseWriter, r *http.Request) {
-	code := r.URL.Query().Get("code")
-
 	s.mu.Lock()
-	auth := s.findAuthorizationByCode(code)
+	auth := s.findAuthorizationByCode(r.URL.Query().Get("code"))
 	pending := auth != nil && auth.state == authorizationPending && !s.authorizationExpired(auth)
+	code := ""
+	if pending {
+		code = auth.code
+	}
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1653,10 +1659,10 @@ func (s *store) cliAuthorizationPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	safe := url.PathEscape(auth.code)
+	safe := url.PathEscape(code)
 	_, _ = io.WriteString(w, page("Approve this login", nil,
 		"<p>A terminal asked to sign in. Approve it only if this code is the one it printed.</p>\n"+
-			"<p><strong>"+html.EscapeString(auth.code)+"</strong></p>\n"+
+			"<p><strong>"+html.EscapeString(code)+"</strong></p>\n"+
 			`<form method="post" action="/_approve/cli/authorizations/`+safe+
 			`/approval"><button type="submit">Approve</button></form>`+"\n"+
 			`<form method="post" action="/_approve/cli/authorizations/`+safe+

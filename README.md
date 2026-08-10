@@ -267,7 +267,15 @@ shape whichever command it ran:
 ```
 
 A failure is the same envelope with `"ok": false` and an `error` object carrying
-the code, the `fix` line and `retryable`.
+the code, the `fix` line and `retryable`. Results go to stdout, failures to
+stderr, one document each.
+
+`auth login` is the single exception, and only because a browser login has to
+speak before it knows its outcome: while it waits it writes what a person needs —
+the code and the page, as `{"authorizing": …}` in a machine format — to stderr,
+so a login that then fails leaves that document ahead of the error. **On that
+stream the last document is the verdict.** It deliberately carries no `ok`, so
+nothing about a login still waiting can be read as one that succeeded.
 
 Breadcrumbs are commands, not hints. `cmd` is ready to run, with this result's
 own slugs and tokens already in it — `action` is the short label, `description`
@@ -294,7 +302,7 @@ What each command hands back, one line each — the wording lives in the code:
 | `runs show` | What the run made, plus the finish if it is still open |
 | `claim` without `--run` | The `uploads attach` that puts it under one — the only way a claimed upload ever gets a run; `claim --run` has already done it and says nothing |
 | A page that came back full | The same listing with `--before`, keeping the `--run` and `--limit` it was given |
-| `auth login` / `auth verify` | The push it just made possible, or the `auth verify` an unconfirmed login still needs |
+| `auth login` / `auth verify` | The push it just made possible; the `auth verify` an unconfirmed login still needs, or the one that settles which key is in play when `KROWK_TOKEN` outranks the file just written |
 
 `--quiet` is the raw record with no envelope, so it carries no breadcrumbs at
 all — in human output either, where the claim and attach lines are suppressed;

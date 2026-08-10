@@ -223,15 +223,19 @@ and agent are detected, so pass only what detection cannot know. Afterwards,
 krowk auth login --no-browser --json
 ```
 
-It blocks until a person approves it, up to a quarter of an hour. While it waits,
-the code and the page go to **stderr** — capture both streams, show the person
-both, and say that the code on the page has to match the one you printed. stdout
-stays one JSON document: the receipt, once the key is stored. Drop `--no-browser`
-where the browser on this machine is that person's own; over SSH, or with no
-display, it is what happens anyway.
+It blocks until a person approves it, up to a quarter of an hour. While it waits
+it writes `{"authorizing": {"code": …, "page": …}}` to **stderr** — capture both
+streams, show the person both fields, and say that the code on the page has to
+match the one you printed. That document carries no `ok`: it is not the outcome.
+stdout stays one document, the receipt, once the key is stored; on stderr the
+**last** document is the verdict. Drop `--no-browser` where the browser on this
+machine is that person's own; over SSH, in CI, or with no display it is what
+happens anyway.
 
 The key itself is not yours to read. It lands in the credentials file at 0600 and
-every later command finds it there.
+every later command finds it there. If the receipt carries `shadowed_by_env`,
+`KROWK_TOKEN` is set and outranks what was just stored — uploads will use that
+key instead, so say so rather than reporting the workspace the receipt names.
 
 ### Keep an artifact that was pushed before signing in
 

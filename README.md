@@ -852,22 +852,4 @@ the release already produces; a Claude Code `PostToolUse` hook so screenshots
 upload with no prompting; a GitHub Action. The `curl | bash` installer is
 written — it has never run against a real release, because there is not one.
 
-## Open questions
-
-- ~~**Nothing dedupes.** Should the registry key artifacts by digest within a
-  workspace, or is a link per push the intended behaviour?~~ **Answered:** a link
-  per push, and retries named with an `Idempotency-Key` — not digests. See
-  [above](#retries-dedupe-identical-pushes-do-not), and canon,
-  `glossary.md` → Identical bytes do not dedupe.
-- **A run per push.** With a key, every `push` that is not given `--run` opens
-  and closes its own run, so ten screenshots from one agent session become ten
-  runs. Should the CLI persist a run for the session — keyed on the agent's
-  session ID — so they group without the caller threading `--run` through?
-- **Oversized files are read before they are refused.** The upload cap lives in
-  the registry, so the client digests a 2 GB file and only then hears it is too
-  large. Should the API root publish `max_upload_bytes` so the client can refuse
-  it locally?
-- **Anonymous uploads have no key to rate-limit against.** IP, or a
-  machine-scoped anonymous token minted on first push?
-
 MIT.

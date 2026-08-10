@@ -94,15 +94,17 @@ Exit codes
   0  it worked
   1  the command was wrong, or krowk failed on its own — also anything unclassified
   2  not found — no such artifact or run in this workspace, or no such endpoint
-  3  refused for want of credentials — no key, a key the registry rejects, or no
-     claim token where that is the only authority (a claim token the registry
-     does not recognise is 2, since it answers that as no such record)
+  3  refused for want of credentials — no key, a key the registry rejects, a
+     browser login somebody denied, or no claim token where that is the only
+     authority (a claim token the registry does not recognise is 2, since it
+     answers that as no such record)
   4  refused by the registry on the request or the state of things — retrying
      unchanged answers the same
   5  rate limited — wait and retry
   6  the bytes did not move — the registry or object storage could not be reached
   7  the registry failed on its side, or answered something unreadable
-  8  gone — the artifact expired or was taken down, and no retry brings it back
+  8  gone — the artifact expired or was taken down, or a browser login lapsed
+     before anybody approved it; no retry brings any of them back
 
 Registry precedence: --dev, then KROWK_API_URL, then KROWK_DEV, then the default.
 
@@ -823,7 +825,7 @@ func authLoginInBrowser(stdout, stderr io.Writer, f flags, format output.Format,
 	ctx := context.Background()
 	auth, err := client.StartCLIAuthorization(ctx)
 	if err != nil {
-		return err
+		return noBrowserLoginHere(err)
 	}
 	page, err := browsableURL(auth.VerificationURL, base)
 	if err != nil {
@@ -859,6 +861,22 @@ func authLoginInBrowser(stdout, stderr io.Writer, f flags, format output.Format,
 		Path: path, Confirmed: true, KeyID: granted.KeyID, Workspace: granted.Workspace,
 	}, format, f.quiet, colour))
 	return nil
+}
+
+// noBrowserLoginHere reads a 404 on the way in as a registry that does not offer
+// browser login, because most often that is what it is: the two halves of this
+// flow live in two repositories and will not ship the same minute, and a
+// self-hosted registry may never grow the second one. "Check KROWK_API_URL names
+// the API host" is the wrong thing to tell someone whose base URL is exactly
+// right — so the fix names both possibilities and the way in that always works.
+func noBrowserLoginHere(err error) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusNotFound {
+		return err
+	}
+	apiErr.Body["fix"] = "this registry does not answer browser login — check KROWK_API_URL, " +
+		"or issue a key in the dashboard and store it with `krowk auth login --token krowk_sk_...`"
+	return err
 }
 
 // awaitAuthorization polls until someone answers or the window closes.

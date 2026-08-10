@@ -397,6 +397,33 @@ func TestAuthLoginTakesNoBrowserBesideAToken(t *testing.T) {
 	}
 }
 
+// A registry with no browser login endpoint is the likeliest 404 here — the two
+// halves of this flow ship from two repositories, and a self-hosted registry may
+// never grow the second. Telling someone to check a base URL that is exactly
+// right sends them to confirm the one part that was not wrong.
+func TestAuthLoginSaysSoWhenTheRegistryHasNoBrowserLogin(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":{"code":"no_such_endpoint","message":"No such endpoint."}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	h, _ := loginHarness(t)
+	h.env["KROWK_API_URL"] = srv.URL + "/v1"
+
+	exit, stdout, stderr := h.run("auth", "login")
+	if exit == 0 {
+		t.Fatalf("a login against a registry that cannot serve one succeeded:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "--token") {
+		t.Errorf("nothing names the way in that still works:\n%s", stderr)
+	}
+	if _, err := os.Stat(api.CredentialsPath()); err == nil {
+		t.Error("a login that never got a key wrote credentials anyway")
+	}
+}
+
 // The page the registry names is handed to the desktop's URL handler, which is a
 // far broader thing than an HTTP client: `file://` walks the disk, `javascript:`
 // runs inside whatever is already open, and desktops register schemes that start

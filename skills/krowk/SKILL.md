@@ -115,7 +115,8 @@ environment variable — so never guess at a spelling this file does not carry.
 | Group an artifact afterwards | `krowk uploads attach art_2e1d --run run_8Kd2wq --json` |
 | Take an artifact down | `krowk uploads delete art_2e1d --json` |
 | Take down a keyless artifact | `krowk uploads delete art_2e1d <claim-token> --json` |
-| Store an API key | `krowk auth login --token krowk_sk_… --json` |
+| Sign in with nobody's key to paste | `krowk auth login --no-browser --json` |
+| Store an API key you were handed | `krowk auth login --token krowk_sk_… --json` |
 | Which key is this, whose workspace | `krowk auth verify --json` |
 | Diagnose a failure | `krowk doctor --json` |
 | The whole surface, as data | `krowk help --json` |
@@ -159,7 +160,8 @@ on the way out. `--run` names a run you opened, and leaves closing it to you.
 
 ```
 Do you now have a key?
-├── no  → krowk auth login --token krowk_sk_… --json    (then continue)
+├── no  → krowk auth login --no-browser --json   (a person approves it; then continue)
+│         or krowk auth login --token krowk_sk_… --json if you were handed one
 └── yes → does it belong under a run?
           ├── no  → krowk claim <artifact> <token> --json
           └── yes → krowk claim <artifact> <token> --run <run> --json
@@ -214,6 +216,22 @@ krowk runs finish run_8Kd2wq --json
 Metadata is recorded on the run, once, when it is opened — repo, commit, branch
 and agent are detected, so pass only what detection cannot know. Afterwards,
 `krowk runs show run_8Kd2wq --json` lists everything the run produced.
+
+### Sign in when there is no key to paste
+
+```bash
+krowk auth login --no-browser --json
+```
+
+It blocks until a person approves it, up to a quarter of an hour. While it waits,
+the code and the page go to **stderr** — capture both streams, show the person
+both, and say that the code on the page has to match the one you printed. stdout
+stays one JSON document: the receipt, once the key is stored. Drop `--no-browser`
+where the browser on this machine is that person's own; over SSH, or with no
+display, it is what happens anyway.
+
+The key itself is not yours to read. It lands in the credentials file at 0600 and
+every later command finds it there.
 
 ### Keep an artifact that was pushed before signing in
 

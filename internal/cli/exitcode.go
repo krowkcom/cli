@@ -81,6 +81,13 @@ var clientCodes = map[string]int{
 	"not_authenticated": exitAuth,
 	"missing_claim":     exitAuth,
 
+	// krowk declining to open a page the registry named — a scheme that is not the
+	// web, or http where the API is https. Deliberately usage rather than a
+	// registry failure, the same call `unexpected_redirect` gets: it is a decision
+	// krowk made about a URL, not a verdict anything sent back, and there is no
+	// version of retrying that changes it.
+	"refused_verification_url": exitUsage,
+
 	// A browser login that ended without a key. Denied is a person saying no,
 	// which leaves the machine exactly as credential-less as never having asked.
 	// Lapsed is krowk concluding the window closed rather than the registry saying

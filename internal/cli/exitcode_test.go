@@ -34,6 +34,10 @@ func TestExitCodeFor(t *testing.T) {
 		// The one code krowk shares with the registry: raised here it is krowk
 		// failing to build a request, not the registry refusing one.
 		{"krowk cannot encode the body", api.Fail("bad_request", ""), 1},
+		// A page krowk will not hand to the desktop's URL handler. Its own decision
+		// about a URL rather than a verdict from anything, the same as the redirect
+		// below.
+		{"a login page krowk will not open", api.Fail("refused_verification_url", ""), 1},
 
 		// Missing credentials, known before anything is sent.
 		{"no key stored", api.Fail("not_authenticated", ""), 3},

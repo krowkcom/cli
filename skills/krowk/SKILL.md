@@ -46,7 +46,7 @@ Linear. One file, one artifact, one link. That link is a card page —
 CDN are `file_url`, which only an image embed should ever name. What groups
 several links together is a **run**, not an artifact.
 
-Seventeen commands, one JSON envelope, and a surface you can read as data:
+Twenty-two commands, one JSON envelope, and a surface you can read as data:
 `krowk help --json` is the whole thing — every command, argument, flag and
 environment variable — so never guess at a spelling this file does not carry.
 
@@ -118,13 +118,35 @@ environment variable — so never guess at a spelling this file does not carry.
 | Store an API key you were handed | `krowk auth login --token krowk_sk_… --json` |
 | Sign in when there is no key to paste | `krowk auth login --no-browser --json` |
 | Which key is this, whose workspace | `krowk auth verify --json` |
+| Which workspaces have a stored key | `krowk workspaces list --json` |
+| Switch the machine-wide default | `krowk workspaces use ws_9hj3kd8a --json` |
+| Pin this repository to a workspace | `krowk config set workspace ws_9hj3kd8a --json` |
+| What resolves here, and why | `krowk config show --json` |
+| One command in another workspace | `krowk push shot.png --workspace ws_9hj3kd8a --json` |
 | Diagnose a failure | `krowk doctor --json` |
 | The whole surface, as data | `krowk help --json` |
 | One command's surface | `krowk help uploads attach --json` |
 
 Global flags on every command: `--json` (or `--format json`), `--format`
 (`human`, `json`, `markdown`, `url`), `--quiet` (the raw record, no envelope and
-therefore no breadcrumbs), `--dev`, `--help`, `--version`.
+therefore no breadcrumbs), `--workspace`, `--dev`, `--help`, `--version`.
+
+### Workspaces
+
+A key belongs to one workspace; `auth login` stores one key per workspace, so
+logging into a second never replaces the first. Which key a command uses:
+`--workspace` → `KROWK_WORKSPACE` → `.krowk/config.json` at the git root → the
+global config → whichever key logged in last. A workspace is always its
+`ws_…` slug.
+
+- In a repo with `.krowk/config.json`, never pass a workspace — it is already
+  pinned.
+- A resolved workspace with no stored key fails with `no_key_for_workspace`
+  (exit 3), never an anonymous fallback. Fix: `krowk auth login`, or check
+  `krowk workspaces list --json`.
+- Always pass values explicitly. The interactive picker behind an omitted
+  value is for humans on a terminal; off a TTY the omission is an immediate
+  error.
 
 ## Decision Trees
 

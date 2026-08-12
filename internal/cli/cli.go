@@ -12,12 +12,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/krowkcom/cli/internal/api"
+	"github.com/krowkcom/cli/internal/config"
 	"github.com/krowkcom/cli/internal/output"
 	"github.com/krowkcom/cli/internal/registry"
 	"github.com/krowkcom/cli/internal/runctx"
@@ -75,7 +77,12 @@ Local registry flags
   --site <url>           Origin for the links it returns (default: the request host)
   --limit-bytes <n>      Reject uploads above this size
 
+Config flags
+  --global               On ` + "`config set`" + ` and ` + "`config unset`" + `, write the machine-wide
+                         file instead of the repository's
+
 Global flags
+  --workspace <name>     Use this workspace's stored key for this one command
   --dev                  Talk to a local registry at %s
   --format <fmt>         human | json | markdown | url (default: human on a TTY, json when piped)
                          markdown and url describe an upload; other commands fall back to json
@@ -86,6 +93,7 @@ Global flags
 
 Environment
   KROWK_TOKEN            API token — wins over the credentials file
+  KROWK_WORKSPACE        Workspace to use, as if by --workspace
   KROWK_API_URL          API base URL (default %s)
   KROWK_DEV              1/true/yes/on — same as --dev
   KROWK_AGENT            Agent name to report
@@ -128,7 +136,16 @@ what --no-browser asks for everywhere else. On CI it is refused outright, since
 nothing there can approve it — that is what --token is for, and --token never
 opens or waits for anything.
 
+A key belongs to one workspace, and the credentials file holds one key per
+workspace: logging in against a second workspace adds a key rather than
+replacing the first. Which key a command uses is decided in order by
+--workspace, KROWK_WORKSPACE, the repository's .krowk/config.json, the global
+config, and finally whichever key logged in last. ` + "`krowk config set workspace <name>`" + `
+pins a repository to a workspace, so every command run inside it — by anyone,
+agent or person — lands there without saying so.
+
 Credentials live in %s (0600).
+Config lives in %s, and per repository in <git-root>/.krowk/config.json.
 `
 
 type flags struct {
@@ -143,6 +160,8 @@ type flags struct {
 	commit      string
 	agent       string
 	token       string
+	workspace   string
+	global      bool
 	format      string
 	addr        string
 	site        string
@@ -179,6 +198,8 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.StringVar(&f.commit, "commit", "", "")
 	fs.StringVar(&f.agent, "agent", "", "")
 	fs.StringVar(&f.token, "token", "", "")
+	fs.StringVar(&f.workspace, "workspace", "", "")
+	fs.BoolVar(&f.global, "global", false, "")
 	fs.StringVar(&f.format, "format", "", "")
 	fs.StringVar(&f.addr, "addr", defaultRegistryAddr, "")
 	fs.StringVar(&f.site, "site", "", "")
@@ -260,9 +281,19 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "login":
 		err = authLogin(stdout, stderr, positionals[2:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
-		err = authToken(stdout, env)
+		err = authToken(stdout, f, env)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "verify":
 		err = authVerify(stdout, format, f, env, colour)
+	case positionals[0] == "workspaces" && (len(positionals) == 1 || positionals[1] == "list"):
+		err = workspacesList(stdout, f, format, env, colour)
+	case len(positionals) > 1 && positionals[0] == "workspaces" && positionals[1] == "use":
+		err = workspacesUse(stdout, positionals[2:], f, format, env, colour, isTTY)
+	case len(positionals) > 1 && positionals[0] == "config" && positionals[1] == "show":
+		err = configShow(stdout, f, format, env, colour)
+	case len(positionals) > 1 && positionals[0] == "config" && positionals[1] == "set":
+		err = configSet(stdout, positionals[2:], f, format, env, colour, isTTY)
+	case len(positionals) > 1 && positionals[0] == "config" && positionals[1] == "unset":
+		err = configUnset(stdout, positionals[2:], f, format, colour)
 	case len(positionals) > 1 && positionals[0] == "registry" && positionals[1] == "serve":
 		err = registryServe(stdout, f)
 	case positionals[0] == "doctor":
@@ -287,9 +318,64 @@ func report(w io.Writer, err error, format output.Format, quiet, colour bool) in
 }
 
 // newClient is the one place a registry client gets built, so every command
-// honours the same precedence: --dev, then KROWK_API_URL, then KROWK_DEV.
-func newClient(f flags, env runctx.Env) *api.Client {
-	return api.New(api.BaseURLFor(f.dev, env), api.ReadToken(env))
+// honours the same precedence twice over: --dev, then KROWK_API_URL, then
+// KROWK_DEV for where to send requests; and --workspace, then KROWK_WORKSPACE,
+// then the repo config, then the global config, then the stored default for
+// which key to send them with.
+//
+// A workspace that resolved by name but holds no key is a refusal, not a
+// fallback. Every layer that can name one is somebody's deliberate ask — a
+// flag typed, a variable exported, a config committed — and quietly uploading
+// anonymously instead would land the artifact in the one place the ask
+// existed to avoid. KROWK_TOKEN is the exception and stays the strongest
+// word: CI injects a token into a checkout whose committed config names a
+// workspace that machine never logged into, and the token is the key that was
+// meant.
+func newClient(f flags, env runctx.Env) (*api.Client, error) {
+	ws, _, err := resolveWorkspace(f, env)
+	if err != nil {
+		return nil, err
+	}
+	token := api.ReadToken(env, ws)
+	if token == "" && ws != "" {
+		return nil, noKeyFor(ws)
+	}
+	return api.New(api.BaseURLFor(f.dev, env), token), nil
+}
+
+// resolveWorkspace answers which workspace this command was pointed at, and by
+// whom. Empty means nothing asked, which is not the anonymous case — it is
+// "use the stored default", and only the credential store knows whether that
+// is a key or nothing.
+func resolveWorkspace(f flags, env runctx.Env) (name, source string, err error) {
+	cfg, err := config.Load("", env, config.Overrides{Workspace: f.workspace})
+	if err != nil {
+		// The file exists and somebody wrote it meaning to steer uploads, so it
+		// does not get shrugged off: acting as though it said nothing would send
+		// uploads somewhere the file visibly tries to prevent.
+		return "", "", api.Fail("bad_config", err.Error()+
+			" — fix the file or remove it; `krowk config show` names every layer")
+	}
+	return cfg.Workspace, cfg.Sources["workspace"], nil
+}
+
+// noKeyFor says the one useful thing about a workspace with no key: what is
+// actually in the store, so the fix is a copy-paste rather than a guess at
+// spelling.
+func noKeyFor(ws string) error {
+	stored := api.StoredWorkspaces()
+	if len(stored) == 0 {
+		return api.Fail("no_key_for_workspace",
+			"no key is stored for workspace `"+ws+"` — no key is stored at all; "+
+				"run `krowk auth login` in that workspace's name")
+	}
+	names := make([]string, 0, len(stored))
+	for _, k := range stored {
+		names = append(names, k.Name)
+	}
+	return api.Fail("no_key_for_workspace",
+		"no key is stored for workspace `"+ws+"` — stored: "+strings.Join(names, ", ")+
+			"; run `krowk auth login` to add one, or `krowk workspaces` to see them")
 }
 
 // registryMode says where the client is pointed, so `doctor` can tell a
@@ -337,7 +423,10 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 		specs = append(specs, spec)
 	}
 
-	client := newClient(f, env)
+	client, err := newClient(f, env)
+	if err != nil {
+		return err
+	}
 	ctx := context.Background()
 
 	result := output.Result{Title: f.title}
@@ -500,11 +589,13 @@ func errCode(err error) string {
 // answer an empty page — and a caller cannot tell that apart from a run that
 // genuinely produced nothing.
 func uploadsList(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
-	client := newClient(f, env)
+	client, err := newClient(f, env)
+	if err != nil {
+		return err
+	}
 	ctx := context.Background()
 
 	var page *api.Page
-	var err error
 	if f.run != "" {
 		page, err = client.ListRunArtifacts(ctx, f.run, f.before, f.limit)
 	} else {
@@ -523,7 +614,10 @@ func uploadsList(w io.Writer, f flags, format output.Format, env runctx.Env, col
 
 // runsList pages through the key's runs, newest first.
 func runsList(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
-	client := newClient(f, env)
+	client, err := newClient(f, env)
+	if err != nil {
+		return err
+	}
 
 	page, err := client.ListRuns(context.Background(), f.before, f.limit)
 	if err != nil {
@@ -540,7 +634,10 @@ func runsShow(w io.Writer, args []string, f flags, format output.Format, env run
 	if len(args) == 0 {
 		return api.Fail("no_run", "pass the run: `krowk runs show run_...`")
 	}
-	client := newClient(f, env)
+	client, err := newClient(f, env)
+	if err != nil {
+		return err
+	}
 
 	run, err := client.ShowRun(context.Background(), args[0])
 	if err != nil {
@@ -554,7 +651,10 @@ func uploadsShow(w io.Writer, args []string, f flags, format output.Format, env 
 	if len(args) == 0 {
 		return api.Fail("no_artifact", "pass the artifact: `krowk uploads show art_...`")
 	}
-	client := newClient(f, env)
+	client, err := newClient(f, env)
+	if err != nil {
+		return err
+	}
 
 	artifact, err := client.ShowArtifact(context.Background(), args[0])
 	if err != nil {
@@ -574,7 +674,10 @@ func uploadsAttach(w io.Writer, args []string, f flags, format output.Format, en
 	if f.run == "" {
 		return api.Fail("no_run", "pass the run to attach it to: `krowk uploads attach "+args[0]+" --run run_...`")
 	}
-	client := newClient(f, env)
+	client, err := newClient(f, env)
+	if err != nil {
+		return err
+	}
 
 	artifact, err := client.AttachRun(context.Background(), args[0], f.run)
 	if err != nil {
@@ -615,7 +718,10 @@ func uploadsDelete(w io.Writer, args []string, f flags, format output.Format, en
 		claimToken = args[1]
 	}
 
-	client := newClient(f, env)
+	client, err := newClient(f, env)
+	if err != nil {
+		return err
+	}
 	// An anonymous upload's only authority is its claim token, so saying plainly
 	// that there is none beats a 400 from the registry naming a parameter the
 	// caller never saw a flag for.
@@ -658,7 +764,10 @@ func withTakedownAuthority(err error, byToken bool) error {
 }
 
 func runsStart(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
-	client := newClient(f, env)
+	client, err := newClient(f, env)
+	if err != nil {
+		return err
+	}
 
 	run, err := client.CreateRun(context.Background(), metadataFor(f, env))
 	if err != nil {
@@ -672,7 +781,10 @@ func runsFinish(w io.Writer, args []string, f flags, format output.Format, env r
 	if len(args) == 0 {
 		return api.Fail("no_run", "pass the run: `krowk runs finish run_...`")
 	}
-	client := newClient(f, env)
+	client, err := newClient(f, env)
+	if err != nil {
+		return err
+	}
 
 	run, err := client.FinishRun(context.Background(), args[0])
 	if err != nil {
@@ -694,7 +806,10 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 		return api.Fail("missing_claim",
 			"pass both the artifact and its token: `krowk claim art_... krowk_claim_...`")
 	}
-	client := newClient(f, env)
+	client, err := newClient(f, env)
+	if err != nil {
+		return err
+	}
 	ctx := context.Background()
 
 	artifact, err := client.ClaimArtifact(ctx, args[0], args[1])
@@ -789,7 +904,7 @@ func authLoginWithToken(w io.Writer, f flags, format output.Format, env runctx.E
 
 	var id api.Identity
 	if verifyErr == nil {
-		id = api.Identity{KeyID: key.KeyID, Workspace: key.Workspace}
+		id = api.Identity{KeyID: key.KeyID, Workspace: key.Workspace, WorkspaceName: key.WorkspaceName}
 	}
 
 	path, err := api.SaveCredentials(f.token, id)
@@ -893,7 +1008,7 @@ func authLoginInBrowser(stdout, stderr io.Writer, f flags, format output.Format,
 	}
 
 	path, err := api.SaveCredentials(granted.Token, api.Identity{
-		KeyID: granted.KeyID, Workspace: granted.Workspace,
+		KeyID: granted.KeyID, Workspace: granted.Workspace, WorkspaceName: granted.WorkspaceName,
 	})
 	if err != nil {
 		// Worse news than the same failure on the --token path, and it has to say
@@ -1131,9 +1246,19 @@ func unconfirmedReason(err error) string {
 	return err.Error()
 }
 
-func authToken(w io.Writer, env runctx.Env) error {
-	token := api.ReadToken(env)
+// authToken prints the token a command run here would send — the resolved
+// workspace's, not just whatever logged in last — because the caller pasting
+// it into a curl expects it to act where krowk itself would act.
+func authToken(w io.Writer, f flags, env runctx.Env) error {
+	ws, _, err := resolveWorkspace(f, env)
+	if err != nil {
+		return err
+	}
+	token := api.ReadToken(env, ws)
 	if token == "" {
+		if ws != "" {
+			return noKeyFor(ws)
+		}
 		return api.Fail("not_authenticated",
 			"run `krowk auth login --token krowk_sk_...`, or upload anonymously")
 	}
@@ -1144,7 +1269,10 @@ func authToken(w io.Writer, env runctx.Env) error {
 // authVerify reports what the stored key can actually do, rather than trusting
 // that a token-shaped string is a working key.
 func authVerify(w io.Writer, format output.Format, f flags, env runctx.Env, colour bool) error {
-	client := newClient(f, env)
+	client, err := newClient(f, env)
+	if err != nil {
+		return err
+	}
 	if client.Token == "" {
 		return api.Fail("not_authenticated",
 			"no key to verify — run `krowk auth login --token krowk_sk_...`, or upload anonymously")
@@ -1159,7 +1287,12 @@ func authVerify(w io.Writer, format output.Format, f flags, env runctx.Env, colo
 }
 
 func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
-	client := newClient(f, env)
+	// Resolved by hand rather than through newClient, because doctor's job is
+	// to describe a broken setup, not to be stopped by one: a malformed config
+	// or a workspace with no key fails every other command, and this is the
+	// command that says so.
+	ws, source, wsErr := resolveWorkspace(f, env)
+	client := api.New(api.BaseURLFor(f.dev, env), api.ReadToken(env, ws))
 
 	report := map[string]any{
 		"version":       Version,
@@ -1168,19 +1301,20 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 		"registry":      registryMode(client, env),
 		"api_status":    probe(client),
 		"authenticated": client.Authenticated(),
-		"token_source":  api.TokenSource(env),
+		"token_source":  api.TokenSource(env, ws),
 		"key":           keySummary(client),
-		"workspace":     recordedWorkspace(env),
+		"workspace":     workspaceSummary(ws, source, wsErr, env),
 		// Runs are where the metadata goes, and they need a key — so whether they
 		// are available is the difference between metadata being kept and dropped.
 		"runs_available": client.Authenticated(),
 		"credentials":    api.CredentialsPath(),
+		"config":         configSummary(),
 		"context":        runctx.Detect(env),
 	}
 
 	keys := []string{"version", "runtime", "api", "registry", "api_status",
 		"authenticated", "token_source", "key", "workspace", "runs_available",
-		"credentials"}
+		"credentials", "config"}
 
 	if format != output.Human {
 		b, _ := json.MarshalIndent(report, "", "  ")
@@ -1246,23 +1380,56 @@ func keySummary(client *api.Client) string {
 	return fmt.Sprintf("%s (%s)", key.KeyID, key.Workspace)
 }
 
-// recordedWorkspace says where uploads land according to what login wrote down,
-// without calling out at all. It is the answer keySummary spends a request on,
-// available on a train.
+// workspaceSummary says where uploads land and who decided it, without calling
+// out at all. It is the answer keySummary spends a request on, available on a
+// train.
 //
-// Silence here is the point rather than a gap. A token from the environment was
-// never logged in, so nothing was recorded about it and the file's workspace
-// belongs to a different key; saying it would name somewhere uploads are not
-// going. A login the registry could not confirm recorded nothing either. Both
-// say so and point at the one thing that can settle it.
-func recordedWorkspace(env runctx.Env) string {
-	if id, ok := api.ReadIdentity(env); ok {
-		return id.Workspace
+// Silence about the environment token is the point rather than a gap: a token
+// from KROWK_TOKEN was never logged in, so nothing was recorded about it and
+// naming a stored workspace would name somewhere uploads are not going. A
+// login the registry could not confirm recorded nothing either. Both say so
+// and point at the one thing that can settle it.
+func workspaceSummary(ws, source string, wsErr error, env runctx.Env) string {
+	if wsErr != nil {
+		return "unresolvable — " + wsErr.Error()
 	}
-	if api.TokenSource(env) == api.TokenSourceNone {
+	if ws != "" {
+		if api.ReadToken(env, ws) == "" {
+			return ws + " (" + source + ") — but no key is stored for it, so every command here fails"
+		}
+		if env("KROWK_TOKEN") != "" {
+			return ws + " (" + source + ") — but KROWK_TOKEN is set and wins; " +
+				"uploads land wherever that key acts, and `krowk auth verify` names it"
+		}
+		return ws + " (" + source + ")"
+	}
+	if id, ok := api.ReadIdentity(env, ""); ok {
+		return id.Workspace + " (stored default)"
+	}
+	if api.TokenSource(env, "") == api.TokenSourceNone {
 		return "none — uploads will be anonymous"
 	}
 	return "unknown — not recorded at login; `krowk auth verify` asks the registry"
+}
+
+// configSummary names the config files a command here would read, marking the
+// ones that exist — the difference between "nothing configured" and "the file
+// is there and not doing what was hoped" is the first thing to check.
+func configSummary() string {
+	parts := []string{"global " + existing(config.GlobalPath())}
+	if repo, inRepo := config.RepoPath(""); inRepo {
+		parts = append(parts, "repo "+existing(repo))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// existing marks a path that is actually on disk, so the doctor line reads at
+// a glance which layers are in play.
+func existing(path string) string {
+	if _, err := os.Stat(path); err != nil {
+		return path + " (absent)"
+	}
+	return path
 }
 
 // registryServe runs the local stand-in for api.krowk.com, so developing against

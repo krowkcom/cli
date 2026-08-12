@@ -294,7 +294,7 @@ func TestEveryCommandInTheHelpTextIsInTheCatalog(t *testing.T) {
 // caller cannot detect except by it silently doing nothing.
 func TestEveryEnvironmentVariableInTheCatalogIsRead(t *testing.T) {
 	sources := map[string]string{}
-	for _, pkg := range []string{".", "../api", "../runctx"} {
+	for _, pkg := range []string{".", "../api", "../config", "../runctx"} {
 		entries, err := os.ReadDir(pkg)
 		if err != nil {
 			t.Fatal(err)

@@ -80,6 +80,10 @@ var clientCodes = map[string]int{
 	// stays a usage mistake.
 	"not_authenticated": exitAuth,
 	"missing_claim":     exitAuth,
+	// A workspace resolved by name — a flag, a variable, a config file — and
+	// holds no key. The command was right and the registry was never asked;
+	// the fix is a credential for that workspace, and nothing else.
+	"no_key_for_workspace": exitAuth,
 
 	// A page krowk will not hand to the desktop's URL handler: a scheme that is not
 	// the web, or http where the API itself is https. It sits with

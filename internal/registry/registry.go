@@ -1554,9 +1554,12 @@ func showKey(w http.ResponseWriter, r *http.Request) {
 	sum := sha256Hex([]byte(token))
 	writeJSON(w, http.StatusOK, map[string]any{
 		// Derived, never the token itself — a key ID ends up in logs and output.
-		"key_id":    "key_" + sum[:8],
-		"name":      "local",
-		"workspace": workspaceFor(token),
+		"key_id": "key_" + sum[:8],
+		"name":   "local",
+		// The name mirrors what the real registry sends, so the CLI's picker
+		// and listings exercise their title path against the stand-in too.
+		"workspace":      workspaceFor(token),
+		"workspace_name": "Local workspace",
 	})
 }
 
@@ -1656,6 +1659,7 @@ func (s *store) showCLIAuthorization(w http.ResponseWriter, r *http.Request) {
 	token := auth.token
 	if delivering {
 		body["token"], body["key_id"], body["workspace"] = auth.token, auth.keyID, auth.workspace
+		body["workspace_name"] = "Local workspace"
 		auth.token, auth.spent = "", true
 	}
 	s.mu.Unlock()

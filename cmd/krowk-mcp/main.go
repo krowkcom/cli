@@ -14,6 +14,7 @@ import (
 
 	"github.com/krowkcom/cli/internal/api"
 	"github.com/krowkcom/cli/internal/cli"
+	"github.com/krowkcom/cli/internal/config"
 	"github.com/krowkcom/cli/internal/mcp"
 	"github.com/krowkcom/cli/internal/runctx"
 )
@@ -32,10 +33,28 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
+	// The same workspace resolution as the CLI, read once at startup from
+	// where the server was launched — an MCP server lives inside one editor
+	// session in one checkout, so the repo config that governs `krowk push`
+	// there governs its uploads too. A malformed config file is fatal for the
+	// same reason it fails the CLI: serving on while ignoring a file written
+	// to steer uploads would land them exactly where it says not to.
+	cfg, err := config.Load("", os.Getenv, config.Overrides{})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "krowk-mcp:", err)
+		os.Exit(1)
+	}
+	token := api.ReadToken(os.Getenv, cfg.Workspace)
+	if token == "" && cfg.Workspace != "" {
+		fmt.Fprintln(os.Stderr, "krowk-mcp: no key is stored for workspace "+cfg.Workspace+
+			" — run `krowk auth login`, or `krowk workspaces` to see what is stored")
+		os.Exit(1)
+	}
+
 	server := &mcp.Server{
 		// Same registry precedence as the CLI, so KROWK_DEV points both at a
 		// local registry without either needing its own plumbing.
-		Client: api.New(api.BaseURLFor(false, os.Getenv), api.ReadToken(os.Getenv)),
+		Client: api.New(api.BaseURLFor(false, os.Getenv), token),
 		Env:    runctx.Env(os.Getenv),
 		// Uploads are confined here. An artifact needs no credential to read, and
 		// the model picks the paths, so the boundary is what keeps an instruction

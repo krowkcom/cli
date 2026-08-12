@@ -27,7 +27,7 @@ krowk push screenshot.png \
 - **Built for agents** — JSON output when piped, a machine-readable command surface, ready-to-run follow-up commands in every result
 - **Zero setup** — push without a key; the upload works instantly and can be claimed into your workspace later
 - **Context attached** — repo, commit, branch, PR and agent are detected from git and CI, so links carry their provenance
-- **One static binary** — Go, standard library only; no runtime to install in an agent container
+- **One static binary** — Go; no runtime to install in an agent container
 
 ## Installation
 
@@ -55,7 +55,10 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 | `krowk uploads attach <artifact> --run <run>` | Put an upload under a run after the fact |
 | `krowk uploads delete <artifact>` | Take an upload down — immediate and unrecoverable |
 | `krowk claim <artifact> <token>` | Keep an anonymous upload past its 24h expiry |
-| `krowk auth login` | Approve this machine in a browser (`--token` for CI) |
+| `krowk auth login` | Approve this machine in a browser (`--token` for CI) — one stored key per workspace |
+| `krowk workspaces list` / `use ws_9hj3kd8a` | List the stored keys, or make one the machine-wide default — `use` with no name picks from a list |
+| `krowk config set workspace ws_9hj3kd8a` | Pin this repository to a workspace (`--global` for the machine) |
+| `krowk config show` / `unset <key>` | The effective configuration and which layer set it, or remove a value |
 | `krowk doctor` | Report version, connectivity, auth and detected run context |
 
 Push flags: `--run`, `--pull-request`, `--reference` (repeatable), `--session`, `--title`, plus `--repo` / `--commit` / `--agent` to override detection. Without a key, uploads land anonymously, expire in 24 hours and return a one-shot claim token.
@@ -97,10 +100,11 @@ Tools: `krowk_push`, `krowk_list_artifacts`, `krowk_get_artifact`, `krowk_claim_
 | Variable | Purpose |
 | --- | --- |
 | `KROWK_TOKEN` | API token — wins over the credentials file |
+| `KROWK_WORKSPACE` | Workspace whose stored key to use, as if by `--workspace` |
 | `KROWK_API_URL` | Point at a self-hosted registry |
 | `KROWK_AGENT` | Override the detected agent name |
 
-Credentials from `krowk auth login` live in `~/.config/krowk/credentials.json` (0600).
+Credentials from `krowk auth login` live in `~/.config/krowk/credentials.json` (0600), one key per workspace. Which key a command uses resolves in order: `--workspace` → `KROWK_WORKSPACE` → `.krowk/config.json` at the git root → `~/.config/krowk/config.json` → whichever key logged in last. Commit the repo file and everyone who clones the repository — person or agent — uploads to the right workspace without naming it; the file selects among keys already on the machine and never carries one itself.
 
 ## Development
 

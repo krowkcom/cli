@@ -664,9 +664,13 @@ func Key(k *api.Key, f Format, quiet, colour bool) string {
 		})
 	}
 
+	workspace := k.Workspace
+	if k.WorkspaceName != "" {
+		workspace = k.WorkspaceName + " (" + k.Workspace + ")"
+	}
 	lines := []string{
 		fmt.Sprintf("%s key valid  %s", paint(colour, green, "✓"), k.KeyID),
-		fmt.Sprintf("  %-11s %s", "workspace", k.Workspace),
+		fmt.Sprintf("  %-11s %s", "workspace", workspace),
 	}
 	if k.Name != "" {
 		lines = append(lines, fmt.Sprintf("  %-11s %s", "name", k.Name))

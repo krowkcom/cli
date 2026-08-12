@@ -42,10 +42,21 @@ func workspacesList(w io.Writer, f flags, format output.Format, env runctx.Env, 
 // workspacesUse repoints the machine-wide default at another stored key. It is
 // selection, not authentication: it can only name a key `auth login` already
 // stored, which is what makes it safe to run without confirming anything.
-func workspacesUse(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
+//
+// With no argument and a person at the terminal, the store's contents become
+// a picker — the answer was always going to be one of those names, so asking
+// beats failing and having them run the listing to copy one out. Everywhere
+// else, no argument stays the error it always was.
+func workspacesUse(w io.Writer, args []string, f flags, format output.Format, env runctx.Env,
+	colour, isTTY bool) error {
 	if len(args) == 0 {
-		return api.Fail("no_workspace",
-			"pass the workspace: `krowk workspaces use <name>` — `krowk workspaces` lists them")
+		name, err := askForWorkspace("Which workspace should be the default?", f, format, env, isTTY,
+			api.Fail("no_workspace",
+				"pass the workspace: `krowk workspaces use <name>` — `krowk workspaces` lists them"))
+		if err != nil {
+			return err
+		}
+		args = []string{name}
 	}
 	path, err := api.SetDefaultWorkspace(args[0])
 	if err != nil {
@@ -84,11 +95,28 @@ func configShow(w io.Writer, f flags, format output.Format, env runctx.Env, colo
 // because pinning the repo is what the command exists for, or the global file
 // behind --global. Outside a git repository there is no repo file to write, and
 // guessing a directory would pin something other than what was meant.
-func configSet(w io.Writer, args []string, f flags, format output.Format, colour bool) error {
-	if len(args) < 2 {
-		return api.Fail("missing_argument",
-			"pass the key and the value: `krowk config set workspace <name>` — "+
-				"keys: "+strings.Join(config.KnownKeys(), ", "))
+//
+// `config set workspace` with the value left off asks, when there is a person
+// to ask — the value is one of the stored names, and the picker offers exactly
+// those. Other keys have no store to offer from, so their missing value stays
+// an error everywhere.
+func configSet(w io.Writer, args []string, f flags, format output.Format, env runctx.Env,
+	colour, isTTY bool) error {
+	missing := api.Fail("missing_argument",
+		"pass the key and the value: `krowk config set workspace <name>` — "+
+			"keys: "+strings.Join(config.KnownKeys(), ", "))
+	if len(args) == 0 {
+		return missing
+	}
+	if len(args) == 1 {
+		if args[0] != "workspace" {
+			return missing
+		}
+		name, err := askForWorkspace("Which workspace should this pin?", f, format, env, isTTY, missing)
+		if err != nil {
+			return err
+		}
+		args = append(args, name)
 	}
 	key, value := args[0], args[1]
 	if err := knownConfigKey(key); err != nil {
@@ -142,6 +170,24 @@ func configFile(f flags) (string, error) {
 				"run it inside the repository, or pass --global for the machine-wide file")
 	}
 	return repo, nil
+}
+
+// askForWorkspace turns a missing argument into a question when a person is
+// there to answer it; anywhere else it answers with `otherwise`, the error
+// the command would have raised anyway. The store's emptiness is checked
+// before the terminal is touched: a picker over nothing is a question with no
+// answers, and the fix for it is a login, not a selection.
+func askForWorkspace(title string, f flags, format output.Format, env runctx.Env,
+	isTTY bool, otherwise error) (string, error) {
+	if !interactive(f, format, env, isTTY) {
+		return "", otherwise
+	}
+	stored := api.StoredWorkspaces()
+	if len(stored) == 0 {
+		return "", api.Fail("not_authenticated",
+			"no keys are stored to pick from — `krowk auth login` adds one")
+	}
+	return pickWorkspace(title, stored)
 }
 
 // knownConfigKey rejects a key this build has no idea of, before any file is

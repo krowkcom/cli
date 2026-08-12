@@ -387,7 +387,7 @@
             "args": [
               {
                 "name": "workspace",
-                "summary": "A workspace `krowk workspaces` lists",
+                "summary": "A workspace `krowk workspaces` lists, e.g. ws_9hj3kd8a — a person at a terminal may omit it and pick from a list instead",
                 "required": true
               }
             ]
@@ -415,7 +415,7 @@
               },
               {
                 "name": "value",
-                "summary": "What to set it to",
+                "summary": "What to set it to, e.g. ws_9hj3kd8a — for `workspace`, a person at a terminal may omit it and pick from the stored keys instead",
                 "required": true
               }
             ],

@@ -313,6 +313,32 @@ func TestWorkspacesListNamesTheStoreAndTheResolution(t *testing.T) {
 	}
 }
 
+// TestThePickerNeverAppearsOffATerminal holds the interactive fallback to its
+// gate: everywhere these tests run — no TTY, JSON asked for — a missing
+// argument must stay the immediate error it always was, because a prompt shown
+// to an agent or a pipe is not a question, it is a hang.
+func TestThePickerNeverAppearsOffATerminal(t *testing.T) {
+	h := newWorkspaceHarness(t)
+	repoDir(t)
+	storeKeys(t, h, "ws_acme", "ws_personal")
+
+	code, _, stderr := h.run("workspaces", "use", "--json")
+	if code != exitUsage {
+		t.Errorf("workspaces use with no name off a TTY = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "no_workspace") {
+		t.Errorf("the refusal does not name itself: %s", stderr)
+	}
+
+	code, _, stderr = h.run("config", "set", "workspace", "--json")
+	if code != exitUsage {
+		t.Errorf("config set with no value off a TTY = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "missing_argument") {
+		t.Errorf("the refusal does not name itself: %s", stderr)
+	}
+}
+
 func TestWorkspacesUseRepointsTheDefault(t *testing.T) {
 	h := newWorkspaceHarness(t)
 	repoDir(t)

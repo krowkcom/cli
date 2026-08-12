@@ -267,7 +267,8 @@ func catalog() Catalog {
 						Usage:   "krowk workspaces use <workspace>",
 						Summary: "Make a stored key the machine-wide default",
 						Args: []Arg{{Name: "workspace", Required: true,
-							Summary: "A workspace `krowk workspaces` lists"}},
+							Summary: "A workspace `krowk workspaces` lists, e.g. ws_9hj3kd8a — " +
+								"a person at a terminal may omit it and pick from a list instead"}},
 					},
 				},
 			},
@@ -283,7 +284,9 @@ func catalog() Catalog {
 						Summary: "Write one value into the repo config, or the global one",
 						Args: []Arg{
 							{Name: "key", Required: true, Summary: "A configuration key, e.g. `workspace`"},
-							{Name: "value", Required: true, Summary: "What to set it to"},
+							{Name: "value", Required: true,
+								Summary: "What to set it to, e.g. ws_9hj3kd8a — for `workspace`, a person " +
+									"at a terminal may omit it and pick from the stored keys instead"},
 						},
 						Flags: []Flag{globalFlag},
 					},

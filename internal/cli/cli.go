@@ -287,11 +287,11 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	case positionals[0] == "workspaces" && (len(positionals) == 1 || positionals[1] == "list"):
 		err = workspacesList(stdout, f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "workspaces" && positionals[1] == "use":
-		err = workspacesUse(stdout, positionals[2:], f, format, env, colour)
+		err = workspacesUse(stdout, positionals[2:], f, format, env, colour, isTTY)
 	case len(positionals) > 1 && positionals[0] == "config" && positionals[1] == "show":
 		err = configShow(stdout, f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "config" && positionals[1] == "set":
-		err = configSet(stdout, positionals[2:], f, format, colour)
+		err = configSet(stdout, positionals[2:], f, format, env, colour, isTTY)
 	case len(positionals) > 1 && positionals[0] == "config" && positionals[1] == "unset":
 		err = configUnset(stdout, positionals[2:], f, format, colour)
 	case len(positionals) > 1 && positionals[0] == "registry" && positionals[1] == "serve":

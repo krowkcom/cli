@@ -23,6 +23,11 @@ type storedKey struct {
 	Token     string `json:"token"`
 	KeyID     string `json:"key_id,omitempty"`
 	Workspace string `json:"workspace,omitempty"`
+	// WorkspaceName is the workspace's human title as the registry reported it
+	// at login — the only thing a picker has to offer a person, since the slug
+	// above identifies but does not describe. Keys stored before the registry
+	// sent one simply have none until their next login.
+	WorkspaceName string `json:"workspace_name,omitempty"`
 }
 
 // credentials is the on-disk shape of ~/.config/krowk/credentials.json: one key
@@ -45,8 +50,9 @@ const defaultEntry = "default"
 // login. It is a record of an answer, not a claim about the key now: a key can
 // be revoked between logging in and using it, and only the registry can say so.
 type Identity struct {
-	KeyID     string `json:"key_id,omitempty"`
-	Workspace string `json:"workspace,omitempty"`
+	KeyID         string `json:"key_id,omitempty"`
+	Workspace     string `json:"workspace,omitempty"`
+	WorkspaceName string `json:"workspace_name,omitempty"`
 }
 
 // WorkspaceKey is one stored key as `krowk workspaces` lists it: the name it is
@@ -56,7 +62,9 @@ type WorkspaceKey struct {
 	Name      string `json:"name"`
 	KeyID     string `json:"key_id,omitempty"`
 	Workspace string `json:"workspace,omitempty"`
-	Default   bool   `json:"default"`
+	// WorkspaceName is the human title, where login recorded one.
+	WorkspaceName string `json:"workspace_name,omitempty"`
+	Default       bool   `json:"default"`
 }
 
 // Where ReadToken would take its token from, as reported by TokenSource.
@@ -240,7 +248,10 @@ func SaveCredentials(token string, id Identity) (string, error) {
 	// The identity is recorded exactly as given, including empty. The entry has
 	// to say what the registry actually said about this key, not what the entry
 	// it happens to be replacing knew about a different one.
-	c.Workspaces[name] = storedKey{Token: token, KeyID: id.KeyID, Workspace: id.Workspace}
+	c.Workspaces[name] = storedKey{
+		Token: token, KeyID: id.KeyID,
+		Workspace: id.Workspace, WorkspaceName: id.WorkspaceName,
+	}
 	c.Default = name
 
 	return writeCredentials(c)
@@ -259,10 +270,11 @@ func StoredWorkspaces() []WorkspaceKey {
 	out := make([]WorkspaceKey, 0, len(c.Workspaces))
 	for name, k := range c.Workspaces {
 		out = append(out, WorkspaceKey{
-			Name:      name,
-			KeyID:     k.KeyID,
-			Workspace: k.Workspace,
-			Default:   name == c.Default,
+			Name:          name,
+			KeyID:         k.KeyID,
+			Workspace:     k.Workspace,
+			WorkspaceName: k.WorkspaceName,
+			Default:       name == c.Default,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

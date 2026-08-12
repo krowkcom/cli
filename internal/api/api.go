@@ -256,12 +256,17 @@ type Run struct {
 // expired, or for a workspace other than the one the caller expects, and all
 // three look identical until an upload fails.
 type Key struct {
-	KeyID      string `json:"key_id,omitempty"`
-	Name       string `json:"name,omitempty"`
-	Workspace  string `json:"workspace,omitempty"`
-	ExpiresAt  string `json:"expires_at,omitempty"`
-	LastUsedAt string `json:"last_used_at,omitempty"`
-	CreatedAt  string `json:"created_at,omitempty"`
+	KeyID     string `json:"key_id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Workspace string `json:"workspace,omitempty"`
+	// WorkspaceName is the workspace's human name, beside the slug. The slug is
+	// what the CLI stores and matches on — names can be renamed under it — but a
+	// person choosing between workspaces has nothing to choose with in a slug.
+	// Older registries do not send it, so it can be empty.
+	WorkspaceName string `json:"workspace_name,omitempty"`
+	ExpiresAt     string `json:"expires_at,omitempty"`
+	LastUsedAt    string `json:"last_used_at,omitempty"`
+	CreatedAt     string `json:"created_at,omitempty"`
 	// Status is the HTTP status the read answered with. Diagnostics print what
 	// actually arrived rather than assuming 200. Transport detail, not part of
 	// the key itself.
@@ -337,6 +342,9 @@ type CLIAuthorization struct {
 	Token     string `json:"token,omitempty"`
 	KeyID     string `json:"key_id,omitempty"`
 	Workspace string `json:"workspace,omitempty"`
+	// WorkspaceName travels with the grant for the same reason /key sends it:
+	// what login records here is all a picker ever has to show a person.
+	WorkspaceName string `json:"workspace_name,omitempty"`
 }
 
 // The states an authorization reports while it still exists. Spent and expired

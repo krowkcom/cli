@@ -51,7 +51,13 @@ func WorkspaceList(ws Workspaces, f Format, quiet, colour bool) string {
 		if k.Default {
 			mark = "  " + paint(colour, dim, "(default)")
 		}
-		lines = append(lines, fmt.Sprintf("  %-16s %s%s", k.Name, k.KeyID, mark))
+		// The title leads where login recorded one; the slug is always there,
+		// because it is the value every command and config file speaks in.
+		name := k.Name
+		if k.WorkspaceName != "" {
+			name = k.WorkspaceName + " — " + k.Name
+		}
+		lines = append(lines, fmt.Sprintf("  %-40s %s%s", name, k.KeyID, mark))
 	}
 	if ws.Resolved != "" {
 		lines = append(lines, fmt.Sprintf("uploads from here land in %s — %s", ws.Resolved, ws.Source))

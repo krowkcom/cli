@@ -313,6 +313,46 @@ func TestWorkspacesListNamesTheStoreAndTheResolution(t *testing.T) {
 	}
 }
 
+// TestLoginRecordsTheWorkspaceTitleForTheListing follows the workspace's human
+// name from the registry through login into `workspaces list` — the whole
+// journey it exists for, since a picker built from the store has nothing else
+// to offer a person but slugs.
+func TestLoginRecordsTheWorkspaceTitleForTheListing(t *testing.T) {
+	h := newWorkspaceHarness(t)
+	repoDir(t)
+	delete(h.env, "KROWK_TOKEN")
+
+	if code, _, stderr := h.run("auth", "login", "--token", "krowk_sk_titled", "--json"); code != 0 {
+		t.Fatalf("auth login = %d, stderr %s", code, stderr)
+	}
+
+	code, stdout, stderr := h.run("workspaces", "list", "--json")
+	if code != 0 {
+		t.Fatalf("workspaces list = %d, stderr %s", code, stderr)
+	}
+	var envelope struct {
+		Data struct {
+			Stored []struct {
+				Name          string `json:"name"`
+				WorkspaceName string `json:"workspace_name"`
+			} `json:"stored"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &envelope); err != nil {
+		t.Fatalf("workspaces list did not answer JSON: %v\n%s", err, stdout)
+	}
+	if len(envelope.Data.Stored) != 1 {
+		t.Fatalf("stored = %+v, want the one key just logged in", envelope.Data.Stored)
+	}
+	got := envelope.Data.Stored[0]
+	if !strings.HasPrefix(got.Name, "ws_") {
+		t.Errorf("entry name = %q, want the ws_ slug the registry reported", got.Name)
+	}
+	if got.WorkspaceName != "Local workspace" {
+		t.Errorf("workspace_name = %q, want the title the registry sent at login", got.WorkspaceName)
+	}
+}
+
 // TestThePickerNeverAppearsOffATerminal holds the interactive fallback to its
 // gate: everywhere these tests run — no TTY, JSON asked for — a missing
 // argument must stay the immediate error it always was, because a prompt shown

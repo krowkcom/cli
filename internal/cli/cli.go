@@ -904,7 +904,7 @@ func authLoginWithToken(w io.Writer, f flags, format output.Format, env runctx.E
 
 	var id api.Identity
 	if verifyErr == nil {
-		id = api.Identity{KeyID: key.KeyID, Workspace: key.Workspace}
+		id = api.Identity{KeyID: key.KeyID, Workspace: key.Workspace, WorkspaceName: key.WorkspaceName}
 	}
 
 	path, err := api.SaveCredentials(f.token, id)
@@ -1008,7 +1008,7 @@ func authLoginInBrowser(stdout, stderr io.Writer, f flags, format output.Format,
 	}
 
 	path, err := api.SaveCredentials(granted.Token, api.Identity{
-		KeyID: granted.KeyID, Workspace: granted.Workspace,
+		KeyID: granted.KeyID, Workspace: granted.Workspace, WorkspaceName: granted.WorkspaceName,
 	})
 	if err != nil {
 		// Worse news than the same failure on the --token path, and it has to say

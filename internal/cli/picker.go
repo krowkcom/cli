@@ -28,9 +28,14 @@ func interactive(f flags, format output.Format, env runctx.Env, isTTY bool) bool
 func pickWorkspace(title string, stored []api.WorkspaceKey) (string, error) {
 	options := make([]huh.Option[string], 0, len(stored))
 	for _, k := range stored {
+		// The title leads and the slug follows: the title is what a person
+		// recognises, the slug is what the choice actually is — it is the value
+		// selected, stored and matched, because titles can be renamed under a
+		// key and slugs cannot. A key stored before the registry sent titles
+		// has only its slug to show.
 		label := k.Name
-		if k.KeyID != "" {
-			label += "  ·  " + k.KeyID
+		if k.WorkspaceName != "" {
+			label = k.WorkspaceName + "  —  " + k.Name
 		}
 		if k.Default {
 			label += "  (default)"

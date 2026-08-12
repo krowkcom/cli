@@ -33,8 +33,9 @@ func loginHarness(t *testing.T) (*harness, string) {
 	return newHarness(t, 0).anonymous(), api.CredentialsPath()
 }
 
-// stored reads the credentials file the way the next command would.
-func stored(t *testing.T, path string) map[string]any {
+// storedFile is the whole credentials file, for the few assertions that are
+// about the store rather than about one key inside it.
+func storedFile(t *testing.T, path string) map[string]any {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -45,6 +46,33 @@ func stored(t *testing.T, path string) map[string]any {
 		t.Fatalf("credentials are not JSON: %v\n%s", err, data)
 	}
 	return c
+}
+
+// stored reads the credentials file the way the next command would: the store
+// holds a key per workspace and a pointer at the one to use when nothing names
+// one, so what a login left for the next command is that entry, not the file
+// around it.
+//
+// The one-key shape that predates the store reads as its own single entry, which
+// is what the credentials reader itself does with it. A login that refuses to
+// write leaves the file in whatever shape it was already in, so a test asserting
+// on the surviving key has to be able to see it either way.
+func stored(t *testing.T, path string) map[string]any {
+	t.Helper()
+	c := storedFile(t, path)
+	if _, current := c["workspaces"]; !current {
+		return c
+	}
+	name, _ := c["default"].(string)
+	if name == "" {
+		t.Fatalf("the credentials point their default at nothing: %v", c)
+	}
+	workspaces, _ := c["workspaces"].(map[string]any)
+	entry, ok := workspaces[name].(map[string]any)
+	if !ok {
+		t.Fatalf("the default names %q, which holds no key: %v", name, c)
+	}
+	return entry
 }
 
 // Login asks the registry who the key is before writing it down, and keeps the
@@ -92,6 +120,10 @@ func TestAuthLoginRefusesAKeyTheRegistryRejects(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	seeded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.env["KROWK_API_URL"] = srv.URL + "/v1"
 
 	body := h.fails("auth", "login", "--token", "krowk_sk_typo")
@@ -104,9 +136,18 @@ func TestAuthLoginRefusesAKeyTheRegistryRejects(t *testing.T) {
 		t.Errorf("fix = %q, which is the command that just failed", fix)
 	}
 
+	// The working key is still the one the next command would reach for, and its
+	// workspace still says what the registry said about it.
 	c := stored(t, path)
 	if c["token"] != "krowk_sk_working" || c["key_id"] != "key_good" {
 		t.Errorf("a rejected login overwrote the working key: %v", c)
+	}
+	// And it is still there because nothing was written at all, rather than
+	// because a rewrite happened to keep it: a store with more than one key in it
+	// has more to lose than the entry being replaced.
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(after, seeded) {
+		t.Errorf("a rejected login rewrote the credentials file:\n%s", after)
 	}
 }
 
@@ -134,6 +175,17 @@ func TestAuthLoginStoresAnUnconfirmedKeyWhenTheRegistryIsSilent(t *testing.T) {
 	// invented.
 	if _, named := c["key_id"]; named {
 		t.Errorf("credentials name a key the registry never confirmed: %v", c)
+	}
+	// A key with no workspace has to be filed somewhere, and it files under
+	// "default" — a real entry name, so an offline login is storable and
+	// replaceable like any other. The entry's own workspace field stays empty,
+	// because that emptiness is the honest record of what the registry said.
+	if ws, recorded := c["workspace"]; recorded && ws != "" {
+		t.Errorf("workspace = %v, want none — the registry named none", ws)
+	}
+	if file := storedFile(t, path); file["default"] != "default" {
+		t.Errorf("default = %v, want the unconfirmed key filed under \"default\": %v",
+			file["default"], file)
 	}
 }
 
@@ -490,6 +542,10 @@ func TestAuthLoginInTheBrowserLeavesAWorkingKeyAloneWhenDenied(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	seeded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	exit, stdout, stderr := browserLogin(t, h, "denial")
 	if exit == 0 {
@@ -500,6 +556,12 @@ func TestAuthLoginInTheBrowserLeavesAWorkingKeyAloneWhenDenied(t *testing.T) {
 	}
 	if c := stored(t, path); c["token"] != "krowk_sk_working" || c["key_id"] != "key_good" {
 		t.Errorf("a denied login overwrote the working key: %v", c)
+	}
+	// Denied means nothing was written, not that the store was rewritten around
+	// the key that survived.
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(after, seeded) {
+		t.Errorf("a denied login rewrote the credentials file:\n%s", after)
 	}
 }
 

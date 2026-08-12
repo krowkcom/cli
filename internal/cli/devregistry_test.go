@@ -305,19 +305,27 @@ func TestDevFlagRedirectsTheClient(t *testing.T) {
 		return func(k string) string { return m[k] }
 	}
 	dev := strings.TrimRight(api.DevBaseURL, "/")
+	baseURL := func(f flags, e runctx.Env) string {
+		t.Helper()
+		client, err := newClient(f, e)
+		if err != nil {
+			t.Fatalf("newClient: %v", err)
+		}
+		return client.BaseURL
+	}
 
-	if got := newClient(flags{dev: true}, env(nil)).BaseURL; got != dev {
+	if got := baseURL(flags{dev: true}, env(nil)); got != dev {
 		t.Errorf("--dev = %q, want %q", got, dev)
 	}
 	// A flag typed on the command line beats an ambient variable.
 	staging := env(map[string]string{"KROWK_API_URL": "https://staging/v1"})
-	if got := newClient(flags{dev: true}, staging).BaseURL; got != dev {
+	if got := baseURL(flags{dev: true}, staging); got != dev {
 		t.Errorf("--dev with KROWK_API_URL set = %q, want %q", got, dev)
 	}
-	if got := newClient(flags{}, staging).BaseURL; got != "https://staging/v1" {
+	if got := baseURL(flags{}, staging); got != "https://staging/v1" {
 		t.Errorf("KROWK_API_URL = %q", got)
 	}
-	if got := newClient(flags{}, env(nil)).BaseURL; got != strings.TrimRight(api.DefaultBaseURL, "/") {
+	if got := baseURL(flags{}, env(nil)); got != strings.TrimRight(api.DefaultBaseURL, "/") {
 		t.Errorf("default = %q, want the public registry", got)
 	}
 }

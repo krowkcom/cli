@@ -117,6 +117,12 @@ func runFlag(usage string) Flag {
 	return Flag{Name: "run", Type: typeString, Usage: usage}
 }
 
+// globalFlag picks which config file `config set` and `config unset` write.
+// One definition for both, so the two commands can never describe it
+// differently.
+var globalFlag = Flag{Name: "global", Type: typeBool, Default: "false",
+	Usage: "Write the machine-wide config instead of the repository's"}
+
 // pageFlags walk a listing. Every listing takes them; only the uploads listing
 // also takes --run, since runs are not grouped under anything themselves.
 func pageFlags() []Flag {
@@ -250,6 +256,47 @@ func catalog() Catalog {
 					{Name: "verify", Usage: "krowk auth verify", Summary: "Check the key and its workspace"},
 				},
 			},
+			{
+				Name:    "workspaces",
+				Summary: "The stored keys, one per workspace",
+				Subcommands: []Command{
+					{Name: "list", Usage: "krowk workspaces [list]",
+						Summary: "List the stored keys, and which workspace resolves here"},
+					{
+						Name:    "use",
+						Usage:   "krowk workspaces use <workspace>",
+						Summary: "Make a stored key the machine-wide default",
+						Args: []Arg{{Name: "workspace", Required: true,
+							Summary: "A workspace `krowk workspaces` lists"}},
+					},
+				},
+			},
+			{
+				Name:    "config",
+				Summary: "Pin a repository, or the machine, to a workspace",
+				Subcommands: []Command{
+					{Name: "show", Usage: "krowk config show",
+						Summary: "The effective configuration, and which layer set each value"},
+					{
+						Name:    "set",
+						Usage:   "krowk config set <key> <value> [--global]",
+						Summary: "Write one value into the repo config, or the global one",
+						Args: []Arg{
+							{Name: "key", Required: true, Summary: "A configuration key, e.g. `workspace`"},
+							{Name: "value", Required: true, Summary: "What to set it to"},
+						},
+						Flags: []Flag{globalFlag},
+					},
+					{
+						Name:    "unset",
+						Usage:   "krowk config unset <key> [--global]",
+						Summary: "Remove one value from the repo config, or the global one",
+						Args: []Arg{{Name: "key", Required: true,
+							Summary: "A configuration key, e.g. `workspace`"}},
+						Flags: []Flag{globalFlag},
+					},
+				},
+			},
 			{Name: "doctor", Usage: "krowk doctor", Summary: "Check the local setup"},
 			{
 				Name:    "registry",
@@ -279,6 +326,9 @@ func catalog() Catalog {
 			},
 		},
 		GlobalFlags: []Flag{
+			{Name: "workspace", Type: typeString,
+				Usage: "Use this workspace's stored key for this one command — " +
+					"outranks KROWK_WORKSPACE and every config file"},
 			{Name: "dev", Type: typeBool, Default: "false",
 				// The address is part of what the flag does, and a machine reading
 				// the surface has nowhere else to learn it.
@@ -293,6 +343,9 @@ func catalog() Catalog {
 		},
 		Environment: []EnvVar{
 			{Name: "KROWK_TOKEN", Usage: "API token — wins over the credentials file"},
+			{Name: "KROWK_WORKSPACE",
+				Usage: "Workspace whose stored key to use, as if by --workspace — " +
+					"outranks the config files, loses to the flag"},
 			{Name: "KROWK_API_URL", Usage: "API base URL", Default: api.DefaultBaseURL},
 			{Name: "KROWK_DEV", Usage: "1/true/yes/on — same as --dev"},
 			{Name: "KROWK_AGENT", Usage: "Agent name to report"},

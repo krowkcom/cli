@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/krowkcom/cli/internal/api"
+	"github.com/krowkcom/cli/internal/config"
 	"github.com/krowkcom/cli/internal/output"
 )
 
@@ -33,7 +34,8 @@ func showHelp(w io.Writer, topic []string, format output.Format) error {
 			return encodeJSON(w, c)
 		}
 		fmt.Fprintf(w, helpTemplate, Version, usageBlock(c),
-			defaultRegistryAddr, api.DevBaseURL, api.DefaultBaseURL, api.CredentialsPath())
+			defaultRegistryAddr, api.DevBaseURL, api.DefaultBaseURL,
+			api.CredentialsPath(), config.GlobalPath())
 		return nil
 	}
 

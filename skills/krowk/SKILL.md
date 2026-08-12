@@ -46,7 +46,7 @@ Linear. One file, one artifact, one link. That link is a card page —
 CDN are `file_url`, which only an image embed should ever name. What groups
 several links together is a **run**, not an artifact.
 
-Seventeen commands, one JSON envelope, and a surface you can read as data:
+Twenty-two commands, one JSON envelope, and a surface you can read as data:
 `krowk help --json` is the whole thing — every command, argument, flag and
 environment variable — so never guess at a spelling this file does not carry.
 
@@ -118,13 +118,32 @@ environment variable — so never guess at a spelling this file does not carry.
 | Store an API key you were handed | `krowk auth login --token krowk_sk_… --json` |
 | Sign in when there is no key to paste | `krowk auth login --no-browser --json` |
 | Which key is this, whose workspace | `krowk auth verify --json` |
+| Which workspaces have a stored key | `krowk workspaces list --json` |
+| Switch the machine-wide default | `krowk workspaces use acme --json` |
+| Pin this repository to a workspace | `krowk config set workspace acme --json` |
+| What resolves here, and why | `krowk config show --json` |
+| One command in another workspace | `krowk push shot.png --workspace acme --json` |
 | Diagnose a failure | `krowk doctor --json` |
 | The whole surface, as data | `krowk help --json` |
 | One command's surface | `krowk help uploads attach --json` |
 
 Global flags on every command: `--json` (or `--format json`), `--format`
 (`human`, `json`, `markdown`, `url`), `--quiet` (the raw record, no envelope and
-therefore no breadcrumbs), `--dev`, `--help`, `--version`.
+therefore no breadcrumbs), `--workspace`, `--dev`, `--help`, `--version`.
+
+### Workspaces
+
+A key belongs to one workspace, and `auth login` stores one key **per**
+workspace — logging into a second adds a key, it does not replace the first.
+Which key a command uses resolves in order: `--workspace` flag →
+`KROWK_WORKSPACE` → `.krowk/config.json` at the git root → the global config →
+whichever key logged in last. A repository pinned with
+`krowk config set workspace <name>` sends every upload made inside it to that
+workspace, so once it is pinned you never pass a workspace by hand there. If a
+resolved workspace has no stored key the command fails with
+`no_key_for_workspace` (exit 3) rather than falling back to an anonymous
+upload — the fix is `krowk auth login` under that workspace, and
+`krowk workspaces list --json` says what is actually stored.
 
 ## Decision Trees
 

@@ -13,8 +13,12 @@ type credentials struct {
 // CredentialsPath is ~/.config/krowk/credentials.json, XDG_CONFIG_HOME honoured.
 // Not os.UserConfigDir: that is ~/Library/Application Support on macOS, and the
 // CLI documents one path on every platform.
-func CredentialsPath() string {
-	dir := os.Getenv("XDG_CONFIG_HOME")
+//
+// The lookup goes through env rather than os.Getenv so a test can point it at a
+// scratch directory — otherwise a developer's real credentials file makes every
+// "anonymous" test run authenticated.
+func CredentialsPath(env func(string) string) string {
+	dir := env("XDG_CONFIG_HOME")
 	if dir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -30,7 +34,7 @@ func ReadToken(env func(string) string) string {
 	if t := env("KROWK_TOKEN"); t != "" {
 		return t
 	}
-	data, err := os.ReadFile(CredentialsPath())
+	data, err := os.ReadFile(CredentialsPath(env))
 	if err != nil {
 		return ""
 	}
@@ -42,8 +46,8 @@ func ReadToken(env func(string) string) string {
 }
 
 // SaveToken writes the token owner-only and returns where it landed.
-func SaveToken(token string) (string, error) {
-	path := CredentialsPath()
+func SaveToken(token string, env func(string) string) (string, error) {
+	path := CredentialsPath(env)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
 	}

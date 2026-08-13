@@ -86,6 +86,35 @@ func TestChangeID(t *testing.T) {
 	}
 }
 
+func TestDetectModelIsHarnessAgnostic(t *testing.T) {
+	// KROWK_MODEL is ours, so it wins over any vendor signal.
+	both := map[string]string{"KROWK_MODEL": "gpt-5.2", "ANTHROPIC_MODEL": "claude-fable-5"}
+	if got := DetectModel(env(both)); got != "gpt-5.2" {
+		t.Errorf("got %q, want the agnostic override", got)
+	}
+	if got := DetectModel(env(map[string]string{"ANTHROPIC_MODEL": "claude-fable-5"})); got != "claude-fable-5" {
+		t.Errorf("got %q", got)
+	}
+	if got := DetectModel(env(nil)); got != "" {
+		t.Errorf("got %q, want empty — no signal, no key", got)
+	}
+}
+
+func TestDetectSystemFollowsTheModelFamily(t *testing.T) {
+	for _, tc := range []struct{ harness, model, want string }{
+		{"", "claude-fable-5", "anthropic"},
+		{"", "gpt-5.2", "openai"},
+		{"", "gemini-3-pro", "gcp.gemini"},
+		{"claude-code", "", "anthropic"},
+		{"cursor", "", ""},
+		{"", "", ""},
+	} {
+		if got := DetectSystem(tc.harness, tc.model); got != tc.want {
+			t.Errorf("DetectSystem(%q, %q) = %q, want %q", tc.harness, tc.model, got, tc.want)
+		}
+	}
+}
+
 func TestArtifactStampDropsTheRunOnlyFacts(t *testing.T) {
 	dirty := true
 	m := Metadata{

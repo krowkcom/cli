@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/krowkcom/cli/internal/api"
 )
@@ -82,46 +83,65 @@ func TestErrorRendersLimitAndFix(t *testing.T) {
 }
 
 // GitHub renders no card for a third-party link, so the image embed is the only
-// form that shows the artifact there. Labels are user-controlled, so delimiter
-// characters must arrive escaped or the embed breaks.
+// form that shows the artifact there — and the embed has to name the bytes,
+// because GitHub renders an image where a link resolves to one and the card
+// page resolves to HTML. The embed is wrapped in a link to the card so clicking
+// it lands on the page with the run metadata. Labels are user-controlled, so
+// delimiter characters must arrive escaped or the embed breaks.
 func TestPasteCarriesBothFormsAndEscapesLabels(t *testing.T) {
 	a := &api.Artifact{
 		Slug:        "art_2e1d",
 		Filename:    "foobar.jpg",
 		ContentType: "image/jpeg",
-		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+		URL:         "https://krowk.com/a/art_2e1d",
+		FileURL:     "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
 	}
-	url := a.URL
+	card, file := a.URL, a.FileURL
+	embed := func(label string) string { return "[![" + label + "](" + file + ")](" + card + ")" }
 
 	for _, tc := range []struct {
 		title    string
 		filename string
 		want     string
 	}{
-		{"Checkout", "foobar.jpg", "![Checkout](" + url + ")"},
-		{"Checkout [v2]", "foobar.jpg", `![Checkout \[v2\]](` + url + ")"},
-		{"", "frame[0].png", `![frame\[0\].png](` + url + ")"},
-		{`back\slash`, "foobar.jpg", `![back\\slash](` + url + ")"},
-		{"line1\nline2\r\nline3", "foobar.jpg", "![line1 line2  line3](" + url + ")"},
+		{"Checkout", "foobar.jpg", embed("Checkout")},
+		{"Checkout [v2]", "foobar.jpg", embed(`Checkout \[v2\]`)},
+		{"", "frame[0].png", embed(`frame\[0\].png`)},
+		{`back\slash`, "foobar.jpg", embed(`back\\slash`)},
+		{"line1\nline2\r\nline3", "foobar.jpg", embed("line1 line2  line3")},
 	} {
 		a.Filename = tc.filename
 		p := PasteFor(a, tc.title)
 		if p.Markdown != tc.want {
 			t.Errorf("PasteFor(%q/%q).Markdown = %q, want %q", tc.title, tc.filename, p.Markdown, tc.want)
 		}
-		// Slack renders no markdown image embeds, so it needs the plain link.
-		if p.URL != a.URL {
-			t.Errorf("url = %q, want the bare link", p.URL)
+		// Slack renders no markdown image embeds, so it needs the bare link —
+		// and the bare link is the card, which is the thing Slack unfurls.
+		if p.URL != card {
+			t.Errorf("url = %q, want the card page", p.URL)
 		}
 	}
 
 	a.Filename = "foobar.jpg"
 	r := Result{Artifacts: []*api.Artifact{a}, Title: "Checkout"}
-	if got := Upload(r, Markdown, false, false, time.Now()); got != "![Checkout]("+url+")" {
+	if got := Upload(r, Markdown, false, false, time.Now()); got != embed("Checkout") {
 		t.Errorf("--format markdown = %q, want just the embed", got)
 	}
-	if got := Upload(r, URL, false, false, time.Now()); got != url {
-		t.Errorf("--format url = %q, want just the link", got)
+	if got := Upload(r, URL, false, false, time.Now()); got != card {
+		t.Errorf("--format url = %q, want just the card link", got)
+	}
+}
+
+// An artifact this side assembled rather than read back has no byte URL, and an
+// embed pointing at nothing is worse than a link that works — so the card
+// stands in for it.
+func TestAnEmbedWithNoByteURLFallsBackToTheCard(t *testing.T) {
+	a := &api.Artifact{
+		Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
+		URL: "https://krowk.com/a/art_2e1d",
+	}
+	if got := MarkdownLink(a, "Checkout"); got != "[![Checkout]("+a.URL+")]("+a.URL+")" {
+		t.Errorf("MarkdownLink = %q, want the card in both slots", got)
 	}
 }
 
@@ -132,13 +152,18 @@ func TestRegistryMarkdownWinsWithoutATitle(t *testing.T) {
 		Slug:        "art_2e1d",
 		Filename:    "foobar.jpg",
 		ContentType: "image/jpeg",
-		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
-		Markdown:    "![foobar.jpg](https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg)",
+		URL:         "https://krowk.com/a/art_2e1d",
+		FileURL:     "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+		Markdown: "[![foobar.jpg](https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg)]" +
+			"(https://krowk.com/a/art_2e1d)",
 	}
 	if got := MarkdownLink(a, ""); got != a.Markdown {
 		t.Errorf("MarkdownLink = %q, want the registry's own markdown", got)
 	}
-	if got := MarkdownLink(a, "Checkout"); got != "![Checkout]("+a.URL+")" {
+	// The re-render is where the two URLs have to be kept apart by this side
+	// rather than by the registry: the embed names the bytes, the link around
+	// it names the card.
+	if got := MarkdownLink(a, "Checkout"); got != "[![Checkout]("+a.FileURL+")]("+a.URL+")" {
 		t.Errorf("MarkdownLink with a title = %q, want the title to win", got)
 	}
 }
@@ -148,7 +173,8 @@ func TestJSONEnvelopeCarriesBothPasteForms(t *testing.T) {
 		Slug:        "art_2e1d",
 		Filename:    "foobar.jpg",
 		ContentType: "image/jpeg",
-		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+		URL:         "https://krowk.com/a/art_2e1d",
+		FileURL:     "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
 	}
 	r := Result{Artifacts: []*api.Artifact{a}}
 
@@ -169,21 +195,39 @@ func TestJSONEnvelopeCarriesBothPasteForms(t *testing.T) {
 }
 
 // The surfaces label must not promise an image the markdown does not carry.
+//
+// The card page makes both halves of that harder to get right. An image embed
+// is now wrapped in a link to the card, so it no longer begins with the bang
+// and a check for one would call every screenshot a plain link. And a
+// non-image's markdown is a link to the card rather than to the file — which is
+// a better link, and still not a preview: GitHub, Linear and Notion build no
+// card for a third-party URL however good its OpenGraph tags are, so what shows
+// there is a blue anchor. Slack is where that link becomes a card, and Slack
+// takes the url form. So the label stays "no preview to embed".
 func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
 	image := PasteFor(&api.Artifact{
 		Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
-		URL: "https://cdn.krowk.com/a/shot.png",
+		URL: "https://krowk.com/a/art_2e1d", FileURL: "https://cdn.krowk.com/ws_9f3c/art_2e1d/shot.png",
 	}, "")
+	if !strings.Contains(image.Markdown, "![") {
+		t.Fatalf("markdown = %q, want an image embed", image.Markdown)
+	}
 	if got := MarkdownSurfacesFor(image); got != EmbedSurfaces {
 		t.Errorf("image label = %q, want %q", got, EmbedSurfaces)
 	}
 
 	log := PasteFor(&api.Artifact{
 		Slug: "art_9f3c", Filename: "build.log", ContentType: "text/plain",
-		URL: "https://cdn.krowk.com/a/build.log",
+		URL: "https://krowk.com/a/art_9f3c", FileURL: "https://cdn.krowk.com/ws_9f3c/art_9f3c/build.log",
 	}, "")
-	if !strings.HasPrefix(log.Markdown, "[") {
+	if strings.Contains(log.Markdown, "![") {
 		t.Fatalf("markdown = %q, want a plain link when there is nothing to embed", log.Markdown)
+	}
+	// And that plain link points at the card, not at the bytes: a reader
+	// clicking a log in a pull request should land on the page that says what
+	// run produced it rather than on a raw download.
+	if !strings.HasSuffix(log.Markdown, "(https://krowk.com/a/art_9f3c)") {
+		t.Errorf("markdown = %q, want it to link to the card page", log.Markdown)
 	}
 	if got := MarkdownSurfacesFor(log); got != PlainSurfaces {
 		t.Errorf("plain-link label = %q, want %q", got, PlainSurfaces)
@@ -197,26 +241,16 @@ func TestClaimTokenIsSurfacedButNeverPasteable(t *testing.T) {
 		Slug:        "art_2e1d",
 		Filename:    "foobar.jpg",
 		ContentType: "image/jpeg",
-		URL:         "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+		URL:         "https://krowk.com/a/art_2e1d",
+		FileURL:     "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
 		ClaimToken:  "krowk_claim_2b7f",
 	}
 	r := Result{Artifacts: []*api.Artifact{a}}
 
 	// Visible to whoever ran the push, as the breadcrumb that spends it...
-	var e struct {
-		Breadcrumbs []Breadcrumb `json:"breadcrumbs"`
-	}
-	if err := json.Unmarshal([]byte(Upload(r, JSON, false, false, time.Now())), &e); err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, b := range e.Breadcrumbs {
-		if strings.Contains(b.Cmd, a.ClaimToken) {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("breadcrumbs = %+v, want the claim command carrying the token", e.Breadcrumbs)
+	crumbs := crumbsOf(t, Upload(r, JSON, false, false, time.Now()))
+	if _, ok := find(crumbs, a.ClaimToken); !ok {
+		t.Errorf("breadcrumbs = %+v, want the claim command carrying the token", crumbs)
 	}
 
 	// ...but never in either paste form.
@@ -232,20 +266,21 @@ func TestClaimTokenIsSurfacedButNeverPasteable(t *testing.T) {
 	}
 }
 
-func TestKeyRendersScopesAndWarnsWhenItCannotUpload(t *testing.T) {
-	k := &api.Key{Valid: true, KeyID: "key_9f3c2e1d", Workspace: "acme",
-		Scopes: []string{"artifacts:read"}}
+func TestKeyRendersTheKeyAndItsWorkspace(t *testing.T) {
+	k := &api.Key{KeyID: "key_9f3c2e1d", Name: "CI", Workspace: "ws_acme",
+		ExpiresAt: "2026-09-01T00:00:00Z"}
 
 	human := Key(k, Human, false, false)
-	for _, want := range []string{"key_9f3c2e1d", "acme", "artifacts:read", "cannot upload"} {
+	// The workspace is the fact worth confirming: it is where an upload lands.
+	for _, want := range []string{"key_9f3c2e1d", "ws_acme", "CI", "2026-09-01"} {
 		if !strings.Contains(human, want) {
 			t.Errorf("human key output is missing %q:\n%s", want, human)
 		}
 	}
 
-	k.Scopes = append(k.Scopes, api.ScopeWrite)
-	if got := Key(k, Human, false, false); strings.Contains(got, "cannot upload") {
-		t.Errorf("a write-scoped key must not warn:\n%s", got)
+	// A key that never expires says nothing about expiry rather than saying none.
+	if got := Key(&api.Key{KeyID: "key_9f3c2e1d"}, Human, false, false); strings.Contains(got, "expires") {
+		t.Errorf("a key with no expiry must not mention one:\n%s", got)
 	}
 
 	// There is no link to a key, so url falls back to the JSON envelope.
@@ -258,5 +293,336 @@ func TestKeyRendersScopesAndWarnsWhenItCannotUpload(t *testing.T) {
 	}
 	if !e.OK || e.Data.KeyID != k.KeyID {
 		t.Errorf("url format = %+v, want the JSON envelope", e)
+	}
+}
+
+func TestStoredKeyDistinguishesAConfirmedLoginFromAnUnconfirmedOne(t *testing.T) {
+	confirmed := &Login{
+		Path: "/home/x/.config/krowk/credentials.json", Confirmed: true,
+		KeyID: "key_9f3c2e1d", Workspace: "ws_acme",
+	}
+
+	human := StoredKey(confirmed, Human, false, false)
+	for _, want := range []string{"key_9f3c2e1d", "ws_acme"} {
+		if !strings.Contains(human, want) {
+			t.Errorf("human login output is missing %q:\n%s", want, human)
+		}
+	}
+	if strings.Contains(human, "unconfirmed") {
+		t.Errorf("a confirmed login must not hedge:\n%s", human)
+	}
+
+	// The unconfirmed case is the one an agent has to be able to read: the
+	// command succeeded and the key is stored, but nothing has vouched for it.
+	pending := &Login{
+		Path: confirmed.Path, Confirmed: false, Reason: "network_unreachable",
+	}
+	if got := StoredKey(pending, Human, false, false); !strings.Contains(got, "unconfirmed") ||
+		!strings.Contains(got, "network_unreachable") {
+		t.Errorf("unconfirmed login does not say so:\n%s", got)
+	}
+
+	var e struct {
+		OK      bool   `json:"ok"`
+		Data    Login  `json:"data"`
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(StoredKey(pending, JSON, false, false)), &e); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if !e.OK {
+		t.Error("storing the token succeeded, so the envelope says ok")
+	}
+	if e.Data.Confirmed || e.Data.Reason != "network_unreachable" {
+		t.Errorf("data = %+v", e.Data)
+	}
+	// An unconfirmed login's next step is verifying, not pushing.
+	if !strings.Contains(StoredKey(pending, JSON, false, false), "auth verify") {
+		t.Error("unconfirmed login should point at `krowk auth verify`")
+	}
+
+	// --quiet drops the envelope, the way it does everywhere else.
+	if got := StoredKey(confirmed, JSON, true, false); strings.Contains(got, `"ok"`) {
+		t.Errorf("--quiet should drop the envelope, got %s", got)
+	}
+}
+
+// The notice a browser login prints while it waits has one job: put the code and
+// the page in front of a person. It is prose in every format, because it is not a
+// result — the result is the receipt on stdout once somebody has approved it.
+func TestAuthorizingShowsTheCodeAndThePage(t *testing.T) {
+	page := "https://app.krowk.com/cli/authorizations/new?code=7K4M-2QXP"
+	opened := Authorization{Code: "7K4M-2QXP", Page: page, Opened: true}
+
+	waiting := Authorizing(opened, Human, false)
+	for _, want := range []string{"7K4M-2QXP", page, "browser is opening"} {
+		if !strings.Contains(waiting, want) {
+			t.Errorf("the notice is missing %q:\n%s", want, waiting)
+		}
+	}
+
+	// Nothing was opened, so nothing may claim it was: this is the SSH and
+	// container case, where reading the URL out of the terminal is the whole flow.
+	printed := Authorizing(Authorization{Code: opened.Code, Page: page}, Human, false)
+	if strings.Contains(printed, "opening") {
+		t.Errorf("a login that opened nothing says it did:\n%s", printed)
+	}
+	if !strings.Contains(printed, "Open this page") {
+		t.Errorf("nothing tells the person to open it themselves:\n%s", printed)
+	}
+
+	// A program gets a document rather than prose, and one that cannot be mistaken
+	// for the command's outcome: no `ok` to read a verdict off.
+	machine := Authorizing(opened, JSON, false)
+	if !strings.HasSuffix(machine, "\n") {
+		t.Errorf("the notice does not end its own line, so the next document runs into it:\n%q", machine)
+	}
+	var doc struct {
+		Authorizing *Authorization `json:"authorizing"`
+		OK          *bool          `json:"ok"`
+		Error       map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(machine), &doc); err != nil {
+		t.Fatalf("the machine notice is not JSON: %v\n%s", err, machine)
+	}
+	if doc.Authorizing == nil || *doc.Authorizing != opened {
+		t.Errorf("authorizing = %+v, want %+v", doc.Authorizing, opened)
+	}
+	if doc.OK != nil {
+		t.Errorf("the notice carries a verdict on a login that has not happened yet:\n%s", machine)
+	}
+}
+
+// The run is the whole point of `uploads attach` and of `claim --run`, and both
+// answer through Artifact. The human line already prints it, so the envelope an
+// agent reads must not be the one place it goes missing.
+func TestAttachedRunReachesTheSummaryAndTheHumanLine(t *testing.T) {
+	attached := &api.Artifact{
+		Slug: "art_x", State: "ready", Filename: "shot.png", ByteSize: 15,
+		Run: &api.ArtifactRun{Slug: "run_y"}, URL: "https://krowk.com/a/art_x",
+	}
+	now := time.Now()
+
+	var e struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(Artifact(attached, JSON, false, false, now)), &e); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if !strings.Contains(e.Summary, "run run_y") {
+		t.Errorf("summary = %q, want the run named", e.Summary)
+	}
+	if human := Artifact(attached, Human, false, false, now); !strings.Contains(human, "run run_y") {
+		t.Errorf("human = %q, want the run named", human)
+	}
+
+	// An artifact with no run says nothing about one rather than trailing a comma.
+	loose := *attached
+	loose.Run = nil
+	if got := Artifact(&loose, JSON, false, false, now); strings.Contains(got, "run ") {
+		t.Errorf("envelope = %s, want no run mentioned", got)
+	}
+}
+
+// The summary speaks for the whole result, so a run it did not open is named only
+// when every artifact is in it — a push given --run, however many files it was.
+func TestSummaryNamesACallerSuppliedRunForEveryFileCount(t *testing.T) {
+	one := &api.Artifact{Slug: "art_a", Filename: "a.png", ByteSize: 10, Run: &api.ArtifactRun{Slug: "run_y"}}
+	two := &api.Artifact{Slug: "art_b", Filename: "b.png", ByteSize: 20, Run: &api.ArtifactRun{Slug: "run_y"}}
+	elsewhere := &api.Artifact{Slug: "art_c", Filename: "c.png", ByteSize: 30, Run: &api.ArtifactRun{Slug: "run_z"}}
+
+	if got := summary(Result{Artifacts: []*api.Artifact{one}}); !strings.Contains(got, "run run_y") {
+		t.Errorf("one file = %q, want the run named", got)
+	}
+	if got := summary(Result{Artifacts: []*api.Artifact{one, two}}); !strings.Contains(got, "run run_y") {
+		t.Errorf("two files in one run = %q, want the run named", got)
+	}
+	// Artifacts in different runs have no single run to report, so none is claimed.
+	if got := summary(Result{Artifacts: []*api.Artifact{one, elsewhere}}); strings.Contains(got, "run ") {
+		t.Errorf("mixed runs = %q, want no run claimed", got)
+	}
+}
+
+// Human and JSON must not disagree about which run an upload went into. A push
+// given --run has the run on its artifacts and none of its own, and both formats
+// read it from the same place.
+func TestHumanAndJSONAgreeOnACallerSuppliedRun(t *testing.T) {
+	r := Result{Artifacts: []*api.Artifact{
+		{Slug: "art_a", Filename: "a.png", ByteSize: 10, Run: &api.ArtifactRun{Slug: "run_y"}, URL: "https://krowk.com/a/art_a"},
+	}}
+	now := time.Now()
+
+	if human := Upload(r, Human, false, false, now); !strings.Contains(human, "run run_y") {
+		t.Errorf("human = %q, want the run named", human)
+	}
+	var e struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(Upload(r, JSON, false, false, now)), &e); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if !strings.Contains(e.Summary, "run run_y") {
+		t.Errorf("summary = %q, want the run named", e.Summary)
+	}
+}
+
+// The registry stores run metadata verbatim from whichever client wrote it, and
+// `runs show` exists to read that back — so it meets values krowk itself never
+// records. Rendering those with fmt would print Go's own syntax at a person.
+func TestRunDetailRendersMetadataThatIsNotAString(t *testing.T) {
+	run := &api.Run{
+		Slug:   "run_x",
+		Status: "finished",
+		Metadata: json.RawMessage(`{
+			"nothing": null, "flag": true, "count": 3, "ratio": 3.5,
+			"nested": {"a": 1}, "refs": ["one", "two"], "holes": ["one", null],
+			"empty": [], "url": {"ci": "https://ci/job?a=1&b=2"}
+		}`),
+	}
+
+	got := RunDetail(run, Human, false, false)
+	field := func(name string) string {
+		for _, line := range strings.Split(got, "\n") {
+			if fields := strings.SplitN(strings.TrimSpace(line), " ", 2); fields[0] == name {
+				return strings.TrimSpace(fields[1])
+			}
+		}
+		t.Fatalf("no %q field in:\n%s", name, got)
+		return ""
+	}
+
+	for name, want := range map[string]string{
+		"flag":  "true",
+		"count": "3",
+		"ratio": "3.5",
+		// A list of plain values reads as a line; anything deeper is a structure,
+		// and flattening it would render [[1,2],[3]] and [1,2,3] alike.
+		"refs":   "one; two",
+		"nested": `{"a":1}`,
+		// A null among the values must not vanish into an empty entry, and an
+		// empty list must not read the same as a null or an empty string.
+		"holes": `["one",null]`,
+		"empty": "[]",
+		// `&` is itself here. encoding/json escapes it for embedding in HTML,
+		// which would make an ordinary CI URL unpasteable.
+		"url": `{"ci":"https://ci/job?a=1&b=2"}`,
+	} {
+		if got := field(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	// A null renders as nothing rather than as the word null.
+	if !strings.Contains(got, "nothing       \n") && !strings.HasSuffix(got, "nothing       ") {
+		t.Errorf("a null should render as an empty value:\n%q", got)
+	}
+}
+
+// A person and an agent have to be told the same number. Metadata decoded into
+// float64 silently rounds past 2^53 — build numbers, Unix times in nanoseconds
+// and snowflake ids all live up there — so the digits would differ between
+// `--format=human` and `--format=json` with nothing to say so.
+func TestALargeNumberSurvivesTheHumanRendering(t *testing.T) {
+	const exact = "1754582400123456789"
+	run := &api.Run{
+		Slug:     "run_x",
+		Status:   "open",
+		Metadata: json.RawMessage(`{"build_id": ` + exact + `, "huge": 1e300}`),
+	}
+
+	human := RunDetail(run, Human, false, false)
+	if !strings.Contains(human, exact) {
+		t.Errorf("human output lost precision, want %s in:\n%s", exact, human)
+	}
+	// And a number written in exponent form stays in it, rather than expanding
+	// to the 301 digits that would swallow the row.
+	if !strings.Contains(human, "1e300") {
+		t.Errorf("want 1e300 kept as written, got:\n%s", human)
+	}
+
+	// The JSON form carries the raw metadata, so the two must agree.
+	if encoded := RunDetail(run, JSON, false, false); !strings.Contains(encoded, exact) {
+		t.Errorf("json output = %s, want %s", encoded, exact)
+	}
+}
+
+// One row, one run. A title is free text, and `--title "$(git log -1)"` is an
+// ordinary thing for an agent to do — a newline in it would split the row and
+// read as runs that do not exist.
+func TestARunLabelStaysOnItsOwnRow(t *testing.T) {
+	label := func(fields map[string]string) string {
+		encoded, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		row := RunList(&api.RunPage{Runs: []*api.Run{{
+			Slug: "run_x", Status: "open", Metadata: encoded,
+		}}}, Listing{}, Human, false, false)
+		if strings.Count(row, "\n") != 0 {
+			t.Fatalf("the label split the row:\n%s", row)
+		}
+		return strings.TrimPrefix(row, "run_x  open  ")
+	}
+
+	if got := label(map[string]string{"title": "Fix checkout\n\nThe button did nothing.\n"}); got != "Fix checkout The button did nothing." {
+		t.Errorf("multi-line title = %q", got)
+	}
+	// Neither an escape sequence nor a bidi override may repaint the row. The
+	// override is the subtler one: it reverses everything drawn after it, so a
+	// title can make a row read as something it is not.
+	if got := label(map[string]string{"title": "\x1b[31mred\x1b[0m"}); strings.ContainsRune(got, '\x1b') {
+		t.Errorf("escape sequence survived: %q", got)
+	}
+	if got := label(map[string]string{"title": "safe ‮gnp.txt"}); strings.ContainsRune(got, '‮') {
+		t.Errorf("bidi override survived: %q", got)
+	}
+	// A joiner is kept, or a multi-part emoji breaks into its pieces.
+	if got := label(map[string]string{"title": "ship \U0001f469‍\U0001f4bb"}); !strings.Contains(got, "‍") {
+		t.Errorf("zero width joiner dropped, emoji split: %q", got)
+	}
+}
+
+// The cap is on the label, and the repo@branch rung joins two fields — clipping
+// each of them instead of the result would let a row reach twice the cap.
+func TestARunLabelIsClippedOnceWhateverItIsBuiltFrom(t *testing.T) {
+	label := func(fields map[string]string) string {
+		encoded, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		row := RunList(&api.RunPage{Runs: []*api.Run{{
+			Slug: "run_x", Status: "open", Metadata: encoded,
+		}}}, Listing{}, Human, false, false)
+		return strings.TrimPrefix(row, "run_x  open  ")
+	}
+
+	for name, fields := range map[string]map[string]string{
+		"title": {"title": strings.Repeat("x", 300)},
+		"joined": {
+			"repo":   strings.Repeat("r", 100),
+			"branch": strings.Repeat("b", 100),
+		},
+	} {
+		got := label(fields)
+		if n := len([]rune(got)); n > maxLabelRunes+1 {
+			t.Errorf("%s label is %d runes, want at most %d plus the ellipsis", name, n, maxLabelRunes)
+		}
+		if !strings.HasSuffix(got, "…") {
+			t.Errorf("%s label was not clipped: %q", name, got)
+		}
+	}
+
+	// Clipped on runes, not bytes, so a multi-byte character is never cut in
+	// half and the row stays valid UTF-8.
+	//
+	// The leading "x" is what makes this bite. Without it a byte-slice at the cap
+	// would land on a character boundary anyway — the cap divides evenly by every
+	// UTF-8 width — and the bug would go unnoticed. One odd byte in front puts the
+	// cut in the middle of a character.
+	got := label(map[string]string{"title": "x" + strings.Repeat("é", 300)})
+	if !utf8.ValidString(got) {
+		t.Errorf("clipping produced invalid UTF-8: %q", got)
+	}
+	if n := len([]rune(got)); n > maxLabelRunes+1 {
+		t.Errorf("multi-byte label is %d runes, want at most %d plus the ellipsis", n, maxLabelRunes)
 	}
 }

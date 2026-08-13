@@ -1,0 +1,115 @@
+name: Packaging
+
+# The release workflow only runs on a tag, which is the worst moment to learn
+# that .goreleaser.yaml has a typo in it. This runs the same build on every
+# change to the packaging, without publishing anything and without needing a
+# single secret.
+on:
+  pull_request:
+    paths:
+      - .goreleaser.yaml
+      - npm/**
+      - scripts/install.sh
+      - scripts/install_test.sh
+      - .github/workflows/packaging.yml
+      - .github/workflows/release.yml
+      - Makefile
+      - go.mod
+  push:
+    branches: [main]
+    paths:
+      - .goreleaser.yaml
+      - npm/**
+      - scripts/install.sh
+      - scripts/install_test.sh
+      - .github/workflows/packaging.yml
+      - .github/workflows/release.yml
+      - Makefile
+      - go.mod
+
+permissions:
+  contents: read
+
+jobs:
+  packaging:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # setup-go needs this to save its build cache; without it every run
+      # ends in "cache write denied: token has no writable scopes".
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Validate the release config
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: check
+
+      # A snapshot is a full release minus the publishing: every binary for
+      # every platform, archived and checksummed, written to dist/.
+      - name: Build a snapshot
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean --skip=publish
+
+      # Also checks the platform tables in .goreleaser.yaml, npm/build.mjs and
+      # both launchers still name the same platforms.
+      - name: Assemble the npm packages
+        run: node npm/build.mjs
+
+      # Tarballs, not the staged directories: npm links a local directory
+      # dependency, and Node resolving through the symlink would look for the
+      # platform package somewhere a real install never would.
+      - name: Pack the packages
+        run: |
+          set -eu
+          mkdir -p dist/npm-tarballs
+          for pkg in dist/npm/*/; do
+            echo "── $pkg"
+            npm pack --pack-destination "$PWD/dist/npm-tarballs" "$pkg"
+          done
+
+      # The launcher can only be exercised on the runner's own platform, but
+      # that is the path every `npx @krowk/cli` takes, so it is worth taking.
+      - name: Run both binaries through the npm launchers
+        run: |
+          set -eux
+          version="$(node -p 'require("./dist/npm/manifest.json").version')"
+          work="$(mktemp -d)"
+          cd "$work"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund \
+            "$GITHUB_WORKSPACE/dist/npm-tarballs/krowk-cli-linux-x64-$version.tgz" \
+            "$GITHUB_WORKSPACE/dist/npm-tarballs/krowk-cli-$version.tgz" \
+            "$GITHUB_WORKSPACE/dist/npm-tarballs/krowk-mcp-$version.tgz"
+          test "$(./node_modules/.bin/krowk --version)" = "$version"
+          test "$(./node_modules/.bin/krowk-mcp --version)" = "$version"
+          ./node_modules/.bin/krowk --help >/dev/null
+
+      # Serves the dist/ the snapshot step above wrote — GoReleaser's own
+      # archive and its own checksums.txt — and installs out of it, so what is
+      # tested is the release rather than a tarball the test rolled itself.
+      # That is why this lives here and not in the test suite: this is the only
+      # job that already has a release to install from.
+      - name: Install from the snapshot built above
+        run: scripts/install_test.sh

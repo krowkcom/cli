@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"strings"
 	"testing"
 
@@ -17,7 +16,7 @@ import (
 	"github.com/krowkcom/cli/internal/runctx"
 )
 
-func TestAuthVerifyReportsTheKeyAndItsScopes(t *testing.T) {
+func TestAuthVerifyReportsTheKeyAndItsWorkspace(t *testing.T) {
 	h := newHarness(t, 0)
 
 	code, stdout, stderr := h.run("auth", "verify")
@@ -27,20 +26,19 @@ func TestAuthVerifyReportsTheKeyAndItsScopes(t *testing.T) {
 	var e struct {
 		OK   bool `json:"ok"`
 		Data struct {
-			Valid     bool     `json:"valid"`
-			KeyID     string   `json:"key_id"`
-			Workspace string   `json:"workspace"`
-			Scopes    []string `json:"scopes"`
+			KeyID     string `json:"key_id"`
+			Workspace string `json:"workspace"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(stdout), &e); err != nil {
 		t.Fatalf("not JSON: %v\n%s", err, stdout)
 	}
-	if !e.OK || !e.Data.Valid || e.Data.KeyID == "" {
+	if !e.OK || e.Data.KeyID == "" {
 		t.Fatalf("verify = %s", stdout)
 	}
-	if !slices.Contains(e.Data.Scopes, "artifacts:write") {
-		t.Errorf("scopes = %v, want artifacts:write", e.Data.Scopes)
+	// The workspace is what verifying is for: it says where an upload would land.
+	if e.Data.Workspace == "" {
+		t.Errorf("verify named no workspace: %s", stdout)
 	}
 }
 
@@ -59,7 +57,7 @@ func TestAuthVerifyQuietIsTheBareKey(t *testing.T) {
 	if _, wrapped := key["ok"]; wrapped {
 		t.Errorf("--quiet should drop the envelope, got %s", stdout)
 	}
-	if key["valid"] != true {
+	if key["key_id"] == nil {
 		t.Errorf("quiet output = %s, want the key itself", stdout)
 	}
 }
@@ -80,7 +78,7 @@ func TestAuthVerifyURLFormatFallsBackToJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &e); err != nil {
 		t.Fatalf("not JSON: %v\n%s", err, stdout)
 	}
-	if !e.OK || e.Data["valid"] != true {
+	if !e.OK || e.Data["key_id"] == nil {
 		t.Errorf("--format url should fall back to the envelope, got %s", stdout)
 	}
 }
@@ -91,19 +89,21 @@ func TestAuthVerifyWithoutAKeySaysSoWithoutCallingOut(t *testing.T) {
 	h.env["KROWK_API_URL"] = "http://127.0.0.1:1/v1" // any call would fail loudly
 
 	code, _, stderr := h.run("auth", "verify")
-	if code != 1 {
-		t.Fatalf("exit %d, want 1", code)
+	if code != 3 {
+		t.Fatalf("exit %d, want 3", code)
 	}
 	if got := decode(t, stderr).Error["error"]; got != "not_authenticated" {
 		t.Errorf("error = %v, want not_authenticated", got)
 	}
 }
 
-// The registry's verdict is what counts, not the token's shape.
+// The registry's answer is what counts, not the token's shape. A key it does not
+// know is a 401 — the same refusal every other endpoint gives.
 func TestAuthVerifyRejectsAKeyTheRegistryDoesNotKnow(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"valid":false}`)
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"error":{"code":"unauthorized","message":"Provide a valid API key."}}`)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -112,11 +112,33 @@ func TestAuthVerifyRejectsAKeyTheRegistryDoesNotKnow(t *testing.T) {
 	h.env["KROWK_TOKEN"] = "hunter2"
 
 	code, _, stderr := h.run("auth", "verify")
-	if code != 1 {
-		t.Fatalf("exit %d, want 1", code)
+	if code != 3 {
+		t.Fatalf("exit %d, want 3", code)
 	}
-	if got := decode(t, stderr).Error["error"]; got != "invalid_key" {
-		t.Errorf("error = %v, want invalid_key", got)
+	if got := decode(t, stderr).Error["error"]; got != "unauthorized" {
+		t.Errorf("error = %v, want unauthorized", got)
+	}
+}
+
+// A 200 is not a yes on its own: the endpoint has to have named a key, or the
+// answer came from something that is not the registry.
+func TestAuthVerifyRejectsAnAnswerThatNamesNoKey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"welcome":"to the website"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	h := newHarness(t, 0)
+	h.env["KROWK_API_URL"] = srv.URL + "/v1"
+	h.env["KROWK_TOKEN"] = "hunter2"
+
+	code, _, stderr := h.run("auth", "verify")
+	if code != 7 {
+		t.Fatalf("exit %d, want 7", code)
+	}
+	if got := decode(t, stderr).Error["error"]; got != "malformed_response" {
+		t.Errorf("error = %v, want malformed_response", got)
 	}
 }
 
@@ -173,8 +195,10 @@ func TestDoctorReportsTheKeyAndReachability(t *testing.T) {
 	if status, _ := report["api_status"].(string); !strings.HasPrefix(status, "reachable") {
 		t.Errorf("api_status = %v, want reachable", report["api_status"])
 	}
-	if key, _ := report["key"].(string); !strings.Contains(key, "artifacts:write") {
-		t.Errorf("key = %v, want the scopes summarised", report["key"])
+	// The summary names the key and the workspace it acts in, which is what
+	// someone reading doctor's output needs to confirm.
+	if key, _ := report["key"].(string); !strings.Contains(key, "ws_") {
+		t.Errorf("key = %v, want the workspace summarised", report["key"])
 	}
 
 	// No key at all reads differently from a rejected one.
@@ -194,7 +218,7 @@ func TestDoctorReportsTheStatusThatArrived(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprint(w, `{"error":{"code":"not_found","message":"No such endpoint."}}`)
+		fmt.Fprint(w, `{"error":{"code":"no_such_endpoint","message":"No such endpoint."}}`)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -281,19 +305,27 @@ func TestDevFlagRedirectsTheClient(t *testing.T) {
 		return func(k string) string { return m[k] }
 	}
 	dev := strings.TrimRight(api.DevBaseURL, "/")
+	baseURL := func(f flags, e runctx.Env) string {
+		t.Helper()
+		client, err := newClient(f, e)
+		if err != nil {
+			t.Fatalf("newClient: %v", err)
+		}
+		return client.BaseURL
+	}
 
-	if got := newClient(flags{dev: true}, env(nil)).BaseURL; got != dev {
+	if got := baseURL(flags{dev: true}, env(nil)); got != dev {
 		t.Errorf("--dev = %q, want %q", got, dev)
 	}
 	// A flag typed on the command line beats an ambient variable.
 	staging := env(map[string]string{"KROWK_API_URL": "https://staging/v1"})
-	if got := newClient(flags{dev: true}, staging).BaseURL; got != dev {
+	if got := baseURL(flags{dev: true}, staging); got != dev {
 		t.Errorf("--dev with KROWK_API_URL set = %q, want %q", got, dev)
 	}
-	if got := newClient(flags{}, staging).BaseURL; got != "https://staging/v1" {
+	if got := baseURL(flags{}, staging); got != "https://staging/v1" {
 		t.Errorf("KROWK_API_URL = %q", got)
 	}
-	if got := newClient(flags{}, env(nil)).BaseURL; got != strings.TrimRight(api.DefaultBaseURL, "/") {
+	if got := baseURL(flags{}, env(nil)); got != strings.TrimRight(api.DefaultBaseURL, "/") {
 		t.Errorf("default = %q, want the public registry", got)
 	}
 }

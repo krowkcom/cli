@@ -1,0 +1,651 @@
+{
+  "cli": {
+    "name": "krowk",
+    "version": "",
+    "summary": "permalinks for agent output",
+    "commands": [
+      {
+        "name": "push",
+        "usage": "krowk push \u003cfile...\u003e [flags]",
+        "summary": "Upload files, get a link for each",
+        "args": [
+          {
+            "name": "file",
+            "summary": "Path to upload",
+            "required": true,
+            "repeated": true
+          }
+        ],
+        "flags": [
+          {
+            "name": "run",
+            "type": "string",
+            "default": "",
+            "usage": "Attach to an existing run instead of opening one"
+          },
+          {
+            "name": "pull-request",
+            "type": "string",
+            "default": "",
+            "usage": "Pull request the work belongs to"
+          },
+          {
+            "name": "reference",
+            "type": "string",
+            "default": "",
+            "usage": "Related link — repeat for more than one",
+            "repeatable": true
+          },
+          {
+            "name": "session",
+            "type": "string",
+            "default": "",
+            "usage": "Agent session ID"
+          },
+          {
+            "name": "title",
+            "type": "string",
+            "default": "",
+            "usage": "Label for the markdown link"
+          },
+          {
+            "name": "repo",
+            "type": "string",
+            "default": "",
+            "usage": "Override the detected repository"
+          },
+          {
+            "name": "commit",
+            "type": "string",
+            "default": "",
+            "usage": "Override the detected commit"
+          },
+          {
+            "name": "agent",
+            "type": "string",
+            "default": "",
+            "usage": "Override the detected agent"
+          },
+          {
+            "name": "metadata",
+            "type": "string",
+            "default": "",
+            "usage": "Extra key=value metadata — your value wins over a detected one. Public",
+            "repeatable": true
+          }
+        ]
+      },
+      {
+        "name": "uploads",
+        "summary": "Work with uploads",
+        "subcommands": [
+          {
+            "name": "create",
+            "usage": "krowk uploads create \u003cfile...\u003e [flags]",
+            "summary": "The same thing, spelled out",
+            "args": [
+              {
+                "name": "file",
+                "summary": "Path to upload",
+                "required": true,
+                "repeated": true
+              }
+            ],
+            "flags": [
+              {
+                "name": "run",
+                "type": "string",
+                "default": "",
+                "usage": "Attach to an existing run instead of opening one"
+              },
+              {
+                "name": "pull-request",
+                "type": "string",
+                "default": "",
+                "usage": "Pull request the work belongs to"
+              },
+              {
+                "name": "reference",
+                "type": "string",
+                "default": "",
+                "usage": "Related link — repeat for more than one",
+                "repeatable": true
+              },
+              {
+                "name": "session",
+                "type": "string",
+                "default": "",
+                "usage": "Agent session ID"
+              },
+              {
+                "name": "title",
+                "type": "string",
+                "default": "",
+                "usage": "Label for the markdown link"
+              },
+              {
+                "name": "repo",
+                "type": "string",
+                "default": "",
+                "usage": "Override the detected repository"
+              },
+              {
+                "name": "commit",
+                "type": "string",
+                "default": "",
+                "usage": "Override the detected commit"
+              },
+              {
+                "name": "agent",
+                "type": "string",
+                "default": "",
+                "usage": "Override the detected agent"
+              },
+              {
+                "name": "metadata",
+                "type": "string",
+                "default": "",
+                "usage": "Extra key=value metadata — your value wins over a detected one. Public",
+                "repeatable": true
+              }
+            ]
+          },
+          {
+            "name": "list",
+            "usage": "krowk uploads list [flags]",
+            "summary": "List uploads, newest first — a run's, or the workspace's",
+            "flags": [
+              {
+                "name": "limit",
+                "type": "int",
+                "default": "50",
+                "usage": "Rows per page (1–100)"
+              },
+              {
+                "name": "before",
+                "type": "string",
+                "default": "",
+                "usage": "Start after this row — the `next` of the last page"
+              },
+              {
+                "name": "run",
+                "type": "string",
+                "default": "",
+                "usage": "Narrow it to what one run produced"
+              }
+            ]
+          },
+          {
+            "name": "show",
+            "usage": "krowk uploads show \u003cartifact\u003e",
+            "summary": "Read one artifact back",
+            "args": [
+              {
+                "name": "artifact",
+                "summary": "The artifact slug",
+                "required": true
+              }
+            ]
+          },
+          {
+            "name": "attach",
+            "usage": "krowk uploads attach \u003cart\u003e --run \u003crun\u003e",
+            "summary": "Put an upload under a run afterwards",
+            "args": [
+              {
+                "name": "artifact",
+                "summary": "The artifact slug",
+                "required": true
+              }
+            ],
+            "flags": [
+              {
+                "name": "run",
+                "type": "string",
+                "default": "",
+                "usage": "The run to put it under — required, and it must be one this workspace holds"
+              }
+            ]
+          },
+          {
+            "name": "delete",
+            "usage": "krowk uploads delete \u003cart\u003e [token]",
+            "summary": "Take an upload down — immediate, cannot be undone",
+            "args": [
+              {
+                "name": "artifact",
+                "summary": "The artifact slug",
+                "required": true
+              },
+              {
+                "name": "claim-token",
+                "summary": "The claim token an anonymous upload came back with, when there is no key to authorise the takedown",
+                "required": false
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "runs",
+        "summary": "Work with runs",
+        "subcommands": [
+          {
+            "name": "start",
+            "usage": "krowk runs start [flags]",
+            "summary": "Open a run to group uploads under",
+            "flags": [
+              {
+                "name": "pull-request",
+                "type": "string",
+                "default": "",
+                "usage": "Pull request the work belongs to"
+              },
+              {
+                "name": "reference",
+                "type": "string",
+                "default": "",
+                "usage": "Related link — repeat for more than one",
+                "repeatable": true
+              },
+              {
+                "name": "session",
+                "type": "string",
+                "default": "",
+                "usage": "Agent session ID"
+              },
+              {
+                "name": "title",
+                "type": "string",
+                "default": "",
+                "usage": "Label for the markdown link"
+              },
+              {
+                "name": "repo",
+                "type": "string",
+                "default": "",
+                "usage": "Override the detected repository"
+              },
+              {
+                "name": "commit",
+                "type": "string",
+                "default": "",
+                "usage": "Override the detected commit"
+              },
+              {
+                "name": "agent",
+                "type": "string",
+                "default": "",
+                "usage": "Override the detected agent"
+              },
+              {
+                "name": "metadata",
+                "type": "string",
+                "default": "",
+                "usage": "Extra key=value metadata — your value wins over a detected one. Public",
+                "repeatable": true
+              }
+            ]
+          },
+          {
+            "name": "list",
+            "usage": "krowk runs list [--limit --before]",
+            "summary": "List the workspace's runs, newest first",
+            "flags": [
+              {
+                "name": "limit",
+                "type": "int",
+                "default": "50",
+                "usage": "Rows per page (1–100)"
+              },
+              {
+                "name": "before",
+                "type": "string",
+                "default": "",
+                "usage": "Start after this row — the `next` of the last page"
+              }
+            ]
+          },
+          {
+            "name": "show",
+            "usage": "krowk runs show \u003crun\u003e",
+            "summary": "Read one run back, with its metadata",
+            "args": [
+              {
+                "name": "run",
+                "summary": "The run slug",
+                "required": true
+              }
+            ]
+          },
+          {
+            "name": "finish",
+            "usage": "krowk runs finish \u003crun\u003e",
+            "summary": "Close a run",
+            "args": [
+              {
+                "name": "run",
+                "summary": "The run slug",
+                "required": true
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "claim",
+        "usage": "krowk claim \u003cartifact\u003e \u003ctoken\u003e [--run]",
+        "summary": "Keep an anonymous upload past expiry",
+        "args": [
+          {
+            "name": "artifact",
+            "summary": "The artifact slug",
+            "required": true
+          },
+          {
+            "name": "claim-token",
+            "summary": "The token the anonymous upload came back with",
+            "required": true
+          }
+        ],
+        "flags": [
+          {
+            "name": "run",
+            "type": "string",
+            "default": "",
+            "usage": "The run to group it under while claiming — a claimed upload has none otherwise"
+          }
+        ]
+      },
+      {
+        "name": "auth",
+        "summary": "Manage the API key",
+        "subcommands": [
+          {
+            "name": "login",
+            "usage": "krowk auth login [--token \u003ctoken\u003e] [--no-browser]",
+            "summary": "Approve this machine in the browser, or store a key",
+            "flags": [
+              {
+                "name": "token",
+                "type": "string",
+                "default": "",
+                "usage": "Check and store this key instead of asking the browser — how CI logs in, e.g. krowk_sk_..."
+              },
+              {
+                "name": "no-browser",
+                "type": "bool",
+                "default": "false",
+                "usage": "Print the code and the page instead of opening a browser — the default over SSH, or with no display"
+              }
+            ]
+          },
+          {
+            "name": "token",
+            "usage": "krowk auth token",
+            "summary": "Print the stored token"
+          },
+          {
+            "name": "verify",
+            "usage": "krowk auth verify",
+            "summary": "Check the key and its workspace"
+          }
+        ]
+      },
+      {
+        "name": "workspaces",
+        "summary": "The stored keys, one per workspace",
+        "subcommands": [
+          {
+            "name": "list",
+            "usage": "krowk workspaces [list]",
+            "summary": "List the stored keys, and which workspace resolves here"
+          },
+          {
+            "name": "use",
+            "usage": "krowk workspaces use \u003cworkspace\u003e",
+            "summary": "Make a stored key the machine-wide default",
+            "args": [
+              {
+                "name": "workspace",
+                "summary": "A workspace `krowk workspaces` lists, e.g. ws_9hj3kd8a — a person at a terminal may omit it and pick from a list instead",
+                "required": true
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "config",
+        "summary": "Pin a repository, or the machine, to a workspace",
+        "subcommands": [
+          {
+            "name": "show",
+            "usage": "krowk config show",
+            "summary": "The effective configuration, and which layer set each value"
+          },
+          {
+            "name": "set",
+            "usage": "krowk config set \u003ckey\u003e \u003cvalue\u003e [--global]",
+            "summary": "Write one value into the repo config, or the global one",
+            "args": [
+              {
+                "name": "key",
+                "summary": "A configuration key, e.g. `workspace`",
+                "required": true
+              },
+              {
+                "name": "value",
+                "summary": "What to set it to, e.g. ws_9hj3kd8a — for `workspace`, a person at a terminal may omit it and pick from the stored keys instead",
+                "required": true
+              }
+            ],
+            "flags": [
+              {
+                "name": "global",
+                "type": "bool",
+                "default": "false",
+                "usage": "Write the machine-wide config instead of the repository's"
+              }
+            ]
+          },
+          {
+            "name": "unset",
+            "usage": "krowk config unset \u003ckey\u003e [--global]",
+            "summary": "Remove one value from the repo config, or the global one",
+            "args": [
+              {
+                "name": "key",
+                "summary": "A configuration key, e.g. `workspace`",
+                "required": true
+              }
+            ],
+            "flags": [
+              {
+                "name": "global",
+                "type": "bool",
+                "default": "false",
+                "usage": "Write the machine-wide config instead of the repository's"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "doctor",
+        "usage": "krowk doctor",
+        "summary": "Check the local setup"
+      },
+      {
+        "name": "registry",
+        "summary": "The local registry to develop against",
+        "subcommands": [
+          {
+            "name": "serve",
+            "usage": "krowk registry serve",
+            "summary": "Run a local registry to develop against",
+            "flags": [
+              {
+                "name": "addr",
+                "type": "string",
+                "default": "127.0.0.1:8787",
+                "usage": "Listen address (loopback only by default)"
+              },
+              {
+                "name": "site",
+                "type": "string",
+                "default": "",
+                "usage": "Origin for the links it returns (default: the request host)"
+              },
+              {
+                "name": "limit-bytes",
+                "type": "int",
+                "default": "",
+                "usage": "Reject uploads above this size"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "help",
+        "usage": "krowk help [command]",
+        "summary": "Show this, or one command's own help",
+        "args": [
+          {
+            "name": "command",
+            "summary": "The command to describe, e.g. `uploads attach`",
+            "required": false
+          }
+        ]
+      }
+    ],
+    "global_flags": [
+      {
+        "name": "workspace",
+        "type": "string",
+        "default": "",
+        "usage": "Use this workspace's stored key for this one command — outranks KROWK_WORKSPACE and every config file"
+      },
+      {
+        "name": "dev",
+        "type": "bool",
+        "default": "false",
+        "usage": "Talk to a local registry at http://localhost:8787/v1"
+      },
+      {
+        "name": "format",
+        "type": "string",
+        "default": "",
+        "usage": "human | json | markdown | url (default: human on a TTY, json when piped)"
+      },
+      {
+        "name": "json",
+        "type": "bool",
+        "default": "false",
+        "usage": "Shorthand for --format json"
+      },
+      {
+        "name": "quiet",
+        "type": "bool",
+        "default": "false",
+        "usage": "Raw JSON, no envelope"
+      },
+      {
+        "name": "help",
+        "aliases": [
+          "h"
+        ],
+        "type": "bool",
+        "default": "false",
+        "usage": "Show the help"
+      },
+      {
+        "name": "version",
+        "aliases": [
+          "v"
+        ],
+        "type": "bool",
+        "default": "false",
+        "usage": "Print the version"
+      }
+    ],
+    "environment": [
+      {
+        "name": "KROWK_TOKEN",
+        "usage": "API token — wins over the credentials file"
+      },
+      {
+        "name": "KROWK_WORKSPACE",
+        "usage": "Workspace whose stored key to use, as if by --workspace — outranks the config files, loses to the flag"
+      },
+      {
+        "name": "KROWK_API_URL",
+        "usage": "API base URL",
+        "default": "https://api.krowk.com/v1"
+      },
+      {
+        "name": "KROWK_DEV",
+        "usage": "1/true/yes/on — same as --dev"
+      },
+      {
+        "name": "KROWK_AGENT",
+        "usage": "Agent name to report"
+      }
+    ]
+  },
+  "mcp_tools": [
+    {
+      "name": "krowk_claim_artifact",
+      "required": [
+        "claim_token",
+        "slug"
+      ],
+      "arguments": [
+        "claim_token",
+        "run",
+        "slug"
+      ]
+    },
+    {
+      "name": "krowk_get_artifact",
+      "required": [
+        "slug"
+      ],
+      "arguments": [
+        "slug"
+      ]
+    },
+    {
+      "name": "krowk_get_run"
+    },
+    {
+      "name": "krowk_list_artifacts",
+      "arguments": [
+        "before",
+        "limit"
+      ]
+    },
+    {
+      "name": "krowk_push",
+      "required": [
+        "files"
+      ],
+      "arguments": [
+        "agent",
+        "commit",
+        "files",
+        "metadata",
+        "pull_request",
+        "references",
+        "repo",
+        "run",
+        "session",
+        "title"
+      ]
+    },
+    {
+      "name": "krowk_verify_key"
+    }
+  ]
+}

@@ -203,7 +203,9 @@ func TestPushReturnsBothPasteFormsLabelled(t *testing.T) {
 	paste, _ := pastes[0].(map[string]any)
 	markdown, _ := paste["markdown"].(string)
 	url, _ := paste["url"].(string)
-	if !strings.HasPrefix(markdown, "![Checkout — mobile](") {
+	// The embed names the bytes and is wrapped in a link to the card page, so
+	// it starts with the wrapping link rather than with the bang.
+	if !strings.HasPrefix(markdown, "[![Checkout — mobile](") {
 		t.Errorf("paste.markdown = %q", markdown)
 	}
 	if url == "" || strings.Contains(url, "![") {
@@ -550,15 +552,16 @@ func TestGetRunReportsDetectedMetadata(t *testing.T) {
 	}
 }
 
-func TestVerifyKeyReportsScopesAndAnonymousMode(t *testing.T) {
+func TestVerifyKeyReportsTheWorkspaceAndAnonymousMode(t *testing.T) {
 	s := newSession(t, "krk_test")
 
 	result := s.callTool("krowk_verify_key", nil)
 	if result["isError"] == true {
 		t.Fatalf("failed: %s", text(t, result))
 	}
-	if body := text(t, result); !strings.Contains(body, "artifacts:write") {
-		t.Errorf("text = %q, want the scopes", body)
+	// An agent needs to know where its uploads land, which is the workspace.
+	if body := text(t, result); !strings.Contains(body, "workspace") {
+		t.Errorf("text = %q, want the workspace", body)
 	}
 
 	// Without a key the answer is "anonymous", not an error — pushing still works.
@@ -577,30 +580,22 @@ func TestVerifyKeyReportsScopesAndAnonymousMode(t *testing.T) {
 func TestClaimAdoptsAnAnonymousPushIntoTheWorkspace(t *testing.T) {
 	anon := newSession(t, "")
 
-	pushed := anon.callTool("krowk_push", map[string]any{"files": []string{anon.fixture}})
-	structured, _ := pushed["structuredContent"].(map[string]any)
-	artifacts, _ := structured["artifacts"].([]any)
-	artifact, _ := artifacts[0].(map[string]any)
-	slug, _ := artifact["slug"].(string)
-	claim, _ := artifact["claim_token"].(string)
-	if slug == "" || claim == "" {
-		t.Fatalf("anonymous push returned no claimable artifact: %+v", artifact)
-	}
+	slug, claim := anon.anonymousPush()
 
 	// Same registry, now with a key.
-	keyed := &session{t: t, server: &Server{
-		Client:  api.New(anon.server.Client.BaseURL, "krowk_sk_test"),
-		Env:     anon.server.Env,
-		Root:    anon.server.Root,
-		Version: anon.server.Version,
-		Now:     anon.server.Now,
-	}, fixture: anon.fixture}
+	keyed := anon.withKey("krowk_sk_test")
 
 	claimed := keyed.callTool("krowk_claim_artifact", map[string]any{
 		"slug": slug, "claim_token": claim,
 	})
 	if claimed["isError"] == true {
 		t.Fatalf("claim failed: %s", text(t, claimed))
+	}
+	// A claim with no run leaves the upload under nothing, and this tool is the
+	// only way it ever gets one — the same gap the CLI closes with a breadcrumb.
+	// There are no breadcrumbs here, so it has to be in the text.
+	if body := text(t, claimed); !strings.Contains(body, "It belongs to no run") {
+		t.Errorf("a claim with no run says nothing about grouping it:\n%s", body)
 	}
 
 	listed := keyed.callTool("krowk_list_artifacts", nil)
@@ -619,6 +614,190 @@ func TestClaimAdoptsAnAnonymousPushIntoTheWorkspace(t *testing.T) {
 	if body := text(t, unlisted); !strings.Contains(body, "unauthorized") {
 		t.Errorf("text = %q, want unauthorized", body)
 	}
+}
+
+// The agent spending the claim token is the one that knows which run the upload
+// came from, so claiming takes the run rather than a separate attach tool. An
+// anonymous upload has no run and no other way to get one.
+func TestClaimGroupsTheAdoptedUploadUnderARun(t *testing.T) {
+	anon := newSession(t, "")
+	slug, claim := anon.anonymousPush()
+
+	keyed := anon.withKey("krowk_sk_test")
+	run := keyed.startRun()
+
+	claimed := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": slug, "claim_token": claim, "run": run,
+	})
+	if claimed["isError"] == true {
+		t.Fatalf("claim with a run failed: %s", text(t, claimed))
+	}
+	// And a claim that did name a run is not told to go and find one.
+	if body := text(t, claimed); strings.Contains(body, "It belongs to no run") {
+		t.Errorf("an upload already grouped was told it belongs to no run:\n%s", body)
+	}
+	if body := text(t, claimed); !strings.Contains(body, "Grouped under run "+run) {
+		t.Errorf("text = %q, want the grouping named the way a push names it", body)
+	}
+	structured, _ := claimed["structuredContent"].(map[string]any)
+	artifact, _ := structured["artifact"].(map[string]any)
+	if runSlugOf(artifact) != run {
+		t.Errorf("artifact run = %v, want %q", artifact["run"], run)
+	}
+}
+
+// The claim is spent before the attach is tried, so a failing attach must not
+// read as a claim the agent can simply repeat.
+func TestAFailedAttachSaysTheClaimStillLanded(t *testing.T) {
+	anon := newSession(t, "")
+	slug, claim := anon.anonymousPush()
+	keyed := anon.withKey("krowk_sk_test")
+
+	failed := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": slug, "claim_token": claim, "run": "run_nosuchrunatall00000",
+	})
+	if failed["isError"] != true {
+		t.Fatalf("attaching to an unknown run should fail: %+v", failed)
+	}
+	body := text(t, failed)
+	if !strings.Contains(body, "claimed and kept") {
+		t.Errorf("text = %q, want it to say the claim landed", body)
+	}
+	// The retry has to be one this transport can make. An agent here cannot shell
+	// out, so naming the CLI's `uploads attach` would be advice it cannot follow.
+	if !strings.Contains(body, "krowk_claim_artifact again") {
+		t.Errorf("text = %q, want the retry to be a tool call", body)
+	}
+	if strings.Contains(body, "uploads attach") {
+		t.Errorf("text = %q, want no shell command on the MCP surface", body)
+	}
+	structured, _ := failed["structuredContent"].(map[string]any)
+	if structured["claimed"] != slug {
+		t.Errorf("claimed = %v, want %q", structured["claimed"], slug)
+	}
+
+	// And the advice works: the same slug and token, with a run that exists, is the
+	// same success — which is what makes re-calling the tool the retry.
+	run := keyed.startRun()
+	retried := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": slug, "claim_token": claim, "run": run,
+	})
+	if retried["isError"] == true {
+		t.Fatalf("the advertised retry failed: %s", text(t, retried))
+	}
+	structured, _ = retried["structuredContent"].(map[string]any)
+	artifact, _ := structured["artifact"].(map[string]any)
+	if runSlugOf(artifact) != run {
+		t.Errorf("retry left run = %v, want %q", artifact["run"], run)
+	}
+}
+
+// A server whose checkout pinned a workspace it could not resolve serves on, but
+// nothing it creates may land in the anonymous workspace instead: that is the
+// silent misdirection — a link that works, pointing at the wrong place.
+func TestAnUnresolvedWorkspaceRefusesUploadsAndStillReads(t *testing.T) {
+	s := newSession(t, "")
+
+	// Something to read back later, uploaded while the server still could.
+	slug, _ := s.anonymousPush()
+
+	s.server.WorkspaceErr = api.Fail("no_stored_key",
+		"run `krowk auth login`, or `krowk workspaces` to see what is stored")
+
+	for _, tool := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"krowk_push", map[string]any{"files": []string{s.fixture}}},
+		{"krowk_list_artifacts", nil},
+		{"krowk_claim_artifact", map[string]any{"slug": slug, "claim_token": "krowk_claim_whatever"}},
+	} {
+		result := s.callTool(tool.name, tool.args)
+		if result["isError"] != true {
+			t.Fatalf("%s should be refused, got %+v", tool.name, result)
+		}
+		body := text(t, result)
+		if !strings.Contains(body, "no_stored_key") || !strings.Contains(body, "krowk auth login") {
+			t.Errorf("%s text = %q, want the workspace reason and its fix", tool.name, body)
+		}
+	}
+
+	// Reading needs no credential, so it is unaffected.
+	got := s.callTool("krowk_get_artifact", map[string]any{"slug": slug})
+	if got["isError"] == true {
+		t.Fatalf("reading an artifact should still work: %s", text(t, got))
+	}
+	if body := text(t, got); !strings.Contains(body, "Artifact "+slug) {
+		t.Errorf("text = %q, want the artifact", body)
+	}
+	if run := s.callTool("krowk_get_run", nil); run["isError"] == true {
+		t.Fatalf("run context should still work: %s", text(t, run))
+	}
+}
+
+// And the agent can find out why, rather than guessing from a refusal.
+func TestVerifyKeyReportsAnUnresolvedWorkspace(t *testing.T) {
+	s := newSession(t, "")
+	s.server.WorkspaceErr = api.Fail("config_unreadable", "fix `.krowk/config.json` and restart the server")
+
+	result := s.callTool("krowk_verify_key", nil)
+	// A status tool reports the state it is in; it does not fail because of it.
+	if result["isError"] == true {
+		t.Fatalf("verify_key should report, not fail: %s", text(t, result))
+	}
+	body := text(t, result)
+	if !strings.Contains(body, "config_unreadable") || !strings.Contains(body, ".krowk/config.json") {
+		t.Errorf("text = %q, want the reason and its fix", body)
+	}
+	structured, _ := result["structuredContent"].(map[string]any)
+	if structured["authenticated"] != false {
+		t.Errorf("authenticated = %v, want false", structured["authenticated"])
+	}
+	if got, _ := structured["workspace_error"].(string); !strings.Contains(got, "config_unreadable") {
+		t.Errorf("workspace_error = %q, want the reason", got)
+	}
+}
+
+// anonymousPush uploads the fixture without a key and returns the slug and the
+// claim token it came back with.
+func (s *session) anonymousPush() (slug, claimToken string) {
+	s.t.Helper()
+	pushed := s.callTool("krowk_push", map[string]any{"files": []string{s.fixture}})
+	structured, _ := pushed["structuredContent"].(map[string]any)
+	artifacts, _ := structured["artifacts"].([]any)
+	if len(artifacts) == 0 {
+		s.t.Fatalf("push returned nothing: %+v", pushed)
+	}
+	artifact, _ := artifacts[0].(map[string]any)
+	slug, _ = artifact["slug"].(string)
+	claimToken, _ = artifact["claim_token"].(string)
+	if slug == "" || claimToken == "" {
+		s.t.Fatalf("anonymous push returned no claimable artifact: %+v", artifact)
+	}
+	return slug, claimToken
+}
+
+// withKey is the same registry seen through a keyed client, which is how the
+// claim flow's two halves are exercised in one test.
+func (s *session) withKey(token string) *session {
+	return &session{t: s.t, server: &Server{
+		Client:  api.New(s.server.Client.BaseURL, token),
+		Env:     s.server.Env,
+		Root:    s.server.Root,
+		Version: s.server.Version,
+		Now:     s.server.Now,
+	}, fixture: s.fixture}
+}
+
+// startRun opens a run to attach to. There is no tool for it — runs are the
+// CLI's business — so it goes through the client the server holds.
+func (s *session) startRun() string {
+	s.t.Helper()
+	run, err := s.server.Client.CreateRun(context.Background(), map[string]any{"agent": "test"})
+	if err != nil {
+		s.t.Fatalf("create run: %v", err)
+	}
+	return run.Slug
 }
 
 func TestUnknownToolAndMethodAreProtocolErrors(t *testing.T) {
@@ -768,4 +947,13 @@ func TestEveryLineOnStdoutIsAJSONRPCResponse(t *testing.T) {
 			t.Errorf("response has no id: %q", line)
 		}
 	}
+}
+
+// runSlugOf digs the slug out of the run an artifact reports. The run rides on
+// an artifact as a nested object rather than as a bare slug, so a client
+// reading one back learns what produced it without a second call.
+func runSlugOf(artifact map[string]any) string {
+	run, _ := artifact["run"].(map[string]any)
+	slug, _ := run["slug"].(string)
+	return slug
 }

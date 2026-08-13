@@ -26,7 +26,14 @@ type Metadata struct {
 	// checkout" records nothing at all — every key is optional, never defaulted.
 	Dirty   *bool  `json:"krowk.vcs.dirty,omitempty"`
 	Harness string `json:"krowk.harness,omitempty"`
-	Client  string `json:"krowk.client,omitempty"`
+	// Model and System are recorded only when the environment actually says.
+	// KROWK_MODEL is the harness-agnostic spelling any wrapper can export;
+	// the vendor variables are the signals specific harnesses already honour.
+	// No signal, no key: a guessed model in an audit record is worse than
+	// none, and --metadata can always spell one out.
+	Model  string `json:"gen_ai.request.model,omitempty"`
+	System string `json:"gen_ai.system,omitempty"`
+	Client string `json:"krowk.client,omitempty"`
 
 	// Facts about the work, not about one file: run-only.
 	ChangeID    string   `json:"vcs.change.id,omitempty"`
@@ -52,7 +59,7 @@ type Overrides struct {
 	Commit      string
 	Agent       string
 	PullRequest string
-	Reference   []string
+	References  []string
 	Session     string
 	Title       string
 	Client      string
@@ -67,9 +74,12 @@ func Resolve(env Env, o Overrides) Metadata {
 	override(&m.Harness, o.Agent)
 	override(&m.ChangeURL, o.PullRequest)
 	override(&m.Session, o.Session)
-	m.References = o.Reference
+	m.References = o.References
 	m.ChangeTitle = o.Title
 	m.Client = o.Client
+	// An overridden harness re-decides the provider: the claim has to follow
+	// the correction, not the detection it replaced.
+	m.System = DetectSystem(m.Harness, m.Model)
 	m.ChangeID = ChangeID(m.ChangeURL)
 	m.reconcileRepo()
 	return m
@@ -92,13 +102,43 @@ func Detect(env Env) Metadata {
 		Branch:     git("rev-parse", "--abbrev-ref", "HEAD"),
 		Dirty:      dirty(),
 		Harness:    DetectAgent(env),
+		Model:      DetectModel(env),
 		Session:    DetectSession(env),
 		ChangeURL:  CIPullRequest(env),
 		remoteSlug: Slug(remote),
 	}
+	m.System = DetectSystem(m.Harness, m.Model)
 	m.ChangeID = ChangeID(m.ChangeURL)
 	m.reconcileRepo()
 	return m
+}
+
+// DetectModel names the model that did the work. KROWK_MODEL first, because it
+// is ours and any harness can export it; ANTHROPIC_MODEL is a signal Claude
+// Code already honours, so when it is set it names the model in use.
+func DetectModel(env Env) string {
+	return firstNonEmpty(
+		env("KROWK_MODEL"),
+		env("ANTHROPIC_MODEL"),
+	)
+}
+
+// DetectSystem names the provider, and only when something actually implies
+// it: the model's own family, or Claude Code as the harness — that harness
+// runs Anthropic models wherever they are hosted. Anything else stays unsaid
+// rather than guessed; --metadata gen_ai.system=... spells out the rest.
+func DetectSystem(harness, model string) string {
+	switch {
+	case strings.HasPrefix(model, "claude"):
+		return "anthropic"
+	case strings.HasPrefix(model, "gpt"):
+		return "openai"
+	case strings.HasPrefix(model, "gemini"):
+		return "gcp.gemini"
+	case harness == "claude-code":
+		return "anthropic"
+	}
+	return ""
 }
 
 // Artifact is the production stamp for one file: the snapshot of this moment,

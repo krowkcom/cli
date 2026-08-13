@@ -53,7 +53,8 @@ If a push comes back anonymous, each artifact carries a claim_token. Spending it
 — krowk_claim_artifact, or ` + "`krowk claim <slug> <token>`" + ` — is the only way to
 keep that upload past its expiry, and anyone holding the token can do it. Treat
 it as a secret: give it to the human, never paste it into a pull request, an
-issue or a chat message.
+issue or a chat message. An anonymous upload belongs to no run, so pass the run
+to krowk_claim_artifact if the upload should be grouped with the rest of them.
 
 krowk_push only uploads files from the working directory and below. Anything
 outside it is refused, symlinks included, and credential files are refused even
@@ -79,6 +80,19 @@ type Server struct {
 	// krowk_push into "read any file on this machine and publish it at a URL I can
 	// fetch without credentials". Empty means the working directory.
 	Root string
+	// WorkspaceErr is why this server holds no key when it was supposed to hold
+	// one: a configuration file it could not read, or a workspace the config
+	// pinned that has no key stored for it. It is nil in the ordinary anonymous
+	// case, where having no key is the intended state rather than a failure.
+	//
+	// It exists because the alternative to serving is not serving: an artifact
+	// needs no credential to read, and an anonymous push plus a claim token is a
+	// whole working flow, so refusing to start takes those away over a problem
+	// they do not have. What it must not do is let an upload land in the
+	// anonymous workspace when a repository asked for a named one — silently
+	// putting the file somewhere other than where the config said. So the tools
+	// that would create something there refuse with this instead.
+	WorkspaceErr error
 	// Now is swapped out in tests so expiry text is stable.
 	Now func() time.Time
 }
@@ -429,6 +443,20 @@ func describeError(err error) string {
 	return strings.Join(lines, "\n")
 }
 
+// workspaceReason renders WorkspaceErr as one line. An *api.Error's Error() is
+// only its code, and the code alone ("no_stored_key") does not tell anyone what
+// to do, so the fix comes with it.
+func workspaceReason(err error) string {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return err.Error()
+	}
+	if fix := apiErr.Fix(); fix != "" {
+		return apiErr.Code() + " — " + fix
+	}
+	return apiErr.Code()
+}
+
 func errorPayload(err error) any {
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) {
@@ -457,7 +485,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Run         string            `json:"run"`
 		Title       string            `json:"title"`
 		PullRequest string            `json:"pull_request"`
-		Reference   []string          `json:"reference"`
+		References  []string          `json:"references"`
 		Session     string            `json:"session"`
 		Repo        string            `json:"repo"`
 		Commit      string            `json:"commit"`
@@ -469,6 +497,13 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 	}
 	if len(a.Files) == 0 {
 		return "", nil, api.Fail("no_file", "pass at least one path in `files`")
+	}
+	// A push creates the thing the workspace was pinned for. Uploading it
+	// anonymously instead would be the misdirection this refusal exists to
+	// prevent: the file would be published, the link would work, and it would be
+	// in the wrong place with nothing saying so.
+	if s.WorkspaceErr != nil {
+		return "", nil, s.WorkspaceErr
 	}
 
 	// Confine before reading anything: an instruction the model picked up from a
@@ -505,7 +540,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Commit:      a.Commit,
 		Agent:       a.Agent,
 		PullRequest: a.PullRequest,
-		Reference:   a.Reference,
+		References:  a.References,
 		Session:     a.Session,
 		Title:       a.Title,
 		Client:      "krowk-mcp/" + s.Version,
@@ -517,8 +552,8 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		}
 		run, runSlug, ownRun = created, created.Slug, true
 	}
-	if !s.Client.Authenticated() && (a.PullRequest != "" || len(a.Reference) > 0 || a.Session != "" || len(a.Metadata) > 0) {
-		notes = append(notes, "pull_request, reference, session and metadata were not recorded: "+
+	if !s.Client.Authenticated() && (a.PullRequest != "" || len(a.References) > 0 || a.Session != "" || len(a.Metadata) > 0) {
+		notes = append(notes, "pull_request, references, session and metadata were not recorded: "+
 			"a keyless upload records no metadata, and opening a run needs an API key")
 	}
 
@@ -578,6 +613,30 @@ func withProgress(err error, done []*api.Artifact, runSlug string, ownRun bool) 
 	return apiErr
 }
 
+// withClaimed says what a failed attach leaves behind: the claim succeeded and
+// the token is spent, so the upload is kept and only the run is missing.
+//
+// The retry it names is this tool again, not the CLI's `uploads attach` — an agent
+// on this transport is here precisely because it cannot shell out, and advice it
+// cannot follow is worse than none. Calling claim again works because a repeat
+// claim with the same key is the same success rather than a spent-token error, so
+// the whole call can simply be made again with a run that exists.
+func withClaimed(err error, claimed *api.Artifact) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	apiErr.Body["claimed"] = claimed.Slug
+	retry := "the upload is claimed and kept, only the run is not attached — call " +
+		"krowk_claim_artifact again with the same slug and claim_token, and a run this " +
+		"workspace holds; claiming twice with the same key is the same success"
+	if fix, _ := apiErr.Body["fix"].(string); fix != "" {
+		retry = fix + "; " + retry
+	}
+	apiErr.Body["fix"] = retry
+	return apiErr
+}
+
 func listArtifacts(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
 	var a struct {
 		Limit  int    `json:"limit"`
@@ -585,6 +644,13 @@ func listArtifacts(ctx context.Context, s *Server, args json.RawMessage) (string
 	}
 	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
 		return "", nil, api.Fail("bad_arguments", "`limit` must be a number and `before` a slug")
+	}
+	// This one creates nothing, but the only listing it could return is the
+	// pinned workspace's, and without a key the registry would answer
+	// `unauthorized` — true, and no help at all in finding the malformed config
+	// or the missing key that caused it. Say the real reason instead.
+	if s.WorkspaceErr != nil {
+		return "", nil, s.WorkspaceErr
 	}
 
 	page, err := s.Client.ListArtifacts(ctx, strings.TrimSpace(a.Before), a.Limit)
@@ -610,6 +676,10 @@ func listArtifacts(ctx context.Context, s *Server, args json.RawMessage) (string
 	return strings.Join(lines, "\n"), page, nil
 }
 
+// getArtifact reads, and reading needs no credential — an artifact is published
+// at a URL anyone with the link can fetch. So it works unchanged when
+// WorkspaceErr is set, as does krowk_get_run, which never touches the registry
+// at all. A server that cannot resolve its workspace is still useful for these.
 func getArtifact(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
 	var a struct {
 		Slug string `json:"slug"`
@@ -628,23 +698,74 @@ func getArtifact(ctx context.Context, s *Server, args json.RawMessage) (string, 
 	return s.render(artifact, "")
 }
 
+// claimArtifact adopts an anonymous upload, and optionally puts it under a run on
+// the way — the agent spending the claim token is the one that knows which run the
+// upload came from, so there is no separate attach tool. The order is fixed: the
+// attach resolves both slugs in the key's workspace, so the claim has to land
+// first.
 func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
 	var a struct {
 		Slug       string `json:"slug"`
 		ClaimToken string `json:"claim_token"`
+		Run        string `json:"run"`
 	}
 	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
-		return "", nil, api.Fail("bad_arguments", "`slug` and `claim_token` must be strings")
+		return "", nil, api.Fail("bad_arguments", "`slug`, `claim_token` and `run` must be strings")
 	}
 	if strings.TrimSpace(a.Slug) == "" || strings.TrimSpace(a.ClaimToken) == "" {
 		return "", nil, api.Fail("missing_claim", "pass both the artifact slug and its claim_token")
+	}
+	// A claim moves an upload into the key's workspace and keeps it there, so it
+	// is a creation in the pinned workspace by another name — and the token is
+	// one-shot, so a claim that lands in the wrong workspace cannot be redone.
+	// Refuse before spending it.
+	if s.WorkspaceErr != nil {
+		return "", nil, s.WorkspaceErr
 	}
 
 	artifact, err := s.Client.ClaimArtifact(ctx, strings.TrimSpace(a.Slug), strings.TrimSpace(a.ClaimToken))
 	if err != nil {
 		return "", nil, err
 	}
-	return s.render(artifact, "")
+
+	runSlug := strings.TrimSpace(a.Run)
+	if runSlug != "" {
+		// The claim has already been spent, so a failure here must not read as one
+		// the agent can undo by calling the tool again: the artifact is kept, and
+		// only the run is missing.
+		attached, err := s.Client.AttachRun(ctx, artifact.Slug, runSlug)
+		if err != nil {
+			return "", nil, withClaimed(err, artifact)
+		}
+		artifact = attached
+	}
+
+	text, structured, err := s.render(artifact, "")
+	if err != nil {
+		return "", nil, err
+	}
+	if runSlug != "" {
+		// renderPush's line, without the status it puts in brackets: attaching answers
+		// with the artifact, so the run's state is not among the facts in hand, and a
+		// second call to fetch it would buy nothing the agent asked for.
+		text += "\n\nGrouped under run " + runSlug + "."
+	} else if artifact.RunSlug() == "" {
+		// The same thing the CLI's claim hands back: the upload is kept but belongs
+		// to no run, and nothing else will ever put it in one. There are no
+		// breadcrumbs on this transport, so it is a line rather than a crumb — but
+		// it is said, instead of being left in the tool schema for an agent that has
+		// already stopped reading it.
+		//
+		// The way out named here is this tool again, the same as withClaimed's: an
+		// agent on this transport cannot shell out to `uploads attach`, and a repeat
+		// claim with the same key and token is the same success rather than a
+		// spent-token error, so the whole call can simply be made again with a run.
+		text += "\n\nIt belongs to no run. A run is where the pull request, commit and " +
+			"session are recorded — call krowk_claim_artifact again with the same slug and " +
+			"claim_token and a `run` this workspace holds to group it under one; claiming " +
+			"twice with the same key is the same success."
+	}
+	return text, structured, nil
 }
 
 func getRun(_ context.Context, s *Server, _ json.RawMessage) (string, any, error) {
@@ -671,6 +792,16 @@ func getRun(_ context.Context, s *Server, _ json.RawMessage) (string, any, error
 }
 
 func verifyKey(ctx context.Context, s *Server, _ json.RawMessage) (string, any, error) {
+	// The question this tool answers is where uploads land, and "nowhere, for
+	// this reason" is an answer rather than a failure — an agent that just had a
+	// push refused reads it here to find out why, so it is reported, not raised.
+	if s.WorkspaceErr != nil {
+		return "This server has no API key, and it was meant to have one: " + workspaceReason(s.WorkspaceErr) +
+				"\n\nUploads, claims and listings are refused rather than landing in the anonymous " +
+				"workspace, because this checkout's config names a workspace of its own. Looking up " +
+				"an artifact still works. Fix the key or the config and restart the server.",
+			map[string]any{"authenticated": false, "workspace_error": workspaceReason(s.WorkspaceErr)}, nil
+	}
 	if s.Client.Token == "" {
 		return "No API key is configured, so pushes will be anonymous: they expire within a day " +
 				"and come back with a claim token.\n\nSet KROWK_TOKEN, or run `krowk auth login --token krowk_sk_...`.",
@@ -684,10 +815,12 @@ func verifyKey(ctx context.Context, s *Server, _ json.RawMessage) (string, any, 
 	lines := []string{
 		"Key " + key.KeyID + " is valid.",
 		"  workspace  " + key.Workspace,
-		"  scopes     " + strings.Join(key.Scopes, " "),
 	}
-	if !key.HasScope(api.ScopeWrite) {
-		lines = append(lines, "", "This key cannot upload — it is missing "+api.ScopeWrite+".")
+	if key.Name != "" {
+		lines = append(lines, "  name       "+key.Name)
+	}
+	if key.ExpiresAt != "" {
+		lines = append(lines, "  expires    "+key.ExpiresAt)
 	}
 	return strings.Join(lines, "\n"), key, nil
 }
@@ -772,6 +905,10 @@ func pasteLines(paste output.Paste) []string {
 
 // claimLines carries the one-shot claim token of an anonymous upload, with the
 // warning it deserves.
+//
+// The command comes from output.ClaimCrumb, which is exported for exactly this:
+// the CLI's envelope, the CLI's human line and this server all name the same
+// call, and spelling it out a fourth time here is how the four drift apart.
 func claimLines(a *api.Artifact) []string {
 	if a.ClaimToken == "" {
 		return nil
@@ -780,7 +917,7 @@ func claimLines(a *api.Artifact) []string {
 		"",
 		"This upload is anonymous and nobody owns it yet. The command below adopts it —",
 		"the token is a secret, so hand it to the human and do not paste it anywhere public:",
-		"krowk claim " + a.Slug + " " + a.ClaimToken,
+		output.ClaimCrumb(a).Cmd,
 	}
 }
 
@@ -820,7 +957,7 @@ func toolSchemas() []map[string]any {
 						"type":        "string",
 						"description": "URL of the pull request this work belongs to.",
 					},
-					"reference": map[string]any{
+					"references": map[string]any{
 						"type":        "array",
 						"items":       map[string]any{"type": "string"},
 						"description": "Related links, e.g. the issue being fixed.",
@@ -872,7 +1009,7 @@ func toolSchemas() []map[string]any {
 				"properties": map[string]any{
 					"slug": map[string]any{
 						"type":        "string",
-						"description": "Artifact slug, e.g. art_9f3c2e1abcdEFGH123456.",
+						"description": "Artifact slug, e.g. art_9f3c2e1a7b04d6c8e5f1a2b3.",
 					},
 				},
 				"additionalProperties": false,
@@ -881,18 +1018,25 @@ func toolSchemas() []map[string]any {
 		{
 			"name": "krowk_claim_artifact",
 			"description": "Spend a claim token to move an anonymous artifact into the key's " +
-				"workspace, where it stops expiring. Needs an API key.",
+				"workspace, where it stops expiring. Pass `run` to also group it under a run — " +
+				"an anonymous upload could not name one, so this is the only way it gets one. " +
+				"Needs an API key.",
 			"inputSchema": map[string]any{
 				"type":     "object",
 				"required": []string{"slug", "claim_token"},
 				"properties": map[string]any{
 					"slug": map[string]any{
 						"type":        "string",
-						"description": "Artifact slug, e.g. art_9f3c2e1abcdEFGH123456.",
+						"description": "Artifact slug, e.g. art_9f3c2e1a7b04d6c8e5f1a2b3.",
 					},
 					"claim_token": map[string]any{
 						"type":        "string",
 						"description": "The claim token the anonymous push returned, e.g. krowk_claim_...",
+					},
+					"run": map[string]any{
+						"type": "string",
+						"description": "Run to attach the claimed upload to, e.g. run_... Attached after " +
+							"the claim, so it must be a run in this key's workspace.",
 					},
 				},
 				"additionalProperties": false,
@@ -910,8 +1054,10 @@ func toolSchemas() []map[string]any {
 		},
 		{
 			"name": "krowk_verify_key",
-			"description": "Check whether an API key is configured and what it is allowed to do. " +
-				"Without a key, pushes still work but are anonymous and expire in 24h.",
+			"description": "Check whether an API key is configured, and which workspace uploads " +
+				"made with it land in. Without a key, pushes still work but are anonymous and expire in 24h. " +
+				"Call it when a push is refused: if this checkout pinned a workspace the server could not " +
+				"reach, the reason is here.",
 			"inputSchema": map[string]any{
 				"type":                 "object",
 				"properties":           map[string]any{},

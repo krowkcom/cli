@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -477,6 +478,375 @@ func TestSetDefaultWorkspaceOnAnEmptyStoreSaysToLogIn(t *testing.T) {
 	}
 	if msg := err.Error(); !strings.Contains(msg, "krowk auth login") {
 		t.Errorf("error = %q, want it to point at `krowk auth login`", msg)
+	}
+}
+
+// A writer that cannot read the store must not write it. The lenient read every
+// reader uses would hand a writer an empty store, and the writer would put one
+// key on disk where all of someone's keys used to be — silently, and with the
+// exit status of a success.
+func TestSaveCredentialsRefusesToWriteOverAStoreItCannotRead(t *testing.T) {
+	path := isolate(t)
+	corrupt := `{"default":"acme","workspaces":{"acme":{"token":"krowk_sk_a`
+	writeRaw(t, path, corrupt)
+
+	if _, err := SaveCredentials("krowk_sk_new", Identity{KeyID: "key_2", Workspace: "personal"}); err == nil {
+		t.Fatal("logging in over an unreadable store succeeded, want a refusal")
+	} else if msg := err.Error(); !strings.Contains(msg, path) {
+		t.Errorf("error = %q, want it to name the file the user has to go and look at", msg)
+	}
+
+	// The refusal is only worth anything if the bytes it refused to touch are
+	// still exactly there.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != corrupt {
+		t.Errorf("credentials file changed:\n%s", data)
+	}
+}
+
+func TestSetDefaultWorkspaceRefusesToWriteOverAStoreItCannotRead(t *testing.T) {
+	path := isolate(t)
+	corrupt := `{"default":"acme","workspaces":{"acme":{"token":"krowk_sk_a`
+	writeRaw(t, path, corrupt)
+
+	if _, err := SetDefaultWorkspace("acme"); err == nil {
+		t.Fatal("repointing the default in an unreadable store succeeded, want a refusal")
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != corrupt {
+		t.Errorf("credentials file changed:\n%s", data)
+	}
+}
+
+// Strictness is about not destroying keys, and a file that is not there holds
+// none. The first login on a fresh machine has to stay an ordinary success.
+func TestSaveCredentialsWritesHappilyWhenThereIsNoFileYet(t *testing.T) {
+	isolate(t)
+
+	if _, err := SaveCredentials("krowk_sk_first", Identity{KeyID: "key_1", Workspace: "acme"}); err != nil {
+		t.Fatalf("first login on a machine with no credentials file failed: %v", err)
+	}
+	if token := ReadToken(noEnv, "acme"); token != "krowk_sk_first" {
+		t.Errorf("token = %q", token)
+	}
+}
+
+// The environment is the answer whatever the file says, including when the file
+// would otherwise have produced a refusal — CI exports a token precisely so
+// nothing has to be stored, and a stale name in someone's dotfiles must not fail
+// a build over a key it is not using.
+func TestResolveTokenPrefersTheEnvironmentEvenOverANameWithNoKey(t *testing.T) {
+	isolate(t)
+
+	if _, err := SaveCredentials("krowk_sk_acme", Identity{KeyID: "key_1", Workspace: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+
+	env := withEnv("krowk_sk_from_ci")
+	for _, ws := range []string{"", "acme", "nowhere"} {
+		token, err := ResolveToken(env, ws)
+		if err != nil {
+			t.Errorf("workspace %q: %v", ws, err)
+		}
+		if token != "krowk_sk_from_ci" {
+			t.Errorf("token for %q = %q, want the environment's", ws, token)
+		}
+	}
+}
+
+func TestResolveTokenReturnsTheNamedWorkspacesKey(t *testing.T) {
+	isolate(t)
+
+	if _, err := SaveCredentials("krowk_sk_acme", Identity{KeyID: "key_1", Workspace: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SaveCredentials("krowk_sk_personal", Identity{KeyID: "key_2", Workspace: "personal"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The named one, not the default — the last login is personal.
+	token, err := ResolveToken(noEnv, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "krowk_sk_acme" {
+		t.Errorf("token = %q, want acme's", token)
+	}
+	if token, err := ResolveToken(noEnv, ""); err != nil || token != "krowk_sk_personal" {
+		t.Errorf("default token = %q, err = %v", token, err)
+	}
+}
+
+// A repo that pins a workspace has said which account its uploads belong to.
+// Sending them anonymously instead would put them somewhere nobody on that team
+// can find them, so this refuses rather than falls back.
+func TestResolveTokenRefusesAWorkspaceWithNoKey(t *testing.T) {
+	isolate(t)
+
+	if _, err := SaveCredentials("krowk_sk_acme", Identity{KeyID: "key_1", Workspace: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+
+	token, err := ResolveToken(noEnv, "nowhere")
+	if err == nil {
+		t.Fatal("a workspace with no stored key resolved, want a refusal")
+	}
+	if token != "" {
+		t.Errorf("token = %q, want none alongside the error", token)
+	}
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "no_key_for_workspace" {
+		t.Fatalf("error = %v, want code no_key_for_workspace", err)
+	}
+	// The usual cause is a typo or a login on the other machine, so the message
+	// has to show what is actually there.
+	if fix := apiErr.Fix(); !strings.Contains(fix, "acme") {
+		t.Errorf("fix = %q, want it to list the stored names", fix)
+	}
+}
+
+// With nothing stored at all there is no list to offer, so the message has to
+// say what to do instead.
+func TestResolveTokenOnAnEmptyStoreSaysToLogIn(t *testing.T) {
+	isolate(t)
+
+	_, err := ResolveToken(noEnv, "acme")
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "no_key_for_workspace" {
+		t.Fatalf("error = %v, want code no_key_for_workspace", err)
+	}
+	if fix := apiErr.Fix(); !strings.Contains(fix, "krowk auth login") {
+		t.Errorf("fix = %q, want it to point at `krowk auth login`", fix)
+	}
+}
+
+// A store that says which key to use and then cannot produce it is broken, not
+// anonymous. Uploading anonymously here is the silent failure the refusal exists
+// to prevent.
+func TestResolveTokenRefusesADanglingDefault(t *testing.T) {
+	path := isolate(t)
+	writeRaw(t, path, `{"default":"ws_gone","workspaces":{"ws_acme":{"token":"krowk_sk_acme","key_id":"key_1","workspace":"ws_acme"}}}`)
+
+	// The store still reads fine for anyone asking by name.
+	if token, err := ResolveToken(noEnv, "ws_acme"); err != nil || token != "krowk_sk_acme" {
+		t.Errorf("named token = %q, err = %v", token, err)
+	}
+
+	token, err := ResolveToken(noEnv, "")
+	if err == nil {
+		t.Fatal("a default pointing at nothing resolved, want a refusal")
+	}
+	if token != "" {
+		t.Errorf("token = %q, want none alongside the error", token)
+	}
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "dangling_default" {
+		t.Fatalf("error = %v, want code dangling_default", err)
+	}
+	fix := apiErr.Fix()
+	for _, want := range []string{"ws_gone", "ws_acme", "krowk workspaces use"} {
+		if !strings.Contains(fix, want) {
+			t.Errorf("fix = %q, want it to mention %q", fix, want)
+		}
+	}
+}
+
+// Uploading without an account is a feature. Nothing stored and nothing named
+// is the one case where no token is the right answer rather than a failure.
+func TestResolveTokenIsAnonymousWithNothingStored(t *testing.T) {
+	isolate(t)
+
+	token, err := ResolveToken(noEnv, "")
+	if err != nil {
+		t.Fatalf("an empty store must be the anonymous case, not a failure: %v", err)
+	}
+	if token != "" {
+		t.Errorf("token = %q, want none", token)
+	}
+}
+
+// The offline login this heals: the key was really for ws_team, but the registry
+// could not say so at the time, so it sits under "default" claiming nothing.
+func TestAdoptIdentityRefilesAnOfflineLoginUnderTheWorkspaceItTurnedOutToBe(t *testing.T) {
+	isolate(t)
+
+	if _, err := SaveCredentials("krowk_sk_offline", Identity{KeyID: "key_7f3a"}); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := AdoptIdentity("krowk_sk_offline", Identity{
+		KeyID: "key_7f3a", Workspace: "ws_team", WorkspaceName: "The Team",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Error("changed = false, want the re-filing reported")
+	}
+
+	// The point of the whole exercise: a repo pinning ws_team now finds a key.
+	token, err := ResolveToken(noEnv, "ws_team")
+	if err != nil || token != "krowk_sk_offline" {
+		t.Errorf("ws_team token = %q, err = %v", token, err)
+	}
+	// The default followed the entry that moved, so an unqualified command keeps
+	// using the key it was using before verify ran.
+	if token, err := ResolveToken(noEnv, ""); err != nil || token != "krowk_sk_offline" {
+		t.Errorf("default token = %q, err = %v", token, err)
+	}
+	stored := StoredWorkspaces()
+	if len(stored) != 1 || stored[0].Name != "ws_team" || !stored[0].Default {
+		t.Fatalf("stored = %+v, want one default entry named ws_team", stored)
+	}
+	if stored[0].WorkspaceName != "The Team" {
+		t.Errorf("workspace name = %q, want what the registry finally said", stored[0].WorkspaceName)
+	}
+	if id, ok := ReadIdentity(noEnv, "ws_team"); !ok || id.Workspace != "ws_team" {
+		t.Errorf("identity = %+v, ok = %v", id, ok)
+	}
+}
+
+// A key the registry vouches for outranks whatever stale record was filed under
+// the name — most likely a revoked key from an earlier login to the same place.
+func TestAdoptIdentityReplacesAStaleEntryUnderThatWorkspace(t *testing.T) {
+	isolate(t)
+
+	if _, err := SaveCredentials("krowk_sk_stale", Identity{KeyID: "key_old", Workspace: "ws_team"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SaveCredentials("krowk_sk_offline", Identity{KeyID: "key_new"}); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := AdoptIdentity("krowk_sk_offline", Identity{KeyID: "key_new", Workspace: "ws_team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Error("changed = false, want the replacement reported")
+	}
+
+	stored := StoredWorkspaces()
+	if len(stored) != 1 || stored[0].Name != "ws_team" {
+		t.Fatalf("stored = %+v, want only ws_team — the entry moved rather than being copied", stored)
+	}
+	if token, err := ResolveToken(noEnv, "ws_team"); err != nil || token != "krowk_sk_offline" {
+		t.Errorf("token = %q, err = %v — want the key the registry just vouched for", token, err)
+	}
+	if token := ReadToken(noEnv, "default"); token != "" {
+		t.Errorf("token still filed under \"default\" = %q, want the entry gone", token)
+	}
+}
+
+// Verifying twice must not keep rewriting the file, and a key the store has
+// never seen is not the store's business.
+func TestAdoptIdentityChangesNothingItShouldNot(t *testing.T) {
+	path := isolate(t)
+
+	if _, err := SaveCredentials("krowk_sk_offline", Identity{KeyID: "key_7f3a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AdoptIdentity("krowk_sk_offline", Identity{KeyID: "key_7f3a", Workspace: "ws_team"}); err != nil {
+		t.Fatal(err)
+	}
+	settled, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct {
+		what  string
+		token string
+		id    Identity
+	}{
+		{"a second verify of the same key", "krowk_sk_offline", Identity{KeyID: "key_7f3a", Workspace: "ws_team"}},
+		{"a token from the environment that was never stored", "krowk_sk_from_ci", Identity{KeyID: "key_9", Workspace: "ws_other"}},
+		{"a registry answer naming no workspace", "krowk_sk_offline", Identity{KeyID: "key_7f3a"}},
+	} {
+		changed, err := AdoptIdentity(c.token, c.id)
+		if err != nil {
+			t.Fatalf("%s: %v", c.what, err)
+		}
+		if changed {
+			t.Errorf("%s: changed = true, want nothing to have happened", c.what)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != string(settled) {
+			t.Errorf("%s rewrote the store:\n%s", c.what, data)
+		}
+	}
+}
+
+// The registry can have more to say about a key already filed in the right
+// place — a workspace that has since been renamed, say — and that is a change
+// worth recording even though nothing moves.
+func TestAdoptIdentityUpdatesAnEntryAlreadyInTheRightPlace(t *testing.T) {
+	isolate(t)
+
+	if _, err := SaveCredentials("krowk_sk_team", Identity{KeyID: "key_1", Workspace: "ws_team"}); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := AdoptIdentity("krowk_sk_team", Identity{
+		KeyID: "key_1", Workspace: "ws_team", WorkspaceName: "Renamed Team",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Error("changed = false, want the newer name recorded")
+	}
+	stored := StoredWorkspaces()
+	if len(stored) != 1 || stored[0].WorkspaceName != "Renamed Team" {
+		t.Errorf("stored = %+v, want the name the registry reports now", stored)
+	}
+}
+
+// Healing a store is no excuse for overwriting one, so verify refuses the same
+// unreadable file a login refuses.
+func TestAdoptIdentityRefusesToWriteOverAStoreItCannotRead(t *testing.T) {
+	path := isolate(t)
+	corrupt := `{"default":"acme","workspaces":{"acme":{"token":"krowk_sk_a`
+	writeRaw(t, path, corrupt)
+
+	if _, err := AdoptIdentity("krowk_sk_acme", Identity{KeyID: "key_1", Workspace: "ws_team"}); err == nil {
+		t.Fatal("adopting into an unreadable store succeeded, want a refusal")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != corrupt {
+		t.Errorf("credentials file changed:\n%s", data)
+	}
+}
+
+// A legacy file is old, not broken, so the strict path writers use has to
+// migrate it exactly as the lenient one does — otherwise the first login after
+// an upgrade refuses instead of carrying the key across.
+func TestAdoptIdentityHealsAMigratedLegacyKey(t *testing.T) {
+	path := isolate(t)
+	writeRaw(t, path, `{"token":"krowk_sk_old","key_id":"key_1"}`)
+
+	changed, err := AdoptIdentity("krowk_sk_old", Identity{KeyID: "key_1", Workspace: "ws_team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Error("changed = false, want the migrated key re-filed")
+	}
+	if token, err := ResolveToken(noEnv, "ws_team"); err != nil || token != "krowk_sk_old" {
+		t.Errorf("ws_team token = %q, err = %v", token, err)
 	}
 }
 

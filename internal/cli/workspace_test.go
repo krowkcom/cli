@@ -188,6 +188,10 @@ func TestKrowkTokenOutranksAPinnedWorkspace(t *testing.T) {
 func TestAMalformedConfigFailsRatherThanBeingShruggedOff(t *testing.T) {
 	h := newWorkspaceHarness(t)
 	dir := repoDir(t)
+	// Keyless, or the environment's token would — correctly — outrank the
+	// broken file and the push would succeed. The refusal under test is for
+	// the machine whose uploads the file was actually steering.
+	delete(h.env, "KROWK_TOKEN")
 	if err := os.MkdirAll(filepath.Join(dir, ".krowk"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -202,6 +206,137 @@ func TestAMalformedConfigFailsRatherThanBeingShruggedOff(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "bad_config") {
 		t.Errorf("the failure does not name itself: %s", stderr)
+	}
+}
+
+// TestKrowkTokenOutranksABrokenConfig pins the strongest-word rule at its
+// hardest edge: CI exports a token into a checkout whose committed config it
+// does not control, and a config file that machine cannot even parse must not
+// be able to take the token's place in line.
+func TestKrowkTokenOutranksABrokenConfig(t *testing.T) {
+	h := newWorkspaceHarness(t)
+	dir := repoDir(t)
+	if err := os.MkdirAll(filepath.Join(dir, ".krowk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".krowk", "config.json"),
+		[]byte(`{"workspace": `), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.env["KROWK_TOKEN"] = "krowk_sk_from_ci"
+
+	if code, _, stderr := h.run("push", h.fixture, "--json"); code != 0 {
+		t.Fatalf("push with KROWK_TOKEN over a broken config = %d, stderr %s", code, stderr)
+	} else if got := h.lastAuthorization(); got != "Bearer krowk_sk_from_ci" {
+		t.Errorf("sent %q, want the environment's key", got)
+	}
+}
+
+// TestADanglingDefaultRefusesRatherThanUploadingAnonymously covers the store
+// saying which key to use and not being able to produce it: the answer is a
+// refusal, never the anonymous workspace the pointer exists to avoid.
+func TestADanglingDefaultRefusesRatherThanUploadingAnonymously(t *testing.T) {
+	h := newWorkspaceHarness(t)
+	repoDir(t)
+	storeKeys(t, h, "ws_acme")
+	// Point the default at an entry that is not there, the way a hand edit or
+	// a dotfile sync does.
+	path := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "krowk", "credentials.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path,
+		[]byte(strings.Replace(string(data), `"default":"ws_acme"`, `"default":"ws_gone"`, 1)),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, stderr := h.run("push", h.fixture, "--json")
+	if code != exitAuth {
+		t.Errorf("push with a dangling default = %d, want %d\n%s", code, exitAuth, stderr)
+	}
+	if !strings.Contains(stderr, "dangling_default") {
+		t.Errorf("the refusal does not name itself: %s", stderr)
+	}
+}
+
+// TestAClaimTokenTakedownWorksInAPinnedKeylessRepo holds the takedown to its
+// own authority model: the claim token speaks for the upload, so a workspace
+// pin this machine holds no key for — which rightly stops an upload — must not
+// stop it.
+func TestAClaimTokenTakedownWorksInAPinnedKeylessRepo(t *testing.T) {
+	h := newWorkspaceHarness(t)
+	dir := repoDir(t)
+	delete(h.env, "KROWK_TOKEN")
+
+	// An anonymous upload first, to have a claim token to spend.
+	code, stdout, stderr := h.run("push", h.fixture, "--json")
+	if code != 0 {
+		t.Fatalf("anonymous push = %d, stderr %s", code, stderr)
+	}
+	var pushed struct {
+		Data struct {
+			Artifacts []struct {
+				Slug       string `json:"slug"`
+				ClaimToken string `json:"claim_token"`
+			} `json:"artifacts"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &pushed); err != nil || len(pushed.Data.Artifacts) == 0 {
+		t.Fatalf("push did not answer an artifact: %v\n%s", err, stdout)
+	}
+	art := pushed.Data.Artifacts[0]
+
+	// Now the repo pins a workspace nobody here ever logged into.
+	if err := os.MkdirAll(filepath.Join(dir, ".krowk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".krowk", "config.json"),
+		[]byte(`{"workspace": "ws_team"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if code, _, stderr := h.run("uploads", "delete", art.Slug, art.ClaimToken, "--json"); code != 0 {
+		t.Errorf("token-authorised takedown in a pinned keyless repo = %d, stderr %s", code, stderr)
+	}
+}
+
+// TestWorkspacesListSaysWhenTheResolvedWorkspaceHoldsNoKey keeps the listing
+// honest: "uploads from here land in X" is a claim every push in the directory
+// would contradict when X holds no key, and an agent believes the listing.
+func TestWorkspacesListSaysWhenTheResolvedWorkspaceHoldsNoKey(t *testing.T) {
+	h := newWorkspaceHarness(t)
+	dir := repoDir(t)
+	storeKeys(t, h, "ws_acme")
+	if err := os.MkdirAll(filepath.Join(dir, ".krowk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".krowk", "config.json"),
+		[]byte(`{"workspace": "ws_team"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := h.run("workspaces", "list", "--json")
+	if code != 0 {
+		t.Fatalf("workspaces list = %d, stderr %s", code, stderr)
+	}
+	var envelope struct {
+		Data struct {
+			Resolved   string `json:"resolved"`
+			KeyMissing bool   `json:"key_missing"`
+		} `json:"data"`
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &envelope); err != nil {
+		t.Fatalf("workspaces list did not answer JSON: %v\n%s", err, stdout)
+	}
+	if envelope.Data.Resolved != "ws_team" || !envelope.Data.KeyMissing {
+		t.Errorf("resolved = %q key_missing = %v, want the pin named and the missing key flagged",
+			envelope.Data.Resolved, envelope.Data.KeyMissing)
+	}
+	if !strings.Contains(envelope.Summary, "no key") {
+		t.Errorf("summary does not warn about the missing key: %s", envelope.Summary)
 	}
 }
 

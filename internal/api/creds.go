@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -91,18 +92,44 @@ func CredentialsPath() string {
 
 // readCredentials returns what is on disk, in the current shape whatever shape
 // it was written in. Every failure reads the same as an empty file, because
-// there is nothing a caller could do differently: a missing file, an unreadable
-// one and a corrupt one all mean "no key here", and the fix for all three is to
-// log in again.
+// there is nothing a *reader* could do differently: a missing file, an
+// unreadable one and a corrupt one all mean "no key here", and the fix for all
+// three is to log in again.
+//
+// This leniency is for readers only, and writers must use readCredentialsStrict
+// instead. The asymmetry is deliberate and it is not a style choice: a reader
+// that misses a key runs anonymously or fails the one command a person is
+// watching, while a writer that misreads the store as empty writes a one-entry
+// file over every key in it and says nothing.
+func readCredentials() credentials {
+	c, err := readCredentialsStrict()
+	if err != nil {
+		return credentials{}
+	}
+	return c
+}
+
+// readCredentialsStrict returns the store for a caller that is about to write it
+// back, and it separates the one case where writing is safe from the two where
+// it is not. No file at all is an empty store and a fine thing to write over —
+// there is nothing there to lose. A file that exists but cannot be read, or that
+// is not the store's JSON, is an error: those bytes may well be somebody's keys,
+// and the lenient read would hand back an empty store that the writer would then
+// commit over all of them.
 //
 // Migration happens here and only here, so that reading an old file is enough
 // to keep working after an upgrade — nobody logs in again to get their key back.
-// The file on disk is left as it is until the next SaveCredentials, which writes
-// the new shape.
-func readCredentials() credentials {
-	data, err := os.ReadFile(CredentialsPath())
+// A legacy file is valid, not corrupt, so it migrates on the strict path too and
+// a login over one keeps the key it held. The file on disk is left as it is
+// until the next write, which writes the new shape.
+func readCredentialsStrict() (credentials, error) {
+	path := CredentialsPath()
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return credentials{}
+		if errors.Is(err, os.ErrNotExist) {
+			return credentials{}, nil
+		}
+		return credentials{}, unreadableStore(path, err)
 	}
 
 	// Decoding to raw members first is what keeps a corrupt file and a legacy
@@ -112,21 +139,33 @@ func readCredentials() credentials {
 	// credentials could not tell them apart — it would silently accept the old
 	// file as an empty store and lose a working key.
 	var raw map[string]json.RawMessage
-	if json.Unmarshal(data, &raw) != nil {
-		return credentials{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return credentials{}, unreadableStore(path, err)
 	}
 	if _, ok := raw["workspaces"]; !ok {
 		if _, legacy := raw["token"]; legacy {
-			return migrateLegacy(data)
+			return migrateLegacy(path, data)
 		}
-		return credentials{}
+		// A JSON object with neither member holds no keys, so there is nothing a
+		// write could destroy and no reason to refuse one.
+		return credentials{}, nil
 	}
 
 	var c credentials
-	if json.Unmarshal(data, &c) != nil {
-		return credentials{}
+	if err := json.Unmarshal(data, &c); err != nil {
+		return credentials{}, unreadableStore(path, err)
 	}
-	return c
+	return c, nil
+}
+
+// unreadableStore is what a writer is told when the store it was about to
+// rewrite could not be read. It names the file, because the person reading this
+// is the only one who can go and look at it, and it says what the refusal bought
+// them: the alternative to this error is a file with one key in it where all of
+// theirs used to be.
+func unreadableStore(path string, cause error) error {
+	return fmt.Errorf("cannot read the existing credentials at %s: %w — refusing to write, "+
+		"because writing over a store that cannot be read would replace every key stored in it with this one", path, cause)
 }
 
 // migrateLegacy reads the one-token shape `{"token":..., "key_id":...,
@@ -135,13 +174,16 @@ func readCredentials() credentials {
 // which is exactly where a key the registry could not confirm goes today — and
 // the default pointer names it, because with one key there is nothing else it
 // could sensibly point at.
-func migrateLegacy(data []byte) credentials {
+//
+// A file that announces itself as legacy by carrying a token and then does not
+// parse as one is corrupt, not old, so it is refused rather than read as empty.
+func migrateLegacy(path string, data []byte) (credentials, error) {
 	var legacy storedKey
-	if json.Unmarshal(data, &legacy) != nil {
-		return credentials{}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return credentials{}, unreadableStore(path, err)
 	}
 	if legacy.Token == "" {
-		return credentials{}
+		return credentials{}, nil
 	}
 	name := legacy.Workspace
 	if name == "" {
@@ -150,7 +192,7 @@ func migrateLegacy(data []byte) credentials {
 	return credentials{
 		Default:    name,
 		Workspaces: map[string]storedKey{name: legacy},
-	}
+	}, nil
 }
 
 // entry resolves the workspace a caller named against the store. An empty name
@@ -178,6 +220,70 @@ func ReadToken(env func(string) string, workspace string) string {
 	}
 	k, _ := readCredentials().entry(workspace)
 	return k.Token
+}
+
+// names lists the entry names in the store, sorted, so an error message that
+// offers them back to a person reads the same twice in a row.
+func (c credentials) names() []string {
+	out := make([]string, 0, len(c.Workspaces))
+	for name := range c.Workspaces {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ResolveToken answers which token a command run against workspace should send,
+// applying the whole policy in one place: KROWK_TOKEN wins over everything; a
+// workspace named but holding no key is a refusal, not an anonymous fallback;
+// and "" means the store's default — where a default pointer naming a missing
+// entry is also a refusal, because a store that SAYS which key to use and cannot
+// produce it must not quietly produce none. No workspace named and nothing
+// stored is the anonymous case: ("", nil), which is how uploading without an
+// account keeps working.
+//
+// Every consumer that has to decide between authenticating, refusing and going
+// anonymous calls this — the CLI's client, `auth token`, the MCP server — so
+// that the three of them cannot drift into three different answers about the
+// same store. ReadToken above stays the lenient low-level read and reports a
+// missing key as an empty string; a caller that wants any of the refusals above
+// must come through here, because ReadToken cannot tell them apart.
+func ResolveToken(env func(string) string, workspace string) (string, error) {
+	if t := env("KROWK_TOKEN"); t != "" {
+		return t, nil
+	}
+	c := readCredentials()
+
+	if workspace != "" {
+		if k, ok := c.Workspaces[workspace]; ok && k.Token != "" {
+			return k.Token, nil
+		}
+		if names := c.names(); len(names) > 0 {
+			return "", Fail("no_key_for_workspace",
+				"no key is stored for workspace "+workspace+" — stored: "+strings.Join(names, ", ")+
+					"; run `krowk auth login` to add one")
+		}
+		return "", Fail("no_key_for_workspace",
+			"no key is stored for workspace "+workspace+", and nothing else is stored either — "+
+				"run `krowk auth login` first")
+	}
+
+	// Nothing named and nothing pointed at is the anonymous case, and it is a
+	// normal one: uploading without an account is a feature, not a misconfigured
+	// store.
+	if c.Default == "" {
+		return "", nil
+	}
+	if k, ok := c.Workspaces[c.Default]; ok && k.Token != "" {
+		return k.Token, nil
+	}
+	stored := "nothing is stored under any name"
+	if names := c.names(); len(names) > 0 {
+		stored = "stored: " + strings.Join(names, ", ")
+	}
+	return "", Fail("dangling_default",
+		"the default names "+c.Default+", and no key is stored under that name — "+stored+
+			"; run `krowk workspaces use <name>` to point the default at a stored key, or `krowk auth login`")
 }
 
 // TokenSource names where ReadToken just got its token, so diagnostics can say
@@ -235,8 +341,15 @@ func ReadIdentity(env func(string) string, workspace string) (Identity, bool) {
 // The fresh key becomes the default because logging in is how a person says
 // which workspace they mean to be working in now. Anything else would have the
 // login appear to do nothing.
+//
+// A store that is there but cannot be read fails the login instead of replacing
+// it. Losing every other key is a far worse outcome than a login someone can
+// simply run again once they have looked at the file the error names.
 func SaveCredentials(token string, id Identity) (string, error) {
-	c := readCredentials()
+	c, err := readCredentialsStrict()
+	if err != nil {
+		return "", err
+	}
 	if c.Workspaces == nil {
 		c.Workspaces = map[string]storedKey{}
 	}
@@ -255,6 +368,66 @@ func SaveCredentials(token string, id Identity) (string, error) {
 	c.Default = name
 
 	return writeCredentials(c)
+}
+
+// AdoptIdentity re-files a stored token under the identity the registry has now
+// vouched for. It finds whichever entry holds exactly this token, moves it under
+// id.Workspace with the identity recorded, replaces any entry already filed
+// there — a key the registry vouches for outranks whatever stale record held the
+// name — points the default at it when the default pointed at the entry that
+// moved, and reports whether anything changed.
+//
+// This is how an offline login gets healed. A `--token` login the registry could
+// not reach files under "default" with no identity at all, and a repo that pins
+// its own workspace then finds no key there and tells the user to log in — the
+// command they just ran. `krowk auth verify` is the moment the registry finally
+// answers, so it is the moment the store can be told what the key really was.
+//
+// A token no entry holds changes nothing: it came from the environment or was
+// never stored, and neither is this store's business to rewrite. The read is the
+// strict one, because healing a store is no excuse for overwriting one that
+// could not be read.
+func AdoptIdentity(token string, id Identity) (changed bool, err error) {
+	if token == "" || id.Workspace == "" {
+		return false, nil
+	}
+	c, err := readCredentialsStrict()
+	if err != nil {
+		return false, err
+	}
+
+	// Sorted, so that a store which somehow holds the same token twice heals the
+	// same way every time rather than however the map felt like iterating.
+	from := ""
+	for _, name := range c.names() {
+		if c.Workspaces[name].Token == token {
+			from = name
+			break
+		}
+	}
+	if from == "" {
+		return false, nil
+	}
+
+	want := storedKey{
+		Token: token, KeyID: id.KeyID,
+		Workspace: id.Workspace, WorkspaceName: id.WorkspaceName,
+	}
+	// Already filed where it belongs and saying the same thing: verifying a key
+	// twice must not keep rewriting the file.
+	if from == id.Workspace && c.Workspaces[from] == want {
+		return false, nil
+	}
+
+	delete(c.Workspaces, from)
+	c.Workspaces[id.Workspace] = want
+	if c.Default == from {
+		c.Default = id.Workspace
+	}
+	if _, err := writeCredentials(c); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // StoredWorkspaces lists every stored key, sorted by name so the listing is the
@@ -290,16 +463,19 @@ func StoredWorkspaces() []WorkspaceKey {
 // user could not connect to the command that caused it. The error lists what is
 // stored instead, because the usual cause is a typo or a half-remembered name
 // and the answer is right there.
+//
+// Like a login, it refuses outright when the store is there but unreadable,
+// rather than repointing a default in a file it would write with one entry in
+// place of everything the user has.
 func SetDefaultWorkspace(name string) (string, error) {
-	c := readCredentials()
+	c, err := readCredentialsStrict()
+	if err != nil {
+		return "", err
+	}
 	if _, ok := c.Workspaces[name]; !ok {
-		stored := StoredWorkspaces()
-		if len(stored) == 0 {
+		names := c.names()
+		if len(names) == 0 {
 			return "", errors.New("no workspace keys are stored — run `krowk auth login` first")
-		}
-		names := make([]string, 0, len(stored))
-		for _, k := range stored {
-			names = append(names, k.Name)
 		}
 		return "", errors.New("no stored key named " + name + " — stored: " + strings.Join(names, ", "))
 	}

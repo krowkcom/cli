@@ -99,6 +99,7 @@ environment variable — so never guess at a spelling this file does not carry.
 | Upload several, one run | `krowk push a.png b.log --json` |
 | Upload with PR context | `krowk push shot.png --pull-request https://github.com/acme/app/pull/12 --json` |
 | Label the markdown link | `krowk push shot.png --title "Cart after the fix" --json` |
+| Record an extra metadata key | `krowk push shot.png --metadata krowk.caption="before the fix" --json` |
 | Markdown to paste in a PR | `krowk push shot.png --format markdown` |
 | Bare URL to paste in Slack | `krowk push shot.png --format url` |
 | Open a run to group under | `krowk runs start --session "$SESSION" --json` |
@@ -235,9 +236,13 @@ krowk push build.log  --run run_8Kd2wq --json
 krowk runs finish run_8Kd2wq --json
 ```
 
-Metadata is recorded on the run, once, when it is opened — repo, commit, branch
-and agent are detected, so pass only what detection cannot know. Afterwards,
-`krowk runs show run_8Kd2wq --json` lists everything the run produced.
+The run records the work — PR, session, references — once, when opened. Every
+push also stamps that artifact with the state it finds *then*: commit, branch,
+dirty, harness, model. So `before.png` and `after.png` pushed across a mid-run
+commit carry two different revisions, which is the point. All of it is detected;
+pass only what detection cannot know, and `--metadata key=value` (repeatable)
+for anything else — your value beats a detected one. Metadata is public.
+Afterwards, `krowk runs show run_8Kd2wq --json` lists everything the run produced.
 
 ### Sign in when there is no key to paste
 
@@ -313,7 +318,10 @@ repository. Then tell the person exactly what was exposed, and rotate it.
 |----------|------|
 | `KROWK_TOKEN` | API key, e.g. `krowk_sk_…`. Outranks the stored credentials file |
 | `KROWK_API_URL` | Base URL of the registry. Default `https://api.krowk.com/v1` |
-| `KROWK_AGENT` | Agent name recorded on runs. Detected otherwise |
+| `KROWK_WORKSPACE` | Workspace whose stored key to use, as if by `--workspace` |
+| `KROWK_AGENT` | Harness name recorded as `krowk.harness`. Detected otherwise |
+| `KROWK_SESSION` | Session ID recorded as `krowk.session`. Detected otherwise |
+| `KROWK_MODEL` | Model recorded as `gen_ai.request.model`. `ANTHROPIC_MODEL` also read |
 | `KROWK_DEV` | `1`/`true`/`yes`/`on` — same as `--dev`, a local registry |
 
 A stored key lives at `~/.config/krowk/credentials.json`, mode 0600, written by

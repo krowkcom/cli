@@ -477,6 +477,11 @@
         "summary": "Check the local setup"
       },
       {
+        "name": "upgrade",
+        "usage": "krowk upgrade",
+        "summary": "Upgrade krowk to the latest release"
+      },
+      {
         "name": "registry",
         "summary": "The local registry to develop against",
         "subcommands": [
@@ -591,6 +596,10 @@
       {
         "name": "KROWK_AGENT",
         "usage": "Agent name to report"
+      },
+      {
+        "name": "KROWK_NO_UPDATE_CHECK",
+        "usage": "1/true/yes/on — never check for or mention new releases"
       }
     ]
   },

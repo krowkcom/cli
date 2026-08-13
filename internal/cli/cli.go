@@ -26,7 +26,10 @@ import (
 )
 
 // Version is stamped at build time: -ldflags "-X .../internal/cli.Version=1.2.3".
-var Version = "0.1.0"
+// The default is "dev", not a number: an unstamped `go build` is a source build,
+// and calling it one keeps `upgrade` and the update notice honest about it —
+// neither will touch a build that git owns.
+var Version = "dev"
 
 // defaultRegistryAddr is where `registry serve` listens, matching api.DevBaseURL
 // so --dev finds it with no configuration.
@@ -100,6 +103,7 @@ Environment
   KROWK_API_URL          API base URL (default %s)
   KROWK_DEV              1/true/yes/on — same as --dev
   KROWK_AGENT            Agent name to report
+  KROWK_NO_UPDATE_CHECK  1/true/yes/on — never check for or mention new releases
 
 Exit codes
   0  it worked
@@ -303,6 +307,8 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		err = registryServe(stdout, f)
 	case positionals[0] == "doctor":
 		err = doctor(stdout, format, f, env)
+	case positionals[0] == "upgrade":
+		err = upgradeCmd(stdout, f, format, env, colour)
 	default:
 		err = api.Fail("unknown_command",
 			"`"+strings.Join(clip(positionals, 2), " ")+"` is not a krowk command — run `krowk --help`")
@@ -310,6 +316,12 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 
 	if err != nil {
 		return report(stderr, err, format, f.quiet, colour)
+	}
+	// The nudge comes last, after the command's own output, and only when the
+	// command worked: a failure has the floor. `upgrade` just answered the same
+	// question, and `registry serve` only gets here when the server stops.
+	if positionals[0] != "upgrade" && positionals[0] != "registry" {
+		maybeNotifyUpdate(stderr, env)
 	}
 	return 0
 }

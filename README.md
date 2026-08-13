@@ -60,6 +60,7 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 | `krowk config set workspace ws_9hj3kd8a` | Pin this repository to a workspace (`--global` for the machine) |
 | `krowk config show` / `unset <key>` | The effective configuration and which layer set it, or remove a value |
 | `krowk doctor` | Report version, connectivity, auth and detected run context |
+| `krowk upgrade` | Upgrade krowk to the latest release |
 
 Push flags: `--run`, `--pull-request`, `--reference` (repeatable), `--session`, `--title`, `--metadata key=value` (repeatable), plus `--repo` / `--commit` / `--agent` to override detection. Without a key, uploads land anonymously, expire in 24 hours and return a one-shot claim token.
 
@@ -125,6 +126,7 @@ Tools: `krowk_push`, `krowk_list_artifacts`, `krowk_get_artifact`, `krowk_claim_
 | `KROWK_API_URL` | Point at a self-hosted registry |
 | `KROWK_AGENT` | Override the detected agent name |
 | `KROWK_MODEL` | Name the model doing the work (`gen_ai.request.model`) — harness-agnostic; `ANTHROPIC_MODEL` is also read |
+| `KROWK_NO_UPDATE_CHECK` | `1`/`true` — never check for or mention new releases |
 
 Credentials from `krowk auth login` live in `~/.config/krowk/credentials.json` (0600), one key per workspace. Which key a command uses resolves in order: `--workspace` → `KROWK_WORKSPACE` → `.krowk/config.json` at the git root → `~/.config/krowk/config.json` → whichever key logged in last. Commit the repo file and everyone who clones the repository — person or agent — uploads to the right workspace without naming it; the file selects among keys already on the machine and never carries one itself.
 

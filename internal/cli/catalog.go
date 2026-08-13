@@ -303,6 +303,7 @@ func catalog() Catalog {
 				},
 			},
 			{Name: "doctor", Usage: "krowk doctor", Summary: "Check the local setup"},
+			{Name: "upgrade", Usage: "krowk upgrade", Summary: "Upgrade krowk to the latest release"},
 			{
 				Name:    "registry",
 				Summary: "The local registry to develop against",
@@ -354,6 +355,8 @@ func catalog() Catalog {
 			{Name: "KROWK_API_URL", Usage: "API base URL", Default: api.DefaultBaseURL},
 			{Name: "KROWK_DEV", Usage: "1/true/yes/on — same as --dev"},
 			{Name: "KROWK_AGENT", Usage: "Agent name to report"},
+			{Name: "KROWK_NO_UPDATE_CHECK",
+				Usage: "1/true/yes/on — never check for or mention new releases"},
 		},
 	}
 }

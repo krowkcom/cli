@@ -453,15 +453,16 @@ var tools = map[string]tool{
 
 func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
 	var a struct {
-		Files       []string `json:"files"`
-		Run         string   `json:"run"`
-		Title       string   `json:"title"`
-		PullRequest string   `json:"pull_request"`
-		Reference   []string `json:"reference"`
-		Session     string   `json:"session"`
-		Repo        string   `json:"repo"`
-		Commit      string   `json:"commit"`
-		Agent       string   `json:"agent"`
+		Files       []string          `json:"files"`
+		Run         string            `json:"run"`
+		Title       string            `json:"title"`
+		PullRequest string            `json:"pull_request"`
+		Reference   []string          `json:"reference"`
+		Session     string            `json:"session"`
+		Repo        string            `json:"repo"`
+		Commit      string            `json:"commit"`
+		Agent       string            `json:"agent"`
+		Metadata    map[string]string `json:"metadata"`
 	}
 	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
 		return "", nil, api.Fail("bad_arguments", "`files` must be an array of paths")
@@ -499,31 +500,39 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 	var notes []string
 	runSlug, ownRun := a.Run, false
 	var run *api.Run
+	resolved := runctx.Resolve(s.Env, runctx.Overrides{
+		Repo:        a.Repo,
+		Commit:      a.Commit,
+		Agent:       a.Agent,
+		PullRequest: a.PullRequest,
+		Reference:   a.Reference,
+		Session:     a.Session,
+		Title:       a.Title,
+		Client:      "krowk-mcp/" + s.Version,
+	})
 	if runSlug == "" && s.Client.Authenticated() {
-		metadata := runctx.Resolve(s.Env, runctx.Overrides{
-			Repo:        a.Repo,
-			Commit:      a.Commit,
-			Agent:       a.Agent,
-			PullRequest: a.PullRequest,
-			Reference:   a.Reference,
-			Session:     a.Session,
-			Title:       a.Title,
-			Client:      "krowk-mcp/" + s.Version,
-		})
-		created, err := s.Client.CreateRun(ctx, metadata)
+		created, err := s.Client.CreateRun(ctx, resolved)
 		if err != nil {
 			return "", nil, err
 		}
 		run, runSlug, ownRun = created, created.Slug, true
 	}
-	if runSlug == "" && (a.PullRequest != "" || len(a.Reference) > 0 || a.Session != "") {
-		notes = append(notes, "pull_request, reference and session were not recorded: run metadata "+
-			"lives on a run, and opening a run needs an API key")
+	if !s.Client.Authenticated() && (a.PullRequest != "" || len(a.Reference) > 0 || a.Session != "" || len(a.Metadata) > 0) {
+		notes = append(notes, "pull_request, reference, session and metadata were not recorded: "+
+			"a keyless upload records no metadata, and opening a run needs an API key")
+	}
+
+	// Each artifact carries its own production record, stamped at this moment;
+	// the run keeps the facts about the work. Keyless pushes record neither.
+	var stamp any
+	if s.Client.Authenticated() {
+		stamp = resolved.Artifact().WithExtras(a.Metadata)
 	}
 
 	artifacts := make([]*api.Artifact, 0, len(specs))
 	for _, spec := range specs {
 		spec.Run = runSlug
+		spec.Metadata = stamp
 		artifact, err := s.Client.Push(ctx, spec)
 		if err != nil {
 			return "", nil, withProgress(err, artifacts, runSlug, ownRun)
@@ -643,11 +652,11 @@ func getRun(_ context.Context, s *Server, _ json.RawMessage) (string, any, error
 
 	lines := []string{"Run context detected for this working directory:"}
 	for _, f := range [][2]string{
-		{"repo", metadata.Repo},
+		{"repo", metadata.RepoName},
 		{"commit", metadata.Commit},
 		{"branch", metadata.Branch},
-		{"agent", metadata.Agent},
-		{"pull request", metadata.PullRequest},
+		{"agent", metadata.Harness},
+		{"pull request", metadata.ChangeURL},
 	} {
 		if f[1] != "" {
 			lines = append(lines, fmt.Sprintf("  %-12s %s", f[0], f[1]))
@@ -823,6 +832,13 @@ func toolSchemas() []map[string]any {
 					"repo":   map[string]any{"type": "string", "description": "Override the detected repository."},
 					"commit": map[string]any{"type": "string", "description": "Override the detected commit."},
 					"agent":  map[string]any{"type": "string", "description": "Override the detected agent name."},
+					"metadata": map[string]any{
+						"type":                 "object",
+						"additionalProperties": map[string]any{"type": "string"},
+						"description": "Extra key/value metadata recorded on each artifact, e.g. " +
+							"krowk.caption or url.full. Your value wins over a detected one. " +
+							"Metadata is public: anyone with the link can read it.",
+					},
 				},
 				"additionalProperties": false,
 			},

@@ -60,6 +60,9 @@ Upload flags
   --repo <owner/name>    Override the detected repository
   --commit <sha>         Override the detected commit
   --agent <name>         Override the detected agent
+  --metadata <key=val>   Extra metadata — repeat for more than one. On push it
+                         lands on each artifact; on ` + "`runs start`" + `, on the run.
+                         Your value wins over a detected one. Metadata is public.
 
 List flags
   --limit <n>            Artifacts per page (1–100, default 50)
@@ -101,6 +104,7 @@ type flags struct {
 	limit       int
 	pullRequest string
 	references  stringSlice
+	metadata    stringSlice
 	session     string
 	title       string
 	repo        string
@@ -134,6 +138,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	fs.IntVar(&f.limit, "limit", 0, "")
 	fs.StringVar(&f.pullRequest, "pull-request", "", "")
 	fs.Var(&f.references, "reference", "")
+	fs.Var(&f.metadata, "metadata", "")
 	fs.StringVar(&f.session, "session", "", "")
 	fs.StringVar(&f.title, "title", "", "")
 	fs.StringVar(&f.repo, "repo", "", "")
@@ -174,7 +179,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		return 0
 	case f.help, len(positionals) == 0, positionals[0] == "help":
 		fmt.Fprintf(stdout, helpTemplate, Version,
-			defaultRegistryAddr, api.DevBaseURL, api.DefaultBaseURL, api.CredentialsPath())
+			defaultRegistryAddr, api.DevBaseURL, api.DefaultBaseURL, api.CredentialsPath(env))
 		return 0
 	}
 
@@ -195,7 +200,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	case positionals[0] == "claim":
 		err = claim(stdout, positionals[1:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "login":
-		err = authLogin(stdout, f.token)
+		err = authLogin(stdout, f.token, env)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
 		err = authToken(stdout, env)
 	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "verify":
@@ -259,6 +264,10 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 	if len(files) == 0 {
 		return api.Fail("no_file", "pass at least one path: `krowk push screenshot.png`")
 	}
+	extras, err := parseMetadata(f.metadata)
+	if err != nil {
+		return err
+	}
 
 	// Every file is measured and digested before anything is sent, so a typo in
 	// the last path fails before the first upload rather than halfway through.
@@ -281,8 +290,17 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 		return err
 	}
 
+	// Every push stamps the artifact with the state it finds at its own moment:
+	// the production record travels with the file, wherever it is later claimed
+	// or attached. Keyless uploads record no metadata — the note above says so.
+	var stamp any
+	if client.Authenticated() {
+		stamp = metadataFor(f, env).Artifact().WithExtras(extras)
+	}
+
 	for _, spec := range specs {
 		spec.Run = runSlug
+		spec.Metadata = stamp
 		artifact, err := client.Push(ctx, spec)
 		if err != nil {
 			return withProgress(err, result.Artifacts, runSlug, ownRun)
@@ -346,6 +364,25 @@ func metadataFor(f flags, env runctx.Env) runctx.Metadata {
 	})
 }
 
+// parseMetadata turns repeated --metadata key=value pairs into a map. The value
+// may contain '='; the key may not be empty. Values are stored verbatim as
+// strings — the registry never learns shapes, and neither does this flag.
+func parseMetadata(pairs []string) (map[string]string, error) {
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(pairs))
+	for _, pair := range pairs {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok || key == "" {
+			return nil, api.Fail("bad_flag",
+				"--metadata takes key=value, like --metadata krowk.caption=\"before the fix\"")
+		}
+		out[key] = value
+	}
+	return out, nil
+}
+
 // anonymousMetadataNote says plainly that metadata asked for by name was not
 // recorded. Silently dropping it would leave an agent believing the pull request
 // it named is attached to the upload, and it is not.
@@ -360,11 +397,14 @@ func anonymousMetadataNote(f flags) string {
 	if f.session != "" {
 		given = append(given, "--session")
 	}
+	if len(f.metadata) > 0 {
+		given = append(given, "--metadata")
+	}
 	if len(given) == 0 {
 		return ""
 	}
-	return strings.Join(given, ", ") + " was not recorded: run metadata lives on a run, " +
-		"and opening a run needs an API key — run `krowk auth login --token krowk_sk_...`"
+	return strings.Join(given, ", ") + " was not recorded: a keyless upload records no metadata — " +
+		"run `krowk auth login --token krowk_sk_...`"
 }
 
 // withProgress keeps what a failed batch would otherwise lose: the links of
@@ -432,7 +472,11 @@ func uploadsShow(w io.Writer, args []string, f flags, format output.Format, env 
 func runsStart(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
 	client := newClient(f, env)
 
-	run, err := client.CreateRun(context.Background(), metadataFor(f, env))
+	extras, err := parseMetadata(f.metadata)
+	if err != nil {
+		return err
+	}
+	run, err := client.CreateRun(context.Background(), metadataFor(f, env).WithExtras(extras))
 	if err != nil {
 		return err
 	}
@@ -471,13 +515,13 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 	return nil
 }
 
-func authLogin(w io.Writer, token string) error {
+func authLogin(w io.Writer, token string, env runctx.Env) error {
 	if token == "" {
 		return api.Fail("missing_token", "pass the key: `krowk auth login --token krowk_sk_...`")
 	}
-	path, err := api.SaveToken(token)
+	path, err := api.SaveToken(token, env)
 	if err != nil {
-		return api.Fail("credentials_unwritable", "could not write "+api.CredentialsPath()+": "+err.Error())
+		return api.Fail("credentials_unwritable", "could not write "+api.CredentialsPath(env)+": "+err.Error())
 	}
 	fmt.Fprintln(w, "✓ token stored in "+path)
 	return nil
@@ -524,7 +568,7 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 		// Runs are where the metadata goes, and they need a key — so whether they
 		// are available is the difference between metadata being kept and dropped.
 		"runs_available": client.Authenticated(),
-		"credentials":    api.CredentialsPath(),
+		"credentials":    api.CredentialsPath(env),
 		"context":        runctx.Detect(env),
 	}
 

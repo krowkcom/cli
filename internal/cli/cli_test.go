@@ -36,6 +36,10 @@ func newHarness(t *testing.T, limitBytes int64) *harness {
 		env: map[string]string{
 			"KROWK_API_URL": server.URL + "/v1",
 			"KROWK_TOKEN":   "krowk_sk_test",
+			// Point the credentials file at a scratch directory, so a real
+			// login on the developer's machine cannot make an "anonymous"
+			// test run authenticated.
+			"XDG_CONFIG_HOME": t.TempDir(),
 		},
 	}
 	h.fixture = h.write("checkout-after.png", "fake png bytes for the test")
@@ -132,6 +136,8 @@ type artifact struct {
 	Markdown    string `json:"markdown"`
 	ExpiresAt   string `json:"expires_at"`
 	ClaimToken  string `json:"claim_token"`
+
+	Metadata json.RawMessage `json:"metadata"`
 }
 
 type run struct {
@@ -219,22 +225,77 @@ func TestMetadataIsRecordedOnTheRun(t *testing.T) {
 	}
 
 	meta := e.Data.Run.Metadata
-	if got := meta["pull_request"]; got != "https://github.com/acme/storefront/pull/412" {
-		t.Errorf("pull_request = %v", got)
+	if got := meta["krowk.change.url"]; got != "https://github.com/acme/storefront/pull/412" {
+		t.Errorf("krowk.change.url = %v", got)
 	}
-	if got := meta["session"]; got != "sess_abc123" {
-		t.Errorf("session = %v", got)
+	// The change's number is derived from its URL, not typed.
+	if got := meta["vcs.change.id"]; got != "412" {
+		t.Errorf("vcs.change.id = %v", got)
 	}
-	if got := meta["client"]; got != "krowk-cli/"+Version {
-		t.Errorf("client = %v", got)
+	if got := meta["krowk.session"]; got != "sess_abc123" {
+		t.Errorf("krowk.session = %v", got)
 	}
-	refs, _ := meta["reference"].([]any)
+	if got := meta["vcs.change.title"]; got != "Checkout — mobile" {
+		t.Errorf("vcs.change.title = %v", got)
+	}
+	if got := meta["krowk.client"]; got != "krowk-cli/"+Version {
+		t.Errorf("krowk.client = %v", got)
+	}
+	refs, _ := meta["krowk.references"].([]any)
 	if len(refs) != 2 || refs[1] != "https://sentry.io/issues/1" {
-		t.Errorf("reference = %v, want both links in order", meta["reference"])
+		t.Errorf("krowk.references = %v, want both links in order", meta["krowk.references"])
 	}
 	// Detected without a flag: the CLI's own repository.
-	if commit, _ := meta["commit"].(string); !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(commit) {
-		t.Errorf("commit = %q, want a detected SHA", commit)
+	if commit, _ := meta["vcs.ref.head.revision"].(string); !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(commit) {
+		t.Errorf("vcs.ref.head.revision = %q, want a detected SHA", commit)
+	}
+	// The worktree state is recorded either way — a tri-state, never defaulted.
+	if _, ok := meta["krowk.vcs.dirty"].(bool); !ok {
+		t.Errorf("krowk.vcs.dirty = %v, want a bool inside a git checkout", meta["krowk.vcs.dirty"])
+	}
+	// Nothing writes a flat legacy key again.
+	for _, legacy := range []string{"repo", "commit", "branch", "agent", "pull_request", "session", "title", "client", "reference"} {
+		if _, present := meta[legacy]; present {
+			t.Errorf("legacy key %q written; the vocabulary moved to OTel names", legacy)
+		}
+	}
+}
+
+func TestEachArtifactCarriesItsOwnProductionRecord(t *testing.T) {
+	h := newHarness(t, 0)
+
+	e := h.ok(
+		"push", h.fixture,
+		"--pull-request=https://github.com/acme/storefront/pull/412",
+		"--metadata", "krowk.caption=Cart before the fix",
+		"--metadata", "url.full=https://app.example.com/cart",
+	)
+
+	shown := only(t, h.ok("uploads", "show", only(t, e).Slug))
+	var meta map[string]any
+	if err := json.Unmarshal(shown.Metadata, &meta); err != nil {
+		t.Fatalf("artifact metadata = %s: %v", shown.Metadata, err)
+	}
+
+	// The caller's keys landed on the artifact.
+	if meta["krowk.caption"] != "Cart before the fix" {
+		t.Errorf("krowk.caption = %v", meta["krowk.caption"])
+	}
+	if meta["url.full"] != "https://app.example.com/cart" {
+		t.Errorf("url.full = %v", meta["url.full"])
+	}
+	// The production stamp was detected at push time.
+	if commit, _ := meta["vcs.ref.head.revision"].(string); !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(commit) {
+		t.Errorf("vcs.ref.head.revision = %q, want a detected SHA", commit)
+	}
+	if _, ok := meta["krowk.vcs.dirty"].(bool); !ok {
+		t.Errorf("krowk.vcs.dirty = %v, want a bool inside a git checkout", meta["krowk.vcs.dirty"])
+	}
+	// Facts about the work stay on the run and only there.
+	for _, runOnly := range []string{"krowk.change.url", "vcs.change.id", "vcs.change.title", "krowk.session", "krowk.references"} {
+		if _, present := meta[runOnly]; present {
+			t.Errorf("run-only key %q leaked onto the artifact", runOnly)
+		}
 	}
 }
 
@@ -342,7 +403,7 @@ func TestRunsStartGroupsLaterUploads(t *testing.T) {
 	if started.Data.Slug == "" || started.Data.Status != "open" {
 		t.Fatalf("runs start = %+v", started.Data)
 	}
-	if got := started.Data.Metadata["session"]; got != "sess_xyz" {
+	if got := started.Data.Metadata["krowk.session"]; got != "sess_xyz" {
 		t.Errorf("run metadata session = %v", got)
 	}
 
@@ -461,7 +522,7 @@ func TestFlagsMayFollowFilenames(t *testing.T) {
 	h := newHarness(t, 0)
 
 	e := h.ok("uploads", "create", h.fixture, "--session=after-the-file")
-	if e.Data.Run == nil || e.Data.Run.Metadata["session"] != "after-the-file" {
+	if e.Data.Run == nil || e.Data.Run.Metadata["krowk.session"] != "after-the-file" {
 		t.Errorf("session = %v", e.Data.Run)
 	}
 }
@@ -474,7 +535,7 @@ func TestSessionIsDetectedWithoutAFlag(t *testing.T) {
 	if e.Data.Run == nil {
 		t.Fatal("no run: an authenticated upload should open one to hold the metadata")
 	}
-	if got := e.Data.Run.Metadata["session"]; got != h.env["CLAUDE_CODE_SESSION_ID"] {
+	if got := e.Data.Run.Metadata["krowk.session"]; got != h.env["CLAUDE_CODE_SESSION_ID"] {
 		t.Errorf("session = %v, want the detected agent session", got)
 	}
 }
@@ -623,8 +684,9 @@ func TestWireShapeMatchesTheRegistrysRoutes(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	h := &harness{t: t, server: server, env: map[string]string{
-		"KROWK_API_URL": server.URL + "/v1",
-		"KROWK_TOKEN":   "krowk_sk_test",
+		"KROWK_API_URL":   server.URL + "/v1",
+		"KROWK_TOKEN":     "krowk_sk_test",
+		"XDG_CONFIG_HOME": t.TempDir(),
 	}}
 	h.fixture = h.write("shot.png", "some bytes")
 
@@ -712,8 +774,9 @@ func faultyHarness(t *testing.T, breaks func(r *http.Request, n int) bool) *harn
 	t.Cleanup(server.Close)
 
 	h := &harness{t: t, server: server, env: map[string]string{
-		"KROWK_API_URL": server.URL + "/v1",
-		"KROWK_TOKEN":   "krowk_sk_test",
+		"KROWK_API_URL":   server.URL + "/v1",
+		"KROWK_TOKEN":     "krowk_sk_test",
+		"XDG_CONFIG_HOME": t.TempDir(),
 	}}
 	h.fixture = h.write("checkout-after.png", "fake png bytes for the test")
 	return h
@@ -791,8 +854,9 @@ func TestCreateRunIsNotRetried(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	h := &harness{t: t, server: server, env: map[string]string{
-		"KROWK_API_URL": server.URL + "/v1",
-		"KROWK_TOKEN":   "krowk_sk_test",
+		"KROWK_API_URL":   server.URL + "/v1",
+		"KROWK_TOKEN":     "krowk_sk_test",
+		"XDG_CONFIG_HOME": t.TempDir(),
 	}}
 	h.fixture = h.write("shot.png", "some bytes")
 

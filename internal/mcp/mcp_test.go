@@ -213,11 +213,14 @@ func TestPushReturnsBothPasteFormsLabelled(t *testing.T) {
 	// output — it is what makes the link worth having.
 	run, _ := structured["run"].(map[string]any)
 	meta, _ := run["metadata"].(map[string]any)
-	if meta["pull_request"] != "https://github.com/acme/storefront/pull/412" {
+	if meta["krowk.change.url"] != "https://github.com/acme/storefront/pull/412" {
 		t.Errorf("run metadata = %v, want the pull request attached", meta)
 	}
-	if meta["client"] != "krowk-mcp/1.2.3" {
-		t.Errorf("client = %v, want the MCP server to identify itself", meta["client"])
+	if meta["vcs.change.id"] != "412" {
+		t.Errorf("vcs.change.id = %v, want it derived from the pull request URL", meta["vcs.change.id"])
+	}
+	if meta["krowk.client"] != "krowk-mcp/1.2.3" {
+		t.Errorf("krowk.client = %v, want the MCP server to identify itself", meta["krowk.client"])
 	}
 }
 
@@ -542,7 +545,7 @@ func TestGetRunReportsDetectedMetadata(t *testing.T) {
 		t.Errorf("text = %q, want the detected repository", body)
 	}
 	structured, _ := result["structuredContent"].(map[string]any)
-	if structured["commit"] == nil {
+	if structured["vcs.ref.head.revision"] == nil {
 		t.Errorf("structuredContent = %+v, want the detected commit", structured)
 	}
 }

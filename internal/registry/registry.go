@@ -41,7 +41,11 @@ const (
 	// How many artifacts a page holds, mirroring the registry's own bounds. The
 	// caller picks, so the ceiling is enforced rather than trusted.
 	defaultPageSize = 50
-	maxPageSize     = 100
+
+	// maxMetadataBytes is the canon cap: 16KB of JSON per record. Size is the
+	// only thing the registry validates about metadata — never keys or shapes.
+	maxMetadataBytes = 16 << 10
+	maxPageSize      = 100
 
 	// The workspace slug keyless uploads land in. One shared workspace, as in
 	// the real registry, so the storage keys look the same.
@@ -49,18 +53,19 @@ const (
 )
 
 type artifact struct {
-	Slug        string `json:"slug"`
-	State       string `json:"state"`
-	Filename    string `json:"filename"`
-	ContentType string `json:"content_type"`
-	ByteSize    int64  `json:"byte_size"`
-	Checksum    string `json:"checksum,omitempty"`
-	Region      string `json:"region"`
-	Run         any    `json:"run"`
-	URL         string `json:"url"`
-	Markdown    string `json:"markdown"`
-	ExpiresAt   any    `json:"expires_at"`
-	CreatedAt   string `json:"created_at"`
+	Slug        string          `json:"slug"`
+	State       string          `json:"state"`
+	Filename    string          `json:"filename"`
+	ContentType string          `json:"content_type"`
+	ByteSize    int64           `json:"byte_size"`
+	Checksum    string          `json:"checksum,omitempty"`
+	Region      string          `json:"region"`
+	Run         any             `json:"run"`
+	URL         string          `json:"url"`
+	Markdown    string          `json:"markdown"`
+	ExpiresAt   any             `json:"expires_at"`
+	CreatedAt   string          `json:"created_at"`
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
 
 	// Not serialized: what the stand-in has to remember between calls.
 	workspace  string
@@ -170,11 +175,12 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 
 	var body struct {
 		Artifact struct {
-			Filename    string `json:"filename"`
-			ContentType string `json:"content_type"`
-			ByteSize    int64  `json:"byte_size"`
-			Checksum    string `json:"checksum"`
-			Run         string `json:"run"`
+			Filename    string          `json:"filename"`
+			ContentType string          `json:"content_type"`
+			ByteSize    int64           `json:"byte_size"`
+			Checksum    string          `json:"checksum"`
+			Run         string          `json:"run"`
+			Metadata    json.RawMessage `json:"metadata"`
 		} `json:"artifact"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
@@ -203,6 +209,18 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 			fmt.Sprintf("Byte size must be at most %d bytes", limitBytes),
 			map[string]any{"byte_size": []string{fmt.Sprintf("must be at most %d bytes", limitBytes)}})
 		return
+	case len(in.Metadata) > maxMetadataBytes:
+		writeError(w, http.StatusUnprocessableEntity, "invalid",
+			fmt.Sprintf("Metadata must be at most %d bytes", maxMetadataBytes),
+			map[string]any{"metadata": []string{fmt.Sprintf("must be at most %d bytes", maxMetadataBytes)}})
+		return
+	}
+
+	// Stored verbatim: the registry validates size and nothing else. Anything
+	// that is not JSON is dropped rather than stored broken.
+	metadata := in.Metadata
+	if !json.Valid(metadata) {
+		metadata = nil
 	}
 
 	anonymous := workspace == ""
@@ -245,6 +263,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		URL:         url,
 		Markdown:    markdown(in.Filename, in.ContentType, url),
 		CreatedAt:   now.Format(time.RFC3339Nano),
+		Metadata:    metadata,
 		workspace:   workspace,
 		uploadTok:   randomToken(),
 		uploadTil:   now.Add(uploadURLLifetime),
@@ -590,6 +609,12 @@ func (s *store) createRun(w http.ResponseWriter, r *http.Request) {
 	if !json.Valid(metadata) {
 		metadata = json.RawMessage("{}")
 	}
+	if len(metadata) > maxMetadataBytes {
+		writeError(w, http.StatusUnprocessableEntity, "invalid",
+			fmt.Sprintf("Metadata must be at most %d bytes", maxMetadataBytes),
+			map[string]any{"metadata": []string{fmt.Sprintf("must be at most %d bytes", maxMetadataBytes)}})
+		return
+	}
 
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	entry := &run{
@@ -720,7 +745,7 @@ func (s *store) expired(a *artifact) bool {
 }
 
 func serializeArtifact(a *artifact) map[string]any {
-	return map[string]any{
+	out := map[string]any{
 		"slug":         a.Slug,
 		"state":        a.State,
 		"filename":     a.Filename,
@@ -734,6 +759,10 @@ func serializeArtifact(a *artifact) map[string]any {
 		"expires_at":   a.ExpiresAt,
 		"created_at":   a.CreatedAt,
 	}
+	if len(a.Metadata) > 0 {
+		out["metadata"] = a.Metadata
+	}
+	return out
 }
 
 // markdown is ready to paste into a pull request: an image embeds, anything else

@@ -52,7 +52,8 @@ advertises all land with the first tagged release — see the prerequisites belo
 | `krowk registry serve` | Run the local stand-in registry to develop against |
 
 Upload flags: `--run`, `--pull-request`, `--reference` (repeatable), `--session`,
-`--title`, plus `--repo` / `--commit` / `--agent` to override detection. Flags
+`--title`, `--metadata key=value` (repeatable), plus `--repo` / `--commit` /
+`--agent` to override detection. Flags
 may follow the filenames.
 
 Global flags: `--dev`, `--format human|json|markdown|url`, `--json`, `--quiet`,
@@ -159,30 +160,45 @@ from being the thing that publishes it.
 
 ## Metadata
 
-Flags win; everything else is detected so the agent never has to type it.
+Flags win; everything else is detected so the agent never has to type it. Key
+names follow the canon vocabulary: OpenTelemetry's where OTel has a word,
+`krowk.`-namespaced where it does not. Metadata is **public** — an artifact's
+card page is keyless, so never record a secret in it.
 
-| Field | Source |
+| Key | Source |
 | --- | --- |
-| `repo` | `GITHUB_REPOSITORY`, else `git remote get-url origin` |
-| `commit` | `GITHUB_SHA`, else `git rev-parse HEAD` |
-| `commit_url` | `{GITHUB_SERVER_URL}/{repo}/commit/{sha}` — omitted when the remote is not GitHub, rather than guessing a path shape |
-| `dirty` | `git status --porcelain` is non-empty, i.e. the screenshot may not match the commit |
-| `branch` | `git rev-parse --abbrev-ref HEAD` |
-| `agent` | `KROWK_AGENT`, else `CLAUDECODE` → `claude-code`, `CURSOR_TRACE_ID` → `cursor`, `GITHUB_ACTIONS` → `github-actions` |
-| `pull_request` | `--pull-request`, else derived from `GITHUB_REF` in a PR build |
-| `session` | `--session`, else `KROWK_SESSION`, `CLAUDE_CODE_SESSION_ID`, `CURSOR_TRACE_ID`, `GITHUB_RUN_ID` |
-| `reference`, `title` | Flags only |
+| `vcs.repository.name` | `--repo`, else `GITHUB_REPOSITORY`, else `git remote get-url origin` |
+| `vcs.repository.url.full` | The `origin` remote when it names a URL; built for GitHub-shaped ssh remotes. Dropped when it disagrees with the repository name — a link to the wrong repository is worse than no link |
+| `vcs.ref.head.revision` | `--commit`, else `GITHUB_SHA`, else `git rev-parse HEAD` |
+| `vcs.ref.head.name` | `git rev-parse --abbrev-ref HEAD` |
+| `krowk.vcs.dirty` | `git status --porcelain` is non-empty, i.e. the screenshot may not match the commit. Omitted outside a git checkout |
+| `krowk.harness` | `--agent`, else `KROWK_AGENT`, else `CLAUDECODE` → `claude-code`, `CURSOR_TRACE_ID` → `cursor`, `GITHUB_ACTIONS` → `github-actions` |
+| `krowk.change.url` | `--pull-request`, else derived from `GITHUB_REF` in a PR build |
+| `vcs.change.id` | Derived from the pull request URL |
+| `krowk.session` | `--session`, else `KROWK_SESSION`, `CLAUDE_CODE_SESSION_ID`, `CURSOR_TRACE_ID`, `GITHUB_RUN_ID` |
+| `krowk.references`, `vcs.change.title` | `--reference` (always a list), `--title` |
+| `krowk.client` | krowk itself: `krowk-cli/…` or `krowk-mcp/…` |
+| anything else | `--metadata key=value`, repeatable. Your value wins over a detected one, standard keys included |
 
-Metadata is recorded on the **run**, because the registry keeps none on an
-artifact. A run belongs to a workspace, so it needs an API key:
+Every write detects at its own moment. Facts about the work — the change, the
+session, the references — live on the **run**; every `push` also stamps each
+**artifact** with the state it finds then (commit, branch, dirty, harness,
+client), so a file's production record travels with it wherever it is later
+claimed or attached. A session that pushes `before.png`, commits the fix and
+pushes `after.png` records two artifacts from two commits under one run.
+Runs and artifact metadata need an API key:
 
 - **With a key** — `push` opens a run carrying the metadata, attaches every
   artifact to it, and closes it on the way out. `--run` attaches to a run you
   opened yourself instead, and leaves closing it to you.
 - **Without a key** — the upload still works. It lands in the shared anonymous
   workspace, expires in 24 hours, and comes back with a claim token. There is no
-  run, so metadata named by flag is *not* recorded, and the result says so in
-  `notes` rather than dropping it silently.
+  run and no metadata is recorded — the result says so in `notes` rather than
+  dropping it silently.
+
+Runs recorded before this vocabulary carry flat keys (`repo`, `commit`, …);
+readers look for the standard key first and fall back. Nothing writes a flat
+key again.
 
 ## Wire contract
 

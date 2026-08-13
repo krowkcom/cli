@@ -1,26 +1,43 @@
 // Package runctx works out the run metadata an agent should never have to type.
+//
+// The key names are the canon vocabulary: OpenTelemetry's where OTel has a
+// word, `krowk.`-namespaced where it does not. Nothing here writes a flat
+// legacy key (`repo`, `commit`, …) — readers fall back to those, writers moved.
 package runctx
 
 import (
+	"encoding/json"
 	"os/exec"
 	"regexp"
 	"strings"
 )
 
-// Metadata is the JSON blob that rides along with an upload. Flags override
+// Metadata is the JSON blob that rides along with a record. Flags override
 // every detected field; omitempty does the pruning.
+//
+// One struct serves both records: a run carries all of it, an artifact carries
+// the production snapshot only — Artifact() clears the run-only facts.
 type Metadata struct {
-	Repo        string   `json:"repo,omitempty"`
-	Commit      string   `json:"commit,omitempty"`
-	CommitURL   string   `json:"commit_url,omitempty"`
-	Dirty       bool     `json:"dirty,omitempty"`
-	Branch      string   `json:"branch,omitempty"`
-	Agent       string   `json:"agent,omitempty"`
-	PullRequest string   `json:"pull_request,omitempty"`
-	Reference   []string `json:"reference,omitempty"`
-	Session     string   `json:"session,omitempty"`
-	Title       string   `json:"title,omitempty"`
-	Client      string   `json:"client,omitempty"`
+	RepoName string `json:"vcs.repository.name,omitempty"`
+	RepoURL  string `json:"vcs.repository.url.full,omitempty"`
+	Commit   string `json:"vcs.ref.head.revision,omitempty"`
+	Branch   string `json:"vcs.ref.head.name,omitempty"`
+	// Dirty is a pointer so "clean tree" is recorded as false while "not a git
+	// checkout" records nothing at all — every key is optional, never defaulted.
+	Dirty   *bool  `json:"krowk.vcs.dirty,omitempty"`
+	Harness string `json:"krowk.harness,omitempty"`
+	Client  string `json:"krowk.client,omitempty"`
+
+	// Facts about the work, not about one file: run-only.
+	ChangeID    string   `json:"vcs.change.id,omitempty"`
+	ChangeTitle string   `json:"vcs.change.title,omitempty"`
+	ChangeURL   string   `json:"krowk.change.url,omitempty"`
+	Session     string   `json:"krowk.session,omitempty"`
+	References  []string `json:"krowk.references,omitempty"`
+
+	// remoteSlug remembers what the origin remote itself named, so an
+	// overridden repository name can be checked against it. Never serialized.
+	remoteSlug string
 }
 
 // Env is a lookup function, so tests do not have to touch the process
@@ -45,19 +62,16 @@ type Overrides struct {
 // CLI and the MCP server so both report metadata the same way.
 func Resolve(env Env, o Overrides) Metadata {
 	m := Detect(env)
-	override(&m.Repo, o.Repo)
+	override(&m.RepoName, o.Repo)
 	override(&m.Commit, o.Commit)
-	override(&m.Agent, o.Agent)
-	override(&m.PullRequest, o.PullRequest)
+	override(&m.Harness, o.Agent)
+	override(&m.ChangeURL, o.PullRequest)
 	override(&m.Session, o.Session)
-	m.Reference = o.Reference
-	m.Title = o.Title
+	m.References = o.Reference
+	m.ChangeTitle = o.Title
 	m.Client = o.Client
-	// An overridden repo or commit makes the detected link point at the wrong
-	// thing, so it is rebuilt rather than left stale.
-	if o.Repo != "" || o.Commit != "" {
-		m.CommitURL = CommitURL(env, git("remote", "get-url", "origin"), m.Repo, m.Commit)
-	}
+	m.ChangeID = ChangeID(m.ChangeURL)
+	m.reconcileRepo()
 	return m
 }
 
@@ -72,22 +86,64 @@ func Detect(env Env) Metadata {
 	remote := git("remote", "get-url", "origin")
 
 	m := Metadata{
-		Repo:        firstNonEmpty(env("GITHUB_REPOSITORY"), Slug(remote)),
-		Commit:      firstNonEmpty(env("GITHUB_SHA"), git("rev-parse", "HEAD")),
-		Branch:      git("rev-parse", "--abbrev-ref", "HEAD"),
-		Dirty:       git("status", "--porcelain") != "",
-		Agent:       DetectAgent(env),
-		Session:     DetectSession(env),
-		PullRequest: CIPullRequest(env),
+		RepoName:   firstNonEmpty(env("GITHUB_REPOSITORY"), Slug(remote)),
+		RepoURL:    RepoURL(env, remote),
+		Commit:     firstNonEmpty(env("GITHUB_SHA"), git("rev-parse", "HEAD")),
+		Branch:     git("rev-parse", "--abbrev-ref", "HEAD"),
+		Dirty:      dirty(),
+		Harness:    DetectAgent(env),
+		Session:    DetectSession(env),
+		ChangeURL:  CIPullRequest(env),
+		remoteSlug: Slug(remote),
 	}
-	m.CommitURL = CommitURL(env, remote, m.Repo, m.Commit)
+	m.ChangeID = ChangeID(m.ChangeURL)
+	m.reconcileRepo()
 	return m
 }
 
-// CommitURL links the commit on GitHub. It stays empty for any other host
-// rather than guessing a path shape and emitting a link that 404s.
-func CommitURL(env Env, remote, repo, commit string) string {
-	if repo == "" || commit == "" {
+// Artifact is the production stamp for one file: the snapshot of this moment,
+// minus the facts that belong to the work rather than the file — the change,
+// the session, the references.
+func (m Metadata) Artifact() Metadata {
+	m.ChangeID, m.ChangeTitle, m.ChangeURL, m.Session = "", "", "", ""
+	m.References = nil
+	return m
+}
+
+// WithExtras lays caller-supplied keys over the stamp. The caller's value wins
+// on any collision, the standard keys included: those are detected or
+// defaulted, so a caller spelling one out is correcting a detection.
+func (m Metadata) WithExtras(extras map[string]string) any {
+	if len(extras) == 0 {
+		return m
+	}
+	b, _ := json.Marshal(m)
+	out := map[string]any{}
+	_ = json.Unmarshal(b, &out)
+	for k, v := range extras {
+		out[k] = v
+	}
+	return out
+}
+
+// reconcileRepo drops the repository URL when the name and the URL disagree:
+// the URL is read off the checkout's remote while the name can arrive by flag
+// or from CI, and a link to the wrong repository is worse than no link.
+func (m *Metadata) reconcileRepo() {
+	if m.remoteSlug != "" && m.RepoName != m.remoteSlug {
+		m.RepoURL = ""
+	}
+}
+
+// RepoURL is the repository's home on its host. An https remote names it
+// directly; an ssh remote gets one built only for a host whose web shape is
+// known, rather than guessing a path that 404s.
+func RepoURL(env Env, remote string) string {
+	if strings.HasPrefix(remote, "http://") || strings.HasPrefix(remote, "https://") {
+		return strings.TrimSuffix(strings.TrimRight(remote, "/"), ".git")
+	}
+	slug := Slug(remote)
+	if slug == "" {
 		return ""
 	}
 	server := env("GITHUB_SERVER_URL") // set by Actions, and correct on Enterprise
@@ -97,7 +153,7 @@ func CommitURL(env Env, remote, repo, commit string) string {
 	if server == "" {
 		return ""
 	}
-	return strings.TrimRight(server, "/") + "/" + repo + "/commit/" + commit
+	return strings.TrimRight(server, "/") + "/" + slug
 }
 
 // DetectSession finds the agent run this upload belongs to, so --session is a
@@ -111,7 +167,7 @@ func DetectSession(env Env) string {
 	)
 }
 
-// DetectAgent names the tool driving the upload.
+// DetectAgent names the harness driving the upload.
 func DetectAgent(env Env) string {
 	switch {
 	case env("KROWK_AGENT") != "":
@@ -127,9 +183,10 @@ func DetectAgent(env Env) string {
 }
 
 var (
-	slugRE  = regexp.MustCompile(`[:/]([^/:]+/[^/]+?)(?:\.git)?/?$`)
-	prRefRE = regexp.MustCompile(`^refs/pull/(\d+)/`)
-	hostRE  = regexp.MustCompile(`^(?:[a-z+]+://)?(?:[^@/]+@)?([^/:]+)[:/]`)
+	slugRE     = regexp.MustCompile(`[:/]([^/:]+/[^/]+?)(?:\.git)?/?$`)
+	prRefRE    = regexp.MustCompile(`^refs/pull/(\d+)/`)
+	hostRE     = regexp.MustCompile(`^(?:[a-z+]+://)?(?:[^@/]+@)?([^/:]+)[:/]`)
+	changeIDRE = regexp.MustCompile(`/(\d+)/?$`)
 )
 
 // Host pulls github.com out of either remote spelling.
@@ -148,6 +205,15 @@ func Slug(remote string) string {
 	return ""
 }
 
+// ChangeID is the change's number, derived from its URL — OTel has a key for
+// the number but none for the URL, so the URL is what gets recorded raw.
+func ChangeID(changeURL string) string {
+	if m := changeIDRE.FindStringSubmatch(changeURL); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
 // CIPullRequest turns refs/pull/412/merge into the pull request URL.
 func CIPullRequest(env Env) string {
 	m := prRefRE.FindStringSubmatch(env("GITHUB_REF"))
@@ -156,6 +222,17 @@ func CIPullRequest(env Env) string {
 		return ""
 	}
 	return "https://github.com/" + repo + "/pull/" + m[1]
+}
+
+// dirty reports the worktree state, or nil outside a git checkout — the
+// distinction a plain bool cannot carry.
+func dirty() *bool {
+	out, err := exec.Command("git", "status", "--porcelain").Output()
+	if err != nil {
+		return nil
+	}
+	d := strings.TrimSpace(string(out)) != ""
+	return &d
 }
 
 // git returns trimmed stdout, or "" for any failure — no git, no repo, no remote.

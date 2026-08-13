@@ -50,25 +50,82 @@ func TestHost(t *testing.T) {
 	}
 }
 
-func TestCommitURL(t *testing.T) {
-	const sha = "757cc51982cd8291486f65e921d45d96a9f688a6"
-	want := "https://github.com/acme/storefront/commit/" + sha
-
-	if got := CommitURL(env(nil), "git@github.com:acme/storefront.git", "acme/storefront", sha); got != want {
-		t.Errorf("got %q, want %q", got, want)
+func TestRepoURL(t *testing.T) {
+	for in, want := range map[string]string{
+		// An https remote names the URL directly, shorn of .git.
+		"https://github.com/acme/storefront.git": "https://github.com/acme/storefront",
+		"https://git.acme.dev/acme/storefront/":  "https://git.acme.dev/acme/storefront",
+		// An ssh remote gets a URL built only for a host whose web shape is known.
+		"git@github.com:acme/storefront.git": "https://github.com/acme/storefront",
+		// A non-GitHub ssh remote gets no URL rather than a guessed one that 404s.
+		"git@gitlab.com:acme/storefront.git": "",
+		"":                                   "",
+	} {
+		if got := RepoURL(env(nil), in); got != want {
+			t.Errorf("RepoURL(%q) = %q, want %q", in, got, want)
+		}
 	}
 	// Actions supplies the server, so Enterprise hosts link correctly.
 	ghes := map[string]string{"GITHUB_SERVER_URL": "https://github.acme.dev/"}
-	if got, want := CommitURL(env(ghes), "", "acme/storefront", sha),
-		"https://github.acme.dev/acme/storefront/commit/"+sha; got != want {
+	if got, want := RepoURL(env(ghes), "git@github.acme.dev:acme/storefront.git"),
+		"https://github.acme.dev/acme/storefront"; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
-	// A non-GitHub remote gets no link rather than a broken one.
-	if got := CommitURL(env(nil), "git@gitlab.com:acme/storefront.git", "acme/storefront", sha); got != "" {
-		t.Errorf("got %q, want empty for a non-GitHub remote", got)
+}
+
+func TestChangeID(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://github.com/acme/storefront/pull/412":            "412",
+		"https://gitlab.com/acme/storefront/-/merge_requests/7/": "7",
+		"https://github.com/acme/storefront":                     "",
+		"":                                                       "",
+	} {
+		if got := ChangeID(in); got != want {
+			t.Errorf("ChangeID(%q) = %q, want %q", in, got, want)
+		}
 	}
-	if got := CommitURL(env(nil), "git@github.com:acme/storefront.git", "acme/storefront", ""); got != "" {
-		t.Errorf("got %q, want empty without a commit", got)
+}
+
+func TestArtifactStampDropsTheRunOnlyFacts(t *testing.T) {
+	dirty := true
+	m := Metadata{
+		RepoName: "acme/storefront", RepoURL: "https://github.com/acme/storefront",
+		Commit: "9e6943f4", Branch: "fix/cart", Dirty: &dirty,
+		Harness: "claude-code", Client: "krowk-cli/test",
+		ChangeID: "412", ChangeTitle: "Cart total", Session: "01J8",
+		ChangeURL:  "https://github.com/acme/storefront/pull/412",
+		References: []string{"https://linear.app/acme/issue/STO-1"},
+	}
+	a := m.Artifact()
+	if a.ChangeID != "" || a.ChangeTitle != "" || a.ChangeURL != "" || a.Session != "" || a.References != nil {
+		t.Errorf("artifact stamp still carries run-only facts: %+v", a)
+	}
+	if a.RepoName != m.RepoName || a.Commit != m.Commit || a.Dirty != m.Dirty || a.Harness != m.Harness {
+		t.Errorf("artifact stamp lost production facts: %+v", a)
+	}
+}
+
+func TestWithExtrasLetsTheCallersKeyWin(t *testing.T) {
+	m := Metadata{RepoName: "acme/storefront", Client: "krowk-cli/test"}
+	out, ok := m.WithExtras(map[string]string{
+		"vcs.repository.name": "acme/other",
+		"krowk.caption":       "before the fix",
+	}).(map[string]any)
+	if !ok {
+		t.Fatalf("want a merged map, got %T", m.WithExtras(map[string]string{"k": "v"}))
+	}
+	if out["vcs.repository.name"] != "acme/other" {
+		t.Errorf("detected key survived an explicit override: %v", out["vcs.repository.name"])
+	}
+	if out["krowk.caption"] != "before the fix" {
+		t.Errorf("caption = %v", out["krowk.caption"])
+	}
+	if out["krowk.client"] != "krowk-cli/test" {
+		t.Errorf("client = %v, want it carried through the merge", out["krowk.client"])
+	}
+	// No extras: the stamp passes through untouched, still pruned by omitempty.
+	if _, isMap := m.WithExtras(nil).(map[string]any); isMap {
+		t.Error("want the struct back when there is nothing to merge")
 	}
 }
 

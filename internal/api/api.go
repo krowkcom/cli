@@ -160,18 +160,19 @@ type Upload struct {
 
 // Artifact is one stored file, as the registry reports it.
 type Artifact struct {
-	Slug        string `json:"slug"`
-	State       string `json:"state"`
-	Filename    string `json:"filename"`
-	ContentType string `json:"content_type"`
-	ByteSize    int64  `json:"byte_size"`
-	Checksum    string `json:"checksum,omitempty"`
-	Region      string `json:"region,omitempty"`
-	Run         string `json:"run,omitempty"`
-	URL         string `json:"url"`
-	Markdown    string `json:"markdown,omitempty"`
-	ExpiresAt   string `json:"expires_at,omitempty"`
-	CreatedAt   string `json:"created_at,omitempty"`
+	Slug        string          `json:"slug"`
+	State       string          `json:"state"`
+	Filename    string          `json:"filename"`
+	ContentType string          `json:"content_type"`
+	ByteSize    int64           `json:"byte_size"`
+	Checksum    string          `json:"checksum,omitempty"`
+	Region      string          `json:"region,omitempty"`
+	Run         string          `json:"run,omitempty"`
+	URL         string          `json:"url"`
+	Markdown    string          `json:"markdown,omitempty"`
+	ExpiresAt   string          `json:"expires_at,omitempty"`
+	CreatedAt   string          `json:"created_at,omitempty"`
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
 
 	// Upload and NextStep only ever appear on the create response.
 	Upload   *Upload `json:"upload,omitempty"`
@@ -183,8 +184,8 @@ type Artifact struct {
 	ClaimToken string `json:"claim_token,omitempty"`
 }
 
-// Run groups the artifacts one agent run produced, and is where run metadata
-// lives — the registry keeps none on an artifact.
+// Run groups the artifacts one agent run produced, and is where the facts
+// about the work live; each artifact carries its own production record.
 type Run struct {
 	Slug       string          `json:"slug"`
 	Status     string          `json:"status"`
@@ -289,6 +290,10 @@ type Spec struct {
 	ByteSize    int64  `json:"byte_size"`
 	Checksum    string `json:"checksum"`
 	Run         string `json:"run,omitempty"`
+	// Metadata is the artifact's own production record — stamped at the moment
+	// this file is pushed, so it travels with the artifact wherever it is
+	// claimed or attached. Metadata is public: the card page is keyless.
+	Metadata any `json:"metadata,omitempty"`
 }
 
 // Inspect measures and digests a file. The digest is read off disk up front

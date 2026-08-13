@@ -247,11 +247,11 @@ func KnownKeys() []string {
 	return names
 }
 
-// known reports whether key is in the schema. Writing a key krowk does not
+// Known reports whether key is in the schema. Writing a key krowk does not
 // understand is refused rather than stored: a typo that lands in the file is a
 // setting that never takes effect, and the file would sit there looking like it
 // had.
-func known(name string) error {
+func Known(name string) error {
 	for _, k := range schema {
 		if k.name == name {
 			return nil
@@ -263,7 +263,7 @@ func known(name string) error {
 // Set writes key=value into the JSON file at path, creating the file and its
 // directory if needed, preserving any keys it does not understand.
 func Set(path, key, value string) error {
-	if err := known(key); err != nil {
+	if err := Known(key); err != nil {
 		return err
 	}
 	return rewrite(path, func(raw map[string]any) { raw[key] = value })
@@ -273,7 +273,7 @@ func Set(path, key, value string) error {
 // including from a file that does not exist: the caller asked for a state, and
 // that state already holds.
 func Unset(path, key string) error {
-	if err := known(key); err != nil {
+	if err := Known(key); err != nil {
 		return err
 	}
 	if _, err := os.Stat(path); os.IsNotExist(err) {

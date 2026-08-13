@@ -332,15 +332,35 @@ func report(w io.Writer, err error, format output.Format, quiet, colour bool) in
 // workspace that machine never logged into, and the token is the key that was
 // meant.
 func newClient(f flags, env runctx.Env) (*api.Client, error) {
+	// KROWK_TOKEN first, before any config file is even opened. The variable is
+	// documented as the strongest word, and CI is why: a job exports a token
+	// into a checkout whose committed config it does not control, and a config
+	// file that machine cannot even parse must not be able to take the token's
+	// place in line — the pre-workspace behaviour, kept on purpose.
+	if token := env("KROWK_TOKEN"); token != "" {
+		return api.New(api.BaseURLFor(f.dev, env), token), nil
+	}
 	ws, _, err := resolveWorkspace(f, env)
 	if err != nil {
 		return nil, err
 	}
-	token := api.ReadToken(env, ws)
-	if token == "" && ws != "" {
-		return nil, noKeyFor(ws)
+	token, err := api.ResolveToken(env, ws)
+	if err != nil {
+		return nil, err
 	}
 	return api.New(api.BaseURLFor(f.dev, env), token), nil
+}
+
+// workspaceKeyMissing reports whether a newClient failure is about a workspace
+// key the store could not produce — as against a config file that could not be
+// read, which is a broken setup no fallback should paper over.
+func workspaceKeyMissing(err error) bool {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	code := apiErr.Code()
+	return code == "no_key_for_workspace" || code == "dangling_default"
 }
 
 // resolveWorkspace answers which workspace this command was pointed at, and by
@@ -357,25 +377,6 @@ func resolveWorkspace(f flags, env runctx.Env) (name, source string, err error) 
 			" — fix the file or remove it; `krowk config show` names every layer")
 	}
 	return cfg.Workspace, cfg.Sources["workspace"], nil
-}
-
-// noKeyFor says the one useful thing about a workspace with no key: what is
-// actually in the store, so the fix is a copy-paste rather than a guess at
-// spelling.
-func noKeyFor(ws string) error {
-	stored := api.StoredWorkspaces()
-	if len(stored) == 0 {
-		return api.Fail("no_key_for_workspace",
-			"no key is stored for workspace `"+ws+"` — no key is stored at all; "+
-				"run `krowk auth login` in that workspace's name")
-	}
-	names := make([]string, 0, len(stored))
-	for _, k := range stored {
-		names = append(names, k.Name)
-	}
-	return api.Fail("no_key_for_workspace",
-		"no key is stored for workspace `"+ws+"` — stored: "+strings.Join(names, ", ")+
-			"; run `krowk auth login` to add one, or `krowk workspaces` to see them")
 }
 
 // registryMode says where the client is pointed, so `doctor` can tell a
@@ -720,7 +721,17 @@ func uploadsDelete(w io.Writer, args []string, f flags, format output.Format, en
 
 	client, err := newClient(f, env)
 	if err != nil {
-		return err
+		// A claim token is its own authority — it speaks for the one anonymous
+		// upload it was issued with, and needs no key at all. So a workspace
+		// that resolved and has no key, which rightly stops an upload, must not
+		// stop a token-authorised takedown: the contributor with a claim token
+		// in a repo pinned to a workspace they never logged into is exactly who
+		// runs this. Everything else about the failure still stands, so it is
+		// only stepped around when the token is present to take over.
+		if claimToken == "" || !workspaceKeyMissing(err) {
+			return err
+		}
+		client = api.New(api.BaseURLFor(f.dev, env), "")
 	}
 	// An anonymous upload's only authority is its claim token, so saying plainly
 	// that there is none beats a 400 from the registry naming a parameter the
@@ -1250,15 +1261,22 @@ func unconfirmedReason(err error) string {
 // workspace's, not just whatever logged in last — because the caller pasting
 // it into a curl expects it to act where krowk itself would act.
 func authToken(w io.Writer, f flags, env runctx.Env) error {
+	// The same short-circuit newClient takes, for the same reason: the
+	// environment's token is what a command here would send, whatever the
+	// config files are doing or failing to do.
+	if token := env("KROWK_TOKEN"); token != "" {
+		fmt.Fprintln(w, token)
+		return nil
+	}
 	ws, _, err := resolveWorkspace(f, env)
 	if err != nil {
 		return err
 	}
-	token := api.ReadToken(env, ws)
+	token, err := api.ResolveToken(env, ws)
+	if err != nil {
+		return err
+	}
 	if token == "" {
-		if ws != "" {
-			return noKeyFor(ws)
-		}
 		return api.Fail("not_authenticated",
 			"run `krowk auth login --token krowk_sk_...`, or upload anonymously")
 	}
@@ -1281,6 +1299,19 @@ func authVerify(w io.Writer, format output.Format, f flags, env runctx.Env, colo
 	key, err := client.VerifyKey(context.Background())
 	if err != nil {
 		return err
+	}
+	// The registry has just vouched for this key, which is more than the store
+	// may know about it: a login that ran offline filed it under "default"
+	// with no workspace at all, and a repo pinned to the real one refuses it
+	// there. Verify is the command the login receipt says to run, so it is
+	// where the record gets set straight. Only for a token the store actually
+	// holds — one from the environment was never stored and is not the store's
+	// business — and a failure to re-file is not a failure to verify: the
+	// answer printed below is true either way.
+	if env("KROWK_TOKEN") == "" {
+		_, _ = api.AdoptIdentity(client.Token, api.Identity{
+			KeyID: key.KeyID, Workspace: key.Workspace, WorkspaceName: key.WorkspaceName,
+		})
 	}
 	fmt.Fprintln(w, output.Key(key, format, f.quiet, colour))
 	return nil

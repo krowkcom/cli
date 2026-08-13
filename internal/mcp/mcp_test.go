@@ -689,6 +689,72 @@ func TestAFailedAttachSaysTheClaimStillLanded(t *testing.T) {
 	}
 }
 
+// A server whose checkout pinned a workspace it could not resolve serves on, but
+// nothing it creates may land in the anonymous workspace instead: that is the
+// silent misdirection — a link that works, pointing at the wrong place.
+func TestAnUnresolvedWorkspaceRefusesUploadsAndStillReads(t *testing.T) {
+	s := newSession(t, "")
+
+	// Something to read back later, uploaded while the server still could.
+	slug, _ := s.anonymousPush()
+
+	s.server.WorkspaceErr = api.Fail("no_stored_key",
+		"run `krowk auth login`, or `krowk workspaces` to see what is stored")
+
+	for _, tool := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"krowk_push", map[string]any{"files": []string{s.fixture}}},
+		{"krowk_list_artifacts", nil},
+		{"krowk_claim_artifact", map[string]any{"slug": slug, "claim_token": "krowk_claim_whatever"}},
+	} {
+		result := s.callTool(tool.name, tool.args)
+		if result["isError"] != true {
+			t.Fatalf("%s should be refused, got %+v", tool.name, result)
+		}
+		body := text(t, result)
+		if !strings.Contains(body, "no_stored_key") || !strings.Contains(body, "krowk auth login") {
+			t.Errorf("%s text = %q, want the workspace reason and its fix", tool.name, body)
+		}
+	}
+
+	// Reading needs no credential, so it is unaffected.
+	got := s.callTool("krowk_get_artifact", map[string]any{"slug": slug})
+	if got["isError"] == true {
+		t.Fatalf("reading an artifact should still work: %s", text(t, got))
+	}
+	if body := text(t, got); !strings.Contains(body, "Artifact "+slug) {
+		t.Errorf("text = %q, want the artifact", body)
+	}
+	if run := s.callTool("krowk_get_run", nil); run["isError"] == true {
+		t.Fatalf("run context should still work: %s", text(t, run))
+	}
+}
+
+// And the agent can find out why, rather than guessing from a refusal.
+func TestVerifyKeyReportsAnUnresolvedWorkspace(t *testing.T) {
+	s := newSession(t, "")
+	s.server.WorkspaceErr = api.Fail("config_unreadable", "fix `.krowk/config.json` and restart the server")
+
+	result := s.callTool("krowk_verify_key", nil)
+	// A status tool reports the state it is in; it does not fail because of it.
+	if result["isError"] == true {
+		t.Fatalf("verify_key should report, not fail: %s", text(t, result))
+	}
+	body := text(t, result)
+	if !strings.Contains(body, "config_unreadable") || !strings.Contains(body, ".krowk/config.json") {
+		t.Errorf("text = %q, want the reason and its fix", body)
+	}
+	structured, _ := result["structuredContent"].(map[string]any)
+	if structured["authenticated"] != false {
+		t.Errorf("authenticated = %v, want false", structured["authenticated"])
+	}
+	if got, _ := structured["workspace_error"].(string); !strings.Contains(got, "config_unreadable") {
+		t.Errorf("workspace_error = %q, want the reason", got)
+	}
+}
+
 // anonymousPush uploads the fixture without a key and returns the slug and the
 // claim token it came back with.
 func (s *session) anonymousPush() (slug, claimToken string) {

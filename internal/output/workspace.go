@@ -24,6 +24,10 @@ type Workspaces struct {
 	// environment is using a different one. Without this line the listing
 	// would answer the question wrongly with confidence.
 	Shadowed bool `json:"shadowed_by_env,omitempty"`
+	// KeyMissing says the resolved workspace cannot actually produce a key, so
+	// every upload here fails — the one qualification without which "uploads
+	// from here land in X" would be a lie told to whoever reads the listing.
+	KeyMissing bool `json:"key_missing,omitempty"`
 }
 
 // WorkspaceList renders the store. There is no link to a workspace, so
@@ -59,7 +63,11 @@ func WorkspaceList(ws Workspaces, f Format, quiet, colour bool) string {
 		}
 		lines = append(lines, fmt.Sprintf("  %-40s %s%s", name, k.KeyID, mark))
 	}
-	if ws.Resolved != "" {
+	switch {
+	case ws.Resolved != "" && ws.KeyMissing:
+		lines = append(lines, fmt.Sprintf("%s resolves here (%s) — but no key is stored for it, "+
+			"so every upload fails until `krowk auth login`", ws.Resolved, ws.Source))
+	case ws.Resolved != "":
 		lines = append(lines, fmt.Sprintf("uploads from here land in %s — %s", ws.Resolved, ws.Source))
 	}
 	if ws.Shadowed {
@@ -83,6 +91,10 @@ func workspacesSummary(ws Workspaces) string {
 			return "no keys stored — uploads are anonymous"
 		}
 		return stored + ", nothing resolves here — uploads are anonymous"
+	}
+	if ws.KeyMissing {
+		return fmt.Sprintf("%s resolves here (%s) but holds no key — every upload fails "+
+			"until `krowk auth login`", ws.Resolved, ws.Source)
 	}
 	return fmt.Sprintf("uploads from here land in %s (%s) — %s", ws.Resolved, ws.Source, stored)
 }

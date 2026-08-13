@@ -80,6 +80,19 @@ type Server struct {
 	// krowk_push into "read any file on this machine and publish it at a URL I can
 	// fetch without credentials". Empty means the working directory.
 	Root string
+	// WorkspaceErr is why this server holds no key when it was supposed to hold
+	// one: a configuration file it could not read, or a workspace the config
+	// pinned that has no key stored for it. It is nil in the ordinary anonymous
+	// case, where having no key is the intended state rather than a failure.
+	//
+	// It exists because the alternative to serving is not serving: an artifact
+	// needs no credential to read, and an anonymous push plus a claim token is a
+	// whole working flow, so refusing to start takes those away over a problem
+	// they do not have. What it must not do is let an upload land in the
+	// anonymous workspace when a repository asked for a named one — silently
+	// putting the file somewhere other than where the config said. So the tools
+	// that would create something there refuse with this instead.
+	WorkspaceErr error
 	// Now is swapped out in tests so expiry text is stable.
 	Now func() time.Time
 }
@@ -430,6 +443,20 @@ func describeError(err error) string {
 	return strings.Join(lines, "\n")
 }
 
+// workspaceReason renders WorkspaceErr as one line. An *api.Error's Error() is
+// only its code, and the code alone ("no_stored_key") does not tell anyone what
+// to do, so the fix comes with it.
+func workspaceReason(err error) string {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return err.Error()
+	}
+	if fix := apiErr.Fix(); fix != "" {
+		return apiErr.Code() + " — " + fix
+	}
+	return apiErr.Code()
+}
+
 func errorPayload(err error) any {
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) {
@@ -469,6 +496,13 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 	}
 	if len(a.Files) == 0 {
 		return "", nil, api.Fail("no_file", "pass at least one path in `files`")
+	}
+	// A push creates the thing the workspace was pinned for. Uploading it
+	// anonymously instead would be the misdirection this refusal exists to
+	// prevent: the file would be published, the link would work, and it would be
+	// in the wrong place with nothing saying so.
+	if s.WorkspaceErr != nil {
+		return "", nil, s.WorkspaceErr
 	}
 
 	// Confine before reading anything: an instruction the model picked up from a
@@ -602,6 +636,13 @@ func listArtifacts(ctx context.Context, s *Server, args json.RawMessage) (string
 	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
 		return "", nil, api.Fail("bad_arguments", "`limit` must be a number and `before` a slug")
 	}
+	// This one creates nothing, but the only listing it could return is the
+	// pinned workspace's, and without a key the registry would answer
+	// `unauthorized` — true, and no help at all in finding the malformed config
+	// or the missing key that caused it. Say the real reason instead.
+	if s.WorkspaceErr != nil {
+		return "", nil, s.WorkspaceErr
+	}
 
 	page, err := s.Client.ListArtifacts(ctx, strings.TrimSpace(a.Before), a.Limit)
 	if err != nil {
@@ -626,6 +667,10 @@ func listArtifacts(ctx context.Context, s *Server, args json.RawMessage) (string
 	return strings.Join(lines, "\n"), page, nil
 }
 
+// getArtifact reads, and reading needs no credential — an artifact is published
+// at a URL anyone with the link can fetch. So it works unchanged when
+// WorkspaceErr is set, as does krowk_get_run, which never touches the registry
+// at all. A server that cannot resolve its workspace is still useful for these.
 func getArtifact(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
 	var a struct {
 		Slug string `json:"slug"`
@@ -660,6 +705,13 @@ func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string
 	}
 	if strings.TrimSpace(a.Slug) == "" || strings.TrimSpace(a.ClaimToken) == "" {
 		return "", nil, api.Fail("missing_claim", "pass both the artifact slug and its claim_token")
+	}
+	// A claim moves an upload into the key's workspace and keeps it there, so it
+	// is a creation in the pinned workspace by another name — and the token is
+	// one-shot, so a claim that lands in the wrong workspace cannot be redone.
+	// Refuse before spending it.
+	if s.WorkspaceErr != nil {
+		return "", nil, s.WorkspaceErr
 	}
 
 	artifact, err := s.Client.ClaimArtifact(ctx, strings.TrimSpace(a.Slug), strings.TrimSpace(a.ClaimToken))
@@ -731,6 +783,16 @@ func getRun(_ context.Context, s *Server, _ json.RawMessage) (string, any, error
 }
 
 func verifyKey(ctx context.Context, s *Server, _ json.RawMessage) (string, any, error) {
+	// The question this tool answers is where uploads land, and "nowhere, for
+	// this reason" is an answer rather than a failure — an agent that just had a
+	// push refused reads it here to find out why, so it is reported, not raised.
+	if s.WorkspaceErr != nil {
+		return "This server has no API key, and it was meant to have one: " + workspaceReason(s.WorkspaceErr) +
+				"\n\nUploads, claims and listings are refused rather than landing in the anonymous " +
+				"workspace, because this checkout's config names a workspace of its own. Looking up " +
+				"an artifact still works. Fix the key or the config and restart the server.",
+			map[string]any{"authenticated": false, "workspace_error": workspaceReason(s.WorkspaceErr)}, nil
+	}
 	if s.Client.Token == "" {
 		return "No API key is configured, so pushes will be anonymous: they expire within a day " +
 				"and come back with a claim token.\n\nSet KROWK_TOKEN, or run `krowk auth login --token krowk_sk_...`.",
@@ -977,7 +1039,9 @@ func toolSchemas() []map[string]any {
 		{
 			"name": "krowk_verify_key",
 			"description": "Check whether an API key is configured, and which workspace uploads " +
-				"made with it land in. Without a key, pushes still work but are anonymous and expire in 24h.",
+				"made with it land in. Without a key, pushes still work but are anonymous and expire in 24h. " +
+				"Call it when a push is refused: if this checkout pinned a workspace the server could not " +
+				"reach, the reason is here.",
 			"inputSchema": map[string]any{
 				"type":                 "object",
 				"properties":           map[string]any{},

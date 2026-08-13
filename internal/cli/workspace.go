@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"io"
-	"slices"
 	"strings"
 
 	"github.com/krowkcom/cli/internal/api"
@@ -35,6 +34,15 @@ func workspacesList(w io.Writer, f flags, format output.Format, env runctx.Env, 
 			}
 		}
 	}
+	// The claim "uploads from here land in X" is checked against the store
+	// before it is made, with the same policy the upload itself would apply.
+	// A listing that asserts it while every push in the directory exits 3
+	// teaches an agent that uploads work, and it never logs in.
+	if view.Resolved != "" && !view.Shadowed {
+		if _, err := api.ResolveToken(env, ws); err != nil {
+			view.KeyMissing = true
+		}
+	}
 	fmt.Fprintln(w, output.WorkspaceList(view, format, f.quiet, colour))
 	return nil
 }
@@ -49,6 +57,13 @@ func workspacesList(w io.Writer, f flags, format output.Format, env runctx.Env, 
 // else, no argument stays the error it always was.
 func workspacesUse(w io.Writer, args []string, f flags, format output.Format, env runctx.Env,
 	colour, isTTY bool) error {
+	// An empty store is a missing credential, not a wrong command: the fix is
+	// `auth login`, and exit 3 is the number that says so — checked before the
+	// argument, because no argument makes a store with nothing in it right.
+	if len(api.StoredWorkspaces()) == 0 {
+		return api.Fail("not_authenticated",
+			"no keys are stored to choose between — `krowk auth login` adds one")
+	}
 	if len(args) == 0 {
 		name, err := askForWorkspace("Which workspace should be the default?", f, format, env, isTTY,
 			api.Fail("no_workspace",
@@ -191,12 +206,12 @@ func askForWorkspace(title string, f flags, format output.Format, env runctx.Env
 }
 
 // knownConfigKey rejects a key this build has no idea of, before any file is
-// touched. Writing it anyway would succeed and then do nothing, which reads as
-// krowk ignoring the user — worse than saying no.
+// touched. The schema's own judgement does the deciding — this only dresses
+// it in the CLI's error envelope, so the two can never disagree about which
+// keys exist.
 func knownConfigKey(key string) error {
-	if slices.Contains(config.KnownKeys(), key) {
-		return nil
+	if err := config.Known(key); err != nil {
+		return api.Fail("unknown_config_key", err.Error())
 	}
-	return api.Fail("unknown_config_key",
-		"`"+key+"` is not a configuration key — keys: "+strings.Join(config.KnownKeys(), ", "))
+	return nil
 }

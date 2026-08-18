@@ -146,6 +146,16 @@ func TestAFailedExpressionDoesNotQuoteTheRecordBack(t *testing.T) {
 	if !strings.Contains(message, "object") {
 		t.Errorf("the failure no longer names the type it met: %q", message)
 	}
+
+	// The preview is caller data rendered as JSON, so anything that looks like
+	// structure can also be inside it. A key holding the same `: ` the message
+	// uses to introduce the type must not move where the message is cut — the
+	// keys sort, so this one lands inside the preview and ahead of the token.
+	const colonInside = `{"data":{"a: b":"y","claim_token":"krowk_claim_s3cret"}}`
+	err = filter(t, ".data | .[0]").Write(&strings.Builder{}, colonInside, false)
+	if message := err.(*api.Error).Fix(); strings.Contains(message, "krowk_claim") {
+		t.Errorf("a colon inside the record let the preview through: %q", message)
+	}
 }
 
 func TestAPipedResultIsNotFoldedForATerminalItIsNotGoingTo(t *testing.T) {

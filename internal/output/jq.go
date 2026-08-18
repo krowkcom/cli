@@ -116,23 +116,22 @@ func jqFailure(err error) error {
 // withoutPreview drops the bracketed value gojq appends to a type mismatch.
 //
 // gojq keeps the value on the error unexported, so this reads the message rather
-// than the error: the value is whatever follows the last `: `, and the preview is
-// the bracketed part of it. Both bounds have to hold — a message that does not
-// end in a bracket is not one of these, and is left exactly as gojq wrote it,
-// because a mangled diagnostic is worse than a long one.
+// than the error. The shape it is cutting is `<what went wrong>: <type>
+// (<preview>)`, and the cut is at the *first* bracket rather than the last: the
+// preview is a JSON rendering of caller data and can hold anything, brackets and
+// colons included, so anything that looks like structure inside it has to be
+// treated as content. A message not ending in a bracket is not one of these and
+// is left exactly as gojq wrote it, since a mangled diagnostic is worse than a
+// long one.
 func withoutPreview(message string) string {
 	if !strings.HasSuffix(message, ")") {
 		return message
 	}
-	value := strings.LastIndex(message, ": ")
-	if value < 0 {
-		return message
-	}
-	bracket := strings.Index(message[value:], " (")
+	bracket := strings.Index(message, " (")
 	if bracket < 0 {
 		return message
 	}
-	return message[:value+bracket]
+	return message[:bracket]
 }
 
 // Write runs the filter over one rendered result and writes what comes out, one

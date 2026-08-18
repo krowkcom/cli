@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -373,7 +374,13 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 func report(w io.Writer, err error, format output.Format, quiet, colour bool, filter *output.Filter) int {
 	rendered := output.Error(err, format, quiet, colour)
 	if filter != nil && !output.IsFilterFailure(err) {
-		if filterErr := filter.Write(w, rendered, colour); filterErr == nil {
+		// Into a buffer first, because a filter can write several values and then
+		// fail on one. Writing straight to stderr would leave those first values
+		// standing in front of the whole envelope this falls back to, and a caller
+		// reading a failure would have to work out which half was the answer.
+		var filtered bytes.Buffer
+		if filterErr := filter.Write(&filtered, rendered, colour); filterErr == nil {
+			fmt.Fprint(w, filtered.String())
 			return exitCodeFor(err)
 		}
 	}

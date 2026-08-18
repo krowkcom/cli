@@ -86,7 +86,15 @@ environment variable — so never guess at a spelling this file does not carry.
    and it clicks through to the card. `paste.url`, bare, for Slack and Basecamp —
    both unfurl the card into a preview, and Slack renders no markdown image
    embeds at all. Never assemble either form yourself; both come back ready.
-8. **Push what the person asked for, not what is nearby.** An artifact is public
+8. **Paste the link where a slug is asked for.** Every command that names a
+   record — `uploads show`, `uploads attach`, `uploads delete`, `claim`,
+   `runs show`, `runs finish`, and `--run` everywhere it appears — reads the slug
+   out of any link that carries it: the card page, the CDN URL, or whatever a
+   person pasted at you. Hand it over whole. Never cut a slug out of a URL
+   yourself, and never ask a person for "just the slug" — you already have it. A
+   link carrying no slug of the kind the command wants fails as `bad_artifact` or
+   `bad_run` (exit 1) before anything is sent.
+9. **Push what the person asked for, not what is nearby.** An artifact is public
    to anyone with the link. Never push `.env` files, key material, credential
    JSON or anything under `.ssh`/`.aws`, and never push a file you found rather
    than made.
@@ -111,6 +119,7 @@ environment variable — so never guess at a spelling this file does not carry.
 | One run's artifacts | `krowk uploads list --run run_8Kd2wq --json` |
 | Next page of a listing | `krowk uploads list --before <next> --json` |
 | Read one artifact back | `krowk uploads show art_2e1d --json` |
+| Read one back from a pasted link | `krowk uploads show https://krowk.com/a/art_2e1d --json` |
 | Keep an anonymous artifact | `krowk claim art_2e1d <claim-token> --json` |
 | Keep it and group it at once | `krowk claim art_2e1d <claim-token> --run run_8Kd2wq --json` |
 | Group an artifact afterwards | `krowk uploads attach art_2e1d --run run_8Kd2wq --json` |

@@ -631,6 +631,72 @@ func TestUploadsShowIsScopedToTheKey(t *testing.T) {
 	}
 }
 
+// The pitch is the pasted link, so what a caller holds after an upload is a URL,
+// not a bare slug. Every command that names a record takes either.
+func TestASlugMayBePastedAsTheLinkThatCarriesIt(t *testing.T) {
+	h := newHarness(t, 0)
+	pushed := only(t, h.ok("push", h.fixture))
+
+	// The card page — the link krowk hands back and the one that gets pasted.
+	if shown := only(t, h.ok("uploads", "show", pushed.URL)); shown.Slug != pushed.Slug {
+		t.Errorf("show by card link = %q, want %q", shown.Slug, pushed.Slug)
+	}
+	// The CDN URL under it, which is what an image embed in a pull request names.
+	if shown := only(t, h.ok("uploads", "show", pushed.FileURL)); shown.Slug != pushed.Slug {
+		t.Errorf("show by file link = %q, want %q", shown.Slug, pushed.Slug)
+	}
+
+	// --run is a slug in the same way, so it reads a link the same way.
+	started := h.ok("runs", "start")
+	runLink := "https://krowk.com/runs/" + started.Data.Slug
+	attached := only(t, h.ok("uploads", "attach", pushed.URL, "--run="+runLink))
+	if attached.runSlug() != started.Data.Slug {
+		t.Errorf("attach by link put it under %q, want %q", attached.runSlug(), started.Data.Slug)
+	}
+	if shown := h.ok("runs", "show", runLink); shown.Data.Slug != started.Data.Slug {
+		t.Errorf("runs show by link = %q, want %q", shown.Data.Slug, started.Data.Slug)
+	}
+}
+
+// The two commands a person reaches for holding nothing but a pasted link and a
+// token: keeping an upload, and taking one down.
+func TestClaimAndTakedownTakeTheLinkToo(t *testing.T) {
+	h := newHarness(t, 0)
+
+	h.anonymous()
+	uploaded := only(t, h.ok("push", h.fixture))
+	h.env["KROWK_TOKEN"] = "krowk_sk_test"
+
+	claimed := only(t, h.ok("claim", uploaded.URL, uploaded.ClaimToken))
+	if claimed.Slug != uploaded.Slug {
+		t.Errorf("claim by link = %q, want %q", claimed.Slug, uploaded.Slug)
+	}
+
+	e := h.ok("uploads", "delete", uploaded.FileURL)
+	if !e.OK || e.Data.Slug != uploaded.Slug || !e.Data.TakenDown {
+		t.Errorf("delete by link = %+v", e)
+	}
+}
+
+// A link naming the wrong kind of record, or none at all, is refused before the
+// request goes out: the registry could only answer "no such record", which reads
+// as a slug that expired rather than as a URL in the wrong place.
+func TestALinkThatNamesTheWrongRecordIsRefusedHere(t *testing.T) {
+	h := newHarness(t, 0)
+	pushed := only(t, h.ok("push", h.fixture))
+
+	refusal := h.failsWith(1, "runs", "show", pushed.URL)
+	if refusal["error"] != "bad_run" {
+		t.Errorf("runs show by artifact link = %v, want bad_run", refusal["error"])
+	}
+	if fix, _ := refusal["fix"].(string); !strings.Contains(fix, pushed.Slug) {
+		t.Errorf("fix = %q, want it to name the artifact the link carries", fix)
+	}
+	if got := h.fails("uploads", "show", "https://krowk.com/pricing")["error"]; got != "bad_artifact" {
+		t.Errorf("a link carrying no slug gave %v, want bad_artifact", got)
+	}
+}
+
 func TestUploadsListPagesNewestFirst(t *testing.T) {
 	h := newHarness(t, 0)
 	for _, name := range []string{"one.txt", "two.txt", "three.txt"} {

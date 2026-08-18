@@ -511,6 +511,43 @@ func TestGetArtifactRoundTripsAPush(t *testing.T) {
 	}
 }
 
+// An agent holding a link and not a slug is the ordinary case — the link is what
+// a push hands back and what everything downstream shows. So `slug` takes one.
+func TestGetArtifactTakesTheLinkAsReadilyAsTheSlug(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	pushed := s.callTool("krowk_push", map[string]any{"files": []string{s.fixture}})
+	structured, _ := pushed["structuredContent"].(map[string]any)
+	artifacts, _ := structured["artifacts"].([]any)
+	if len(artifacts) != 1 {
+		t.Fatalf("artifacts = %+v, want one", structured["artifacts"])
+	}
+	artifact, _ := artifacts[0].(map[string]any)
+	slug, _ := artifact["slug"].(string)
+	url, _ := artifact["url"].(string)
+	if slug == "" || url == "" {
+		t.Fatalf("no slug or url from the push: %+v", pushed)
+	}
+
+	got := s.callTool("krowk_get_artifact", map[string]any{"slug": url})
+	if got["isError"] == true {
+		t.Fatalf("lookup by link failed: %s", text(t, got))
+	}
+	if body := text(t, got); !strings.Contains(body, "Artifact "+slug) {
+		t.Errorf("text = %q, want the artifact the link names", body)
+	}
+
+	// A link naming nothing is refused here rather than sent on as a slug, which
+	// the registry could only answer as a record it does not have.
+	refused := s.callTool("krowk_get_artifact", map[string]any{"slug": "https://krowk.com/pricing"})
+	if refused["isError"] != true {
+		t.Fatalf("want isError, got %+v", refused)
+	}
+	if body := text(t, refused); !strings.Contains(body, "bad_artifact") {
+		t.Errorf("text = %q, want bad_artifact", body)
+	}
+}
+
 func TestGetArtifactNeedsASlug(t *testing.T) {
 	s := newSession(t, "krk_test")
 

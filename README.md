@@ -62,6 +62,8 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 | `krowk doctor` | Report version, connectivity, auth and detected run context |
 | `krowk upgrade` | Upgrade krowk to the latest release |
 
+Wherever a command takes `<artifact>`, `<run>` or `--run`, it takes the link as readily as the slug: paste `https://krowk.com/a/art_…` or the CDN URL under it, and the slug is read out of it.
+
 Push flags: `--run`, `--pull-request`, `--reference` (repeatable), `--session`, `--title`, `--metadata key=value` (repeatable), plus `--repo` / `--commit` / `--agent` to override detection. Without a key, uploads land anonymously, expire in 24 hours and return a one-shot claim token.
 
 ### Metadata

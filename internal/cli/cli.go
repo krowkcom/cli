@@ -54,7 +54,8 @@ Usage
 %s
 
 Upload flags
-  --run <slug>           Attach to an existing run instead of opening one. On
+  --run <slug|link>      Attach to an existing run instead of opening one, by
+                         slug or by any link carrying one. On
                          ` + "`claim`" + ` and ` + "`uploads attach`" + ` it names the run an upload
                          already made joins — a claimed upload has none otherwise
   --pull-request <url>   Pull request the work belongs to
@@ -71,7 +72,7 @@ Upload flags
 List flags
   --limit <n>            Rows per page (1–100, default 50)
   --before <slug>        Start after this row — the ` + "`next`" + ` of the last page
-  --run <slug>           On ` + "`uploads list`" + `, narrow it to what one run produced
+  --run <slug|link>      On ` + "`uploads list`" + `, narrow it to what one run produced
 
 Auth flags
   --token <key>          Store this key rather than asking the browser — how CI
@@ -128,6 +129,11 @@ Run metadata — the pull request, references and session — is recorded on a r
 and a run belongs to a workspace, so it needs an API key. Without one an upload
 still works: it lands anonymously, expires within a day, and comes back with a
 claim token that ` + "`krowk claim`" + ` spends to keep it.
+
+Wherever an artifact or a run is named — a positional, or --run — a link that
+carries it does just as well: the card page, the CDN URL under it, or anything
+else krowk printed. A link carrying no slug of the kind the command wants, or
+two different ones, is refused before anything is sent.
 
 Taking an upload down removes the bytes at once and leaves the link reporting
 that it was taken down. There is no undo and no confirmation — it is what to
@@ -433,6 +439,9 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 	if err != nil {
 		return err
 	}
+	if f, err = withRunFlag(f); err != nil {
+		return err
+	}
 
 	// Every file is measured and digested before anything is sent, so a typo in
 	// the last path fails before the first upload rather than halfway through.
@@ -633,6 +642,36 @@ func errCode(err error) string {
 	return err.Error()
 }
 
+// withRunFlag reads --run the way the positionals are read: the slug, or a link
+// carrying it. Called by the four commands that consume the flag rather than
+// once in Run, because a flag nothing reads has to stay a flag nothing reads —
+// resolving it centrally made `krowk doctor --run <link>` fail on a value doctor
+// never looks at, and answered an unknown command with a complaint about its
+// flags instead of naming the command.
+func withRunFlag(f flags) (flags, error) {
+	slug, err := api.ParseSlug(api.KindRun, f.run)
+	if err != nil {
+		return f, err
+	}
+	f.run = slug
+	return f, nil
+}
+
+// slugArg reads the positional every command that names one record takes: the
+// slug, or — since the pitch of the product is the pasted link — any link that
+// carries it. The missing case stays each command's own words, because "pass the
+// artifact" is only useful when it shows that command's spelling of it.
+func slugArg(kind string, args []string, missing, fix string) (string, error) {
+	// Blank counts as absent: `krowk uploads show "$SLUG"` with the variable
+	// unset arrives as one empty word, and the answer to that is the command's
+	// own "pass the artifact" rather than a refusal from the registry about a
+	// record with no name.
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		return "", api.Fail(missing, fix)
+	}
+	return api.ParseSlug(kind, args[0])
+}
+
 // uploadsList pages through the key's workspace. Needs a key: keyless requests
 // all share the anonymous workspace, so there is nothing of one's own to list.
 //
@@ -642,6 +681,10 @@ func errCode(err error) string {
 // answer an empty page — and a caller cannot tell that apart from a run that
 // genuinely produced nothing.
 func uploadsList(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
+	f, err := withRunFlag(f)
+	if err != nil {
+		return err
+	}
 	client, err := newClient(f, env)
 	if err != nil {
 		return err
@@ -684,15 +727,16 @@ func runsList(w io.Writer, f flags, format output.Format, env runctx.Env, colour
 // upload's origin lives — the pull request, the commit, the session — since the
 // registry keeps none of it on the artifact.
 func runsShow(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
-	if len(args) == 0 {
-		return api.Fail("no_run", "pass the run: `krowk runs show run_...`")
+	slug, err := slugArg(api.KindRun, args, "no_run", "pass the run: `krowk runs show run_...`")
+	if err != nil {
+		return err
 	}
 	client, err := newClient(f, env)
 	if err != nil {
 		return err
 	}
 
-	run, err := client.ShowRun(context.Background(), args[0])
+	run, err := client.ShowRun(context.Background(), slug)
 	if err != nil {
 		return err
 	}
@@ -701,15 +745,17 @@ func runsShow(w io.Writer, args []string, f flags, format output.Format, env run
 }
 
 func uploadsShow(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
-	if len(args) == 0 {
-		return api.Fail("no_artifact", "pass the artifact: `krowk uploads show art_...`")
+	slug, err := slugArg(api.KindArtifact, args, "no_artifact",
+		"pass the artifact: `krowk uploads show art_...`")
+	if err != nil {
+		return err
 	}
 	client, err := newClient(f, env)
 	if err != nil {
 		return err
 	}
 
-	artifact, err := client.ShowArtifact(context.Background(), args[0])
+	artifact, err := client.ShowArtifact(context.Background(), slug)
 	if err != nil {
 		return err
 	}
@@ -721,18 +767,23 @@ func uploadsShow(w io.Writer, args []string, f flags, format output.Format, env 
 // upload that started out anonymous ever gets one: it could not name a run when
 // it was created, and claiming it does not give it one.
 func uploadsAttach(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
-	if len(args) == 0 {
-		return api.Fail("no_artifact", "pass the artifact: `krowk uploads attach art_... --run run_...`")
+	slug, err := slugArg(api.KindArtifact, args, "no_artifact",
+		"pass the artifact: `krowk uploads attach art_... --run run_...`")
+	if err != nil {
+		return err
 	}
-	if f.run == "" {
-		return api.Fail("no_run", "pass the run to attach it to: `krowk uploads attach "+args[0]+" --run run_...`")
+	if strings.TrimSpace(f.run) == "" {
+		return api.Fail("no_run", "pass the run to attach it to: `krowk uploads attach "+slug+" --run run_...`")
+	}
+	if f, err = withRunFlag(f); err != nil {
+		return err
 	}
 	client, err := newClient(f, env)
 	if err != nil {
 		return err
 	}
 
-	artifact, err := client.AttachRun(context.Background(), args[0], f.run)
+	artifact, err := client.AttachRun(context.Background(), slug, f.run)
 	if err != nil {
 		return err
 	}
@@ -752,10 +803,11 @@ func uploadsAttach(w io.Writer, args []string, f flags, format output.Format, en
 // to different callers: a key speaks for everything in its workspace, and a
 // claim token speaks for the one anonymous upload it was issued with.
 func uploadsDelete(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
-	if len(args) == 0 {
-		return api.Fail("no_artifact", "pass the artifact: `krowk uploads delete art_...`")
+	slug, err := slugArg(api.KindArtifact, args, "no_artifact",
+		"pass the artifact: `krowk uploads delete art_...`")
+	if err != nil {
+		return err
 	}
-	slug := args[0]
 	var claimToken string
 	if len(args) > 1 {
 		// Checked rather than taken as given, because a second word that is not a
@@ -763,12 +815,16 @@ func uploadsDelete(w io.Writer, args []string, f flags, format output.Format, en
 		// stray argument would quietly turn an authorised takedown into an
 		// unauthorised one and report it as a 404. `uploads delete art_a art_b`,
 		// meaning two artifacts, is the way that happens.
-		if !strings.HasPrefix(args[1], claimTokenPrefix) {
+		//
+		// Trimmed because it was pasted, and not quoted back because of what a
+		// paste in this position can be: the second link of two, signature and
+		// all, which a refusal would then write into stderr and the envelope.
+		claimToken = strings.TrimSpace(args[1])
+		if !strings.HasPrefix(claimToken, claimTokenPrefix) {
 			return api.Fail("bad_claim_token",
-				"`"+args[1]+"` is not a claim token — takedown takes one artifact and, after it, "+
-					"only the `"+claimTokenPrefix+"...` token that upload came back with")
+				"the second argument is not a claim token — takedown takes one artifact and, "+
+					"after it, only the `"+claimTokenPrefix+"...` token that upload came back with")
 		}
-		claimToken = args[1]
 	}
 
 	client, err := newClient(f, env)
@@ -845,15 +901,16 @@ func runsStart(w io.Writer, f flags, format output.Format, env runctx.Env, colou
 }
 
 func runsFinish(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
-	if len(args) == 0 {
-		return api.Fail("no_run", "pass the run: `krowk runs finish run_...`")
+	slug, err := slugArg(api.KindRun, args, "no_run", "pass the run: `krowk runs finish run_...`")
+	if err != nil {
+		return err
 	}
 	client, err := newClient(f, env)
 	if err != nil {
 		return err
 	}
 
-	run, err := client.FinishRun(context.Background(), args[0])
+	run, err := client.FinishRun(context.Background(), slug)
 	if err != nil {
 		return err
 	}
@@ -873,13 +930,25 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 		return api.Fail("missing_claim",
 			"pass both the artifact and its token: `krowk claim art_... krowk_claim_...`")
 	}
+	// no_artifact rather than missing_claim: a blank first positional is the
+	// command being wrong, and missing_claim is classified as a credential the
+	// caller has to produce — which would send a script off to check its key over
+	// an argument that was never filled in.
+	slug, err := slugArg(api.KindArtifact, args, "no_artifact",
+		"pass both the artifact and its token: `krowk claim art_... krowk_claim_...`")
+	if err != nil {
+		return err
+	}
+	if f, err = withRunFlag(f); err != nil {
+		return err
+	}
 	client, err := newClient(f, env)
 	if err != nil {
 		return err
 	}
 	ctx := context.Background()
 
-	artifact, err := client.ClaimArtifact(ctx, args[0], args[1])
+	artifact, err := client.ClaimArtifact(ctx, slug, strings.TrimSpace(args[1]))
 	if err != nil {
 		return err
 	}

@@ -511,6 +511,43 @@ func TestGetArtifactRoundTripsAPush(t *testing.T) {
 	}
 }
 
+// An agent holding a link and not a slug is the ordinary case — the link is what
+// a push hands back and what everything downstream shows. So `slug` takes one.
+func TestGetArtifactTakesTheLinkAsReadilyAsTheSlug(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	pushed := s.callTool("krowk_push", map[string]any{"files": []string{s.fixture}})
+	structured, _ := pushed["structuredContent"].(map[string]any)
+	artifacts, _ := structured["artifacts"].([]any)
+	if len(artifacts) != 1 {
+		t.Fatalf("artifacts = %+v, want one", structured["artifacts"])
+	}
+	artifact, _ := artifacts[0].(map[string]any)
+	slug, _ := artifact["slug"].(string)
+	url, _ := artifact["url"].(string)
+	if slug == "" || url == "" {
+		t.Fatalf("no slug or url from the push: %+v", pushed)
+	}
+
+	got := s.callTool("krowk_get_artifact", map[string]any{"slug": url})
+	if got["isError"] == true {
+		t.Fatalf("lookup by link failed: %s", text(t, got))
+	}
+	if body := text(t, got); !strings.Contains(body, "Artifact "+slug) {
+		t.Errorf("text = %q, want the artifact the link names", body)
+	}
+
+	// A link naming nothing is refused here rather than sent on as a slug, which
+	// the registry could only answer as a record it does not have.
+	refused := s.callTool("krowk_get_artifact", map[string]any{"slug": "https://krowk.com/pricing"})
+	if refused["isError"] != true {
+		t.Fatalf("want isError, got %+v", refused)
+	}
+	if body := text(t, refused); !strings.Contains(body, "bad_artifact") {
+		t.Errorf("text = %q, want bad_artifact", body)
+	}
+}
+
 func TestGetArtifactNeedsASlug(t *testing.T) {
 	s := newSession(t, "krk_test")
 
@@ -613,6 +650,37 @@ func TestClaimAdoptsAnAnonymousPushIntoTheWorkspace(t *testing.T) {
 	}
 	if body := text(t, unlisted); !strings.Contains(body, "unauthorized") {
 		t.Errorf("text = %q, want unauthorized", body)
+	}
+}
+
+// The claim spends a one-shot token, so what it does with a link — and what it
+// refuses before spending anything — is worth pinning on this transport too.
+func TestClaimTakesLinksAndRefusesBeforeSpendingTheToken(t *testing.T) {
+	anon := newSession(t, "")
+	slug, claim := anon.anonymousPush()
+	keyed := anon.withKey("krowk_sk_test")
+	run := keyed.startRun()
+
+	// A run argument that carries no run is refused, and the token survives it:
+	// the claim below still works.
+	refused := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": slug, "claim_token": claim, "run": "https://krowk.com/pricing",
+	})
+	if refused["isError"] != true {
+		t.Fatalf("a run link naming nothing was accepted: %+v", refused)
+	}
+	if body := text(t, refused); !strings.Contains(body, "bad_run") {
+		t.Errorf("text = %q, want bad_run", body)
+	}
+
+	claimed := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": "https://krowk.com/a/" + slug, "claim_token": claim, "run": run,
+	})
+	if claimed["isError"] == true {
+		t.Fatalf("claim by link failed: %s", text(t, claimed))
+	}
+	if body := text(t, claimed); !strings.Contains(body, slug) || !strings.Contains(body, run) {
+		t.Errorf("text = %q, want the artifact under the run", body)
 	}
 }
 

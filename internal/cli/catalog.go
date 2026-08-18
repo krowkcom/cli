@@ -115,9 +115,21 @@ func metadataFlags() []Flag {
 // means there. On a push it opens or names the run the artifacts go under; on a
 // listing it narrows the page; on a claim or an attach it names the run an
 // upload that already exists joins.
+//
+// What it takes is the same everywhere, so that half of the sentence is written
+// once here: a run slug, or a link that carries one.
 func runFlag(usage string) Flag {
-	return Flag{Name: "run", Type: typeString, Usage: usage}
+	return Flag{Name: "run", Type: typeString, Usage: usage + ". Its slug, or a link carrying it"}
 }
+
+// artifactArg and runArg describe the positional every command that names one
+// record takes. They say the link is accepted because the catalog is what a
+// machine reads instead of the prose: an agent holding `krowk.com/a/art_…` and
+// no rule saying it may paste it will cut the slug out itself, or ask.
+const (
+	artifactArg = "The artifact slug, or a link carrying it — the card page or the CDN URL"
+	runArg      = "The run slug, or a link carrying it"
+)
 
 // globalFlag picks which config file `config set` and `config unset` write.
 // One definition for both, so the two commands can never describe it
@@ -170,13 +182,13 @@ func catalog() Catalog {
 						Name:    "show",
 						Usage:   "krowk uploads show <artifact>",
 						Summary: "Read one artifact back",
-						Args:    []Arg{{Name: "artifact", Summary: "The artifact slug", Required: true}},
+						Args:    []Arg{{Name: "artifact", Summary: artifactArg, Required: true}},
 					},
 					{
 						Name:    "attach",
 						Usage:   "krowk uploads attach <art> --run <run>",
 						Summary: "Put an upload under a run afterwards",
-						Args:    []Arg{{Name: "artifact", Summary: "The artifact slug", Required: true}},
+						Args:    []Arg{{Name: "artifact", Summary: artifactArg, Required: true}},
 						Flags: []Flag{runFlag(
 							"The run to put it under — required, and it must be one this workspace holds")},
 					},
@@ -185,7 +197,7 @@ func catalog() Catalog {
 						Usage:   "krowk uploads delete <art> [token]",
 						Summary: "Take an upload down — immediate, cannot be undone",
 						Args: []Arg{
-							{Name: "artifact", Summary: "The artifact slug", Required: true},
+							{Name: "artifact", Summary: artifactArg, Required: true},
 							{Name: "claim-token", Summary: "The claim token an anonymous upload came back " +
 								"with, when there is no key to authorise the takedown"},
 						},
@@ -215,13 +227,13 @@ func catalog() Catalog {
 						Name:    "show",
 						Usage:   "krowk runs show <run>",
 						Summary: "Read one run back, with its metadata",
-						Args:    []Arg{{Name: "run", Summary: "The run slug", Required: true}},
+						Args:    []Arg{{Name: "run", Summary: runArg, Required: true}},
 					},
 					{
 						Name:    "finish",
 						Usage:   "krowk runs finish <run>",
 						Summary: "Close a run",
-						Args:    []Arg{{Name: "run", Summary: "The run slug", Required: true}},
+						Args:    []Arg{{Name: "run", Summary: runArg, Required: true}},
 					},
 				},
 			},
@@ -230,7 +242,7 @@ func catalog() Catalog {
 				Usage:   "krowk claim <artifact> <token> [--run]",
 				Summary: "Keep an anonymous upload past expiry",
 				Args: []Arg{
-					{Name: "artifact", Summary: "The artifact slug", Required: true},
+					{Name: "artifact", Summary: artifactArg, Required: true},
 					{Name: "claim-token", Summary: "The token the anonymous upload came back with",
 						Required: true},
 				},

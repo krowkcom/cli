@@ -501,10 +501,19 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 	// A push creates the thing the workspace was pinned for. Uploading it
 	// anonymously instead would be the misdirection this refusal exists to
 	// prevent: the file would be published, the link would work, and it would be
-	// in the wrong place with nothing saying so.
+	// in the wrong place with nothing saying so. Checked before the arguments are
+	// shaped, so an agent told to fix its `run` does not learn about a broken
+	// workspace on the next call instead.
 	if s.WorkspaceErr != nil {
 		return "", nil, s.WorkspaceErr
 	}
+	// A run named by link is a run named: the agent holding one usually holds the
+	// result of the call that opened it, links and all.
+	runNamed, err := api.ParseSlug(api.KindRun, a.Run)
+	if err != nil {
+		return "", nil, err
+	}
+	a.Run = runNamed
 
 	// Confine before reading anything: an instruction the model picked up from a
 	// repository file or a web page must not be able to name ~/.ssh/id_rsa here.
@@ -690,8 +699,12 @@ func getArtifact(ctx context.Context, s *Server, args json.RawMessage) (string, 
 	if strings.TrimSpace(a.Slug) == "" {
 		return "", nil, api.Fail("missing_slug", "pass the artifact slug, e.g. art_...")
 	}
+	slug, err := api.ParseSlug(api.KindArtifact, a.Slug)
+	if err != nil {
+		return "", nil, err
+	}
 
-	artifact, err := s.Client.ShowArtifact(ctx, strings.TrimSpace(a.Slug))
+	artifact, err := s.Client.ShowArtifact(ctx, slug)
 	if err != nil {
 		return "", nil, err
 	}
@@ -712,23 +725,37 @@ func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string
 	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
 		return "", nil, api.Fail("bad_arguments", "`slug`, `claim_token` and `run` must be strings")
 	}
-	if strings.TrimSpace(a.Slug) == "" || strings.TrimSpace(a.ClaimToken) == "" {
-		return "", nil, api.Fail("missing_claim", "pass both the artifact slug and its claim_token")
+	// A blank slug is answered as the argument it is, not as missing_claim, which
+	// is classified as a credential to produce — the same split the CLI makes,
+	// because an agent on either transport is told to check its key otherwise.
+	if strings.TrimSpace(a.Slug) == "" {
+		return "", nil, api.Fail("no_artifact", "pass the artifact slug, e.g. art_...")
+	}
+	if strings.TrimSpace(a.ClaimToken) == "" {
+		return "", nil, api.Fail("missing_claim", "pass the claim_token the anonymous push returned")
 	}
 	// A claim moves an upload into the key's workspace and keeps it there, so it
 	// is a creation in the pinned workspace by another name — and the token is
 	// one-shot, so a claim that lands in the wrong workspace cannot be redone.
-	// Refuse before spending it.
+	// Refuse before spending it, and before anything else: an agent told to fix
+	// its `run` argument first would learn about the broken workspace second.
 	if s.WorkspaceErr != nil {
 		return "", nil, s.WorkspaceErr
 	}
-
-	artifact, err := s.Client.ClaimArtifact(ctx, strings.TrimSpace(a.Slug), strings.TrimSpace(a.ClaimToken))
+	slug, err := api.ParseSlug(api.KindArtifact, a.Slug)
+	if err != nil {
+		return "", nil, err
+	}
+	runSlug, err := api.ParseSlug(api.KindRun, a.Run)
 	if err != nil {
 		return "", nil, err
 	}
 
-	runSlug := strings.TrimSpace(a.Run)
+	artifact, err := s.Client.ClaimArtifact(ctx, slug, strings.TrimSpace(a.ClaimToken))
+	if err != nil {
+		return "", nil, err
+	}
+
 	if runSlug != "" {
 		// The claim has already been spent, so a failure here must not read as one
 		// the agent can undo by calling the tool again: the artifact is kept, and
@@ -946,8 +973,9 @@ func toolSchemas() []map[string]any {
 							"anyone with the link.",
 					},
 					"run": map[string]any{
-						"type":        "string",
-						"description": "Attach to an existing run instead of opening one.",
+						"type": "string",
+						"description": "Attach to an existing run instead of opening one. Its slug, " +
+							"or any link carrying it.",
 					},
 					"title": map[string]any{
 						"type":        "string",
@@ -1008,8 +1036,9 @@ func toolSchemas() []map[string]any {
 				"required": []string{"slug"},
 				"properties": map[string]any{
 					"slug": map[string]any{
-						"type":        "string",
-						"description": "Artifact slug, e.g. art_9f3c2e1a7b04d6c8e5f1a2b3.",
+						"type": "string",
+						"description": "Artifact slug, e.g. art_9f3c2e1a7b04d6c8e5f1a2b3 — or any " +
+							"link carrying it, like https://krowk.com/a/art_9f3c2e1a7b04d6c8e5f1a2b3.",
 					},
 				},
 				"additionalProperties": false,
@@ -1026,8 +1055,9 @@ func toolSchemas() []map[string]any {
 				"required": []string{"slug", "claim_token"},
 				"properties": map[string]any{
 					"slug": map[string]any{
-						"type":        "string",
-						"description": "Artifact slug, e.g. art_9f3c2e1a7b04d6c8e5f1a2b3.",
+						"type": "string",
+						"description": "Artifact slug, e.g. art_9f3c2e1a7b04d6c8e5f1a2b3 — or any " +
+							"link carrying it, like https://krowk.com/a/art_9f3c2e1a7b04d6c8e5f1a2b3.",
 					},
 					"claim_token": map[string]any{
 						"type":        "string",
@@ -1035,8 +1065,9 @@ func toolSchemas() []map[string]any {
 					},
 					"run": map[string]any{
 						"type": "string",
-						"description": "Run to attach the claimed upload to, e.g. run_... Attached after " +
-							"the claim, so it must be a run in this key's workspace.",
+						"description": "Run to attach the claimed upload to, e.g. run_..., or any " +
+							"link carrying it. Attached after the claim, so it must be a run in this " +
+							"key's workspace.",
 					},
 				},
 				"additionalProperties": false,

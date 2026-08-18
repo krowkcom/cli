@@ -118,3 +118,60 @@ func TestParseSlugDoesNotReadAHyphenatedWordAsASlug(t *testing.T) {
 		t.Error("`run-fast` was read as a run slug")
 	}
 }
+
+// A URL is full of tokens shaped like a slug and not one: `run_id=4821` in a CI
+// link, a file called art_report.png, a job path with run_7 in it. Reading any
+// of them as a slug would send krowk at a record nobody named.
+func TestParseSlugDoesNotReadSlugShapedWordsOutOfALink(t *testing.T) {
+	for _, c := range []struct{ kind, input string }{
+		{KindRun, "https://ci.example.com/build?run_id=4821"},
+		{KindRun, "https://ci.example.com/jobs/run_7/log.txt"},
+		{KindArtifact, "https://example.com/art_1.png"},
+		{KindArtifact, "./art_report.png"},
+		{KindRun, "https://example.com/run-fast/report.html"},
+	} {
+		if slug, err := ParseSlug(c.kind, c.input); err == nil {
+			t.Errorf("ParseSlug(%q) read %q as a slug", c.input, slug)
+		}
+	}
+}
+
+// Nothing and whitespace are different answers. Absent is how an optional run
+// is not given; blank was typed, or a shell expanded an empty variable into it,
+// and reading it as absent would silently widen the command it was passed to.
+func TestParseSlugSeparatesAbsentFromBlank(t *testing.T) {
+	if slug, err := ParseSlug(KindRun, ""); err != nil || slug != "" {
+		t.Errorf("ParseSlug(\"\") = %q, %v — want absent", slug, err)
+	}
+	_, err := ParseSlug(KindRun, "   ")
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "bad_run" {
+		t.Errorf("a blank run gave %v, want bad_run", err)
+	}
+}
+
+// ParseSlug is exported and takes a plain string, so a kind it has never heard
+// of has to be an error rather than a panic.
+func TestParseSlugSurvivesAnUnknownKind(t *testing.T) {
+	_, err := ParseSlug("job", "https://krowk.com/a/art_9f3c2e1a7b04d6c8e5f1a2b3")
+	if err == nil {
+		t.Fatal("an unknown kind was accepted")
+	}
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "bad_job" {
+		t.Errorf("err = %v, want bad_job", err)
+	}
+}
+
+// Only the artifact has a public page, so only its refusal may point at one:
+// there is no krowk.com/a/run_… to send anybody to.
+func TestParseSlugDoesNotInventAPageForARun(t *testing.T) {
+	_, err := ParseSlug(KindRun, "https://krowk.com/pricing")
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want an api failure", err)
+	}
+	if fix, _ := apiErr.Body["fix"].(string); strings.Contains(fix, "/a/run_") {
+		t.Errorf("fix = %q, want no artifact card path in a run's message", fix)
+	}
+}

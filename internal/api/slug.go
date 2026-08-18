@@ -21,13 +21,18 @@ var slugNouns = map[string]string{
 	KindWorkspace: "workspace",
 }
 
-// dnsSlugFloor is how long the random half of a slug has to be before the
-// hyphen spelling is read as one. A slug is 24 random characters, and the
-// hyphen form only exists as a DNS label — `art-{slug}.krowkusercontent.com` —
-// so a short word on the other side of a hyphen, like `run-fast` in a path, is
-// not a slug and must not be mistaken for one. The underscore spelling needs no
-// such floor: nothing else is spelled that way.
-const dnsSlugFloor = 16
+// slugFloor is how much random tail a token needs before a link is read as
+// carrying a slug. Canon mints exactly 24 base36 characters after the prefix —
+// the website validates that shape before it calls the registry at all — so
+// nothing real is turned away by a floor, and everything a URL is full of is:
+// `run_id=4821` in a CI link, `art_report.png` beside a checkout, `run_7` in a
+// job path. Each of those is `<kind>_<base36>` and none of them is a slug.
+//
+// A floor rather than 24 exactly, because this is a reader and not a validator:
+// the registry stays the authority on what it mints, and a slug shorter than
+// canon's would still resolve when passed bare, which is the path this function
+// leaves untouched.
+const slugFloor = 16
 
 // ParseSlug takes what somebody typed where a slug belongs — the slug itself,
 // or a link that carries one — and answers with the slug.
@@ -45,6 +50,19 @@ const dnsSlugFloor = 16
 // which reads as a slug that expired rather than as a URL in the wrong place.
 func ParseSlug(kind, input string) (string, error) {
 	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		// Nothing at all is not a mistake — an optional run is absent this way,
+		// and the caller decides what that means. Whitespace is a mistake: it was
+		// typed, or a shell expanded an empty variable into it, and letting it
+		// read as absent would quietly widen `--run " "` from one run to a new
+		// one and `uploads list --run " "` to the whole workspace.
+		if input == "" {
+			return "", nil
+		}
+		return "", Fail(slugFailure(kind),
+			"a blank "+slugNoun(kind)+" is not one — pass the "+slugNoun(kind)+
+				" slug, or a link that carries it")
+	}
 	if !looksLikeLink(trimmed) {
 		return trimmed, nil
 	}
@@ -65,16 +83,41 @@ func ParseSlug(kind, input string) (string, error) {
 		}
 		for _, token := range tokens {
 			if slug, ok := slugOfKind(other, token); ok {
-				return "", Fail("bad_"+slugNouns[kind],
-					"that link names "+article(slugNouns[other])+" — `"+slug+"` — and this takes "+
-						article(slugNouns[kind])+"; pass the "+slugNouns[kind]+" slug, or a link that carries one")
+				return "", Fail(slugFailure(kind),
+					"that link names "+article(slugNoun(other))+" — `"+slug+"` — and this takes "+
+						article(slugNoun(kind))+"; pass the "+slugNoun(kind)+
+						" slug, or a link that carries one")
 			}
 		}
 	}
 
-	return "", Fail("bad_"+slugNouns[kind],
-		"`"+trimmed+"` carries no "+slugNouns[kind]+" slug — paste the link krowk handed back, "+
-			"like https://krowk.com/a/"+kind+"_…, or the "+slugNouns[kind]+" slug itself")
+	return "", Fail(slugFailure(kind),
+		"`"+trimmed+"` carries no "+slugNoun(kind)+" slug — paste "+slugExample(kind)+
+			", or the "+slugNoun(kind)+" slug itself")
+}
+
+// slugNoun and slugFailure keep an unknown kind from being worse than useless:
+// ParseSlug takes a plain string, so a caller can name a kind this file has
+// never heard of, and the answer to that is a readable error rather than a
+// panic on an empty noun.
+func slugNoun(kind string) string {
+	if noun, ok := slugNouns[kind]; ok {
+		return noun
+	}
+	return kind
+}
+
+func slugFailure(kind string) string { return "bad_" + slugNoun(kind) }
+
+// slugExample shows the shape that would have worked. Only the artifact has a
+// public page to point at — `krowk.com/a/{slug}` is the card — so the other
+// kinds are told to paste whatever krowk printed rather than a URL shape that
+// does not exist.
+func slugExample(kind string) string {
+	if kind == KindArtifact {
+		return "the link krowk handed back, like https://krowk.com/a/art_…"
+	}
+	return "a link krowk printed that carries the " + slugNoun(kind) + " slug"
 }
 
 // looksLikeLink is what separates a slug from a URL that holds one. A slug is
@@ -102,22 +145,19 @@ func isSlugBoundary(r rune) bool {
 // `art_…` as the registry mints it, and `art-…` as it appears in a DNS label
 // where an underscore is not legal.
 func slugOfKind(kind, token string) (string, bool) {
-	if rest, ok := strings.CutPrefix(token, kind+"_"); ok && isBase36(rest) {
-		return kind + "_" + rest, true
-	}
-	if rest, ok := strings.CutPrefix(token, kind+"-"); ok && isBase36(rest) && len(rest) >= dnsSlugFloor {
-		// Handed back in the underscore spelling, because that is the identity
-		// every endpoint is addressed by; the hyphen is only how DNS spells it.
-		return kind + "_" + rest, true
+	for _, separator := range []string{"_", "-"} {
+		rest, ok := strings.CutPrefix(token, kind+separator)
+		if ok && len(rest) >= slugFloor && isBase36(rest) {
+			// Handed back in the underscore spelling, because that is the identity
+			// every endpoint is addressed by; the hyphen is only how DNS spells it.
+			return kind + "_" + rest, true
+		}
 	}
 	return "", false
 }
 
-// isBase36 is the slug alphabet: lowercase letters and digits, at least one.
+// isBase36 is the slug alphabet: lowercase letters and digits.
 func isBase36(s string) bool {
-	if s == "" {
-		return false
-	}
 	for _, r := range s {
 		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
 			return false
@@ -128,6 +168,9 @@ func isBase36(s string) bool {
 
 // article keeps the error sentences readable — "an artifact", "a run".
 func article(noun string) string {
+	if noun == "" {
+		return "one"
+	}
 	if strings.ContainsRune("aeiou", rune(noun[0])) {
 		return "an " + noun
 	}

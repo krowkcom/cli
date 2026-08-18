@@ -119,7 +119,7 @@ func metadataFlags() []Flag {
 // What it takes is the same everywhere, so that half of the sentence is written
 // once here: a run slug, or a link that carries one.
 func runFlag(usage string) Flag {
-	return Flag{Name: "run", Type: typeString, Usage: usage + " — its slug, or any link carrying it"}
+	return Flag{Name: "run", Type: typeString, Usage: usage + ". Its slug, or any link carrying it"}
 }
 
 // artifactArg and runArg describe the positional every command that names one

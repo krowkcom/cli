@@ -726,6 +726,14 @@ func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string
 	if strings.TrimSpace(a.Slug) == "" || strings.TrimSpace(a.ClaimToken) == "" {
 		return "", nil, api.Fail("missing_claim", "pass both the artifact slug and its claim_token")
 	}
+	// A claim moves an upload into the key's workspace and keeps it there, so it
+	// is a creation in the pinned workspace by another name — and the token is
+	// one-shot, so a claim that lands in the wrong workspace cannot be redone.
+	// Refuse before spending it, and before anything else: an agent told to fix
+	// its `run` argument first would learn about the broken workspace second.
+	if s.WorkspaceErr != nil {
+		return "", nil, s.WorkspaceErr
+	}
 	slug, err := api.ParseSlug(api.KindArtifact, a.Slug)
 	if err != nil {
 		return "", nil, err
@@ -733,13 +741,6 @@ func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string
 	runSlug, err := api.ParseSlug(api.KindRun, a.Run)
 	if err != nil {
 		return "", nil, err
-	}
-	// A claim moves an upload into the key's workspace and keeps it there, so it
-	// is a creation in the pinned workspace by another name — and the token is
-	// one-shot, so a claim that lands in the wrong workspace cannot be redone.
-	// Refuse before spending it.
-	if s.WorkspaceErr != nil {
-		return "", nil, s.WorkspaceErr
 	}
 
 	artifact, err := s.Client.ClaimArtifact(ctx, slug, strings.TrimSpace(a.ClaimToken))

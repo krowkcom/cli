@@ -129,11 +129,13 @@ and a run belongs to a workspace, so it needs an API key. Without one an upload
 still works: it lands anonymously, expires within a day, and comes back with a
 claim token that ` + "`krowk claim`" + ` spends to keep it.
 
-Wherever a slug is asked for — a positional or --run — a link that carries it
-does just as well: the card page, the CDN URL under it, or anything else krowk
-printed. The slug is read out of it, so there is nothing to cut out by hand. A
-link carrying no slug of the kind the command wants is refused here rather than
-sent on, since the registry could only answer that as a record it does not have.
+Wherever an artifact or a run is named — a positional, or --run — a link that
+carries it does just as well: the card page, the CDN URL under it, or anything
+else krowk printed. The slug is read out of it, so there is nothing to cut out
+by hand. A link carrying no slug of the kind the command wants is refused here
+rather than sent on, since the registry could only answer that as a record it
+does not have. (--before is not one of these: it is a cursor krowk hands back,
+and it is passed on as it was given.)
 
 Taking an upload down removes the bytes at once and leaves the link reporting
 that it was taken down. There is no undo and no confirmation — it is what to
@@ -251,19 +253,6 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		return report(stderr, err, format, f.quiet, colour)
 	}
 
-	// --run names a run everywhere it appears, so it takes a link to one for the
-	// same reason the positionals do: what the caller holds after `runs start` is
-	// the result krowk printed, and cutting the slug out of it by hand is work
-	// krowk can do. Done here, once, rather than in each of the four commands
-	// that read the flag.
-	if f.run != "" {
-		runSlug, slugErr := api.ParseSlug(api.KindRun, f.run)
-		if slugErr != nil {
-			return report(stderr, slugErr, format, f.quiet, colour)
-		}
-		f.run = runSlug
-	}
-
 	switch {
 	case f.version:
 		fmt.Fprintln(stdout, Version)
@@ -280,6 +269,21 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 			return report(stderr, err, format, f.quiet, colour)
 		}
 		return 0
+	}
+
+	// --run names a run everywhere it appears, so it takes a link to one for the
+	// same reason the positionals do: what the caller holds after `runs start` is
+	// the result krowk printed, and cutting the slug out of it by hand is work
+	// krowk can do. Done here, once, rather than in each of the four commands
+	// that read the flag — and after help and --version, which answer whatever
+	// else is on the line: a question about the surface is not a request to
+	// resolve anything.
+	if f.run != "" {
+		runSlug, slugErr := api.ParseSlug(api.KindRun, f.run)
+		if slugErr != nil {
+			return report(stderr, slugErr, format, f.quiet, colour)
+		}
+		f.run = runSlug
 	}
 
 	var err error
@@ -657,7 +661,11 @@ func errCode(err error) string {
 // carries it. The missing case stays each command's own words, because "pass the
 // artifact" is only useful when it shows that command's spelling of it.
 func slugArg(kind string, args []string, missing, fix string) (string, error) {
-	if len(args) == 0 {
+	// Blank counts as absent: `krowk uploads show "$SLUG"` with the variable
+	// unset arrives as one empty word, and the answer to that is the command's
+	// own "pass the artifact" rather than a refusal from the registry about a
+	// record with no name.
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
 		return "", api.Fail(missing, fix)
 	}
 	return api.ParseSlug(kind, args[0])

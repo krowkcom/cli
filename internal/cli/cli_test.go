@@ -678,6 +678,18 @@ func TestClaimAndTakedownTakeTheLinkToo(t *testing.T) {
 	}
 }
 
+// Help answers whatever else is on the line. A --run that cannot be read is
+// still a question about the surface, and that answer never depended on
+// resolving a run.
+func TestHelpStillAnswersBesideAnUnreadableRun(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, stdout, stderr := h.run("--help", "--run=https://krowk.com/pricing")
+	if code != 0 || !strings.Contains(stdout, "krowk") {
+		t.Errorf("help beside a bad --run exited %d, stderr:\n%s", code, stderr)
+	}
+}
+
 // A link naming the wrong kind of record, or none at all, is refused before the
 // request goes out: the registry could only answer "no such record", which reads
 // as a slug that expired rather than as a URL in the wrong place.
@@ -692,8 +704,9 @@ func TestALinkThatNamesTheWrongRecordIsRefusedHere(t *testing.T) {
 	if fix, _ := refusal["fix"].(string); !strings.Contains(fix, pushed.Slug) {
 		t.Errorf("fix = %q, want it to name the artifact the link carries", fix)
 	}
-	if got := h.fails("uploads", "show", "https://krowk.com/pricing")["error"]; got != "bad_artifact" {
-		t.Errorf("a link carrying no slug gave %v, want bad_artifact", got)
+	nothing := h.failsWith(1, "uploads", "show", "https://krowk.com/pricing")
+	if nothing["error"] != "bad_artifact" {
+		t.Errorf("a link carrying no slug gave %v, want bad_artifact", nothing["error"])
 	}
 }
 

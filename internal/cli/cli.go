@@ -54,7 +54,8 @@ Usage
 %s
 
 Upload flags
-  --run <slug>           Attach to an existing run instead of opening one. On
+  --run <slug|link>      Attach to an existing run instead of opening one, by
+                         slug or by any link carrying one. On
                          ` + "`claim`" + ` and ` + "`uploads attach`" + ` it names the run an upload
                          already made joins — a claimed upload has none otherwise
   --pull-request <url>   Pull request the work belongs to
@@ -71,7 +72,7 @@ Upload flags
 List flags
   --limit <n>            Rows per page (1–100, default 50)
   --before <slug>        Start after this row — the ` + "`next`" + ` of the last page
-  --run <slug>           On ` + "`uploads list`" + `, narrow it to what one run produced
+  --run <slug|link>      On ` + "`uploads list`" + `, narrow it to what one run produced
 
 Auth flags
   --token <key>          Store this key rather than asking the browser — how CI
@@ -928,11 +929,12 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 		return api.Fail("missing_claim",
 			"pass both the artifact and its token: `krowk claim art_... krowk_claim_...`")
 	}
-	if strings.TrimSpace(args[0]) == "" {
-		return api.Fail("missing_claim",
-			"pass both the artifact and its token: `krowk claim art_... krowk_claim_...`")
-	}
-	slug, err := api.ParseSlug(api.KindArtifact, args[0])
+	// no_artifact rather than missing_claim: a blank first positional is the
+	// command being wrong, and missing_claim is classified as a credential the
+	// caller has to produce — which would send a script off to check its key over
+	// an argument that was never filled in.
+	slug, err := slugArg(api.KindArtifact, args, "no_artifact",
+		"pass both the artifact and its token: `krowk claim art_... krowk_claim_...`")
 	if err != nil {
 		return err
 	}

@@ -648,7 +648,7 @@ func TestASlugMayBePastedAsTheLinkThatCarriesIt(t *testing.T) {
 
 	// --run is a slug in the same way, so it reads a link the same way.
 	started := h.ok("runs", "start")
-	runLink := "https://krowk.com/runs/" + started.Data.Slug
+	runLink := "https://app.krowk.com/runs/" + started.Data.Slug
 	attached := only(t, h.ok("uploads", "attach", pushed.URL, "--run="+runLink))
 	if attached.runSlug() != started.Data.Slug {
 		t.Errorf("attach by link put it under %q, want %q", attached.runSlug(), started.Data.Slug)
@@ -708,8 +708,11 @@ func TestABlankRecordIsTheCommandsOwnMissingArgument(t *testing.T) {
 	if got := h.fails("uploads", "show", "  ")["error"]; got != "no_artifact" {
 		t.Errorf("a blank artifact gave %v, want no_artifact", got)
 	}
-	if got := h.fails("claim", "", "krowk_claim_whatever")["error"]; got != "missing_claim" {
-		t.Errorf("a blank claim gave %v, want missing_claim", got)
+	// no_artifact, not missing_claim: the fix is the argument, and missing_claim
+	// is the code that says the fix is a credential (exit 3).
+	blank := h.failsWith(1, "claim", "", "krowk_claim_whatever")
+	if blank["error"] != "no_artifact" {
+		t.Errorf("a blank claim gave %v, want no_artifact", blank["error"])
 	}
 }
 

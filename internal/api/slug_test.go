@@ -93,6 +93,23 @@ func TestParseSlugRefusesALinkThatNamesNothing(t *testing.T) {
 	}
 }
 
+// A URL is where credentials travel — a presigned link carries its signature in
+// the query — and a refusal is written to stderr and into the JSON envelope,
+// which is what CI keeps. So what was pasted is not quoted back.
+func TestParseSlugDoesNotQuoteBackWhatWasPasted(t *testing.T) {
+	const signed = "https://s3.example.com/b/x?X-Amz-Signature=deadbeefcafe0123456789"
+
+	_, err := ParseSlug(KindRun, signed)
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want an api failure", err)
+	}
+	if fix, _ := apiErr.Body["fix"].(string); strings.Contains(fix, "Signature") ||
+		strings.Contains(strings.ToLower(fix), "s3.example.com") {
+		t.Errorf("fix = %q, want it to say nothing of what was pasted", fix)
+	}
+}
+
 // A card link handed to a command that wants a run is the commonest way to get
 // this wrong, so the refusal names the artifact it found rather than only the
 // run it did not.
@@ -179,15 +196,23 @@ func TestParseSlugDoesNotInventAPageForARun(t *testing.T) {
 // The hyphen spelling exists in one place only: a DNS label, where an
 // underscore is not legal. Somebody else's CI path is not that place, and
 // reading a slug out of one invents a record krowk then goes and asks about.
-func TestParseSlugReadsTheHyphenSpellingOnlyInAHost(t *testing.T) {
+func TestParseSlugReadsTheHyphenSpellingOnlyOnTheHostThatUsesIt(t *testing.T) {
 	const tail = "9f3c2e1a7b04d6c8e5f1a2b3"
 
 	got, err := ParseSlug(KindArtifact, "https://art-"+tail+".krowkusercontent.com/checkout.png")
 	if err != nil || got != "art_"+tail {
 		t.Errorf("host label = %q, %v — want art_%s", got, err, tail)
 	}
-	if slug, err := ParseSlug(KindRun, "https://ci.example.com/j/run-abcdefghij0123456789/log"); err == nil {
-		t.Errorf("a hyphenated path segment was read as %q", slug)
+	// Somebody else's subdomain, and somebody else's path. Neither spells a krowk
+	// slug, and reading one out would point a takedown at a record the pasted
+	// link never named.
+	for _, foreign := range []string{
+		"https://art-" + tail + ".evil.example.com/checkout.png",
+		"https://ci.example.com/j/run-" + tail + "/log",
+	} {
+		if slug, err := ParseSlug(KindArtifact, foreign); err == nil {
+			t.Errorf("ParseSlug(%q) read %q as a slug", foreign, slug)
+		}
 	}
 }
 
@@ -223,6 +248,13 @@ func TestParseSlugReadsAPercentEncodedLink(t *testing.T) {
 	got, err := ParseSlug(KindArtifact, "https://krowk.com/a/art%5F9f3c2e1a7b04d6c8e5f1a2b3")
 	if err != nil || got != artifact {
 		t.Errorf("encoded link = %q, %v — want %s", got, err, artifact)
+	}
+
+	// A stray `%` elsewhere — a file called 100%.png — must not take the escape
+	// that spells the slug down with it.
+	both := "https://krowk.com/100%.png/a/art%5F9f3c2e1a7b04d6c8e5f1a2b3"
+	if got, err := ParseSlug(KindArtifact, both); err != nil || got != artifact {
+		t.Errorf("link with a literal %% = %q, %v — want %s", got, err, artifact)
 	}
 }
 

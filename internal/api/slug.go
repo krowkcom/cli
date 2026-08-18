@@ -1,9 +1,6 @@
 package api
 
-import (
-	"net/url"
-	"strings"
-)
+import "strings"
 
 // Slug kinds, spelled as the registry prefixes them. A kind is what a command
 // is asking for: `uploads show` wants an artifact and `runs show` wants a run,
@@ -25,17 +22,25 @@ var slugNouns = map[string]string{
 }
 
 // slugFloor is how much random tail a token needs before a link is read as
-// carrying a slug. Canon mints exactly 24 base36 characters after the prefix —
-// the website validates that shape before it calls the registry at all — so
-// nothing real is turned away by a floor, and everything a URL is full of is:
-// `run_id=4821` in a CI link, `art_report.png` beside a checkout, `run_7` in a
-// job path. Each of those is `<kind>_<base36>` and none of them is a slug.
+// carrying a slug. Canon mints exactly 24 base36 characters after the prefix,
+// and the website refuses anything else before it ever calls the registry, so
+// nothing krowk made is turned away by this — and everything a URL is full of
+// is: `run_id=4821` in a CI link, `art_report.png` beside a checkout, `run_7`
+// in a job path, a 16-character token in a signed URL. None of those is a slug,
+// and `uploads delete` is immediate and has no undo.
 //
-// A floor rather than 24 exactly, because this is a reader and not a validator:
-// the registry stays the authority on what it mints, and a slug shorter than
-// canon's would still resolve when passed bare, which is the path this function
-// leaves untouched.
-const slugFloor = 16
+// A floor rather than 24 exactly, so a registry that one day mints a longer
+// slug still has its links read. Shorter would stop being read out of links and
+// go on working when passed bare, which is the path this function leaves
+// untouched.
+const slugFloor = 24
+
+// bytesHost is where a slug is spelled as a DNS label — `art-{slug}` is a host
+// under it, and an underscore is not legal in one. Nowhere else spells a slug
+// that way, so nowhere else is read that way: `art-9f3c….evil.example.com` is
+// somebody else's subdomain, and reading a record out of it would point a
+// takedown at an artifact the pasted link never named.
+const bytesHost = "krowkusercontent.com"
 
 // ParseSlug takes what somebody typed where a slug belongs — the slug itself,
 // or a link that carries one — and answers with the slug.
@@ -70,8 +75,8 @@ func ParseSlug(kind, input string) (string, error) {
 		return trimmed, nil
 	}
 
-	host, rest := splitLink(trimmed)
-	found := slugsIn(kind, host, rest)
+	link := readLink(trimmed)
+	found := link.slugs(kind)
 	switch len(found) {
 	case 1:
 		return found[0], nil
@@ -94,7 +99,7 @@ func ParseSlug(kind, input string) (string, error) {
 		if other == kind {
 			continue
 		}
-		if elsewhere := slugsIn(other, host, rest); len(elsewhere) > 0 {
+		if elsewhere := link.slugs(other); len(elsewhere) > 0 {
 			return "", Fail(slugFailure(kind),
 				"that link names "+article(slugNoun(other))+" — `"+elsewhere[0]+"` — and this takes "+
 					article(slugNoun(kind))+"; pass the "+slugNoun(kind)+
@@ -102,25 +107,35 @@ func ParseSlug(kind, input string) (string, error) {
 		}
 	}
 
+	// What was pasted is not quoted back. A URL is where credentials travel —
+	// a presigned link carries its signature in the query — and the caller has
+	// the string in front of them either way, where stderr and the JSON envelope
+	// are what CI keeps.
 	return "", Fail(slugFailure(kind),
-		"`"+trimmed+"` carries no "+slugNoun(kind)+" slug — pass "+slugExample(kind))
+		"that carries no "+slugNoun(kind)+" slug — pass "+slugExample(kind))
 }
 
-// slugsIn collects the distinct slugs of one kind a link carries, in the order
-// they appear. Distinct, because the same slug twice is not an ambiguity: the
-// markdown krowk hands back names one artifact in both halves of
-// `[![name](file_url)](card_url)`, and pasting that whole line is a reasonable
-// thing to do.
-//
-// The two spellings are read in the two places they exist. `art_…` is the
-// identity, and it can turn up in any segment of a URL. `art-…` is only ever a
-// DNS label — `art-{slug}.krowkusercontent.com` — where an underscore is not
-// legal, so it is read in the host and nowhere else: a path like
-// `/j/run-abcdefghij0123456789/log` on somebody else's CI belongs to them, and
-// reading a slug out of it would invent a record krowk then asks about.
-func slugsIn(kind, host, rest string) []string {
+// link is one pasted string, taken apart once: the host's labels and everything
+// after them, each already tokenized, so a refusal that asks about three kinds
+// walks the string no more times than an answer that asks about one.
+type link struct {
+	hostLabels []string
+	rest       []string
+	// dnsSpelling says the host is one that spells slugs as labels, which is the
+	// only place the hyphen form is real.
+	dnsSpelling bool
+}
+
+// slugs collects the distinct slugs of one kind, in the order they appear.
+// Distinct, because the same slug twice is not an ambiguity: the markdown krowk
+// hands back names one artifact in both halves of `[![name](file)](card)`, and
+// pasting that whole line is a reasonable thing to do.
+func (l link) slugs(kind string) []string {
 	var found []string
-	add := func(slug string) {
+	add := func(slug string, ok bool) {
+		if !ok {
+			return
+		}
 		for _, seen := range found {
 			if seen == slug {
 				return
@@ -129,44 +144,80 @@ func slugsIn(kind, host, rest string) []string {
 		found = append(found, slug)
 	}
 
-	for _, label := range strings.FieldsFunc(host, isSlugBoundary) {
-		if slug, ok := slugSpelled(kind, "-", label); ok {
-			add(slug)
+	for _, label := range l.hostLabels {
+		if l.dnsSpelling {
+			add(slugSpelled(kind, "-", label))
 		}
-		if slug, ok := slugSpelled(kind, "_", label); ok {
-			add(slug)
-		}
+		add(slugSpelled(kind, "_", label))
 	}
-	for _, token := range strings.FieldsFunc(rest, isSlugBoundary) {
-		if slug, ok := slugSpelled(kind, "_", token); ok {
-			add(slug)
-		}
+	for _, token := range l.rest {
+		add(slugSpelled(kind, "_", token))
 	}
 	return found
 }
 
-// splitLink separates the host from everything after it, so the hyphen spelling
-// can be read where it is legal and not where it is not. Both halves come back
-// lowercased and percent-decoded: a slug is lowercase base36, and a link that
-// has been through an encoder on its way to being pasted still carries the same
-// slug — `art%5F9f3c…` is one, spelled by a machine.
-func splitLink(link string) (host, rest string) {
-	decoded := link
-	if unescaped, err := url.QueryUnescape(link); err == nil {
-		decoded = unescaped
-	}
-	decoded = strings.ToLower(decoded)
+// readLink separates the host from everything after it and tokenizes both. The
+// string is lowercased and percent-decoded first: a slug is lowercase base36,
+// and a link that went through an encoder on its way to being pasted carries
+// the same slug — `art%5F9f3c…` is one, spelled by a machine.
+func readLink(pasted string) link {
+	decoded := strings.ToLower(decodePercent(pasted))
 
 	if scheme := strings.Index(decoded, "://"); scheme >= 0 {
 		decoded = decoded[scheme+3:]
 	}
-	// A path, query or fragment ends the host; anything before the first of them
+	// A path, query or fragment ends the host; what is before the first of them
 	// is the authority, userinfo and port included — all of which break on a slug
 	// boundary anyway.
+	host, rest := decoded, ""
 	if end := strings.IndexAny(decoded, "/?#"); end >= 0 {
-		return decoded[:end], decoded[end:]
+		host, rest = decoded[:end], decoded[end:]
 	}
-	return decoded, ""
+	return link{
+		hostLabels:  strings.FieldsFunc(host, isSlugBoundary),
+		rest:        strings.FieldsFunc(rest, isSlugBoundary),
+		dnsSpelling: host == bytesHost || strings.HasSuffix(host, "."+bytesHost),
+	}
+}
+
+// decodePercent replaces the %XX escapes it can read and leaves everything else
+// exactly as it found it.
+//
+// Not url.QueryUnescape: that fails the whole string on one stray `%` — a
+// filename like `100%.png` in the path — and a failure there would hide a slug
+// spelled correctly somewhere else in the same link. It also reads `+` as a
+// space, which is the query's rule and not the path's.
+func decodePercent(s string) string {
+	if !strings.Contains(s, "%") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) {
+			if hi, ok := unhex(s[i+1]); ok {
+				if lo, ok := unhex(s[i+2]); ok {
+					b.WriteByte(hi<<4 | lo)
+					i += 2
+					continue
+				}
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func unhex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
 
 // slugNoun and slugFailure keep an unknown kind from being worse than useless:

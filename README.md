@@ -1,4 +1,4 @@
-<img src=".github/logo.svg" alt="Krowk" width="56" />
+<a href="https://krowk.com"><img src=".github/logo.svg" alt="Krowk" width="56" /></a>
 
 # Krowk
 
@@ -147,4 +147,4 @@ The CLI ships the registry it develops against, so trying it out needs neither t
 
 ## License
 
-MIT
+MIT — the CLI for [krowk.com](https://krowk.com).

@@ -1,6 +1,9 @@
 package api
 
-import "strings"
+import (
+	"net/url"
+	"strings"
+)
 
 // Slug kinds, spelled as the registry prefixes them. A kind is what a command
 // is asking for: `uploads show` wants an artifact and `runs show` wants a run,
@@ -67,33 +70,103 @@ func ParseSlug(kind, input string) (string, error) {
 		return trimmed, nil
 	}
 
-	tokens := strings.FieldsFunc(strings.ToLower(trimmed), isSlugBoundary)
-	for _, token := range tokens {
-		if slug, ok := slugOfKind(kind, token); ok {
-			return slug, nil
-		}
+	host, rest := splitLink(trimmed)
+	found := slugsIn(kind, host, rest)
+	switch len(found) {
+	case 1:
+		return found[0], nil
+	case 0:
+		break
+	default:
+		// Two different records in one string and no way to know which was meant.
+		// `uploads delete` is immediate and has no undo, so guessing here is how a
+		// paste of two links, or of a page that mentions a second artifact, takes
+		// down something nobody named.
+		return "", Fail(slugFailure(kind),
+			"that carries more than one "+slugNoun(kind)+" — `"+strings.Join(found, "`, `")+
+				"` — so which one is meant is a guess; pass the one you want")
 	}
 
-	// Naming the kind that *is* in the link turns a dead end into the next
-	// command: a card link handed to `runs show` is the artifact's link, and the
-	// run it belongs to is one `uploads show` away.
+	// Naming the kind that *is* there turns a dead end into the next command: a
+	// card link handed to `runs show` is the artifact's link, and the run it
+	// belongs to is one `uploads show` away.
 	for _, other := range []string{KindArtifact, KindRun, KindWorkspace} {
 		if other == kind {
 			continue
 		}
-		for _, token := range tokens {
-			if slug, ok := slugOfKind(other, token); ok {
-				return "", Fail(slugFailure(kind),
-					"that link names "+article(slugNoun(other))+" — `"+slug+"` — and this takes "+
-						article(slugNoun(kind))+"; pass the "+slugNoun(kind)+
-						" slug, or a link that carries one")
-			}
+		if elsewhere := slugsIn(other, host, rest); len(elsewhere) > 0 {
+			return "", Fail(slugFailure(kind),
+				"that link names "+article(slugNoun(other))+" — `"+elsewhere[0]+"` — and this takes "+
+					article(slugNoun(kind))+"; pass the "+slugNoun(kind)+
+					" slug, or a link that carries one")
 		}
 	}
 
 	return "", Fail(slugFailure(kind),
-		"`"+trimmed+"` carries no "+slugNoun(kind)+" slug — paste "+slugExample(kind)+
-			", or the "+slugNoun(kind)+" slug itself")
+		"`"+trimmed+"` carries no "+slugNoun(kind)+" slug — pass "+slugExample(kind))
+}
+
+// slugsIn collects the distinct slugs of one kind a link carries, in the order
+// they appear. Distinct, because the same slug twice is not an ambiguity: the
+// markdown krowk hands back names one artifact in both halves of
+// `[![name](file_url)](card_url)`, and pasting that whole line is a reasonable
+// thing to do.
+//
+// The two spellings are read in the two places they exist. `art_…` is the
+// identity, and it can turn up in any segment of a URL. `art-…` is only ever a
+// DNS label — `art-{slug}.krowkusercontent.com` — where an underscore is not
+// legal, so it is read in the host and nowhere else: a path like
+// `/j/run-abcdefghij0123456789/log` on somebody else's CI belongs to them, and
+// reading a slug out of it would invent a record krowk then asks about.
+func slugsIn(kind, host, rest string) []string {
+	var found []string
+	add := func(slug string) {
+		for _, seen := range found {
+			if seen == slug {
+				return
+			}
+		}
+		found = append(found, slug)
+	}
+
+	for _, label := range strings.FieldsFunc(host, isSlugBoundary) {
+		if slug, ok := slugSpelled(kind, "-", label); ok {
+			add(slug)
+		}
+		if slug, ok := slugSpelled(kind, "_", label); ok {
+			add(slug)
+		}
+	}
+	for _, token := range strings.FieldsFunc(rest, isSlugBoundary) {
+		if slug, ok := slugSpelled(kind, "_", token); ok {
+			add(slug)
+		}
+	}
+	return found
+}
+
+// splitLink separates the host from everything after it, so the hyphen spelling
+// can be read where it is legal and not where it is not. Both halves come back
+// lowercased and percent-decoded: a slug is lowercase base36, and a link that
+// has been through an encoder on its way to being pasted still carries the same
+// slug — `art%5F9f3c…` is one, spelled by a machine.
+func splitLink(link string) (host, rest string) {
+	decoded := link
+	if unescaped, err := url.QueryUnescape(link); err == nil {
+		decoded = unescaped
+	}
+	decoded = strings.ToLower(decoded)
+
+	if scheme := strings.Index(decoded, "://"); scheme >= 0 {
+		decoded = decoded[scheme+3:]
+	}
+	// A path, query or fragment ends the host; anything before the first of them
+	// is the authority, userinfo and port included — all of which break on a slug
+	// boundary anyway.
+	if end := strings.IndexAny(decoded, "/?#"); end >= 0 {
+		return decoded[:end], decoded[end:]
+	}
+	return decoded, ""
 }
 
 // slugNoun and slugFailure keep an unknown kind from being worse than useless:
@@ -115,16 +188,20 @@ func slugFailure(kind string) string { return "bad_" + slugNoun(kind) }
 // does not exist.
 func slugExample(kind string) string {
 	if kind == KindArtifact {
-		return "the link krowk handed back, like https://krowk.com/a/art_…"
+		return "the artifact slug, like art_…, or the link krowk handed back, " +
+			"like https://krowk.com/a/art_…"
 	}
-	return "a link krowk printed that carries the " + slugNoun(kind) + " slug"
+	// No URL shape is named for the others, because krowk prints none: a run
+	// comes back as a slug, and inventing `krowk.com/a/run_…` here would send a
+	// caller to the artifact card's path, where no run has ever lived.
+	return "the " + slugNoun(kind) + " slug, like " + kind + "_…, or a link carrying it"
 }
 
 // looksLikeLink is what separates a slug from a URL that holds one. A slug is
 // one word: no scheme, no path, no host. So anything carrying a separator is
 // treated as a link, and everything else is left exactly as it was typed.
 func looksLikeLink(s string) bool {
-	return strings.ContainsAny(s, "/:") || strings.Contains(s, ".")
+	return strings.ContainsAny(s, "/:.")
 }
 
 // isSlugBoundary is every character a slug cannot contain, which is what makes
@@ -141,19 +218,15 @@ func isSlugBoundary(r rune) bool {
 	return true
 }
 
-// slugOfKind reads one token as a slug of the given kind, in either spelling:
-// `art_…` as the registry mints it, and `art-…` as it appears in a DNS label
-// where an underscore is not legal.
-func slugOfKind(kind, token string) (string, bool) {
-	for _, separator := range []string{"_", "-"} {
-		rest, ok := strings.CutPrefix(token, kind+separator)
-		if ok && len(rest) >= slugFloor && isBase36(rest) {
-			// Handed back in the underscore spelling, because that is the identity
-			// every endpoint is addressed by; the hyphen is only how DNS spells it.
-			return kind + "_" + rest, true
-		}
+// slugSpelled reads one token as a slug of the given kind in one spelling, and
+// answers in the underscore one — that is the identity every endpoint is
+// addressed by; the hyphen is only how DNS spells it.
+func slugSpelled(kind, separator, token string) (string, bool) {
+	rest, ok := strings.CutPrefix(token, kind+separator)
+	if !ok || len(rest) < slugFloor || !isBase36(rest) {
+		return "", false
 	}
-	return "", false
+	return kind + "_" + rest, true
 }
 
 // isBase36 is the slug alphabet: lowercase letters and digits.

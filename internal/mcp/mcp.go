@@ -498,6 +498,15 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 	if len(a.Files) == 0 {
 		return "", nil, api.Fail("no_file", "pass at least one path in `files`")
 	}
+	// A push creates the thing the workspace was pinned for. Uploading it
+	// anonymously instead would be the misdirection this refusal exists to
+	// prevent: the file would be published, the link would work, and it would be
+	// in the wrong place with nothing saying so. Checked before the arguments are
+	// shaped, so an agent told to fix its `run` does not learn about a broken
+	// workspace on the next call instead.
+	if s.WorkspaceErr != nil {
+		return "", nil, s.WorkspaceErr
+	}
 	// A run named by link is a run named: the agent holding one usually holds the
 	// result of the call that opened it, links and all.
 	runNamed, err := api.ParseSlug(api.KindRun, a.Run)
@@ -505,13 +514,6 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		return "", nil, err
 	}
 	a.Run = runNamed
-	// A push creates the thing the workspace was pinned for. Uploading it
-	// anonymously instead would be the misdirection this refusal exists to
-	// prevent: the file would be published, the link would work, and it would be
-	// in the wrong place with nothing saying so.
-	if s.WorkspaceErr != nil {
-		return "", nil, s.WorkspaceErr
-	}
 
 	// Confine before reading anything: an instruction the model picked up from a
 	// repository file or a web page must not be able to name ~/.ssh/id_rsa here.

@@ -175,3 +175,67 @@ func TestParseSlugDoesNotInventAPageForARun(t *testing.T) {
 		t.Errorf("fix = %q, want no artifact card path in a run's message", fix)
 	}
 }
+
+// The hyphen spelling exists in one place only: a DNS label, where an
+// underscore is not legal. Somebody else's CI path is not that place, and
+// reading a slug out of one invents a record krowk then goes and asks about.
+func TestParseSlugReadsTheHyphenSpellingOnlyInAHost(t *testing.T) {
+	const tail = "9f3c2e1a7b04d6c8e5f1a2b3"
+
+	got, err := ParseSlug(KindArtifact, "https://art-"+tail+".krowkusercontent.com/checkout.png")
+	if err != nil || got != "art_"+tail {
+		t.Errorf("host label = %q, %v — want art_%s", got, err, tail)
+	}
+	if slug, err := ParseSlug(KindRun, "https://ci.example.com/j/run-abcdefghij0123456789/log"); err == nil {
+		t.Errorf("a hyphenated path segment was read as %q", slug)
+	}
+}
+
+// Two different records in one string and no way to know which was meant. The
+// takedown is immediate and has no undo, so this is refused rather than guessed.
+func TestParseSlugRefusesTwoRecordsOfTheSameKind(t *testing.T) {
+	const first = "art_9f3c2e1a7b04d6c8e5f1a2b3"
+	const second = "art_0b1c2d3e4f5a6b7c8d9e0f1a"
+
+	_, err := ParseSlug(KindArtifact, "https://krowk.com/a/"+first+" https://krowk.com/a/"+second)
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "bad_artifact" {
+		t.Fatalf("err = %v, want bad_artifact", err)
+	}
+	if fix, _ := apiErr.Body["fix"].(string); !strings.Contains(fix, first) || !strings.Contains(fix, second) {
+		t.Errorf("fix = %q, want both slugs named", fix)
+	}
+
+	// The same slug twice is not an ambiguity, which matters because the markdown
+	// krowk hands back names one artifact in both halves of the line.
+	markdown := "[![shot](https://cdn.krowkusercontent.com/weur/ws_1a2b3c4d5e6f7g8h9i0j1k2l/" +
+		first + "/shot.png)](https://krowk.com/a/" + first + ")"
+	if got, err := ParseSlug(KindArtifact, markdown); err != nil || got != first {
+		t.Errorf("the pasted markdown gave %q, %v — want %s", got, err, first)
+	}
+}
+
+// A link that went through an encoder on its way to being pasted still carries
+// the same slug; only a machine spelled it.
+func TestParseSlugReadsAPercentEncodedLink(t *testing.T) {
+	const artifact = "art_9f3c2e1a7b04d6c8e5f1a2b3"
+
+	got, err := ParseSlug(KindArtifact, "https://krowk.com/a/art%5F9f3c2e1a7b04d6c8e5f1a2b3")
+	if err != nil || got != artifact {
+		t.Errorf("encoded link = %q, %v — want %s", got, err, artifact)
+	}
+}
+
+// Only the artifact has a page at krowk.com/a/…; a run's refusal must not send
+// anyone to a URL shape krowk has never printed.
+func TestParseSlugsRunRefusalNamesOnlyTheSlug(t *testing.T) {
+	_, err := ParseSlug(KindRun, "https://ci.example.com/build/12")
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want an api failure", err)
+	}
+	fix, _ := apiErr.Body["fix"].(string)
+	if strings.Contains(fix, "krowk.com") || !strings.Contains(fix, "run_…") {
+		t.Errorf("fix = %q, want the run slug and no invented page", fix)
+	}
+}

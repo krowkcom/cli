@@ -678,15 +678,38 @@ func TestClaimAndTakedownTakeTheLinkToo(t *testing.T) {
 	}
 }
 
-// Help answers whatever else is on the line. A --run that cannot be read is
-// still a question about the surface, and that answer never depended on
-// resolving a run.
-func TestHelpStillAnswersBesideAnUnreadableRun(t *testing.T) {
+// A flag nothing reads stays a flag nothing reads. --run is resolved by the four
+// commands that consume it, so a link nobody asked about cannot fail help, a
+// command that ignores the flag, or — worst of the three — an unknown command,
+// where a complaint about the flags hides the mistake that was actually made.
+func TestAnUnreadableRunOnlyFailsTheCommandsThatReadIt(t *testing.T) {
+	h := newHarness(t, 0)
+	const bad = "--run=https://krowk.com/pricing"
+
+	if code, stdout, stderr := h.run("--help", bad); code != 0 || !strings.Contains(stdout, "krowk") {
+		t.Errorf("help beside a bad --run exited %d, stderr:\n%s", code, stderr)
+	}
+	if code, _, stderr := h.run("runs", "list", bad); code != 0 {
+		t.Errorf("`runs list` reads no run, but exited %d:\n%s", code, stderr)
+	}
+	if got := h.fails("nonsense", bad)["error"]; got != "unknown_command" {
+		t.Errorf("an unknown command answered %v, want unknown_command", got)
+	}
+	if got := h.failsWith(1, "push", h.fixture, bad)["error"]; got != "bad_run" {
+		t.Errorf("push reads the run, so it must refuse it: %v", got)
+	}
+}
+
+// The blank spellings of "you gave me nothing" answer with the command's own
+// words rather than with a request krowk knows it cannot make.
+func TestABlankRecordIsTheCommandsOwnMissingArgument(t *testing.T) {
 	h := newHarness(t, 0)
 
-	code, stdout, stderr := h.run("--help", "--run=https://krowk.com/pricing")
-	if code != 0 || !strings.Contains(stdout, "krowk") {
-		t.Errorf("help beside a bad --run exited %d, stderr:\n%s", code, stderr)
+	if got := h.fails("uploads", "show", "  ")["error"]; got != "no_artifact" {
+		t.Errorf("a blank artifact gave %v, want no_artifact", got)
+	}
+	if got := h.fails("claim", "", "krowk_claim_whatever")["error"]; got != "missing_claim" {
+		t.Errorf("a blank claim gave %v, want missing_claim", got)
 	}
 }
 

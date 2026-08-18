@@ -271,21 +271,6 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		return 0
 	}
 
-	// --run names a run everywhere it appears, so it takes a link to one for the
-	// same reason the positionals do: what the caller holds after `runs start` is
-	// the result krowk printed, and cutting the slug out of it by hand is work
-	// krowk can do. Done here, once, rather than in each of the four commands
-	// that read the flag — and after help and --version, which answer whatever
-	// else is on the line: a question about the surface is not a request to
-	// resolve anything.
-	if f.run != "" {
-		runSlug, slugErr := api.ParseSlug(api.KindRun, f.run)
-		if slugErr != nil {
-			return report(stderr, slugErr, format, f.quiet, colour)
-		}
-		f.run = runSlug
-	}
-
 	var err error
 	switch {
 	case positionals[0] == "push":
@@ -454,6 +439,9 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 	}
 	extras, err := parseMetadata(f.metadata)
 	if err != nil {
+		return err
+	}
+	if f, err = withRunFlag(f); err != nil {
 		return err
 	}
 
@@ -656,6 +644,21 @@ func errCode(err error) string {
 	return err.Error()
 }
 
+// withRunFlag reads --run the way the positionals are read: the slug, or a link
+// carrying it. Called by the four commands that consume the flag rather than
+// once in Run, because a flag nothing reads has to stay a flag nothing reads —
+// resolving it centrally made `krowk doctor --run <link>` fail on a value doctor
+// never looks at, and answered an unknown command with a complaint about its
+// flags instead of naming the command.
+func withRunFlag(f flags) (flags, error) {
+	slug, err := api.ParseSlug(api.KindRun, f.run)
+	if err != nil {
+		return f, err
+	}
+	f.run = slug
+	return f, nil
+}
+
 // slugArg reads the positional every command that names one record takes: the
 // slug, or — since the pitch of the product is the pasted link — any link that
 // carries it. The missing case stays each command's own words, because "pass the
@@ -680,6 +683,10 @@ func slugArg(kind string, args []string, missing, fix string) (string, error) {
 // answer an empty page — and a caller cannot tell that apart from a run that
 // genuinely produced nothing.
 func uploadsList(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
+	f, err := withRunFlag(f)
+	if err != nil {
+		return err
+	}
 	client, err := newClient(f, env)
 	if err != nil {
 		return err
@@ -769,6 +776,9 @@ func uploadsAttach(w io.Writer, args []string, f flags, format output.Format, en
 	}
 	if f.run == "" {
 		return api.Fail("no_run", "pass the run to attach it to: `krowk uploads attach "+slug+" --run run_...`")
+	}
+	if f, err = withRunFlag(f); err != nil {
+		return err
 	}
 	client, err := newClient(f, env)
 	if err != nil {
@@ -918,8 +928,15 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 		return api.Fail("missing_claim",
 			"pass both the artifact and its token: `krowk claim art_... krowk_claim_...`")
 	}
+	if strings.TrimSpace(args[0]) == "" {
+		return api.Fail("missing_claim",
+			"pass both the artifact and its token: `krowk claim art_... krowk_claim_...`")
+	}
 	slug, err := api.ParseSlug(api.KindArtifact, args[0])
 	if err != nil {
+		return err
+	}
+	if f, err = withRunFlag(f); err != nil {
 		return err
 	}
 	client, err := newClient(f, env)

@@ -19,6 +19,7 @@ the versions are the `v*` tags a release is cut from. Entries land under
   passed on untouched, so slugs behave exactly as they did. A link carrying no
   slug of the kind the command wants now fails locally as `bad_artifact` or
   `bad_run` (exit 1), instead of going out and coming back as a record that does
-  not exist; a card link handed to `runs show` names the artifact it carries.
+  not exist; a card link handed to `runs show` names the artifact it carries, and
+  a string carrying two different artifacts is refused rather than acted on.
 
 [Unreleased]: https://github.com/krowkcom/cli/compare/v0.4.1...HEAD

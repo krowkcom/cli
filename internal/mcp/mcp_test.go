@@ -653,6 +653,37 @@ func TestClaimAdoptsAnAnonymousPushIntoTheWorkspace(t *testing.T) {
 	}
 }
 
+// The claim spends a one-shot token, so what it does with a link — and what it
+// refuses before spending anything — is worth pinning on this transport too.
+func TestClaimTakesLinksAndRefusesBeforeSpendingTheToken(t *testing.T) {
+	anon := newSession(t, "")
+	slug, claim := anon.anonymousPush()
+	keyed := anon.withKey("krowk_sk_test")
+	run := keyed.startRun()
+
+	// A run argument that carries no run is refused, and the token survives it:
+	// the claim below still works.
+	refused := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": slug, "claim_token": claim, "run": "https://krowk.com/pricing",
+	})
+	if refused["isError"] != true {
+		t.Fatalf("a run link naming nothing was accepted: %+v", refused)
+	}
+	if body := text(t, refused); !strings.Contains(body, "bad_run") {
+		t.Errorf("text = %q, want bad_run", body)
+	}
+
+	claimed := keyed.callTool("krowk_claim_artifact", map[string]any{
+		"slug": "https://krowk.com/a/" + slug, "claim_token": claim, "run": run,
+	})
+	if claimed["isError"] == true {
+		t.Fatalf("claim by link failed: %s", text(t, claimed))
+	}
+	if body := text(t, claimed); !strings.Contains(body, slug) || !strings.Contains(body, run) {
+		t.Errorf("text = %q, want the artifact under the run", body)
+	}
+}
+
 // The agent spending the claim token is the one that knows which run the upload
 // came from, so claiming takes the run rather than a separate attach tool. An
 // anonymous upload has no run and no other way to get one.

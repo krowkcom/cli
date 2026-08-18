@@ -28,7 +28,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   reported whole, since filtering the complaint with the expression behind it
   would bury it. `auth token`, `registry serve` and `--version` print no JSON,
   and refuse the flag rather than ignore it — the surface says which commands
-  those are, under `no_json`.
+  those are, under `no_json`. Neither can it be combined with `--format human`,
+  `markdown` or `url`, since one of the two would have to be discarded.
+  `doctor` and `upgrade` answer with a bare record and no envelope, as they
+  always have, so filter those as `--jq '.token_source'`.
 - Every command that names a record now takes the link as readily as the slug.
   Paste the card page, `https://krowk.com/a/art_…`, the CDN URL under it, or the
   markdown line carrying both, into `uploads show`, `uploads attach`,

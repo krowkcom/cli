@@ -273,7 +273,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	// --json does: there is nothing for a filter to read in a human row.
 	format, formatErr := output.ResolveFormat(f.format, f.json || jqGiven, isTTY)
 	if formatErr != nil {
-		return report(stderr, formatErr, output.JSON, f.quiet, false, nil)
+		return report(stderr, formatErr, output.JSON, f.quiet, false)
 	}
 	colour := isTTY
 
@@ -281,7 +281,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		// Reported unfiltered: the command line did not parse, so what --jq was
 		// given — or whether it was given at all — is not something krowk knows.
 		err := api.Fail("bad_flag", parseErr.Error()+" — run `krowk --help`")
-		return report(stderr, err, format, f.quiet, colour, nil)
+		return report(stderr, err, format, f.quiet, colour)
 	}
 
 	// Compiled here rather than where it is used, so a mistyped expression is
@@ -289,14 +289,22 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	// down. A refusal about --jq is itself reported unfiltered, since running a
 	// broken filter over the complaint about it would bury the complaint.
 	filter, jqErr := output.CompileFilter(f.jq, jqGiven)
+	if jqErr == nil && filter != nil && f.format != "" && output.Format(f.format) != output.JSON {
+		// Refused rather than overridden. --jq reads JSON and a paste form is not
+		// JSON, so one of the two was going to be ignored — and this same change
+		// stopped ignoring a --format that is merely misspelled. A --format spelled
+		// right deserves at least as much.
+		jqErr = api.Fail("bad_flag", "--jq reads the JSON, so it cannot be combined with "+
+			"--format "+f.format+" — drop one of the two")
+	}
 	if jqErr != nil {
-		return report(stderr, jqErr, format, f.quiet, colour, nil)
+		return report(stderr, jqErr, format, f.quiet, colour)
 	}
 	f.filter = filter
 	f.tty = isTTY
 	f.errTTY = isErrTTY
 	if err := filterHasSomethingToRead(filter, f, positionals); err != nil {
-		return report(stderr, err, format, f.quiet, colour, nil)
+		return report(stderr, err, format, f.quiet, colour)
 	}
 
 	switch {
@@ -312,7 +320,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 			topic = topic[1:]
 		}
 		if err := showHelp(stdout, topic, format, f); err != nil {
-			return reportOn(stderr, err, format, f.quiet, colour, f.errTTY, f.filter)
+			return reportFiltered(stderr, err, format, f.quiet, colour, f.errTTY, f.filter)
 		}
 		return 0
 	}
@@ -369,7 +377,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	}
 
 	if err != nil {
-		return reportOn(stderr, err, format, f.quiet, colour, f.errTTY, f.filter)
+		return reportFiltered(stderr, err, format, f.quiet, colour, f.errTTY, f.filter)
 	}
 	// The nudge comes last, after the command's own output, and only when the
 	// command worked: a failure has the floor. `upgrade` just answered the same
@@ -390,15 +398,16 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 // output.IsFilterFailure names and which running the filter again would only
 // bury, and one whose filtering fails, which falls back to the whole envelope
 // rather than to silence.
-func report(w io.Writer, err error, format output.Format, quiet, colour bool, filter *output.Filter) int {
-	return reportOn(w, err, format, quiet, colour, colour, filter)
+func report(w io.Writer, err error, format output.Format, quiet, colour bool) int {
+	return reportFiltered(w, err, format, quiet, colour, false, nil)
 }
 
-// reportOn is report with the two terminal questions answered separately: colour
-// is stdout's, which is what krowk has always painted a failure by, and errTTY
-// is this writer's, which is the only honest answer to whether a string printed
-// raw here could repaint something.
-func reportOn(w io.Writer, err error, format output.Format, quiet, colour, errTTY bool,
+// reportFiltered is report for the paths that have a filter to run over the
+// failure. The two terminal questions are separate here: colour is stdout's,
+// which is what krowk has always painted a failure by, and errTTY is this
+// writer's, which is the only honest answer to whether a string printed raw
+// here could repaint something.
+func reportFiltered(w io.Writer, err error, format output.Format, quiet, colour, errTTY bool,
 	filter *output.Filter) int {
 	rendered := output.Error(err, format, quiet, colour)
 	if filter != nil && !output.IsFilterFailure(err) {
@@ -411,8 +420,12 @@ func reportOn(w io.Writer, err error, format output.Format, quiet, colour, errTT
 		// an answer there. On a failure it is not: exiting non-zero having printed
 		// nothing anywhere leaves a caller a number and no reason for it, which is
 		// the one thing this function exists to prevent.
-		filterErr := filter.Write(&filtered, rendered, errTTY)
-		if filterErr == nil && filtered.Len() > 0 {
+		said, filterErr := filter.Write(&filtered, rendered, errTTY)
+		// said, not the byte count. An expression written for a result — the very
+		// one the docs hand out, `.data.artifacts[0].url` — answers `null` over a
+		// failure, and printing that instead of the envelope would leave a caller
+		// five bytes and an exit code where the reason should be.
+		if filterErr == nil && said > 0 {
 			fmt.Fprint(w, filtered.String())
 			return exitCodeFor(err)
 		}
@@ -444,14 +457,18 @@ func reportOn(w io.Writer, err error, format output.Format, quiet, colour, errTT
 // which is JSON like any other, and refusing it would make the two spellings of
 // one question — that and `krowk help auth token` — disagree.
 func filterHasSomethingToRead(filter *output.Filter, f flags, positionals []string) error {
-	if filter == nil || f.help {
+	if filter == nil {
 		return nil
 	}
 	name := ""
+	// The order is Run's dispatch order, and has to stay it: --version is answered
+	// before --help, so treating --help as "this prints a catalog entry" first
+	// would wave `krowk --version --help --jq …` straight past the check and print
+	// the version unfiltered.
 	switch {
 	case f.version:
 		name = "--version"
-	case len(positionals) > 0 && positionals[0] == "help":
+	case f.help, len(positionals) > 0 && positionals[0] == "help":
 		return nil
 	default:
 		// Find answers with the leaf, whose Name is the last word of it, so the
@@ -480,29 +497,34 @@ func emit(w io.Writer, rendered string, f flags) error {
 	// worse than no listing: `SLUGS=$(krowk uploads list --jq …)` would hold a
 	// prefix of the answer with nothing marking where it stopped.
 	var filtered bytes.Buffer
-	if err := f.filter.Write(&filtered, rendered, f.tty); err != nil {
-		return didWorkThenFailedToRead(err)
+	if _, err := f.filter.Write(&filtered, rendered, f.tty); err != nil {
+		return afterTheCommandRan(err)
 	}
 	fmt.Fprint(w, filtered.String())
 	return nil
 }
 
-// didWorkThenFailedToRead marks a filter failure that happened after the command
-// had already done its work.
+// afterTheCommandRan marks a filter failure that happened once the command had
+// already done whatever it does.
 //
-// The command succeeded and only the reading of it failed, which is a distinction
-// worth spending a sentence on: `krowk push shot.png --jq '.data.artifacts.url'`
-// is a plausible typo for `.data.artifacts[0].url`, it compiles, so the up-front
-// check cannot catch it — and the upload has landed by the time it does. A
-// wrapper that retries on a non-zero exit would upload the file twice. Nothing
-// here can stop it retrying, but the message can tell it not to.
-func didWorkThenFailedToRead(err error) error {
+// The command succeeded and only the reading of it failed, which is worth a
+// sentence: `krowk push shot.png --jq '.data.artifacts.url'` is a plausible typo
+// for `.data.artifacts[0].url`, it compiles, so the up-front check cannot catch
+// it — and the upload has landed by the time it does. A wrapper that retries on
+// a non-zero exit would upload the file twice. Nothing here can stop it
+// retrying, but the message can say what a retry would be repeating.
+//
+// It says the command ran rather than telling anyone not to run it again: most
+// commands are reads, and warning someone off `uploads list` is the opposite of
+// useful.
+func afterTheCommandRan(err error) error {
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) {
 		return err
 	}
 	return api.Fail(apiErr.Code(), apiErr.Fix()+
-		". The command itself succeeded, so running it again would repeat the work")
+		". The command itself succeeded — this is the reading of its result failing, "+
+		"so running it again repeats whatever it did")
 }
 
 // newClient is the one place a registry client gets built, so every command

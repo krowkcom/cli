@@ -169,7 +169,13 @@ already done its work and running it again would repeat it. Both exit 1.
 `auth token`, `registry serve` and `--version` print no JSON and refuse `--jq`
 rather than ignore it; `krowk help --json` marks them `no_json`. A `--jq` given
 with nothing in it — a shell expanding an unset variable — is `bad_jq`, never
-"no filter".
+"no filter". `--jq` cannot be combined with `--format human`, `markdown` or
+`url`: it reads the JSON, so one of the two would have to be discarded, and it
+is refused rather than picked.
+
+Two commands answer with a bare record and no envelope, whatever the flags:
+`doctor` and `upgrade`. Filter those as `--jq '.token_source'`, not
+`--jq '.data.token_source'`.
 
 ### Workspaces
 

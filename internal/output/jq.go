@@ -1,15 +1,18 @@
 package output
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
+
+	"time"
 
 	"github.com/itchyny/gojq"
 
@@ -41,6 +44,9 @@ import (
 // that travels: into a skill file, a CI job, a command one agent hands another.
 // Reading back the result krowk just produced is what --jq is for; reading the
 // environment it ran in is not.
+
+// filterDeadline bounds one filter run. See where it is used.
+const filterDeadline = 30 * time.Second
 
 // Filter is one compiled --jq expression, ready to run over a rendered result.
 type Filter struct{ code *gojq.Code }
@@ -130,6 +136,10 @@ func jqFailure(err error) error {
 			"in jq they choose the process's exit code, and krowk's exit codes are "+
 			"what happened to the artifact")
 	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return api.Fail("jq_failed", "--jq did not finish within "+filterDeadline.String()+
+			" — an expression that never ends, such as one recursing without a base case")
+	}
 	return api.Fail("jq_failed", "--jq: "+withoutCredentials(err.Error()))
 }
 
@@ -137,7 +147,7 @@ func jqFailure(err error) error {
 // they have: the prefix the registry stamps them with and the characters after
 // it. They are the two values in a record that are not the caller's to see a
 // second time.
-var credentialInMessage = regexp.MustCompile(`krowk_(sk|claim)_[A-Za-z0-9_-]+`)
+var credentialInMessage = regexp.MustCompile(`(krowk_(?:sk|claim)_)[A-Za-z0-9_-]+`)
 
 // withoutCredentials redacts those secrets out of a message, keeping the prefix
 // so a reader can still tell what kind of value was there.
@@ -146,16 +156,21 @@ var credentialInMessage = regexp.MustCompile(`krowk_(sk|claim)_[A-Za-z0-9_-]+`)
 // and a run's metadata runs to krowk's 16KB cap — an error envelope carrying
 // that is not a diagnostic, it is the result again with `ok: false` on it.
 func withoutCredentials(message string) string {
-	message = credentialInMessage.ReplaceAllStringFunc(message, func(secret string) string {
-		return secret[:strings.LastIndexByte(secret, '_')+1] + "[redacted]"
-	})
+	// The prefix is the captured group and not everything up to the last
+	// underscore: a token may carry underscores of its own — base64url does, and
+	// so does anything minted in segments — and finding the boundary by scanning
+	// would leave all but the last segment of the secret standing.
+	message = credentialInMessage.ReplaceAllString(message, "${1}[redacted]")
 	const longest = 400
 	if len(message) <= longest {
 		return message
 	}
-	// Cut back to a rune boundary, so a clipped message is still text.
+	// Back off over the trailing partial rune only. Testing the whole prefix
+	// would walk the cut all the way to the first invalid byte anywhere in it,
+	// and invalid bytes are reachable — `@base64d` decodes to arbitrary ones —
+	// so a message could erase itself.
 	clipped := message[:longest]
-	for len(clipped) > 0 && !utf8.ValidString(clipped) {
+	for len(clipped) > 0 && !utf8.RuneStart(clipped[len(clipped)-1]) {
 		clipped = clipped[:len(clipped)-1]
 	}
 	return clipped + " …"
@@ -179,7 +194,11 @@ func withoutCredentials(message string) string {
 // escaped it is not on this path. So on a terminal every string a result carries
 // is folded the way a human row's is. Piped output is the machine contract and
 // goes through byte for byte, as --format json does.
-func (f *Filter) Write(w io.Writer, rendered string, tty bool) error {
+// The count it answers with is the values that were not null. A caller deciding
+// whether the filter had anything to say needs that rather than a byte count:
+// an expression written for a result, run over a failure, answers `null` — five
+// bytes that mean "the thing you asked for is not in here".
+func (f *Filter) Write(w io.Writer, rendered string, tty bool) (said int, err error) {
 	dec := json.NewDecoder(strings.NewReader(rendered))
 	dec.UseNumber()
 	var input any
@@ -187,14 +206,23 @@ func (f *Filter) Write(w io.Writer, rendered string, tty bool) error {
 		// The renderer produced something that is not one JSON document, which is
 		// krowk's bug rather than the caller's. Saying so beats a jq error about a
 		// value the caller never wrote.
-		return api.Fail("jq_failed", "--jq had no JSON result to filter: "+err.Error())
+		return 0, api.Fail("jq_failed", "--jq had no JSON result to filter: "+err.Error())
 	}
 
-	iter := f.code.Run(input)
+	// With a deadline, because an expression travels — into a skill file, a CI
+	// job, a command one agent hands another — and `repeat(.)` is a plausible
+	// thing to get wrong. jq would spin forever and so would this; in an
+	// unattended container that is a wedged pipeline with no diagnostic. The
+	// window is enormous next to the work: filtering a page of a hundred rows is
+	// microseconds, so nothing legitimate comes near it.
+	ctx, cancel := context.WithTimeout(context.Background(), filterDeadline)
+	defer cancel()
+
+	iter := f.code.RunWithContext(ctx, input)
 	for {
 		v, ok := iter.Next()
 		if !ok {
-			return nil
+			return said, nil
 		}
 		if err, ok := v.(error); ok {
 			// gojq's halt and halt_error arrive here too, and are deliberately
@@ -202,17 +230,17 @@ func (f *Filter) Write(w io.Writer, rendered string, tty bool) error {
 			// process's exit code, and krowk's exit codes are a contract a script
 			// branches on — `halt_error(2)` would answer "not found" about an
 			// artifact that was found. An expression does not get to say that.
-			return jqFailure(err)
+			return said, jqFailure(err)
+		}
+		if v != nil {
+			said++
 		}
 		if s, ok := v.(string); ok {
 			if tty {
-				s = oneLine(s)
+				s = terminalSafeString(s)
 			}
 			fmt.Fprintln(w, s)
 			continue
-		}
-		if tty {
-			v = terminalSafe(v)
 		}
 		// gojq's encoder, not the stdlib's: it spells a result the way jq spells it,
 		// down to which characters it declines to escape, so a filter run here reads
@@ -224,69 +252,75 @@ func (f *Filter) Write(w io.Writer, rendered string, tty bool) error {
 		// rebuilds slices and objects rather than inventing types, so nothing
 		// outside its set can arrive.
 		b, _ := gojq.Marshal(v)
-		fmt.Fprintln(w, string(b))
-	}
-}
-
-// terminalSafe folds every string inside a filter result so that nothing printed
-// as part of an object or an array can move the cursor or recolour the line.
-// Numbers, booleans and nulls have nothing to fold and pass through.
-//
-// gojq's encoder escapes the ASCII control bytes and nothing else, which is what
-// leaves the work here: a C1 control or a bidi override is a multi-byte rune and
-// reaches the terminal exactly as it arrived.
-//
-// Nothing is folded in place. One expression can emit several values, and gojq
-// goes on computing the later ones out of the same decoded document — so writing
-// a folded string back into it would have `--jq '.data.artifacts,
-// (.data.artifacts[0].filename | length)'` measure the display form rather than
-// the value. Folding is for the copy on its way to the terminal and nothing else.
-func terminalSafe(v any) any {
-	switch val := v.(type) {
-	case string:
-		return oneLine(val)
-	case []any:
-		safe := make([]any, len(val))
-		for i, elem := range val {
-			safe[i] = terminalSafe(elem)
+		encoded := string(b)
+		if tty {
+			encoded = terminalSafeJSON(encoded)
 		}
-		return safe
-	case map[string]any:
-		return terminalSafeKeys(val)
+		fmt.Fprintln(w, encoded)
 	}
-	return v
 }
 
-// terminalSafeKeys rebuilds an object with printable keys, without ever dropping
-// an entry. A key that would repaint the row is escaped rather than folded: two
-// keys that folded to the same text would silently become one, and a field
-// vanishing from a result is worse than a field printed with its escapes spelled
-// out. Escaping is the JSON spelling of the same bytes, so nothing is lost, and
-// a name already taken is escaped again until it is not.
-func terminalSafeKeys(val map[string]any) map[string]any {
-	safe := make(map[string]any, len(val))
-	var escaped []string
-	for k, elem := range val {
-		if oneLine(k) == k {
-			safe[k] = terminalSafe(elem)
+// terminalSafeString makes one string safe to print on a terminal without
+// changing what it says.
+//
+// The escaped form is the JSON spelling of the same bytes: an escape sequence
+// arrives as `\x1b[31m` and stays on the line as those six characters, and a
+// newline arrives as `\n` rather than as a second row. A string carrying nothing
+// dangerous is printed exactly as it is, which is the case that matters — a
+// filename with two spaces in it is a filename with two spaces in it, and a
+// caller copying one out of the terminal has to get the name that exists.
+//
+// This is what folding it would have cost: trimming and collapsing every
+// whitespace run reads well in a table, where a value is being shown, and is
+// wrong here, where a value is being handed over.
+func terminalSafeString(s string) string {
+	if !unprintable(s) {
+		return s
+	}
+	return quoteInner(s)
+}
+
+// terminalSafeJSON is the same job for a compound result, done on the encoded
+// form rather than on the values inside it.
+//
+// gojq's encoder escapes the ASCII control bytes and nothing else, so what is
+// left to deal with is the multi-byte ones — a C1 control, a bidi override —
+// which reach the terminal exactly as they arrived. Rewriting the strings before
+// encoding would be wrong twice over: the encoder would escape the backslash of
+// the escape, so the JSON would go out saying the filename is the eight
+// characters `a\u202eb`, and an object's keys would have to be rewritten too and
+// could collide as they were.
+//
+// Done here it is exact. JSON's own structure is printable ASCII, so anything
+// this replaces is inside a string, and `\uXXXX` is what JSON already spells
+// that character as — the document parses back to precisely what it held.
+func terminalSafeJSON(encoded string) string {
+	if !unprintable(encoded) {
+		return encoded
+	}
+	var b strings.Builder
+	b.Grow(len(encoded))
+	for _, r := range encoded {
+		if unicode.IsControl(r) || reordering(r) {
+			fmt.Fprintf(&b, `\u%04x`, r)
 			continue
 		}
-		escaped = append(escaped, k)
+		b.WriteRune(r)
 	}
-	// Sorted, so an object with two unprintable keys resolves its collisions the
-	// same way every time rather than by map order.
-	slices.Sort(escaped)
-	for _, k := range escaped {
-		name := quoteInner(k)
-		for {
-			if _, taken := safe[name]; !taken {
-				break
-			}
-			name = quoteInner(name)
+	return b.String()
+}
+
+// unprintable reports whether a string carries anything that would move the
+// cursor, recolour the row, or reorder what is drawn after it — the control
+// characters and the format characters a human row drops, the newlines and tabs
+// among them, since one filter result is one line.
+func unprintable(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) || reordering(r) {
+			return true
 		}
-		safe[name] = terminalSafe(val[k])
 	}
-	return safe
+	return false
 }
 
 // quoteInner is strconv.Quote without the quotes it wraps the result in: the

@@ -1,6 +1,7 @@
 package output
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -24,7 +25,7 @@ func filter(t *testing.T, expr string) *Filter {
 func filtered(t *testing.T, expr, document string, tty bool) string {
 	t.Helper()
 	var b strings.Builder
-	if err := filter(t, expr).Write(&b, document, tty); err != nil {
+	if _, err := filter(t, expr).Write(&b, document, tty); err != nil {
 		t.Fatalf("--jq %q: %v", expr, err)
 	}
 	return b.String()
@@ -116,7 +117,7 @@ func TestNumbersSurviveAFilterAsTheyWereWritten(t *testing.T) {
 
 func TestAnExpressionPointedAtTheWrongShapeFails(t *testing.T) {
 	const doc = `{"data":{"artifacts":[]}}`
-	err := filter(t, ".data | .[0]").Write(&strings.Builder{}, doc, false)
+	_, err := filter(t, ".data | .[0]").Write(&strings.Builder{}, doc, false)
 	if got := codeOf(t, err); got != "jq_failed" {
 		t.Errorf("shape mismatch = %q, want jq_failed", got)
 	}
@@ -147,7 +148,7 @@ func TestAFailedExpressionNeverCarriesACredential(t *testing.T) {
 		".data.artifacts[0] | halt_error",
 		".data | .[0]",
 	} {
-		err := filter(t, expr).Write(&strings.Builder{}, doc, false)
+		_, err := filter(t, expr).Write(&strings.Builder{}, doc, false)
 		if err == nil {
 			t.Errorf("--jq %q did not fail", expr)
 			continue
@@ -161,12 +162,32 @@ func TestAFailedExpressionNeverCarriesACredential(t *testing.T) {
 	}
 }
 
+func TestACredentialWithUnderscoresInItIsStillRedacted(t *testing.T) {
+	// The prefix is the captured group, not everything up to the last underscore:
+	// base64url uses "_", and so does anything minted in segments, so scanning for
+	// the boundary would leave all but the last segment of the secret standing.
+	for _, message := range []string{
+		"got: krowk_sk_QmFzZTY0dXJsX3Rva2Vu_XY",
+		"cannot index krowk_claim_aa_bb_cc_ddeeff with a number",
+	} {
+		got := withoutCredentials(message)
+		for _, fragment := range []string{"QmFz", "aa_bb", "ddeeff"} {
+			if strings.Contains(got, fragment) {
+				t.Errorf("withoutCredentials(%q) = %q — the secret survived", message, got)
+			}
+		}
+		if !strings.Contains(got, "[redacted]") {
+			t.Errorf("withoutCredentials(%q) = %q — nothing was redacted", message, got)
+		}
+	}
+}
+
 func TestALongFailureIsClippedRatherThanCarryingTheWholeRecord(t *testing.T) {
 	// `error(.)` hands the whole document back, and a run's metadata runs to
 	// krowk's 16KB cap. An error envelope carrying that is the result again with
 	// ok: false on it, not a diagnostic.
 	doc := `{"data":{"note":"` + strings.Repeat("x", 4000) + `"}}`
-	err := filter(t, ".data | error").Write(&strings.Builder{}, doc, false)
+	_, err := filter(t, ".data | error").Write(&strings.Builder{}, doc, false)
 	if message := err.(*api.Error).Fix(); len(message) > 500 {
 		t.Errorf("failure is %d bytes long, want it clipped", len(message))
 	}
@@ -176,7 +197,7 @@ func TestHaltSaysWhyItIsRefusedRatherThanRepeatingGojq(t *testing.T) {
 	// Refusing halt is deliberate — it picks the process's exit code in jq, and
 	// krowk's exit codes say what happened to the artifact. gojq renders a bare
 	// halt as "halt error: null", which tells a caller none of that.
-	err := filter(t, "halt").Write(&strings.Builder{}, `{}`, false)
+	_, err := filter(t, "halt").Write(&strings.Builder{}, `{}`, false)
 	message := err.(*api.Error).Fix()
 	if strings.Contains(message, "null") || !strings.Contains(message, "halt") {
 		t.Errorf("halt reported as %q, want it named and explained", message)
@@ -201,15 +222,27 @@ func TestATerminalNeverSeesAStringThatCouldRepaintIt(t *testing.T) {
 	if strings.Contains(got, "\x1b") {
 		t.Errorf("a terminal was handed an escape sequence: %q", got)
 	}
-	if want := "saferedred"; strings.Contains(got, want) {
-		t.Errorf("folding lost text rather than the escape: %q", got)
+	// Escaped, not dropped: the value is being handed over, not displayed, so it
+	// has to still say what it said.
+	if want := `safe\x1b[31mred`; !strings.Contains(got, want) {
+		t.Errorf("the escape was rewritten rather than spelled out: %q", got)
 	}
 
-	// One value, one line: a newline in a title would otherwise read as a second
-	// result to whatever is counting them.
+	// One value, one line: a newline would otherwise read as a second result to
+	// whatever is counting them, so it is spelled rather than printed.
 	multiline := filtered(t, ".data.title", `{"data":{"title":"first\nsecond"}}`, true)
-	if want := "first second\n"; multiline != want {
-		t.Errorf("terminal folding = %q, want %q", multiline, want)
+	if want := `first\nsecond` + "\n"; multiline != want {
+		t.Errorf("terminal escaping = %q, want %q", multiline, want)
+	}
+}
+
+func TestATerminalStillSeesAValueThatIsMerelyUnusual(t *testing.T) {
+	// The reason strings are escaped rather than folded. Two spaces in a filename
+	// are two spaces in a filename, and a caller copying one out of the terminal
+	// into a command has to get the name that exists.
+	const doc = `{"data":{"filename":"  my  file .png"}}`
+	if got := filtered(t, ".data.filename", doc, true); got != "  my  file .png\n" {
+		t.Errorf("a harmless value was rewritten for the terminal: %q", got)
 	}
 }
 
@@ -222,21 +255,14 @@ func TestATerminalNeverSeesAnEscapeInsideAPrintedObject(t *testing.T) {
 	if strings.Contains(got, "\x1b") || strings.Contains(got, "\u202e") {
 		t.Errorf("a printed object carried an escape to the terminal: %q", got)
 	}
-	// Escaped rather than folded, because a key that folded into another key
-	// would take a field out of the result with it.
+	// Nothing is lost doing it: the escapes are what JSON already spells those
+	// characters as, so the line parses back to exactly what it held.
 	if !strings.Contains(got, "key") || !strings.Contains(got, "value") {
-		t.Errorf("folding dropped a field: %q", got)
+		t.Errorf("making the line safe dropped a field: %q", got)
 	}
-}
-
-func TestTwoUnprintableKeysBothSurvive(t *testing.T) {
-	// The reason keys are escaped and not folded: these two fold to the same
-	// text, and a result quietly losing one of them is worse than a result
-	// printing both with their escapes spelled out.
-	const doc = "{\"\\u001b[31mk\":1,\"\\u001b[32mk\":2}"
-	got := filtered(t, ".", doc, true)
-	if strings.Count(got, `:`) != 2 {
-		t.Errorf("an entry was lost folding the keys: %q", got)
+	var back map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(got)), &back); err != nil {
+		t.Errorf("the safe line is no longer JSON: %v", err)
 	}
 }
 
@@ -255,17 +281,19 @@ func TestTheEnvironmentIsNotReachableFromAnExpression(t *testing.T) {
 
 func TestFoldingForATerminalDoesNotChangeWhatTheFilterComputes(t *testing.T) {
 	// One expression, several outputs, computed out of the same decoded document.
-	// Folding the first output in place would leave the second measuring the
-	// display form: "a  b" folds to "a b", so the length would read 3 and not 4.
-	const doc = `{"data":{"artifacts":[{"filename":"a  b"}]}}`
+	// Making the first output safe in place would leave the second measuring the
+	// escaped form: a bidi override is one rune where its JSON spelling is six,
+	// so the length would read 8 rather than 3.
+	const doc = "{\"data\":{\"artifacts\":[{\"filename\":\"a\\u202eb\"}]}}"
 	const expr = `.data.artifacts, (.data.artifacts[0].filename | length)`
 
 	got := filtered(t, expr, doc, true)
-	if !strings.Contains(got, "\n4\n") {
-		t.Errorf("folding changed the value a later output was computed from: %q", got)
+	if !strings.Contains(got, "\n3\n") {
+		t.Errorf("the terminal copy changed what a later output was computed from: %q", got)
 	}
-	// And the folded copy is still what got printed.
-	if !strings.Contains(got, `"a b"`) {
-		t.Errorf("the printed object was not folded: %q", got)
+	// And the terminal copy carries the override spelled out, which is what JSON
+	// already calls that character — so the document still parses back to it.
+	if !strings.Contains(got, `a\u202eb`) {
+		t.Errorf("the printed object was not made safe: %q", got)
 	}
 }

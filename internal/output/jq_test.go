@@ -10,7 +10,7 @@ import (
 // filter compiles an expression a test expects to be good.
 func filter(t *testing.T, expr string) *Filter {
 	t.Helper()
-	f, err := CompileFilter(expr)
+	f, err := CompileFilter(expr, true)
 	if err != nil {
 		t.Fatalf("CompileFilter(%q) = %v", expr, err)
 	}
@@ -46,18 +46,20 @@ func codeOf(t *testing.T, err error) string {
 
 func TestCompileFilterTellsAnUnsetFlagFromABlankOne(t *testing.T) {
 	// No flag is no filter, and no mistake.
-	f, err := CompileFilter("")
+	f, err := CompileFilter("", false)
 	if err != nil || f != nil {
-		t.Errorf("CompileFilter(\"\") = %v, %v — want no filter and no failure", f, err)
+		t.Errorf("CompileFilter(unset) = %v, %v — want no filter and no failure", f, err)
 	}
 
-	// A blank one was typed, or a shell expanded an empty variable into it.
-	// Reading it as "no filter" would answer the whole envelope to a caller who
-	// asked for one field of it.
-	for _, blank := range []string{" ", "\t", "\n"} {
-		_, err := CompileFilter(blank)
+	// A flag that was typed and carries nothing is a shell that expanded an
+	// empty variable into it. Reading that as "no filter" would answer the whole
+	// envelope to a caller who asked for one field of it — and, on a command
+	// that prints no JSON at all, would skip the refusal that keeps a raw secret
+	// off stdout. The empty string counts: it is the spelling a shell produces.
+	for _, blank := range []string{"", " ", "\t", "\n"} {
+		_, err := CompileFilter(blank, true)
 		if got := codeOf(t, err); got != "bad_jq" {
-			t.Errorf("CompileFilter(%q) = %q, want bad_jq", blank, got)
+			t.Errorf("CompileFilter(%q, given) = %q, want bad_jq", blank, got)
 		}
 	}
 }
@@ -66,7 +68,7 @@ func TestCompileFilterRefusesAnExpressionThatDoesNotParse(t *testing.T) {
 	// The point of compiling here rather than at the point of use: this happens
 	// before the command it belongs to uploads, claims or takes anything down.
 	for _, expr := range []string{".data | [", ".data |", "{"} {
-		_, err := CompileFilter(expr)
+		_, err := CompileFilter(expr, true)
 		if got := codeOf(t, err); got != "bad_jq" {
 			t.Errorf("CompileFilter(%q) = %q, want bad_jq", expr, got)
 		}
@@ -131,30 +133,53 @@ func TestAnExpressionPointedAtTheWrongShapeFails(t *testing.T) {
 	}
 }
 
-func TestAFailedExpressionDoesNotQuoteTheRecordBack(t *testing.T) {
-	// gojq spells a type mismatch as the type and then a preview of the value.
-	// That preview is a slice of the record the command just produced, and an
-	// anonymous push carries a claim token in one — a one-shot secret that must
-	// not reach a log because a filter had a typo in it.
-	const doc = `{"data":{"artifacts":[{"claim_token":"krowk_claim_s3cret"}]}}`
-	err := filter(t, ".data | .[0]").Write(&strings.Builder{}, doc, false)
-	message := err.(*api.Error).Fix()
-	if strings.Contains(message, "krowk_claim") || strings.Contains(message, "claim_token") {
-		t.Errorf("the failure quotes the record back: %q", message)
+func TestAFailedExpressionNeverCarriesACredential(t *testing.T) {
+	// gojq puts the value into a failure in three different shapes, and only one
+	// of them is the bracketed preview: a wrap error quotes it mid-sentence with
+	// no brackets at all, and error/halt_error hand back whatever they were given,
+	// whole. Cutting the message on shape catches one of the three, so nothing is
+	// cut on shape — the credentials come out by name instead.
+	const doc = `{"data":{"artifacts":[{"claim_token":"krowk_claim_s3crets3cret","key":"krowk_sk_alsos3cret"}]}}`
+	for _, expr := range []string{
+		".data.artifacts[0].claim_token | tonumber",
+		".data.artifacts[0].claim_token | fromjson",
+		".data | error",
+		".data.artifacts[0] | halt_error",
+		".data | .[0]",
+	} {
+		err := filter(t, expr).Write(&strings.Builder{}, doc, false)
+		if err == nil {
+			t.Errorf("--jq %q did not fail", expr)
+			continue
+		}
+		message := err.(*api.Error).Fix()
+		for _, secret := range []string{"s3cret", "alsos3cret"} {
+			if strings.Contains(message, secret) {
+				t.Errorf("--jq %q put a credential in the failure: %q", expr, message)
+			}
+		}
 	}
-	// The type is the part that says what to fix, so it stays.
-	if !strings.Contains(message, "object") {
-		t.Errorf("the failure no longer names the type it met: %q", message)
-	}
+}
 
-	// The preview is caller data rendered as JSON, so anything that looks like
-	// structure can also be inside it. A key holding the same `: ` the message
-	// uses to introduce the type must not move where the message is cut — the
-	// keys sort, so this one lands inside the preview and ahead of the token.
-	const colonInside = `{"data":{"a: b":"y","claim_token":"krowk_claim_s3cret"}}`
-	err = filter(t, ".data | .[0]").Write(&strings.Builder{}, colonInside, false)
-	if message := err.(*api.Error).Fix(); strings.Contains(message, "krowk_claim") {
-		t.Errorf("a colon inside the record let the preview through: %q", message)
+func TestALongFailureIsClippedRatherThanCarryingTheWholeRecord(t *testing.T) {
+	// `error(.)` hands the whole document back, and a run's metadata runs to
+	// krowk's 16KB cap. An error envelope carrying that is the result again with
+	// ok: false on it, not a diagnostic.
+	doc := `{"data":{"note":"` + strings.Repeat("x", 4000) + `"}}`
+	err := filter(t, ".data | error").Write(&strings.Builder{}, doc, false)
+	if message := err.(*api.Error).Fix(); len(message) > 500 {
+		t.Errorf("failure is %d bytes long, want it clipped", len(message))
+	}
+}
+
+func TestHaltSaysWhyItIsRefusedRatherThanRepeatingGojq(t *testing.T) {
+	// Refusing halt is deliberate — it picks the process's exit code in jq, and
+	// krowk's exit codes say what happened to the artifact. gojq renders a bare
+	// halt as "halt error: null", which tells a caller none of that.
+	err := filter(t, "halt").Write(&strings.Builder{}, `{}`, false)
+	message := err.(*api.Error).Fix()
+	if strings.Contains(message, "null") || !strings.Contains(message, "halt") {
+		t.Errorf("halt reported as %q, want it named and explained", message)
 	}
 }
 

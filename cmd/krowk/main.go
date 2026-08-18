@@ -9,10 +9,13 @@ import (
 )
 
 func main() {
-	os.Exit(cli.Run(os.Args[1:], os.Stdout, os.Stderr, os.Getenv, isTerminal(os.Stdout)))
+	os.Exit(cli.Run(os.Args[1:], os.Stdout, os.Stderr, os.Getenv,
+		isTerminal(os.Stdout), isTerminal(os.Stderr)))
 }
 
-// isTerminal decides whether to colour output and default to the human format.
+// isTerminal decides whether to colour output and default to the human format,
+// and — asked of stderr as well as of stdout — whether a string a --jq filter
+// prints raw on that stream could repaint a terminal.
 func isTerminal(f *os.File) bool {
 	info, err := f.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0

@@ -383,7 +383,8 @@
           {
             "name": "token",
             "usage": "krowk auth token",
-            "summary": "Print the stored token"
+            "summary": "Print the stored token",
+            "no_json": true
           },
           {
             "name": "verify",
@@ -508,7 +509,8 @@
                 "default": "",
                 "usage": "Reject uploads above this size"
               }
-            ]
+            ],
+            "no_json": true
           }
         ]
       },

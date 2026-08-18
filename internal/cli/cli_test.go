@@ -88,7 +88,7 @@ func (h *harness) run(args ...string) (code int, stdout, stderr string) {
 func (h *harness) runOn(isTTY bool, args ...string) (code int, stdout, stderr string) {
 	h.t.Helper()
 	var out, errOut bytes.Buffer
-	code = Run(args, &out, &errOut, func(k string) string { return h.env[k] }, isTTY)
+	code = Run(args, &out, &errOut, func(k string) string { return h.env[k] }, isTTY, isTTY)
 	return code, out.String(), errOut.String()
 }
 
@@ -1921,5 +1921,67 @@ func TestOnATerminalAFilteredStringCannotRepaintTheRow(t *testing.T) {
 	_, piped, _ := h.runOn(false, "runs", "list", "--jq=.data.runs[0].metadata[\"vcs.change.title\"]")
 	if !strings.Contains(piped, "\x1b") {
 		t.Errorf("piped output lost the byte it was supposed to pass through: %q", piped)
+	}
+}
+
+func TestAnEmptyFilterIsAFlagWithNothingInItRatherThanNoFlag(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// `--jq "$FIELD"` with the variable unset. Reading it as "no filter" would
+	// answer with the whole envelope where one field was asked for — and on
+	// `auth token`, would skip the refusal and print the key.
+	body := h.failsWith(1, "uploads", "list", "--jq=")
+	if body["error"] != "bad_jq" {
+		t.Errorf("`--jq=` failed as %v, want bad_jq", body["error"])
+	}
+
+	code, stdout, _ := h.run("auth", "token", "--jq=")
+	if code == 0 || strings.Contains(stdout, "krowk_sk_") {
+		t.Errorf("`auth token --jq=` exited %d and printed %q — the key escaped the refusal",
+			code, stdout)
+	}
+}
+
+func TestHelpIsFilterableOnACommandThatIsNot(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// `krowk auth token --help` prints the catalog entry, which is JSON like any
+	// other. Refusing it would make the two spellings of one question disagree.
+	code, viaFlag, stderr := h.run("auth", "token", "--help", "--jq=.name")
+	if code != 0 {
+		t.Fatalf("`auth token --help --jq` exited %d, stderr:\n%s", code, stderr)
+	}
+	_, viaHelp, _ := h.run("help", "auth", "token", "--jq=.name")
+	if viaFlag != viaHelp || strings.TrimSpace(viaFlag) != "auth token" {
+		t.Errorf("--help gave %q and `help` gave %q, want the same command entry", viaFlag, viaHelp)
+	}
+}
+
+func TestABrokenFilterIsReportedEvenWhenTheCommandAlsoFailed(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// Otherwise whether a caller learns their expression is broken depends on
+	// whether the registry happened to answer: the same expression against a
+	// command that worked fails loudly.
+	code, _, stderr := h.run("uploads", "show", "art_nope", "--jq=.error | .[0]")
+	if code == 0 {
+		t.Fatal("exited 0 on a missing artifact")
+	}
+	if !strings.Contains(stderr, "jq_failed") {
+		t.Errorf("stderr = %q, want the broken filter named as well as not_found", stderr)
+	}
+	if !strings.Contains(stderr, "not_found") {
+		t.Errorf("stderr = %q, want the command's own failure kept", stderr)
+	}
+}
+
+func TestAMistypedFormatIsStillAMistakeWhenAFilterIsAskedFor(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// --jq settles the format, but it does not excuse one that does not exist:
+	// a caller who meant markdown and mistyped it should hear about it.
+	body := h.failsWith(1, "uploads", "list", "--format=markdwon", "--jq=.")
+	if body["error"] != "bad_format" {
+		t.Errorf("`--format=markdwon --jq .` failed as %v, want bad_format", body["error"])
 	}
 }

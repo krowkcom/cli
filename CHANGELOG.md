@@ -27,7 +27,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   non-zero exit does not repeat the work. A failure `--jq` caused is always
   reported whole, since filtering the complaint with the expression behind it
   would bury it. `auth token`, `registry serve` and `--version` print no JSON,
-  and refuse the flag rather than ignore it.
+  and refuse the flag rather than ignore it — the surface says which commands
+  those are, under `no_json`.
 - Every command that names a record now takes the link as readily as the slug.
   Paste the card page, `https://krowk.com/a/art_…`, the CDN URL under it, or the
   markdown line carrying both, into `uploads show`, `uploads attach`,
@@ -42,6 +43,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Changed
 
+- A `--format` nobody has heard of is now refused even when `--json` or `--jq`
+  was passed as well. It used to be accepted and ignored, so a caller who meant
+  `--format markdown` and mistyped it was told nothing.
 - A claim token is trimmed before it is sent, on `claim` and on
   `uploads delete`, so one copied with a trailing space or newline works instead
   of failing as an unauthorised claim.

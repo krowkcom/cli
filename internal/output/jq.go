@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/itchyny/gojq"
 
@@ -48,12 +50,15 @@ type Filter struct{ code *gojq.Code }
 // the caller's to fix, and learning about it after an upload has already landed
 // is learning about it too late.
 //
-// An unset flag is no filter and not a mistake. A blank one is a mistake, by the
-// rule api.ParseSlug applies to --run: it was typed, or a shell expanded an
-// empty variable into it, and reading it as "no filter" would answer with the
-// whole envelope to a caller who asked for one field of it.
-func CompileFilter(expr string) (*Filter, error) {
-	if expr == "" {
+// given says whether the flag appeared on the command line, which is a different
+// question from whether it carries anything. api.ParseSlug can treat "" as
+// absent because --run is genuinely optional and a command without one is a
+// command that means something; --jq has no such reading. A flag that was typed
+// and is empty is a shell that expanded a variable into nothing, and answering
+// it with the whole envelope would hand `krowk auth token --jq "$FIELD"` the
+// unfiltered secret it asked one field of.
+func CompileFilter(expr string, given bool) (*Filter, error) {
+	if !given {
 		return nil, nil
 	}
 	if strings.TrimSpace(expr) == "" {
@@ -102,45 +107,58 @@ func IsFilterFailure(err error) bool {
 // the fix is a different one: bad_jq is a typo, jq_failed is an expression
 // pointed at the wrong shape.
 //
-// The result itself is taken back out of the message. gojq spells a type
-// mismatch as the type and then a preview of the value in brackets — `expected
-// an array but got: object ({"artifacts":[{"byte_size ...})` — and that preview
-// is a slice of the record the command just produced. An anonymous push carries
-// a claim token in that record, and a one-shot secret must not reach a log
-// because someone's filter had a typo in it. The type says what to fix and
-// stays; the contents say nothing to anyone and go.
+// gojq's message is kept whole, because it is the diagnostic: which operation,
+// which type, which position. What comes out of it is credentials, and only
+// credentials.
+//
+// The message can carry the record. A type error quotes a preview of the value,
+// a wrap error quotes it mid-sentence, and `error`/`halt_error` hand back
+// whatever the expression gave them, untruncated. Cutting the message at some
+// punctuation cannot be made to work — a preview is caller data and picks its
+// own brackets and colons, and half these shapes carry no brackets at all. So
+// nothing is cut on shape. The record coming back to the caller who just fetched
+// it is not the problem; the two secrets inside it are. An anonymous push
+// carries a claim token and a login carries an API key, and neither may reach a
+// log because someone's filter had a typo in it.
 func jqFailure(err error) error {
-	return api.Fail("jq_failed", "--jq: "+withoutPreview(err.Error()))
+	var halt *gojq.HaltError
+	if errors.As(err, &halt) {
+		// gojq renders a bare `halt` as "halt error: null", which says nothing
+		// about why krowk refused it. The refusal is deliberate — see where this
+		// is caught — so it gets a sentence of its own.
+		return api.Fail("jq_failed", "--jq: halt and halt_error are not honoured — "+
+			"in jq they choose the process's exit code, and krowk's exit codes are "+
+			"what happened to the artifact")
+	}
+	return api.Fail("jq_failed", "--jq: "+withoutCredentials(err.Error()))
 }
 
-// withoutPreview drops the value gojq appends to a type mismatch, and the tail
-// of the message with it.
+// credentialInMessage matches the two secrets krowk mints, by the only shape
+// they have: the prefix the registry stamps them with and the characters after
+// it. They are the two values in a record that are not the caller's to see a
+// second time.
+var credentialInMessage = regexp.MustCompile(`krowk_(sk|claim)_[A-Za-z0-9_-]+`)
+
+// withoutCredentials redacts those secrets out of a message, keeping the prefix
+// so a reader can still tell what kind of value was there.
 //
-// gojq keeps the value on the error unexported, so this reads the message rather
-// than the error. The shape is `<what went wrong>: <type> (<preview>)`, and the
-// cut is at the *first* bracket: the preview is a JSON rendering of caller data
-// and can hold brackets, colons and anything else that looks like structure, so
-// cutting at any later position is cutting where the data chose. Cutting at the
-// first bracket can only ever remove more than the preview, never less, and that
-// is the direction which has to be safe.
-//
-// What it removes more of is a second operand, where there is one: gojq spells a
-// bad addition `cannot add: object (…) and number (…)`, and what survives here is
-// `cannot add: object`. That is the price. The operation and the left-hand type
-// are the part a caller acts on, and no reading of a preview can be trusted not
-// to hand a claim token back with it.
-//
-// A message not ending in a bracket carries no preview and is left exactly as
-// gojq wrote it, since a mangled diagnostic is worse than a long one.
-func withoutPreview(message string) string {
-	if !strings.HasSuffix(message, ")") {
+// The message is capped too. `--jq 'error(.)'` hands back the whole document,
+// and a run's metadata runs to krowk's 16KB cap — an error envelope carrying
+// that is not a diagnostic, it is the result again with `ok: false` on it.
+func withoutCredentials(message string) string {
+	message = credentialInMessage.ReplaceAllStringFunc(message, func(secret string) string {
+		return secret[:strings.LastIndexByte(secret, '_')+1] + "[redacted]"
+	})
+	const longest = 400
+	if len(message) <= longest {
 		return message
 	}
-	bracket := strings.Index(message, " (")
-	if bracket < 0 {
-		return message
+	// Cut back to a rune boundary, so a clipped message is still text.
+	clipped := message[:longest]
+	for len(clipped) > 0 && !utf8.ValidString(clipped) {
+		clipped = clipped[:len(clipped)-1]
 	}
-	return message[:bracket]
+	return clipped + " …"
 }
 
 // Write runs the filter over one rendered result and writes what comes out, one
@@ -199,10 +217,13 @@ func (f *Filter) Write(w io.Writer, rendered string, tty bool) error {
 		// gojq's encoder, not the stdlib's: it spells a result the way jq spells it,
 		// down to which characters it declines to escape, so a filter run here reads
 		// the same as the same filter run under jq.
-		b, err := gojq.Marshal(v)
-		if err != nil {
-			return api.Fail("jq_failed", "--jq produced a value that is not JSON: "+err.Error())
-		}
+		//
+		// Its error is always nil, and it panics instead on a type it does not know
+		// — so the thing to hold is the invariant, not the return value. Everything
+		// it is handed here came out of gojq's own iterator, and terminalSafe
+		// rebuilds slices and objects rather than inventing types, so nothing
+		// outside its set can arrive.
+		b, _ := gojq.Marshal(v)
 		fmt.Fprintln(w, string(b))
 	}
 }

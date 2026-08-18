@@ -194,11 +194,16 @@ type flags struct {
 	// filter is --jq once it has been compiled, and nil when there was none. It
 	// rides along here rather than through every command's signature because it
 	// applies to whatever a command renders and to nothing a command decides.
-	// tty travels with it because the two are only ever read together: a filter
-	// prints strings raw, and whether that reaches a terminal decides whether
-	// they have to be folded first.
+	//
+	// tty and errTTY are that filter's other half: a filter prints strings raw,
+	// so whether they have to be folded first depends on whether they are going
+	// to a terminal. There are two because there are two streams and they are
+	// answered separately — results go to stdout and failures to stderr, and
+	// `krowk … --jq … > out.json` from a terminal is exactly the case where one
+	// is a file and the other is not.
 	filter *output.Filter
 	tty    bool
+	errTTY bool
 }
 
 type stringSlice []string
@@ -245,7 +250,7 @@ func newFlagSet(f *flags) *flag.FlagSet {
 }
 
 // Run executes one invocation and returns the process exit code.
-func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY bool) int {
+func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY, isErrTTY bool) int {
 	var f flags
 	fs := newFlagSet(&f)
 
@@ -253,10 +258,20 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	// collect them. Lets flags follow filenames, the way agents write commands.
 	positionals, parseErr := parseInterleaved(fs, args)
 
+	// Whether --jq was typed, which is a different question from what it carries:
+	// `--jq "$FIELD"` with the variable unset is a flag that was given and is
+	// empty, and reading that as "no filter" would answer with everything.
+	jqGiven := false
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "jq" {
+			jqGiven = true
+		}
+	})
+
 	// Resolve the format before reporting anything, including the parse error.
 	// --jq asks for a value out of the JSON, so it settles the format the same way
 	// --json does: there is nothing for a filter to read in a human row.
-	format, formatErr := output.ResolveFormat(f.format, f.json || f.jq != "", isTTY)
+	format, formatErr := output.ResolveFormat(f.format, f.json || jqGiven, isTTY)
 	if formatErr != nil {
 		return report(stderr, formatErr, output.JSON, f.quiet, false, nil)
 	}
@@ -273,13 +288,14 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	// refused before the command it belongs to uploads, claims or takes anything
 	// down. A refusal about --jq is itself reported unfiltered, since running a
 	// broken filter over the complaint about it would bury the complaint.
-	filter, jqErr := output.CompileFilter(f.jq)
+	filter, jqErr := output.CompileFilter(f.jq, jqGiven)
 	if jqErr != nil {
 		return report(stderr, jqErr, format, f.quiet, colour, nil)
 	}
 	f.filter = filter
 	f.tty = isTTY
-	if err := filterHasSomethingToRead(filter, f.version, positionals); err != nil {
+	f.errTTY = isErrTTY
+	if err := filterHasSomethingToRead(filter, f, positionals); err != nil {
 		return report(stderr, err, format, f.quiet, colour, nil)
 	}
 
@@ -296,7 +312,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 			topic = topic[1:]
 		}
 		if err := showHelp(stdout, topic, format, f); err != nil {
-			return report(stderr, err, format, f.quiet, colour, f.filter)
+			return reportOn(stderr, err, format, f.quiet, colour, f.errTTY, f.filter)
 		}
 		return 0
 	}
@@ -353,7 +369,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	}
 
 	if err != nil {
-		return report(stderr, err, format, f.quiet, colour, f.filter)
+		return reportOn(stderr, err, format, f.quiet, colour, f.errTTY, f.filter)
 	}
 	// The nudge comes last, after the command's own output, and only when the
 	// command worked: a failure has the floor. `upgrade` just answered the same
@@ -375,6 +391,15 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 // bury, and one whose filtering fails, which falls back to the whole envelope
 // rather than to silence.
 func report(w io.Writer, err error, format output.Format, quiet, colour bool, filter *output.Filter) int {
+	return reportOn(w, err, format, quiet, colour, colour, filter)
+}
+
+// reportOn is report with the two terminal questions answered separately: colour
+// is stdout's, which is what krowk has always painted a failure by, and errTTY
+// is this writer's, which is the only honest answer to whether a string printed
+// raw here could repaint something.
+func reportOn(w io.Writer, err error, format output.Format, quiet, colour, errTTY bool,
+	filter *output.Filter) int {
 	rendered := output.Error(err, format, quiet, colour)
 	if filter != nil && !output.IsFilterFailure(err) {
 		// Into a buffer first, because a filter can write several values and then
@@ -386,39 +411,56 @@ func report(w io.Writer, err error, format output.Format, quiet, colour bool, fi
 		// an answer there. On a failure it is not: exiting non-zero having printed
 		// nothing anywhere leaves a caller a number and no reason for it, which is
 		// the one thing this function exists to prevent.
-		if filterErr := filter.Write(&filtered, rendered, colour); filterErr == nil && filtered.Len() > 0 {
+		filterErr := filter.Write(&filtered, rendered, errTTY)
+		if filterErr == nil && filtered.Len() > 0 {
 			fmt.Fprint(w, filtered.String())
 			return exitCodeFor(err)
+		}
+		if filterErr != nil {
+			// Said before the envelope, and not instead of it. Otherwise whether a
+			// caller ever learns their expression is broken depends on whether the
+			// registry happened to answer — the same expression against a command
+			// that worked would have failed loudly.
+			fmt.Fprintln(w, output.Error(filterErr, format, quiet, colour))
 		}
 	}
 	fmt.Fprintln(w, rendered)
 	return exitCodeFor(err)
 }
 
-// filterHasSomethingToRead refuses --jq on the three things krowk does that
-// render no JSON for it to read.
+// filterHasSomethingToRead refuses --jq where the command answers with something
+// other than JSON.
 //
-// `auth token` prints the bare token so `$(krowk auth token)` works, `--version`
-// prints the version, and `registry serve` runs a server and prints its log.
+// `auth token` prints the bare token so `$(krowk auth token)` works, `registry
+// serve` runs a server and prints its log, and `--version` prints the version.
 // None of them goes through emit, so a filter would be silently skipped and the
-// caller would get an unfiltered line back — from `auth token`, a raw secret
-// where an expression asked for one field. A flag that quietly does nothing on
-// three commands is the kind of thing the catalog exists to make impossible, so
-// it is a refusal instead.
-func filterHasSomethingToRead(filter *output.Filter, version bool, positionals []string) error {
-	if filter == nil {
+// caller handed an unfiltered line — from `auth token`, the raw secret where an
+// expression asked for one field of it. A flag that quietly does nothing is what
+// the catalog exists to make impossible, so which commands those are is read off
+// the catalog rather than written out again here: a command added later carries
+// the answer or does not, and the surface test notices either way.
+//
+// Help is not one of them. `krowk auth token --help` prints the catalog entry,
+// which is JSON like any other, and refusing it would make the two spellings of
+// one question — that and `krowk help auth token` — disagree.
+func filterHasSomethingToRead(filter *output.Filter, f flags, positionals []string) error {
+	if filter == nil || f.help {
 		return nil
 	}
 	name := ""
 	switch {
-	case version:
+	case f.version:
 		name = "--version"
-	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
-		name = "auth token"
-	case len(positionals) > 1 && positionals[0] == "registry" && positionals[1] == "serve":
-		name = "registry serve"
-	default:
+	case len(positionals) > 0 && positionals[0] == "help":
 		return nil
+	default:
+		// Find answers with the leaf, whose Name is the last word of it, so the
+		// message says what was typed rather than "`token`".
+		cmd, ok := Surface().Find(positionals)
+		if !ok || !cmd.NoJSON {
+			return nil
+		}
+		name = strings.Join(clip(positionals, 2), " ")
 	}
 	return api.Fail("jq_unsupported", "`"+name+"` prints no JSON, so there is nothing for --jq to read"+
 		" — drop the flag, or ask a command that answers with a record")
@@ -460,7 +502,7 @@ func didWorkThenFailedToRead(err error) error {
 		return err
 	}
 	return api.Fail(apiErr.Code(), apiErr.Fix()+
-		" — the command itself succeeded, so running it again would repeat the work")
+		". The command itself succeeded, so running it again would repeat the work")
 }
 
 // newClient is the one place a registry client gets built, so every command

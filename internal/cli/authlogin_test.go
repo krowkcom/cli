@@ -332,7 +332,7 @@ func browserLogin(t *testing.T, h *harness, button string, args ...string) (exit
 		// --no-browser always: a test must never reach for the desktop's URL
 		// handler, and on macOS and Windows nothing else here would stop it.
 		done <- Run(append([]string{"auth", "login", "--no-browser"}, args...), &out, shown,
-			func(k string) string { return h.env[k] }, false)
+			func(k string) string { return h.env[k] }, false, false)
 	}()
 
 	// Generous, because it bounds a test that hangs rather than the flow itself:

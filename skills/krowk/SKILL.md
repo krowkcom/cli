@@ -167,7 +167,9 @@ fails as `jq_failed` afterwards, and says so, because by then the command has
 already done its work and running it again would repeat it. Both exit 1.
 
 `auth token`, `registry serve` and `--version` print no JSON and refuse `--jq`
-rather than ignore it.
+rather than ignore it; `krowk help --json` marks them `no_json`. A `--jq` given
+with nothing in it — a shell expanding an unset variable — is `bad_jq`, never
+"no filter".
 
 ### Workspaces
 

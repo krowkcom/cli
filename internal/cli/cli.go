@@ -95,6 +95,8 @@ Global flags
                          markdown and url describe an upload; other commands fall back to json
   --json                 Shorthand for --format json
   --quiet                Raw JSON, no envelope
+  --jq <expr>            Filter the JSON with a jq expression, built in — implies
+                         --format json, and reads the bare record under --quiet
   -h, --help             Show this
   -v, --version          Print the version
 
@@ -184,8 +186,18 @@ type flags struct {
 	noBrowser   bool
 	json        bool
 	quiet       bool
+	jq          string
 	help        bool
 	version     bool
+
+	// filter is --jq once it has been compiled, and nil when there was none. It
+	// rides along here rather than through every command's signature because it
+	// applies to whatever a command renders and to nothing a command decides.
+	// tty travels with it because the two are only ever read together: a filter
+	// prints strings raw, and whether that reaches a terminal decides whether
+	// they have to be folded first.
+	filter *output.Filter
+	tty    bool
 }
 
 type stringSlice []string
@@ -223,6 +235,7 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.BoolVar(&f.noBrowser, "no-browser", false, "")
 	fs.BoolVar(&f.json, "json", false, "")
 	fs.BoolVar(&f.quiet, "quiet", false, "")
+	fs.StringVar(&f.jq, "jq", "", "")
 	fs.BoolVar(&f.help, "help", false, "")
 	fs.BoolVar(&f.help, "h", false, "")
 	fs.BoolVar(&f.version, "version", false, "")
@@ -240,16 +253,31 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	positionals, parseErr := parseInterleaved(fs, args)
 
 	// Resolve the format before reporting anything, including the parse error.
-	format, formatErr := output.ResolveFormat(f.format, f.json, isTTY)
+	// --jq asks for a value out of the JSON, so it settles the format the same way
+	// --json does: there is nothing for a filter to read in a human row.
+	format, formatErr := output.ResolveFormat(f.format, f.json || f.jq != "", isTTY)
 	if formatErr != nil {
-		return report(stderr, formatErr, output.JSON, f.quiet, false)
+		return report(stderr, formatErr, output.JSON, f.quiet, false, nil)
 	}
 	colour := isTTY
 
 	if parseErr != nil {
+		// Reported unfiltered: the command line did not parse, so what --jq was
+		// given — or whether it was given at all — is not something krowk knows.
 		err := api.Fail("bad_flag", parseErr.Error()+" — run `krowk --help`")
-		return report(stderr, err, format, f.quiet, colour)
+		return report(stderr, err, format, f.quiet, colour, nil)
 	}
+
+	// Compiled here rather than where it is used, so a mistyped expression is
+	// refused before the command it belongs to uploads, claims or takes anything
+	// down. A refusal about --jq is itself reported unfiltered, since running a
+	// broken filter over the complaint about it would bury the complaint.
+	filter, jqErr := output.CompileFilter(f.jq)
+	if jqErr != nil {
+		return report(stderr, jqErr, format, f.quiet, colour, nil)
+	}
+	f.filter = filter
+	f.tty = isTTY
 
 	switch {
 	case f.version:
@@ -263,8 +291,8 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		if len(topic) > 0 && topic[0] == "help" {
 			topic = topic[1:]
 		}
-		if err := showHelp(stdout, topic, format); err != nil {
-			return report(stderr, err, format, f.quiet, colour)
+		if err := showHelp(stdout, topic, format, f); err != nil {
+			return report(stderr, err, format, f.quiet, colour, f.filter)
 		}
 		return 0
 	}
@@ -321,7 +349,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	}
 
 	if err != nil {
-		return report(stderr, err, format, f.quiet, colour)
+		return report(stderr, err, format, f.quiet, colour, f.filter)
 	}
 	// The nudge comes last, after the command's own output, and only when the
 	// command worked: a failure has the floor. `upgrade` just answered the same
@@ -335,9 +363,34 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 // report renders a failure and answers with the exit code that classifies it.
 // Every failing path in Run goes through here, so there is one place where a
 // failure becomes a number and no way to exit non-zero without printing why.
-func report(w io.Writer, err error, format output.Format, quiet, colour bool) int {
-	fmt.Fprintln(w, output.Error(err, format, quiet, colour))
+// A failure is filtered like any other result, so `--jq '.error.error'` reads
+// the code out of a refusal the same way it reads a slug out of an upload — a
+// caller that filters everything should not have to stop filtering to find out
+// what went wrong. Two failures are never filtered: one caused by --jq, which
+// output.IsFilterFailure names and which running the filter again would only
+// bury, and one whose filtering fails, which falls back to the whole envelope
+// rather than to silence.
+func report(w io.Writer, err error, format output.Format, quiet, colour bool, filter *output.Filter) int {
+	rendered := output.Error(err, format, quiet, colour)
+	if filter != nil && !output.IsFilterFailure(err) {
+		if filterErr := filter.Write(w, rendered, colour); filterErr == nil {
+			return exitCodeFor(err)
+		}
+	}
+	fmt.Fprintln(w, rendered)
 	return exitCodeFor(err)
+}
+
+// emit is where a rendered result reaches the caller, and the one place a --jq
+// filter gets to touch one. Every command goes through it, so a filter can never
+// apply to some results and not others — a caller reading one field out of a
+// push must be able to read the same field out of a claim.
+func emit(w io.Writer, rendered string, f flags) error {
+	if f.filter == nil {
+		fmt.Fprintln(w, rendered)
+		return nil
+	}
+	return f.filter.Write(w, rendered, f.tty)
 }
 
 // newClient is the one place a registry client gets built, so every command
@@ -497,8 +550,7 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 		}
 	}
 
-	fmt.Fprintln(w, output.Upload(result, format, f.quiet, colour, time.Now()))
-	return nil
+	return emit(w, output.Upload(result, format, f.quiet, colour, time.Now()), f)
 }
 
 // resolveRun decides which run the artifacts belong to: the one named on the
@@ -704,8 +756,7 @@ func uploadsList(w io.Writer, f flags, format output.Format, env runctx.Env, col
 	// included: an agent paging by 10 that was handed a crumb paging by 50 would
 	// change stride halfway through the walk without being told.
 	listing := output.Listing{Run: f.run, Limit: f.limit}
-	fmt.Fprintln(w, output.List(page, listing, format, f.quiet, colour, time.Now()))
-	return nil
+	return emit(w, output.List(page, listing, format, f.quiet, colour, time.Now()), f)
 }
 
 // runsList pages through the key's runs, newest first.
@@ -719,8 +770,7 @@ func runsList(w io.Writer, f flags, format output.Format, env runctx.Env, colour
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.RunList(page, output.Listing{Limit: f.limit}, format, f.quiet, colour))
-	return nil
+	return emit(w, output.RunList(page, output.Listing{Limit: f.limit}, format, f.quiet, colour), f)
 }
 
 // runsShow reads one run back with everything recorded on it. That is where an
@@ -740,8 +790,7 @@ func runsShow(w io.Writer, args []string, f flags, format output.Format, env run
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.RunDetail(run, format, f.quiet, colour))
-	return nil
+	return emit(w, output.RunDetail(run, format, f.quiet, colour), f)
 }
 
 func uploadsShow(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
@@ -759,8 +808,7 @@ func uploadsShow(w io.Writer, args []string, f flags, format output.Format, env 
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()))
-	return nil
+	return emit(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()), f)
 }
 
 // uploadsAttach puts an upload under a run after the fact. It is the only way an
@@ -787,8 +835,7 @@ func uploadsAttach(w io.Writer, args []string, f flags, format output.Format, en
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()))
-	return nil
+	return emit(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()), f)
 }
 
 // uploadsDelete takes an upload down: the bytes leave storage at once and the
@@ -853,8 +900,7 @@ func uploadsDelete(w io.Writer, args []string, f flags, format output.Format, en
 	if err := client.TakeDownArtifact(context.Background(), slug, claimToken); err != nil {
 		return withTakedownAuthority(err, claimToken != "")
 	}
-	fmt.Fprintln(w, output.Removed(slug, format, f.quiet, colour))
-	return nil
+	return emit(w, output.Removed(slug, format, f.quiet, colour), f)
 }
 
 // withTakedownAuthority says what a 404 from a takedown actually means. The
@@ -896,8 +942,7 @@ func runsStart(w io.Writer, f flags, format output.Format, env runctx.Env, colou
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.Run(run, format, f.quiet, colour))
-	return nil
+	return emit(w, output.Run(run, format, f.quiet, colour), f)
 }
 
 func runsFinish(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
@@ -914,8 +959,7 @@ func runsFinish(w io.Writer, args []string, f flags, format output.Format, env r
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.Run(run, format, f.quiet, colour))
-	return nil
+	return emit(w, output.Run(run, format, f.quiet, colour), f)
 }
 
 // claim spends the token an anonymous upload came back with, which is the only
@@ -966,8 +1010,7 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 	// in a workspace and under nothing, and `uploads attach` is the only way it
 	// ever gets one. That is worth handing back as a command rather than leaving
 	// to be discovered in the help.
-	fmt.Fprintln(w, output.Claimed(artifact, format, f.quiet, colour, time.Now()))
-	return nil
+	return emit(w, output.Claimed(artifact, format, f.quiet, colour, time.Now()), f)
 }
 
 // authLogin gets a key onto this machine, one of two ways, and which one is
@@ -1054,8 +1097,7 @@ func authLoginWithToken(w io.Writer, f flags, format output.Format, env runctx.E
 	} else {
 		result.KeyID, result.Workspace = key.KeyID, key.Workspace
 	}
-	fmt.Fprintln(w, output.StoredKey(result, format, f.quiet, colour))
-	return nil
+	return emit(w, output.StoredKey(result, format, f.quiet, colour), f)
 }
 
 // How long a browser login is given, and how often it is asked about. Both are
@@ -1170,8 +1212,7 @@ func authLoginInBrowser(stdout, stderr io.Writer, f flags, format output.Format,
 	if !result.Confirmed {
 		result.Reason = "the registry approved it without naming the key or its workspace"
 	}
-	fmt.Fprintln(stdout, output.StoredKey(result, format, f.quiet, colour))
-	return nil
+	return emit(stdout, output.StoredKey(result, format, f.quiet, colour), f)
 }
 
 // noBrowserLoginHere reads a 404 on the way in as a registry that does not offer
@@ -1438,8 +1479,7 @@ func authVerify(w io.Writer, format output.Format, f flags, env runctx.Env, colo
 			KeyID: key.KeyID, Workspace: key.Workspace, WorkspaceName: key.WorkspaceName,
 		})
 	}
-	fmt.Fprintln(w, output.Key(key, format, f.quiet, colour))
-	return nil
+	return emit(w, output.Key(key, format, f.quiet, colour), f)
 }
 
 func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
@@ -1474,8 +1514,7 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 
 	if format != output.Human {
 		b, _ := json.MarshalIndent(report, "", "  ")
-		fmt.Fprintln(w, string(b))
-		return nil
+		return emit(w, string(b), f)
 	}
 
 	for _, k := range keys {

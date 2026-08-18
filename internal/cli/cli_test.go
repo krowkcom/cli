@@ -1723,3 +1723,103 @@ func TestPagingARunsUploadsStaysScopedToTheRun(t *testing.T) {
 		t.Errorf("second page = %d artifacts, want the run's other one alone", len(second.Data.Artifacts))
 	}
 }
+
+// --jq is the built-in jq filter. The tests that follow are about how it joins
+// the rest of the CLI: which format it settles, what it is pointed at, and what
+// happens to a failure while one is in force. What jq itself does with an
+// expression is the output package's business, and jq_test.go holds it there.
+
+func TestFilteringSettlesTheFormatTheWayJSONDoes(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// There is nothing for a filter to read in a human row, so --jq decides the
+	// format the same way --json does — including over a --format that asked for
+	// something else.
+	for _, args := range [][]string{
+		{"push", h.fixture, "--jq=.data.artifacts[0].slug"},
+		{"push", h.fixture, "--format=human", "--jq=.data.artifacts[0].slug"},
+		{"push", h.fixture, "--format=url", "--jq=.data.artifacts[0].slug"},
+	} {
+		code, stdout, stderr := h.run(args...)
+		if code != 0 {
+			t.Fatalf("`krowk %s` exited %d, stderr:\n%s", strings.Join(args, " "), code, stderr)
+		}
+		if !strings.HasPrefix(strings.TrimSpace(stdout), "art_") {
+			t.Errorf("`krowk %s` printed %q, want the slug alone",
+				strings.Join(args, " "), stdout)
+		}
+	}
+}
+
+func TestQuietPointsTheFilterAtTheRecordInsteadOfTheEnvelope(t *testing.T) {
+	h := newHarness(t, 0)
+	h.ok("push", h.fixture)
+
+	// --quiet is the record without the envelope, so an expression written for
+	// one would be wrong for the other. The filter reads whatever the command
+	// actually rendered.
+	_, wrapped, _ := h.run("uploads", "list", "--jq=.data.artifacts[0].slug")
+	_, bare, _ := h.run("uploads", "list", "--quiet", "--jq=.artifacts[0].slug")
+	if wrapped == "" || wrapped != bare {
+		t.Errorf("enveloped = %q and bare = %q, want the same slug from each", wrapped, bare)
+	}
+}
+
+func TestAMistypedExpressionIsRefusedBeforeAnythingIsSent(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// The whole reason the expression is compiled up front: a push that has
+	// already landed cannot be un-landed because the filter after it had a typo.
+	body := h.failsWith(1, "push", h.fixture, "--jq=.data.artifacts[0 |")
+	if body["error"] != "bad_jq" {
+		t.Errorf("failure = %v, want bad_jq", body["error"])
+	}
+
+	listed := h.ok("uploads", "list")
+	if len(listed.Data.Artifacts) != 0 {
+		t.Errorf("%d artifacts landed, want none — the refusal came too late",
+			len(listed.Data.Artifacts))
+	}
+}
+
+func TestAFailureIsFilteredLikeAnyOtherResult(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// A caller that filters everything should not have to stop filtering to find
+	// out what went wrong.
+	code, _, stderr := h.run("uploads", "show", "art_nope", "--jq=.error.error")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 — filtering must not change how a failure classifies", code)
+	}
+	if got := strings.TrimSpace(stderr); got != "not_found" {
+		t.Errorf("filtered failure = %q, want not_found", got)
+	}
+}
+
+func TestAFailureCausedByTheFilterIsReportedWhole(t *testing.T) {
+	h := newHarness(t, 0)
+	h.ok("push", h.fixture)
+
+	// An expression that does not fit the result will not fit the complaint
+	// about it either, so filtering that complaint would answer `null` and an
+	// exit code with nothing anywhere saying the expression was the problem.
+	body := h.failsWith(1, "uploads", "list", "--jq=.data | .[0]")
+	if body["error"] != "jq_failed" {
+		t.Errorf("failure = %v, want jq_failed said in full", body["error"])
+	}
+}
+
+func TestTheSurfaceItselfIsFilterable(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// `krowk help --json` is how an agent learns the surface without parsing
+	// prose. Reading one field out of it should not mean parsing the whole thing
+	// either.
+	code, stdout, stderr := h.run("help", "--json", "--jq=.global_flags[].name")
+	if code != 0 {
+		t.Fatalf("exited %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "jq") {
+		t.Errorf("the filtered surface does not name --jq: %q", stdout)
+	}
+}

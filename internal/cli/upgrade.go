@@ -138,7 +138,7 @@ func upgradeCmd(w io.Writer, f flags, format output.Format, env runctx.Env, colo
 	writeUpdateState(env, updateState{CheckedAt: time.Now(), Latest: latest})
 
 	if !versionLess(Version, latest) {
-		return upgradeReport(w, format, map[string]any{
+		return upgradeReport(w, f, format, map[string]any{
 			"upgraded": false, "version": Version, "latest": latest,
 		}, "krowk "+Version+" is the latest release")
 	}
@@ -171,18 +171,17 @@ func upgradeCmd(w io.Writer, f flags, format output.Format, env runctx.Env, colo
 	if err != nil {
 		return err
 	}
-	return upgradeReport(w, format, map[string]any{
+	return upgradeReport(w, f, format, map[string]any{
 		"upgraded": true, "version": latest, "from": Version, "binaries": replaced,
 	}, "upgraded "+Version+" → "+latest+"\n  "+strings.Join(replaced, "\n  "))
 }
 
 // upgradeReport prints the outcome the way doctor does: lines for a person,
 // JSON for everything else.
-func upgradeReport(w io.Writer, format output.Format, report map[string]any, human string) error {
+func upgradeReport(w io.Writer, f flags, format output.Format, report map[string]any, human string) error {
 	if format != output.Human {
 		b, _ := json.MarshalIndent(report, "", "  ")
-		fmt.Fprintln(w, string(b))
-		return nil
+		return emit(w, string(b), f)
 	}
 	fmt.Fprintln(w, human)
 	return nil

@@ -355,6 +355,9 @@ func catalog() Catalog {
 				Usage: "human | json | markdown | url (default: human on a TTY, json when piped)"},
 			{Name: "json", Type: typeBool, Default: "false", Usage: "Shorthand for --format json"},
 			{Name: "quiet", Type: typeBool, Default: "false", Usage: "Raw JSON, no envelope"},
+			{Name: "jq", Type: typeString,
+				Usage: "Filter the JSON with a jq expression — built in, no jq binary needed. " +
+					"Implies --format json, and reads the bare record under --quiet"},
 			{Name: "help", Aliases: []string{"h"}, Type: typeBool, Default: "false", Usage: "Show the help"},
 			{Name: "version", Aliases: []string{"v"}, Type: typeBool, Default: "false",
 				Usage: "Print the version"},

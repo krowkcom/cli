@@ -557,6 +557,12 @@
         "usage": "Raw JSON, no envelope"
       },
       {
+        "name": "jq",
+        "type": "string",
+        "default": "",
+        "usage": "Filter the JSON with a jq expression — built in, no jq binary needed. Implies --format json, and reads the bare record under --quiet"
+      },
+      {
         "name": "help",
         "aliases": [
           "h"

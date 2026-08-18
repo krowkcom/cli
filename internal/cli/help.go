@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,12 +27,12 @@ import (
 // `krowk push` does. markdown and url are the two paste forms of an artifact's
 // link — an embed and the card page's URL — and have nothing to say about a
 // command, so they fall back to the text a person would read.
-func showHelp(w io.Writer, topic []string, format output.Format) error {
+func showHelp(w io.Writer, topic []string, format output.Format, f flags) error {
 	c := Surface()
 
 	if len(topic) == 0 {
 		if format == output.JSON {
-			return encodeJSON(w, c)
+			return encodeJSON(w, c, f)
 		}
 		fmt.Fprintf(w, helpTemplate, Version, usageBlock(c),
 			defaultRegistryAddr, api.DevBaseURL, api.DefaultBaseURL,
@@ -48,7 +49,7 @@ func showHelp(w io.Writer, topic []string, format output.Format) error {
 			"`"+strings.Join(clip(topic, 2), " ")+"` is not a krowk command — run `krowk help` for the list")
 	}
 	if format == output.JSON {
-		return encodeJSON(w, cmd)
+		return encodeJSON(w, cmd, f)
 	}
 	fmt.Fprintln(w, commandHelp(cmd))
 	return nil
@@ -56,13 +57,16 @@ func showHelp(w io.Writer, topic []string, format output.Format) error {
 
 // encodeJSON writes the surface indented, the way every other JSON answer from
 // krowk is written, and with HTML escaping off so a URL in a usage line stays
-// readable.
-func encodeJSON(w io.Writer, v any) error {
-	enc := json.NewEncoder(w)
+// readable. It goes out through emit like any other result, so the surface is
+// filterable too: `krowk help --json --jq '.commands[].name'` is the shortest
+// way for an agent to learn what krowk can do.
+func encodeJSON(w io.Writer, v any, f flags) error {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {
 		return api.Fail("encode_failed", "the help catalog could not be encoded: "+err.Error())
 	}
-	return nil
+	return emit(w, strings.TrimRight(buf.String(), "\n"), f)
 }

@@ -333,7 +333,7 @@ func TestEveryEnvironmentVariableInTheCatalogIsRead(t *testing.T) {
 
 func renderedHelp() string {
 	var b strings.Builder
-	if err := showHelp(&b, nil, "human"); err != nil {
+	if err := showHelp(&b, nil, "human", flags{}); err != nil {
 		panic(err)
 	}
 	return b.String()

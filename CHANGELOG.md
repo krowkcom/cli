@@ -18,11 +18,16 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `URL=$(krowk push shot.png --jq '.data.artifacts[0].url')` is the whole
   ceremony; anything else prints as JSON, one value per line. `krowk help --json`
   is filterable too, which is the shortest way for an agent to read the surface.
-  A failure is filtered like any other result, so `--jq '.error.error'` reads the
-  code out of one. An expression that does not parse is refused as `bad_jq`
-  before the command sends anything, and one that does not fit the result it was
-  pointed at answers `jq_failed` — that one is always reported whole, since
-  filtering the complaint with the expression that caused it would bury it.
+  A failure is filtered like any other result, in whatever shape the command
+  rendered it: `--jq '.error.error'` reads the code out of an envelope, and
+  `--quiet --jq '.error'` reads it out of the bare body. An expression that does
+  not parse is refused as `bad_jq` before the command sends anything, and one
+  that does not fit the result it was pointed at answers `jq_failed` afterwards,
+  saying that the command itself succeeded so that a wrapper retrying on a
+  non-zero exit does not repeat the work. A failure `--jq` caused is always
+  reported whole, since filtering the complaint with the expression behind it
+  would bury it. `auth token`, `registry serve` and `--version` print no JSON,
+  and refuse the flag rather than ignore it.
 - Every command that names a record now takes the link as readily as the slug.
   Paste the card page, `https://krowk.com/a/art_…`, the CDN URL under it, or the
   markdown line carrying both, into `uploads show`, `uploads attach`,

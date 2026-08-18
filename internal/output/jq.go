@@ -91,7 +91,7 @@ func IsFilterFailure(err error) bool {
 		return false
 	}
 	switch apiErr.Code() {
-	case "bad_jq", "jq_failed":
+	case "bad_jq", "jq_failed", "jq_unsupported":
 		return true
 	}
 	return false
@@ -113,16 +113,25 @@ func jqFailure(err error) error {
 	return api.Fail("jq_failed", "--jq: "+withoutPreview(err.Error()))
 }
 
-// withoutPreview drops the bracketed value gojq appends to a type mismatch.
+// withoutPreview drops the value gojq appends to a type mismatch, and the tail
+// of the message with it.
 //
 // gojq keeps the value on the error unexported, so this reads the message rather
-// than the error. The shape it is cutting is `<what went wrong>: <type>
-// (<preview>)`, and the cut is at the *first* bracket rather than the last: the
-// preview is a JSON rendering of caller data and can hold anything, brackets and
-// colons included, so anything that looks like structure inside it has to be
-// treated as content. A message not ending in a bracket is not one of these and
-// is left exactly as gojq wrote it, since a mangled diagnostic is worse than a
-// long one.
+// than the error. The shape is `<what went wrong>: <type> (<preview>)`, and the
+// cut is at the *first* bracket: the preview is a JSON rendering of caller data
+// and can hold brackets, colons and anything else that looks like structure, so
+// cutting at any later position is cutting where the data chose. Cutting at the
+// first bracket can only ever remove more than the preview, never less, and that
+// is the direction which has to be safe.
+//
+// What it removes more of is a second operand, where there is one: gojq spells a
+// bad addition `cannot add: object (…) and number (…)`, and what survives here is
+// `cannot add: object`. That is the price. The operation and the left-hand type
+// are the part a caller acts on, and no reading of a preview can be trusted not
+// to hand a claim token back with it.
+//
+// A message not ending in a bracket carries no preview and is left exactly as
+// gojq wrote it, since a mangled diagnostic is worse than a long one.
 func withoutPreview(message string) string {
 	if !strings.HasSuffix(message, ")") {
 		return message
@@ -170,6 +179,11 @@ func (f *Filter) Write(w io.Writer, rendered string, tty bool) error {
 			return nil
 		}
 		if err, ok := v.(error); ok {
+			// gojq's halt and halt_error arrive here too, and are deliberately
+			// reported as failures rather than honoured. jq lets them choose the
+			// process's exit code, and krowk's exit codes are a contract a script
+			// branches on — `halt_error(2)` would answer "not found" about an
+			// artifact that was found. An expression does not get to say that.
 			return jqFailure(err)
 		}
 		if s, ok := v.(string); ok {
@@ -200,15 +214,22 @@ func (f *Filter) Write(w io.Writer, rendered string, tty bool) error {
 // gojq's encoder escapes the ASCII control bytes and nothing else, which is what
 // leaves the work here: a C1 control or a bidi override is a multi-byte rune and
 // reaches the terminal exactly as it arrived.
+//
+// Nothing is folded in place. One expression can emit several values, and gojq
+// goes on computing the later ones out of the same decoded document — so writing
+// a folded string back into it would have `--jq '.data.artifacts,
+// (.data.artifacts[0].filename | length)'` measure the display form rather than
+// the value. Folding is for the copy on its way to the terminal and nothing else.
 func terminalSafe(v any) any {
 	switch val := v.(type) {
 	case string:
 		return oneLine(val)
 	case []any:
+		safe := make([]any, len(val))
 		for i, elem := range val {
-			val[i] = terminalSafe(elem)
+			safe[i] = terminalSafe(elem)
 		}
-		return val
+		return safe
 	case map[string]any:
 		return terminalSafeKeys(val)
 	}

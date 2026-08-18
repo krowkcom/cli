@@ -158,11 +158,16 @@ krowk uploads list --limit 10 --jq '[.data.artifacts[] | {slug, filename}]'
 krowk help --json --jq '.commands[].name'
 ```
 
-A failure is filtered too, so `--jq '.error.error'` reads the code out of one —
-except a failure `--jq` itself caused, which is always reported whole. An
-expression that does not parse fails as `bad_jq` before the command sends
-anything; one that does not fit the result fails as `jq_failed` afterwards. Both
-exit 1.
+A failure is filtered too, and it is filtered in whatever shape the command
+rendered it: `--jq '.error.error'` reads the code out of an envelope, and
+`--quiet --jq '.error'` reads it out of the bare body. A failure `--jq` itself
+caused is always reported whole. An expression that does not parse fails as
+`bad_jq` before the command sends anything; one that does not fit the result
+fails as `jq_failed` afterwards, and says so, because by then the command has
+already done its work and running it again would repeat it. Both exit 1.
+
+`auth token`, `registry serve` and `--version` print no JSON and refuse `--jq`
+rather than ignore it.
 
 ### Workspaces
 

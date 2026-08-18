@@ -80,8 +80,15 @@ func (h *harness) write(name, contents string) string {
 
 func (h *harness) run(args ...string) (code int, stdout, stderr string) {
 	h.t.Helper()
+	return h.runOn(false, args...)
+}
+
+// runOn is run with the terminal question answered explicitly, for the handful
+// of tests whose subject is what krowk does differently on one.
+func (h *harness) runOn(isTTY bool, args ...string) (code int, stdout, stderr string) {
+	h.t.Helper()
 	var out, errOut bytes.Buffer
-	code = Run(args, &out, &errOut, func(k string) string { return h.env[k] }, false)
+	code = Run(args, &out, &errOut, func(k string) string { return h.env[k] }, isTTY)
 	return code, out.String(), errOut.String()
 }
 
@@ -1821,5 +1828,98 @@ func TestTheSurfaceItselfIsFilterable(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "jq") {
 		t.Errorf("the filtered surface does not name --jq: %q", stdout)
+	}
+}
+
+func TestAFilterWritesNothingUntilItHasWrittenEverything(t *testing.T) {
+	h := newHarness(t, 0)
+	for _, name := range []string{"one.png", "two.png"} {
+		h.ok("push", h.write(name, "bytes for "+name))
+	}
+
+	// Several values and then a failure. Half a listing on stdout with an exit
+	// code behind it is worse than none: the caller's variable would hold a
+	// prefix of the answer with nothing marking where it stopped.
+	code, stdout, _ := h.run("uploads", "list", "--jq=.data.artifacts[].slug, (.data | .[0])")
+	if code == 0 {
+		t.Fatalf("exited 0, want the filter failure")
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want nothing — the filter failed partway", stdout)
+	}
+}
+
+func TestAFilterThatFailsAfterTheWorkSaysTheWorkHappened(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// `.data.artifacts.url` is the plausible typo for `.data.artifacts[0].url`.
+	// It compiles, so nothing catches it up front, and the upload has landed by
+	// the time it fails — a wrapper retrying on a non-zero exit would push twice.
+	body := h.failsWith(1, "push", h.fixture, "--jq=.data.artifacts.url")
+	fix, _ := body["fix"].(string)
+	if !strings.Contains(fix, "succeeded") {
+		t.Errorf("fix = %q, want it to say the command itself worked", fix)
+	}
+
+	listed := h.ok("uploads", "list")
+	if len(listed.Data.Artifacts) != 1 {
+		t.Fatalf("%d artifacts, want the one the failing filter was reading", len(listed.Data.Artifacts))
+	}
+}
+
+func TestAFailureNeverExitsNonZeroWithNothingPrinted(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// An expression that matches nothing is silence on a result, and silence is
+	// an answer there. On a failure it would leave a caller a number and no
+	// reason for it.
+	code, stdout, stderr := h.run("uploads", "show", "art_nope",
+		`--jq=.error | select(.error == "gone")`)
+	if code == 0 {
+		t.Fatal("exited 0 on a missing artifact")
+	}
+	if stdout == "" && stderr == "" {
+		t.Errorf("exited %d having printed nothing anywhere", code)
+	}
+}
+
+func TestTheFlagIsRefusedWhereThereIsNoJSONToRead(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// Silently skipping the filter would hand back an unfiltered line — from
+	// `auth token`, the raw secret where an expression asked for one field.
+	for _, args := range [][]string{
+		{"auth", "token", "--jq=.data.token"},
+		{"--version", "--jq=."},
+		{"registry", "serve", "--jq=."},
+	} {
+		code, stdout, stderr := h.runOn(false, args...)
+		if code == 0 {
+			t.Errorf("`krowk %s` exited 0, want a refusal, stdout:\n%s",
+				strings.Join(args, " "), stdout)
+			continue
+		}
+		if !strings.Contains(stderr, "jq_unsupported") {
+			t.Errorf("`krowk %s` failed as %q, want jq_unsupported",
+				strings.Join(args, " "), strings.TrimSpace(stderr))
+		}
+	}
+}
+
+func TestOnATerminalAFilteredStringCannotRepaintTheRow(t *testing.T) {
+	h := newHarness(t, 0)
+	h.ok("push", h.write("shot.png", "bytes"), "--title=cart \x1b[31mafter the fix")
+
+	// A title is caller-controlled and travels through the registry, and a string
+	// result prints raw — so the JSON encoder that would have escaped this is not
+	// on the path. Piped output is the machine contract and keeps the bytes; a
+	// terminal does not.
+	_, onTTY, _ := h.runOn(true, "runs", "list", "--jq=.data.runs[0].metadata[\"vcs.change.title\"]")
+	if strings.Contains(onTTY, "\x1b") {
+		t.Errorf("a terminal was handed an escape sequence: %q", onTTY)
+	}
+	_, piped, _ := h.runOn(false, "runs", "list", "--jq=.data.runs[0].metadata[\"vcs.change.title\"]")
+	if !strings.Contains(piped, "\x1b") {
+		t.Errorf("piped output lost the byte it was supposed to pass through: %q", piped)
 	}
 }

@@ -227,3 +227,20 @@ func TestTheEnvironmentIsNotReachableFromAnExpression(t *testing.T) {
 		}
 	}
 }
+
+func TestFoldingForATerminalDoesNotChangeWhatTheFilterComputes(t *testing.T) {
+	// One expression, several outputs, computed out of the same decoded document.
+	// Folding the first output in place would leave the second measuring the
+	// display form: "a  b" folds to "a b", so the length would read 3 and not 4.
+	const doc = `{"data":{"artifacts":[{"filename":"a  b"}]}}`
+	const expr = `.data.artifacts, (.data.artifacts[0].filename | length)`
+
+	got := filtered(t, expr, doc, true)
+	if !strings.Contains(got, "\n4\n") {
+		t.Errorf("folding changed the value a later output was computed from: %q", got)
+	}
+	// And the folded copy is still what got printed.
+	if !strings.Contains(got, `"a b"`) {
+		t.Errorf("the printed object was not folded: %q", got)
+	}
+}

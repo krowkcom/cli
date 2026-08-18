@@ -279,6 +279,9 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	}
 	f.filter = filter
 	f.tty = isTTY
+	if err := filterHasSomethingToRead(filter, f.version, positionals); err != nil {
+		return report(stderr, err, format, f.quiet, colour, nil)
+	}
 
 	switch {
 	case f.version:
@@ -379,13 +382,46 @@ func report(w io.Writer, err error, format output.Format, quiet, colour bool, fi
 		// standing in front of the whole envelope this falls back to, and a caller
 		// reading a failure would have to work out which half was the answer.
 		var filtered bytes.Buffer
-		if filterErr := filter.Write(&filtered, rendered, colour); filterErr == nil {
+		// An expression that matches nothing is silence on a result, and silence is
+		// an answer there. On a failure it is not: exiting non-zero having printed
+		// nothing anywhere leaves a caller a number and no reason for it, which is
+		// the one thing this function exists to prevent.
+		if filterErr := filter.Write(&filtered, rendered, colour); filterErr == nil && filtered.Len() > 0 {
 			fmt.Fprint(w, filtered.String())
 			return exitCodeFor(err)
 		}
 	}
 	fmt.Fprintln(w, rendered)
 	return exitCodeFor(err)
+}
+
+// filterHasSomethingToRead refuses --jq on the three things krowk does that
+// render no JSON for it to read.
+//
+// `auth token` prints the bare token so `$(krowk auth token)` works, `--version`
+// prints the version, and `registry serve` runs a server and prints its log.
+// None of them goes through emit, so a filter would be silently skipped and the
+// caller would get an unfiltered line back — from `auth token`, a raw secret
+// where an expression asked for one field. A flag that quietly does nothing on
+// three commands is the kind of thing the catalog exists to make impossible, so
+// it is a refusal instead.
+func filterHasSomethingToRead(filter *output.Filter, version bool, positionals []string) error {
+	if filter == nil {
+		return nil
+	}
+	name := ""
+	switch {
+	case version:
+		name = "--version"
+	case len(positionals) > 1 && positionals[0] == "auth" && positionals[1] == "token":
+		name = "auth token"
+	case len(positionals) > 1 && positionals[0] == "registry" && positionals[1] == "serve":
+		name = "registry serve"
+	default:
+		return nil
+	}
+	return api.Fail("jq_unsupported", "`"+name+"` prints no JSON, so there is nothing for --jq to read"+
+		" — drop the flag, or ask a command that answers with a record")
 }
 
 // emit is where a rendered result reaches the caller, and the one place a --jq
@@ -397,7 +433,34 @@ func emit(w io.Writer, rendered string, f flags) error {
 		fmt.Fprintln(w, rendered)
 		return nil
 	}
-	return f.filter.Write(w, rendered, f.tty)
+	// Into a buffer, so a filter that writes several values and then fails on one
+	// writes none of them. Half a listing on stdout followed by an exit code is
+	// worse than no listing: `SLUGS=$(krowk uploads list --jq …)` would hold a
+	// prefix of the answer with nothing marking where it stopped.
+	var filtered bytes.Buffer
+	if err := f.filter.Write(&filtered, rendered, f.tty); err != nil {
+		return didWorkThenFailedToRead(err)
+	}
+	fmt.Fprint(w, filtered.String())
+	return nil
+}
+
+// didWorkThenFailedToRead marks a filter failure that happened after the command
+// had already done its work.
+//
+// The command succeeded and only the reading of it failed, which is a distinction
+// worth spending a sentence on: `krowk push shot.png --jq '.data.artifacts.url'`
+// is a plausible typo for `.data.artifacts[0].url`, it compiles, so the up-front
+// check cannot catch it — and the upload has landed by the time it does. A
+// wrapper that retries on a non-zero exit would upload the file twice. Nothing
+// here can stop it retrying, but the message can tell it not to.
+func didWorkThenFailedToRead(err error) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	return api.Fail(apiErr.Code(), apiErr.Fix()+
+		" — the command itself succeeded, so running it again would repeat the work")
 }
 
 // newClient is the one place a registry client gets built, so every command

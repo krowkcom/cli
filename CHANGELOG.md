@@ -11,6 +11,18 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- `--jq '<expression>'` filters a result inside krowk, with jq compiled in — no
+  jq binary to install and no pipe to build. It works on every command, implies
+  `--json`, and reads what the command rendered: the envelope normally, the bare
+  record under `--quiet`. A string result prints without its quotes, so
+  `URL=$(krowk push shot.png --jq '.data.artifacts[0].url')` is the whole
+  ceremony; anything else prints as JSON, one value per line. `krowk help --json`
+  is filterable too, which is the shortest way for an agent to read the surface.
+  A failure is filtered like any other result, so `--jq '.error.error'` reads the
+  code out of one. An expression that does not parse is refused as `bad_jq`
+  before the command sends anything, and one that does not fit the result it was
+  pointed at answers `jq_failed` — that one is always reported whole, since
+  filtering the complaint with the expression that caused it would bury it.
 - Every command that names a record now takes the link as readily as the slug.
   Paste the card page, `https://krowk.com/a/art_…`, the CDN URL under it, or the
   markdown line carrying both, into `uploads show`, `uploads attach`,

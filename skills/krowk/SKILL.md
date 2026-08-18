@@ -135,10 +135,34 @@ environment variable — so never guess at a spelling this file does not carry.
 | Diagnose a failure | `krowk doctor --json` |
 | The whole surface, as data | `krowk help --json` |
 | One command's surface | `krowk help uploads attach --json` |
+| One field out of a result | `krowk push shot.png --jq '.data.artifacts[0].url'` |
+| Every slug in a listing | `krowk uploads list --jq '.data.artifacts[].slug'` |
 
 Global flags on every command: `--json` (or `--format json`), `--format`
 (`human`, `json`, `markdown`, `url`), `--quiet` (the raw record, no envelope and
-therefore no breadcrumbs), `--workspace`, `--dev`, `--help`, `--version`.
+therefore no breadcrumbs), `--jq`, `--workspace`, `--dev`, `--help`,
+`--version`.
+
+### Filtering with --jq
+
+`--jq '<expression>'` runs a jq expression over the JSON inside krowk — the jq
+binary does not have to be installed, and the pipe through it is not needed. It
+implies `--json`, and it reads whatever the command rendered: the envelope
+normally, the bare record under `--quiet`. A string result prints without its
+quotes, so it drops straight into a shell variable; anything else prints as
+JSON, one value per line.
+
+```bash
+URL=$(krowk push shot.png --jq '.data.artifacts[0].url')
+krowk uploads list --limit 10 --jq '[.data.artifacts[] | {slug, filename}]'
+krowk help --json --jq '.commands[].name'
+```
+
+A failure is filtered too, so `--jq '.error.error'` reads the code out of one —
+except a failure `--jq` itself caused, which is always reported whole. An
+expression that does not parse fails as `bad_jq` before the command sends
+anything; one that does not fit the result fails as `jq_failed` afterwards. Both
+exit 1.
 
 ### Workspaces
 

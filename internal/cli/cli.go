@@ -772,7 +772,7 @@ func uploadsAttach(w io.Writer, args []string, f flags, format output.Format, en
 	if err != nil {
 		return err
 	}
-	if f.run == "" {
+	if strings.TrimSpace(f.run) == "" {
 		return api.Fail("no_run", "pass the run to attach it to: `krowk uploads attach "+slug+" --run run_...`")
 	}
 	if f, err = withRunFlag(f); err != nil {
@@ -815,12 +815,16 @@ func uploadsDelete(w io.Writer, args []string, f flags, format output.Format, en
 		// stray argument would quietly turn an authorised takedown into an
 		// unauthorised one and report it as a 404. `uploads delete art_a art_b`,
 		// meaning two artifacts, is the way that happens.
-		if !strings.HasPrefix(args[1], claimTokenPrefix) {
+		//
+		// Trimmed because it was pasted, and not quoted back because of what a
+		// paste in this position can be: the second link of two, signature and
+		// all, which a refusal would then write into stderr and the envelope.
+		claimToken = strings.TrimSpace(args[1])
+		if !strings.HasPrefix(claimToken, claimTokenPrefix) {
 			return api.Fail("bad_claim_token",
-				"`"+args[1]+"` is not a claim token — takedown takes one artifact and, after it, "+
-					"only the `"+claimTokenPrefix+"...` token that upload came back with")
+				"the second argument is not a claim token — takedown takes one artifact and, "+
+					"after it, only the `"+claimTokenPrefix+"...` token that upload came back with")
 		}
-		claimToken = args[1]
 	}
 
 	client, err := newClient(f, env)
@@ -944,7 +948,7 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 	}
 	ctx := context.Background()
 
-	artifact, err := client.ClaimArtifact(ctx, slug, args[1])
+	artifact, err := client.ClaimArtifact(ctx, slug, strings.TrimSpace(args[1]))
 	if err != nil {
 		return err
 	}

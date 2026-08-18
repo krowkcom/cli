@@ -725,8 +725,14 @@ func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string
 	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
 		return "", nil, api.Fail("bad_arguments", "`slug`, `claim_token` and `run` must be strings")
 	}
-	if strings.TrimSpace(a.Slug) == "" || strings.TrimSpace(a.ClaimToken) == "" {
-		return "", nil, api.Fail("missing_claim", "pass both the artifact slug and its claim_token")
+	// A blank slug is answered as the argument it is, not as missing_claim, which
+	// is classified as a credential to produce — the same split the CLI makes,
+	// because an agent on either transport is told to check its key otherwise.
+	if strings.TrimSpace(a.Slug) == "" {
+		return "", nil, api.Fail("no_artifact", "pass the artifact slug, e.g. art_...")
+	}
+	if strings.TrimSpace(a.ClaimToken) == "" {
+		return "", nil, api.Fail("missing_claim", "pass the claim_token the anonymous push returned")
 	}
 	// A claim moves an upload into the key's workspace and keeps it there, so it
 	// is a creation in the pinned workspace by another name — and the token is

@@ -1,6 +1,9 @@
 package api
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // Slug kinds, spelled as the registry prefixes them. A kind is what a command
 // is asking for: `uploads show` wants an artifact and `runs show` wants a run,
@@ -115,20 +118,11 @@ func slugsIn(kind string, tokens []string) []string {
 		if !ok || len(rest) < slugLength || !isBase36(rest) {
 			continue
 		}
-		if slug := kind + "_" + rest; !contains(found, slug) {
+		if slug := kind + "_" + rest; !slices.Contains(found, slug) {
 			found = append(found, slug)
 		}
 	}
 	return found
-}
-
-func contains(haystack []string, needle string) bool {
-	for _, straw := range haystack {
-		if straw == needle {
-			return true
-		}
-	}
-	return false
 }
 
 // slugNoun and slugFailure keep an unknown kind from being worse than useless:
@@ -166,25 +160,23 @@ func looksLikeLink(s string) bool {
 // the surrounding link fall away: the scheme, the host's labels, the path's
 // segments, a query and a fragment all break on one of these. `_` does not,
 // because that is how a slug is spelled.
-func isSlugBoundary(r rune) bool {
-	switch {
-	case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-		return false
-	case r == '_':
-		return false
-	}
-	return true
-}
+//
+// Written against isBase36Rune rather than beside it, so the alphabet has one
+// definition: two would let the tokenizer split on a character the matcher
+// accepts, and a slug would be cut in half before anything looked at it.
+func isSlugBoundary(r rune) bool { return !isBase36Rune(r) && r != '_' }
 
 // isBase36 is the slug alphabet: lowercase letters and digits.
 func isBase36(s string) bool {
 	for _, r := range s {
-		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
+		if !isBase36Rune(r) {
 			return false
 		}
 	}
 	return true
 }
+
+func isBase36Rune(r rune) bool { return r >= 'a' && r <= 'z' || r >= '0' && r <= '9' }
 
 // article keeps the error sentences readable — "an artifact", "a run".
 func article(noun string) string {

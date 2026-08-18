@@ -88,14 +88,11 @@ environment variable — so never guess at a spelling this file does not carry.
    embeds at all. Never assemble either form yourself; both come back ready.
 8. **Paste the link where a slug is asked for.** Every command that names a
    record — `uploads show`, `uploads attach`, `uploads delete`, `claim`,
-   `runs show`, `runs finish`, and `--run` everywhere it appears — reads the slug
-   out of any link that carries it: the card page, the CDN URL, or whatever a
-   person pasted at you. Hand it over whole. Never cut a slug out of a URL
-   yourself, and never ask a person for "just the slug" — you already have it.
-   What is refused, before anything is sent, is a link carrying no slug of the
-   kind the command wants, and one carrying two different slugs of it:
-   `bad_artifact` or `bad_run`, exit 1. Both mean pass one record, not that the
-   link has to be trimmed.
+   `runs show`, `runs finish`, and `--run` — reads the slug out of any link that
+   carries it. Hand it over whole: never cut a slug out of a URL yourself, and
+   never ask a person for "just the slug". A link carrying no slug of the kind
+   the command wants, or two different ones, fails as `bad_artifact` or
+   `bad_run` (exit 1) before anything is sent.
 9. **Push what the person asked for, not what is nearby.** An artifact is public
    to anyone with the link. Never push `.env` files, key material, credential
    JSON or anything under `.ssh`/`.aws`, and never push a file you found rather

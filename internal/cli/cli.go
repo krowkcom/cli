@@ -132,11 +132,8 @@ claim token that ` + "`krowk claim`" + ` spends to keep it.
 
 Wherever an artifact or a run is named — a positional, or --run — a link that
 carries it does just as well: the card page, the CDN URL under it, or anything
-else krowk printed. The slug is read out of it, so there is nothing to cut out
-by hand. A link carrying no slug of the kind the command wants is refused here
-rather than sent on, since the registry could only answer that as a record it
-does not have. (--before is not one of these: it is a cursor krowk hands back,
-and it is passed on as it was given.)
+else krowk printed. A link carrying no slug of the kind the command wants, or
+two different ones, is refused before anything is sent.
 
 Taking an upload down removes the bytes at once and leaves the link reporting
 that it was taken down. There is no undo and no confirmation — it is what to

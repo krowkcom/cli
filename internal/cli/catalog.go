@@ -119,7 +119,7 @@ func metadataFlags() []Flag {
 // What it takes is the same everywhere, so that half of the sentence is written
 // once here: a run slug, or a link that carries one.
 func runFlag(usage string) Flag {
-	return Flag{Name: "run", Type: typeString, Usage: usage + ". Its slug, or any link carrying it"}
+	return Flag{Name: "run", Type: typeString, Usage: usage + ". Its slug, or a link carrying it"}
 }
 
 // artifactArg and runArg describe the positional every command that names one
@@ -127,8 +127,8 @@ func runFlag(usage string) Flag {
 // machine reads instead of the prose: an agent holding `krowk.com/a/art_…` and
 // no rule saying it may paste it will cut the slug out itself, or ask.
 const (
-	artifactArg = "The artifact slug, or any link carrying it — the card page or the CDN URL"
-	runArg      = "The run slug, or any link carrying it"
+	artifactArg = "The artifact slug, or a link carrying it — the card page or the CDN URL"
+	runArg      = "The run slug, or a link carrying it"
 )
 
 // globalFlag picks which config file `config set` and `config unset` write.

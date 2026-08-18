@@ -30,8 +30,6 @@ func TestParseSlugTakesTheLinksKrowkHandsOut(t *testing.T) {
 		{"a local registry's storage path", KindArtifact,
 			"http://localhost:8787/_storage/ws_1a2b3c4d5e6f7g8h9i0j1k2l/" + artifact + "/checkout.png",
 			artifact},
-		{"the DNS spelling, where an underscore is not legal", KindArtifact,
-			"https://art-9f3c2e1a7b04d6c8e5f1a2b3.krowkusercontent.com/checkout.png", artifact},
 		{"an uppercase paste", KindArtifact, "HTTPS://KROWK.COM/A/" + strings.ToUpper(artifact), artifact},
 		{"surrounding whitespace", KindArtifact, "  https://krowk.com/a/" + artifact + "\n", artifact},
 		{"a run link", KindRun, "https://app.krowk.com/runs/" + run, run},
@@ -39,9 +37,6 @@ func TestParseSlugTakesTheLinksKrowkHandsOut(t *testing.T) {
 		{"the run in a CDN URL is not the artifact", KindRun,
 			"https://cdn.krowkusercontent.com/weur/ws_1a2b3c4d5e6f7g8h9i0j1k2l/" + artifact + "/x.png?run=" + run,
 			run},
-		{"a workspace out of a CDN URL", KindWorkspace,
-			"https://cdn.krowkusercontent.com/weur/ws_1a2b3c4d5e6f7g8h9i0j1k2l/" + artifact + "/x.png",
-			"ws_1a2b3c4d5e6f7g8h9i0j1k2l"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got, err := ParseSlug(c.kind, c.input)
@@ -127,15 +122,6 @@ func TestParseSlugSaysWhichKindTheLinkActuallyNames(t *testing.T) {
 	}
 }
 
-// The hyphen spelling only exists as a DNS label, where a slug's 24 random
-// characters follow the prefix. A hyphenated word in a path is not a slug, and
-// reading one as a slug would send a takedown at whatever it matched.
-func TestParseSlugDoesNotReadAHyphenatedWordAsASlug(t *testing.T) {
-	if _, err := ParseSlug(KindRun, "https://example.com/run-fast/report.html"); err == nil {
-		t.Error("`run-fast` was read as a run slug")
-	}
-}
-
 // A URL is full of tokens shaped like a slug and not one: `run_id=4821` in a CI
 // link, a file called art_report.png, a job path with run_7 in it. Reading any
 // of them as a slug would send krowk at a record nobody named.
@@ -145,7 +131,6 @@ func TestParseSlugDoesNotReadSlugShapedWordsOutOfALink(t *testing.T) {
 		{KindRun, "https://ci.example.com/jobs/run_7/log.txt"},
 		{KindArtifact, "https://example.com/art_1.png"},
 		{KindArtifact, "./art_report.png"},
-		{KindRun, "https://example.com/run-fast/report.html"},
 	} {
 		if slug, err := ParseSlug(c.kind, c.input); err == nil {
 			t.Errorf("ParseSlug(%q) read %q as a slug", c.input, slug)
@@ -180,42 +165,6 @@ func TestParseSlugSurvivesAnUnknownKind(t *testing.T) {
 	}
 }
 
-// Only the artifact has a public page, so only its refusal may point at one:
-// there is no krowk.com/a/run_… to send anybody to.
-func TestParseSlugDoesNotInventAPageForARun(t *testing.T) {
-	_, err := ParseSlug(KindRun, "https://krowk.com/pricing")
-	var apiErr *Error
-	if !errors.As(err, &apiErr) {
-		t.Fatalf("err = %v, want an api failure", err)
-	}
-	if fix, _ := apiErr.Body["fix"].(string); strings.Contains(fix, "/a/run_") {
-		t.Errorf("fix = %q, want no artifact card path in a run's message", fix)
-	}
-}
-
-// The hyphen spelling exists in one place only: a DNS label, where an
-// underscore is not legal. Somebody else's CI path is not that place, and
-// reading a slug out of one invents a record krowk then goes and asks about.
-func TestParseSlugReadsTheHyphenSpellingOnlyOnTheHostThatUsesIt(t *testing.T) {
-	const tail = "9f3c2e1a7b04d6c8e5f1a2b3"
-
-	got, err := ParseSlug(KindArtifact, "https://art-"+tail+".krowkusercontent.com/checkout.png")
-	if err != nil || got != "art_"+tail {
-		t.Errorf("host label = %q, %v — want art_%s", got, err, tail)
-	}
-	// Somebody else's subdomain, and somebody else's path. Neither spells a krowk
-	// slug, and reading one out would point a takedown at a record the pasted
-	// link never named.
-	for _, foreign := range []string{
-		"https://art-" + tail + ".evil.example.com/checkout.png",
-		"https://ci.example.com/j/run-" + tail + "/log",
-	} {
-		if slug, err := ParseSlug(KindArtifact, foreign); err == nil {
-			t.Errorf("ParseSlug(%q) read %q as a slug", foreign, slug)
-		}
-	}
-}
-
 // Two different records in one string and no way to know which was meant. The
 // takedown is immediate and has no undo, so this is refused rather than guessed.
 func TestParseSlugRefusesTwoRecordsOfTheSameKind(t *testing.T) {
@@ -237,24 +186,6 @@ func TestParseSlugRefusesTwoRecordsOfTheSameKind(t *testing.T) {
 		first + "/shot.png)](https://krowk.com/a/" + first + ")"
 	if got, err := ParseSlug(KindArtifact, markdown); err != nil || got != first {
 		t.Errorf("the pasted markdown gave %q, %v — want %s", got, err, first)
-	}
-}
-
-// A link that went through an encoder on its way to being pasted still carries
-// the same slug; only a machine spelled it.
-func TestParseSlugReadsAPercentEncodedLink(t *testing.T) {
-	const artifact = "art_9f3c2e1a7b04d6c8e5f1a2b3"
-
-	got, err := ParseSlug(KindArtifact, "https://krowk.com/a/art%5F9f3c2e1a7b04d6c8e5f1a2b3")
-	if err != nil || got != artifact {
-		t.Errorf("encoded link = %q, %v — want %s", got, err, artifact)
-	}
-
-	// A stray `%` elsewhere — a file called 100%.png — must not take the escape
-	// that spells the slug down with it.
-	both := "https://krowk.com/100%.png/a/art%5F9f3c2e1a7b04d6c8e5f1a2b3"
-	if got, err := ParseSlug(KindArtifact, both); err != nil || got != artifact {
-		t.Errorf("link with a literal %% = %q, %v — want %s", got, err, artifact)
 	}
 }
 

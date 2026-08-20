@@ -173,6 +173,11 @@ func withoutCredentials(message string) string {
 	for len(clipped) > 0 && !utf8.RuneStart(clipped[len(clipped)-1]) {
 		clipped = clipped[:len(clipped)-1]
 	}
+	// The continuation bytes are gone; a lead byte whose tail was cut off is
+	// still standing, and would print as a replacement character.
+	if r, _ := utf8.DecodeLastRuneInString(clipped); r == utf8.RuneError && len(clipped) > 0 {
+		clipped = clipped[:len(clipped)-1]
+	}
 	return clipped + " …"
 }
 

@@ -135,10 +135,47 @@ environment variable — so never guess at a spelling this file does not carry.
 | Diagnose a failure | `krowk doctor --json` |
 | The whole surface, as data | `krowk help --json` |
 | One command's surface | `krowk help uploads attach --json` |
+| One field out of a result | `krowk push shot.png --jq '.data.artifacts[0].url'` |
+| Every slug in a listing | `krowk uploads list --jq '.data.artifacts[].slug'` |
 
 Global flags on every command: `--json` (or `--format json`), `--format`
 (`human`, `json`, `markdown`, `url`), `--quiet` (the raw record, no envelope and
-therefore no breadcrumbs), `--workspace`, `--dev`, `--help`, `--version`.
+therefore no breadcrumbs), `--jq`, `--workspace`, `--dev`, `--help`,
+`--version`.
+
+### Filtering with --jq
+
+`--jq '<expression>'` runs a jq expression over the JSON inside krowk — the jq
+binary does not have to be installed, and the pipe through it is not needed. It
+implies `--json`, and it reads whatever the command rendered: the envelope
+normally, the bare record under `--quiet`. A string result prints without its
+quotes, so it drops straight into a shell variable; anything else prints as
+JSON, one value per line.
+
+```bash
+URL=$(krowk push shot.png --jq '.data.artifacts[0].url')
+krowk uploads list --limit 10 --jq '[.data.artifacts[] | {slug, filename}]'
+krowk help --json --jq '.commands[].name'
+```
+
+A failure is filtered too, and it is filtered in whatever shape the command
+rendered it: `--jq '.error.error'` reads the code out of an envelope, and
+`--quiet --jq '.error'` reads it out of the bare body. A failure `--jq` itself
+caused is always reported whole. An expression that does not parse fails as
+`bad_jq` before the command sends anything; one that does not fit the result
+fails as `jq_failed` afterwards, and says so, because by then the command has
+already done its work and running it again would repeat it. Both exit 1.
+
+`auth token`, `registry serve` and `--version` print no JSON and refuse `--jq`
+rather than ignore it; `krowk help --json` marks them `no_json`. A `--jq` given
+with nothing in it — a shell expanding an unset variable — is `bad_jq`, never
+"no filter". `--jq` cannot be combined with `--format human`, `markdown` or
+`url`: it reads the JSON, so one of the two would have to be discarded, and it
+is refused rather than picked.
+
+Two commands answer with a bare record and no envelope, whatever the flags:
+`doctor` and `upgrade`. Filter those as `--jq '.token_source'`, not
+`--jq '.data.token_source'`.
 
 ### Workspaces
 

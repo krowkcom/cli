@@ -383,7 +383,8 @@
           {
             "name": "token",
             "usage": "krowk auth token",
-            "summary": "Print the stored token"
+            "summary": "Print the stored token",
+            "no_json": true
           },
           {
             "name": "verify",
@@ -508,7 +509,8 @@
                 "default": "",
                 "usage": "Reject uploads above this size"
               }
-            ]
+            ],
+            "no_json": true
           }
         ]
       },
@@ -555,6 +557,12 @@
         "type": "bool",
         "default": "false",
         "usage": "Raw JSON, no envelope"
+      },
+      {
+        "name": "jq",
+        "type": "string",
+        "default": "",
+        "usage": "Filter the JSON with a jq expression — built in, no jq binary needed. Implies --format json, and reads the bare record under --quiet"
       },
       {
         "name": "help",

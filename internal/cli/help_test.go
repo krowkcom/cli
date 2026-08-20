@@ -12,7 +12,7 @@ import (
 func runHelp(t *testing.T, isTTY bool, args ...string) (int, string, string) {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	code := Run(args, &out, &errOut, func(string) string { return "" }, isTTY)
+	code := Run(args, &out, &errOut, func(string) string { return "" }, isTTY, isTTY)
 	return code, out.String(), errOut.String()
 }
 

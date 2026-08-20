@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"fmt"
 	"io"
 	"strings"
 
@@ -43,8 +42,7 @@ func workspacesList(w io.Writer, f flags, format output.Format, env runctx.Env, 
 			view.KeyMissing = true
 		}
 	}
-	fmt.Fprintln(w, output.WorkspaceList(view, format, f.quiet, colour))
-	return nil
+	return emit(w, output.WorkspaceList(view, format, f.quiet, colour), f)
 }
 
 // workspacesUse repoints the machine-wide default at another stored key. It is
@@ -79,8 +77,7 @@ func workspacesUse(w io.Writer, args []string, f flags, format output.Format, en
 		// is empty, so it is surfaced as written rather than paraphrased.
 		return api.Fail("unknown_workspace", err.Error())
 	}
-	fmt.Fprintln(w, output.DefaultWorkspace(args[0], path, format, f.quiet, colour))
-	return nil
+	return emit(w, output.DefaultWorkspace(args[0], path, format, f.quiet, colour), f)
 }
 
 // configShow reports the effective configuration and where each value came
@@ -102,8 +99,7 @@ func configShow(w io.Writer, f flags, format output.Format, env runctx.Env, colo
 	if repo, inRepo := config.RepoPath(""); inRepo {
 		view.RepoPath = repo
 	}
-	fmt.Fprintln(w, output.ConfigShow(view, format, f.quiet, colour))
-	return nil
+	return emit(w, output.ConfigShow(view, format, f.quiet, colour), f)
 }
 
 // configSet writes one key into a config file: the repository's by default,
@@ -145,8 +141,7 @@ func configSet(w io.Writer, args []string, f flags, format output.Format, env ru
 	if err := config.Set(path, key, value); err != nil {
 		return api.Fail("config_unwritable", "could not write "+path+": "+err.Error())
 	}
-	fmt.Fprintln(w, output.ConfigWrote(key, value, path, format, f.quiet, colour))
-	return nil
+	return emit(w, output.ConfigWrote(key, value, path, format, f.quiet, colour), f)
 }
 
 // configUnset removes one key from a config file, same file selection as
@@ -168,8 +163,7 @@ func configUnset(w io.Writer, args []string, f flags, format output.Format, colo
 	if err := config.Unset(path, args[0]); err != nil {
 		return api.Fail("config_unwritable", "could not write "+path+": "+err.Error())
 	}
-	fmt.Fprintln(w, output.ConfigWrote(args[0], "", path, format, f.quiet, colour))
-	return nil
+	return emit(w, output.ConfigWrote(args[0], "", path, format, f.quiet, colour), f)
 }
 
 // configFile is which file `config set` and `config unset` write: the

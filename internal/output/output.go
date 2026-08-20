@@ -139,17 +139,23 @@ func (r Result) Bytes() int64 {
 // ResolveFormat defaults to human on a terminal and JSON when piped, so an
 // agent capturing stdout gets structured data without asking for it.
 func ResolveFormat(flag string, jsonFlag, isTTY bool) (Format, error) {
-	if jsonFlag {
-		return JSON, nil
-	}
+	// Read before jsonFlag gets to override it. A --format nobody has heard of is
+	// a mistake whether or not something else settled the format afterwards, and
+	// answering it in JSON because --json or --jq was also passed tells a caller
+	// who meant `--format markdown` and typed it wrong that they got what they
+	// asked for.
 	switch Format(flag) {
 	case Human, JSON, Markdown, URL:
+		if jsonFlag {
+			return JSON, nil
+		}
 		return Format(flag), nil
 	case "":
-		if isTTY {
-			return Human, nil
+		switch {
+		case jsonFlag, !isTTY:
+			return JSON, nil
 		}
-		return JSON, nil
+		return Human, nil
 	}
 	return "", api.Fail("bad_format", "unknown --format "+flag+" (expected human, json, markdown or url)")
 }

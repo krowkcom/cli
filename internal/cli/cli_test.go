@@ -80,8 +80,23 @@ func (h *harness) write(name, contents string) string {
 
 func (h *harness) run(args ...string) (code int, stdout, stderr string) {
 	h.t.Helper()
+	return h.runOn(false, args...)
+}
+
+// runOn is run with the terminal question answered explicitly, for the handful
+// of tests whose subject is what krowk does differently on one. The two streams
+// are asked separately because they are answered separately — a result redirected
+// to a file while failures stay on the terminal is the ordinary shape of an agent
+// invocation, not an edge case.
+func (h *harness) runOn(isTTY bool, args ...string) (code int, stdout, stderr string) {
+	h.t.Helper()
+	return h.runOnStreams(isTTY, isTTY, args...)
+}
+
+func (h *harness) runOnStreams(isTTY, isErrTTY bool, args ...string) (code int, stdout, stderr string) {
+	h.t.Helper()
 	var out, errOut bytes.Buffer
-	code = Run(args, &out, &errOut, func(k string) string { return h.env[k] }, false)
+	code = Run(args, &out, &errOut, func(k string) string { return h.env[k] }, isTTY, isErrTTY)
 	return code, out.String(), errOut.String()
 }
 
@@ -1721,5 +1736,409 @@ func TestPagingARunsUploadsStaysScopedToTheRun(t *testing.T) {
 	second := h.ok("uploads", "list", "--run="+runSlug, "--before="+e.Data.Next)
 	if len(second.Data.Artifacts) != 1 {
 		t.Errorf("second page = %d artifacts, want the run's other one alone", len(second.Data.Artifacts))
+	}
+}
+
+// --jq is the built-in jq filter. The tests that follow are about how it joins
+// the rest of the CLI: which format it settles, what it is pointed at, and what
+// happens to a failure while one is in force. What jq itself does with an
+// expression is the output package's business, and jq_test.go holds it there.
+
+func TestFilteringSettlesTheFormatTheWayJSONDoes(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// There is nothing for a filter to read in a human row or a paste form, so
+	// --jq settles the format the way --json does. Where the caller asked for one
+	// of the others in the same breath, TestAFormatAFilterWouldDiscardIsRefused
+	// covers what happens: it is refused rather than quietly overridden.
+	for _, args := range [][]string{
+		{"push", h.fixture, "--jq=.data.artifacts[0].slug"},
+		{"push", h.fixture, "--format=json", "--jq=.data.artifacts[0].slug"},
+	} {
+		code, stdout, stderr := h.run(args...)
+		if code != 0 {
+			t.Fatalf("`krowk %s` exited %d, stderr:\n%s", strings.Join(args, " "), code, stderr)
+		}
+		if !strings.HasPrefix(strings.TrimSpace(stdout), "art_") {
+			t.Errorf("`krowk %s` printed %q, want the slug alone",
+				strings.Join(args, " "), stdout)
+		}
+	}
+}
+
+func TestQuietPointsTheFilterAtTheRecordInsteadOfTheEnvelope(t *testing.T) {
+	h := newHarness(t, 0)
+	h.ok("push", h.fixture)
+
+	// --quiet is the record without the envelope, so an expression written for
+	// one would be wrong for the other. The filter reads whatever the command
+	// actually rendered.
+	_, wrapped, _ := h.run("uploads", "list", "--jq=.data.artifacts[0].slug")
+	_, bare, _ := h.run("uploads", "list", "--quiet", "--jq=.artifacts[0].slug")
+	if wrapped == "" || wrapped != bare {
+		t.Errorf("enveloped = %q and bare = %q, want the same slug from each", wrapped, bare)
+	}
+}
+
+func TestAMistypedExpressionIsRefusedBeforeAnythingIsSent(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// The whole reason the expression is compiled up front: a push that has
+	// already landed cannot be un-landed because the filter after it had a typo.
+	body := h.failsWith(1, "push", h.fixture, "--jq=.data.artifacts[0 |")
+	if body["error"] != "bad_jq" {
+		t.Errorf("failure = %v, want bad_jq", body["error"])
+	}
+
+	listed := h.ok("uploads", "list")
+	if len(listed.Data.Artifacts) != 0 {
+		t.Errorf("%d artifacts landed, want none — the refusal came too late",
+			len(listed.Data.Artifacts))
+	}
+}
+
+func TestAFailureIsFilteredLikeAnyOtherResult(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// A caller that filters everything should not have to stop filtering to find
+	// out what went wrong.
+	code, _, stderr := h.run("uploads", "show", "art_nope", "--jq=.error.error")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 — filtering must not change how a failure classifies", code)
+	}
+	if got := strings.TrimSpace(stderr); got != "not_found" {
+		t.Errorf("filtered failure = %q, want not_found", got)
+	}
+}
+
+func TestAFailureCausedByTheFilterIsReportedWhole(t *testing.T) {
+	h := newHarness(t, 0)
+	h.ok("push", h.fixture)
+
+	// An expression that does not fit the result will not fit the complaint
+	// about it either, so filtering that complaint would answer `null` and an
+	// exit code with nothing anywhere saying the expression was the problem.
+	body := h.failsWith(1, "uploads", "list", "--jq=.data | .[0]")
+	if body["error"] != "jq_failed" {
+		t.Errorf("failure = %v, want jq_failed said in full", body["error"])
+	}
+}
+
+func TestTheSurfaceItselfIsFilterable(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// `krowk help --json` is how an agent learns the surface without parsing
+	// prose. Reading one field out of it should not mean parsing the whole thing
+	// either.
+	code, stdout, stderr := h.run("help", "--json", "--jq=.global_flags[].name")
+	if code != 0 {
+		t.Fatalf("exited %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "jq") {
+		t.Errorf("the filtered surface does not name --jq: %q", stdout)
+	}
+}
+
+func TestAFilterWritesNothingUntilItHasWrittenEverything(t *testing.T) {
+	h := newHarness(t, 0)
+	for _, name := range []string{"one.png", "two.png"} {
+		h.ok("push", h.write(name, "bytes for "+name))
+	}
+
+	// Several values and then a failure. Half a listing on stdout with an exit
+	// code behind it is worse than none: the caller's variable would hold a
+	// prefix of the answer with nothing marking where it stopped.
+	code, stdout, _ := h.run("uploads", "list", "--jq=.data.artifacts[].slug, (.data | .[0])")
+	if code == 0 {
+		t.Fatalf("exited 0, want the filter failure")
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want nothing — the filter failed partway", stdout)
+	}
+}
+
+func TestAFilterThatFailsAfterTheWorkSaysTheWorkHappened(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// `.data.artifacts.url` is the plausible typo for `.data.artifacts[0].url`.
+	// It compiles, so nothing catches it up front, and the upload has landed by
+	// the time it fails — a wrapper retrying on a non-zero exit would push twice.
+	body := h.failsWith(1, "push", h.fixture, "--jq=.data.artifacts.url")
+	fix, _ := body["fix"].(string)
+	if !strings.Contains(fix, "succeeded") {
+		t.Errorf("fix = %q, want it to say the command itself worked", fix)
+	}
+
+	listed := h.ok("uploads", "list")
+	if len(listed.Data.Artifacts) != 1 {
+		t.Fatalf("%d artifacts, want the one the failing filter was reading", len(listed.Data.Artifacts))
+	}
+}
+
+func TestAFailureNeverExitsNonZeroWithNothingPrinted(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// An expression that matches nothing is silence on a result, and silence is
+	// an answer there. On a failure it would leave a caller a number and no
+	// reason for it.
+	code, stdout, stderr := h.run("uploads", "show", "art_nope",
+		`--jq=.error | select(.error == "gone")`)
+	if code == 0 {
+		t.Fatal("exited 0 on a missing artifact")
+	}
+	if stdout == "" && stderr == "" {
+		t.Errorf("exited %d having printed nothing anywhere", code)
+	}
+}
+
+func TestTheFlagIsRefusedWhereThereIsNoJSONToRead(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// Silently skipping the filter would hand back an unfiltered line — from
+	// `auth token`, the raw secret where an expression asked for one field.
+	for _, args := range [][]string{
+		{"auth", "token", "--jq=.data.token"},
+		{"--version", "--jq=."},
+		{"registry", "serve", "--jq=."},
+	} {
+		code, stdout, stderr := h.runOn(false, args...)
+		if code == 0 {
+			t.Errorf("`krowk %s` exited 0, want a refusal, stdout:\n%s",
+				strings.Join(args, " "), stdout)
+			continue
+		}
+		if !strings.Contains(stderr, "jq_unsupported") {
+			t.Errorf("`krowk %s` failed as %q, want jq_unsupported",
+				strings.Join(args, " "), strings.TrimSpace(stderr))
+		}
+	}
+}
+
+func TestOnATerminalAFilteredStringCannotRepaintTheRow(t *testing.T) {
+	h := newHarness(t, 0)
+	h.ok("push", h.write("shot.png", "bytes"), "--title=cart \x1b[31mafter the fix")
+
+	// A title is caller-controlled and travels through the registry, and a string
+	// result prints raw — so the JSON encoder that would have escaped this is not
+	// on the path. Piped output is the machine contract and keeps the bytes; a
+	// terminal does not.
+	_, onTTY, _ := h.runOn(true, "runs", "list", "--jq=.data.runs[0].metadata[\"vcs.change.title\"]")
+	if strings.Contains(onTTY, "\x1b") {
+		t.Errorf("a terminal was handed an escape sequence: %q", onTTY)
+	}
+	_, piped, _ := h.runOn(false, "runs", "list", "--jq=.data.runs[0].metadata[\"vcs.change.title\"]")
+	if !strings.Contains(piped, "\x1b") {
+		t.Errorf("piped output lost the byte it was supposed to pass through: %q", piped)
+	}
+}
+
+func TestAnEmptyFilterIsAFlagWithNothingInItRatherThanNoFlag(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// `--jq "$FIELD"` with the variable unset. Reading it as "no filter" would
+	// answer with the whole envelope where one field was asked for — and on
+	// `auth token`, would skip the refusal and print the key.
+	body := h.failsWith(1, "uploads", "list", "--jq=")
+	if body["error"] != "bad_jq" {
+		t.Errorf("`--jq=` failed as %v, want bad_jq", body["error"])
+	}
+
+	code, stdout, _ := h.run("auth", "token", "--jq=")
+	if code == 0 || strings.Contains(stdout, "krowk_sk_") {
+		t.Errorf("`auth token --jq=` exited %d and printed %q — the key escaped the refusal",
+			code, stdout)
+	}
+}
+
+func TestHelpIsFilterableOnACommandThatIsNot(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// `krowk auth token --help` prints the catalog entry, which is JSON like any
+	// other. Refusing it would make the two spellings of one question disagree.
+	code, viaFlag, stderr := h.run("auth", "token", "--help", "--jq=.name")
+	if code != 0 {
+		t.Fatalf("`auth token --help --jq` exited %d, stderr:\n%s", code, stderr)
+	}
+	_, viaHelp, _ := h.run("help", "auth", "token", "--jq=.name")
+	if viaFlag != viaHelp || strings.TrimSpace(viaFlag) != "auth token" {
+		t.Errorf("--help gave %q and `help` gave %q, want the same command entry", viaFlag, viaHelp)
+	}
+}
+
+func TestABrokenFilterIsReportedEvenWhenTheCommandAlsoFailed(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// Otherwise whether a caller learns their expression is broken depends on
+	// whether the registry happened to answer: the same expression against a
+	// command that worked fails loudly.
+	code, _, stderr := h.run("uploads", "show", "art_nope", "--jq=.error | .[0]")
+	if code == 0 {
+		t.Fatal("exited 0 on a missing artifact")
+	}
+	if !strings.Contains(stderr, "jq_failed") {
+		t.Errorf("stderr = %q, want the broken filter named as well as not_found", stderr)
+	}
+	if !strings.Contains(stderr, "not_found") {
+		t.Errorf("stderr = %q, want the command's own failure kept", stderr)
+	}
+}
+
+func TestAMistypedFormatIsStillAMistakeWhenAFilterIsAskedFor(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// --jq settles the format, but it does not excuse one that does not exist:
+	// a caller who meant markdown and mistyped it should hear about it.
+	body := h.failsWith(1, "uploads", "list", "--format=markdwon", "--jq=.")
+	if body["error"] != "bad_format" {
+		t.Errorf("`--format=markdwon --jq .` failed as %v, want bad_format", body["error"])
+	}
+}
+
+func TestAFormatAFilterWouldDiscardIsRefused(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// --jq reads the JSON, and a paste form is not JSON, so one of the two was
+	// always going to be ignored. Refusing beats picking: this same change
+	// stopped ignoring a --format that is merely misspelled, and one spelled
+	// right deserves at least as much.
+	for _, format := range []string{"human", "markdown", "url"} {
+		body := h.failsWith(1, "uploads", "list", "--format="+format, "--jq=.")
+		if body["error"] != "bad_flag" {
+			t.Errorf("--format=%s with --jq failed as %v, want bad_flag", format, body["error"])
+		}
+	}
+
+	// json is what --jq settles on anyway, so saying so is not a conflict.
+	if _, _, stderr := h.run("uploads", "list", "--format=json", "--jq=.ok"); stderr != "" {
+		t.Errorf("--format=json with --jq complained: %s", stderr)
+	}
+}
+
+func TestAVersionAskedForWithHelpStillRefusesTheFilter(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// --version is answered before --help, so a check that treats --help as
+	// "this prints a catalog entry" first waves the pair straight past.
+	code, stdout, stderr := h.run("--version", "--help", "--jq=.x")
+	if code == 0 {
+		t.Errorf("`--version --help --jq` exited 0 printing %q, want the refusal", stdout)
+	}
+	if !strings.Contains(stderr, "jq_unsupported") {
+		t.Errorf("failed as %q, want jq_unsupported", strings.TrimSpace(stderr))
+	}
+}
+
+func TestAFailureIsNotSwallowedByAFilterWrittenForAResult(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// `.data.artifacts[0].url` is the expression the README and the skill hand
+	// out. Over a failure it answers null — five bytes that would otherwise stand
+	// where the reason should be.
+	code, _, stderr := h.run("uploads", "show", "art_nope", "--jq=.data.artifacts[0].url")
+	if code == 0 {
+		t.Fatal("exited 0 on a missing artifact")
+	}
+	if !strings.Contains(stderr, "not_found") {
+		t.Errorf("stderr = %q, want the reason kept", stderr)
+	}
+}
+
+// TestEveryCommandThatRendersJSONReachesTheFilter is the net the catalog's
+// no_json field is only useful with.
+//
+// The golden surface pins what is written down; it cannot notice a command that
+// should have been marked and was not. So this runs the leaves against a real
+// registry with a filter on, and holds each one to its own claim: a command
+// marked no_json refuses the flag, and one that is not either answers something
+// a filter produced or fails through the envelope — never an unfiltered line,
+// which is how `auth token` came to print a key.
+func TestEveryCommandThatRendersJSONReachesTheFilter(t *testing.T) {
+	// What a leaf needs typed after it to get past its own argument checking.
+	// A command that waits for something — a browser, a picker, a listening
+	// socket — is named here with why, rather than left out silently.
+	args := map[string][]string{
+		"push":           {"<file>"},
+		"uploads create": {"<file>"},
+		"uploads show":   {"<artifact>"},
+		"uploads attach": {"<artifact>", "--run=run_nope"},
+		"uploads delete": {"<artifact>"},
+		"runs show":      {"run_nope"},
+		"runs finish":    {"run_nope"},
+		"claim":          {"art_nope", "krowk_claim_nope"},
+		"workspaces use": {"ws_nope"},
+		"config set":     {"workspace", "ws_nope"},
+		"config unset":   {"workspace"},
+		"help":           nil,
+		"auth login":     nil, // waits on a browser or a device code
+		"registry serve": nil, // listens until it is killed
+		"upgrade":        nil, // reaches for the release feed
+	}
+	skip := map[string]string{
+		"auth login":     "waits on an authorization that never comes",
+		"upgrade":        "would go to the network for a release",
+		"registry serve": "listens until killed — covered as a no_json refusal below",
+	}
+
+	for _, leaf := range Surface().Leaves() {
+		t.Run(leaf.Name, func(t *testing.T) {
+			h := newHarness(t, 0)
+			typed := append(strings.Fields(leaf.Name), args[leaf.Name]...)
+			for i, a := range typed {
+				switch a {
+				case "<file>":
+					typed[i] = h.fixture
+				case "<artifact>":
+					typed[i] = "art_nope"
+				}
+			}
+
+			if leaf.NoJSON {
+				_, stdout, stderr := h.run(append(typed, "--jq=.")...)
+				if !strings.Contains(stderr, "jq_unsupported") {
+					t.Errorf("marked no_json but answered %q / %q", stdout, stderr)
+				}
+				return
+			}
+			if why, ok := skip[leaf.Name]; ok {
+				t.Skip(why)
+			}
+
+			// `.` over anything a command renders is that thing again, compactly.
+			// What must never come back is a line the filter never touched, which
+			// is what a command writing straight to the writer would produce.
+			_, stdout, _ := h.run(append(typed, "--jq=.")...)
+			if stdout == "" {
+				return // it failed, and the failure went through the envelope
+			}
+			if !json.Valid([]byte(stdout)) {
+				t.Errorf("printed something no filter produced: %q", stdout)
+			}
+			if strings.Count(strings.TrimSpace(stdout), "\n") > 0 {
+				t.Errorf("printed more than one value for `.`, so the filter was skipped: %q", stdout)
+			}
+		})
+	}
+}
+
+func TestEachStreamIsAskedAboutItselfAndNotAboutTheOther(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// An unknown command is quoted back in the message, so this is a failure whose
+	// text a caller controls.
+	typo := "\x1b[31mnope"
+
+	// `krowk … --jq … > out.json` from a terminal: stdout is a file and stderr is
+	// not. A failure filtered down to a string prints raw, so the stream it is
+	// going to is the only stream worth asking about.
+	_, _, onTerminal := h.runOnStreams(false, true, typo, "--jq=.error.fix")
+	if strings.Contains(onTerminal, "\x1b") {
+		t.Errorf("stderr is a terminal and got an escape sequence: %q", onTerminal)
+	}
+
+	// And the mirror: `2> errors.log` from a terminal must not have its log
+	// rewritten for a terminal it is not going to.
+	_, _, toFile := h.runOnStreams(true, false, typo, "--jq=.error.fix")
+	if !strings.Contains(toFile, "\x1b") {
+		t.Errorf("stderr is a file and the bytes were rewritten anyway: %q", toFile)
 	}
 }

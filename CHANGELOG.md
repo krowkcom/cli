@@ -11,6 +11,27 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- `--jq '<expression>'` filters a result inside krowk, with jq compiled in — no
+  jq binary to install and no pipe to build. It works on every command, implies
+  `--json`, and reads what the command rendered: the envelope normally, the bare
+  record under `--quiet`. A string result prints without its quotes, so
+  `URL=$(krowk push shot.png --jq '.data.artifacts[0].url')` is the whole
+  ceremony; anything else prints as JSON, one value per line. `krowk help --json`
+  is filterable too, which is the shortest way for an agent to read the surface.
+  A failure is filtered like any other result, in whatever shape the command
+  rendered it: `--jq '.error.error'` reads the code out of an envelope, and
+  `--quiet --jq '.error'` reads it out of the bare body. An expression that does
+  not parse is refused as `bad_jq` before the command sends anything, and one
+  that does not fit the result it was pointed at answers `jq_failed` afterwards,
+  saying that the command itself succeeded so that a wrapper retrying on a
+  non-zero exit does not repeat the work. A failure `--jq` caused is always
+  reported whole, since filtering the complaint with the expression behind it
+  would bury it. `auth token`, `registry serve` and `--version` print no JSON,
+  and refuse the flag rather than ignore it — the surface says which commands
+  those are, under `no_json`. Neither can it be combined with `--format human`,
+  `markdown` or `url`, since one of the two would have to be discarded.
+  `doctor` and `upgrade` answer with a bare record and no envelope, as they
+  always have, so filter those as `--jq '.token_source'`.
 - Every command that names a record now takes the link as readily as the slug.
   Paste the card page, `https://krowk.com/a/art_…`, the CDN URL under it, or the
   markdown line carrying both, into `uploads show`, `uploads attach`,
@@ -25,6 +46,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Changed
 
+- A `--format` nobody has heard of is now refused even when `--json` or `--jq`
+  was passed as well. It used to be accepted and ignored, so a caller who meant
+  `--format markdown` and mistyped it was told nothing.
 - A claim token is trimmed before it is sent, on `claim` and on
   `uploads delete`, so one copied with a trailing space or newline works instead
   of failing as an unauthorised claim.

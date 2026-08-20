@@ -194,7 +194,7 @@ func TestNoCodeIsInBothTables(t *testing.T) {
 // template growing arguments.
 func TestHelpDocumentsEveryExitCode(t *testing.T) {
 	var help strings.Builder
-	if err := showHelp(&help, nil, output.Human); err != nil {
+	if err := showHelp(&help, nil, output.Human, flags{}); err != nil {
 		t.Fatalf("showHelp: %v", err)
 	}
 	for exit := exitOK; exit <= exitGone; exit++ {

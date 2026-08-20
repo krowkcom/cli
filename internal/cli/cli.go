@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -95,6 +96,8 @@ Global flags
                          markdown and url describe an upload; other commands fall back to json
   --json                 Shorthand for --format json
   --quiet                Raw JSON, no envelope
+  --jq <expr>            Filter the JSON with a jq expression, built in — implies
+                         --format json, and reads the bare record under --quiet
   -h, --help             Show this
   -v, --version          Print the version
 
@@ -184,8 +187,23 @@ type flags struct {
 	noBrowser   bool
 	json        bool
 	quiet       bool
+	jq          string
 	help        bool
 	version     bool
+
+	// filter is --jq once it has been compiled, and nil when there was none. It
+	// rides along here rather than through every command's signature because it
+	// applies to whatever a command renders and to nothing a command decides.
+	//
+	// tty and errTTY are that filter's other half: a filter prints strings raw,
+	// so whether they have to be folded first depends on whether they are going
+	// to a terminal. There are two because there are two streams and they are
+	// answered separately — results go to stdout and failures to stderr, and
+	// `krowk … --jq … > out.json` from a terminal is exactly the case where one
+	// is a file and the other is not.
+	filter *output.Filter
+	tty    bool
+	errTTY bool
 }
 
 type stringSlice []string
@@ -223,6 +241,7 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.BoolVar(&f.noBrowser, "no-browser", false, "")
 	fs.BoolVar(&f.json, "json", false, "")
 	fs.BoolVar(&f.quiet, "quiet", false, "")
+	fs.StringVar(&f.jq, "jq", "", "")
 	fs.BoolVar(&f.help, "help", false, "")
 	fs.BoolVar(&f.help, "h", false, "")
 	fs.BoolVar(&f.version, "version", false, "")
@@ -231,7 +250,7 @@ func newFlagSet(f *flags) *flag.FlagSet {
 }
 
 // Run executes one invocation and returns the process exit code.
-func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY bool) int {
+func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY, isErrTTY bool) int {
 	var f flags
 	fs := newFlagSet(&f)
 
@@ -239,15 +258,52 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	// collect them. Lets flags follow filenames, the way agents write commands.
 	positionals, parseErr := parseInterleaved(fs, args)
 
+	// Whether --jq was typed, which is a different question from what it carries:
+	// `--jq "$FIELD"` with the variable unset is a flag that was given and is
+	// empty, and reading that as "no filter" would answer with everything.
+	jqGiven := false
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "jq" {
+			jqGiven = true
+		}
+	})
+
 	// Resolve the format before reporting anything, including the parse error.
-	format, formatErr := output.ResolveFormat(f.format, f.json, isTTY)
+	// --jq asks for a value out of the JSON, so it settles the format the same way
+	// --json does: there is nothing for a filter to read in a human row.
+	format, formatErr := output.ResolveFormat(f.format, f.json || jqGiven, isTTY)
 	if formatErr != nil {
 		return report(stderr, formatErr, output.JSON, f.quiet, false)
 	}
 	colour := isTTY
 
 	if parseErr != nil {
+		// Reported unfiltered: the command line did not parse, so what --jq was
+		// given — or whether it was given at all — is not something krowk knows.
 		err := api.Fail("bad_flag", parseErr.Error()+" — run `krowk --help`")
+		return report(stderr, err, format, f.quiet, colour)
+	}
+
+	// Compiled here rather than where it is used, so a mistyped expression is
+	// refused before the command it belongs to uploads, claims or takes anything
+	// down. A refusal about --jq is itself reported unfiltered, since running a
+	// broken filter over the complaint about it would bury the complaint.
+	filter, jqErr := output.CompileFilter(f.jq, jqGiven)
+	if jqErr == nil && filter != nil && f.format != "" && output.Format(f.format) != output.JSON {
+		// Refused rather than overridden. --jq reads JSON and a paste form is not
+		// JSON, so one of the two was going to be ignored — and this same change
+		// stopped ignoring a --format that is merely misspelled. A --format spelled
+		// right deserves at least as much.
+		jqErr = api.Fail("bad_flag", "--jq reads the JSON, so it cannot be combined with "+
+			"--format "+f.format+" — drop one of the two")
+	}
+	if jqErr != nil {
+		return report(stderr, jqErr, format, f.quiet, colour)
+	}
+	f.filter = filter
+	f.tty = isTTY
+	f.errTTY = isErrTTY
+	if err := filterHasSomethingToRead(filter, f, positionals); err != nil {
 		return report(stderr, err, format, f.quiet, colour)
 	}
 
@@ -263,8 +319,8 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		if len(topic) > 0 && topic[0] == "help" {
 			topic = topic[1:]
 		}
-		if err := showHelp(stdout, topic, format); err != nil {
-			return report(stderr, err, format, f.quiet, colour)
+		if err := showHelp(stdout, topic, format, f); err != nil {
+			return reportFiltered(stderr, err, format, f.quiet, colour, f.errTTY, f.filter)
 		}
 		return 0
 	}
@@ -321,7 +377,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	}
 
 	if err != nil {
-		return report(stderr, err, format, f.quiet, colour)
+		return reportFiltered(stderr, err, format, f.quiet, colour, f.errTTY, f.filter)
 	}
 	// The nudge comes last, after the command's own output, and only when the
 	// command worked: a failure has the floor. `upgrade` just answered the same
@@ -335,9 +391,140 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 // report renders a failure and answers with the exit code that classifies it.
 // Every failing path in Run goes through here, so there is one place where a
 // failure becomes a number and no way to exit non-zero without printing why.
+// A failure is filtered like any other result, so `--jq '.error.error'` reads
+// the code out of a refusal the same way it reads a slug out of an upload — a
+// caller that filters everything should not have to stop filtering to find out
+// what went wrong. Two failures are never filtered: one caused by --jq, which
+// output.IsFilterFailure names and which running the filter again would only
+// bury, and one whose filtering fails, which falls back to the whole envelope
+// rather than to silence.
 func report(w io.Writer, err error, format output.Format, quiet, colour bool) int {
-	fmt.Fprintln(w, output.Error(err, format, quiet, colour))
+	return reportFiltered(w, err, format, quiet, colour, false, nil)
+}
+
+// reportFiltered is report for the paths that have a filter to run over the
+// failure. The two terminal questions are separate here: colour is stdout's,
+// which is what krowk has always painted a failure by, and errTTY is this
+// writer's, which is the only honest answer to whether a string printed raw
+// here could repaint something.
+func reportFiltered(w io.Writer, err error, format output.Format, quiet, colour, errTTY bool,
+	filter *output.Filter) int {
+	rendered := output.Error(err, format, quiet, colour)
+	if filter != nil && !output.IsFilterFailure(err) {
+		// Into a buffer first, because a filter can write several values and then
+		// fail on one. Writing straight to stderr would leave those first values
+		// standing in front of the whole envelope this falls back to, and a caller
+		// reading a failure would have to work out which half was the answer.
+		var filtered bytes.Buffer
+		// An expression that matches nothing is silence on a result, and silence is
+		// an answer there. On a failure it is not: exiting non-zero having printed
+		// nothing anywhere leaves a caller a number and no reason for it, which is
+		// the one thing this function exists to prevent.
+		said, filterErr := filter.Write(&filtered, rendered, errTTY)
+		// said, not the byte count. An expression written for a result — the very
+		// one the docs hand out, `.data.artifacts[0].url` — answers `null` over a
+		// failure, and printing that instead of the envelope would leave a caller
+		// five bytes and an exit code where the reason should be.
+		if filterErr == nil && said > 0 {
+			fmt.Fprint(w, filtered.String())
+			return exitCodeFor(err)
+		}
+		if filterErr != nil {
+			// Said before the envelope, and not instead of it. Otherwise whether a
+			// caller ever learns their expression is broken depends on whether the
+			// registry happened to answer — the same expression against a command
+			// that worked would have failed loudly.
+			fmt.Fprintln(w, output.Error(filterErr, format, quiet, colour))
+		}
+	}
+	fmt.Fprintln(w, rendered)
 	return exitCodeFor(err)
+}
+
+// filterHasSomethingToRead refuses --jq where the command answers with something
+// other than JSON.
+//
+// `auth token` prints the bare token so `$(krowk auth token)` works, `registry
+// serve` runs a server and prints its log, and `--version` prints the version.
+// None of them goes through emit, so a filter would be silently skipped and the
+// caller handed an unfiltered line — from `auth token`, the raw secret where an
+// expression asked for one field of it. A flag that quietly does nothing is what
+// the catalog exists to make impossible, so which commands those are is read off
+// the catalog rather than written out again here: a command added later carries
+// the answer or does not, and the surface test notices either way.
+//
+// Help is not one of them. `krowk auth token --help` prints the catalog entry,
+// which is JSON like any other, and refusing it would make the two spellings of
+// one question — that and `krowk help auth token` — disagree.
+func filterHasSomethingToRead(filter *output.Filter, f flags, positionals []string) error {
+	if filter == nil {
+		return nil
+	}
+	name := ""
+	// The order is Run's dispatch order, and has to stay it: --version is answered
+	// before --help, so treating --help as "this prints a catalog entry" first
+	// would wave `krowk --version --help --jq …` straight past the check and print
+	// the version unfiltered.
+	switch {
+	case f.version:
+		name = "--version"
+	case f.help, len(positionals) > 0 && positionals[0] == "help":
+		return nil
+	default:
+		// Find answers with the leaf, whose Name is the last word of it, so the
+		// message says what was typed rather than "`token`".
+		cmd, ok := Surface().Find(positionals)
+		if !ok || !cmd.NoJSON {
+			return nil
+		}
+		name = strings.Join(clip(positionals, 2), " ")
+	}
+	return api.Fail("jq_unsupported", "`"+name+"` prints no JSON, so there is nothing for --jq to read"+
+		" — drop the flag, or ask a command that answers with a record")
+}
+
+// emit is where a rendered result reaches the caller, and the one place a --jq
+// filter gets to touch one. Every command goes through it, so a filter can never
+// apply to some results and not others — a caller reading one field out of a
+// push must be able to read the same field out of a claim.
+func emit(w io.Writer, rendered string, f flags) error {
+	if f.filter == nil {
+		fmt.Fprintln(w, rendered)
+		return nil
+	}
+	// Into a buffer, so a filter that writes several values and then fails on one
+	// writes none of them. Half a listing on stdout followed by an exit code is
+	// worse than no listing: `SLUGS=$(krowk uploads list --jq …)` would hold a
+	// prefix of the answer with nothing marking where it stopped.
+	var filtered bytes.Buffer
+	if _, err := f.filter.Write(&filtered, rendered, f.tty); err != nil {
+		return afterTheCommandRan(err)
+	}
+	fmt.Fprint(w, filtered.String())
+	return nil
+}
+
+// afterTheCommandRan marks a filter failure that happened once the command had
+// already done whatever it does.
+//
+// The command succeeded and only the reading of it failed, which is worth a
+// sentence: `krowk push shot.png --jq '.data.artifacts.url'` is a plausible typo
+// for `.data.artifacts[0].url`, it compiles, so the up-front check cannot catch
+// it — and the upload has landed by the time it does. A wrapper that retries on
+// a non-zero exit would upload the file twice. Nothing here can stop it
+// retrying, but the message can say what a retry would be repeating.
+//
+// It says the command ran rather than telling anyone not to run it again: most
+// commands are reads, and warning someone off `uploads list` is the opposite of
+// useful.
+func afterTheCommandRan(err error) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	return api.Fail(apiErr.Code(), apiErr.Fix()+
+		". The command itself succeeded — this is the reading of its result failing, "+
+		"so running it again repeats whatever it did")
 }
 
 // newClient is the one place a registry client gets built, so every command
@@ -497,8 +684,7 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 		}
 	}
 
-	fmt.Fprintln(w, output.Upload(result, format, f.quiet, colour, time.Now()))
-	return nil
+	return emit(w, output.Upload(result, format, f.quiet, colour, time.Now()), f)
 }
 
 // resolveRun decides which run the artifacts belong to: the one named on the
@@ -704,8 +890,7 @@ func uploadsList(w io.Writer, f flags, format output.Format, env runctx.Env, col
 	// included: an agent paging by 10 that was handed a crumb paging by 50 would
 	// change stride halfway through the walk without being told.
 	listing := output.Listing{Run: f.run, Limit: f.limit}
-	fmt.Fprintln(w, output.List(page, listing, format, f.quiet, colour, time.Now()))
-	return nil
+	return emit(w, output.List(page, listing, format, f.quiet, colour, time.Now()), f)
 }
 
 // runsList pages through the key's runs, newest first.
@@ -719,8 +904,7 @@ func runsList(w io.Writer, f flags, format output.Format, env runctx.Env, colour
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.RunList(page, output.Listing{Limit: f.limit}, format, f.quiet, colour))
-	return nil
+	return emit(w, output.RunList(page, output.Listing{Limit: f.limit}, format, f.quiet, colour), f)
 }
 
 // runsShow reads one run back with everything recorded on it. That is where an
@@ -740,8 +924,7 @@ func runsShow(w io.Writer, args []string, f flags, format output.Format, env run
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.RunDetail(run, format, f.quiet, colour))
-	return nil
+	return emit(w, output.RunDetail(run, format, f.quiet, colour), f)
 }
 
 func uploadsShow(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
@@ -759,8 +942,7 @@ func uploadsShow(w io.Writer, args []string, f flags, format output.Format, env 
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()))
-	return nil
+	return emit(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()), f)
 }
 
 // uploadsAttach puts an upload under a run after the fact. It is the only way an
@@ -787,8 +969,7 @@ func uploadsAttach(w io.Writer, args []string, f flags, format output.Format, en
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()))
-	return nil
+	return emit(w, output.Artifact(artifact, format, f.quiet, colour, time.Now()), f)
 }
 
 // uploadsDelete takes an upload down: the bytes leave storage at once and the
@@ -853,8 +1034,7 @@ func uploadsDelete(w io.Writer, args []string, f flags, format output.Format, en
 	if err := client.TakeDownArtifact(context.Background(), slug, claimToken); err != nil {
 		return withTakedownAuthority(err, claimToken != "")
 	}
-	fmt.Fprintln(w, output.Removed(slug, format, f.quiet, colour))
-	return nil
+	return emit(w, output.Removed(slug, format, f.quiet, colour), f)
 }
 
 // withTakedownAuthority says what a 404 from a takedown actually means. The
@@ -896,8 +1076,7 @@ func runsStart(w io.Writer, f flags, format output.Format, env runctx.Env, colou
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.Run(run, format, f.quiet, colour))
-	return nil
+	return emit(w, output.Run(run, format, f.quiet, colour), f)
 }
 
 func runsFinish(w io.Writer, args []string, f flags, format output.Format, env runctx.Env, colour bool) error {
@@ -914,8 +1093,7 @@ func runsFinish(w io.Writer, args []string, f flags, format output.Format, env r
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, output.Run(run, format, f.quiet, colour))
-	return nil
+	return emit(w, output.Run(run, format, f.quiet, colour), f)
 }
 
 // claim spends the token an anonymous upload came back with, which is the only
@@ -966,8 +1144,7 @@ func claim(w io.Writer, args []string, f flags, format output.Format, env runctx
 	// in a workspace and under nothing, and `uploads attach` is the only way it
 	// ever gets one. That is worth handing back as a command rather than leaving
 	// to be discovered in the help.
-	fmt.Fprintln(w, output.Claimed(artifact, format, f.quiet, colour, time.Now()))
-	return nil
+	return emit(w, output.Claimed(artifact, format, f.quiet, colour, time.Now()), f)
 }
 
 // authLogin gets a key onto this machine, one of two ways, and which one is
@@ -1054,8 +1231,7 @@ func authLoginWithToken(w io.Writer, f flags, format output.Format, env runctx.E
 	} else {
 		result.KeyID, result.Workspace = key.KeyID, key.Workspace
 	}
-	fmt.Fprintln(w, output.StoredKey(result, format, f.quiet, colour))
-	return nil
+	return emit(w, output.StoredKey(result, format, f.quiet, colour), f)
 }
 
 // How long a browser login is given, and how often it is asked about. Both are
@@ -1170,8 +1346,7 @@ func authLoginInBrowser(stdout, stderr io.Writer, f flags, format output.Format,
 	if !result.Confirmed {
 		result.Reason = "the registry approved it without naming the key or its workspace"
 	}
-	fmt.Fprintln(stdout, output.StoredKey(result, format, f.quiet, colour))
-	return nil
+	return emit(stdout, output.StoredKey(result, format, f.quiet, colour), f)
 }
 
 // noBrowserLoginHere reads a 404 on the way in as a registry that does not offer
@@ -1438,8 +1613,7 @@ func authVerify(w io.Writer, format output.Format, f flags, env runctx.Env, colo
 			KeyID: key.KeyID, Workspace: key.Workspace, WorkspaceName: key.WorkspaceName,
 		})
 	}
-	fmt.Fprintln(w, output.Key(key, format, f.quiet, colour))
-	return nil
+	return emit(w, output.Key(key, format, f.quiet, colour), f)
 }
 
 func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
@@ -1474,8 +1648,7 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 
 	if format != output.Human {
 		b, _ := json.MarshalIndent(report, "", "  ")
-		fmt.Fprintln(w, string(b))
-		return nil
+		return emit(w, string(b), f)
 	}
 
 	for _, k := range keys {

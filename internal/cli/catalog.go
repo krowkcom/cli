@@ -45,6 +45,12 @@ type Command struct {
 	Args        []Arg     `json:"args,omitempty"`
 	Flags       []Flag    `json:"flags,omitempty"`
 	Subcommands []Command `json:"subcommands,omitempty"`
+	// NoJSON marks the commands that answer with something other than a record:
+	// a bare token, a server's log. They are the ones --jq has nothing to read
+	// on, and it is said here rather than in the code that refuses it so that a
+	// caller reading the surface knows before trying, and so that a command
+	// added later has to answer the question.
+	NoJSON bool `json:"no_json,omitempty"`
 }
 
 // Arg is one positional. Required and Repeated are separate questions: `push`
@@ -266,7 +272,8 @@ func catalog() Catalog {
 									"the default over SSH, or with no display"},
 						},
 					},
-					{Name: "token", Usage: "krowk auth token", Summary: "Print the stored token"},
+					{Name: "token", Usage: "krowk auth token", Summary: "Print the stored token",
+						NoJSON: true},
 					{Name: "verify", Usage: "krowk auth verify", Summary: "Check the key and its workspace"},
 				},
 			},
@@ -322,6 +329,7 @@ func catalog() Catalog {
 				Subcommands: []Command{
 					{
 						Name:    "serve",
+						NoJSON:  true,
 						Usage:   "krowk registry serve",
 						Summary: "Run a local registry to develop against",
 						Flags: []Flag{
@@ -355,6 +363,9 @@ func catalog() Catalog {
 				Usage: "human | json | markdown | url (default: human on a TTY, json when piped)"},
 			{Name: "json", Type: typeBool, Default: "false", Usage: "Shorthand for --format json"},
 			{Name: "quiet", Type: typeBool, Default: "false", Usage: "Raw JSON, no envelope"},
+			{Name: "jq", Type: typeString,
+				Usage: "Filter the JSON with a jq expression — built in, no jq binary needed. " +
+					"Implies --format json, and reads the bare record under --quiet"},
 			{Name: "help", Aliases: []string{"h"}, Type: typeBool, Default: "false", Usage: "Show the help"},
 			{Name: "version", Aliases: []string{"v"}, Type: typeBool, Default: "false",
 				Usage: "Print the version"},

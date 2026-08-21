@@ -9,6 +9,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-21
+
 ### Added
 
 - `--jq '<expression>'` filters a result inside krowk, with jq compiled in — no
@@ -62,4 +64,5 @@ the versions are the `v*` tags a release is cut from. Entries land under
   credentials travel, and a refusal is written to stderr and into the JSON
   envelope.
 
-[Unreleased]: https://github.com/krowkcom/cli/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/krowkcom/cli/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/krowkcom/cli/compare/v0.4.1...v0.5.0

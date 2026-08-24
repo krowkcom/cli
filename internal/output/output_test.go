@@ -82,72 +82,52 @@ func TestErrorRendersLimitAndFix(t *testing.T) {
 	}
 }
 
-// GitHub renders no card for a third-party link, so the image embed is the only
-// form that shows the artifact there — and the embed has to name the bytes,
-// because GitHub renders an image where a link resolves to one and the card
-// page resolves to HTML. The embed is wrapped in a link to the card so clicking
-// it lands on the page with the run metadata. Labels are user-controlled, so
-// delimiter characters must arrive escaped or the embed breaks.
-func TestPasteCarriesBothFormsAndEscapesLabels(t *testing.T) {
+// The forms are the registry's, and this side passes them through. Nothing here
+// composes an embed: how a krowk reference looks has to be one deploy away from
+// changing everywhere, including in the installs that already exist.
+func TestPasteFormsComeFromTheRegistry(t *testing.T) {
+	block := "[![Cart before the fix](https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg)]" +
+		"(https://krowk.com/a/art_2e1d)\nCart before the fix · " +
+		"[View preview ↗](https://krowk.com/a/art_2e1d)"
 	a := &api.Artifact{
 		Slug:        "art_2e1d",
 		Filename:    "foobar.jpg",
 		ContentType: "image/jpeg",
 		URL:         "https://krowk.com/a/art_2e1d",
 		FileURL:     "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
-	}
-	card, file := a.URL, a.FileURL
-	embed := func(label string) string { return "[![" + label + "](" + file + ")](" + card + ")" }
-
-	for _, tc := range []struct {
-		title    string
-		filename string
-		want     string
-	}{
-		{"Checkout", "foobar.jpg", embed("Checkout")},
-		{"Checkout [v2]", "foobar.jpg", embed(`Checkout \[v2\]`)},
-		{"", "frame[0].png", embed(`frame\[0\].png`)},
-		{`back\slash`, "foobar.jpg", embed(`back\\slash`)},
-		{"line1\nline2\r\nline3", "foobar.jpg", embed("line1 line2  line3")},
-	} {
-		a.Filename = tc.filename
-		p := PasteFor(a, tc.title)
-		if p.Markdown != tc.want {
-			t.Errorf("PasteFor(%q/%q).Markdown = %q, want %q", tc.title, tc.filename, p.Markdown, tc.want)
-		}
-		// Slack renders no markdown image embeds, so it needs the bare link —
-		// and the bare link is the card, which is the thing Slack unfurls.
-		if p.URL != card {
-			t.Errorf("url = %q, want the card page", p.URL)
-		}
+		Paste: &api.Paste{
+			Markdown:     block,
+			URL:          "https://krowk.com/a/art_2e1d",
+			Destinations: map[string]string{"github": "markdown", "slack": "url", "_default": "markdown"},
+		},
 	}
 
-	a.Filename = "foobar.jpg"
+	p := PasteOf(a)
+	if p.Markdown != block {
+		t.Errorf("markdown = %q, want the served block verbatim", p.Markdown)
+	}
+	if p.URL != a.URL {
+		t.Errorf("url = %q, want the card page", p.URL)
+	}
+	if p.Destinations["slack"] != "url" {
+		t.Errorf("destinations = %v, want the served table passed through", p.Destinations)
+	}
+
+	// A title used to relabel the markdown. It no longer can: what the block
+	// says is the caption recorded on the artifact, which is data rather than
+	// something re-typed at render time.
 	r := Result{Artifacts: []*api.Artifact{a}, Title: "Checkout"}
-	if got := Upload(r, Markdown, false, false, time.Now()); got != embed("Checkout") {
-		t.Errorf("--format markdown = %q, want just the embed", got)
+	if got := Upload(r, Markdown, false, false, time.Now()); got != block {
+		t.Errorf("--format markdown = %q, want the served block", got)
 	}
-	if got := Upload(r, URL, false, false, time.Now()); got != card {
+	if got := Upload(r, URL, false, false, time.Now()); got != a.URL {
 		t.Errorf("--format url = %q, want just the card link", got)
 	}
 }
 
-// An artifact this side assembled rather than read back has no byte URL, and an
-// embed pointing at nothing is worse than a link that works — so the card
-// stands in for it.
-func TestAnEmbedWithNoByteURLFallsBackToTheCard(t *testing.T) {
-	a := &api.Artifact{
-		Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
-		URL: "https://krowk.com/a/art_2e1d",
-	}
-	if got := MarkdownLink(a, "Checkout"); got != "[![Checkout]("+a.URL+")]("+a.URL+")" {
-		t.Errorf("MarkdownLink = %q, want the card in both slots", got)
-	}
-}
-
-// The registry renders paste-ready markdown itself; without a caller-supplied
-// title, its version wins verbatim.
-func TestRegistryMarkdownWinsWithoutATitle(t *testing.T) {
+// A registry too old to compute a block still serves the single-line markdown
+// it always did, and that is served too — so it is what gets pasted.
+func TestOlderRegistryMarkdownIsStillWhatIsPasted(t *testing.T) {
 	a := &api.Artifact{
 		Slug:        "art_2e1d",
 		Filename:    "foobar.jpg",
@@ -157,14 +137,36 @@ func TestRegistryMarkdownWinsWithoutATitle(t *testing.T) {
 		Markdown: "[![foobar.jpg](https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg)]" +
 			"(https://krowk.com/a/art_2e1d)",
 	}
-	if got := MarkdownLink(a, ""); got != a.Markdown {
-		t.Errorf("MarkdownLink = %q, want the registry's own markdown", got)
+	if got := PasteOf(a).Markdown; got != a.Markdown {
+		t.Errorf("markdown = %q, want the registry's own", got)
 	}
-	// The re-render is where the two URLs have to be kept apart by this side
-	// rather than by the registry: the embed names the bytes, the link around
-	// it names the card.
-	if got := MarkdownLink(a, "Checkout"); got != "[![Checkout]("+a.FileURL+")]("+a.URL+")" {
-		t.Errorf("MarkdownLink with a title = %q, want the title to win", got)
+}
+
+// A registry that serves neither leaves nothing to paste but the link, and the
+// link is what is pasted. Composing a form here is the thing being prevented.
+func TestWithNothingServedThePasteIsTheLink(t *testing.T) {
+	a := &api.Artifact{
+		Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
+		URL: "https://krowk.com/a/art_2e1d",
+	}
+	if got := PasteOf(a).Markdown; got != a.URL {
+		t.Errorf("markdown = %q, want the bare link", got)
+	}
+}
+
+// A block is more than one line, so two of them are separated by a blank line:
+// run together, CommonMark folds the lot into one paragraph.
+func TestBlocksArePastedOneAfterAnotherAsBlocks(t *testing.T) {
+	block := func(n string) string {
+		return "[![" + n + "](https://cdn.krowk.com/" + n + ")](https://krowk.com/a/" + n + ")\n" +
+			n + " · [View preview ↗](https://krowk.com/a/" + n + ")"
+	}
+	r := Result{Artifacts: []*api.Artifact{
+		{Slug: "art_1", URL: "https://krowk.com/a/before", Paste: &api.Paste{Markdown: block("before")}},
+		{Slug: "art_2", URL: "https://krowk.com/a/after", Paste: &api.Paste{Markdown: block("after")}},
+	}}
+	if got := Upload(r, Markdown, false, false, time.Now()); got != block("before")+"\n\n"+block("after") {
+		t.Errorf("--format markdown = %q, want the blocks separated by a blank line", got)
 	}
 }
 
@@ -175,6 +177,11 @@ func TestJSONEnvelopeCarriesBothPasteForms(t *testing.T) {
 		ContentType: "image/jpeg",
 		URL:         "https://krowk.com/a/art_2e1d",
 		FileURL:     "https://cdn.krowk.com/ws_9f3c/art_2e1d/foobar.jpg",
+	}
+	a.Paste = &api.Paste{
+		Markdown:     "[![foobar.jpg](" + a.FileURL + ")](" + a.URL + ")",
+		URL:          a.URL,
+		Destinations: map[string]string{"github": "markdown", "slack": "url", "_default": "markdown"},
 	}
 	r := Result{Artifacts: []*api.Artifact{a}}
 
@@ -187,9 +194,23 @@ func TestJSONEnvelopeCarriesBothPasteForms(t *testing.T) {
 	if e.Paste.Markdown == "" || e.Paste.URL != a.URL {
 		t.Errorf("paste = %+v, want both forms so the agent can pick", e.Paste)
 	}
+	// And the table beside them, so an agent picks by destination rather than
+	// by a rule of its own about which tool takes which form.
+	if e.Paste.Destinations["slack"] != "url" {
+		t.Errorf("paste.destinations = %v, want the registry's table", e.Paste.Destinations)
+	}
 
-	// --quiet is the raw result, untouched; no paste block belongs there.
-	if strings.Contains(Upload(r, JSON, true, false, time.Now()), `"paste"`) {
+	// --quiet is the raw result, untouched: no envelope, so nothing krowk added
+	// around the record. The artifacts keep their own paste field, because that
+	// is part of what the registry sent back, not something wrapped around it.
+	var bare map[string]any
+	if err := json.Unmarshal([]byte(Upload(r, JSON, true, false, time.Now())), &bare); err != nil {
+		t.Fatal(err)
+	}
+	if _, wrapped := bare["paste"]; wrapped {
+		t.Error("--quiet should stay the raw result")
+	}
+	if _, wrapped := bare["ok"]; wrapped {
 		t.Error("--quiet should stay the raw result")
 	}
 }
@@ -205,10 +226,15 @@ func TestJSONEnvelopeCarriesBothPasteForms(t *testing.T) {
 // there is a blue anchor. Slack is where that link becomes a card, and Slack
 // takes the url form. So the label stays "no preview to embed".
 func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
-	image := PasteFor(&api.Artifact{
+	image := PasteOf(&api.Artifact{
 		Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
 		URL: "https://krowk.com/a/art_2e1d", FileURL: "https://cdn.krowk.com/ws_9f3c/art_2e1d/shot.png",
-	}, "")
+		Paste: &api.Paste{
+			Markdown: "[![shot.png](https://cdn.krowk.com/ws_9f3c/art_2e1d/shot.png)]" +
+				"(https://krowk.com/a/art_2e1d)\nshot.png · [View preview ↗](https://krowk.com/a/art_2e1d)",
+			URL: "https://krowk.com/a/art_2e1d",
+		},
+	})
 	if !strings.Contains(image.Markdown, "![") {
 		t.Fatalf("markdown = %q, want an image embed", image.Markdown)
 	}
@@ -216,17 +242,21 @@ func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
 		t.Errorf("image label = %q, want %q", got, EmbedSurfaces)
 	}
 
-	log := PasteFor(&api.Artifact{
+	log := PasteOf(&api.Artifact{
 		Slug: "art_9f3c", Filename: "build.log", ContentType: "text/plain",
 		URL: "https://krowk.com/a/art_9f3c", FileURL: "https://cdn.krowk.com/ws_9f3c/art_9f3c/build.log",
-	}, "")
+		Paste: &api.Paste{
+			Markdown: "**build.log** · [View preview ↗](https://krowk.com/a/art_9f3c)",
+			URL:      "https://krowk.com/a/art_9f3c",
+		},
+	})
 	if strings.Contains(log.Markdown, "![") {
 		t.Fatalf("markdown = %q, want a plain link when there is nothing to embed", log.Markdown)
 	}
 	// And that plain link points at the card, not at the bytes: a reader
 	// clicking a log in a pull request should land on the page that says what
 	// run produced it rather than on a raw download.
-	if !strings.HasSuffix(log.Markdown, "(https://krowk.com/a/art_9f3c)") {
+	if !strings.Contains(log.Markdown, "(https://krowk.com/a/art_9f3c)") {
 		t.Errorf("markdown = %q, want it to link to the card page", log.Markdown)
 	}
 	if got := MarkdownSurfacesFor(log); got != PlainSurfaces {
@@ -254,7 +284,7 @@ func TestClaimTokenIsSurfacedButNeverPasteable(t *testing.T) {
 	}
 
 	// ...but never in either paste form.
-	p := PasteFor(a, "")
+	p := PasteOf(a)
 	if strings.Contains(p.Markdown, "claim") || strings.Contains(p.URL, "claim") {
 		t.Errorf("paste = %+v, want no claim token", p)
 	}

@@ -9,6 +9,20 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Changed
+
+- Every paste form krowk prints now comes from the registry verbatim — the
+  block, the bare link, and the `destinations` table beside them in the JSON
+  envelope. Nothing is assembled in the CLI any more, which is what lets the
+  look of a krowk reference change in a single registry deploy, including for
+  the installs that already exist. `--format markdown` therefore prints the
+  whole block rather than a one-line embed, and several files come back as
+  several blocks separated by a blank line rather than one line each.
+- `--title` no longer relabels a pasted link. It is the title of the work and
+  lands on the run, as it always did; what a pasted link says about a file is
+  now that file's `--caption`, which is recorded on the artifact and read back
+  by whatever renders it. `krowk_push` over MCP follows the same rule.
+
 ### Added
 
 - `--destination <tool>` on `push` prints what that tool wants pasted into it —
@@ -32,6 +46,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   than guessed at. Distinct from `--title`, which stays a label for the work and
   lands on the run. A keyless push drops it as it drops all metadata, and says
   so in `notes`.
+- Ordinary `krowk push` output now ends with the ready-to-paste krowk block, so
+  the last thing on screen is the thing worth copying rather than a bare link.
+  `--quiet` still prints the record and nothing suggested.
 - The paste envelope `krowk registry serve` answers with now carries the krowk
   block itself — the image, the caption from `krowk.caption`, the link through
   to the card, and the expiry of an unclaimed upload — beside the bare link and

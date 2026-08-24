@@ -594,7 +594,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		}
 	}
 
-	return s.renderPush(artifacts, run, a.Title, notes)
+	return s.renderPush(artifacts, run, notes)
 }
 
 // withProgress keeps what a failed batch would otherwise lose: the links of
@@ -708,7 +708,7 @@ func getArtifact(ctx context.Context, s *Server, args json.RawMessage) (string, 
 	if err != nil {
 		return "", nil, err
 	}
-	return s.render(artifact, "")
+	return s.render(artifact)
 }
 
 // claimArtifact adopts an anonymous upload, and optionally puts it under a run on
@@ -767,7 +767,7 @@ func claimArtifact(ctx context.Context, s *Server, args json.RawMessage) (string
 		artifact = attached
 	}
 
-	text, structured, err := s.render(artifact, "")
+	text, structured, err := s.render(artifact)
 	if err != nil {
 		return "", nil, err
 	}
@@ -854,8 +854,8 @@ func verifyKey(ctx context.Context, s *Server, _ json.RawMessage) (string, any, 
 
 // render is the one place a lone artifact turns into text, so every tool hands
 // back both paste forms described the same way.
-func (s *Server) render(a *api.Artifact, title string) (string, any, error) {
-	paste := output.PasteFor(a, title)
+func (s *Server) render(a *api.Artifact) (string, any, error) {
+	paste := output.PasteOf(a)
 
 	lines := []string{
 		fmt.Sprintf("Artifact %s — %s, %s", a.Slug, a.Filename, output.HumanBytes(a.ByteSize)),
@@ -874,20 +874,14 @@ func (s *Server) render(a *api.Artifact, title string) (string, any, error) {
 
 // renderPush reports a whole push: one artifact per file, each with both paste
 // forms, and the run they were grouped under when there was one.
-func (s *Server) renderPush(artifacts []*api.Artifact, run *api.Run, title string, notes []string) (string, any, error) {
-	// A title names one thing, so it labels a lone artifact and is left off a
-	// set of them rather than repeated on every line.
-	if len(artifacts) > 1 {
-		title = ""
-	}
-
+func (s *Server) renderPush(artifacts []*api.Artifact, run *api.Run, notes []string) (string, any, error) {
 	var lines []string
 	pastes := make([]output.Paste, 0, len(artifacts))
 	for i, a := range artifacts {
 		if i > 0 {
 			lines = append(lines, "")
 		}
-		paste := output.PasteFor(a, title)
+		paste := output.PasteOf(a)
 		pastes = append(pastes, paste)
 		lines = append(lines,
 			fmt.Sprintf("Artifact %s — %s, %s", a.Slug, a.Filename, output.HumanBytes(a.ByteSize)))
@@ -979,7 +973,7 @@ func toolSchemas() []map[string]any {
 					},
 					"title": map[string]any{
 						"type":        "string",
-						"description": "Label for the markdown link text.",
+						"description": "Title for the run this push opens, e.g. the pull request's.",
 					},
 					"pull_request": map[string]any{
 						"type":        "string",

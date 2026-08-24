@@ -120,7 +120,9 @@ func metadataFlags() []Flag {
 		{Name: "reference", Type: typeString, Repeatable: true,
 			Usage: "Related link — repeat for more than one"},
 		{Name: "session", Type: typeString, Usage: "Agent session ID"},
-		{Name: "title", Type: typeString, Usage: "Label for the markdown link"},
+		{Name: "title", Type: typeString,
+			Usage: "Title for the work this push belongs to, recorded on the run. " +
+				"What a pasted link says is the artifact's --caption"},
 		{Name: "repo", Type: typeString, Usage: "Override the detected repository"},
 		{Name: "commit", Type: typeString, Usage: "Override the detected commit"},
 		{Name: "agent", Type: typeString, Usage: "Override the detected agent"},

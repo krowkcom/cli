@@ -59,7 +59,7 @@
             "name": "title",
             "type": "string",
             "default": "",
-            "usage": "Label for the markdown link"
+            "usage": "Title for the work this push belongs to, recorded on the run. What a pasted link says is the artifact's --caption"
           },
           {
             "name": "repo",
@@ -147,7 +147,7 @@
                 "name": "title",
                 "type": "string",
                 "default": "",
-                "usage": "Label for the markdown link"
+                "usage": "Title for the work this push belongs to, recorded on the run. What a pasted link says is the artifact's --caption"
               },
               {
                 "name": "repo",
@@ -284,7 +284,7 @@
                 "name": "title",
                 "type": "string",
                 "default": "",
-                "usage": "Label for the markdown link"
+                "usage": "Title for the work this push belongs to, recorded on the run. What a pasted link says is the artifact's --caption"
               },
               {
                 "name": "repo",

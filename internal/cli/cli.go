@@ -63,7 +63,8 @@ Upload flags
                          already made joins — a claimed upload has none otherwise
   --pull-request <url>   Pull request the work belongs to
   --reference <url>      Related link — repeat for more than one
-  --title <text>         Label for the markdown link
+  --title <text>         Title for the work, recorded on the run. What a pasted
+                         link says about a file is that file's --caption
   --caption <text>       What this file shows, recorded on the artifact as
                          ` + "`krowk.caption`" + ` and used wherever it is pasted. Repeat
                          to caption several files in the order they are given

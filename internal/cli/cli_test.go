@@ -2338,3 +2338,20 @@ func TestNoDestinationTableIsHardcodedInTheCLI(t *testing.T) {
 		}
 	}
 }
+
+// A block is more than one line, so two of them need a blank line between: run
+// together, CommonMark folds the lot into one paragraph and the pair pastes as
+// a single run-on line.
+func TestSeveralBlocksArePastedAsSeveralBlocks(t *testing.T) {
+	h := newHarness(t, 0)
+	second := h.write("checkout-before.png", "other fake png bytes")
+
+	code, out, _ := h.run("push", h.fixture, second,
+		"--caption", "After", "--caption", "Before", "--destination", "github")
+	if code != 0 {
+		t.Fatalf("push --destination github exited %d", code)
+	}
+	if !strings.Contains(out, "\n\n") {
+		t.Errorf("--destination github printed %q, want a blank line between the blocks", out)
+	}
+}

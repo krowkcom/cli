@@ -256,17 +256,29 @@ func link(embed bool, label, fileURL, cardURL string) string {
 // can tell anything about.
 func Destination(r Result, destination string) string {
 	if destinationForm(r, destination) == string(URL) {
-		return urlResult(r)
+		lines := make([]string, 0, len(r.Artifacts))
+		for _, a := range r.Artifacts {
+			if a.Paste != nil && a.Paste.URL != "" {
+				lines = append(lines, a.Paste.URL)
+				continue
+			}
+			lines = append(lines, a.URL)
+		}
+		return strings.Join(lines, "\n")
 	}
-	lines := make([]string, 0, len(r.Artifacts))
+
+	blocks := make([]string, 0, len(r.Artifacts))
 	for _, a := range r.Artifacts {
 		if a.Paste != nil && a.Paste.Markdown != "" {
-			lines = append(lines, a.Paste.Markdown)
+			blocks = append(blocks, a.Paste.Markdown)
 			continue
 		}
-		lines = append(lines, MarkdownLink(a, ""))
+		blocks = append(blocks, MarkdownLink(a, ""))
 	}
-	return strings.Join(lines, "\n")
+	// Blank lines between blocks, not newlines: a block is more than one line,
+	// and CommonMark folds consecutive lines into one paragraph — a push of two
+	// screenshots would paste as a single run-on line.
+	return strings.Join(blocks, "\n\n")
 }
 
 // destinationForm is the form the served table names for this destination, and

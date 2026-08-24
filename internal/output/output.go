@@ -623,7 +623,7 @@ func Artifact(a *api.Artifact, f Format, quiet, colour bool, now time.Time) stri
 	case Markdown:
 		return markdownResult(result)
 	case URL:
-		return a.URL
+		return cardFor(a)
 	}
 	return Upload(result, f, quiet, colour, now)
 }

@@ -102,6 +102,12 @@ func uploadFlags() []Flag {
 		{Name: "caption", Type: typeString, Repeatable: true,
 			Usage: "What this file shows, recorded on the artifact as `krowk.caption`. " +
 				"Repeat to caption several files, in the order they are given"},
+		// The tools are not listed here on purpose: the table lives in the
+		// registry and is served with the artifacts, so a list in the surface
+		// would be a second one, stale the day the first one grows.
+		{Name: "destination", Type: typeString,
+			Usage: "Print what this tool wants pasted into it, e.g. github or slack. " +
+				"A tool krowk has not been told about gets the markdown block"},
 	}, metadataFlags()...)
 }
 

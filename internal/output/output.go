@@ -243,6 +243,43 @@ func link(embed bool, label, fileURL, cardURL string) string {
 	return fmt.Sprintf("[%s](%s)", label, cardURL)
 }
 
+// Destination renders this result the way the named tool wants it pasted:
+// the krowk block where the tool renders markdown, the bare card link where it
+// unfurls one into a card of its own.
+//
+// The table it resolves against is the registry's, served with the artifacts —
+// there is no list of tools on this side to go stale, and none to disagree with
+// what the card page and every other consumer read. A registry too old to send
+// a table leaves nothing to resolve against, so the answer is markdown: that is
+// what `_default` says, and it is the safe way to be wrong — a block where it
+// will not render is still informative text, while a bare link is a link nobody
+// can tell anything about.
+func Destination(r Result, destination string) string {
+	if destinationForm(r, destination) == string(URL) {
+		return urlResult(r)
+	}
+	lines := make([]string, 0, len(r.Artifacts))
+	for _, a := range r.Artifacts {
+		if a.Paste != nil && a.Paste.Markdown != "" {
+			lines = append(lines, a.Paste.Markdown)
+			continue
+		}
+		lines = append(lines, MarkdownLink(a, ""))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// destinationForm is the form the served table names for this destination, and
+// markdown when nothing was served to name one.
+func destinationForm(r Result, destination string) string {
+	for _, a := range r.Artifacts {
+		if form := a.Paste.FormFor(destination); form != "" {
+			return form
+		}
+	}
+	return string(Markdown)
+}
+
 // Upload renders a successful upload.
 func Upload(r Result, f Format, quiet, colour bool, now time.Time) string {
 	switch f {

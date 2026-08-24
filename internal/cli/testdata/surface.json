@@ -31,6 +31,12 @@
             "repeatable": true
           },
           {
+            "name": "destination",
+            "type": "string",
+            "default": "",
+            "usage": "Print what this tool wants pasted into it, e.g. github or slack. A tool krowk has not been told about gets the markdown block"
+          },
+          {
             "name": "pull-request",
             "type": "string",
             "default": "",
@@ -111,6 +117,12 @@
                 "default": "",
                 "usage": "What this file shows, recorded on the artifact as `krowk.caption`. Repeat to caption several files, in the order they are given",
                 "repeatable": true
+              },
+              {
+                "name": "destination",
+                "type": "string",
+                "default": "",
+                "usage": "Print what this tool wants pasted into it, e.g. github or slack. A tool krowk has not been told about gets the markdown block"
               },
               {
                 "name": "pull-request",

@@ -1612,3 +1612,108 @@ func TestLapsedBrowserLoginsAreSweptButNotImmediately(t *testing.T) {
 		t.Errorf("a login past the grace period is %d %v, want it swept", status, body)
 	}
 }
+
+// pasteOf digs out the paste envelope the registry computes for an artifact.
+func pasteOf(t *testing.T, payload map[string]any) map[string]any {
+	t.Helper()
+	paste, ok := payload["paste"].(map[string]any)
+	if !ok {
+		t.Fatalf("no paste envelope in %v", payload)
+	}
+	return paste
+}
+
+// Every krowk reference has the same silhouette, and the registry is what gives
+// it one: an image embeds its bytes, clicks through to the card, and says
+// underneath what it shows and where it goes.
+func TestPasteBlockIsBuiltFromTheArtifactsOwnCaption(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	status, payload := request(t, http.MethodPost, server.URL+"/v1/artifacts", "hunter2", "application/json",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":4,
+		  "metadata":{"krowk.caption":"Button update before"}}}`)
+	if status != http.StatusCreated {
+		t.Fatalf("declare = %d %v", status, payload)
+	}
+
+	paste := pasteOf(t, payload)
+	url, _ := payload["url"].(string)
+	fileURL, _ := payload["file_url"].(string)
+	want := "[![Button update before](" + fileURL + ")](" + url + ")\n" +
+		"Button update before · [View preview ↗](" + url + ")"
+	if paste["markdown"] != want {
+		t.Errorf("paste.markdown =\n%v\nwant\n%v", paste["markdown"], want)
+	}
+	// The other form is the bare card link, and it is always present: a
+	// consumer picks by destination rather than by what it was sent.
+	if paste["url"] != url {
+		t.Errorf("paste.url = %v, want the card page %q", paste["url"], url)
+	}
+}
+
+// No caption is the ordinary case, and the filename is the honest stand-in.
+// Anything that would end or nest a link label leaves here escaped, or the
+// block breaks wherever it is pasted.
+func TestPasteBlockFallsBackToTheEscapedFilename(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	payload := declareTyped(t, server, "hunter2", "frame[0].png", "image/png", "bytes")
+
+	paste := pasteOf(t, payload)
+	markdown, _ := paste["markdown"].(string)
+	if !strings.Contains(markdown, `[![frame\[0\].png](`) {
+		t.Errorf("paste.markdown = %q, want the filename escaped in the label", markdown)
+	}
+}
+
+// A log or a diff has nothing to embed, so the block is the same shape minus
+// the image: the caption carries the line on its own, and is bolded because it
+// is now the whole of it.
+func TestPasteBlockForANonImageIsTheSameShapeWithoutTheImage(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	payload := declare(t, server, "hunter2", "deploy.log", "build output")
+
+	paste := pasteOf(t, payload)
+	url, _ := payload["url"].(string)
+	want := "**deploy.log** · [View preview ↗](" + url + ")"
+	if paste["markdown"] != want {
+		t.Errorf("paste.markdown = %v, want %v", paste["markdown"], want)
+	}
+}
+
+// An unclaimed artifact is on a clock, and a block that does not say so invites
+// an inline image into a pull request comment that will outlive it.
+func TestPasteBlockSaysWhenAnUnclaimedArtifactGoes(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	payload := declareTyped(t, server, "", "shot.png", "image/png", "bytes")
+
+	paste := pasteOf(t, payload)
+	markdown, _ := paste["markdown"].(string)
+	if !strings.Contains(markdown, " · expires ") {
+		t.Errorf("paste.markdown = %q, want the expiry named", markdown)
+	}
+}
+
+// The destination table is the registry's, and it is served with every
+// artifact: that is what lets a tool prove out without a client release.
+func TestPasteCarriesTheDestinationTable(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	payload := declare(t, server, "hunter2", "deploy.log", "build output")
+
+	destinations, ok := pasteOf(t, payload)["destinations"].(map[string]any)
+	if !ok {
+		t.Fatalf("no destinations table in %v", payload["paste"])
+	}
+	for destination, want := range map[string]string{
+		"github": "markdown", "linear": "markdown",
+		"slack": "url", "asana": "url",
+		"_default": "markdown",
+	} {
+		if destinations[destination] != want {
+			t.Errorf("destinations[%q] = %v, want %q", destination, destinations[destination], want)
+		}
+	}
+}

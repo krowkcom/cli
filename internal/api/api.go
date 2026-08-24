@@ -216,8 +216,14 @@ type Artifact struct {
 	// an image embed should be built from it, because a paste destination
 	// renders an image only where the link resolves to image bytes; everything
 	// a person or an agent is handed points at the card instead.
-	FileURL   string `json:"file_url,omitempty"`
-	Markdown  string `json:"markdown,omitempty"`
+	FileURL  string `json:"file_url,omitempty"`
+	Markdown string `json:"markdown,omitempty"`
+	// Paste is this artifact in the forms its destinations need, computed by
+	// the registry. It is served rather than assembled so that how a krowk
+	// reference looks is one deploy away from changing everywhere, including in
+	// the clients already installed. Nil where the registry does not send it,
+	// which is what every reader here has to be ready for.
+	Paste     *Paste `json:"paste,omitempty"`
 	ExpiresAt string `json:"expires_at,omitempty"`
 	CreatedAt string `json:"created_at,omitempty"`
 	// Metadata is the artifact's own production record — stamped at the moment
@@ -233,6 +239,39 @@ type Artifact struct {
 	// artifact. It is the only way to keep that artifact past its expiry, so it
 	// is carried through to the output rather than dropped here.
 	ClaimToken string `json:"claim_token,omitempty"`
+}
+
+// Paste is one artifact ready to go into a comment, in the two forms the places
+// it lands need, with the table that says which is which.
+//
+// Two forms because there is no single one: GitHub renders the markdown block
+// and builds no preview card for a third-party link, while Slack renders no
+// markdown image embed at all and unfurls a bare URL into a card of its own.
+type Paste struct {
+	// Markdown is the krowk block: the image, the caption, the link through to
+	// the card, and the expiry when there is one.
+	Markdown string `json:"markdown"`
+	// URL is the bare card link, for the places that unfurl it themselves.
+	URL string `json:"url"`
+	// Destinations maps a tool name to the form it wants — "markdown" or
+	// "url" — with `_default` answering for every tool not named. The table is
+	// the registry's, so a tool proving out reaches clients that were installed
+	// before anyone had heard of it.
+	Destinations map[string]string `json:"destinations,omitempty"`
+}
+
+// FormFor is the form this destination wants, "" when there is nothing served
+// to answer with. An unknown destination gets `_default`, per the table: the
+// worst case of the block where it does not render is informative text, and the
+// worst case of a bare link is a link nobody can tell anything about.
+func (p *Paste) FormFor(destination string) string {
+	if p == nil || len(p.Destinations) == 0 {
+		return ""
+	}
+	if form, named := p.Destinations[strings.ToLower(destination)]; named {
+		return form
+	}
+	return p.Destinations["_default"]
 }
 
 // RunSlug names the run this artifact belongs to, or "" when it belongs to

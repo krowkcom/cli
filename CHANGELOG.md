@@ -11,6 +11,17 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- `--destination <tool>` on `push` prints what that tool wants pasted into it —
+  the krowk block for `github`, `linear` and the other markdown surfaces, the
+  bare card link for `slack`, `basecamp` and the others that unfurl one
+  themselves. A tool krowk has not been told about gets the block, and the push
+  still succeeds: a block where it does not render is informative text, a bare
+  link is a link nobody can tell anything about. Which tool wants which form is
+  the registry's table, served with the artifact and readable at
+  `paste.destinations`, so a tool proving out reaches installs that predate it —
+  there is no list of tools inside the CLI. It cannot be combined with
+  `--format`, `--json` or `--jq`, which ask for a different rendering of the same
+  result; that is refused as `bad_flag` rather than silently ranked.
 - `--caption '<text>'` on `push` records what a file shows on the artifact
   itself, as `krowk.caption`, so whatever renders the link later — a card page,
   a pull request comment, an integration — reads the caption off the record
@@ -21,6 +32,11 @@ the versions are the `v*` tags a release is cut from. Entries land under
   than guessed at. Distinct from `--title`, which stays a label for the work and
   lands on the run. A keyless push drops it as it drops all metadata, and says
   so in `notes`.
+- The paste envelope `krowk registry serve` answers with now carries the krowk
+  block itself — the image, the caption from `krowk.caption`, the link through
+  to the card, and the expiry of an unclaimed upload — beside the bare link and
+  the destination table. It is what the production registry serves, so a paste
+  built against the local stand-in looks like a paste built against production.
 
 ## [0.5.0] - 2026-08-21
 

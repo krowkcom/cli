@@ -1890,6 +1890,7 @@ func (s *store) serializeArtifact(a *artifact) map[string]any {
 		"url":          a.URL,
 		"file_url":     a.FileURL,
 		"markdown":     a.Markdown,
+		"paste":        pasteFor(a),
 		"expires_at":   a.ExpiresAt,
 		"created_at":   a.CreatedAt,
 	}
@@ -1924,6 +1925,101 @@ func (s *store) serializeArtifactRun(a *artifact) any {
 		"metadata":   metadata,
 		"created_at": r.CreatedAt,
 	}
+}
+
+// destinationClasses is the canonical table: which paste form each tool wants.
+// It lives here, and only here, because a tool proving out is a registry deploy
+// and nothing else — a client that carried its own copy would be wrong until it
+// was upgraded, and there is no upgrading the ones already installed.
+//
+// `_default` answers for every tool not named. It is the markdown block,
+// because the worst case of the block in a place that will not render it is
+// informative text, while the worst case of a bare link is a link nobody can
+// tell anything about.
+var destinationClasses = map[string]string{
+	"github": "markdown",
+	"gitlab": "markdown",
+	"linear": "markdown",
+	"notion": "markdown",
+
+	"slack":    "url",
+	"basecamp": "url",
+	"asana":    "url",
+
+	"_default": "markdown",
+}
+
+// pasteFor is the artifact in the two forms its destinations need, plus the
+// table saying which is which. Both forms are always present: a consumer picks
+// by destination and pastes verbatim, and never assembles either itself.
+func pasteFor(a *artifact) map[string]any {
+	return map[string]any{
+		"markdown":     pasteBlock(a),
+		"url":          a.URL,
+		"destinations": destinationClasses,
+	}
+}
+
+// pasteBlock is the krowk block: every reference to an artifact has the same
+// silhouette wherever it lands. An image embeds its bytes and clicks through to
+// the card page; anything else is the same block minus the image, with the
+// caption in bold in the line's place. The caption line repeats the caption as
+// the image's alt text, which is what a screen reader reads.
+//
+// An unclaimed artifact expires, so the block says when. A reader deciding
+// whether to trust an inline image in a pull request comment deserves to know
+// it is on a clock.
+func pasteBlock(a *artifact) string {
+	caption := labelEscaper.Replace(pasteCaption(a))
+	image := strings.HasPrefix(a.ContentType, "image/")
+
+	// Bold only where the caption is the whole of the block. Under an image it
+	// is already carrying the picture's weight, and bolding it there would make
+	// the line shout.
+	label := caption
+	if !image {
+		label = "**" + caption + "**"
+	}
+	parts := []string{label, "[View preview ↗](" + a.URL + ")"}
+	if until := pasteExpiry(a); until != "" {
+		parts = append(parts, "expires "+until)
+	}
+	line := strings.Join(parts, " · ")
+
+	if !image {
+		return line
+	}
+	return fmt.Sprintf("[![%s](%s)](%s)\n%s", caption, a.FileURL, a.URL, line)
+}
+
+// pasteCaption is what the block says this artifact is: the caption recorded on
+// the artifact when it was pushed, and the filename when there is none. Real
+// data either way — nothing here is composed at paste time.
+func pasteCaption(a *artifact) string {
+	if len(a.Metadata) > 0 {
+		var meta map[string]any
+		if json.Unmarshal(a.Metadata, &meta) == nil {
+			if caption, ok := meta["krowk.caption"].(string); ok && caption != "" {
+				return caption
+			}
+		}
+	}
+	return a.Filename
+}
+
+// pasteExpiry is the day an unclaimed artifact goes, spelled for a person
+// reading a comment rather than for a parser: the record itself carries the
+// timestamp.
+func pasteExpiry(a *artifact) string {
+	iso, ok := a.ExpiresAt.(string)
+	if !ok {
+		return ""
+	}
+	at, err := time.Parse(time.RFC3339Nano, iso)
+	if err != nil {
+		return ""
+	}
+	return at.UTC().Format("Jan 2")
 }
 
 // markdown is ready to paste into a pull request. An image embeds and the embed

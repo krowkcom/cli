@@ -2255,3 +2255,103 @@ func TestOneCaptionCoversAWholeSet(t *testing.T) {
 		}
 	}
 }
+
+// One flag, the right form, whatever the tool. The table it resolves against is
+// the registry's, so the CLI knows nothing about GitHub or Slack beyond what it
+// was served with the artifact.
+func TestDestinationPrintsTheFormThatToolWants(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, block, _ := h.run("push", h.fixture, "--caption", "Button update before", "--destination", "github")
+	if code != 0 {
+		t.Fatalf("push --destination github exited %d", code)
+	}
+	if !strings.Contains(block, "[![Button update before](") {
+		t.Errorf("--destination github printed %q, want the markdown krowk block", block)
+	}
+	if !strings.Contains(block, "View preview ↗") {
+		t.Errorf("--destination github printed %q, want the block's caption line", block)
+	}
+
+	code, bare, _ := h.run("push", h.fixture, "--destination", "slack")
+	if code != 0 {
+		t.Fatalf("push --destination slack exited %d", code)
+	}
+	if strings.Contains(bare, "](") || !strings.HasPrefix(strings.TrimSpace(bare), "http") {
+		t.Errorf("--destination slack printed %q, want the bare card URL", bare)
+	}
+}
+
+// A tool nobody has verified yet is not an error: the block is informative
+// wherever it lands, and refusing the push would lose the upload over a word.
+func TestUnknownDestinationFallsBackToTheBlock(t *testing.T) {
+	h := newHarness(t, 0)
+
+	code, out, stderr := h.run("push", h.fixture, "--destination", "sometool")
+	if code != 0 {
+		t.Fatalf("push --destination sometool exited %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(out, "](") {
+		t.Errorf("--destination sometool printed %q, want the markdown block", out)
+	}
+}
+
+// Two flags asking for two different renderings of the same result: one of them
+// was always going to be ignored, so neither is.
+func TestDestinationRefusesToShareTheOutput(t *testing.T) {
+	h := newHarness(t, 0)
+
+	for _, other := range [][]string{{"--format", "json"}, {"--json"}, {"--jq", ".data"}} {
+		args := append([]string{"push", h.fixture, "--destination", "github"}, other...)
+		err := h.fails(args...)
+		if err["error"] != "bad_flag" {
+			t.Errorf("push --destination github %v: error = %v, want bad_flag", other, err["error"])
+		}
+	}
+}
+
+// The resolution has to come from what the registry served. Nothing in the CLI
+// may carry its own copy of the table: a copy is stale the day a tool is added,
+// and there is no upgrading the installs that already exist.
+func TestNoDestinationTableIsHardcodedInTheCLI(t *testing.T) {
+	for _, dir := range []string{".", "../output", "../api", "../mcp"} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+				continue
+			}
+			body, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Named tools may be talked about in prose; a table is what must not
+			// exist, and in Go it reads as a tool name quoted as a key or value.
+			for _, table := range []string{`"gitlab":`, `"notion":`, `"asana":`, `"_default":`} {
+				if strings.Contains(string(body), table) {
+					t.Errorf("%s/%s carries a destination table: %s — the registry serves it",
+						dir, entry.Name(), table)
+				}
+			}
+		}
+	}
+}
+
+// A block is more than one line, so two of them need a blank line between: run
+// together, CommonMark folds the lot into one paragraph and the pair pastes as
+// a single run-on line.
+func TestSeveralBlocksArePastedAsSeveralBlocks(t *testing.T) {
+	h := newHarness(t, 0)
+	second := h.write("checkout-before.png", "other fake png bytes")
+
+	code, out, _ := h.run("push", h.fixture, second,
+		"--caption", "After", "--caption", "Before", "--destination", "github")
+	if code != 0 {
+		t.Fatalf("push --destination github exited %d", code)
+	}
+	if !strings.Contains(out, "\n\n") {
+		t.Errorf("--destination github printed %q, want a blank line between the blocks", out)
+	}
+}

@@ -67,6 +67,10 @@ Upload flags
   --caption <text>       What this file shows, recorded on the artifact as
                          ` + "`krowk.caption`" + ` and used wherever it is pasted. Repeat
                          to caption several files in the order they are given
+  --destination <tool>   Print what this tool wants pasted into it — the krowk
+                         block for ` + "`github`" + `, ` + "`linear`" + ` and the like, the bare link for
+                         the ones that unfurl it themselves, like ` + "`slack`" + `. A tool
+                         krowk has not been told about gets the block
   --session <id>         Override the detected agent session
   --repo <owner/name>    Override the detected repository
   --commit <sha>         Override the detected commit
@@ -177,6 +181,7 @@ type flags struct {
 	references  stringSlice
 	metadata    stringSlice
 	caption     stringSlice
+	destination string
 	session     string
 	title       string
 	repo        string
@@ -232,6 +237,7 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.Var(&f.references, "reference", "")
 	fs.Var(&f.metadata, "metadata", "")
 	fs.Var(&f.caption, "caption", "")
+	fs.StringVar(&f.destination, "destination", "", "")
 	fs.StringVar(&f.session, "session", "", "")
 	fs.StringVar(&f.title, "title", "", "")
 	fs.StringVar(&f.repo, "repo", "", "")
@@ -296,6 +302,16 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	// down. A refusal about --jq is itself reported unfiltered, since running a
 	// broken filter over the complaint about it would bury the complaint.
 	filter, jqErr := output.CompileFilter(f.jq, jqGiven)
+	// --destination picks a paste form, so it cannot ride alongside a flag that
+	// picks a different one. Refused rather than silently ranked: whichever way
+	// the tie were broken, the caller asked for two things and would be given
+	// one without being told which.
+	if jqErr == nil && f.destination != "" {
+		if given := destinationConflict(f, jqGiven); given != "" {
+			jqErr = api.Fail("bad_flag", "--destination prints the form that destination wants, "+
+				"so it cannot be combined with "+given+" — drop one of the two")
+		}
+	}
 	if jqErr == nil && filter != nil && f.format != "" && output.Format(f.format) != output.JSON {
 		// Refused rather than overridden. --jq reads JSON and a paste form is not
 		// JSON, so one of the two was going to be ignored — and this same change
@@ -702,6 +718,9 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 		}
 	}
 
+	if f.destination != "" {
+		return emit(w, output.Destination(result, f.destination), f)
+	}
 	return emit(w, output.Upload(result, format, f.quiet, colour, time.Now()), f)
 }
 
@@ -769,6 +788,21 @@ func parseMetadata(pairs []string) (map[string]string, error) {
 // the registry, a card page, an integration — reads the caption from the record
 // instead of being told it again at every destination.
 const captionKey = "krowk.caption"
+
+// destinationConflict names the flag --destination was asked to share the output
+// with, or "" when there is none. --json and --jq are conflicts as much as
+// --format is: both ask for the envelope, and a paste form is not it.
+func destinationConflict(f flags, jqGiven bool) string {
+	switch {
+	case f.format != "":
+		return "--format " + f.format
+	case jqGiven:
+		return "--jq"
+	case f.json:
+		return "--json"
+	}
+	return ""
+}
 
 // captionsFor lines the captions up with the files they describe. A caption
 // names one file, so a push of three files either captions all three or none of

@@ -64,7 +64,7 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 
 Wherever a command takes `<artifact>`, `<run>` or `--run`, it takes the link as readily as the slug: paste `https://krowk.com/a/art_…` or the CDN URL under it, and the slug is read out of it.
 
-Push flags: `--run`, `--pull-request`, `--reference` (repeatable), `--session`, `--title`, `--caption` (repeatable), `--metadata key=value` (repeatable), plus `--repo` / `--commit` / `--agent` to override detection. Without a key, uploads land anonymously, expire in 24 hours and return a one-shot claim token.
+Push flags: `--run`, `--pull-request`, `--reference` (repeatable), `--session`, `--title`, `--caption` (repeatable), `--destination <tool>`, `--metadata key=value` (repeatable), plus `--repo` / `--commit` / `--agent` to override detection. Without a key, uploads land anonymously, expire in 24 hours and return a one-shot claim token.
 
 ### Metadata
 
@@ -90,10 +90,15 @@ Every write detects at its own moment. Facts about the work — the change, the 
 
 ### Sharing the link
 
-| Destination | Use | Why |
-| --- | --- | --- |
-| GitHub, Linear, Notion | `--format markdown` | An image embed that renders inline and clicks through to the run |
-| Slack, Basecamp | `--format url` | A bare URL that unfurls into a preview card |
+Name where it is going and paste what comes out:
+
+```
+krowk push shot.png --caption "Cart before the fix" --destination github
+```
+
+`--destination github` (or `gitlab`, `linear`, `notion`, …) prints the krowk block — the image, the caption, the link through to the card. `--destination slack` (or `basecamp`, `asana`) prints the bare URL those tools unfurl into a preview card of their own. A tool krowk has not been told about gets the block, which reads as text wherever it does not render.
+
+Which tool wants which form is the registry's table, served with the artifact and readable at `paste.destinations` in the JSON envelope — so a tool proving out reaches installs that predate it. `--format markdown` and `--format url` remain as explicit overrides.
 
 ## For AI agents
 

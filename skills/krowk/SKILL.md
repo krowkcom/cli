@@ -90,7 +90,7 @@ environment variable — so never guess at a spelling this file does not carry.
    prints exactly what goes in the comment. Never assemble a form yourself.
    A bare `url` in a comment is a link nobody can tell anything about; the block
    says what the file is, shows it where it can be shown, and clicks through to
-   the run.
+   the card page with the run metadata on it.
 8. **Say what the file shows, on the file.** `--caption "Cart before the fix"`
    records the caption on the artifact, and every paste of it says so from then
    on — including the ones made by somebody else, later, from the card page.
@@ -235,8 +235,9 @@ krowk auth verify --json
                  • the link is live immediately
                  • it expires in 24h unless claimed
                  • data.artifacts[].claim_token is the only way back to it
-                 • no run, so --pull-request/--session/--title metadata is
-                   dropped and reported in data.notes
+                 • no run, so --pull-request/--session/--title/--caption
+                   metadata is dropped and reported in data.notes — a keyless
+                   block falls back to the filename
                Say this to the person; do not stop and ask them to sign up.
 ```
 

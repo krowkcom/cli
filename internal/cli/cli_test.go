@@ -2213,3 +2213,45 @@ func TestKeylessPushSaysTheCaptionWasDropped(t *testing.T) {
 		t.Errorf("notes = %v, want the dropped --caption named", e.Data.Notes)
 	}
 }
+
+// --caption is shorthand for one metadata key, so spelling that key out by hand
+// is a correction of the shorthand and has to win — the same rule every other
+// detected or defaulted key follows.
+func TestSpelledOutCaptionKeyBeatsTheFlag(t *testing.T) {
+	h := newHarness(t, 0)
+
+	pushed := only(t, h.ok("push", h.fixture,
+		"--caption", "from the flag",
+		"--metadata", "krowk.caption=spelled out by hand"))
+	shown := only(t, h.ok("uploads", "show", pushed.Slug))
+
+	var meta map[string]any
+	if err := json.Unmarshal(shown.Metadata, &meta); err != nil {
+		t.Fatalf("artifact metadata = %s: %v", shown.Metadata, err)
+	}
+	if meta["krowk.caption"] != "spelled out by hand" {
+		t.Errorf("krowk.caption = %v, want the hand-written value", meta["krowk.caption"])
+	}
+}
+
+// One caption and several files is the only reading that is not a guess: the
+// same subject shot more than once. It reaches every artifact.
+func TestOneCaptionCoversAWholeSet(t *testing.T) {
+	h := newHarness(t, 0)
+	second := h.write("checkout-before.png", "other fake png bytes")
+
+	e := h.ok("push", h.fixture, second, "--caption", "Checkout, both states")
+	if len(e.Data.Artifacts) != 2 {
+		t.Fatalf("artifacts = %d, want 2", len(e.Data.Artifacts))
+	}
+	for _, a := range e.Data.Artifacts {
+		shown := only(t, h.ok("uploads", "show", a.Slug))
+		var meta map[string]any
+		if err := json.Unmarshal(shown.Metadata, &meta); err != nil {
+			t.Fatalf("artifact metadata = %s: %v", shown.Metadata, err)
+		}
+		if meta["krowk.caption"] != "Checkout, both states" {
+			t.Errorf("%s krowk.caption = %v", a.Slug, meta["krowk.caption"])
+		}
+	}
+}

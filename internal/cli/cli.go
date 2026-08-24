@@ -667,16 +667,21 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 
 	// Every push stamps the artifact with the state it finds at its own moment:
 	// the production record travels with the file, wherever it is later claimed
-	// or attached. Keyless uploads record no metadata — the note above says so.
-	artifactStamp := metadataFor(f, env).Artifact()
+	// or attached. Keyless uploads record no metadata — the note above says so,
+	// and the state is not even detected for them.
+	//
+	// The stamp is shared and the caption is not: a caption names one file, so
+	// it is laid over the stamp per file rather than folded into it.
+	var stamp runctx.Metadata
+	authenticated := client.Authenticated()
+	if authenticated {
+		stamp = metadataFor(f, env).Artifact()
+	}
 
 	for i, spec := range specs {
 		spec.Run = runSlug
-		// Every push stamps the artifact with the state it finds at its own
-		// moment, plus this file's own caption: the caption names one file, so
-		// it is laid over the shared stamp rather than folded into it.
-		if client.Authenticated() {
-			spec.Metadata = artifactStamp.WithExtras(withCaption(extras, captions, i))
+		if authenticated {
+			spec.Metadata = stamp.WithExtras(withCaption(extras, captions, i))
 		}
 		artifact, err := client.Push(ctx, spec)
 		if err != nil {
@@ -759,11 +764,11 @@ func parseMetadata(pairs []string) (map[string]string, error) {
 	return out, nil
 }
 
-// CaptionKey is the artifact metadata key a caption is recorded under. It is
+// captionKey is the artifact metadata key a caption is recorded under. It is
 // artifact data rather than paste-time freehand, so whatever renders a paste —
 // the registry, a card page, an integration — reads the caption from the record
 // instead of being told it again at every destination.
-const CaptionKey = "krowk.caption"
+const captionKey = "krowk.caption"
 
 // captionsFor lines the captions up with the files they describe. A caption
 // names one file, so a push of three files either captions all three or none of
@@ -792,12 +797,12 @@ func withCaption(extras map[string]string, captions []string, i int) map[string]
 	if i >= len(captions) {
 		return extras
 	}
-	if _, spelled := extras[CaptionKey]; spelled {
+	if _, spelled := extras[captionKey]; spelled {
 		return extras
 	}
 	out := make(map[string]string, len(extras)+1)
 	maps.Copy(out, extras)
-	out[CaptionKey] = captions[i]
+	out[captionKey] = captions[i]
 	return out
 }
 

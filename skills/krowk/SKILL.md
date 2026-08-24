@@ -80,20 +80,39 @@ environment variable — so never guess at a spelling this file does not carry.
    flags are *not* recorded, and `data.notes` says so. Do not invent a login step
    the task did not ask for: push first, and mention the key only when the person
    wants the link to outlive the day or wants the artifacts grouped.
-7. **Paste the right form for the destination.** `paste.markdown` for GitHub,
-   Linear and Notion — those render an image URL inline and a third-party link as
-   a plain anchor, so an image comes as `[![name](file_url)](url)`: it renders,
-   and it clicks through to the card. `paste.url`, bare, for Slack and Basecamp —
-   both unfurl the card into a preview, and Slack renders no markdown image
-   embeds at all. Never assemble either form yourself; both come back ready.
-8. **Paste the link where a slug is asked for.** Every command that names a
+7. **Never paste a bare artifact link. Anywhere.** A krowk reference is the
+   block the registry computed, and it comes back ready: `paste.markdown` for
+   the tools that render markdown, `paste.url` for the ones that unfurl a link
+   into a card of their own. `paste.destinations` maps a tool name to which of
+   the two it wants, with `_default` for the tools it does not name — so pick by
+   destination rather than by a rule of your own. Where you know the
+   destination, let krowk pick: `krowk push shot.png --destination github`
+   prints exactly what goes in the comment. Never assemble a form yourself.
+   A bare `url` in a comment is a link nobody can tell anything about; the block
+   says what the file is, shows it where it can be shown, and clicks through to
+   the run.
+8. **Say what the file shows, on the file.** `--caption "Cart before the fix"`
+   records the caption on the artifact, and every paste of it says so from then
+   on — including the ones made by somebody else, later, from the card page.
+   Without one the block falls back to the filename, which tells a reader
+   nothing. Caption every push a person will read. `--title` is a different
+   thing: it names the work and lands on the run.
+9. **Pasting into something durable? Claim it first.** An unclaimed artifact
+   expires within the day, so an inline image in a pull request comment, an
+   issue, a design doc or anything else that outlives the session becomes a
+   broken image in a comment nobody can edit. The block labels the expiry, which
+   is honest, not a fix. Before pasting a keyless push anywhere durable, tell
+   the person what it costs — one `krowk claim` with the token from `data`, and
+   a key — and let them decide. Chat is the exception: a Slack message about
+   today's work outlives nothing.
+10. **Paste the link where a slug is asked for.** Every command that names a
    record — `uploads show`, `uploads attach`, `uploads delete`, `claim`,
    `runs show`, `runs finish`, and `--run` — reads the slug out of any link that
    carries it. Hand it over whole: never cut a slug out of a URL yourself, and
    never ask a person for "just the slug". A link carrying no slug of the kind
    the command wants, or two different ones, fails as `bad_artifact` or
    `bad_run` (exit 1) before anything is sent.
-9. **Push what the person asked for, not what is nearby.** An artifact is public
+11. **Push what the person asked for, not what is nearby.** An artifact is public
    to anyone with the link. Never push `.env` files, key material, credential
    JSON or anything under `.ssh`/`.aws`, and never push a file you found rather
    than made.
@@ -105,10 +124,14 @@ environment variable — so never guess at a spelling this file does not carry.
 | Upload one file, get a link | `krowk push shot.png --json` |
 | Upload several, one run | `krowk push a.png b.log --json` |
 | Upload with PR context | `krowk push shot.png --pull-request https://github.com/acme/app/pull/12 --json` |
-| Label the markdown link | `krowk push shot.png --title "Cart after the fix" --json` |
-| Record an extra metadata key | `krowk push shot.png --metadata krowk.caption="before the fix" --json` |
-| Markdown to paste in a PR | `krowk push shot.png --format markdown` |
-| Bare URL to paste in Slack | `krowk push shot.png --format url` |
+| Say what the file shows | `krowk push shot.png --caption "Cart after the fix" --json` |
+| Caption a before/after pair | `krowk push before.png after.png --caption "Cart before" --caption "Cart after" --json` |
+| Title the work, on the run | `krowk push shot.png --title "Checkout — mobile" --json` |
+| Record an extra metadata key | `krowk push shot.png --metadata url.full="https://app.example.com/cart" --json` |
+| Exactly what one tool wants pasted | `krowk push shot.png --destination github` |
+| The same, for a tool that unfurls | `krowk push shot.png --destination slack` |
+| Markdown block, whatever the tool | `krowk push shot.png --format markdown` |
+| Bare URL, whatever the tool | `krowk push shot.png --format url` |
 | Open a run to group under | `krowk runs start --session "$SESSION" --json` |
 | Push into an open run | `krowk push shot.png --run run_8Kd2wq --json` |
 | Close a run | `krowk runs finish run_8Kd2wq --json` |
@@ -142,6 +165,12 @@ Global flags on every command: `--json` (or `--format json`), `--format`
 (`human`, `json`, `markdown`, `url`), `--quiet` (the raw record, no envelope and
 therefore no breadcrumbs), `--jq`, `--workspace`, `--dev`, `--help`,
 `--version`.
+
+`--destination` is a push flag rather than a global one, and it prints a paste
+form rather than the envelope — so it cannot be combined with `--json`, `--jq`
+or `--format`, and krowk refuses the combination as `bad_flag` rather than
+picking one. When you need both the envelope and the exact form, take the
+envelope: `paste.markdown`, `paste.url` and `paste.destinations` are all in it.
 
 ### Filtering with --jq
 
@@ -259,13 +288,27 @@ the file: it was readable at a public URL for as long as it was up.
 ```bash
 krowk push shot.png \
   --pull-request https://github.com/acme/storefront/pull/412 \
-  --title "Cart total after the fix" --json
+  --caption "Cart total after the fix" --json
 ```
 
-Read `paste.markdown` from the envelope and put that line in the comment body —
-it is an image embed wrapped in a link to the card, so the screenshot renders
-inline and clicking it lands on the page with the run metadata.
-`data.artifacts[0].url` is that card page bare, for Slack.
+Put `paste.markdown` in the comment body, whole. It is the krowk block: the
+screenshot renders inline, the caption says what it shows, and both click
+through to the card page with the run metadata on it. Never the bare
+`data.artifacts[0].url` — GitHub builds no preview card for a third-party link,
+so a bare link there is a blue anchor telling the reader nothing.
+
+If the destination is known and there is nothing else to read out of the result,
+skip the envelope and let krowk print the form:
+
+```bash
+krowk push shot.png --caption "Cart total after the fix" --destination github
+```
+
+A pull request comment outlives the session, and a keyless artifact does not: it
+expires within the day and the embed goes with it. Check `data.artifacts[0]` for
+a `claim_token` before pasting, and if there is one, say so — claiming it needs
+a key and is the person's call, but a broken image in a merged PR is not
+something either of you can fix later.
 
 ### A whole session's output under one run
 

@@ -95,8 +95,14 @@ const (
 // uploadFlags are what `push` and `uploads create` take — the same command
 // spelled two ways.
 func uploadFlags() []Flag {
-	return append([]Flag{runFlag("Attach to an existing run instead of opening one")},
-		metadataFlags()...)
+	return append([]Flag{
+		runFlag("Attach to an existing run instead of opening one"),
+		// Per artifact rather than per run, which is what keeps it apart from
+		// --title: a caption says what one file shows, a title names the work.
+		{Name: "caption", Type: typeString, Repeatable: true,
+			Usage: "What this file shows, recorded on the artifact as `krowk.caption`. " +
+				"Repeat to caption several files, in the order they are given"},
+	}, metadataFlags()...)
 }
 
 // metadataFlags record where the work came from. They live on the run, which is

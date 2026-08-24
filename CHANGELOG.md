@@ -9,6 +9,19 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Added
+
+- `--caption '<text>'` on `push` records what a file shows on the artifact
+  itself, as `krowk.caption`, so whatever renders the link later — a card page,
+  a pull request comment, an integration — reads the caption off the record
+  instead of being told it again at every destination. It is per file and
+  repeatable: `krowk push before.png after.png --caption 'Cart before the fix'
+  --caption 'Cart after the fix'` captions each one, a single caption covers a
+  whole set, and a count that matches neither is refused as `bad_flag` rather
+  than guessed at. Distinct from `--title`, which stays a label for the work and
+  lands on the run. A keyless push drops it as it drops all metadata, and says
+  so in `notes`.
+
 ## [0.5.0] - 2026-08-21
 
 ### Added

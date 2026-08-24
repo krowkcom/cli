@@ -24,6 +24,13 @@
             "usage": "Attach to an existing run instead of opening one. Its slug, or a link carrying it"
           },
           {
+            "name": "caption",
+            "type": "string",
+            "default": "",
+            "usage": "What this file shows, recorded on the artifact as `krowk.caption`. Repeat to caption several files, in the order they are given",
+            "repeatable": true
+          },
+          {
             "name": "pull-request",
             "type": "string",
             "default": "",
@@ -97,6 +104,13 @@
                 "type": "string",
                 "default": "",
                 "usage": "Attach to an existing run instead of opening one. Its slug, or a link carrying it"
+              },
+              {
+                "name": "caption",
+                "type": "string",
+                "default": "",
+                "usage": "What this file shows, recorded on the artifact as `krowk.caption`. Repeat to caption several files, in the order they are given",
+                "repeatable": true
               },
               {
                 "name": "pull-request",

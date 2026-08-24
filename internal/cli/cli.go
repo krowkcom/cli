@@ -10,11 +10,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +64,9 @@ Upload flags
   --pull-request <url>   Pull request the work belongs to
   --reference <url>      Related link — repeat for more than one
   --title <text>         Label for the markdown link
+  --caption <text>       What this file shows, recorded on the artifact as
+                         ` + "`krowk.caption`" + ` and used wherever it is pasted. Repeat
+                         to caption several files in the order they are given
   --session <id>         Override the detected agent session
   --repo <owner/name>    Override the detected repository
   --commit <sha>         Override the detected commit
@@ -171,6 +176,7 @@ type flags struct {
 	pullRequest string
 	references  stringSlice
 	metadata    stringSlice
+	caption     stringSlice
 	session     string
 	title       string
 	repo        string
@@ -225,6 +231,7 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.StringVar(&f.pullRequest, "pull-request", "", "")
 	fs.Var(&f.references, "reference", "")
 	fs.Var(&f.metadata, "metadata", "")
+	fs.Var(&f.caption, "caption", "")
 	fs.StringVar(&f.session, "session", "", "")
 	fs.StringVar(&f.title, "title", "", "")
 	fs.StringVar(&f.repo, "repo", "", "")
@@ -626,6 +633,10 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 	if err != nil {
 		return err
 	}
+	captions, err := captionsFor(f.caption, len(files))
+	if err != nil {
+		return err
+	}
 	if f, err = withRunFlag(f); err != nil {
 		return err
 	}
@@ -657,14 +668,16 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 	// Every push stamps the artifact with the state it finds at its own moment:
 	// the production record travels with the file, wherever it is later claimed
 	// or attached. Keyless uploads record no metadata — the note above says so.
-	var stamp any
-	if client.Authenticated() {
-		stamp = metadataFor(f, env).Artifact().WithExtras(extras)
-	}
+	artifactStamp := metadataFor(f, env).Artifact()
 
-	for _, spec := range specs {
+	for i, spec := range specs {
 		spec.Run = runSlug
-		spec.Metadata = stamp
+		// Every push stamps the artifact with the state it finds at its own
+		// moment, plus this file's own caption: the caption names one file, so
+		// it is laid over the shared stamp rather than folded into it.
+		if client.Authenticated() {
+			spec.Metadata = artifactStamp.WithExtras(withCaption(extras, captions, i))
+		}
 		artifact, err := client.Push(ctx, spec)
 		if err != nil {
 			return withProgress(err, result.Artifacts, runSlug, ownRun)
@@ -746,6 +759,48 @@ func parseMetadata(pairs []string) (map[string]string, error) {
 	return out, nil
 }
 
+// CaptionKey is the artifact metadata key a caption is recorded under. It is
+// artifact data rather than paste-time freehand, so whatever renders a paste —
+// the registry, a card page, an integration — reads the caption from the record
+// instead of being told it again at every destination.
+const CaptionKey = "krowk.caption"
+
+// captionsFor lines the captions up with the files they describe. A caption
+// names one file, so a push of three files either captions all three or none of
+// them; the single-caption case is spread across the set, which is what a
+// before/after pair of the same subject wants and the only reading of one
+// caption and several files that is not a guess.
+func captionsFor(captions []string, files int) ([]string, error) {
+	switch {
+	case len(captions) == 0:
+		return nil, nil
+	case len(captions) == 1 && files > 1:
+		return slices.Repeat(captions, files), nil
+	case len(captions) != files:
+		return nil, api.Fail("bad_flag", fmt.Sprintf(
+			"--caption was given %d times for %d files: pass one caption per file, "+
+				"in the order the files are, or a single one for all of them",
+			len(captions), files))
+	}
+	return captions, nil
+}
+
+// withCaption lays one file's caption over the shared extras. The caller's own
+// --metadata krowk.caption still wins, because a key spelled out by hand is a
+// correction and this flag is the shorthand for it.
+func withCaption(extras map[string]string, captions []string, i int) map[string]string {
+	if i >= len(captions) {
+		return extras
+	}
+	if _, spelled := extras[CaptionKey]; spelled {
+		return extras
+	}
+	out := make(map[string]string, len(extras)+1)
+	maps.Copy(out, extras)
+	out[CaptionKey] = captions[i]
+	return out
+}
+
 // anonymousMetadataNote says plainly that metadata asked for by name was not
 // recorded. Silently dropping it would leave an agent believing the pull request
 // it named is attached to the upload, and it is not.
@@ -762,6 +817,9 @@ func anonymousMetadataNote(f flags) string {
 	}
 	if len(f.metadata) > 0 {
 		given = append(given, "--metadata")
+	}
+	if len(f.caption) > 0 {
+		given = append(given, "--caption")
 	}
 	if len(given) == 0 {
 		return ""

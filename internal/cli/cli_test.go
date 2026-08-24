@@ -2142,3 +2142,74 @@ func TestEachStreamIsAskedAboutItselfAndNotAboutTheOther(t *testing.T) {
 		t.Errorf("stderr is a file and the bytes were rewritten anyway: %q", toFile)
 	}
 }
+
+// A caption is what a paste says about one file, so it has to be real data on
+// that file's record rather than something typed again at every destination.
+func TestCaptionLandsOnTheArtifactRecord(t *testing.T) {
+	h := newHarness(t, 0)
+
+	pushed := only(t, h.ok("push", h.fixture, "--caption", "Button update before"))
+	shown := only(t, h.ok("uploads", "show", pushed.Slug))
+
+	var meta map[string]any
+	if err := json.Unmarshal(shown.Metadata, &meta); err != nil {
+		t.Fatalf("artifact metadata = %s: %v", shown.Metadata, err)
+	}
+	if meta["krowk.caption"] != "Button update before" {
+		t.Errorf("krowk.caption = %v, want the caption the push was given", meta["krowk.caption"])
+	}
+	// --caption is the file's, --title is the work's. The two must not collapse
+	// into one another: a caption on the run would caption every file in it.
+	if _, leaked := meta["vcs.change.title"]; leaked {
+		t.Error("vcs.change.title leaked onto the artifact; --title is run metadata")
+	}
+}
+
+// The point of a per-file caption is a before/after pair, so the captions have
+// to line up with the files in the order they were given.
+func TestCaptionsAreMatchedToTheirOwnFiles(t *testing.T) {
+	h := newHarness(t, 0)
+	after := h.write("checkout-before.png", "other fake png bytes")
+
+	e := h.ok("push", h.fixture, after,
+		"--caption", "Cart before the fix", "--caption", "Cart after the fix")
+	if len(e.Data.Artifacts) != 2 {
+		t.Fatalf("artifacts = %d, want 2", len(e.Data.Artifacts))
+	}
+	for i, want := range []string{"Cart before the fix", "Cart after the fix"} {
+		shown := only(t, h.ok("uploads", "show", e.Data.Artifacts[i].Slug))
+		var meta map[string]any
+		if err := json.Unmarshal(shown.Metadata, &meta); err != nil {
+			t.Fatalf("artifact metadata = %s: %v", shown.Metadata, err)
+		}
+		if meta["krowk.caption"] != want {
+			t.Errorf("artifact %d krowk.caption = %v, want %q", i, meta["krowk.caption"], want)
+		}
+	}
+}
+
+// Two captions for three files is a mistake with no reading that is not a
+// guess, and guessing would caption a file with a description of another one.
+func TestMismatchedCaptionCountIsRefused(t *testing.T) {
+	h := newHarness(t, 0)
+	second := h.write("checkout-before.png", "other fake png bytes")
+	third := h.write("checkout-during.png", "more fake png bytes")
+
+	err := h.fails("push", h.fixture, second, third,
+		"--caption", "one", "--caption", "two")
+	if err["error"] != "bad_flag" {
+		t.Errorf("error = %v, want bad_flag", err["error"])
+	}
+}
+
+// A keyless upload records no metadata at all, and a caption is metadata. It is
+// dropped like the rest — and said so, because an agent that believes its
+// caption landed pastes a block that has none.
+func TestKeylessPushSaysTheCaptionWasDropped(t *testing.T) {
+	h := newHarness(t, 0).anonymous()
+
+	e := h.ok("push", h.fixture, "--caption", "Button update before")
+	if len(e.Data.Notes) == 0 || !strings.Contains(strings.Join(e.Data.Notes, " "), "--caption") {
+		t.Errorf("notes = %v, want the dropped --caption named", e.Data.Notes)
+	}
+}

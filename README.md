@@ -64,7 +64,7 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 
 Wherever a command takes `<artifact>`, `<run>` or `--run`, it takes the link as readily as the slug: paste `https://krowk.com/a/art_…` or the CDN URL under it, and the slug is read out of it.
 
-Push flags: `--run`, `--pull-request`, `--reference` (repeatable), `--session`, `--title`, `--metadata key=value` (repeatable), plus `--repo` / `--commit` / `--agent` to override detection. Without a key, uploads land anonymously, expire in 24 hours and return a one-shot claim token.
+Push flags: `--run`, `--pull-request`, `--reference` (repeatable), `--session`, `--title`, `--caption` (repeatable), `--metadata key=value` (repeatable), plus `--repo` / `--commit` / `--agent` to override detection. Without a key, uploads land anonymously, expire in 24 hours and return a one-shot claim token.
 
 ### Metadata
 
@@ -82,6 +82,7 @@ Key names follow the canon vocabulary: OpenTelemetry's where OTel has a word, `k
 | `krowk.change.url` / `vcs.change.id` | `--pull-request` (or `GITHUB_REF` in a PR build); the id is derived from the URL |
 | `krowk.session` | `--session`, else `KROWK_SESSION`, `CLAUDE_CODE_SESSION_ID`, `CURSOR_TRACE_ID`, `GITHUB_RUN_ID` |
 | `krowk.references` / `vcs.change.title` | `--reference` (always a list), `--title` |
+| `krowk.caption` | `--caption` — on the artifact, not the run: what that one file shows |
 | `krowk.client` | krowk itself: `krowk-cli/…` or `krowk-mcp/…` |
 | anything else | `--metadata key=value` — your value wins over a detected one, standard keys included |
 

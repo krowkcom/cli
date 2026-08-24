@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -129,6 +131,105 @@ func finalize(t *testing.T, server *httptest.Server, token string, payload map[s
 	t.Helper()
 	slug, _ := payload["slug"].(string)
 	return request(t, http.MethodPut, server.URL+"/v1/artifacts/"+slug+"/finalization", token, "", "")
+}
+
+// putSigned uploads with exactly the headers the declare handed back, which is
+// what a client does and what storage checks. put's fixed text/plain cannot
+// carry a typed artifact: the content type is signed into the upload, so
+// sending another one is refused the way a bad signature is.
+func putSigned(t *testing.T, payload map[string]any, body string) int {
+	t.Helper()
+	upload, _ := payload["upload"].(map[string]any)
+	headers, _ := upload["headers"].(map[string]any)
+	req, err := http.NewRequest(http.MethodPut, uploadURL(t, payload), strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range headers {
+		if text, ok := value.(string); ok {
+			req.Header.Set(name, text)
+		}
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	return res.StatusCode
+}
+
+// pngBytes is a real PNG of the given size, encoded rather than hand-built so
+// the header under test is the one the standard library writes.
+func pngBytes(t *testing.T, width, height int) string {
+	t.Helper()
+	var encoded strings.Builder
+	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, width, height))); err != nil {
+		t.Fatal(err)
+	}
+	return encoded.String()
+}
+
+// The registry measures an image at finalize and serves the pair on every read
+// of it, so this has to as well. A client or a page that found dimensions here
+// and none in production would have passed against a stand-in that drifted,
+// which is the whole failure the shared contract exists to prevent.
+func TestFinalizeMeasuresAnImageAndServesItsSize(t *testing.T) {
+	server, _ := newClockedServer(t)
+	body := pngBytes(t, 320, 200)
+
+	payload := declareTyped(t, server, "krowk_sk_test", "shot.png", "image/png", body)
+	// Nothing is measured before storage confirms the bytes, exactly as the size
+	// on the record is the declared one until then.
+	if payload["width"] != nil {
+		t.Errorf("declared width = %v, want null", payload["width"])
+	}
+	if status := putSigned(t, payload, body); status != http.StatusOK {
+		t.Fatalf("put = %d", status)
+	}
+
+	status, ready := finalize(t, server, "krowk_sk_test", payload)
+	if status != http.StatusOK {
+		t.Fatalf("finalize = %d %v", status, ready)
+	}
+	if ready["width"] != float64(320) || ready["height"] != float64(200) {
+		t.Errorf("size = %vx%v, want 320x200", ready["width"], ready["height"])
+	}
+}
+
+// Nothing to measure is null, not a missing key and not a zero — an image zero
+// pixels wide is a measurement, and this is the absence of one.
+func TestArtifactWithNothingToMeasureSendsNullDimensions(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	for _, spec := range []struct{ name, filename, contentType, body string }{
+		{"a file that is not an image", "notes.txt", "text/plain", "the bytes"},
+		{"an image whose header says nothing", "shot.png", "image/png", "not an image"},
+	} {
+		t.Run(spec.name, func(t *testing.T) {
+			payload := declareTyped(t, server, "krowk_sk_test", spec.filename, spec.contentType, spec.body)
+			if status := putSigned(t, payload, spec.body); status != http.StatusOK {
+				t.Fatalf("put = %d", status)
+			}
+
+			status, ready := finalize(t, server, "krowk_sk_test", payload)
+			if status != http.StatusOK {
+				t.Fatalf("finalize = %d %v", status, ready)
+			}
+			if ready["state"] != "ready" {
+				t.Errorf("state = %v, want ready — a measurement must never fail a push", ready["state"])
+			}
+			width, present := ready["width"]
+			if !present {
+				t.Fatal("width is missing; it has to be present and null so a reader branches on the value")
+			}
+			if width != nil {
+				t.Errorf("width = %v, want null", width)
+			}
+			if ready["height"] != nil {
+				t.Errorf("height = %v, want null", ready["height"])
+			}
+		})
+	}
 }
 
 // presign asks for the upload of an artifact again — keyless when token is "",

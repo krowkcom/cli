@@ -9,6 +9,15 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Added
+
+- `krowk registry serve` now measures an uploaded image and answers with its
+  pixel `width` and `height`, the way the real registry does — so a page or a
+  client developed against the local stand-in sees the same payload it will see
+  in production. Null for anything that is not an image and for a header the
+  standard library cannot read; WebP is the gap, since decoding one is not in
+  the standard library and this binary carries no dependencies.
+
 ## [0.6.0] - 2026-08-24
 
 Upgrading from 0.4.1 over npm? This carries everything 0.5.0 did as well —

@@ -14,6 +14,7 @@
 package registry
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -22,6 +23,16 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"image"
+	// Registering the decoders is the whole reason these are imported:
+	// image.DecodeConfig dispatches on what has registered a format, and
+	// without them it cannot read anything. PNG, JPEG and GIF are what the
+	// standard library brings, and the standard library is all this binary
+	// gets (canon, engineering/principles.md -> Where those rules bend). WebP
+	// is the gap: the registry measures one and this cannot.
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"maps"
 	"net"
@@ -109,9 +120,17 @@ type artifact struct {
 	uploaded   bool
 	storedSize int64
 	storedSum  string
-	uploadTok  string
-	uploadTil  time.Time
-	claimed    bool
+	// What the uploaded bytes measured, and what finalize copies onto the
+	// published pair below — the same two-step storedSize and storedSum take,
+	// and for the same reason: a pending artifact reports nothing storage has
+	// not confirmed yet. Zero for a non-image and for a header we cannot read.
+	storedWidth  int
+	storedHeight int
+	width        int
+	height       int
+	uploadTok    string
+	uploadTil    time.Time
+	claimed      bool
 	// deletedAt turns the record into a tombstone: the bytes are gone but the row
 	// stays, so a slug that was taken down answers 410 rather than 404. Zero means
 	// it is still live.
@@ -720,6 +739,7 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
 	a.uploaded = true
 	a.storedSize = int64(len(bytes))
 	a.storedSum = sum
+	a.storedWidth, a.storedHeight = imageSize(a.ContentType, bytes)
 	s.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
@@ -925,6 +945,7 @@ func (s *store) finalizeArtifact(w http.ResponseWriter, r *http.Request) {
 	// artifact's bytes are immutable, so its presigned URL stops working.
 	a.State = "ready"
 	a.ByteSize = a.storedSize
+	a.width, a.height = a.storedWidth, a.storedHeight
 	if a.Checksum == "" {
 		a.Checksum = a.storedSum
 	}
@@ -1877,6 +1898,42 @@ func (s *store) expired(a *artifact) bool {
 // serializeArtifact is the artifact as the API reports it. A method rather than
 // a free function because `run` is now the run itself rather than its slug, and
 // the run lives in the store — every caller already holds the lock.
+// dimensionHeaderBytes is how much of an image is read to measure it, and it is
+// the registry's number rather than a convenience: a stand-in that measured a
+// file the registry gives up on would let a client pass here and find no
+// dimensions in production. A JPEG's size marker sits behind however much EXIF
+// was written in front of it, which is what sets it.
+const dimensionHeaderBytes = 64 << 10
+
+// imageSize reads an image's pixel dimensions out of the front of its bytes, or
+// 0, 0 for anything that is not an image and any header that does not parse.
+//
+// DecodeConfig rather than Decode: it reads the header and stops, so this never
+// allocates a pixel buffer for a file the CLI's own test suite handed it.
+func imageSize(contentType string, body []byte) (int, int) {
+	mime := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	if !strings.HasPrefix(mime, "image/") {
+		return 0, 0
+	}
+	if len(body) > dimensionHeaderBytes {
+		body = body[:dimensionHeaderBytes]
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(body))
+	if err != nil {
+		return 0, 0
+	}
+	return config.Width, config.Height
+}
+
+// nullableInt sends a measurement that was never made as null rather than as 0,
+// which would read as an image zero pixels wide.
+func nullableInt(value int) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
+}
+
 func (s *store) serializeArtifact(a *artifact) map[string]any {
 	out := map[string]any{
 		"slug":         a.Slug,
@@ -1884,15 +1941,20 @@ func (s *store) serializeArtifact(a *artifact) map[string]any {
 		"filename":     a.Filename,
 		"content_type": a.ContentType,
 		"byte_size":    a.ByteSize,
-		"checksum":     a.Checksum,
-		"region":       a.Region,
-		"run":          s.serializeArtifactRun(a),
-		"url":          a.URL,
-		"file_url":     a.FileURL,
-		"markdown":     a.Markdown,
-		"paste":        pasteFor(a),
-		"expires_at":   a.ExpiresAt,
-		"created_at":   a.CreatedAt,
+		// Always present, null when there is no measurement, because that is
+		// what the registry sends: a reader branches on the value rather than
+		// on whether the key arrived.
+		"width":      nullableInt(a.width),
+		"height":     nullableInt(a.height),
+		"checksum":   a.Checksum,
+		"region":     a.Region,
+		"run":        s.serializeArtifactRun(a),
+		"url":        a.URL,
+		"file_url":   a.FileURL,
+		"markdown":   a.Markdown,
+		"paste":      pasteFor(a),
+		"expires_at": a.ExpiresAt,
+		"created_at": a.CreatedAt,
 	}
 	if len(a.Metadata) > 0 {
 		out["metadata"] = a.Metadata

@@ -9,6 +9,12 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-24
+
+Upgrading from 0.4.1 over npm? This carries everything 0.5.0 did as well —
+`--jq`, pasted links where a slug is asked for, and the rest — because 0.5.0
+was released on GitHub but never published to npm.
+
 ### Changed
 
 - Every paste form krowk prints now comes from the registry verbatim — the
@@ -117,5 +123,6 @@ the versions are the `v*` tags a release is cut from. Entries land under
   credentials travel, and a refusal is written to stderr and into the JSON
   envelope.
 
-[Unreleased]: https://github.com/krowkcom/cli/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/krowkcom/cli/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/krowkcom/cli/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/krowkcom/cli/compare/v0.4.1...v0.5.0

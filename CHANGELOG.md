@@ -18,6 +18,13 @@ the versions are the `v*` tags a release is cut from. Entries land under
   the installs that already exist. `--format markdown` therefore prints the
   whole block rather than a one-line embed, and several files come back as
   several blocks separated by a blank line rather than one line each.
+- The bundled agent skill now says plainly what it only implied: never paste a
+  bare artifact link anywhere, use `paste.markdown` / `paste.url` and pick
+  between them with the served `paste.destinations` table, and reach for
+  `--destination` where the destination is known. It also nudges: an unclaimed
+  artifact pasted into a pull request, an issue or a doc becomes a broken image
+  once it expires, so the claim step is surfaced to the person before the paste
+  rather than after. A test holds the skill to those lines.
 - `--title` no longer relabels a pasted link. It is the title of the work and
   lands on the run, as it always did; what a pasted link says about a file is
   now that file's `--caption`, which is recorded on the artifact and read back

@@ -353,3 +353,34 @@ func inlineSpans(line string) []string {
 	}
 	return spans
 }
+
+// The skill is a contract as much as a manual, and these are the lines an agent
+// has to be holding when it decides what to put in a comment. They are pinned
+// because prose drifts: a rewrite that loses the never-bare-link rule reads
+// perfectly well and quietly gives back the behaviour it exists to prevent.
+func TestSkillCarriesThePasteContract(t *testing.T) {
+	source, err := os.ReadFile(skillPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+
+	for _, want := range []struct{ what, phrase string }{
+		{"the never-bare-link invariant", "Never paste a bare artifact link"},
+		{"the flag that picks the form", "--destination"},
+		{"the served table to pick with", "paste.destinations"},
+		{"the claim nudge", "Claim it first"},
+		{"why the claim nudge exists", "expires within the day"},
+	} {
+		if !strings.Contains(text, want.phrase) {
+			t.Errorf("the skill no longer carries %s (%q)", want.what, want.phrase)
+		}
+	}
+
+	// And it assembles nothing: an example of an embed in the skill is an
+	// invitation to build one, which is the whole of what the envelope exists
+	// to stop.
+	if strings.Contains(text, "[![") {
+		t.Error("the skill spells out an image embed — the forms come from the envelope")
+	}
+}

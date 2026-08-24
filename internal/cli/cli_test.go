@@ -827,35 +827,40 @@ func TestSessionIsDetectedWithoutAFlag(t *testing.T) {
 func TestMarkdownFormatIsPasteReady(t *testing.T) {
 	h := newHarness(t, 0)
 
-	_, stdout, _ := h.run("push", h.fixture, "--title=Checkout", "--format=markdown")
+	_, stdout, _ := h.run("push", h.fixture, "--caption=Checkout", "--format=markdown")
 
-	// An image embeds and the title labels it — and the embed names the bytes
-	// while the link around it names the card page, which is the only pair of
-	// URLs that both renders in a pull request and clicks through to the run.
-	want := regexp.MustCompile(`^\[!\[Checkout]\(http.+checkout-after\.png\)]\(http.+/a/art_\w+\)$`)
+	// The whole block, as the registry computed it: an image embed naming the
+	// bytes, wrapped in a link to the card page — the only pair of URLs that
+	// both renders in a pull request and clicks through to the run — and under
+	// it the caption and the link, spelled out for a reader.
+	want := regexp.MustCompile(
+		`^\[!\[Checkout]\(http.+checkout-after\.png\)]\(http.+/a/art_\w+\)\n` +
+			`Checkout · \[View preview ↗]\(http.+/a/art_\w+\)$`)
 	if !want.MatchString(strings.TrimSpace(stdout)) {
 		t.Errorf("markdown = %q", stdout)
 	}
 }
 
-func TestMarkdownGivesOneLinePerFile(t *testing.T) {
+func TestMarkdownGivesOneBlockPerFile(t *testing.T) {
 	h := newHarness(t, 0)
 	second := h.write("log.txt", "the build log")
 
 	_, stdout, _ := h.run("push", h.fixture, second, "--format=markdown")
 
-	lines := strings.Split(strings.TrimSpace(stdout), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("want a line per file, got %q", stdout)
+	// A blank line between the blocks, because a block is more than one line
+	// and CommonMark would fold the pair into a single paragraph.
+	blocks := strings.Split(strings.TrimSpace(stdout), "\n\n")
+	if len(blocks) != 2 {
+		t.Fatalf("want a block per file, got %q", stdout)
 	}
-	// The image embeds; the log is a plain link. Both are wrapped in, or are,
-	// a link to the card page.
-	if !strings.HasPrefix(lines[0], "[![") || !strings.HasPrefix(lines[1], "[log.txt](") {
+	// The image embeds; the log has nothing to embed and leads with its name
+	// in bold instead. Both link to the card page.
+	if !strings.HasPrefix(blocks[0], "[![") || !strings.HasPrefix(blocks[1], "**log.txt**") {
 		t.Errorf("markdown = %q", stdout)
 	}
-	for i, line := range lines {
-		if !strings.HasSuffix(line, ")") || !strings.Contains(line, "/a/art_") {
-			t.Errorf("line %d = %q, want it to link to a card page", i, line)
+	for i, block := range blocks {
+		if !strings.Contains(block, "/a/art_") {
+			t.Errorf("block %d = %q, want it to link to a card page", i, block)
 		}
 	}
 }
@@ -2353,5 +2358,60 @@ func TestSeveralBlocksArePastedAsSeveralBlocks(t *testing.T) {
 	}
 	if !strings.Contains(out, "\n\n") {
 		t.Errorf("--destination github printed %q, want a blank line between the blocks", out)
+	}
+}
+
+// The last thing printed is the thing that gets copied — by a person dragging a
+// selection, by an agent taking the tail of what it was shown. So the last
+// thing printed is the block, not a bare link.
+func TestHumanOutputEndsWithTheBlock(t *testing.T) {
+	h := newHarness(t, 0)
+
+	_, stdout, _ := h.runOn(true, "push", h.fixture, "--caption", "Button update before")
+
+	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
+	last := lines[len(lines)-1]
+	if !strings.Contains(last, "View preview ↗") {
+		t.Errorf("last line = %q, want the block's caption line:\n%s", last, stdout)
+	}
+	if !strings.Contains(stdout, "[![Button update before](") {
+		t.Errorf("output has no block:\n%s", stdout)
+	}
+	// --quiet asks for the record and nothing suggested, block included.
+	_, quiet, _ := h.runOn(true, "push", h.fixture, "--quiet")
+	if strings.Contains(quiet, "paste this") {
+		t.Errorf("--quiet printed the block:\n%s", quiet)
+	}
+}
+
+// No paste form may be composed on this side: how a krowk reference looks has
+// to be one registry deploy away from changing everywhere, including in the
+// installs that already exist. The image embed is the shape that matters —
+// it is the one a client would be tempted to build itself.
+func TestNoPasteFormIsComposedInTheCLI(t *testing.T) {
+	for _, dir := range []string{".", "../output", "../api", "../mcp"} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+				continue
+			}
+			body, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, line := range strings.Split(string(body), "\n") {
+				// Comments may talk about the shape; code may not build it.
+				if strings.HasPrefix(strings.TrimSpace(line), "//") {
+					continue
+				}
+				if strings.Contains(line, "[![") {
+					t.Errorf("%s/%s:%d composes an image embed — the registry serves the forms",
+						dir, entry.Name(), i+1)
+				}
+			}
+		}
 	}
 }

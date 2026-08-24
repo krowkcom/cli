@@ -183,13 +183,16 @@ func TestPushReturnsBothPasteFormsLabelled(t *testing.T) {
 		"files":        []string{s.fixture},
 		"title":        "Checkout — mobile",
 		"pull_request": "https://github.com/acme/storefront/pull/412",
+		"metadata":     map[string]any{"krowk.caption": "Checkout on mobile"},
 	})
 	if result["isError"] == true {
 		t.Fatalf("push failed: %s", text(t, result))
 	}
 
 	body := text(t, result)
-	for _, want := range []string{"Paste into GitHub", "Paste into Slack", "![Checkout — mobile]("} {
+	// The caption is the artifact's own, so it is what the block says. A title
+	// names the work and stays on the run.
+	for _, want := range []string{"Paste into GitHub", "Paste into Slack", "![Checkout on mobile]("} {
 		if !strings.Contains(body, want) {
 			t.Errorf("text is missing %q:\n%s", want, body)
 		}
@@ -205,7 +208,7 @@ func TestPushReturnsBothPasteFormsLabelled(t *testing.T) {
 	url, _ := paste["url"].(string)
 	// The embed names the bytes and is wrapped in a link to the card page, so
 	// it starts with the wrapping link rather than with the bang.
-	if !strings.HasPrefix(markdown, "[![Checkout — mobile](") {
+	if !strings.HasPrefix(markdown, "[![Checkout on mobile](") {
 		t.Errorf("paste.markdown = %q", markdown)
 	}
 	if url == "" || strings.Contains(url, "![") {

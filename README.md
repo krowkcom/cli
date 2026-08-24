@@ -81,7 +81,7 @@ Key names follow the canon vocabulary: OpenTelemetry's where OTel has a word, `k
 | `gen_ai.request.model` / `gen_ai.system` | `KROWK_MODEL`, else `ANTHROPIC_MODEL`; the provider follows the model's family (or the harness), never a guess |
 | `krowk.change.url` / `vcs.change.id` | `--pull-request` (or `GITHUB_REF` in a PR build); the id is derived from the URL |
 | `krowk.session` | `--session`, else `KROWK_SESSION`, `CLAUDE_CODE_SESSION_ID`, `CURSOR_TRACE_ID`, `GITHUB_RUN_ID` |
-| `krowk.references` / `vcs.change.title` | `--reference` (always a list), `--title` |
+| `krowk.references` / `vcs.change.title` | `--reference` (always a list), `--title` — the work's title, not the paste's label |
 | `krowk.caption` | `--caption` — on the artifact, not the run: what that one file shows |
 | `krowk.client` | krowk itself: `krowk-cli/…` or `krowk-mcp/…` |
 | anything else | `--metadata key=value` — your value wins over a detected one, standard keys included |
@@ -100,11 +100,13 @@ krowk push shot.png --caption "Cart before the fix" --destination github
 
 Which tool wants which form is the registry's table, served with the artifact and readable at `paste.destinations` in the JSON envelope — so a tool proving out reaches installs that predate it. `--format markdown` and `--format url` remain as explicit overrides.
 
+Without a destination, ordinary human output ends with the block anyway, so the last thing on screen is the thing worth copying. Every form is computed by the registry and passed through untouched — krowk assembles no paste of its own, which is what lets the look of a krowk reference change in one deploy, for installs that already exist.
+
 ## For AI agents
 
 The agent skill at [`skills/krowk/SKILL.md`](skills/krowk/SKILL.md) teaches an agent the whole tool — the installer drops it into `~/.claude/skills` automatically. The essentials:
 
-- **Output is JSON when piped** (or with `--json`): one envelope for every command — `ok`, `data`, `paste` (both share formats, pre-built), `summary` and `breadcrumbs`.
+- **Output is JSON when piped** (or with `--json`): one envelope for every command — `ok`, `data`, `paste` (both forms as the registry computed them, plus the `destinations` table saying which tool wants which), `summary` and `breadcrumbs`.
 - **Breadcrumbs are ready-to-run commands**, with this result's own slugs and tokens filled in. Substitute any `<placeholder>` before running — never paste one into a shell verbatim.
 - **`krowk help --json`** returns the entire command surface — commands, flags, types, defaults, environment variables — so an agent discovers krowk without parsing prose. It is generated from the same catalog that routes commands, so it cannot drift.
 - **`--jq '<expr>'` filters that JSON in-process** — jq compiled in, no jq binary and no pipe. It implies `--json` and reads what the command rendered: the envelope, or the bare record under `--quiet`. A string result prints unquoted, so `URL=$(krowk push shot.png --jq '.data.artifacts[0].url')` is the whole ceremony. A bad expression fails as `bad_jq` before anything is sent; one that compiles and then does not fit the result fails as `jq_failed` afterwards, saying that the command itself succeeded. `doctor` and `upgrade` answer with a bare record rather than an envelope, and `auth token`, `registry serve` and `--version` answer with no JSON at all and refuse the flag — `krowk help --json` marks those `no_json`.

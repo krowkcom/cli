@@ -33,11 +33,16 @@ const (
 // Slack renders no markdown image embeds at all and unfurls a bare URL into a
 // card of its own. So the CLI carries both and says which is which.
 type Paste struct {
-	// Markdown embeds the image and links through to the artifact. This is
-	// the form for GitHub, Linear and Notion.
+	// Markdown is the krowk block: the image, the caption, the link through to
+	// the card. This is the form for GitHub, Linear and Notion.
 	Markdown string `json:"markdown"`
 	// URL is the bare link, for Slack and Basecamp, which unfurl it themselves.
 	URL string `json:"url"`
+	// Destinations maps a tool name to the form it wants, `_default` answering
+	// for the ones not named. It is the registry's table, passed straight
+	// through, so an agent picks by destination without krowk having to be
+	// upgraded when a tool proves out.
+	Destinations map[string]string `json:"destinations,omitempty"`
 }
 
 // EmbedSurfaces and LinkSurfaces name where each form belongs, so the choice
@@ -50,9 +55,39 @@ const (
 	LinkSurfaces  = "Slack, Basecamp — they unfurl the link themselves"
 )
 
-// PasteFor builds both forms for one artifact.
-func PasteFor(a *api.Artifact, title string) Paste {
-	return Paste{Markdown: MarkdownLink(a, title), URL: a.URL}
+// PasteOf is one artifact's forms, as the registry computed them.
+func PasteOf(a *api.Artifact) Paste {
+	p := Paste{Markdown: blockFor(a), URL: cardFor(a)}
+	if a.Paste != nil {
+		p.Destinations = a.Paste.Destinations
+	}
+	return p
+}
+
+// blockFor is the artifact's krowk block, and nothing this side made up. The
+// registry computes it — the image, the caption off the record, the link
+// through to the card, the expiry when there is one — so how a krowk reference
+// looks changes in one deploy, including for the installs that already exist.
+//
+// Older registries send only the single-line `markdown` field, which is theirs
+// too. One that sends neither leaves nothing to paste but the link itself:
+// composing a form here is what this exists to stop.
+func blockFor(a *api.Artifact) string {
+	if a.Paste != nil && a.Paste.Markdown != "" {
+		return a.Paste.Markdown
+	}
+	if a.Markdown != "" {
+		return a.Markdown
+	}
+	return a.URL
+}
+
+// cardFor is the bare link form: the registry's, where it sent one.
+func cardFor(a *api.Artifact) string {
+	if a.Paste != nil && a.Paste.URL != "" {
+		return a.Paste.URL
+	}
+	return a.URL
 }
 
 // MarkdownSurfacesFor is the honest label for a paste's markdown form: it only
@@ -197,52 +232,6 @@ func RelativeExpiry(iso string, now time.Time) string {
 	return fmt.Sprintf("expires in %dd", int(d.Round(24*time.Hour).Hours()/24))
 }
 
-// MarkdownLink is the paste-ready link for one artifact. The registry renders
-// this itself — an image embed that clicks through to the card page, anything
-// else a plain link to the card — so its version is used unless a title was
-// asked for, which only the caller knows.
-func MarkdownLink(a *api.Artifact, title string) string {
-	if title == "" && a.Markdown != "" {
-		return a.Markdown
-	}
-	label := title
-	if label == "" {
-		label = a.Filename
-	}
-	if label == "" {
-		label = a.Slug
-	}
-	return link(strings.HasPrefix(a.ContentType, "image/"), label, a.FileURL, a.URL)
-}
-
-// labelEscaper escapes the characters that end or nest a link label, and folds
-// newlines to spaces because CommonMark link text cannot span lines. Parens
-// are legal in link text, so they stay.
-var labelEscaper = strings.NewReplacer(`\`, `\\`, `[`, `\[`, `]`, `\]`, "\n", " ", "\r", " ")
-
-// link renders one artifact two ways, and the two URLs are not
-// interchangeable. An image embed has to name the bytes — a paste destination
-// renders an image only where the link resolves to image bytes, and the card
-// page resolves to HTML — but the image is then wrapped in a link to the card,
-// so clicking through lands on the page with the run metadata rather than on a
-// bare file. Anything that cannot be embedded is a plain link to the card.
-//
-// fileURL empty falls back to the card: an artifact assembled on this side
-// rather than read from the registry has no byte URL, and an embed pointing at
-// nothing is worse than a link that works.
-func link(embed bool, label, fileURL, cardURL string) string {
-	// Labels are user-controlled — a title, a filename — so delimiter
-	// characters must leave here escaped or the link breaks where it is pasted.
-	label = labelEscaper.Replace(label)
-	if embed {
-		if fileURL == "" {
-			fileURL = cardURL
-		}
-		return fmt.Sprintf("[![%s](%s)](%s)", label, fileURL, cardURL)
-	}
-	return fmt.Sprintf("[%s](%s)", label, cardURL)
-}
-
 // Destination renders this result the way the named tool wants it pasted:
 // the krowk block where the tool renders markdown, the bare card link where it
 // unfurls one into a card of its own.
@@ -256,29 +245,9 @@ func link(embed bool, label, fileURL, cardURL string) string {
 // can tell anything about.
 func Destination(r Result, destination string) string {
 	if destinationForm(r, destination) == string(URL) {
-		lines := make([]string, 0, len(r.Artifacts))
-		for _, a := range r.Artifacts {
-			if a.Paste != nil && a.Paste.URL != "" {
-				lines = append(lines, a.Paste.URL)
-				continue
-			}
-			lines = append(lines, a.URL)
-		}
-		return strings.Join(lines, "\n")
+		return urlResult(r)
 	}
-
-	blocks := make([]string, 0, len(r.Artifacts))
-	for _, a := range r.Artifacts {
-		if a.Paste != nil && a.Paste.Markdown != "" {
-			blocks = append(blocks, a.Paste.Markdown)
-			continue
-		}
-		blocks = append(blocks, MarkdownLink(a, ""))
-	}
-	// Blank lines between blocks, not newlines: a block is more than one line,
-	// and CommonMark folds consecutive lines into one paragraph — a push of two
-	// screenshots would paste as a single run-on line.
-	return strings.Join(blocks, "\n\n")
+	return markdownResult(r)
 }
 
 // destinationForm is the form the served table names for this destination, and
@@ -333,7 +302,17 @@ func pasteForResult(r Result) *Paste {
 	if len(r.Artifacts) == 0 {
 		return nil
 	}
-	return &Paste{Markdown: markdownResult(r), URL: urlResult(r)}
+	paste := Paste{Markdown: markdownResult(r), URL: urlResult(r)}
+	// The table is the same on every artifact of one push — it is the
+	// registry's, not the artifact's — so the first one to carry it answers for
+	// the envelope.
+	for _, a := range r.Artifacts {
+		if a.Paste != nil && len(a.Paste.Destinations) > 0 {
+			paste.Destinations = a.Paste.Destinations
+			break
+		}
+	}
+	return &paste
 }
 
 // urlResult is the bare link per artifact, for the surfaces that unfurl a URL
@@ -341,7 +320,7 @@ func pasteForResult(r Result) *Paste {
 func urlResult(r Result) string {
 	lines := make([]string, 0, len(r.Artifacts))
 	for _, a := range r.Artifacts {
-		lines = append(lines, a.URL)
+		lines = append(lines, cardFor(a))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -433,18 +412,16 @@ func ClaimCrumb(a *api.Artifact) Breadcrumb {
 	}
 }
 
+// markdownResult is every artifact's block, in order. Blocks are separated by a
+// blank line rather than a newline: a block is more than one line, and
+// CommonMark folds consecutive lines into one paragraph, so a push of two
+// screenshots would otherwise paste as a single run-on line.
 func markdownResult(r Result) string {
-	lines := make([]string, 0, len(r.Artifacts))
-	title := r.Title
-	// A title names one thing, so it labels a lone artifact and is left off a
-	// set of them rather than repeated on every line.
-	if len(r.Artifacts) > 1 {
-		title = ""
-	}
+	blocks := make([]string, 0, len(r.Artifacts))
 	for _, a := range r.Artifacts {
-		lines = append(lines, MarkdownLink(a, title))
+		blocks = append(blocks, blockFor(a))
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(blocks, "\n\n")
 }
 
 func humanResult(r Result, quiet, colour bool, now time.Time) string {
@@ -508,6 +485,18 @@ func humanResult(r Result, quiet, colour bool, now time.Time) string {
 		}
 		lines = append(lines, crumbLine("keep it", ClaimCrumb(a).Cmd, colour))
 	}
+
+	// The block goes last, and last is the point: whoever copies the final
+	// thing they were shown — a person dragging a selection, an agent taking
+	// the tail of the output — copies the pretty form rather than a bare link.
+	//
+	// Not under --quiet, which asks for the record and nothing suggested.
+	if block := markdownResult(r); !quiet && block != "" {
+		lines = append(lines,
+			"",
+			paint(colour, dim, "  paste this:"),
+			block)
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -534,11 +523,7 @@ type Listing struct {
 func List(p *api.Page, l Listing, f Format, quiet, colour bool, now time.Time) string {
 	switch f {
 	case Markdown:
-		lines := make([]string, 0, len(p.Artifacts))
-		for _, a := range p.Artifacts {
-			lines = append(lines, MarkdownLink(a, ""))
-		}
-		return strings.Join(lines, "\n")
+		return markdownResult(Result{Artifacts: p.Artifacts})
 	case URL:
 		return urlResult(Result{Artifacts: p.Artifacts})
 	case Human:
@@ -638,7 +623,7 @@ func Artifact(a *api.Artifact, f Format, quiet, colour bool, now time.Time) stri
 	case Markdown:
 		return markdownResult(result)
 	case URL:
-		return a.URL
+		return cardFor(a)
 	}
 	return Upload(result, f, quiet, colour, now)
 }

@@ -24,7 +24,7 @@ lint: ## Requires golangci-lint; falls back to vet
 check: vet test ## Everything CI runs
 
 mock: ## Local stand-in for api.krowk.com on :8787
-	go run ./cmd/krowk registry serve
+	go run ./internal/devregistry
 
 install:
 	go install -trimpath -ldflags "$(LDFLAGS)" ./cmd/krowk ./cmd/krowk-mcp

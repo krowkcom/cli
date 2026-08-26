@@ -146,10 +146,10 @@ Credentials from `krowk auth login` live in `~/.config/krowk/credentials.json` (
 ```bash
 make check          # go vet + go test ./...
 make build          # → bin/krowk and bin/krowk-mcp
-krowk registry serve   # a local stand-in registry — then run any command with --dev
+make mock           # a local stand-in registry — then run any command with --dev
 ```
 
-The CLI ships the registry it develops against, so trying it out needs neither the network nor a key.
+The repository ships the registry it develops against as an internal command (`go run ./internal/devregistry`), so trying krowk out needs neither the network nor a key. It is not part of any released binary.
 
 ## Who uses Krowk?
 

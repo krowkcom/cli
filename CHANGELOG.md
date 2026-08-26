@@ -9,6 +9,15 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Removed
+
+- The `registry serve` command. It was a development tool, but it sat in the
+  public help and the surface JSON, where an agent reading `krowk --help` would
+  take it for a way to host uploads — and host them on a process whose links
+  die with it. The stand-in still exists for developing krowk itself: run it
+  with `make mock` (`go run ./internal/devregistry`) and point commands at it
+  with `--dev` as before.
+
 ## [0.6.0] - 2026-08-24
 
 Upgrading from 0.4.1 over npm? This carries everything 0.5.0 did as well —

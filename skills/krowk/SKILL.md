@@ -195,7 +195,7 @@ caused is always reported whole. An expression that does not parse fails as
 fails as `jq_failed` afterwards, and says so, because by then the command has
 already done its work and running it again would repeat it. Both exit 1.
 
-`auth token`, `registry serve` and `--version` print no JSON and refuse `--jq`
+`auth token` and `--version` print no JSON and refuse `--jq`
 rather than ignore it; `krowk help --json` marks them `no_json`. A `--jq` given
 with nothing in it — a shell expanding an unset variable — is `bad_jq`, never
 "no filter". `--jq` cannot be combined with `--format human`, `markdown` or
@@ -343,8 +343,10 @@ for a key, or asked for something a key is required for.
 **It does not work against `api.krowk.com` yet.** The endpoints and the approval
 page are not built there, so the command answers `404 no_such_endpoint` with a fix
 line saying so. Against production, `--token` is the only way in. Use this flow
-against a registry that serves it — a local `krowk registry serve`, or
-`api.krowk.com` once the gap closes.
+against a registry that serves it — the repository's dev stand-in
+(`go run ./internal/devregistry`, then `--dev`), or `api.krowk.com` once the gap
+closes. With only an installed krowk there is no local registry to point at:
+don't try to host one, run the flow with `--token` or not at all.
 
 ```bash
 krowk auth login --no-browser --json

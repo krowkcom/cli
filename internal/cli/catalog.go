@@ -338,26 +338,6 @@ func catalog() Catalog {
 			{Name: "doctor", Usage: "krowk doctor", Summary: "Check the local setup"},
 			{Name: "upgrade", Usage: "krowk upgrade", Summary: "Upgrade krowk to the latest release"},
 			{
-				Name:    "registry",
-				Summary: "The local registry to develop against",
-				Subcommands: []Command{
-					{
-						Name:    "serve",
-						NoJSON:  true,
-						Usage:   "krowk registry serve",
-						Summary: "Run a local registry to develop against",
-						Flags: []Flag{
-							{Name: "addr", Type: typeString, Default: defaultRegistryAddr,
-								Usage: "Listen address (loopback only by default)"},
-							{Name: "site", Type: typeString,
-								Usage: "Origin for the links it returns (default: the request host)"},
-							{Name: "limit-bytes", Type: typeInt,
-								Usage: "Reject uploads above this size"},
-						},
-					},
-				},
-			},
-			{
 				Name:    "help",
 				Usage:   "krowk help [command]",
 				Summary: "Show this, or one command's own help",

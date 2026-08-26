@@ -35,7 +35,7 @@ func showHelp(w io.Writer, topic []string, format output.Format, f flags) error 
 			return encodeJSON(w, c, f)
 		}
 		fmt.Fprintf(w, helpTemplate, Version, usageBlock(c),
-			defaultRegistryAddr, api.DevBaseURL, api.DefaultBaseURL,
+			api.DevBaseURL, api.DefaultBaseURL,
 			api.CredentialsPath(), config.GlobalPath())
 		return nil
 	}

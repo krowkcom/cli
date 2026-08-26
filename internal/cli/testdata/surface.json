@@ -509,38 +509,6 @@
         "summary": "Upgrade krowk to the latest release"
       },
       {
-        "name": "registry",
-        "summary": "The local registry to develop against",
-        "subcommands": [
-          {
-            "name": "serve",
-            "usage": "krowk registry serve",
-            "summary": "Run a local registry to develop against",
-            "flags": [
-              {
-                "name": "addr",
-                "type": "string",
-                "default": "127.0.0.1:8787",
-                "usage": "Listen address (loopback only by default)"
-              },
-              {
-                "name": "site",
-                "type": "string",
-                "default": "",
-                "usage": "Origin for the links it returns (default: the request host)"
-              },
-              {
-                "name": "limit-bytes",
-                "type": "int",
-                "default": "",
-                "usage": "Reject uploads above this size"
-              }
-            ],
-            "no_json": true
-          }
-        ]
-      },
-      {
         "name": "help",
         "usage": "krowk help [command]",
         "summary": "Show this, or one command's own help",

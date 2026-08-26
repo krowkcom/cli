@@ -1904,7 +1904,6 @@ func TestTheFlagIsRefusedWhereThereIsNoJSONToRead(t *testing.T) {
 	for _, args := range [][]string{
 		{"auth", "token", "--jq=.data.token"},
 		{"--version", "--jq=."},
-		{"registry", "serve", "--jq=."},
 	} {
 		code, stdout, stderr := h.runOn(false, args...)
 		if code == 0 {
@@ -2075,13 +2074,11 @@ func TestEveryCommandThatRendersJSONReachesTheFilter(t *testing.T) {
 		"config unset":   {"workspace"},
 		"help":           nil,
 		"auth login":     nil, // waits on a browser or a device code
-		"registry serve": nil, // listens until it is killed
 		"upgrade":        nil, // reaches for the release feed
 	}
 	skip := map[string]string{
-		"auth login":     "waits on an authorization that never comes",
-		"upgrade":        "would go to the network for a release",
-		"registry serve": "listens until killed — covered as a no_json refusal below",
+		"auth login": "waits on an authorization that never comes",
+		"upgrade":    "would go to the network for a release",
 	}
 
 	for _, leaf := range Surface().Leaves() {

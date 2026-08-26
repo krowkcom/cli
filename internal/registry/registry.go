@@ -333,7 +333,7 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	// an unfurler is an HTTP client with no credentials that reads the tags out
 	// of the first response and never runs any script. In production the Nuxt
 	// site serves this off the registry's data; here it is the same origin, so
-	// a paste out of `krowk registry serve` unfurls the way production does.
+	// a paste out of the dev stand-in unfurls the way production does.
 	mux.HandleFunc("GET /a/{slug}", s.artifactPage)
 
 	// A path that matches nothing, which includes a known path asked for with a
@@ -464,7 +464,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	// The card page is the link, the storage path is where the bytes are. The
 	// real registry serves the first from krowk.com and the second from the
 	// CDN; here one origin serves both, which is enough for a paste against
-	// `krowk registry serve` to behave the way a paste against production does.
+	// the dev stand-in to behave the way a paste against production does.
 	fileURL := site + "/_storage/" + key
 	url := site + "/a/" + slug
 	now := s.now().UTC()
@@ -1822,7 +1822,7 @@ func (s *store) authorizationExpired(a *authorization) bool {
 // sweepAuthorizations drops what has been lapsed long enough that nobody is still
 // asking about it. The real registry sweeps on a schedule; here it runs when a
 // login is opened, which is the only moment this map can grow — otherwise a
-// `registry serve` left up all week accumulates every login it ever answered, and
+// stand-in left up all week accumulates every login it ever answered, and
 // the lookup by code walks all of them.
 //
 // The grace period is what keeps `410 expired` meaningful. Reaping at the window's

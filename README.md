@@ -109,7 +109,7 @@ The agent skill at [`skills/krowk/SKILL.md`](skills/krowk/SKILL.md) teaches an a
 - **Output is JSON when piped** (or with `--json`): one envelope for every command — `ok`, `data`, `paste` (both forms as the registry computed them, plus the `destinations` table saying which tool wants which), `summary` and `breadcrumbs`.
 - **Breadcrumbs are ready-to-run commands**, with this result's own slugs and tokens filled in. Substitute any `<placeholder>` before running — never paste one into a shell verbatim.
 - **`krowk help --json`** returns the entire command surface — commands, flags, types, defaults, environment variables — so an agent discovers krowk without parsing prose. It is generated from the same catalog that routes commands, so it cannot drift.
-- **`--jq '<expr>'` filters that JSON in-process** — jq compiled in, no jq binary and no pipe. It implies `--json` and reads what the command rendered: the envelope, or the bare record under `--quiet`. A string result prints unquoted, so `URL=$(krowk push shot.png --jq '.data.artifacts[0].url')` is the whole ceremony. A bad expression fails as `bad_jq` before anything is sent; one that compiles and then does not fit the result fails as `jq_failed` afterwards, saying that the command itself succeeded. `doctor` and `upgrade` answer with a bare record rather than an envelope, and `auth token`, `registry serve` and `--version` answer with no JSON at all and refuse the flag — `krowk help --json` marks those `no_json`.
+- **`--jq '<expr>'` filters that JSON in-process** — jq compiled in, no jq binary and no pipe. It implies `--json` and reads what the command rendered: the envelope, or the bare record under `--quiet`. A string result prints unquoted, so `URL=$(krowk push shot.png --jq '.data.artifacts[0].url')` is the whole ceremony. A bad expression fails as `bad_jq` before anything is sent; one that compiles and then does not fit the result fails as `jq_failed` afterwards, saying that the command itself succeeded. `doctor` and `upgrade` answer with a bare record rather than an envelope, and `auth token` and `--version` answer with no JSON at all and refuse the flag — `krowk help --json` marks those `no_json`.
 - **A claim token is a one-shot secret.** It keeps an anonymous upload; never put one in a PR comment or anywhere public.
 - **Exit codes classify the failure**: `0` ok · `1` bad command · `2` not found · `3` needs credentials · `4` refused, retrying won't help · `5` rate limited · `6` transfer failed, retry · `7` server error, retry · `8` gone, don't retry.
 
@@ -146,10 +146,10 @@ Credentials from `krowk auth login` live in `~/.config/krowk/credentials.json` (
 ```bash
 make check          # go vet + go test ./...
 make build          # → bin/krowk and bin/krowk-mcp
-krowk registry serve   # a local stand-in registry — then run any command with --dev
+make mock           # a local stand-in registry — then run any command with --dev
 ```
 
-The CLI ships the registry it develops against, so trying it out needs neither the network nor a key.
+The repository ships the registry it develops against as an internal command (`go run ./internal/devregistry`), so trying krowk out needs neither the network nor a key. It is not part of any released binary.
 
 ## Who uses Krowk?
 

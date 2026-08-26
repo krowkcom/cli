@@ -57,8 +57,9 @@ import (
 const (
 	// DefaultBaseURL is overridden by KROWK_API_URL.
 	DefaultBaseURL = "https://api.krowk.com/v1"
-	// DevBaseURL is where `krowk registry serve` listens, and what --dev points
-	// at, so testing against a local registry needs no environment plumbing.
+	// DevBaseURL is where the local stand-in registry (`go run
+	// ./internal/devregistry`) listens, and what --dev points at, so testing
+	// against a local registry needs no environment plumbing.
 	DevBaseURL  = "http://localhost:8787/v1"
 	maxAttempts = 3
 )

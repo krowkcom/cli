@@ -1,4 +1,4 @@
-# action.yml — the GitHub Action face of the CLI: `uses: krowkcom/cli@v1`.
+# action.yml — the GitHub Action face of the CLI: `uses: krowkcom/cli@<tag>`.
 #
 # It is a composite of two bash steps, install then push, because that is all
 # the action does: put the binary on the runner and run the same `krowk push`
@@ -68,9 +68,20 @@ runs:
         KROWK_SKIP_SKILL: "1"
       run: |
         set -euo pipefail
+        if [ "${RUNNER_OS:-}" = "Windows" ]; then
+          echo "::error::This action supports Linux and macOS runners" >&2
+          exit 1
+        fi
         export KROWK_BIN_DIR="$RUNNER_TEMP/krowk-bin"
         mkdir -p "$KROWK_BIN_DIR"
-        curl -fsSL https://krowk.com/install | bash
+        # Already on PATH before the installer runs, so its setup_path leaves
+        # the runner's dotfiles alone — a self-hosted runner keeps its .bashrc.
+        export PATH="$KROWK_BIN_DIR:$PATH"
+        # The installer comes from this action's own ref, so pinning the action
+        # by tag or SHA pins the code that runs — krowk.com/install is the
+        # fallback for a checkout that is not running as an action.
+        installer="https://raw.githubusercontent.com/${GITHUB_ACTION_REPOSITORY:-krowkcom/cli}/${GITHUB_ACTION_REF:-main}/scripts/install.sh"
+        curl -fsSL "$installer" | bash
         echo "$KROWK_BIN_DIR" >> "$GITHUB_PATH"
 
     - name: Push files
@@ -85,6 +96,14 @@ runs:
       run: |
         set -euo pipefail
         shopt -s nullglob globstar
+
+        # jq parses the envelope below. Hosted runners ship it; a container or
+        # self-hosted runner may not, and the failure should say so.
+        command -v jq >/dev/null || { echo "::error::jq is required and is not on this runner" >&2; exit 1; }
+
+        # Mask the token even when it did not come from a secret, so a krowk
+        # error that echoes configuration cannot surface it in the log.
+        [ -n "$KROWK_TOKEN" ] && echo "::add-mask::$KROWK_TOKEN"
 
         # Split the input into patterns with globbing off, so an unmatched
         # pattern survives to be named in the error instead of vanishing under
@@ -101,6 +120,14 @@ runs:
             echo "::error::No file matches '$pattern'" >&2
             exit 1
           fi
+          # nullglob only drops unmatched *globs* — a literal path survives
+          # expansion whether it exists or not, so existence is its own check.
+          for f in "${matched[@]}"; do
+            if [ ! -e "$f" ]; then
+              echo "::error::No file matches '$pattern'" >&2
+              exit 1
+            fi
+          done
           files+=("${matched[@]}")
         done
         if [ ${#files[@]} -eq 0 ]; then
@@ -124,8 +151,17 @@ runs:
           printf '%s<<%s\n%s\n%s\n' "$name" "$eof" "$value" "$eof" >> "$GITHUB_OUTPUT"
         }
 
+        # A keyless push answers with claim tokens — the capability to claim
+        # or delete the upload. Mask each one, then strip them (and the
+        # breadcrumbs that quote them) before anything reaches an output a
+        # later step might paste into a PR comment.
+        jq -r '.. | .claim_token? // empty' <<<"$out" | while IFS= read -r t; do
+          echo "::add-mask::$t"
+        done
+        out=$(jq 'del(.breadcrumbs) | del(.data.artifacts[]?.claim_token)' <<<"$out")
+
         emit json "$out"
-        emit urls "$(jq -r '.data.artifacts[].url' <<<"$out")"
+        emit urls "$(jq -r '.data.artifacts[]?.url // empty' <<<"$out")"
         emit markdown "$(jq -r '.paste.markdown // ""' <<<"$out")"
         printf 'run-slug=%s\n' "$(jq -r '.data.run.slug // ""' <<<"$out")" >> "$GITHUB_OUTPUT"
 
@@ -133,5 +169,5 @@ runs:
         {
           echo "### Krowk uploads"
           echo
-          jq -r '.data.artifacts[] | "- \(.url)"' <<<"$out"
+          jq -r '.data.artifacts[]? | "- \(.url)"' <<<"$out"
         } >> "$GITHUB_STEP_SUMMARY"

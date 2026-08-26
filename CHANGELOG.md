@@ -9,6 +9,15 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Added
+
+- A GitHub Action, `uses: krowkcom/cli@<tag>`, wrapping the CLI for CI: give it
+  files or globs, it installs the binary, pushes them, and hands back `urls`,
+  a `markdown` paste block ready for a PR comment, the `run-slug` and the full
+  `json` envelope — with the links also written to the job's step summary. The
+  pull request, repo and commit are detected from the runner's environment,
+  the same way they are locally.
+
 ## [0.7.0] - 2026-08-26
 
 ### Removed

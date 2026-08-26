@@ -1,0 +1,175 @@
+# action.yml — the GitHub Action face of the CLI: `uses: krowkcom/cli@<tag>`.
+#
+# It is a composite of two bash steps, install then push, because that is all
+# the action does: put the binary on the runner and run the same `krowk push`
+# a person would. Everything the CLI detects on its own — repo, commit, branch,
+# the pull request from GITHUB_REF, the agent, the session from GITHUB_RUN_ID —
+# it detects here too, so the useful invocation is just `files:`.
+name: Krowk
+description: >-
+  Upload screenshots, videos and other agent output to Krowk and get permalinks
+  back — ready to paste into a pull request comment.
+branding:
+  icon: upload
+  color: gray-dark
+
+inputs:
+  files:
+    description: >-
+      Files to upload — paths or globs, separated by whitespace or newlines.
+      Globs support ** (e.g. screenshots/**/*.png).
+    required: true
+  token:
+    description: >-
+      A workspace API key, so the uploads land in your workspace instead of
+      expiring after 24 hours. Pass a secret; without it the push is keyless.
+    required: false
+  version:
+    description: The CLI version to install, e.g. 0.7.0. Defaults to the latest release.
+    required: false
+  run-slug:
+    description: Attach the uploads to this existing run instead of opening one.
+    required: false
+  title:
+    description: Title for the work this push belongs to, recorded on the run.
+    required: false
+  pull-request:
+    description: >-
+      Pull request URL the work belongs to. Only needed when the workflow does
+      not run on the pull request itself — on pull_request events it is
+      detected from GITHUB_REF.
+    required: false
+
+outputs:
+  urls:
+    description: One artifact URL per line, in the order the files were given.
+    value: ${{ steps.push.outputs.urls }}
+  markdown:
+    description: >-
+      The registry's markdown paste block for all uploads — what to put in a
+      pull request comment.
+    value: ${{ steps.push.outputs.markdown }}
+  run-slug:
+    description: The run the uploads were recorded under, e.g. run_8Kd2wq.
+    value: ${{ steps.push.outputs.run-slug }}
+  json:
+    description: >-
+      The JSON envelope from `krowk push --json`, with claim tokens and
+      breadcrumbs stripped so it is safe to paste.
+    value: ${{ steps.push.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install krowk
+      shell: bash
+      env:
+        KROWK_VERSION: ${{ inputs.version }}
+        # The runner already has its skills; installing one here would write
+        # into a throwaway home directory anyway.
+        KROWK_SKIP_SKILL: "1"
+      run: |
+        set -euo pipefail
+        if [ "${RUNNER_OS:-}" = "Windows" ]; then
+          echo "::error::This action supports Linux and macOS runners" >&2
+          exit 1
+        fi
+        export KROWK_BIN_DIR="$RUNNER_TEMP/krowk-bin"
+        mkdir -p "$KROWK_BIN_DIR"
+        # Already on PATH before the installer runs, so its setup_path leaves
+        # the runner's dotfiles alone — a self-hosted runner keeps its .bashrc.
+        export PATH="$KROWK_BIN_DIR:$PATH"
+        # The installer ships with the action itself — the runner already has
+        # this repo on disk at GITHUB_ACTION_PATH — so pinning the action by
+        # tag or SHA pins the code that runs, with no fetch to go stale and
+        # nothing hard-coded that GitHub Enterprise would not resolve.
+        bash "${GITHUB_ACTION_PATH:?}/scripts/install.sh"
+        echo "$KROWK_BIN_DIR" >> "$GITHUB_PATH"
+
+    - name: Push files
+      id: push
+      shell: bash
+      env:
+        KROWK_TOKEN: ${{ inputs.token }}
+        INPUT_FILES: ${{ inputs.files }}
+        INPUT_RUN: ${{ inputs.run-slug }}
+        INPUT_TITLE: ${{ inputs.title }}
+        INPUT_PULL_REQUEST: ${{ inputs.pull-request }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob globstar
+
+        # jq parses the envelope below. Hosted runners ship it; a container or
+        # self-hosted runner may not, and the failure should say so.
+        command -v jq >/dev/null || { echo "::error::jq is required and is not on this runner" >&2; exit 1; }
+
+        # Mask the token even when it did not come from a secret, so a krowk
+        # error that echoes configuration cannot surface it in the log.
+        [ -n "$KROWK_TOKEN" ] && echo "::add-mask::$KROWK_TOKEN"
+
+        # Split the input into patterns with globbing off, so an unmatched
+        # pattern survives to be named in the error instead of vanishing under
+        # nullglob; then expand each one with globbing back on. The input is
+        # whitespace-separated — a path with a space in it reaches krowk
+        # through a glob.
+        set -f
+        read -d '' -ra patterns <<<"$INPUT_FILES" || true
+        set +f
+        files=()
+        for pattern in "${patterns[@]}"; do
+          matched=($pattern)
+          if [ ${#matched[@]} -eq 0 ]; then
+            echo "::error::No file matches '$pattern'" >&2
+            exit 1
+          fi
+          # nullglob only drops unmatched *globs* — a literal path survives
+          # expansion whether it exists or not, so existence is its own check.
+          for f in "${matched[@]}"; do
+            if [ ! -e "$f" ]; then
+              echo "::error::No file matches '$pattern'" >&2
+              exit 1
+            fi
+          done
+          files+=("${matched[@]}")
+        done
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "::error::The 'files' input is empty" >&2
+          exit 1
+        fi
+
+        args=(push "${files[@]}" --json)
+        [ -n "$INPUT_RUN" ] && args+=(--run "$INPUT_RUN")
+        [ -n "$INPUT_TITLE" ] && args+=(--title "$INPUT_TITLE")
+        [ -n "$INPUT_PULL_REQUEST" ] && args+=(--pull-request "$INPUT_PULL_REQUEST")
+
+        out=$(krowk "${args[@]}")
+
+        # Multi-line values go through the heredoc form of GITHUB_OUTPUT. The
+        # delimiter is random so no artifact caption can terminate it early.
+        emit() {
+          local name="$1" value="$2"
+          local eof
+          eof="EOF_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          printf '%s<<%s\n%s\n%s\n' "$name" "$eof" "$value" "$eof" >> "$GITHUB_OUTPUT"
+        }
+
+        # A keyless push answers with claim tokens — the capability to claim
+        # or delete the upload. Mask each one, then strip them (and the
+        # breadcrumbs that quote them) before anything reaches an output a
+        # later step might paste into a PR comment.
+        jq -r '.. | .claim_token? // empty' <<<"$out" | while IFS= read -r t; do
+          echo "::add-mask::$t"
+        done
+        out=$(jq 'del(.breadcrumbs) | del(.data.artifacts[]?.claim_token)' <<<"$out")
+
+        emit json "$out"
+        emit urls "$(jq -r '.data.artifacts[]?.url // empty' <<<"$out")"
+        emit markdown "$(jq -r '.paste.markdown // ""' <<<"$out")"
+        printf 'run-slug=%s\n' "$(jq -r '.data.run.slug // ""' <<<"$out")" >> "$GITHUB_OUTPUT"
+
+        # The summary makes the links clickable without a PR comment step.
+        {
+          echo "### Krowk uploads"
+          echo
+          jq -r '.data.artifacts[]? | "- \(.url)"' <<<"$out"
+        } >> "$GITHUB_STEP_SUMMARY"

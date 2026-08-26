@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
@@ -193,6 +195,64 @@ func TestFinalizeMeasuresAnImageAndServesItsSize(t *testing.T) {
 	}
 	if ready["width"] != float64(320) || ready["height"] != float64(200) {
 		t.Errorf("size = %vx%v, want 320x200", ready["width"], ready["height"])
+	}
+}
+
+// WebP is the format the standard library cannot decode, so the stand-in reads
+// its header by hand — and a hand-rolled parser is only worth trusting against
+// bytes something else produced. These three are real files, one per encoding
+// a WebP can hold, all 40x24.
+func TestFinalizeMeasuresEveryWebPEncoding(t *testing.T) {
+	for _, name := range []string{"tiny-vp8.webp", "tiny-vp8l.webp", "tiny-vp8x.webp"} {
+		t.Run(name, func(t *testing.T) {
+			server, _ := newClockedServer(t)
+			raw, err := os.ReadFile(filepath.Join("testdata", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := string(raw)
+
+			payload := declareTyped(t, server, "krowk_sk_test", name, "image/webp", body)
+			if status := putSigned(t, payload, body); status != http.StatusOK {
+				t.Fatalf("put = %d", status)
+			}
+
+			status, ready := finalize(t, server, "krowk_sk_test", payload)
+			if status != http.StatusOK {
+				t.Fatalf("finalize = %d %v", status, ready)
+			}
+			if ready["width"] != float64(40) || ready["height"] != float64(24) {
+				t.Errorf("size = %vx%v, want 40x24", ready["width"], ready["height"])
+			}
+		})
+	}
+}
+
+// A RIFF container that is not a WebP, and a WebP truncated to nothing useful,
+// both have to fall through rather than read whatever is at those offsets.
+func TestWebPSizeRefusesWhatItCannotRead(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "tiny-vp8.webp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, spec := range []struct {
+		name string
+		body []byte
+	}{
+		{"too short to hold a header", raw[:20]},
+		{"a RIFF that is not a WebP", append([]byte("RIFF____AVI "), raw[16:]...)},
+		{"a lossy frame with no sync code", func() []byte {
+			broken := append([]byte(nil), raw...)
+			broken[23] = 0x00
+			return broken
+		}()},
+	} {
+		t.Run(spec.name, func(t *testing.T) {
+			if width, height, ok := webPSize(spec.body); ok {
+				t.Errorf("read %dx%d from bytes it should have refused", width, height)
+			}
+		})
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,9 +28,8 @@ import (
 	// Registering the decoders is the whole reason these are imported:
 	// image.DecodeConfig dispatches on what has registered a format, and
 	// without them it cannot read anything. PNG, JPEG and GIF are what the
-	// standard library brings, and the standard library is all this binary
-	// gets (canon, engineering/principles.md -> Where those rules bend). WebP
-	// is the gap: the registry measures one and this cannot.
+	// standard library brings; WebP it does not, so webPSize below reads that
+	// one by hand rather than this binary taking a dependency.
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
@@ -1918,11 +1918,64 @@ func imageSize(contentType string, body []byte) (int, int) {
 	if len(body) > dimensionHeaderBytes {
 		body = body[:dimensionHeaderBytes]
 	}
+	if width, height, ok := webPSize(body); ok {
+		return width, height
+	}
 	config, _, err := image.DecodeConfig(bytes.NewReader(body))
 	if err != nil {
 		return 0, 0
 	}
 	return config.Width, config.Height
+}
+
+// webPSize reads a WebP canvas size, because the standard library does not and
+// this binary takes no dependencies (canon, engineering/principles.md -> Where
+// those rules bend). Leaving it out was the alternative and it is worse than
+// forty lines: the registry measures a WebP, so a stand-in that did not would
+// answer differently from production for a format screenshot tools emit by
+// default — which is the drift the shared contract exists to prevent.
+//
+// A WebP is a RIFF container whose first chunk says which of three encodings
+// it holds, and all three state the canvas in that chunk's first bytes. Only
+// the header is read; nothing here decodes an image.
+func webPSize(body []byte) (int, int, bool) {
+	if len(body) < 30 || string(body[0:4]) != "RIFF" || string(body[8:12]) != "WEBP" {
+		return 0, 0, false
+	}
+
+	switch string(body[12:16]) {
+	case "VP8 ":
+		// Lossy. A three-byte frame tag, then a sync code that says the frame
+		// really is a keyframe, then the size as two 14-bit little-endian
+		// values — the top two bits of each pair are scaling, not size.
+		if body[23] != 0x9d || body[24] != 0x01 || body[25] != 0x2a {
+			return 0, 0, false
+		}
+		width := int(binary.LittleEndian.Uint16(body[26:28]) & 0x3fff)
+		height := int(binary.LittleEndian.Uint16(body[28:30]) & 0x3fff)
+		return width, height, width > 0 && height > 0
+
+	case "VP8L":
+		// Lossless. One signature byte, then width-1 in 14 bits and height-1 in
+		// the 14 after it, packed little-endian across four bytes.
+		if body[20] != 0x2f {
+			return 0, 0, false
+		}
+		bits := binary.LittleEndian.Uint32(body[21:25])
+		width := int(bits&0x3fff) + 1
+		height := int((bits>>14)&0x3fff) + 1
+		return width, height, true
+
+	case "VP8X":
+		// Extended — what an animation, an alpha channel or embedded metadata
+		// produces. The canvas is stated outright, as two three-byte
+		// little-endian values holding size-1.
+		width := int(uint32(body[24])|uint32(body[25])<<8|uint32(body[26])<<16) + 1
+		height := int(uint32(body[27])|uint32(body[28])<<8|uint32(body[29])<<16) + 1
+		return width, height, true
+	}
+
+	return 0, 0, false
 }
 
 // nullableInt sends a measurement that was never made as null rather than as 0,

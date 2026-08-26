@@ -15,8 +15,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   pixel `width` and `height`, the way the real registry does — so a page or a
   client developed against the local stand-in sees the same payload it will see
   in production. Null for anything that is not an image and for a header the
-  standard library cannot read; WebP is the gap, since decoding one is not in
-  the standard library and this binary carries no dependencies.
+  standard library cannot read. PNG, JPEG and GIF go through the standard
+  library; WebP has no decoder there, so its header is read directly rather
+  than the CLI taking a dependency for it.
 
 ## [0.6.0] - 2026-08-24
 

@@ -9,6 +9,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-26
+
 ### Removed
 
 - The `registry serve` command. It was a development tool, but it sat in the
@@ -132,6 +134,7 @@ was released on GitHub but never published to npm.
   credentials travel, and a refusal is written to stderr and into the JSON
   envelope.
 
-[Unreleased]: https://github.com/krowkcom/cli/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/krowkcom/cli/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/krowkcom/cli/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/krowkcom/cli/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/krowkcom/cli/compare/v0.4.1...v0.5.0

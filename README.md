@@ -128,7 +128,7 @@ The repository doubles as an action, so CI can push what a test run produced and
 
 `files` is the only required input — whitespace-separated paths or globs, so a path with a space in it has to go through a glob. The pull request, repo, commit and branch are detected from the runner's environment, exactly as they are on a laptop. `token` keeps the uploads past the keyless 24-hour expiry; `version` pins a CLI release; `run-slug` and `title` name or open the run they group under. Linux and macOS runners.
 
-Outputs: `urls` (one artifact URL per line), `markdown` (the registry's paste block, ready for a PR comment), `run-slug`, and `json` (the whole envelope, for anything else). The links also land in the job's step summary, clickable without any comment step.
+Outputs: `urls` (one artifact URL per line), `markdown` (the registry's paste block, ready for a PR comment), `run-slug`, and `json` (the envelope, claim tokens and breadcrumbs stripped, for anything else). The links also land in the job's step summary, clickable without any comment step.
 
 ## For AI agents
 

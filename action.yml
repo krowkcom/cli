@@ -53,7 +53,9 @@ outputs:
     description: The run the uploads were recorded under, e.g. run_8Kd2wq.
     value: ${{ steps.push.outputs.run-slug }}
   json:
-    description: The full JSON envelope from `krowk push --json`.
+    description: >-
+      The JSON envelope from `krowk push --json`, with claim tokens and
+      breadcrumbs stripped so it is safe to paste.
     value: ${{ steps.push.outputs.json }}
 
 runs:
@@ -77,11 +79,11 @@ runs:
         # Already on PATH before the installer runs, so its setup_path leaves
         # the runner's dotfiles alone — a self-hosted runner keeps its .bashrc.
         export PATH="$KROWK_BIN_DIR:$PATH"
-        # The installer comes from this action's own ref, so pinning the action
-        # by tag or SHA pins the code that runs — krowk.com/install is the
-        # fallback for a checkout that is not running as an action.
-        installer="https://raw.githubusercontent.com/${GITHUB_ACTION_REPOSITORY:-krowkcom/cli}/${GITHUB_ACTION_REF:-main}/scripts/install.sh"
-        curl -fsSL "$installer" | bash
+        # The installer ships with the action itself — the runner already has
+        # this repo on disk at GITHUB_ACTION_PATH — so pinning the action by
+        # tag or SHA pins the code that runs, with no fetch to go stale and
+        # nothing hard-coded that GitHub Enterprise would not resolve.
+        bash "${GITHUB_ACTION_PATH:?}/scripts/install.sh"
         echo "$KROWK_BIN_DIR" >> "$GITHUB_PATH"
 
     - name: Push files

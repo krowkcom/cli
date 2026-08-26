@@ -256,6 +256,42 @@ func TestWebPSizeRefusesWhatItCannotRead(t *testing.T) {
 	}
 }
 
+// The registry measures an SVG, so this does too. A percentage-sized one is
+// deliberately not a measurement: it means "however big the box is", which is
+// nothing a card can reserve space from.
+func TestFinalizeMeasuresAnSvgOnlyWhenItStatesAFixedSize(t *testing.T) {
+	for _, spec := range []struct {
+		name          string
+		attributes    string
+		width, height any
+	}{
+		{"pixels", `width="120px" height="80px"`, float64(120), float64(80)},
+		{"units", `width="120pt" height="80pt"`, float64(120), float64(80)},
+		{"bare numbers", `width="120" height="80"`, float64(120), float64(80)},
+		{"percentages", `width="100%" height="100%" viewBox="0 0 120 80"`, nil, nil},
+		{"a viewBox alone", `viewBox="0 0 120 80"`, nil, nil},
+	} {
+		t.Run(spec.name, func(t *testing.T) {
+			server, _ := newClockedServer(t)
+			body := `<svg xmlns="http://www.w3.org/2000/svg" ` + spec.attributes + `></svg>`
+
+			payload := declareTyped(t, server, "krowk_sk_test", "chart.svg", "image/svg+xml", body)
+			if status := putSigned(t, payload, body); status != http.StatusOK {
+				t.Fatalf("put = %d", status)
+			}
+
+			status, ready := finalize(t, server, "krowk_sk_test", payload)
+			if status != http.StatusOK {
+				t.Fatalf("finalize = %d %v", status, ready)
+			}
+			if ready["width"] != spec.width || ready["height"] != spec.height {
+				t.Errorf("size = %vx%v, want %vx%v",
+					ready["width"], ready["height"], spec.width, spec.height)
+			}
+		})
+	}
+}
+
 // Nothing to measure is null, not a missing key and not a zero — an image zero
 // pixels wide is a measurement, and this is the absence of one.
 func TestArtifactWithNothingToMeasureSendsNullDimensions(t *testing.T) {

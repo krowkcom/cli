@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"html"
@@ -1921,6 +1922,9 @@ func imageSize(contentType string, body []byte) (int, int) {
 	if width, height, ok := webPSize(body); ok {
 		return width, height
 	}
+	if width, height, ok := svgSize(mime, body); ok {
+		return width, height
+	}
 	config, _, err := image.DecodeConfig(bytes.NewReader(body))
 	if err != nil {
 		return 0, 0
@@ -1976,6 +1980,77 @@ func webPSize(body []byte) (int, int, bool) {
 	}
 
 	return 0, 0, false
+}
+
+// svgSize reads the width and height an SVG states on its root element, for the
+// same reason webPSize exists: the registry measures an SVG and a stand-in that
+// did not would answer differently for a diagram, which is a thing agents push.
+//
+// An SVG is XML, so this is encoding/xml and not a parser of our own. Only the
+// root element is read; the decoder stops at it, and the caller has already cut
+// the input down to the header budget.
+//
+// A size in units — 120pt, 120px — is 120 to a browser laying the document out,
+// so the unit is dropped rather than converted. A percentage is not a pixel
+// size at all: it means "however big the box is", which is nothing a card can
+// reserve, so it reads as no measurement. Same for an SVG that states only a
+// viewBox.
+func svgSize(mime string, body []byte) (int, int, bool) {
+	if mime != "image/svg+xml" {
+		return 0, 0, false
+	}
+
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	// Somebody else's file: without this an entity declaration is a decoder
+	// that expands rather than one that stops.
+	decoder.Strict = false
+	decoder.Entity = xml.HTMLEntity
+
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return 0, 0, false
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		if start.Name.Local != "svg" {
+			return 0, 0, false
+		}
+
+		width, height := 0, 0
+		for _, attribute := range start.Attr {
+			switch attribute.Name.Local {
+			case "width":
+				width = svgLength(attribute.Value)
+			case "height":
+				height = svgLength(attribute.Value)
+			}
+		}
+		return width, height, width > 0 && height > 0
+	}
+}
+
+// svgLength is the leading number of an SVG length, or 0 for one that does not
+// resolve to a fixed size.
+func svgLength(value string) int {
+	value = strings.TrimSpace(value)
+	if strings.HasSuffix(value, "%") {
+		return 0
+	}
+
+	digits := 0
+	for digits < len(value) && value[digits] >= '0' && value[digits] <= '9' {
+		digits++
+	}
+	// A fractional length truncates the way a pixel count has to; a length that
+	// does not start with a digit is not one this reads.
+	size, err := strconv.Atoi(value[:digits])
+	if err != nil || size <= 0 {
+		return 0
+	}
+	return size
 }
 
 // nullableInt sends a measurement that was never made as null rather than as 0,

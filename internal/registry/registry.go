@@ -14,14 +14,26 @@
 package registry
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"html"
+	"image"
+	// Registering the decoders is the whole reason these are imported:
+	// image.DecodeConfig dispatches on what has registered a format, and
+	// without them it cannot read anything. PNG, JPEG and GIF are what the
+	// standard library brings; WebP it does not, so webPSize below reads that
+	// one by hand rather than this binary taking a dependency.
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"maps"
 	"net"
@@ -109,9 +121,17 @@ type artifact struct {
 	uploaded   bool
 	storedSize int64
 	storedSum  string
-	uploadTok  string
-	uploadTil  time.Time
-	claimed    bool
+	// What the uploaded bytes measured, and what finalize copies onto the
+	// published pair below — the same two-step storedSize and storedSum take,
+	// and for the same reason: a pending artifact reports nothing storage has
+	// not confirmed yet. Zero for a non-image and for a header we cannot read.
+	storedWidth  int
+	storedHeight int
+	width        int
+	height       int
+	uploadTok    string
+	uploadTil    time.Time
+	claimed      bool
 	// deletedAt turns the record into a tombstone: the bytes are gone but the row
 	// stays, so a slug that was taken down answers 410 rather than 404. Zero means
 	// it is still live.
@@ -720,6 +740,7 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
 	a.uploaded = true
 	a.storedSize = int64(len(bytes))
 	a.storedSum = sum
+	a.storedWidth, a.storedHeight = imageSize(a.ContentType, bytes)
 	s.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
@@ -925,6 +946,7 @@ func (s *store) finalizeArtifact(w http.ResponseWriter, r *http.Request) {
 	// artifact's bytes are immutable, so its presigned URL stops working.
 	a.State = "ready"
 	a.ByteSize = a.storedSize
+	a.width, a.height = a.storedWidth, a.storedHeight
 	if a.Checksum == "" {
 		a.Checksum = a.storedSum
 	}
@@ -1877,6 +1899,169 @@ func (s *store) expired(a *artifact) bool {
 // serializeArtifact is the artifact as the API reports it. A method rather than
 // a free function because `run` is now the run itself rather than its slug, and
 // the run lives in the store — every caller already holds the lock.
+// dimensionHeaderBytes is how much of an image is read to measure it, and it is
+// the registry's number rather than a convenience: a stand-in that measured a
+// file the registry gives up on would let a client pass here and find no
+// dimensions in production. A JPEG's size marker sits behind however much EXIF
+// was written in front of it, which is what sets it.
+const dimensionHeaderBytes = 64 << 10
+
+// imageSize reads an image's pixel dimensions out of the front of its bytes, or
+// 0, 0 for anything that is not an image and any header that does not parse.
+//
+// DecodeConfig rather than Decode: it reads the header and stops, so this never
+// allocates a pixel buffer for a file the CLI's own test suite handed it.
+func imageSize(contentType string, body []byte) (int, int) {
+	mime := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	if !strings.HasPrefix(mime, "image/") {
+		return 0, 0
+	}
+	if len(body) > dimensionHeaderBytes {
+		body = body[:dimensionHeaderBytes]
+	}
+	if width, height, ok := webPSize(body); ok {
+		return width, height
+	}
+	if width, height, ok := svgSize(mime, body); ok {
+		return width, height
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(body))
+	if err != nil {
+		return 0, 0
+	}
+	return config.Width, config.Height
+}
+
+// webPSize reads a WebP canvas size, because the standard library does not and
+// this binary takes no dependencies (canon, engineering/principles.md -> Where
+// those rules bend). Leaving it out was the alternative and it is worse than
+// forty lines: the registry measures a WebP, so a stand-in that did not would
+// answer differently from production for a format screenshot tools emit by
+// default — which is the drift the shared contract exists to prevent.
+//
+// A WebP is a RIFF container whose first chunk says which of three encodings
+// it holds, and all three state the canvas in that chunk's first bytes. Only
+// the header is read; nothing here decodes an image.
+func webPSize(body []byte) (int, int, bool) {
+	if len(body) < 30 || string(body[0:4]) != "RIFF" || string(body[8:12]) != "WEBP" {
+		return 0, 0, false
+	}
+
+	switch string(body[12:16]) {
+	case "VP8 ":
+		// Lossy. A three-byte frame tag, then a sync code that says the frame
+		// really is a keyframe, then the size as two 14-bit little-endian
+		// values — the top two bits of each pair are scaling, not size.
+		if body[23] != 0x9d || body[24] != 0x01 || body[25] != 0x2a {
+			return 0, 0, false
+		}
+		width := int(binary.LittleEndian.Uint16(body[26:28]) & 0x3fff)
+		height := int(binary.LittleEndian.Uint16(body[28:30]) & 0x3fff)
+		return width, height, width > 0 && height > 0
+
+	case "VP8L":
+		// Lossless. One signature byte, then width-1 in 14 bits and height-1 in
+		// the 14 after it, packed little-endian across four bytes.
+		if body[20] != 0x2f {
+			return 0, 0, false
+		}
+		bits := binary.LittleEndian.Uint32(body[21:25])
+		width := int(bits&0x3fff) + 1
+		height := int((bits>>14)&0x3fff) + 1
+		return width, height, true
+
+	case "VP8X":
+		// Extended — what an animation, an alpha channel or embedded metadata
+		// produces. The canvas is stated outright, as two three-byte
+		// little-endian values holding size-1.
+		width := int(uint32(body[24])|uint32(body[25])<<8|uint32(body[26])<<16) + 1
+		height := int(uint32(body[27])|uint32(body[28])<<8|uint32(body[29])<<16) + 1
+		return width, height, true
+	}
+
+	return 0, 0, false
+}
+
+// svgSize reads the width and height an SVG states on its root element, for the
+// same reason webPSize exists: the registry measures an SVG and a stand-in that
+// did not would answer differently for a diagram, which is a thing agents push.
+//
+// An SVG is XML, so this is encoding/xml and not a parser of our own. Only the
+// root element is read; the decoder stops at it, and the caller has already cut
+// the input down to the header budget.
+//
+// A size in units — 120pt, 120px — is 120 to a browser laying the document out,
+// so the unit is dropped rather than converted. A percentage is not a pixel
+// size at all: it means "however big the box is", which is nothing a card can
+// reserve, so it reads as no measurement. Same for an SVG that states only a
+// viewBox.
+func svgSize(mime string, body []byte) (int, int, bool) {
+	if mime != "image/svg+xml" {
+		return 0, 0, false
+	}
+
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	// Somebody else's file: without this an entity declaration is a decoder
+	// that expands rather than one that stops.
+	decoder.Strict = false
+	decoder.Entity = xml.HTMLEntity
+
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return 0, 0, false
+		}
+		start, ok := token.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		if start.Name.Local != "svg" {
+			return 0, 0, false
+		}
+
+		width, height := 0, 0
+		for _, attribute := range start.Attr {
+			switch attribute.Name.Local {
+			case "width":
+				width = svgLength(attribute.Value)
+			case "height":
+				height = svgLength(attribute.Value)
+			}
+		}
+		return width, height, width > 0 && height > 0
+	}
+}
+
+// svgLength is the leading number of an SVG length, or 0 for one that does not
+// resolve to a fixed size.
+func svgLength(value string) int {
+	value = strings.TrimSpace(value)
+	if strings.HasSuffix(value, "%") {
+		return 0
+	}
+
+	digits := 0
+	for digits < len(value) && value[digits] >= '0' && value[digits] <= '9' {
+		digits++
+	}
+	// A fractional length truncates the way a pixel count has to; a length that
+	// does not start with a digit is not one this reads.
+	size, err := strconv.Atoi(value[:digits])
+	if err != nil || size <= 0 {
+		return 0
+	}
+	return size
+}
+
+// nullableInt sends a measurement that was never made as null rather than as 0,
+// which would read as an image zero pixels wide.
+func nullableInt(value int) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
+}
+
 func (s *store) serializeArtifact(a *artifact) map[string]any {
 	out := map[string]any{
 		"slug":         a.Slug,
@@ -1884,15 +2069,20 @@ func (s *store) serializeArtifact(a *artifact) map[string]any {
 		"filename":     a.Filename,
 		"content_type": a.ContentType,
 		"byte_size":    a.ByteSize,
-		"checksum":     a.Checksum,
-		"region":       a.Region,
-		"run":          s.serializeArtifactRun(a),
-		"url":          a.URL,
-		"file_url":     a.FileURL,
-		"markdown":     a.Markdown,
-		"paste":        pasteFor(a),
-		"expires_at":   a.ExpiresAt,
-		"created_at":   a.CreatedAt,
+		// Always present, null when there is no measurement, because that is
+		// what the registry sends: a reader branches on the value rather than
+		// on whether the key arrived.
+		"width":      nullableInt(a.width),
+		"height":     nullableInt(a.height),
+		"checksum":   a.Checksum,
+		"region":     a.Region,
+		"run":        s.serializeArtifactRun(a),
+		"url":        a.URL,
+		"file_url":   a.FileURL,
+		"markdown":   a.Markdown,
+		"paste":      pasteFor(a),
+		"expires_at": a.ExpiresAt,
+		"created_at": a.CreatedAt,
 	}
 	if len(a.Metadata) > 0 {
 		out["metadata"] = a.Metadata

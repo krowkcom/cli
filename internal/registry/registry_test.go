@@ -1785,7 +1785,7 @@ func (b brokenWriter) Header() http.Header       { return b.header }
 func (b brokenWriter) WriteHeader(int)           {}
 func (b brokenWriter) Write([]byte) (int, error) { return 0, errors.New("connection reset") }
 
-// Lapsed logins are swept, or a `registry serve` left up all week accumulates
+// Lapsed logins are swept, or a stand-in registry left up all week accumulates
 // every login it ever answered. The grace period is what keeps `410 expired`
 // meaningful: reaped at the window's edge, a client that polled a second late
 // would be told no such login rather than that the window closed.

@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -199,5 +201,78 @@ func TestRunWithAnEmptyAddrFailsToBind(t *testing.T) {
 	var bindErr *bindError
 	if !errors.As(serveErr, &bindErr) || out.Len() != 0 {
 		t.Fatalf("run with an empty addr = %v (out %q), want a quiet bind failure", serveErr, out.String())
+	}
+}
+
+// The one path the handler tests cannot see: the flags actually reaching
+// registry.Handler through serve. A limit small enough to refuse the declared
+// artifact proves --limit-bytes arrived as the byte ceiling.
+func TestServeWiresLimitBytesIntoTheHandler(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- serve(io.Discard, ln, ln.Addr().String(), "", 4) }()
+
+	res, err := http.Post("http://"+ln.Addr().String()+"/v1/artifacts", "application/json",
+		strings.NewReader(`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refused struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&refused); err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode == http.StatusOK || refused.Error.Code != "invalid" {
+		t.Fatalf("declare of %d bytes over a %d-byte limit = %d %v, want an invalid refusal",
+			5, 4, res.StatusCode, refused.Error)
+	}
+	if msg := refused.Error.Details["byte_size"]; !strings.Contains(fmt.Sprint(msg), "at most 4 bytes") {
+		t.Errorf("details = %v, want the wired limit named", refused.Error.Details)
+	}
+
+	ln.Close()
+	if serveErr := <-done; serveErr == nil || !strings.Contains(serveErr.Error(), "stopped") {
+		t.Errorf("serve after the listener closed = %v, want the stop reported", serveErr)
+	}
+}
+
+// --site rebrands the public links only, so an upload still lands on the local
+// listener while the returned URLs carry the named origin.
+func TestServeWiresSiteIntoTheHandler(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- serve(io.Discard, ln, ln.Addr().String(), "https://files.example", 0) }()
+
+	res, err := http.Post("http://"+ln.Addr().String()+"/v1/artifacts", "application/json",
+		strings.NewReader(`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var declared struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&declared); err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if !strings.HasPrefix(declared.URL, "https://files.example/") {
+		t.Errorf("artifact url = %q, want the --site origin baked in", declared.URL)
+	}
+
+	ln.Close()
+	if serveErr := <-done; serveErr == nil || !strings.Contains(serveErr.Error(), "stopped") {
+		t.Errorf("serve after the listener closed = %v, want the stop reported", serveErr)
 	}
 }

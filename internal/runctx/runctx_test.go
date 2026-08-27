@@ -37,6 +37,25 @@ func TestDetectAgent(t *testing.T) {
 	}
 }
 
+// The env wins over git because CI checks out a detached HEAD, where git can
+// only answer the literal "HEAD". GITHUB_HEAD_REF names the pull request's
+// source branch and beats GITHUB_REF_NAME, which on a PR is `412/merge`.
+func TestBranchFromCI(t *testing.T) {
+	pr := map[string]string{"GITHUB_HEAD_REF": "feature/x", "GITHUB_REF_NAME": "412/merge"}
+	if got := ciBranch(env(pr)); got != "feature/x" {
+		t.Errorf("got %q, want the PR source branch", got)
+	}
+	push := map[string]string{"GITHUB_REF_NAME": "main", "GITHUB_REF_TYPE": "branch"}
+	if got := ciBranch(env(push)); got != "main" {
+		t.Errorf("got %q, want the pushed branch", got)
+	}
+	// A tag push carries the tag in GITHUB_REF_NAME, and a tag is not a branch.
+	tag := map[string]string{"GITHUB_REF_NAME": "v0.8.0", "GITHUB_REF_TYPE": "tag"}
+	if got := ciBranch(env(tag)); got != "" {
+		t.Errorf("got %q, want no branch on a tag push", got)
+	}
+}
+
 func TestHost(t *testing.T) {
 	for in, want := range map[string]string{
 		"git@github.com:acme/storefront.git":     "github.com",

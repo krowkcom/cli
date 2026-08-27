@@ -1,0 +1,103 @@
+# Smoke test for the GitHub Action at the repo root. The action executes the
+# bundled scripts/install.sh, so a change to either file can break consumers
+# with nothing else failing — packaging.yml tests the installer, not the
+# action. This runs the real thing: install, keyless push to production
+# (deliberate — no secret to leak to a fork, and the artifact expires in 24h),
+# outputs asserted.
+name: action
+on:
+  pull_request:
+    paths:
+      - action.yml
+      - scripts/install.sh
+      - .github/workflows/action.yml
+  push:
+    branches: [main]
+    paths:
+      - action.yml
+      - scripts/install.sh
+      - .github/workflows/action.yml
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    strategy:
+      # macOS is in the matrix because its stock bash is 3.2; its failure (or
+      # ubuntu's) must not cancel the other leg — the whole point is seeing
+      # which one broke.
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu has globstar, so it takes the ** pattern; macOS may not,
+          # so it takes the plain glob the action promises works everywhere.
+          - os: ubuntu-latest
+            files: shots/**/*.png
+          - os: macos-latest
+            files: shots/*.png
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make files to push
+        run: |
+          mkdir -p shots/deep
+          printf '\x89PNG\r\n\x1a\n' > shots/smoke.png
+          echo "action smoke test artifact" >> shots/smoke.png
+          cp shots/smoke.png shots/deep/nested.png
+
+      - uses: ./
+        id: krowk
+        with:
+          files: ${{ matrix.files }}
+          title: action smoke test (${{ matrix.os }})
+
+      - name: Assert the outputs
+        env:
+          URLS: ${{ steps.krowk.outputs.urls }}
+          MD: ${{ steps.krowk.outputs.markdown }}
+          JSON: ${{ steps.krowk.outputs.json }}
+        run: |
+          set -euo pipefail
+          [ -n "$URLS" ] || { echo "::error::urls output is empty" >&2; exit 1; }
+          [ -n "$MD" ] || { echo "::error::markdown output is empty" >&2; exit 1; }
+          # A keyless push answers with claim tokens; none may survive into
+          # the json output a later step could paste somewhere public.
+          if grep -q claim_token <<<"$JSON"; then
+            echo "::error::json output leaks a claim_token" >&2
+            exit 1
+          fi
+          echo "pushed: $URLS"
+
+      # `uses: ./` leaves GITHUB_ACTION_REF unset, so the two paths a consumer
+      # actually hits — a tag-pinned action installing that release, and the
+      # ** guard on a bash that predates globstar (macOS /bin/bash is pinned
+      # to 3.2 by its GPLv3 allergy) — are exercised on the extracted step
+      # scripts, which is the same code by construction.
+      - name: A tag-pinned action installs that release
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          ruby -ryaml -e 'puts YAML.load_file("action.yml")["runs"]["steps"][0]["run"]' > /tmp/install_step.sh
+          export GITHUB_ACTION_PATH="$PWD" GITHUB_ACTION_REF=v0.7.0 KROWK_SKIP_SKILL=1
+          export RUNNER_TEMP=/tmp/pin GITHUB_PATH=/tmp/pin_path
+          mkdir -p /tmp/pin && : > /tmp/pin_path
+          bash /tmp/install_step.sh
+          got=$(/tmp/pin/krowk-bin/krowk --version)
+          [ "$got" = "0.7.0" ] || { echo "::error::installed $got, want the pinned 0.7.0" >&2; exit 1; }
+
+      - name: A ** glob fails plainly on bash 3.2
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          ruby -ryaml -e 'puts YAML.load_file("action.yml")["runs"]["steps"][1]["run"]' > /tmp/push_step.sh
+          /bin/bash -c 'echo "stock bash: $BASH_VERSION"'
+          set +e
+          out=$(INPUT_FILES='shots/**/*.png' INPUT_RUN= INPUT_TITLE= INPUT_PULL_REQUEST= KROWK_TOKEN= \
+            GITHUB_OUTPUT=/tmp/o GITHUB_STEP_SUMMARY=/tmp/s /bin/bash /tmp/push_step.sh 2>&1)
+          code=$?
+          set -e
+          [ "$code" -ne 0 ] || { echo "::error::** on bash 3.2 should have failed" >&2; exit 1; }
+          grep -q "needs \*\* globs" <<<"$out" || { echo "::error::wrong failure: $out" >&2; exit 1; }

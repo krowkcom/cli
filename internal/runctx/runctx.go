@@ -99,7 +99,7 @@ func Detect(env Env) Metadata {
 		RepoName:   firstNonEmpty(env("GITHUB_REPOSITORY"), Slug(remote)),
 		RepoURL:    RepoURL(env, remote),
 		Commit:     firstNonEmpty(env("GITHUB_SHA"), git("rev-parse", "HEAD")),
-		Branch:     git("rev-parse", "--abbrev-ref", "HEAD"),
+		Branch:     Branch(env),
 		Dirty:      dirty(),
 		Harness:    DetectAgent(env),
 		Model:      DetectModel(env),
@@ -111,6 +111,35 @@ func Detect(env Env) Metadata {
 	m.ChangeID = ChangeID(m.ChangeURL)
 	m.reconcileRepo()
 	return m
+}
+
+// Branch names the branch the work is on. CI checks out a detached HEAD, so
+// `git rev-parse --abbrev-ref HEAD` answers the literal string "HEAD" there —
+// the branch is in the environment instead: GITHUB_HEAD_REF on a pull request
+// (the source branch, where GITHUB_REF_NAME would say `412/merge`), and
+// GITHUB_REF_NAME on a push when the ref is a branch — a tag push carries the
+// tag there, and a tag is not a branch. A local detached HEAD records no
+// branch at all, which is the truth of it.
+func Branch(env Env) string {
+	if b := ciBranch(env); b != "" {
+		return b
+	}
+	if b := git("rev-parse", "--abbrev-ref", "HEAD"); b != "HEAD" {
+		return b
+	}
+	return ""
+}
+
+// ciBranch is the environment half of Branch, on its own so it can be tested
+// without a repository underneath.
+func ciBranch(env Env) string {
+	if b := env("GITHUB_HEAD_REF"); b != "" {
+		return b
+	}
+	if b := env("GITHUB_REF_NAME"); b != "" && env("GITHUB_REF_TYPE") == "branch" {
+		return b
+	}
+	return ""
 }
 
 // DetectModel names the model that did the work. KROWK_MODEL first, because it

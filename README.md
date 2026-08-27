@@ -107,7 +107,7 @@ Without a destination, ordinary human output ends with the block anyway, so the 
 The repository doubles as an action, so CI can push what a test run produced and put the links where a reviewer will see them:
 
 ```yaml
-- uses: krowkcom/cli@main # pin to the first release tag that carries action.yml once cut
+- uses: krowkcom/cli@main # from the next release on, pin its tag — the tag pins the binary too
   id: krowk
   with:
     files: |

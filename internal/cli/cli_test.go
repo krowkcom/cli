@@ -439,6 +439,42 @@ func TestRunsStartRefusesAMalformedLink(t *testing.T) {
 	}
 }
 
+// A run carries the metadata it was opened with, so run-level flags passed
+// alongside --run have nowhere to land. Dropping them quietly would leave the
+// caller believing the link it named is on the run, and it is not.
+func TestPushSaysWhenARunAlreadyHasItsMetadata(t *testing.T) {
+	h := newHarness(t, 0)
+
+	run := h.ok("runs", "start").Data.Slug
+	e := h.ok("push", h.fixture, "--run="+run,
+		"--link=https://linear.app/acme/issue/ENG-9",
+		"--pull-request=https://github.com/acme/storefront/pull/412",
+		"--caption=Cart after the fix",
+	)
+	note := strings.Join(e.Data.Notes, " ")
+	for _, want := range []string{"--link", "--pull-request", run} {
+		if !strings.Contains(note, want) {
+			t.Errorf("notes = %v, want %q named", e.Data.Notes, want)
+		}
+	}
+	// --caption is the artifact's, so it lands and is not in the note.
+	if strings.Contains(note, "--caption") {
+		t.Errorf("notes = %v, want the caption left out: it lands on the artifact", e.Data.Notes)
+	}
+	shown := only(t, h.ok("uploads", "show", only(t, e).Slug))
+	var meta map[string]any
+	if err := json.Unmarshal(shown.Metadata, &meta); err != nil {
+		t.Fatalf("artifact metadata = %s: %v", shown.Metadata, err)
+	}
+	if meta["krowk.caption"] != "Cart after the fix" {
+		t.Errorf("krowk.caption = %v, want the caption recorded", meta["krowk.caption"])
+	}
+	// And a push with nothing run-level to drop says nothing.
+	if quiet := h.ok("push", h.fixture, "--run="+run, "--caption=Only mine"); len(quiet.Data.Notes) != 0 {
+		t.Errorf("notes = %v, want none when no run metadata was passed", quiet.Data.Notes)
+	}
+}
+
 func TestEachArtifactCarriesItsOwnProductionRecord(t *testing.T) {
 	h := newHarness(t, 0)
 

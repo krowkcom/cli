@@ -43,6 +43,13 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Fixed
 
+- Run metadata passed to a push that names an existing run is now reported as
+  dropped instead of vanishing. `krowk push shot.png --run run_… --link …`
+  records nothing on that run — a run carries the metadata it was opened with —
+  and both the CLI and the MCP tool now say so in `notes`, naming the flags and
+  the run. `--caption` and `--metadata` are unaffected: they land on the
+  artifact. The keyless note gained `--title` for the same reason: it was
+  dropped and unmentioned.
 - The branch a run records in CI. GitHub checks out a detached HEAD, where
   git can only answer the literal `HEAD` — the branch is read from the
   runner's environment instead, preferring a pull request's source branch

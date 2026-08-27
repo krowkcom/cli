@@ -597,10 +597,20 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		}
 		run, runSlug, ownRun = created, created.Slug, true
 	}
-	if !s.Client.Authenticated() && (a.PullRequest != "" || len(a.Links) > 0 ||
-		len(a.References) > 0 || a.Session != "" || len(a.Metadata) > 0) {
-		notes = append(notes, "pull_request, links, references, session and metadata were not "+
-			"recorded: a keyless upload records no metadata, and opening a run needs an API key")
+	workMetadata := a.PullRequest != "" || len(a.Links) > 0 || len(a.References) > 0 ||
+		a.Session != "" || a.Title != ""
+	if !s.Client.Authenticated() && (workMetadata || len(a.Metadata) > 0) {
+		notes = append(notes, "pull_request, links, references, session, title and metadata "+
+			"were not recorded: a keyless upload records no metadata, and opening a run "+
+			"needs an API key")
+	}
+	// A run named by the caller already carries the metadata it was opened with,
+	// so these have nowhere to land. Said rather than refused: the same arguments
+	// on every push of a batch is a reasonable way to write the calls, and
+	// `metadata` still lands on each artifact.
+	if s.Client.Authenticated() && a.Run != "" && workMetadata {
+		notes = append(notes, "pull_request, links, references, session and title were not "+
+			"recorded: run "+a.Run+" already carries the metadata it was opened with")
 	}
 
 	// Each artifact carries its own production record, stamped at this moment;

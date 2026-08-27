@@ -327,6 +327,33 @@ func TestPushNamesTheArgumentThatIsTheWrongShape(t *testing.T) {
 // The schema says additionalProperties: false, so the tool enforces it. An
 // agent writing `label` where the schema says `title` would otherwise get a
 // link with no name on it and no word said about why.
+// Same honesty in the tool: metadata about the work has nowhere to land on a
+// run the caller named, and an agent told nothing would report the issue as
+// linked when it is not.
+func TestPushSaysWhenANamedRunAlreadyHasItsMetadata(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	first := s.callTool("krowk_push", map[string]any{"files": []string{s.fixture}})
+	structured, _ := first["structuredContent"].(map[string]any)
+	run, _ := structured["run"].(map[string]any)
+	slug, _ := run["slug"].(string)
+	if slug == "" {
+		t.Fatalf("no run slug to reuse: %+v", structured)
+	}
+
+	result := s.callTool("krowk_push", map[string]any{
+		"files": []string{s.fixture},
+		"run":   slug,
+		"links": []any{map[string]any{"url": "https://linear.app/acme/issue/ENG-9"}},
+	})
+	if result["isError"] == true {
+		t.Fatalf("push failed: %s", text(t, result))
+	}
+	if body := text(t, result); !strings.Contains(body, "links") || !strings.Contains(body, slug) {
+		t.Errorf("text = %q, want it to say the links were not recorded on %s", body, slug)
+	}
+}
+
 func TestPushRefusesAnUnknownArgument(t *testing.T) {
 	s := newSession(t, "krk_test")
 

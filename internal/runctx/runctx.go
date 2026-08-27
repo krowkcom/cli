@@ -126,22 +126,47 @@ func ValidateLinks(links []Link) error {
 // tab, a NEL or a U+2028 line separator breaks a single-row render as surely as
 // a newline does, and none of them is anything a title or a rel needs.
 func validateLinkLine(where, field, value string, max int) error {
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s has a %s that is not valid UTF-8: "+
+			"recording it would replace the bad bytes with U+FFFD, and the record "+
+			"is meant to be what the caller said", where, field)
+	}
 	if n := utf8.RuneCountInString(value); n > max {
 		return fmt.Errorf("%s has a %d-character %s, past the %d one line holds",
 			where, n, field, max)
 	}
-	if strings.ContainsFunc(value, isLineBreaking) {
-		return fmt.Errorf("%s has a %s spanning more than one line or carrying a "+
-			"control character: it is what a reader sees on one row", where, field)
+	if strings.ContainsFunc(value, isDisplayHostile) {
+		return fmt.Errorf("%s has a %s that would repaint the row it is drawn on — "+
+			"a line break, a control character or a bidi override: it is what a "+
+			"reader sees instead of the URL, on one row", where, field)
 	}
 	return nil
 }
 
-// isLineBreaking reports the characters that end a line or steer a renderer:
-// the C0 controls (tab and newline among them), DEL, NEL, and the Unicode line
-// and paragraph separators.
-func isLineBreaking(r rune) bool {
-	return r < ' ' || r == 0x7f || r == 0x85 || r == 0x2028 || r == 0x2029
+// isDisplayHostile reports the characters that end a line, steer a terminal or
+// move text that is drawn after them: the C0 controls (tab and newline among
+// them), DEL, NEL, the Unicode line and paragraph separators, the bidi
+// overrides and isolates, the zero-width spaces and the byte order mark.
+//
+// The renderer already folds these out of anything it draws
+// (output.reordering, output.oneLine). This is the writer's side of the same
+// rule, and it refuses rather than folds: a title krowk quietly rewrote is not
+// what the caller said, and the record is stored verbatim and read for years.
+// U+200D ZERO WIDTH JOINER is kept for the same reason the renderer keeps it —
+// it is what holds a multi-part emoji together.
+func isDisplayHostile(r rune) bool {
+	switch {
+	case r == '\u200d': // ZERO WIDTH JOINER
+		return false
+	case r < ' ', r == 0x7f, r == 0x85,
+		r == '\u2028', r == '\u2029', // line and paragraph separators
+		r == '\ufeff',                  // BYTE ORDER MARK
+		r >= '\u200b' && r <= '\u200f', // zero-width spaces, LRM, RLM
+		r >= '\u202a' && r <= '\u202e', // bidi embeddings and overrides
+		r >= '\u2066' && r <= '\u2069': // bidi isolates
+		return true
+	}
+	return false
 }
 
 // validateLinkURL holds a URL to what can be pasted and followed. Parsed
@@ -152,12 +177,20 @@ func validateLinkURL(where, raw string) error {
 	if strings.TrimSpace(raw) == "" {
 		return fmt.Errorf("%s has no url: every link needs an absolute http(s) URL", where)
 	}
+	if !utf8.ValidString(raw) {
+		return fmt.Errorf("%s has a url that is not valid UTF-8: "+
+			"recording it would replace the bad bytes with U+FFFD, and a rewritten "+
+			"URL points somewhere else", where)
+	}
 	// Before parsing, because url.Parse accepts a space in a path and every
 	// renderer that puts the URL in markdown then breaks on it — and a URL is
-	// one word by definition.
-	if strings.ContainsFunc(raw, func(r rune) bool { return r == ' ' || isLineBreaking(r) }) {
-		return fmt.Errorf("%s (%q) has a space or a control character in it: "+
-			"a URL is one unbroken word", where, raw)
+	// one word by definition. The display-hostile characters go with it: a bidi
+	// override in a URL repaints the row it is drawn on, which is how a link
+	// gets to look like one host and lead to another.
+	if strings.ContainsFunc(raw, func(r rune) bool { return r == ' ' || isDisplayHostile(r) }) {
+		return fmt.Errorf("%s (%q) has a space, a control character or a bidi "+
+			"override in it: a URL is one unbroken word, and one that reads as it "+
+			"resolves", where, raw)
 	}
 	if utf8.RuneCountInString(raw) > MaxLinkURL {
 		return fmt.Errorf("%s is %d characters, past the %d a URL may be",
@@ -166,10 +199,23 @@ func validateLinkURL(where, raw string) error {
 	u, err := url.Parse(raw)
 	// The scheme is compared lowercased because it is case-insensitive in the
 	// URL itself: HTTPS://example.com is the same link, and refusing it would
-	// point the caller at --reference for a URL that is perfectly good.
+	// send the caller to references for a URL that is perfectly good.
+	//
+	// The message names no flag: the CLI and the MCP server share this
+	// validator, and telling an agent to use --reference where its tool takes a
+	// `references` array is advice that fails.
 	if err != nil || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") || u.Host == "" {
 		return fmt.Errorf("%s (%s) is not an absolute http(s) URL — "+
-			"a ticket key or an internal ID is a --reference, not a link", where, raw)
+			"a ticket key or an internal ID belongs in references, not in links", where, raw)
+	}
+	// Credentials in a URL are credentials published: run metadata is public and
+	// permanent, and krowk refuses credential *files* for the same reason. The
+	// link without them is almost always the link that was meant, so this says
+	// so rather than stripping them and recording a URL nobody typed.
+	if u.User != nil {
+		return fmt.Errorf("%s carries a username or password in the URL, and run "+
+			"metadata is public and permanent: link %s://%s%s instead",
+			where, u.Scheme, u.Host, u.EscapedPath())
 	}
 	return nil
 }

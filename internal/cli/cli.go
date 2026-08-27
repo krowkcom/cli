@@ -771,7 +771,12 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 // there is no key to open one with.
 func resolveRun(ctx context.Context, client *api.Client, f flags, env runctx.Env, result *output.Result) (slug string, own bool, err error) {
 	if f.run != "" {
-		// The caller manages this run's lifecycle, so it is not finished here.
+		// The caller manages this run's lifecycle, so it is not finished here —
+		// and its metadata was recorded when it was opened, so flags describing
+		// the work have nowhere to land. Which is worth saying out loud.
+		if note := namedRunMetadataNote(f); note != "" {
+			result.Notes = append(result.Notes, note)
+		}
 		return f.run, false, nil
 	}
 	if !client.Authenticated() {
@@ -897,6 +902,34 @@ func withCaption(extras map[string]string, captions []string, i int) map[string]
 // recorded. Silently dropping it would leave an agent believing the pull request
 // it named is attached to the upload, and it is not.
 func anonymousMetadataNote(f flags) string {
+	given := append(runMetadataGiven(f), artifactMetadataGiven(f)...)
+	if len(given) == 0 {
+		return ""
+	}
+	return strings.Join(given, ", ") + " was not recorded: a keyless upload records no metadata — " +
+		"run `krowk auth login --token krowk_sk_...`"
+}
+
+// namedRunMetadataNote is the same honesty for the other path that drops
+// metadata: a run's metadata was recorded when the run was opened, so flags
+// describing the work are dropped when --run names one that already exists.
+// Said rather than refused, because the flags are harmless in a script that
+// pushes to a run it opened earlier with the same arguments — and because
+// --caption and --metadata land on the artifact and are recorded either way.
+func namedRunMetadataNote(f flags) string {
+	given := runMetadataGiven(f)
+	if len(given) == 0 {
+		return ""
+	}
+	return strings.Join(given, ", ") + " was not recorded: run " + f.run +
+		" already carries the metadata it was opened with — pass these to " +
+		"`krowk runs start`, or drop --run and let this push open its own run"
+}
+
+// runMetadataGiven names the flags that describe the work, which is what a run
+// carries; artifactMetadataGiven names the ones that describe one file. The two
+// are separate because the paths that drop metadata drop different halves of it.
+func runMetadataGiven(f flags) []string {
 	var given []string
 	if f.pullRequest != "" {
 		given = append(given, "--pull-request")
@@ -910,17 +943,21 @@ func anonymousMetadataNote(f flags) string {
 	if f.session != "" {
 		given = append(given, "--session")
 	}
+	if f.title != "" {
+		given = append(given, "--title")
+	}
+	return given
+}
+
+func artifactMetadataGiven(f flags) []string {
+	var given []string
 	if len(f.metadata) > 0 {
 		given = append(given, "--metadata")
 	}
 	if len(f.caption) > 0 {
 		given = append(given, "--caption")
 	}
-	if len(given) == 0 {
-		return ""
-	}
-	return strings.Join(given, ", ") + " was not recorded: a keyless upload records no metadata — " +
-		"run `krowk auth login --token krowk_sk_...`"
+	return given
 }
 
 // withProgress keeps what a failed batch would otherwise lose: the links of

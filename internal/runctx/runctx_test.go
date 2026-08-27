@@ -228,6 +228,9 @@ func TestValidateLinks(t *testing.T) {
 	ok = append(ok,
 		Link{URL: "HTTPS://internal.corp/issue/9"},
 		Link{URL: "https://example.com/2", Title: strings.Repeat("画", MaxLinkTitle)},
+		// The joiner holds a multi-part emoji together, so refusing it would break
+		// one glyph into several — the renderer keeps it for the same reason.
+		Link{URL: "https://example.com/3", Title: "shipped 👨‍👩‍👧"},
 	)
 	if err := ValidateLinks(ok); err != nil {
 		t.Errorf("ValidateLinks(%+v) = %v, want it accepted — rel is open, http is a URL", ok, err)
@@ -265,6 +268,12 @@ func TestValidateLinks(t *testing.T) {
 			Rel: strings.Repeat("x", MaxLinkRel+1)}},
 		"a title carrying a tab":            {{URL: "https://example.com/1", Title: "one\ttwo"}},
 		"a title carrying a line separator": {{URL: "https://example.com/1", Title: "one\u2028two"}},
+		"a title repainting the row": {{URL: "https://example.com/1",
+			Title: "safe\u202ednegis-ton"}},
+		"a url carrying a bidi override":  {{URL: "https://example.com/\u202e1"}},
+		"a url carrying credentials":      {{URL: "https://user:s3cret@example.com/1"}},
+		"a url that is not valid UTF-8":   {{URL: "https://example.com/\xff"}},
+		"a title that is not valid UTF-8": {{URL: "https://example.com/1", Title: "one\xfftwo"}},
 	} {
 		if err := ValidateLinks(links); err == nil {
 			t.Errorf("ValidateLinks(%s) = nil, want it refused", name)

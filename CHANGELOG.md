@@ -9,6 +9,20 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Changed
+
+- The GitHub Action pinned to a release tag now installs that release's
+  binary rather than the latest, so `uses: krowkcom/cli@v0.8.0` means 0.8.0
+  the whole way down. An explicit `version` input still wins.
+- The branch a run records is now right in CI: GitHub checks out a detached
+  HEAD, where git could only answer the literal `HEAD` — the branch is read
+  from the runner's environment instead, preferring a pull request's source
+  branch over the synthetic `412/merge` ref. A local detached HEAD records no
+  branch at all now, which is the truth of it.
+- The action names a directory a glob swept up instead of handing it to
+  krowk, and a `**` glob on a bash too old for one (macOS ships 3.2) fails
+  saying exactly that, while plain globs keep working there.
+
 ### Added
 
 - A GitHub Action, `uses: krowkcom/cli@<tag>`, wrapping the CLI for CI: give it

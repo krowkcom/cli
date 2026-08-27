@@ -74,15 +74,24 @@ runs:
           echo "::error::This action supports Linux and macOS runners" >&2
           exit 1
         fi
+        # No version asked for and the action pinned to a release tag: install
+        # that release, so pinning the action pins the binary too. Any other
+        # ref (main, a SHA, a branch) has no release of its own — latest it is.
+        if [ -z "${KROWK_VERSION:-}" ]; then
+          case "${GITHUB_ACTION_REF:-}" in
+            v[0-9]*) export KROWK_VERSION="${GITHUB_ACTION_REF#v}" ;;
+          esac
+        fi
         export KROWK_BIN_DIR="$RUNNER_TEMP/krowk-bin"
         mkdir -p "$KROWK_BIN_DIR"
         # Already on PATH before the installer runs, so its setup_path leaves
         # the runner's dotfiles alone — a self-hosted runner keeps its .bashrc.
         export PATH="$KROWK_BIN_DIR:$PATH"
         # The installer ships with the action itself — the runner already has
-        # this repo on disk at GITHUB_ACTION_PATH — so pinning the action by
-        # tag or SHA pins the code that runs, with no fetch to go stale and
-        # nothing hard-coded that GitHub Enterprise would not resolve.
+        # this repo on disk at GITHUB_ACTION_PATH — so pinning the action pins
+        # the installer, with no fetch to go stale and nothing hard-coded that
+        # GitHub Enterprise would not resolve. The binary is pinned by the
+        # version resolved above.
         bash "${GITHUB_ACTION_PATH:?}/scripts/install.sh"
         echo "$KROWK_BIN_DIR" >> "$GITHUB_PATH"
 
@@ -97,7 +106,12 @@ runs:
         INPUT_PULL_REQUEST: ${{ inputs.pull-request }}
       run: |
         set -euo pipefail
-        shopt -s nullglob globstar
+        shopt -s nullglob
+        # globstar arrived in bash 4; macOS runners resolve `shell: bash` to
+        # the stock 3.2. Plain globs still work there, so only a pattern that
+        # actually says ** should fail — and say why.
+        globstar_ok=1
+        shopt -s globstar 2>/dev/null || globstar_ok=
 
         # jq parses the envelope below. Hosted runners ship it; a container or
         # self-hosted runner may not, and the failure should say so.
@@ -117,16 +131,22 @@ runs:
         set +f
         files=()
         for pattern in "${patterns[@]}"; do
+          case "$pattern" in *'**'*) [ -n "$globstar_ok" ] || {
+            echo "::error::'$pattern' needs ** globs, and this bash ($BASH_VERSION) predates them — use single-level globs, or bash 4+" >&2
+            exit 1
+          };; esac
           matched=($pattern)
           if [ ${#matched[@]} -eq 0 ]; then
             echo "::error::No file matches '$pattern'" >&2
             exit 1
           fi
           # nullglob only drops unmatched *globs* — a literal path survives
-          # expansion whether it exists or not, so existence is its own check.
+          # expansion whether it exists or not. And what krowk pushes is
+          # files, so a directory a glob swept up is an error here, where the
+          # pattern can be named, not later in krowk's own words.
           for f in "${matched[@]}"; do
-            if [ ! -e "$f" ]; then
-              echo "::error::No file matches '$pattern'" >&2
+            if [ ! -f "$f" ]; then
+              echo "::error::No file matches '$pattern' — '$f' is $([ -e "$f" ] && echo "not a regular file" || echo "missing")" >&2
               exit 1
             fi
           done

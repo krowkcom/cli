@@ -1,0 +1,57 @@
+# Smoke test for the GitHub Action at the repo root. The action executes the
+# bundled scripts/install.sh, so a change to either file can break consumers
+# with nothing else failing — packaging.yml tests the installer, not the
+# action. This runs the real thing: install, keyless push, outputs.
+name: action
+on:
+  pull_request:
+    paths:
+      - action.yml
+      - scripts/install.sh
+      - .github/workflows/action.yml
+  push:
+    branches: [main]
+    paths:
+      - action.yml
+      - scripts/install.sh
+      - .github/workflows/action.yml
+
+jobs:
+  smoke:
+    strategy:
+      matrix:
+        # macOS is in the matrix because its stock bash is 3.2 — the action
+        # promises plain globs work there whatever bash `shell: bash` finds.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make files to push
+        run: |
+          mkdir -p shots
+          printf '\x89PNG\r\n\x1a\n' > shots/smoke.png
+          echo "action smoke test artifact" >> shots/smoke.png
+
+      - uses: ./
+        id: krowk
+        with:
+          files: shots/*.png
+          title: action smoke test (${{ matrix.os }})
+
+      - name: Assert the outputs
+        env:
+          URLS: ${{ steps.krowk.outputs.urls }}
+          MD: ${{ steps.krowk.outputs.markdown }}
+          JSON: ${{ steps.krowk.outputs.json }}
+        run: |
+          set -euo pipefail
+          [ -n "$URLS" ] || { echo "::error::urls output is empty" >&2; exit 1; }
+          [ -n "$MD" ] || { echo "::error::markdown output is empty" >&2; exit 1; }
+          # A keyless push answers with claim tokens; none may survive into
+          # the json output a later step could paste somewhere public.
+          if grep -q claim_token <<<"$JSON"; then
+            echo "::error::json output leaks a claim_token" >&2
+            exit 1
+          fi
+          echo "pushed: $URLS"

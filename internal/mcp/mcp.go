@@ -12,6 +12,7 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -479,12 +480,65 @@ var tools = map[string]tool{
 	"krowk_verify_key":     verifyKey,
 }
 
+// given names the arguments that were actually passed, in the schema's own
+// order, so a note about dropped metadata lists what the caller sent and
+// nothing else.
+func given(passed map[string]bool) []string {
+	order := []string{"pull_request", "links", "references", "session", "title", "metadata"}
+	var names []string
+	for _, name := range order {
+		if passed[name] {
+			names = append(names, "`"+name+"`")
+		}
+	}
+	return names
+}
+
+// checkLinkFields re-reads just the links, refusing a field the schema does not
+// name. Separate from the main decode so the strictness reaches the links and
+// nothing else.
+func checkLinkFields(args json.RawMessage) error {
+	var probe struct {
+		Links json.RawMessage `json:"links"`
+	}
+	if json.Unmarshal(args, &probe) != nil || len(probe.Links) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(probe.Links))
+	dec.DisallowUnknownFields()
+	var links []runctx.Link
+	if err := dec.Decode(&links); err != nil {
+		return err
+	}
+	return nil
+}
+
+// badArgument names the argument that did not fit its type, so an agent fixes
+// the one it got wrong. Without the name every shape error read as "`files`
+// must be an array of paths" — advice to change the argument that was right.
+func badArgument(err error) string {
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) && typeErr.Field != "" {
+		return fmt.Sprintf("`%s` is the wrong shape: got %s — see the tool's schema",
+			typeErr.Field, typeErr.Value)
+	}
+	// The decoder's own wording for an unknown field already names it, and no
+	// paraphrase of it says more: `json: unknown field "label"`.
+	if msg := err.Error(); strings.Contains(msg, "unknown field") {
+		return strings.TrimPrefix(msg, "json: ") +
+			" — this tool takes only the arguments in its schema"
+	}
+	return "the arguments are not the shape this tool takes: `files` is an array of " +
+		"paths, `links` an array of {url, title, rel} objects — see the tool's schema"
+}
+
 func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
 	var a struct {
 		Files       []string          `json:"files"`
 		Run         string            `json:"run"`
 		Title       string            `json:"title"`
 		PullRequest string            `json:"pull_request"`
+		Links       []runctx.Link     `json:"links"`
 		References  []string          `json:"references"`
 		Session     string            `json:"session"`
 		Repo        string            `json:"repo"`
@@ -492,11 +546,27 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Agent       string            `json:"agent"`
 		Metadata    map[string]string `json:"metadata"`
 	}
-	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
-		return "", nil, api.Fail("bad_arguments", "`files` must be an array of paths")
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &a); err != nil {
+			return "", nil, api.Fail("bad_arguments", badArgument(err))
+		}
+		// A link's own fields are checked strictly, because a link is the one
+		// argument here whose misspelling is silent: `label` where the schema says
+		// `title` decodes to a link with no name and nothing said about it. The
+		// arguments around it stay lenient, the way every other tool's are — a
+		// stray one is not worth failing an upload over.
+		if err := checkLinkFields(args); err != nil {
+			return "", nil, api.Fail("bad_arguments", badArgument(err))
+		}
 	}
 	if len(a.Files) == 0 {
 		return "", nil, api.Fail("no_file", "pass at least one path in `files`")
+	}
+	// Held to the vocabulary here rather than at the registry, which stores
+	// metadata verbatim and validates nothing but its size: a malformed link
+	// accepted now is malformed in the record forever.
+	if err := runctx.ValidateLinks(a.Links); err != nil {
+		return "", nil, api.Fail("bad_arguments", "`links`: "+err.Error())
 	}
 	// A push creates the thing the workspace was pinned for. Uploading it
 	// anonymously instead would be the misdirection this refusal exists to
@@ -549,6 +619,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Commit:      a.Commit,
 		Agent:       a.Agent,
 		PullRequest: a.PullRequest,
+		Links:       a.Links,
 		References:  a.References,
 		Session:     a.Session,
 		Title:       a.Title,
@@ -561,9 +632,27 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		}
 		run, runSlug, ownRun = created, created.Slug, true
 	}
-	if !s.Client.Authenticated() && (a.PullRequest != "" || len(a.References) > 0 || a.Session != "" || len(a.Metadata) > 0) {
-		notes = append(notes, "pull_request, references, session and metadata were not recorded: "+
-			"a keyless upload records no metadata, and opening a run needs an API key")
+	// Named rather than listed wholesale: an agent told that four arguments it
+	// never passed were dropped has to work out which of them it actually sent.
+	work := given(map[string]bool{
+		"pull_request": a.PullRequest != "",
+		"links":        len(a.Links) > 0,
+		"references":   len(a.References) > 0,
+		"session":      a.Session != "",
+		"title":        a.Title != "",
+	})
+	if !s.Client.Authenticated() {
+		if all := given(map[string]bool{"metadata": len(a.Metadata) > 0}); len(work)+len(all) > 0 {
+			notes = append(notes, strings.Join(append(work, all...), ", ")+" were not recorded: "+
+				"a keyless upload records no metadata, and opening a run needs an API key")
+		}
+	} else if a.Run != "" && len(work) > 0 {
+		// A run named by the caller already carries the metadata it was opened
+		// with, so these have nowhere to land. Said rather than refused: the same
+		// arguments on every push of a batch is a reasonable way to write the
+		// calls, and `metadata` still lands on each artifact.
+		notes = append(notes, strings.Join(work, ", ")+" were not recorded: run "+a.Run+
+			" already carries the metadata it was opened with")
 	}
 
 	// Each artifact carries its own production record, stamped at this moment;
@@ -979,10 +1068,48 @@ func toolSchemas() []map[string]any {
 						"type":        "string",
 						"description": "URL of the pull request this work belongs to.",
 					},
+					"links": map[string]any{
+						"type":     "array",
+						"maxItems": runctx.MaxLinks,
+						"items": map[string]any{
+							"type":     "object",
+							"required": []string{"url"},
+							"properties": map[string]any{
+								"url": map[string]any{
+									"type":        "string",
+									"format":      "uri",
+									"maxLength":   runctx.MaxLinkURL,
+									"description": "Absolute http(s) URL. Anything else is refused, not trimmed.",
+								},
+								"title": map[string]any{
+									"type":      "string",
+									"maxLength": runctx.MaxLinkTitle,
+									"description": "One line naming the link, shown to a reader instead of " +
+										"the URL, e.g. the issue's own title.",
+								},
+								"rel": map[string]any{
+									"type":      "string",
+									"maxLength": runctx.MaxLinkRel,
+									"description": "What this link is. Pick from " +
+										strings.Join(runctx.LinkRels, ", ") +
+										" where one fits: `fixes` for the issue this work closes, `tracks` " +
+										"for the ticket it is filed under, `spec` for what it implements, " +
+										"`discussion` for the thread about it, `source` for what it was " +
+										"derived from, `supersedes` for the run it replaces. Any other word " +
+										"is accepted and stored as given.",
+								},
+							},
+							"additionalProperties": false,
+						},
+						"description": "Links this work is about, recorded on the run as `krowk.links` — " +
+							"the issue being fixed, the spec, the discussion. Prefer this over " +
+							"`references` for anything that is a URL.",
+					},
 					"references": map[string]any{
-						"type":        "array",
-						"items":       map[string]any{"type": "string"},
-						"description": "Related links, e.g. the issue being fixed.",
+						"type":  "array",
+						"items": map[string]any{"type": "string"},
+						"description": "Related identifiers that are not URLs, e.g. a ticket key. " +
+							"A URL belongs in `links`.",
 					},
 					"session": map[string]any{
 						"type":        "string",

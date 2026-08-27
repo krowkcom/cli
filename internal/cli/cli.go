@@ -49,7 +49,14 @@ Upload flags
                          ` + "`claim`" + ` and ` + "`uploads attach`" + ` it names the run an upload
                          already made joins — a claimed upload has none otherwise
   --pull-request <url>   Pull request the work belongs to
-  --reference <url>      Related link — repeat for more than one
+  --link <url>           Link this work is about — the issue, the spec, the
+                         discussion. Repeat for more than one, up to 20, and
+                         label or classify each with the two flags below
+  --link-title <text>    What to call the --link before it, instead of its URL
+  --link-rel <kind>      What the --link before it is: tracks, fixes, spec,
+                         discussion, source, supersedes — or your own word
+  --reference <id>       Related identifier that is not a URL, e.g. a ticket
+                         key — repeat for more than one. A URL is a --link
   --title <text>         Title for the work, recorded on the run. What a pasted
                          link says about a file is that file's --caption
   --caption <text>       What this file shows, recorded on the artifact as
@@ -120,10 +127,10 @@ Exit codes
 
 Registry precedence: --dev, then KROWK_API_URL, then KROWK_DEV, then the default.
 
-Run metadata — the pull request, references and session — is recorded on a run,
-and a run belongs to a workspace, so it needs an API key. Without one an upload
-still works: it lands anonymously, expires within a day, and comes back with a
-claim token that ` + "`krowk claim`" + ` spends to keep it.
+Run metadata — the pull request, the links, the references, the session — is
+recorded on a run, and a run belongs to a workspace, so it needs an API key.
+Without one an upload still works: it lands anonymously, expires within a day,
+and comes back with a claim token that ` + "`krowk claim`" + ` spends to keep it.
 
 Wherever an artifact or a run is named — a positional, or --run — a link that
 carries it does just as well: the card page, the CDN URL under it, or anything
@@ -161,6 +168,7 @@ type flags struct {
 	before      string
 	limit       int
 	pullRequest string
+	links       linkSlice
 	references  stringSlice
 	metadata    stringSlice
 	caption     stringSlice
@@ -202,6 +210,57 @@ type stringSlice []string
 func (s *stringSlice) String() string     { return strings.Join(*s, ",") }
 func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
 
+// linkSlice collects --link, in the order the links were typed. Order is what
+// makes --link-title and --link-rel unambiguous: each of them describes the
+// --link before it, the way --caption describes the file at its position.
+type linkSlice []runctx.Link
+
+func (l *linkSlice) String() string {
+	urls := make([]string, 0, len(*l))
+	for _, link := range *l {
+		urls = append(urls, link.URL)
+	}
+	return strings.Join(urls, ",")
+}
+
+func (l *linkSlice) Set(v string) error {
+	*l = append(*l, runctx.Link{URL: v})
+	return nil
+}
+
+// linkField is --link-title or --link-rel: it sets one field on the --link it
+// follows. A second one for the same link, or one before any --link, is a
+// mistake worth naming — silently overwriting would drop a label the caller
+// typed, and attaching one to nothing would drop it entirely.
+type linkField struct {
+	links *linkSlice
+	name  string
+	field func(*runctx.Link) *string
+	// given is the indexes of the links this flag has already described. It is
+	// a set rather than a look at the field's emptiness because
+	// `--link-title "$UNSET" --link-title fallback` is two flags, and reading
+	// the first as absent is how the overwrite this refuses gets in anyway.
+	given map[int]bool
+}
+
+func (f linkField) String() string { return "" }
+
+func (f linkField) Set(v string) error {
+	if len(*f.links) == 0 {
+		return fmt.Errorf("--%s describes the --link before it, and none was given yet: "+
+			"write --link <url> --%s %q", f.name, f.name, v)
+	}
+	at := len(*f.links) - 1
+	if f.given[at] {
+		return fmt.Errorf("--%s was given twice for the same --link (%s): "+
+			"each link takes one, after the --link it belongs to",
+			f.name, (*f.links)[at].URL)
+	}
+	f.given[at] = true
+	*f.field(&(*f.links)[at]) = v
+	return nil
+}
+
 // newFlagSet registers every flag krowk takes, against the struct that receives
 // them. Split out of Run so the surface catalog can be held to it: the flag set
 // is what actually parses a command line, so it — not a list written down
@@ -214,6 +273,11 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.StringVar(&f.before, "before", "", "")
 	fs.IntVar(&f.limit, "limit", 0, "")
 	fs.StringVar(&f.pullRequest, "pull-request", "", "")
+	fs.Var(&f.links, "link", "")
+	fs.Var(linkField{links: &f.links, name: "link-title", given: map[int]bool{},
+		field: func(l *runctx.Link) *string { return &l.Title }}, "link-title", "")
+	fs.Var(linkField{links: &f.links, name: "link-rel", given: map[int]bool{},
+		field: func(l *runctx.Link) *string { return &l.Rel }}, "link-rel", "")
 	fs.Var(&f.references, "reference", "")
 	fs.Var(&f.metadata, "metadata", "")
 	fs.Var(&f.caption, "caption", "")
@@ -628,6 +692,9 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 	if err != nil {
 		return err
 	}
+	if err := checkLinks(f.links); err != nil {
+		return err
+	}
 	if f, err = withRunFlag(f); err != nil {
 		return err
 	}
@@ -703,15 +770,23 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 // command line, a fresh one carrying the detected metadata, or none at all when
 // there is no key to open one with.
 func resolveRun(ctx context.Context, client *api.Client, f flags, env runctx.Env, result *output.Result) (slug string, own bool, err error) {
-	if f.run != "" {
-		// The caller manages this run's lifecycle, so it is not finished here.
-		return f.run, false, nil
-	}
+	// Whichever note applies, the keyless one comes first: no key is why nothing
+	// was recorded, and a note about a run's metadata being settled would send
+	// the caller to `krowk runs start`, which needs the key they do not have.
 	if !client.Authenticated() {
 		if note := anonymousMetadataNote(f); note != "" {
 			result.Notes = append(result.Notes, note)
 		}
-		return "", false, nil
+		return f.run, false, nil
+	}
+	if f.run != "" {
+		// The caller manages this run's lifecycle, so it is not finished here —
+		// and its metadata was recorded when it was opened, so flags describing
+		// the work have nowhere to land. Which is worth saying out loud.
+		if note := namedRunMetadataNote(f); note != "" {
+			result.Notes = append(result.Notes, note)
+		}
+		return f.run, false, nil
 	}
 
 	run, err := client.CreateRun(ctx, metadataFor(f, env))
@@ -732,11 +807,25 @@ func metadataFor(f flags, env runctx.Env) runctx.Metadata {
 		Commit:      f.commit,
 		Agent:       f.agent,
 		PullRequest: f.pullRequest,
+		Links:       f.links,
 		References:  f.references,
 		Session:     f.session,
 		Title:       f.title,
 		Client:      "krowk-cli/" + Version,
 	})
+}
+
+// checkLinks holds --link to the vocabulary before anything is sent, so a
+// malformed URL fails the command rather than landing in a record that is
+// stored verbatim and never validated again.
+func checkLinks(links linkSlice) error {
+	if err := runctx.ValidateLinks(links); err != nil {
+		// No flag name prefixed: the message names the link and the field that is
+		// wrong, and prefixing --link would send a caller with a bad --link-title
+		// to the flag that was right.
+		return api.Fail("bad_flag", err.Error())
+	}
+	return nil
 }
 
 // parseMetadata turns repeated --metadata key=value pairs into a map. The value
@@ -819,9 +908,40 @@ func withCaption(extras map[string]string, captions []string, i int) map[string]
 // recorded. Silently dropping it would leave an agent believing the pull request
 // it named is attached to the upload, and it is not.
 func anonymousMetadataNote(f flags) string {
+	given := append(runMetadataGiven(f), artifactMetadataGiven(f)...)
+	if len(given) == 0 {
+		return ""
+	}
+	return strings.Join(given, ", ") + " was not recorded: a keyless upload records no metadata — " +
+		"run `krowk auth login --token krowk_sk_...`"
+}
+
+// namedRunMetadataNote is the same honesty for the other path that drops
+// metadata: a run's metadata was recorded when the run was opened, so flags
+// describing the work are dropped when --run names one that already exists.
+// Said rather than refused, because the flags are harmless in a script that
+// pushes to a run it opened earlier with the same arguments — and because
+// --caption and --metadata land on the artifact and are recorded either way.
+func namedRunMetadataNote(f flags) string {
+	given := runMetadataGiven(f)
+	if len(given) == 0 {
+		return ""
+	}
+	return strings.Join(given, ", ") + " was not recorded: run " + f.run +
+		" already carries the metadata it was opened with — pass these to " +
+		"`krowk runs start`, or drop --run and let this push open its own run"
+}
+
+// runMetadataGiven names the flags that describe the work, which is what a run
+// carries; artifactMetadataGiven names the ones that describe one file. The two
+// are separate because the paths that drop metadata drop different halves of it.
+func runMetadataGiven(f flags) []string {
 	var given []string
 	if f.pullRequest != "" {
 		given = append(given, "--pull-request")
+	}
+	if len(f.links) > 0 {
+		given = append(given, "--link")
 	}
 	if len(f.references) > 0 {
 		given = append(given, "--reference")
@@ -829,17 +949,21 @@ func anonymousMetadataNote(f flags) string {
 	if f.session != "" {
 		given = append(given, "--session")
 	}
+	if f.title != "" {
+		given = append(given, "--title")
+	}
+	return given
+}
+
+func artifactMetadataGiven(f flags) []string {
+	var given []string
 	if len(f.metadata) > 0 {
 		given = append(given, "--metadata")
 	}
 	if len(f.caption) > 0 {
 		given = append(given, "--caption")
 	}
-	if len(given) == 0 {
-		return ""
-	}
-	return strings.Join(given, ", ") + " was not recorded: a keyless upload records no metadata — " +
-		"run `krowk auth login --token krowk_sk_...`"
+	return given
 }
 
 // withProgress keeps what a failed batch would otherwise lose: the links of
@@ -1135,6 +1259,9 @@ func withTakedownAuthority(err error, byToken bool) error {
 }
 
 func runsStart(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if err := checkLinks(f.links); err != nil {
+		return err
+	}
 	client, err := newClient(f, env)
 	if err != nil {
 		return err

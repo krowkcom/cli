@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/krowkcom/cli/internal/api"
+	"github.com/krowkcom/cli/internal/runctx"
 )
 
 // The catalog is what krowk says it can do, as data rather than as prose.
@@ -117,8 +118,21 @@ func uploadFlags() []Flag {
 func metadataFlags() []Flag {
 	return []Flag{
 		{Name: "pull-request", Type: typeString, Usage: "Pull request the work belongs to"},
+		{Name: "link", Type: typeString, Repeatable: true,
+			Usage: "Link this work is about — the issue, the spec, the discussion. " +
+				"An absolute http(s) URL, repeatable up to 20, recorded on the run as " +
+				"`krowk.links`"},
+		// Two flags rather than a --link value with a syntax to parse: a URL may
+		// contain any separator that would have delimited a title, and an agent
+		// getting the quoting wrong would record a link to somewhere else.
+		{Name: "link-title", Type: typeString, Repeatable: true,
+			Usage: "What to call the --link before it, instead of its URL. One line"},
+		{Name: "link-rel", Type: typeString, Repeatable: true,
+			Usage: "What the --link before it is: " + strings.Join(runctx.LinkRels, ", ") +
+				" — or a word of your own"},
 		{Name: "reference", Type: typeString, Repeatable: true,
-			Usage: "Related link — repeat for more than one"},
+			Usage: "Related identifier that is not a URL, e.g. a ticket key — " +
+				"repeat for more than one. A URL is a --link"},
 		{Name: "session", Type: typeString, Usage: "Agent session ID"},
 		{Name: "title", Type: typeString,
 			Usage: "Title for the work this push belongs to, recorded on the run. " +

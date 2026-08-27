@@ -11,6 +11,25 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- `--link`, for the links a piece of work is about — the issue it fixes, the
+  spec it implements, the discussion behind it. Repeat it for more than one, up
+  to twenty, and label each with `--link-title` and classify it with
+  `--link-rel` (`tracks`, `fixes`, `spec`, `discussion`, `source`,
+  `supersedes`, or a word of your own); both describe the `--link` before them.
+  They land on the run as `krowk.links`, an array of `{url, title, rel}`
+  objects, so a reader can name a link instead of showing a raw URL. A link
+  that is not an absolute `http(s)` URL, one with a space in it, a title over
+  140 characters or a rel over 64, either of them carrying a tab, a newline or
+  another control character, a twenty-first link, or a set of links
+  large enough to crowd out the detected metadata is refused rather than
+  trimmed — metadata is stored verbatim and nothing downstream validates it
+  again, so a shortened URL would be a link to somewhere else for as long as
+  the record lives. `--reference` is
+  unchanged and is now the place for identifiers that are not URLs, such as a
+  bare ticket key.
+- The same links on the MCP `krowk_push` tool, as a `links` array whose schema
+  names the suggested `rel` values, so an agent picks from the vocabulary
+  rather than inventing one.
 - A GitHub Action, `uses: krowkcom/cli@<tag>`, wrapping the CLI for CI: give it
   files or globs, it installs the binary, pushes them, and hands back `urls`,
   a `markdown` paste block ready for a PR comment, the `run-slug` and the
@@ -24,6 +43,13 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Fixed
 
+- Run metadata passed to a push that names an existing run is now reported as
+  dropped instead of vanishing. `krowk push shot.png --run run_… --link …`
+  records nothing on that run — a run carries the metadata it was opened with —
+  and both the CLI and the MCP tool now say so in `notes`, naming the flags and
+  the run. `--caption` and `--metadata` are unaffected: they land on the
+  artifact. The keyless note gained `--title` for the same reason: it was
+  dropped and unmentioned.
 - The branch a run records in CI. GitHub checks out a detached HEAD, where
   git can only answer the literal `HEAD` — the branch is read from the
   runner's environment instead, preferring a pull request's source branch

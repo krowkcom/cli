@@ -64,7 +64,7 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 
 Wherever a command takes `<artifact>`, `<run>` or `--run`, it takes the link as readily as the slug: paste `https://krowk.com/a/art_…` or the CDN URL under it, and the slug is read out of it.
 
-Push flags: `--run`, `--pull-request`, `--reference` (repeatable), `--session`, `--title`, `--caption` (repeatable), `--destination <tool>`, `--metadata key=value` (repeatable), plus `--repo` / `--commit` / `--agent` to override detection. Without a key, uploads land anonymously, expire in 24 hours and return a one-shot claim token.
+Push flags: `--run`, `--pull-request`, `--link <url>` (repeatable, with `--link-title` / `--link-rel` describing the `--link` before them), `--reference` (repeatable, for identifiers that are not URLs), `--session`, `--title`, `--caption` (repeatable), `--destination <tool>`, `--metadata key=value` (repeatable), plus `--repo` / `--commit` / `--agent` to override detection. Without a key, uploads land anonymously, expire in 24 hours and return a one-shot claim token.
 
 ### Metadata
 
@@ -81,12 +81,13 @@ Key names follow the canon vocabulary: OpenTelemetry's where OTel has a word, `k
 | `gen_ai.request.model` / `gen_ai.system` | `KROWK_MODEL`, else `ANTHROPIC_MODEL`; the provider follows the model's family (or the harness), never a guess |
 | `krowk.change.url` / `vcs.change.id` | `--pull-request` (or `GITHUB_REF` in a PR build); the id is derived from the URL |
 | `krowk.session` | `--session`, else `KROWK_SESSION`, `CLAUDE_CODE_SESSION_ID`, `CURSOR_TRACE_ID`, `GITHUB_RUN_ID` |
-| `krowk.references` / `vcs.change.title` | `--reference` (always a list), `--title` — the work's title, not the paste's label |
+| `krowk.links` | `--link` (always a list, up to 20) — each entry `{url, title?, rel?}`, labelled by `--link-title` and classified by `--link-rel` (`tracks`, `fixes`, `spec`, `discussion`, `source`, `supersedes`, or your own word) |
+| `krowk.references` / `vcs.change.title` | `--reference` (always a list) for identifiers that are not URLs, `--title` — the work's title, not the paste's label |
 | `krowk.caption` | `--caption` — on the artifact, not the run: what that one file shows |
 | `krowk.client` | krowk itself: `krowk-cli/…` or `krowk-mcp/…` |
 | anything else | `--metadata key=value` — your value wins over a detected one, standard keys included |
 
-Every write detects at its own moment. Facts about the work — the change, the session, the references — live on the **run**; every push also stamps each **artifact** with the state it finds then (commit, branch, dirty, harness, client), so a file's production record travels with it wherever it is later claimed or attached. Runs recorded before this vocabulary carry flat keys (`repo`, `commit`, …); readers look for the standard key first and fall back.
+Every write detects at its own moment. Facts about the work — the change, the session, the links and references — live on the **run**; every push also stamps each **artifact** with the state it finds then (commit, branch, dirty, harness, client), so a file's production record travels with it wherever it is later claimed or attached. Runs recorded before this vocabulary carry flat keys (`repo`, `commit`, …); readers look for the standard key first and fall back.
 
 ### Sharing the link
 

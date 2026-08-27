@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http/httptest"
 	"os"
@@ -226,6 +227,171 @@ func TestPushReturnsBothPasteFormsLabelled(t *testing.T) {
 	}
 	if meta["krowk.client"] != "krowk-mcp/1.2.3" {
 		t.Errorf("krowk.client = %v, want the MCP server to identify itself", meta["krowk.client"])
+	}
+}
+
+// The push tool takes the structured links the CLI's --link writes, so an agent
+// driving krowk through MCP records the same vocabulary rather than a flat list.
+func TestPushRecordsStructuredLinksOnTheRun(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	result := s.callTool("krowk_push", map[string]any{
+		"files": []string{s.fixture},
+		"links": []any{
+			map[string]any{
+				"url":   "https://linear.app/acme/issue/ENG-9",
+				"title": "Cart total rounds wrong",
+				"rel":   "fixes",
+			},
+			map[string]any{"url": "https://github.com/acme/storefront/discussions/7"},
+		},
+	})
+	if result["isError"] == true {
+		t.Fatalf("push failed: %s", text(t, result))
+	}
+
+	structured, _ := result["structuredContent"].(map[string]any)
+	run, _ := structured["run"].(map[string]any)
+	meta, _ := run["metadata"].(map[string]any)
+	links, _ := meta["krowk.links"].([]any)
+	if len(links) != 2 {
+		t.Fatalf("krowk.links = %v, want both entries", meta["krowk.links"])
+	}
+	first, _ := links[0].(map[string]any)
+	if first["url"] != "https://linear.app/acme/issue/ENG-9" ||
+		first["title"] != "Cart total rounds wrong" || first["rel"] != "fixes" {
+		t.Errorf("krowk.links[0] = %v", first)
+	}
+	// A link with only a URL records only a URL: no empty title or rel keys, the
+	// same pruning every other optional key gets.
+	second, _ := links[1].(map[string]any)
+	if len(second) != 1 || second["url"] != "https://github.com/acme/storefront/discussions/7" {
+		t.Errorf("krowk.links[1] = %v, want the URL alone", second)
+	}
+}
+
+// The same limits the CLI flag enforces, enforced here — and enforced before a
+// single byte moves, since the point is to keep a malformed link out of a record
+// nothing downstream validates.
+func TestPushRefusesMalformedLinks(t *testing.T) {
+	for name, links := range map[string][]any{
+		"not a URL":     {map[string]any{"url": "ENG-9"}},
+		"no URL at all": {map[string]any{"title": "an issue somewhere"}},
+		"a title of two lines": {map[string]any{
+			"url": "https://example.com/1", "title": "first\nsecond"}},
+		"an overlong title": {map[string]any{
+			"url": "https://example.com/1", "title": strings.Repeat("x", 141)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newSession(t, "krk_test")
+			result := s.callTool("krowk_push", map[string]any{
+				"files": []string{s.fixture},
+				"links": links,
+			})
+			if result["isError"] != true {
+				t.Fatalf("push succeeded with %v: %s", links, text(t, result))
+			}
+			if body := text(t, result); !strings.Contains(body, "links") {
+				t.Errorf("text = %q, want it to name what was wrong", body)
+			}
+		})
+	}
+}
+
+// A shape error has to name the argument it is about. The one message this used
+// to carry blamed `files` for everything, which is advice to change the
+// argument that was right.
+func TestPushNamesTheArgumentThatIsTheWrongShape(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	result := s.callTool("krowk_push", map[string]any{
+		"files": []string{s.fixture},
+		// The likely mistake now that the schema has links: an array of URLs
+		// rather than an array of link objects.
+		"links": []any{"https://linear.app/acme/issue/ENG-9"},
+	})
+	if result["isError"] != true {
+		t.Fatalf("push accepted a links array of strings: %s", text(t, result))
+	}
+	body := text(t, result)
+	if !strings.Contains(body, "links") {
+		t.Errorf("text = %q, want it to name `links`", body)
+	}
+	if strings.Contains(body, "`files` must be an array of paths") {
+		t.Errorf("text = %q, want it to stop blaming files", body)
+	}
+}
+
+// The schema says additionalProperties: false, so the tool enforces it. An
+// agent writing `label` where the schema says `title` would otherwise get a
+// link with no name on it and no word said about why.
+// Same honesty in the tool: metadata about the work has nowhere to land on a
+// run the caller named, and an agent told nothing would report the issue as
+// linked when it is not.
+func TestPushSaysWhenANamedRunAlreadyHasItsMetadata(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	first := s.callTool("krowk_push", map[string]any{"files": []string{s.fixture}})
+	structured, _ := first["structuredContent"].(map[string]any)
+	run, _ := structured["run"].(map[string]any)
+	slug, _ := run["slug"].(string)
+	if slug == "" {
+		t.Fatalf("no run slug to reuse: %+v", structured)
+	}
+
+	result := s.callTool("krowk_push", map[string]any{
+		"files": []string{s.fixture},
+		"run":   slug,
+		"links": []any{map[string]any{"url": "https://linear.app/acme/issue/ENG-9"}},
+	})
+	if result["isError"] == true {
+		t.Fatalf("push failed: %s", text(t, result))
+	}
+	if body := text(t, result); !strings.Contains(body, "links") || !strings.Contains(body, slug) {
+		t.Errorf("text = %q, want it to say the links were not recorded on %s", body, slug)
+	}
+}
+
+func TestPushRefusesAnUnknownArgument(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	result := s.callTool("krowk_push", map[string]any{
+		"files": []string{s.fixture},
+		"links": []any{map[string]any{"url": "https://example.com/1", "label": "My Issue"}},
+	})
+	if result["isError"] != true {
+		t.Fatalf("push accepted an unknown field: %s", text(t, result))
+	}
+	if body := text(t, result); !strings.Contains(body, "label") {
+		t.Errorf("text = %q, want it to name the field it did not know", body)
+	}
+
+	// Strictness reaches the links and stops there: a stray argument beside them
+	// is not worth failing an upload over, and no other tool refuses one.
+	ok := s.callTool("krowk_push", map[string]any{
+		"files":   []string{s.fixture},
+		"caption": "a flag the CLI has and this tool does not",
+	})
+	if ok["isError"] == true {
+		t.Errorf("push refused a stray argument: %s", text(t, ok))
+	}
+}
+
+// Twenty-one links is a loop appending one per iteration, and it would fill the
+// 16KB metadata cap with links while pushing the detected metadata out.
+func TestPushRefusesMoreLinksThanARunHolds(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	links := make([]any, 0, 21)
+	for i := 0; i < 21; i++ {
+		links = append(links, map[string]any{"url": fmt.Sprintf("https://example.com/%d", i)})
+	}
+	result := s.callTool("krowk_push", map[string]any{
+		"files": []string{s.fixture},
+		"links": links,
+	})
+	if result["isError"] != true {
+		t.Fatalf("push accepted 21 links: %s", text(t, result))
 	}
 }
 

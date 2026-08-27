@@ -7,9 +7,12 @@ package runctx
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/url"
 	"os/exec"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Metadata is the JSON blob that rides along with a record. Flags override
@@ -40,11 +43,198 @@ type Metadata struct {
 	ChangeTitle string   `json:"vcs.change.title,omitempty"`
 	ChangeURL   string   `json:"krowk.change.url,omitempty"`
 	Session     string   `json:"krowk.session,omitempty"`
+	Links       []Link   `json:"krowk.links,omitempty"`
 	References  []string `json:"krowk.references,omitempty"`
 
 	// remoteSlug remembers what the origin remote itself named, so an
 	// overridden repository name can be checked against it. Never serialized.
 	remoteSlug string
+}
+
+// Link is one structured reference: where it points, optionally what to call
+// it and what kind of link it is. The canon vocabulary (`krowk.links` in
+// engineering/metadata.md) fixes the shape — url required, title and rel
+// optional, rel an open string rather than an enum so a writer with a kind the
+// suggested list does not name records its own word instead of mislabelling.
+type Link struct {
+	URL   string `json:"url"`
+	Title string `json:"title,omitempty"`
+	Rel   string `json:"rel,omitempty"`
+}
+
+// The limits links are held to. They are the vocabulary's, not the registry's:
+// the registry validates size and nothing else, so a link that is malformed
+// here is malformed in the record forever.
+//
+// MaxLinks bounds the count and MaxLinksBytes the whole of it, because the two
+// answer different failures: twenty is what a run's links are worth reading,
+// and twenty links at the per-link maximum is 40KB — past the registry's 16KB
+// metadata cap, which would fail the run with the registry's own opaque
+// refusal rather than with a sentence naming the flag. Half the cap, so the
+// detected metadata always has room beside them.
+//
+// Lengths are counted in characters rather than bytes: a title cut at 140
+// bytes is 46 characters of Japanese, and the number in the vocabulary is what
+// a person writing a title counts.
+const (
+	MaxLinks      = 20
+	MaxLinkURL    = 2048
+	MaxLinkTitle  = 140
+	MaxLinkRel    = 64
+	MaxLinksBytes = 8192
+)
+
+// LinkRels are the suggested values for a link's rel, in the order a writer is
+// likely to want them. Suggested, not enforced — see Link.
+var LinkRels = []string{"tracks", "fixes", "spec", "discussion", "source", "supersedes"}
+
+// ValidateLinks refuses what it cannot record faithfully rather than mangling
+// it: a truncated URL is a link to somewhere else, and a title carrying a
+// newline breaks every renderer that puts it on a row. Errors are plain, so
+// each caller can dress them in its own failure code — `bad_flag` from the CLI,
+// `bad_arguments` from the MCP server.
+func ValidateLinks(links []Link) error {
+	if len(links) > MaxLinks {
+		return fmt.Errorf("%d links is more than the %d a run records: "+
+			"link what the work is about, not everything it touched", len(links), MaxLinks)
+	}
+	for i, l := range links {
+		where := fmt.Sprintf("link %d", i+1)
+		if err := validateLinkURL(where, l.URL); err != nil {
+			return err
+		}
+		if err := validateLinkLine(where, "title", l.Title, MaxLinkTitle); err != nil {
+			return err
+		}
+		// rel is an open string, not an enum — a writer with a kind the suggested
+		// list does not name records its own word. Open is not unbounded: it
+		// renders on the same row as the title, so it is held to the same shape.
+		if err := validateLinkLine(where, "rel", l.Rel, MaxLinkRel); err != nil {
+			return err
+		}
+	}
+	// The whole of them, not each: the per-link maxima multiply past the
+	// registry's 16KB metadata cap, and a refusal from there names nothing.
+	if n := linksBytes(links); n > MaxLinksBytes {
+		return fmt.Errorf("the links come to %d bytes of metadata, past the %d they may fill: "+
+			"a run's metadata budget is shared with everything krowk detects", n, MaxLinksBytes)
+	}
+	return nil
+}
+
+// validateLinkLine holds a link's human-readable half to one row of text. A
+// tab, a NEL or a U+2028 line separator breaks a single-row render as surely as
+// a newline does, and none of them is anything a title or a rel needs.
+func validateLinkLine(where, field, value string, max int) error {
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s has a %s that is not valid UTF-8: "+
+			"recording it would replace the bad bytes with U+FFFD, and the record "+
+			"is meant to be what the caller said", where, field)
+	}
+	if n := utf8.RuneCountInString(value); n > max {
+		return fmt.Errorf("%s has a %d-character %s, past the %d one line holds",
+			where, n, field, max)
+	}
+	if strings.ContainsFunc(value, isDisplayHostile) {
+		return fmt.Errorf("%s has a %s that would repaint the row it is drawn on — "+
+			"a line break, a control character or a bidi override: it is what a "+
+			"reader sees instead of the URL, on one row", where, field)
+	}
+	return nil
+}
+
+// isDisplayHostile reports the characters that end a line, steer a terminal or
+// move text that is drawn after them: the C0 controls (tab and newline among
+// them), DEL, NEL, the Unicode line and paragraph separators, the bidi
+// overrides and isolates, the zero-width spaces and the byte order mark.
+//
+// The renderer already folds these out of anything it draws
+// (output.reordering, output.oneLine). This is the writer's side of the same
+// rule, and it refuses rather than folds: a title krowk quietly rewrote is not
+// what the caller said, and the record is stored verbatim and read for years.
+// U+200D ZERO WIDTH JOINER is kept for the same reason the renderer keeps it —
+// it is what holds a multi-part emoji together.
+func isDisplayHostile(r rune) bool {
+	switch {
+	case r == '\u200d': // ZERO WIDTH JOINER
+		return false
+	case r < ' ', r == 0x7f, r == 0x85,
+		r == '\u2028', r == '\u2029', // line and paragraph separators
+		r == '\ufeff',                  // BYTE ORDER MARK
+		r >= '\u200b' && r <= '\u200f', // zero-width spaces, LRM, RLM
+		r >= '\u202a' && r <= '\u202e', // bidi embeddings and overrides
+		r >= '\u2066' && r <= '\u2069': // bidi isolates
+		return true
+	}
+	return false
+}
+
+// validateLinkURL holds a URL to what can be pasted and followed. Parsed
+// rather than prefix-matched: a string that reads as a URL and does not parse
+// as one is a link nothing can follow, and it is stored verbatim, so this is
+// the only place it is ever looked at.
+func validateLinkURL(where, raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("%s has no url: every link needs an absolute http(s) URL", where)
+	}
+	if !utf8.ValidString(raw) {
+		return fmt.Errorf("%s has a url that is not valid UTF-8: "+
+			"recording it would replace the bad bytes with U+FFFD, and a rewritten "+
+			"URL points somewhere else", where)
+	}
+	// Before parsing, because url.Parse accepts a space in a path and every
+	// renderer that puts the URL in markdown then breaks on it — and a URL is
+	// one word by definition. The display-hostile characters go with it: a bidi
+	// override in a URL repaints the row it is drawn on, which is how a link
+	// gets to look like one host and lead to another.
+	if strings.ContainsFunc(raw, func(r rune) bool { return r == ' ' || isDisplayHostile(r) }) {
+		return fmt.Errorf("%s (%q) has a space, a control character or a bidi "+
+			"override in it: a URL is one unbroken word, and one that reads as it "+
+			"resolves", where, raw)
+	}
+	if utf8.RuneCountInString(raw) > MaxLinkURL {
+		return fmt.Errorf("%s is %d characters, past the %d a URL may be",
+			where, utf8.RuneCountInString(raw), MaxLinkURL)
+	}
+	u, err := url.Parse(raw)
+	// The scheme is compared lowercased because it is case-insensitive in the
+	// URL itself: HTTPS://example.com is the same link, and refusing it would
+	// send the caller to references for a URL that is perfectly good.
+	//
+	// The message names no flag: the CLI and the MCP server share this
+	// validator, and telling an agent to use --reference where its tool takes a
+	// `references` array is advice that fails.
+	if err != nil || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") || u.Host == "" {
+		return fmt.Errorf("%s (%s) is not an absolute http(s) URL — "+
+			"a ticket key or an internal ID belongs in references, not in links", where, raw)
+	}
+	// Credentials in a URL are credentials published: run metadata is public and
+	// permanent, and krowk refuses credential *files* for the same reason. The
+	// link without them is almost always the link that was meant, so this says
+	// so rather than stripping them and recording a URL nobody typed.
+	if u.User != nil {
+		// The suggestion is the same URL with the credentials taken out, query
+		// and fragment included: a link stripped down to its path points at a
+		// different page, and a suggestion that does that is not a suggestion.
+		clean := *u
+		clean.User = nil
+		return fmt.Errorf("%s carries a username or password in the URL, and run "+
+			"metadata is public and permanent: link %s instead", where, clean.String())
+	}
+	return nil
+}
+
+// linksBytes is what these links will occupy in the record: the JSON, since
+// that is what the registry counts against its cap.
+func linksBytes(links []Link) int {
+	if len(links) == 0 {
+		return 0
+	}
+	b, err := json.Marshal(links)
+	if err != nil {
+		return 0
+	}
+	return len(b)
 }
 
 // Env is a lookup function, so tests do not have to touch the process
@@ -59,6 +249,7 @@ type Overrides struct {
 	Commit      string
 	Agent       string
 	PullRequest string
+	Links       []Link
 	References  []string
 	Session     string
 	Title       string
@@ -74,6 +265,7 @@ func Resolve(env Env, o Overrides) Metadata {
 	override(&m.Harness, o.Agent)
 	override(&m.ChangeURL, o.PullRequest)
 	override(&m.Session, o.Session)
+	m.Links = o.Links
 	m.References = o.References
 	m.ChangeTitle = o.Title
 	m.Client = o.Client
@@ -172,10 +364,15 @@ func DetectSystem(harness, model string) string {
 
 // Artifact is the production stamp for one file: the snapshot of this moment,
 // minus the facts that belong to the work rather than the file — the change,
-// the session, the references.
+// the session, the links and the references.
+//
+// The vocabulary allows krowk.links on an artifact too, for a link that is
+// about the one file. Nothing here writes one: --link names what the work is
+// about, and copying the work's links onto every artifact would claim the file
+// is what each of them points at.
 func (m Metadata) Artifact() Metadata {
 	m.ChangeID, m.ChangeTitle, m.ChangeURL, m.Session = "", "", "", ""
-	m.References = nil
+	m.Links, m.References = nil, nil
 	return m
 }
 

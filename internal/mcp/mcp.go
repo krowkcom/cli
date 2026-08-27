@@ -485,6 +485,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Run         string            `json:"run"`
 		Title       string            `json:"title"`
 		PullRequest string            `json:"pull_request"`
+		Links       []runctx.Link     `json:"links"`
 		References  []string          `json:"references"`
 		Session     string            `json:"session"`
 		Repo        string            `json:"repo"`
@@ -497,6 +498,12 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 	}
 	if len(a.Files) == 0 {
 		return "", nil, api.Fail("no_file", "pass at least one path in `files`")
+	}
+	// Held to the vocabulary here rather than at the registry, which stores
+	// metadata verbatim and validates nothing but its size: a malformed link
+	// accepted now is malformed in the record forever.
+	if err := runctx.ValidateLinks(a.Links); err != nil {
+		return "", nil, api.Fail("bad_arguments", "`links`: "+err.Error())
 	}
 	// A push creates the thing the workspace was pinned for. Uploading it
 	// anonymously instead would be the misdirection this refusal exists to
@@ -549,6 +556,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Commit:      a.Commit,
 		Agent:       a.Agent,
 		PullRequest: a.PullRequest,
+		Links:       a.Links,
 		References:  a.References,
 		Session:     a.Session,
 		Title:       a.Title,
@@ -561,9 +569,10 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		}
 		run, runSlug, ownRun = created, created.Slug, true
 	}
-	if !s.Client.Authenticated() && (a.PullRequest != "" || len(a.References) > 0 || a.Session != "" || len(a.Metadata) > 0) {
-		notes = append(notes, "pull_request, references, session and metadata were not recorded: "+
-			"a keyless upload records no metadata, and opening a run needs an API key")
+	if !s.Client.Authenticated() && (a.PullRequest != "" || len(a.Links) > 0 ||
+		len(a.References) > 0 || a.Session != "" || len(a.Metadata) > 0) {
+		notes = append(notes, "pull_request, links, references, session and metadata were not "+
+			"recorded: a keyless upload records no metadata, and opening a run needs an API key")
 	}
 
 	// Each artifact carries its own production record, stamped at this moment;
@@ -979,10 +988,47 @@ func toolSchemas() []map[string]any {
 						"type":        "string",
 						"description": "URL of the pull request this work belongs to.",
 					},
+					"links": map[string]any{
+						"type":     "array",
+						"maxItems": runctx.MaxLinks,
+						"items": map[string]any{
+							"type":     "object",
+							"required": []string{"url"},
+							"properties": map[string]any{
+								"url": map[string]any{
+									"type":        "string",
+									"format":      "uri",
+									"maxLength":   runctx.MaxLinkURL,
+									"description": "Absolute http(s) URL. Anything else is refused, not trimmed.",
+								},
+								"title": map[string]any{
+									"type":      "string",
+									"maxLength": runctx.MaxLinkTitle,
+									"description": "One line naming the link, shown to a reader instead of " +
+										"the URL, e.g. the issue's own title.",
+								},
+								"rel": map[string]any{
+									"type": "string",
+									"description": "What this link is. Pick from " +
+										strings.Join(runctx.LinkRels, ", ") +
+										" where one fits: `fixes` for the issue this work closes, `tracks` " +
+										"for the ticket it is filed under, `spec` for what it implements, " +
+										"`discussion` for the thread about it, `source` for what it was " +
+										"derived from, `supersedes` for the run it replaces. Any other word " +
+										"is accepted and stored as given.",
+								},
+							},
+							"additionalProperties": false,
+						},
+						"description": "Links this work is about, recorded on the run as `krowk.links` — " +
+							"the issue being fixed, the spec, the discussion. Prefer this over " +
+							"`references` for anything that is a URL.",
+					},
 					"references": map[string]any{
-						"type":        "array",
-						"items":       map[string]any{"type": "string"},
-						"description": "Related links, e.g. the issue being fixed.",
+						"type":  "array",
+						"items": map[string]any{"type": "string"},
+						"description": "Related identifiers that are not URLs, e.g. a ticket key. " +
+							"A URL belongs in `links`.",
 					},
 					"session": map[string]any{
 						"type":        "string",

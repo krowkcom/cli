@@ -235,9 +235,11 @@ func flagTypeOf(t *testing.T, f *flag.Flag) string {
 		return typeBool
 	}
 	switch kind := fmt.Sprintf("%T", f.Value); kind {
-	case "*flag.stringValue", "*cli.stringSlice":
-		// stringSlice is --reference: still a string to whoever types it, and the
-		// catalog says the repetition separately with Repeatable.
+	case "*flag.stringValue", "*cli.stringSlice", "*cli.linkSlice", "cli.linkField":
+		// stringSlice is --reference and linkSlice is --link: still a string to
+		// whoever types it, and the catalog says the repetition separately with
+		// Repeatable. linkField is --link-title and --link-rel, a string that
+		// lands on the link before it rather than in a list of its own.
 		return typeString
 	case "*flag.intValue", "*flag.int64Value":
 		// Both are `int` to a reader of the surface. The width is a Go detail.

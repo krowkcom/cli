@@ -7,6 +7,7 @@ package runctx
 
 import (
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -40,11 +41,70 @@ type Metadata struct {
 	ChangeTitle string   `json:"vcs.change.title,omitempty"`
 	ChangeURL   string   `json:"krowk.change.url,omitempty"`
 	Session     string   `json:"krowk.session,omitempty"`
+	Links       []Link   `json:"krowk.links,omitempty"`
 	References  []string `json:"krowk.references,omitempty"`
 
 	// remoteSlug remembers what the origin remote itself named, so an
 	// overridden repository name can be checked against it. Never serialized.
 	remoteSlug string
+}
+
+// Link is one structured reference: where it points, optionally what to call
+// it and what kind of link it is. The canon vocabulary (`krowk.links` in
+// engineering/metadata.md) fixes the shape — url required, title and rel
+// optional, rel an open string rather than an enum so a writer with a kind the
+// suggested list does not name records its own word instead of mislabelling.
+type Link struct {
+	URL   string `json:"url"`
+	Title string `json:"title,omitempty"`
+	Rel   string `json:"rel,omitempty"`
+}
+
+// The limits links are held to. They are the vocabulary's, not the registry's:
+// the registry validates size and nothing else, so a link that is malformed
+// here is malformed in the record forever. MaxLinks is a guard against a loop
+// that appends one per iteration filling the 16KB metadata cap with links and
+// pushing the detected metadata out of the record.
+const (
+	MaxLinks     = 20
+	MaxLinkURL   = 2048
+	MaxLinkTitle = 140
+)
+
+// LinkRels are the suggested values for a link's rel, in the order a writer is
+// likely to want them. Suggested, not enforced — see Link.
+var LinkRels = []string{"tracks", "fixes", "spec", "discussion", "source", "supersedes"}
+
+// ValidateLinks refuses what it cannot record faithfully rather than mangling
+// it: a truncated URL is a link to somewhere else, and a title carrying a
+// newline breaks every renderer that puts it on a row. Errors are plain, so
+// each caller can dress them in its own failure code — `bad_flag` from the CLI,
+// `bad_arguments` from the MCP server.
+func ValidateLinks(links []Link) error {
+	if len(links) > MaxLinks {
+		return fmt.Errorf("%d links is more than the %d a run records: "+
+			"link what the work is about, not everything it touched", len(links), MaxLinks)
+	}
+	for i, l := range links {
+		where := fmt.Sprintf("link %d", i+1)
+		switch {
+		case strings.TrimSpace(l.URL) == "":
+			return fmt.Errorf("%s has no url: every link needs an absolute http(s) URL", where)
+		case !strings.HasPrefix(l.URL, "http://") && !strings.HasPrefix(l.URL, "https://"):
+			return fmt.Errorf("%s (%s) is not an absolute http(s) URL — "+
+				"a ticket key or an internal ID is a --reference, not a link", where, l.URL)
+		case len(l.URL) > MaxLinkURL:
+			return fmt.Errorf("%s is %d characters, past the %d a URL may be",
+				where, len(l.URL), MaxLinkURL)
+		case len(l.Title) > MaxLinkTitle:
+			return fmt.Errorf("%s has a %d-character title, past the %d one line holds",
+				where, len(l.Title), MaxLinkTitle)
+		case strings.ContainsAny(l.Title, "\r\n"):
+			return fmt.Errorf("%s has a title spanning more than one line: "+
+				"a title is what a reader sees instead of the URL, on one row", where)
+		}
+	}
+	return nil
 }
 
 // Env is a lookup function, so tests do not have to touch the process
@@ -59,6 +119,7 @@ type Overrides struct {
 	Commit      string
 	Agent       string
 	PullRequest string
+	Links       []Link
 	References  []string
 	Session     string
 	Title       string
@@ -74,6 +135,7 @@ func Resolve(env Env, o Overrides) Metadata {
 	override(&m.Harness, o.Agent)
 	override(&m.ChangeURL, o.PullRequest)
 	override(&m.Session, o.Session)
+	m.Links = o.Links
 	m.References = o.References
 	m.ChangeTitle = o.Title
 	m.Client = o.Client
@@ -172,10 +234,15 @@ func DetectSystem(harness, model string) string {
 
 // Artifact is the production stamp for one file: the snapshot of this moment,
 // minus the facts that belong to the work rather than the file — the change,
-// the session, the references.
+// the session, the links and the references.
+//
+// The vocabulary allows krowk.links on an artifact too, for a link that is
+// about the one file. Nothing here writes one: --link names what the work is
+// about, and copying the work's links onto every artifact would claim the file
+// is what each of them points at.
 func (m Metadata) Artifact() Metadata {
 	m.ChangeID, m.ChangeTitle, m.ChangeURL, m.Session = "", "", "", ""
-	m.References = nil
+	m.Links, m.References = nil, nil
 	return m
 }
 

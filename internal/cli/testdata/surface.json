@@ -43,10 +43,31 @@
             "usage": "Pull request the work belongs to"
           },
           {
+            "name": "link",
+            "type": "string",
+            "default": "",
+            "usage": "Link this work is about — the issue, the spec, the discussion. An absolute http(s) URL, repeatable up to 20, recorded on the run as `krowk.links`",
+            "repeatable": true
+          },
+          {
+            "name": "link-title",
+            "type": "string",
+            "default": "",
+            "usage": "What to call the --link before it, instead of its URL. One line",
+            "repeatable": true
+          },
+          {
+            "name": "link-rel",
+            "type": "string",
+            "default": "",
+            "usage": "What the --link before it is: tracks, fixes, spec, discussion, source, supersedes — or a word of your own",
+            "repeatable": true
+          },
+          {
             "name": "reference",
             "type": "string",
             "default": "",
-            "usage": "Related link — repeat for more than one",
+            "usage": "Related identifier that is not a URL, e.g. a ticket key — repeat for more than one. A URL is a --link",
             "repeatable": true
           },
           {
@@ -131,10 +152,31 @@
                 "usage": "Pull request the work belongs to"
               },
               {
+                "name": "link",
+                "type": "string",
+                "default": "",
+                "usage": "Link this work is about — the issue, the spec, the discussion. An absolute http(s) URL, repeatable up to 20, recorded on the run as `krowk.links`",
+                "repeatable": true
+              },
+              {
+                "name": "link-title",
+                "type": "string",
+                "default": "",
+                "usage": "What to call the --link before it, instead of its URL. One line",
+                "repeatable": true
+              },
+              {
+                "name": "link-rel",
+                "type": "string",
+                "default": "",
+                "usage": "What the --link before it is: tracks, fixes, spec, discussion, source, supersedes — or a word of your own",
+                "repeatable": true
+              },
+              {
                 "name": "reference",
                 "type": "string",
                 "default": "",
-                "usage": "Related link — repeat for more than one",
+                "usage": "Related identifier that is not a URL, e.g. a ticket key — repeat for more than one. A URL is a --link",
                 "repeatable": true
               },
               {
@@ -268,10 +310,31 @@
                 "usage": "Pull request the work belongs to"
               },
               {
+                "name": "link",
+                "type": "string",
+                "default": "",
+                "usage": "Link this work is about — the issue, the spec, the discussion. An absolute http(s) URL, repeatable up to 20, recorded on the run as `krowk.links`",
+                "repeatable": true
+              },
+              {
+                "name": "link-title",
+                "type": "string",
+                "default": "",
+                "usage": "What to call the --link before it, instead of its URL. One line",
+                "repeatable": true
+              },
+              {
+                "name": "link-rel",
+                "type": "string",
+                "default": "",
+                "usage": "What the --link before it is: tracks, fixes, spec, discussion, source, supersedes — or a word of your own",
+                "repeatable": true
+              },
+              {
                 "name": "reference",
                 "type": "string",
                 "default": "",
-                "usage": "Related link — repeat for more than one",
+                "usage": "Related identifier that is not a URL, e.g. a ticket key — repeat for more than one. A URL is a --link",
                 "repeatable": true
               },
               {
@@ -646,6 +709,7 @@
         "agent",
         "commit",
         "files",
+        "links",
         "metadata",
         "pull_request",
         "references",

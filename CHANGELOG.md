@@ -11,6 +11,21 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- `--link`, for the links a piece of work is about — the issue it fixes, the
+  spec it implements, the discussion behind it. Repeat it for more than one, up
+  to twenty, and label each with `--link-title` and classify it with
+  `--link-rel` (`tracks`, `fixes`, `spec`, `discussion`, `source`,
+  `supersedes`, or a word of your own); both describe the `--link` before them.
+  They land on the run as `krowk.links`, an array of `{url, title, rel}`
+  objects, so a reader can name a link instead of showing a raw URL. A link
+  that is not an absolute `http(s)` URL, a title spanning two lines, or a
+  twenty-first link is refused rather than trimmed — metadata is stored
+  verbatim and nothing downstream validates it again. `--reference` is
+  unchanged and is now the place for identifiers that are not URLs, such as a
+  bare ticket key.
+- The same links on the MCP `krowk_push` tool, as a `links` array whose schema
+  names the suggested `rel` values, so an agent picks from the vocabulary
+  rather than inventing one.
 - A GitHub Action, `uses: krowkcom/cli@<tag>`, wrapping the CLI for CI: give it
   files or globs, it installs the binary, pushes them, and hands back `urls`,
   a `markdown` paste block ready for a PR comment, the `run-slug` and the

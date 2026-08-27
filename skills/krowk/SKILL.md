@@ -124,6 +124,7 @@ environment variable — so never guess at a spelling this file does not carry.
 | Upload one file, get a link | `krowk push shot.png --json` |
 | Upload several, one run | `krowk push a.png b.log --json` |
 | Upload with PR context | `krowk push shot.png --pull-request https://github.com/acme/app/pull/12 --json` |
+| Link the issue this work is about | `krowk push shot.png --link https://linear.app/acme/issue/ENG-9 --link-title "Cart total rounds wrong" --link-rel fixes --json` |
 | Say what the file shows | `krowk push shot.png --caption "Cart after the fix" --json` |
 | Caption a before/after pair | `krowk push before.png after.png --caption "Cart before" --caption "Cart after" --json` |
 | Title the work, on the run | `krowk push shot.png --title "Checkout — mobile" --json` |
@@ -235,8 +236,8 @@ krowk auth verify --json
                  • the link is live immediately
                  • it expires in 24h unless claimed
                  • data.artifacts[].claim_token is the only way back to it
-                 • no run, so --pull-request/--session/--title/--caption
-                   metadata is dropped and reported in data.notes — a keyless
+                 • no run, so --pull-request/--session/--title/--caption/
+                   --link metadata is dropped and reported in data.notes — a keyless
                    block falls back to the filename
                Say this to the person; do not stop and ask them to sign up.
 ```
@@ -325,7 +326,7 @@ krowk push build.log  --run run_8Kd2wq --json
 krowk runs finish run_8Kd2wq --json
 ```
 
-The run records the work — PR, session, references — once, when opened. Every
+The run records the work — PR, session, links — once, when opened. Every
 push also stamps that artifact with the state it finds *then*: commit, branch,
 dirty, harness, model. So `before.png` and `after.png` pushed across a mid-run
 commit carry two different revisions, which is the point. All of it is detected;

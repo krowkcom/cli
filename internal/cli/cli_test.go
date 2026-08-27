@@ -328,6 +328,112 @@ func TestMetadataIsRecordedOnTheRun(t *testing.T) {
 	}
 }
 
+// --link records the structured half of the vocabulary: the URL, and what the
+// caller chose to call it and to classify it as. The pairing is positional, so
+// this test is also the one that pins the order — a title landing on the wrong
+// link would mislabel a link rather than fail.
+func TestLinksAreRecordedOnTheRunWithTheirTitlesAndRels(t *testing.T) {
+	h := newHarness(t, 0)
+
+	e := h.ok(
+		"push", h.fixture,
+		"--link=https://linear.app/acme/issue/ENG-9",
+		"--link-title=Cart total rounds wrong",
+		"--link-rel=fixes",
+		"--link=https://github.com/acme/storefront/discussions/7",
+		"--link-rel=discussion",
+		"--reference=ENG-9",
+	)
+
+	if e.Data.Run == nil {
+		t.Fatal("no run: an authenticated upload should open one to hold the metadata")
+	}
+	links, _ := e.Data.Run.Metadata["krowk.links"].([]any)
+	if len(links) != 2 {
+		t.Fatalf("krowk.links = %v, want two entries", e.Data.Run.Metadata["krowk.links"])
+	}
+	first, _ := links[0].(map[string]any)
+	if first["url"] != "https://linear.app/acme/issue/ENG-9" ||
+		first["title"] != "Cart total rounds wrong" || first["rel"] != "fixes" {
+		t.Errorf("krowk.links[0] = %v", first)
+	}
+	// The second link took the --link-rel that followed it and none of the first
+	// link's title: an unlabelled link records no title key at all.
+	second, _ := links[1].(map[string]any)
+	if second["url"] != "https://github.com/acme/storefront/discussions/7" ||
+		second["rel"] != "discussion" {
+		t.Errorf("krowk.links[1] = %v", second)
+	}
+	if _, titled := second["title"]; titled {
+		t.Errorf("krowk.links[1] = %v, want no title key on an unlabelled link", second)
+	}
+	// --reference is untouched by any of it, and keeps taking non-URL identifiers.
+	refs, _ := e.Data.Run.Metadata["krowk.references"].([]any)
+	if len(refs) != 1 || refs[0] != "ENG-9" {
+		t.Errorf("krowk.references = %v, want the one identifier", e.Data.Run.Metadata["krowk.references"])
+	}
+}
+
+// A link krowk cannot record faithfully is refused rather than mangled: the
+// record is stored verbatim and validated by nothing downstream, so a trimmed
+// URL is a link to somewhere else forever.
+func TestMalformedLinksAreRefusedBeforeAnythingIsSent(t *testing.T) {
+	h := newHarness(t, 0)
+
+	tooMany := []string{"push", h.fixture}
+	for i := 0; i < 21; i++ {
+		tooMany = append(tooMany, fmt.Sprintf("--link=https://example.com/%d", i))
+	}
+
+	cases := map[string][]string{
+		"not a URL":       {"push", h.fixture, "--link=ENG-9"},
+		"a relative path": {"push", h.fixture, "--link=/acme/storefront/issues/9"},
+		"a title of two lines": {"push", h.fixture, "--link=https://example.com/1",
+			"--link-title=first\nsecond"},
+		"an overlong title": {"push", h.fixture, "--link=https://example.com/1",
+			"--link-title=" + strings.Repeat("x", 141)},
+		"an overlong URL":             {"push", h.fixture, "--link=https://example.com/" + strings.Repeat("x", 2048)},
+		"more links than a run holds": tooMany,
+		"a title before any link": {"push", h.fixture, "--link-title=orphan",
+			"--link=https://example.com/1"},
+		"two titles for one link": {"push", h.fixture, "--link=https://example.com/1",
+			"--link-title=one", "--link-title=two"},
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := h.fails(args...)
+			if body["error"] != "bad_flag" {
+				t.Errorf("%v: error = %v, want bad_flag", args, body["error"])
+			}
+			if fix, _ := body["fix"].(string); !strings.Contains(fix, "link") {
+				t.Errorf("fix = %q, want it to name the flag it is about", fix)
+			}
+		})
+	}
+	// Nothing was uploaded by any of them: the refusal comes before the bytes.
+	if e := h.ok("uploads", "list"); len(e.Data.Artifacts) != 0 {
+		t.Errorf("%d artifacts uploaded by refused commands", len(e.Data.Artifacts))
+	}
+}
+
+// `runs start` carries the metadata flags, so it validates them too — the run is
+// where krowk.links lands, and opening one with a broken link would record it.
+func TestRunsStartRefusesAMalformedLink(t *testing.T) {
+	h := newHarness(t, 0)
+
+	if body := h.fails("runs", "start", "--link=ENG-9"); body["error"] != "bad_flag" {
+		t.Errorf("error = %v, want bad_flag", body["error"])
+	}
+	e := h.ok("runs", "start", "--link=https://linear.app/acme/issue/ENG-9", "--link-rel=tracks")
+	links, _ := e.Data.Metadata["krowk.links"].([]any)
+	if len(links) != 1 {
+		t.Fatalf("krowk.links = %v, want the one link", e.Data.Metadata["krowk.links"])
+	}
+	if first, _ := links[0].(map[string]any); first["rel"] != "tracks" {
+		t.Errorf("krowk.links[0] = %v", first)
+	}
+}
+
 func TestEachArtifactCarriesItsOwnProductionRecord(t *testing.T) {
 	h := newHarness(t, 0)
 
@@ -359,7 +465,7 @@ func TestEachArtifactCarriesItsOwnProductionRecord(t *testing.T) {
 		t.Errorf("krowk.vcs.dirty = %v, want a bool inside a git checkout", meta["krowk.vcs.dirty"])
 	}
 	// Facts about the work stay on the run and only there.
-	for _, runOnly := range []string{"krowk.change.url", "vcs.change.id", "vcs.change.title", "krowk.session", "krowk.references"} {
+	for _, runOnly := range []string{"krowk.change.url", "vcs.change.id", "vcs.change.title", "krowk.session", "krowk.links", "krowk.references"} {
 		if _, present := meta[runOnly]; present {
 			t.Errorf("run-only key %q leaked onto the artifact", runOnly)
 		}

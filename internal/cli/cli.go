@@ -49,7 +49,14 @@ Upload flags
                          ` + "`claim`" + ` and ` + "`uploads attach`" + ` it names the run an upload
                          already made joins — a claimed upload has none otherwise
   --pull-request <url>   Pull request the work belongs to
-  --reference <url>      Related link — repeat for more than one
+  --link <url>           Link this work is about — the issue, the spec, the
+                         discussion. Repeat for more than one, up to 20, and
+                         label or classify each with the two flags below
+  --link-title <text>    What to call the --link before it, instead of its URL
+  --link-rel <kind>      What the --link before it is: tracks, fixes, spec,
+                         discussion, source, supersedes — or your own word
+  --reference <id>       Related identifier that is not a URL, e.g. a ticket
+                         key — repeat for more than one. A URL is a --link
   --title <text>         Title for the work, recorded on the run. What a pasted
                          link says about a file is that file's --caption
   --caption <text>       What this file shows, recorded on the artifact as
@@ -120,10 +127,10 @@ Exit codes
 
 Registry precedence: --dev, then KROWK_API_URL, then KROWK_DEV, then the default.
 
-Run metadata — the pull request, references and session — is recorded on a run,
-and a run belongs to a workspace, so it needs an API key. Without one an upload
-still works: it lands anonymously, expires within a day, and comes back with a
-claim token that ` + "`krowk claim`" + ` spends to keep it.
+Run metadata — the pull request, the links, the references, the session — is
+recorded on a run, and a run belongs to a workspace, so it needs an API key.
+Without one an upload still works: it lands anonymously, expires within a day,
+and comes back with a claim token that ` + "`krowk claim`" + ` spends to keep it.
 
 Wherever an artifact or a run is named — a positional, or --run — a link that
 carries it does just as well: the card page, the CDN URL under it, or anything
@@ -161,6 +168,7 @@ type flags struct {
 	before      string
 	limit       int
 	pullRequest string
+	links       linkSlice
 	references  stringSlice
 	metadata    stringSlice
 	caption     stringSlice
@@ -202,6 +210,51 @@ type stringSlice []string
 func (s *stringSlice) String() string     { return strings.Join(*s, ",") }
 func (s *stringSlice) Set(v string) error { *s = append(*s, v); return nil }
 
+// linkSlice collects --link, in the order the links were typed. Order is what
+// makes --link-title and --link-rel unambiguous: each of them describes the
+// --link before it, the way --caption describes the file at its position.
+type linkSlice []runctx.Link
+
+func (l *linkSlice) String() string {
+	urls := make([]string, 0, len(*l))
+	for _, link := range *l {
+		urls = append(urls, link.URL)
+	}
+	return strings.Join(urls, ",")
+}
+
+func (l *linkSlice) Set(v string) error {
+	*l = append(*l, runctx.Link{URL: v})
+	return nil
+}
+
+// linkField is --link-title or --link-rel: it sets one field on the --link it
+// follows. A second one for the same link, or one before any --link, is a
+// mistake worth naming — silently overwriting would drop a label the caller
+// typed, and attaching one to nothing would drop it entirely.
+type linkField struct {
+	links *linkSlice
+	name  string
+	field func(*runctx.Link) *string
+}
+
+func (f linkField) String() string { return "" }
+
+func (f linkField) Set(v string) error {
+	if len(*f.links) == 0 {
+		return fmt.Errorf("--%s describes the --link before it, and none was given yet: "+
+			"write --link <url> --%s %q", f.name, f.name, v)
+	}
+	dst := f.field(&(*f.links)[len(*f.links)-1])
+	if *dst != "" {
+		return fmt.Errorf("--%s was given twice for the same --link (%s): "+
+			"each link takes one, after the --link it belongs to",
+			f.name, (*f.links)[len(*f.links)-1].URL)
+	}
+	*dst = v
+	return nil
+}
+
 // newFlagSet registers every flag krowk takes, against the struct that receives
 // them. Split out of Run so the surface catalog can be held to it: the flag set
 // is what actually parses a command line, so it — not a list written down
@@ -214,6 +267,11 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.StringVar(&f.before, "before", "", "")
 	fs.IntVar(&f.limit, "limit", 0, "")
 	fs.StringVar(&f.pullRequest, "pull-request", "", "")
+	fs.Var(&f.links, "link", "")
+	fs.Var(linkField{links: &f.links, name: "link-title",
+		field: func(l *runctx.Link) *string { return &l.Title }}, "link-title", "")
+	fs.Var(linkField{links: &f.links, name: "link-rel",
+		field: func(l *runctx.Link) *string { return &l.Rel }}, "link-rel", "")
 	fs.Var(&f.references, "reference", "")
 	fs.Var(&f.metadata, "metadata", "")
 	fs.Var(&f.caption, "caption", "")
@@ -628,6 +686,9 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 	if err != nil {
 		return err
 	}
+	if err := checkLinks(f.links); err != nil {
+		return err
+	}
 	if f, err = withRunFlag(f); err != nil {
 		return err
 	}
@@ -732,11 +793,22 @@ func metadataFor(f flags, env runctx.Env) runctx.Metadata {
 		Commit:      f.commit,
 		Agent:       f.agent,
 		PullRequest: f.pullRequest,
+		Links:       f.links,
 		References:  f.references,
 		Session:     f.session,
 		Title:       f.title,
 		Client:      "krowk-cli/" + Version,
 	})
+}
+
+// checkLinks holds --link to the vocabulary before anything is sent, so a
+// malformed URL fails the command rather than landing in a record that is
+// stored verbatim and never validated again.
+func checkLinks(links linkSlice) error {
+	if err := runctx.ValidateLinks(links); err != nil {
+		return api.Fail("bad_flag", "--link: "+err.Error())
+	}
+	return nil
 }
 
 // parseMetadata turns repeated --metadata key=value pairs into a map. The value
@@ -822,6 +894,9 @@ func anonymousMetadataNote(f flags) string {
 	var given []string
 	if f.pullRequest != "" {
 		given = append(given, "--pull-request")
+	}
+	if len(f.links) > 0 {
+		given = append(given, "--link")
 	}
 	if len(f.references) > 0 {
 		given = append(given, "--reference")
@@ -1135,6 +1210,9 @@ func withTakedownAuthority(err error, byToken bool) error {
 }
 
 func runsStart(w io.Writer, f flags, format output.Format, env runctx.Env, colour bool) error {
+	if err := checkLinks(f.links); err != nil {
+		return err
+	}
 	client, err := newClient(f, env)
 	if err != nil {
 		return err

@@ -1,6 +1,10 @@
 package runctx
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func env(pairs map[string]string) Env {
 	return func(k string) string { return pairs[k] }
@@ -142,10 +146,12 @@ func TestArtifactStampDropsTheRunOnlyFacts(t *testing.T) {
 		Harness: "claude-code", Client: "krowk-cli/test",
 		ChangeID: "412", ChangeTitle: "Cart total", Session: "01J8",
 		ChangeURL:  "https://github.com/acme/storefront/pull/412",
-		References: []string{"https://linear.app/acme/issue/STO-1"},
+		Links:      []Link{{URL: "https://linear.app/acme/issue/STO-1", Rel: "fixes"}},
+		References: []string{"STO-1"},
 	}
 	a := m.Artifact()
-	if a.ChangeID != "" || a.ChangeTitle != "" || a.ChangeURL != "" || a.Session != "" || a.References != nil {
+	if a.ChangeID != "" || a.ChangeTitle != "" || a.ChangeURL != "" || a.Session != "" ||
+		a.Links != nil || a.References != nil {
 		t.Errorf("artifact stamp still carries run-only facts: %+v", a)
 	}
 	if a.RepoName != m.RepoName || a.Commit != m.Commit || a.Dirty != m.Dirty || a.Harness != m.Harness {
@@ -204,5 +210,68 @@ func TestCIPullRequest(t *testing.T) {
 	branch := map[string]string{"GITHUB_REF": "refs/heads/main", "GITHUB_REPOSITORY": "acme/storefront"}
 	if got := CIPullRequest(env(branch)); got != "" {
 		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// ValidateLinks is the one place the vocabulary's limits are enforced — the
+// registry stores metadata verbatim and checks nothing but its size, so a link
+// that gets past this is in the record for good.
+func TestValidateLinks(t *testing.T) {
+	ok := []Link{
+		{URL: "https://linear.app/acme/issue/STO-1", Title: "Cart total", Rel: "fixes"},
+		{URL: "http://localhost:3000/report.html"},
+		{URL: "https://example.com/1", Rel: "a word of my own"},
+	}
+	if err := ValidateLinks(ok); err != nil {
+		t.Errorf("ValidateLinks(%+v) = %v, want it accepted — rel is open, http is a URL", ok, err)
+	}
+	if err := ValidateLinks(nil); err != nil {
+		t.Errorf("ValidateLinks(nil) = %v, want no links to be no error", err)
+	}
+
+	tooMany := make([]Link, MaxLinks+1)
+	for i := range tooMany {
+		tooMany[i] = Link{URL: "https://example.com/x"}
+	}
+	for name, links := range map[string][]Link{
+		"an empty url":       {{URL: ""}},
+		"a blank url":        {{URL: "   "}},
+		"a bare ticket key":  {{URL: "STO-1"}},
+		"a relative path":    {{URL: "/acme/storefront/issues/1"}},
+		"another scheme":     {{URL: "ftp://example.com/report"}},
+		"a url past the cap": {{URL: "https://example.com/" + strings.Repeat("x", MaxLinkURL)}},
+		"a title past the cap": {{URL: "https://example.com/1",
+			Title: strings.Repeat("x", MaxLinkTitle+1)}},
+		"a title over two lines":      {{URL: "https://example.com/1", Title: "first\nsecond"}},
+		"more links than a run holds": tooMany,
+	} {
+		if err := ValidateLinks(links); err == nil {
+			t.Errorf("ValidateLinks(%s) = nil, want it refused", name)
+		}
+	}
+}
+
+// A link the caller supplies is carried through as given: Resolve detects
+// nothing here, so there is nothing for it to override or merge.
+func TestResolveCarriesLinksThrough(t *testing.T) {
+	links := []Link{{URL: "https://linear.app/acme/issue/STO-1", Rel: "tracks"}}
+	m := Resolve(func(string) string { return "" }, Overrides{Links: links})
+	if len(m.Links) != 1 || m.Links[0] != links[0] {
+		t.Errorf("Links = %+v, want %+v", m.Links, links)
+	}
+}
+
+// The key is the canon spelling, and the shape inside it is the canon shape —
+// what every reader of a run pins against.
+func TestLinksSerializeUnderTheCanonKey(t *testing.T) {
+	b, err := json.Marshal(Metadata{
+		Links: []Link{{URL: "https://example.com/1", Title: "One"}, {URL: "https://example.com/2"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `{"krowk.links":[{"url":"https://example.com/1","title":"One"},{"url":"https://example.com/2"}]}`
+	if string(b) != want {
+		t.Errorf("marshal =\n%s\nwant\n%s", b, want)
 	}
 }

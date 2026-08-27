@@ -9,28 +9,26 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
-### Changed
-
-- The GitHub Action pinned to a release tag now installs that release's
-  binary rather than the latest, so `uses: krowkcom/cli@v0.8.0` means 0.8.0
-  the whole way down. An explicit `version` input still wins.
-- The branch a run records is now right in CI: GitHub checks out a detached
-  HEAD, where git could only answer the literal `HEAD` — the branch is read
-  from the runner's environment instead, preferring a pull request's source
-  branch over the synthetic `412/merge` ref. A local detached HEAD records no
-  branch at all now, which is the truth of it.
-- The action names a directory a glob swept up instead of handing it to
-  krowk, and a `**` glob on a bash too old for one (macOS ships 3.2) fails
-  saying exactly that, while plain globs keep working there.
-
 ### Added
 
 - A GitHub Action, `uses: krowkcom/cli@<tag>`, wrapping the CLI for CI: give it
   files or globs, it installs the binary, pushes them, and hands back `urls`,
-  a `markdown` paste block ready for a PR comment, the `run-slug` and the full
-  `json` envelope — with the links also written to the job's step summary. The
-  pull request, repo and commit are detected from the runner's environment,
-  the same way they are locally.
+  a `markdown` paste block ready for a PR comment, the `run-slug` and the
+  `json` envelope with its claim tokens stripped — with the links also written
+  to the job's step summary. The pull request, repo and commit are detected
+  from the runner's environment, the same way they are locally. Pinning the
+  action to a release tag pins the binary to that release, an explicit
+  `version` input wins over the tag, a directory a glob swept up is named
+  rather than handed to krowk, and a `**` glob on a bash too old for one
+  (macOS ships 3.2) fails saying exactly that while plain globs keep working.
+
+### Fixed
+
+- The branch a run records in CI. GitHub checks out a detached HEAD, where
+  git can only answer the literal `HEAD` — the branch is read from the
+  runner's environment instead, preferring a pull request's source branch
+  over the synthetic `412/merge` ref, and taking nothing from a tag push. A
+  local detached HEAD records no branch at all now, which is the truth of it.
 
 ## [0.7.0] - 2026-08-26
 

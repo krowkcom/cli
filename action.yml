@@ -79,7 +79,7 @@ runs:
         # ref (main, a SHA, a branch) has no release of its own — latest it is.
         if [ -z "${KROWK_VERSION:-}" ]; then
           case "${GITHUB_ACTION_REF:-}" in
-            v[0-9]*) export KROWK_VERSION="${GITHUB_ACTION_REF#v}" ;;
+            v[0-9]*.[0-9]*.[0-9]*) export KROWK_VERSION="${GITHUB_ACTION_REF#v}" ;;
           esac
         fi
         export KROWK_BIN_DIR="$RUNNER_TEMP/krowk-bin"
@@ -145,10 +145,14 @@ runs:
           # files, so a directory a glob swept up is an error here, where the
           # pattern can be named, not later in krowk's own words.
           for f in "${matched[@]}"; do
-            if [ ! -f "$f" ]; then
-              echo "::error::No file matches '$pattern' — '$f' is $([ -e "$f" ] && echo "not a regular file" || echo "missing")" >&2
-              exit 1
+            if [ -f "$f" ]; then
+              continue
+            elif [ -e "$f" ]; then
+              echo "::error::Not a file: '$f' (matched by '$pattern')" >&2
+            else
+              echo "::error::No file matches '$pattern'" >&2
             fi
+            exit 1
           done
           files+=("${matched[@]}")
         done

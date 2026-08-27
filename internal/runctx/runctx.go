@@ -117,13 +117,26 @@ func Detect(env Env) Metadata {
 // `git rev-parse --abbrev-ref HEAD` answers the literal string "HEAD" there —
 // the branch is in the environment instead: GITHUB_HEAD_REF on a pull request
 // (the source branch, where GITHUB_REF_NAME would say `412/merge`), and
-// GITHUB_REF_NAME on a push. A local detached HEAD records no branch at all,
-// which is the truth of it.
+// GITHUB_REF_NAME on a push when the ref is a branch — a tag push carries the
+// tag there, and a tag is not a branch. A local detached HEAD records no
+// branch at all, which is the truth of it.
 func Branch(env Env) string {
-	if b := firstNonEmpty(env("GITHUB_HEAD_REF"), env("GITHUB_REF_NAME")); b != "" {
+	if b := ciBranch(env); b != "" {
 		return b
 	}
 	if b := git("rev-parse", "--abbrev-ref", "HEAD"); b != "HEAD" {
+		return b
+	}
+	return ""
+}
+
+// ciBranch is the environment half of Branch, on its own so it can be tested
+// without a repository underneath.
+func ciBranch(env Env) string {
+	if b := env("GITHUB_HEAD_REF"); b != "" {
+		return b
+	}
+	if b := env("GITHUB_REF_NAME"); b != "" && env("GITHUB_REF_TYPE") == "branch" {
 		return b
 	}
 	return ""

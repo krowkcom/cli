@@ -222,6 +222,13 @@ func TestValidateLinks(t *testing.T) {
 		{URL: "http://localhost:3000/report.html"},
 		{URL: "https://example.com/1", Rel: "a word of my own"},
 	}
+	// The scheme is case-insensitive in the URL itself, and a title is counted
+	// in characters rather than bytes — 140 runes of Japanese is a title, not a
+	// 420-byte overrun.
+	ok = append(ok,
+		Link{URL: "HTTPS://internal.corp/issue/9"},
+		Link{URL: "https://example.com/2", Title: strings.Repeat("画", MaxLinkTitle)},
+	)
 	if err := ValidateLinks(ok); err != nil {
 		t.Errorf("ValidateLinks(%+v) = %v, want it accepted — rel is open, http is a URL", ok, err)
 	}
@@ -233,6 +240,11 @@ func TestValidateLinks(t *testing.T) {
 	for i := range tooMany {
 		tooMany[i] = Link{URL: "https://example.com/x"}
 	}
+	tooBig := make([]Link, MaxLinks)
+	for i := range tooBig {
+		// Each URL is well inside the per-link maximum; together they are not.
+		tooBig[i] = Link{URL: "https://example.com/" + strings.Repeat("x", 1900)}
+	}
 	for name, links := range map[string][]Link{
 		"an empty url":       {{URL: ""}},
 		"a blank url":        {{URL: "   "}},
@@ -242,8 +254,12 @@ func TestValidateLinks(t *testing.T) {
 		"a url past the cap": {{URL: "https://example.com/" + strings.Repeat("x", MaxLinkURL)}},
 		"a title past the cap": {{URL: "https://example.com/1",
 			Title: strings.Repeat("x", MaxLinkTitle+1)}},
-		"a title over two lines":      {{URL: "https://example.com/1", Title: "first\nsecond"}},
-		"more links than a run holds": tooMany,
+		"a title over two lines":                     {{URL: "https://example.com/1", Title: "first\nsecond"}},
+		"more links than a run holds":                tooMany,
+		"more bytes than the metadata budget spares": tooBig,
+		"a url with a space in it":                   {{URL: "https://exa mple.com/1"}},
+		"a url spanning two lines":                   {{URL: "https://example.com/a\nb"}},
+		"a scheme and nothing else":                  {{URL: "https://"}},
 	} {
 		if err := ValidateLinks(links); err == nil {
 			t.Errorf("ValidateLinks(%s) = nil, want it refused", name)

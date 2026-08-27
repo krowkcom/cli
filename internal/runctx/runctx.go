@@ -8,9 +8,11 @@ package runctx
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os/exec"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Metadata is the JSON blob that rides along with a record. Flags override
@@ -62,13 +64,23 @@ type Link struct {
 
 // The limits links are held to. They are the vocabulary's, not the registry's:
 // the registry validates size and nothing else, so a link that is malformed
-// here is malformed in the record forever. MaxLinks is a guard against a loop
-// that appends one per iteration filling the 16KB metadata cap with links and
-// pushing the detected metadata out of the record.
+// here is malformed in the record forever.
+//
+// MaxLinks bounds the count and MaxLinksBytes the whole of it, because the two
+// answer different failures: twenty is what a run's links are worth reading,
+// and twenty links at the per-link maximum is 40KB — past the registry's 16KB
+// metadata cap, which would fail the run with the registry's own opaque
+// refusal rather than with a sentence naming the flag. Half the cap, so the
+// detected metadata always has room beside them.
+//
+// Lengths are counted in characters rather than bytes: a title cut at 140
+// bytes is 46 characters of Japanese, and the number in the vocabulary is what
+// a person writing a title counts.
 const (
-	MaxLinks     = 20
-	MaxLinkURL   = 2048
-	MaxLinkTitle = 140
+	MaxLinks      = 20
+	MaxLinkURL    = 2048
+	MaxLinkTitle  = 140
+	MaxLinksBytes = 8192
 )
 
 // LinkRels are the suggested values for a link's rel, in the order a writer is
@@ -87,24 +99,68 @@ func ValidateLinks(links []Link) error {
 	}
 	for i, l := range links {
 		where := fmt.Sprintf("link %d", i+1)
+		if err := validateLinkURL(where, l.URL); err != nil {
+			return err
+		}
 		switch {
-		case strings.TrimSpace(l.URL) == "":
-			return fmt.Errorf("%s has no url: every link needs an absolute http(s) URL", where)
-		case !strings.HasPrefix(l.URL, "http://") && !strings.HasPrefix(l.URL, "https://"):
-			return fmt.Errorf("%s (%s) is not an absolute http(s) URL — "+
-				"a ticket key or an internal ID is a --reference, not a link", where, l.URL)
-		case len(l.URL) > MaxLinkURL:
-			return fmt.Errorf("%s is %d characters, past the %d a URL may be",
-				where, len(l.URL), MaxLinkURL)
-		case len(l.Title) > MaxLinkTitle:
+		case utf8.RuneCountInString(l.Title) > MaxLinkTitle:
 			return fmt.Errorf("%s has a %d-character title, past the %d one line holds",
-				where, len(l.Title), MaxLinkTitle)
-		case strings.ContainsAny(l.Title, "\r\n"):
+				where, utf8.RuneCountInString(l.Title), MaxLinkTitle)
+		case strings.ContainsFunc(l.Title, func(r rune) bool { return r == '\r' || r == '\n' }):
 			return fmt.Errorf("%s has a title spanning more than one line: "+
 				"a title is what a reader sees instead of the URL, on one row", where)
 		}
 	}
+	// The whole of them, not each: the per-link maxima multiply past the
+	// registry's 16KB metadata cap, and a refusal from there names nothing.
+	if n := linksBytes(links); n > MaxLinksBytes {
+		return fmt.Errorf("the links come to %d bytes of metadata, past the %d they may fill: "+
+			"a run's metadata budget is shared with everything krowk detects", n, MaxLinksBytes)
+	}
 	return nil
+}
+
+// validateLinkURL holds a URL to what can be pasted and followed. Parsed
+// rather than prefix-matched: a string that reads as a URL and does not parse
+// as one is a link nothing can follow, and it is stored verbatim, so this is
+// the only place it is ever looked at.
+func validateLinkURL(where, raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("%s has no url: every link needs an absolute http(s) URL", where)
+	}
+	// Before parsing, because url.Parse accepts a space in a path and every
+	// renderer that puts the URL in markdown then breaks on it — and a URL is
+	// one word by definition.
+	if strings.ContainsFunc(raw, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
+		return fmt.Errorf("%s (%q) has a space or a control character in it: "+
+			"a URL is one unbroken word", where, raw)
+	}
+	if utf8.RuneCountInString(raw) > MaxLinkURL {
+		return fmt.Errorf("%s is %d characters, past the %d a URL may be",
+			where, utf8.RuneCountInString(raw), MaxLinkURL)
+	}
+	u, err := url.Parse(raw)
+	// The scheme is compared lowercased because it is case-insensitive in the
+	// URL itself: HTTPS://example.com is the same link, and refusing it would
+	// point the caller at --reference for a URL that is perfectly good.
+	if err != nil || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") || u.Host == "" {
+		return fmt.Errorf("%s (%s) is not an absolute http(s) URL — "+
+			"a ticket key or an internal ID is a --reference, not a link", where, raw)
+	}
+	return nil
+}
+
+// linksBytes is what these links will occupy in the record: the JSON, since
+// that is what the registry counts against its cap.
+func linksBytes(links []Link) int {
+	if len(links) == 0 {
+		return 0
+	}
+	b, err := json.Marshal(links)
+	if err != nil {
+		return 0
+	}
+	return len(b)
 }
 
 // Env is a lookup function, so tests do not have to touch the process

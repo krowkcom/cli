@@ -398,6 +398,11 @@ func TestMalformedLinksAreRefusedBeforeAnythingIsSent(t *testing.T) {
 			"--link=https://example.com/1"},
 		"two titles for one link": {"push", h.fixture, "--link=https://example.com/1",
 			"--link-title=one", "--link-title=two"},
+		// The second of these is the shape an unset shell variable takes, and
+		// reading the empty first one as "not given" is how the overwrite gets in.
+		"a second title where the first was empty": {"push", h.fixture,
+			"--link=https://example.com/1", "--link-title=", "--link-title=fallback"},
+		"a url with a space in it": {"push", h.fixture, "--link=https://exa mple.com/1"},
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {

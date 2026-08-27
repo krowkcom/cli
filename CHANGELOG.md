@@ -18,9 +18,12 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `supersedes`, or a word of your own); both describe the `--link` before them.
   They land on the run as `krowk.links`, an array of `{url, title, rel}`
   objects, so a reader can name a link instead of showing a raw URL. A link
-  that is not an absolute `http(s)` URL, a title spanning two lines, or a
-  twenty-first link is refused rather than trimmed — metadata is stored
-  verbatim and nothing downstream validates it again. `--reference` is
+  that is not an absolute `http(s)` URL, one with a space in it, a title over
+  140 characters or spanning two lines, a twenty-first link, or a set of links
+  large enough to crowd out the detected metadata is refused rather than
+  trimmed — metadata is stored verbatim and nothing downstream validates it
+  again, so a shortened URL would be a link to somewhere else for as long as
+  the record lives. `--reference` is
   unchanged and is now the place for identifiers that are not URLs, such as a
   bare ticket key.
 - The same links on the MCP `krowk_push` tool, as a `links` array whose schema

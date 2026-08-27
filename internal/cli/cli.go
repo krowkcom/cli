@@ -236,6 +236,11 @@ type linkField struct {
 	links *linkSlice
 	name  string
 	field func(*runctx.Link) *string
+	// given is the indexes of the links this flag has already described. It is
+	// a set rather than a look at the field's emptiness because
+	// `--link-title "$UNSET" --link-title fallback` is two flags, and reading
+	// the first as absent is how the overwrite this refuses gets in anyway.
+	given map[int]bool
 }
 
 func (f linkField) String() string { return "" }
@@ -245,13 +250,14 @@ func (f linkField) Set(v string) error {
 		return fmt.Errorf("--%s describes the --link before it, and none was given yet: "+
 			"write --link <url> --%s %q", f.name, f.name, v)
 	}
-	dst := f.field(&(*f.links)[len(*f.links)-1])
-	if *dst != "" {
+	at := len(*f.links) - 1
+	if f.given[at] {
 		return fmt.Errorf("--%s was given twice for the same --link (%s): "+
 			"each link takes one, after the --link it belongs to",
-			f.name, (*f.links)[len(*f.links)-1].URL)
+			f.name, (*f.links)[at].URL)
 	}
-	*dst = v
+	f.given[at] = true
+	*f.field(&(*f.links)[at]) = v
 	return nil
 }
 
@@ -268,9 +274,9 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.IntVar(&f.limit, "limit", 0, "")
 	fs.StringVar(&f.pullRequest, "pull-request", "", "")
 	fs.Var(&f.links, "link", "")
-	fs.Var(linkField{links: &f.links, name: "link-title",
+	fs.Var(linkField{links: &f.links, name: "link-title", given: map[int]bool{},
 		field: func(l *runctx.Link) *string { return &l.Title }}, "link-title", "")
-	fs.Var(linkField{links: &f.links, name: "link-rel",
+	fs.Var(linkField{links: &f.links, name: "link-rel", given: map[int]bool{},
 		field: func(l *runctx.Link) *string { return &l.Rel }}, "link-rel", "")
 	fs.Var(&f.references, "reference", "")
 	fs.Var(&f.metadata, "metadata", "")

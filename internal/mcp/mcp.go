@@ -479,6 +479,19 @@ var tools = map[string]tool{
 	"krowk_verify_key":     verifyKey,
 }
 
+// badArgument names the argument that did not fit its type, so an agent fixes
+// the one it got wrong. Without the name every shape error read as "`files`
+// must be an array of paths" — advice to change the argument that was right.
+func badArgument(err error) string {
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) && typeErr.Field != "" {
+		return fmt.Sprintf("`%s` is the wrong shape: got %s where %s was expected — "+
+			"see the tool's schema", typeErr.Field, typeErr.Value, typeErr.Type)
+	}
+	return "the arguments are not the shape this tool takes: `files` is an array of " +
+		"paths, `links` an array of {url, title, rel} objects — see the tool's schema"
+}
+
 func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, error) {
 	var a struct {
 		Files       []string          `json:"files"`
@@ -493,8 +506,10 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Agent       string            `json:"agent"`
 		Metadata    map[string]string `json:"metadata"`
 	}
-	if len(args) > 0 && json.Unmarshal(args, &a) != nil {
-		return "", nil, api.Fail("bad_arguments", "`files` must be an array of paths")
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &a); err != nil {
+			return "", nil, api.Fail("bad_arguments", badArgument(err))
+		}
 	}
 	if len(a.Files) == 0 {
 		return "", nil, api.Fail("no_file", "pass at least one path in `files`")

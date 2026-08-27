@@ -300,6 +300,30 @@ func TestPushRefusesMalformedLinks(t *testing.T) {
 
 // Twenty-one links is a loop appending one per iteration, and it would fill the
 // 16KB metadata cap with links while pushing the detected metadata out.
+// A shape error has to name the argument it is about. The one message this used
+// to carry blamed `files` for everything, which is advice to change the
+// argument that was right.
+func TestPushNamesTheArgumentThatIsTheWrongShape(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	result := s.callTool("krowk_push", map[string]any{
+		"files": []string{s.fixture},
+		// The likely mistake now that the schema has links: an array of URLs
+		// rather than an array of link objects.
+		"links": []any{"https://linear.app/acme/issue/ENG-9"},
+	})
+	if result["isError"] != true {
+		t.Fatalf("push accepted a links array of strings: %s", text(t, result))
+	}
+	body := text(t, result)
+	if !strings.Contains(body, "links") {
+		t.Errorf("text = %q, want it to name `links`", body)
+	}
+	if strings.Contains(body, "`files` must be an array of paths") {
+		t.Errorf("text = %q, want it to stop blaming files", body)
+	}
+}
+
 func TestPushRefusesMoreLinksThanARunHolds(t *testing.T) {
 	s := newSession(t, "krk_test")
 

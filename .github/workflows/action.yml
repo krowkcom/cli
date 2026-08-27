@@ -80,7 +80,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          python3 -c "import yaml; print(yaml.safe_load(open('action.yml'))['runs']['steps'][0]['run'])" > /tmp/install_step.sh
+          ruby -ryaml -e 'puts YAML.load_file("action.yml")["runs"]["steps"][0]["run"]' > /tmp/install_step.sh
           export GITHUB_ACTION_PATH="$PWD" GITHUB_ACTION_REF=v0.7.0 KROWK_SKIP_SKILL=1
           export RUNNER_TEMP=/tmp/pin GITHUB_PATH=/tmp/pin_path
           mkdir -p /tmp/pin && : > /tmp/pin_path
@@ -92,7 +92,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          python3 -c "import yaml; print(yaml.safe_load(open('action.yml'))['runs']['steps'][1]['run'])" > /tmp/push_step.sh
+          ruby -ryaml -e 'puts YAML.load_file("action.yml")["runs"]["steps"][1]["run"]' > /tmp/push_step.sh
           /bin/bash -c 'echo "stock bash: $BASH_VERSION"'
           set +e
           out=$(INPUT_FILES='shots/**/*.png' INPUT_RUN= INPUT_TITLE= INPUT_PULL_REQUEST= KROWK_TOKEN= \

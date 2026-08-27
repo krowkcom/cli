@@ -480,9 +480,20 @@ var tools = map[string]tool{
 	"krowk_verify_key":     verifyKey,
 }
 
-// badArgument names the argument that did not fit its type, so an agent fixes
-// the one it got wrong. Without the name every shape error read as "`files`
-// must be an array of paths" — advice to change the argument that was right.
+// given names the arguments that were actually passed, in the schema's own
+// order, so a note about dropped metadata lists what the caller sent and
+// nothing else.
+func given(passed map[string]bool) []string {
+	order := []string{"pull_request", "links", "references", "session", "title", "metadata"}
+	var names []string
+	for _, name := range order {
+		if passed[name] {
+			names = append(names, "`"+name+"`")
+		}
+	}
+	return names
+}
+
 // checkLinkFields re-reads just the links, refusing a field the schema does not
 // name. Separate from the main decode so the strictness reaches the links and
 // nothing else.
@@ -502,6 +513,9 @@ func checkLinkFields(args json.RawMessage) error {
 	return nil
 }
 
+// badArgument names the argument that did not fit its type, so an agent fixes
+// the one it got wrong. Without the name every shape error read as "`files`
+// must be an array of paths" — advice to change the argument that was right.
 func badArgument(err error) string {
 	var typeErr *json.UnmarshalTypeError
 	if errors.As(err, &typeErr) && typeErr.Field != "" {
@@ -618,20 +632,27 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		}
 		run, runSlug, ownRun = created, created.Slug, true
 	}
-	workMetadata := a.PullRequest != "" || len(a.Links) > 0 || len(a.References) > 0 ||
-		a.Session != "" || a.Title != ""
-	if !s.Client.Authenticated() && (workMetadata || len(a.Metadata) > 0) {
-		notes = append(notes, "pull_request, links, references, session, title and metadata "+
-			"were not recorded: a keyless upload records no metadata, and opening a run "+
-			"needs an API key")
-	}
-	// A run named by the caller already carries the metadata it was opened with,
-	// so these have nowhere to land. Said rather than refused: the same arguments
-	// on every push of a batch is a reasonable way to write the calls, and
-	// `metadata` still lands on each artifact.
-	if s.Client.Authenticated() && a.Run != "" && workMetadata {
-		notes = append(notes, "pull_request, links, references, session and title were not "+
-			"recorded: run "+a.Run+" already carries the metadata it was opened with")
+	// Named rather than listed wholesale: an agent told that four arguments it
+	// never passed were dropped has to work out which of them it actually sent.
+	work := given(map[string]bool{
+		"pull_request": a.PullRequest != "",
+		"links":        len(a.Links) > 0,
+		"references":   len(a.References) > 0,
+		"session":      a.Session != "",
+		"title":        a.Title != "",
+	})
+	if !s.Client.Authenticated() {
+		if all := given(map[string]bool{"metadata": len(a.Metadata) > 0}); len(work)+len(all) > 0 {
+			notes = append(notes, strings.Join(append(work, all...), ", ")+" were not recorded: "+
+				"a keyless upload records no metadata, and opening a run needs an API key")
+		}
+	} else if a.Run != "" && len(work) > 0 {
+		// A run named by the caller already carries the metadata it was opened
+		// with, so these have nowhere to land. Said rather than refused: the same
+		// arguments on every push of a batch is a reasonable way to write the
+		// calls, and `metadata` still lands on each artifact.
+		notes = append(notes, strings.Join(work, ", ")+" were not recorded: run "+a.Run+
+			" already carries the metadata it was opened with")
 	}
 
 	// Each artifact carries its own production record, stamped at this moment;
@@ -1067,7 +1088,8 @@ func toolSchemas() []map[string]any {
 										"the URL, e.g. the issue's own title.",
 								},
 								"rel": map[string]any{
-									"type": "string",
+									"type":      "string",
+									"maxLength": runctx.MaxLinkRel,
 									"description": "What this link is. Pick from " +
 										strings.Join(runctx.LinkRels, ", ") +
 										" where one fits: `fixes` for the issue this work closes, `tracks` " +

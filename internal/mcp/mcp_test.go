@@ -298,8 +298,6 @@ func TestPushRefusesMalformedLinks(t *testing.T) {
 	}
 }
 
-// Twenty-one links is a loop appending one per iteration, and it would fill the
-// 16KB metadata cap with links while pushing the detected metadata out.
 // A shape error has to name the argument it is about. The one message this used
 // to carry blamed `files` for everything, which is advice to change the
 // argument that was right.
@@ -379,6 +377,8 @@ func TestPushRefusesAnUnknownArgument(t *testing.T) {
 	}
 }
 
+// Twenty-one links is a loop appending one per iteration, and it would fill the
+// 16KB metadata cap with links while pushing the detected metadata out.
 func TestPushRefusesMoreLinksThanARunHolds(t *testing.T) {
 	s := newSession(t, "krk_test")
 

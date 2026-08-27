@@ -108,7 +108,7 @@ Without a destination, ordinary human output ends with the block anyway, so the 
 The repository doubles as an action, so CI can push what a test run produced and put the links where a reviewer will see them:
 
 ```yaml
-- uses: krowkcom/cli@main # from the next release on, pin its tag — the tag pins the binary too
+- uses: krowkcom/cli@v0 # or a release tag, e.g. @v0.8.0, to freeze the binary too
   id: krowk
   with:
     files: |
@@ -128,6 +128,8 @@ The repository doubles as an action, so CI can push what a test run produced and
 ```
 
 `files` is the only required input — whitespace-separated paths or globs, so a path with a space in it has to go through a glob. The pull request, repo, commit and branch are detected from the runner's environment, exactly as they are on a laptop. `token` keeps the uploads past the keyless 24-hour expiry; `version` pins a CLI release; `run-slug` and `title` name or open the run they group under. Linux and macOS runners.
+
+`@v0` moves with each 0.x release and installs the latest one. `@v0.8.0` pins the action and the binary together — the installer ships inside the action, so a pinned tag has nothing left to fetch and go stale. An explicit `version` wins over either.
 
 Outputs: `urls` (one artifact URL per line), `markdown` (the registry's paste block, ready for a PR comment), `run-slug`, and `json` (the envelope, claim tokens and breadcrumbs stripped, for anything else). The links also land in the job's step summary, clickable without any comment step.
 

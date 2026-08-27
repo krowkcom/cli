@@ -3,9 +3,13 @@ name: Release
 # A tag is the whole trigger. `git tag -a v0.1.0 -m ... && git push origin v0.1.0`
 # builds both binaries for five platforms, opens the GitHub Release with the
 # archives and checksums on it, and publishes the seven npm packages.
+#
+# Three components, deliberately: the moving major tag this workflow pushes at
+# the end is also `v*`, and a release run for `v0` would ask GoReleaser to cut
+# a release of version "0" and npm to publish it.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
 
 permissions:
   contents: read
@@ -65,3 +69,30 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: node npm/publish.mjs
+
+      # The moving major tag, so `uses: krowkcom/cli@v0` follows the 0.x line
+      # instead of freezing a workflow on one patch release. It moves last, once
+      # the release exists and npm carries the packages: a tag pointing at bytes
+      # nobody can download yet is worse than a tag that lags by a minute.
+      #
+      # Pushed through the API rather than git, because the checkout above keeps
+      # no credentials on disk. A ref moved by GITHUB_TOKEN starts no workflow
+      # run either way, and the narrowed trigger above would ignore it.
+      - name: Move the major tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A prerelease is not what `@v0` should hand an unsuspecting workflow.
+          case "$GITHUB_REF_NAME" in
+            *-*)
+              echo "::notice::$GITHUB_REF_NAME is a prerelease, so the major tag stays where it is"
+              exit 0
+              ;;
+          esac
+          major="${GITHUB_REF_NAME%%.*}"
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$major" \
+            -f sha="$GITHUB_SHA" -F force=true >/dev/null \
+            || gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$major" -f sha="$GITHUB_SHA" >/dev/null
+          echo "\`$major\` now points at $GITHUB_REF_NAME." >> "$GITHUB_STEP_SUMMARY"

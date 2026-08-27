@@ -9,6 +9,24 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Added
+
+- A moving major tag for the GitHub Action: `uses: krowkcom/cli@v0` follows the
+  0.x line rather than freezing a workflow on one patch release, and each
+  release moves it once the archives and the npm packages are up. A release tag
+  still pins the action and the CLI together, and an explicit `version` input
+  still wins over both. The tag has no release of its own, so it installs the
+  latest — and the action now refuses to install across a major line rather
+  than hand a workflow pinned to `@v0` a 1.x binary with a changed command
+  surface.
+
+### Fixed
+
+- The release workflow no longer triggers on every `v*` tag, only on a
+  three-component version. The moving major tag is a `v*` tag too, and a
+  release run for `v0` would have tried to cut a release of version "0" and
+  publish it to npm.
+
 ## [0.8.0] - 2026-08-27
 
 ### Added

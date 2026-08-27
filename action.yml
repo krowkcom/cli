@@ -1,4 +1,5 @@
-# action.yml — the GitHub Action face of the CLI: `uses: krowkcom/cli@<tag>`.
+# action.yml — the GitHub Action face of the CLI: `uses: krowkcom/cli@v0`,
+# or a release tag where a workflow wants the version frozen.
 #
 # It is a composite of two bash steps, install then push, because that is all
 # the action does: put the binary on the runner and run the same `krowk push`
@@ -25,7 +26,9 @@ inputs:
       expiring after 24 hours. Pass a secret; without it the push is keyless.
     required: false
   version:
-    description: The CLI version to install, e.g. 0.7.0. Defaults to the latest release.
+    description: >-
+      The CLI version to install, e.g. 0.8.0. Wins over whatever the action's
+      own ref implies. Defaults to the release the ref names, or the latest.
     required: false
   run-slug:
     description: Attach the uploads to this existing run instead of opening one.
@@ -76,7 +79,8 @@ runs:
         fi
         # No version asked for and the action pinned to a release tag: install
         # that release, so pinning the action pins the binary too. Any other
-        # ref (main, a SHA, a branch) has no release of its own — latest it is.
+        # ref — the moving major tag, main, a SHA, a branch — has no release of
+        # its own, so latest it is.
         if [ -z "${KROWK_VERSION:-}" ]; then
           case "${GITHUB_ACTION_REF:-}" in
             v[0-9]*.[0-9]*.[0-9]*) export KROWK_VERSION="${GITHUB_ACTION_REF#v}" ;;
@@ -94,6 +98,25 @@ runs:
         # version resolved above.
         bash "${GITHUB_ACTION_PATH:?}/scripts/install.sh"
         echo "$KROWK_BIN_DIR" >> "$GITHUB_PATH"
+        # `@v0` resolved to the latest release just now, which is what that tag
+        # means for as long as 0.x is the latest line and not one release after.
+        # Nothing here can ask for "the newest 0.x" without hard-coding a host
+        # this action would then not resolve on GitHub Enterprise, so the major
+        # is checked instead: a workflow that asked for 0.x gets told, rather
+        # than handed a 1.x binary and a changed command surface.
+        if [ -z "${KROWK_VERSION:-}" ]; then
+          case "${GITHUB_ACTION_REF:-}" in
+            v[0-9]*.*) ;;
+            v[0-9]*)
+              want="${GITHUB_ACTION_REF#v}"
+              got=$(krowk --version)
+              if [ "${got%%.*}" != "$want" ]; then
+                echo "::error::krowk@${GITHUB_ACTION_REF} resolved to the latest release, ${got}, which is not on the ${want}.x line. Pin a release tag to stay on ${want}.x, or move the action to @v${got%%.*}." >&2
+                exit 1
+              fi
+              ;;
+          esac
+        fi
 
     - name: Push files
       id: push

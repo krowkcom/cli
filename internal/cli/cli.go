@@ -770,6 +770,15 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 // command line, a fresh one carrying the detected metadata, or none at all when
 // there is no key to open one with.
 func resolveRun(ctx context.Context, client *api.Client, f flags, env runctx.Env, result *output.Result) (slug string, own bool, err error) {
+	// Whichever note applies, the keyless one comes first: no key is why nothing
+	// was recorded, and a note about a run's metadata being settled would send
+	// the caller to `krowk runs start`, which needs the key they do not have.
+	if !client.Authenticated() {
+		if note := anonymousMetadataNote(f); note != "" {
+			result.Notes = append(result.Notes, note)
+		}
+		return f.run, false, nil
+	}
 	if f.run != "" {
 		// The caller manages this run's lifecycle, so it is not finished here —
 		// and its metadata was recorded when it was opened, so flags describing
@@ -778,12 +787,6 @@ func resolveRun(ctx context.Context, client *api.Client, f flags, env runctx.Env
 			result.Notes = append(result.Notes, note)
 		}
 		return f.run, false, nil
-	}
-	if !client.Authenticated() {
-		if note := anonymousMetadataNote(f); note != "" {
-			result.Notes = append(result.Notes, note)
-		}
-		return "", false, nil
 	}
 
 	run, err := client.CreateRun(ctx, metadataFor(f, env))
@@ -817,7 +820,10 @@ func metadataFor(f flags, env runctx.Env) runctx.Metadata {
 // stored verbatim and never validated again.
 func checkLinks(links linkSlice) error {
 	if err := runctx.ValidateLinks(links); err != nil {
-		return api.Fail("bad_flag", "--link: "+err.Error())
+		// No flag name prefixed: the message names the link and the field that is
+		// wrong, and prefixing --link would send a caller with a bad --link-title
+		// to the flag that was right.
+		return api.Fail("bad_flag", err.Error())
 	}
 	return nil
 }

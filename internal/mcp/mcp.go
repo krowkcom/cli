@@ -483,6 +483,25 @@ var tools = map[string]tool{
 // badArgument names the argument that did not fit its type, so an agent fixes
 // the one it got wrong. Without the name every shape error read as "`files`
 // must be an array of paths" — advice to change the argument that was right.
+// checkLinkFields re-reads just the links, refusing a field the schema does not
+// name. Separate from the main decode so the strictness reaches the links and
+// nothing else.
+func checkLinkFields(args json.RawMessage) error {
+	var probe struct {
+		Links json.RawMessage `json:"links"`
+	}
+	if json.Unmarshal(args, &probe) != nil || len(probe.Links) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(probe.Links))
+	dec.DisallowUnknownFields()
+	var links []runctx.Link
+	if err := dec.Decode(&links); err != nil {
+		return err
+	}
+	return nil
+}
+
 func badArgument(err error) string {
 	var typeErr *json.UnmarshalTypeError
 	if errors.As(err, &typeErr) && typeErr.Field != "" {
@@ -514,13 +533,15 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Metadata    map[string]string `json:"metadata"`
 	}
 	if len(args) > 0 {
-		// Unknown fields are refused rather than dropped, because the schema says
-		// additionalProperties: false and an agent that writes `label` where the
-		// schema says `title` would otherwise get a silently nameless link — the
-		// mistake this tool is in the best position to catch.
-		dec := json.NewDecoder(bytes.NewReader(args))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&a); err != nil {
+		if err := json.Unmarshal(args, &a); err != nil {
+			return "", nil, api.Fail("bad_arguments", badArgument(err))
+		}
+		// A link's own fields are checked strictly, because a link is the one
+		// argument here whose misspelling is silent: `label` where the schema says
+		// `title` decodes to a link with no name and nothing said about it. The
+		// arguments around it stay lenient, the way every other tool's are — a
+		// stray one is not worth failing an upload over.
+		if err := checkLinkFields(args); err != nil {
 			return "", nil, api.Fail("bad_arguments", badArgument(err))
 		}
 	}

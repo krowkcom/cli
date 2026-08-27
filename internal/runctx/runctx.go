@@ -213,9 +213,13 @@ func validateLinkURL(where, raw string) error {
 	// link without them is almost always the link that was meant, so this says
 	// so rather than stripping them and recording a URL nobody typed.
 	if u.User != nil {
+		// The suggestion is the same URL with the credentials taken out, query
+		// and fragment included: a link stripped down to its path points at a
+		// different page, and a suggestion that does that is not a suggestion.
+		clean := *u
+		clean.User = nil
 		return fmt.Errorf("%s carries a username or password in the URL, and run "+
-			"metadata is public and permanent: link %s://%s%s instead",
-			where, u.Scheme, u.Host, u.EscapedPath())
+			"metadata is public and permanent: link %s instead", where, clean.String())
 	}
 	return nil
 }

@@ -367,6 +367,16 @@ func TestPushRefusesAnUnknownArgument(t *testing.T) {
 	if body := text(t, result); !strings.Contains(body, "label") {
 		t.Errorf("text = %q, want it to name the field it did not know", body)
 	}
+
+	// Strictness reaches the links and stops there: a stray argument beside them
+	// is not worth failing an upload over, and no other tool refuses one.
+	ok := s.callTool("krowk_push", map[string]any{
+		"files":   []string{s.fixture},
+		"caption": "a flag the CLI has and this tool does not",
+	})
+	if ok["isError"] == true {
+		t.Errorf("push refused a stray argument: %s", text(t, ok))
+	}
 }
 
 func TestPushRefusesMoreLinksThanARunHolds(t *testing.T) {

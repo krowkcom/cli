@@ -473,6 +473,24 @@ func TestPushSaysWhenARunAlreadyHasItsMetadata(t *testing.T) {
 	if quiet := h.ok("push", h.fixture, "--run="+run, "--caption=Only mine"); len(quiet.Data.Notes) != 0 {
 		t.Errorf("notes = %v, want none when no run metadata was passed", quiet.Data.Notes)
 	}
+
+	// Without a key the missing key is the reason, not a run's settled metadata:
+	// the note has to name that, and must not send the caller to
+	// `krowk runs start`, which needs the key they do not have. (A keyless push
+	// cannot name a run at all — the registry refuses that outright — so this is
+	// the keyless push that opens nothing.)
+	keyless := h.anonymous().ok("push", h.fixture,
+		"--link=https://linear.app/acme/issue/ENG-9", "--caption=Cart after the fix")
+	note = strings.Join(keyless.Data.Notes, " ")
+	if !strings.Contains(note, "keyless") || !strings.Contains(note, "--link") ||
+		!strings.Contains(note, "--caption") {
+		t.Errorf("keyless notes = %v, want the key named as the reason and every "+
+			"dropped flag with it", keyless.Data.Notes)
+	}
+	if strings.Contains(note, "runs start") {
+		t.Errorf("keyless notes = %v, want no advice that needs the key it lacks",
+			keyless.Data.Notes)
+	}
 }
 
 func TestEachArtifactCarriesItsOwnProductionRecord(t *testing.T) {

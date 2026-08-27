@@ -324,6 +324,24 @@ func TestPushNamesTheArgumentThatIsTheWrongShape(t *testing.T) {
 	}
 }
 
+// The schema says additionalProperties: false, so the tool enforces it. An
+// agent writing `label` where the schema says `title` would otherwise get a
+// link with no name on it and no word said about why.
+func TestPushRefusesAnUnknownArgument(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	result := s.callTool("krowk_push", map[string]any{
+		"files": []string{s.fixture},
+		"links": []any{map[string]any{"url": "https://example.com/1", "label": "My Issue"}},
+	})
+	if result["isError"] != true {
+		t.Fatalf("push accepted an unknown field: %s", text(t, result))
+	}
+	if body := text(t, result); !strings.Contains(body, "label") {
+		t.Errorf("text = %q, want it to name the field it did not know", body)
+	}
+}
+
 func TestPushRefusesMoreLinksThanARunHolds(t *testing.T) {
 	s := newSession(t, "krk_test")
 

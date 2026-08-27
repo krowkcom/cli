@@ -260,6 +260,11 @@ func TestValidateLinks(t *testing.T) {
 		"a url with a space in it":                   {{URL: "https://exa mple.com/1"}},
 		"a url spanning two lines":                   {{URL: "https://example.com/a\nb"}},
 		"a scheme and nothing else":                  {{URL: "https://"}},
+		"a rel over two lines":                       {{URL: "https://example.com/1", Rel: "fixes\nsomething"}},
+		"a rel past the cap": {{URL: "https://example.com/1",
+			Rel: strings.Repeat("x", MaxLinkRel+1)}},
+		"a title carrying a tab":            {{URL: "https://example.com/1", Title: "one\ttwo"}},
+		"a title carrying a line separator": {{URL: "https://example.com/1", Title: "one\u2028two"}},
 	} {
 		if err := ValidateLinks(links); err == nil {
 			t.Errorf("ValidateLinks(%s) = nil, want it refused", name)

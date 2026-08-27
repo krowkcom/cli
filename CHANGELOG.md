@@ -19,7 +19,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   They land on the run as `krowk.links`, an array of `{url, title, rel}`
   objects, so a reader can name a link instead of showing a raw URL. A link
   that is not an absolute `http(s)` URL, one with a space in it, a title over
-  140 characters or spanning two lines, a twenty-first link, or a set of links
+  140 characters or a rel over 64, either of them carrying a tab, a newline or
+  another control character, a twenty-first link, or a set of links
   large enough to crowd out the detected metadata is refused rather than
   trimmed — metadata is stored verbatim and nothing downstream validates it
   again, so a shortened URL would be a link to somewhere else for as long as

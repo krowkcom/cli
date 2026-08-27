@@ -80,6 +80,7 @@ const (
 	MaxLinks      = 20
 	MaxLinkURL    = 2048
 	MaxLinkTitle  = 140
+	MaxLinkRel    = 64
 	MaxLinksBytes = 8192
 )
 
@@ -102,13 +103,14 @@ func ValidateLinks(links []Link) error {
 		if err := validateLinkURL(where, l.URL); err != nil {
 			return err
 		}
-		switch {
-		case utf8.RuneCountInString(l.Title) > MaxLinkTitle:
-			return fmt.Errorf("%s has a %d-character title, past the %d one line holds",
-				where, utf8.RuneCountInString(l.Title), MaxLinkTitle)
-		case strings.ContainsFunc(l.Title, func(r rune) bool { return r == '\r' || r == '\n' }):
-			return fmt.Errorf("%s has a title spanning more than one line: "+
-				"a title is what a reader sees instead of the URL, on one row", where)
+		if err := validateLinkLine(where, "title", l.Title, MaxLinkTitle); err != nil {
+			return err
+		}
+		// rel is an open string, not an enum — a writer with a kind the suggested
+		// list does not name records its own word. Open is not unbounded: it
+		// renders on the same row as the title, so it is held to the same shape.
+		if err := validateLinkLine(where, "rel", l.Rel, MaxLinkRel); err != nil {
+			return err
 		}
 	}
 	// The whole of them, not each: the per-link maxima multiply past the
@@ -118,6 +120,28 @@ func ValidateLinks(links []Link) error {
 			"a run's metadata budget is shared with everything krowk detects", n, MaxLinksBytes)
 	}
 	return nil
+}
+
+// validateLinkLine holds a link's human-readable half to one row of text. A
+// tab, a NEL or a U+2028 line separator breaks a single-row render as surely as
+// a newline does, and none of them is anything a title or a rel needs.
+func validateLinkLine(where, field, value string, max int) error {
+	if n := utf8.RuneCountInString(value); n > max {
+		return fmt.Errorf("%s has a %d-character %s, past the %d one line holds",
+			where, n, field, max)
+	}
+	if strings.ContainsFunc(value, isLineBreaking) {
+		return fmt.Errorf("%s has a %s spanning more than one line or carrying a "+
+			"control character: it is what a reader sees on one row", where, field)
+	}
+	return nil
+}
+
+// isLineBreaking reports the characters that end a line or steer a renderer:
+// the C0 controls (tab and newline among them), DEL, NEL, and the Unicode line
+// and paragraph separators.
+func isLineBreaking(r rune) bool {
+	return r < ' ' || r == 0x7f || r == 0x85 || r == 0x2028 || r == 0x2029
 }
 
 // validateLinkURL holds a URL to what can be pasted and followed. Parsed
@@ -131,7 +155,7 @@ func validateLinkURL(where, raw string) error {
 	// Before parsing, because url.Parse accepts a space in a path and every
 	// renderer that puts the URL in markdown then breaks on it — and a URL is
 	// one word by definition.
-	if strings.ContainsFunc(raw, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
+	if strings.ContainsFunc(raw, func(r rune) bool { return r == ' ' || isLineBreaking(r) }) {
 		return fmt.Errorf("%s (%q) has a space or a control character in it: "+
 			"a URL is one unbroken word", where, raw)
 	}

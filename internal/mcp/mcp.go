@@ -12,6 +12,7 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -485,8 +486,14 @@ var tools = map[string]tool{
 func badArgument(err error) string {
 	var typeErr *json.UnmarshalTypeError
 	if errors.As(err, &typeErr) && typeErr.Field != "" {
-		return fmt.Sprintf("`%s` is the wrong shape: got %s where %s was expected — "+
-			"see the tool's schema", typeErr.Field, typeErr.Value, typeErr.Type)
+		return fmt.Sprintf("`%s` is the wrong shape: got %s — see the tool's schema",
+			typeErr.Field, typeErr.Value)
+	}
+	// The decoder's own wording for an unknown field already names it, and no
+	// paraphrase of it says more: `json: unknown field "label"`.
+	if msg := err.Error(); strings.Contains(msg, "unknown field") {
+		return strings.TrimPrefix(msg, "json: ") +
+			" — this tool takes only the arguments in its schema"
 	}
 	return "the arguments are not the shape this tool takes: `files` is an array of " +
 		"paths, `links` an array of {url, title, rel} objects — see the tool's schema"
@@ -507,7 +514,13 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Metadata    map[string]string `json:"metadata"`
 	}
 	if len(args) > 0 {
-		if err := json.Unmarshal(args, &a); err != nil {
+		// Unknown fields are refused rather than dropped, because the schema says
+		// additionalProperties: false and an agent that writes `label` where the
+		// schema says `title` would otherwise get a silently nameless link — the
+		// mistake this tool is in the best position to catch.
+		dec := json.NewDecoder(bytes.NewReader(args))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&a); err != nil {
 			return "", nil, api.Fail("bad_arguments", badArgument(err))
 		}
 	}

@@ -201,6 +201,106 @@ func TestHumanHelpIsStillHumanOnATerminal(t *testing.T) {
 	}
 }
 
+// `krowk` alone is a greeting and not the manual. Somebody who typed the name to
+// see what happens is asking what this is and what to type next, and an answer
+// that fills the scrollback answers neither.
+func TestBareKrowkGreetsRatherThanPrintingTheWholeHelp(t *testing.T) {
+	code, stdout, _ := runHelp(t, true)
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if lines := strings.Count(strings.TrimSpace(stdout), "\n") + 1; lines > 12 {
+		t.Errorf("the greeting is %d lines, which is a wall of text:\n%s", lines, stdout)
+	}
+	// It says where the rest lives, precisely because it is not the rest.
+	if !strings.Contains(stdout, "krowk help") {
+		t.Errorf("the greeting does not point at the help:\n%s", stdout)
+	}
+	for _, section := range []string{"Usage", "Upload flags", "Exit codes"} {
+		if strings.Contains(stdout, section) {
+			t.Errorf("the greeting carries the %q section of the help:\n%s", section, stdout)
+		}
+	}
+
+	// And asking for the help is still asking for all of it.
+	_, full, _ := runHelp(t, true, "help")
+	for _, want := range []string{"Usage", "Upload flags", "Exit codes"} {
+		if !strings.Contains(full, want) {
+			t.Errorf("`krowk help` no longer carries %q", want)
+		}
+	}
+}
+
+// A program is not greeted. It ran `krowk` with no arguments to find out what
+// krowk can do, and three lines of prose are no use to it.
+func TestBareKrowkAnswersAProgramWithTheSurface(t *testing.T) {
+	_, piped, _ := runHelp(t, false)
+	_, surface, _ := runHelp(t, true, "help", "--json")
+	if piped != surface {
+		t.Errorf("piped `krowk` is not the surface:\n%s", piped)
+	}
+}
+
+// The greeting is the shortest path into krowk, so a command it recommends that
+// has since been renamed would send the first-time reader straight into a
+// refusal.
+func TestTheGreetingRecommendsCommandsThatExist(t *testing.T) {
+	c := Surface()
+	checked := 0
+	for _, line := range strings.Split(greetingTemplate, "\n") {
+		// The indented lines, which are the recommendations. The line above them
+		// starts with the name too, and is what krowk is rather than what to type.
+		if !strings.HasPrefix(line, "  krowk ") {
+			continue
+		}
+		checked++
+		fields := strings.Fields(line)
+		// Longest first, so `auth login` is checked as the pair it is, then
+		// shortened past the arguments and flags standing after the command.
+		words := fields[1:]
+		for len(words) > 0 {
+			if _, ok := c.Find(words); ok {
+				break
+			}
+			words = words[:len(words)-1]
+		}
+		if len(words) == 0 {
+			t.Errorf("the greeting recommends `%s`, which is not a krowk command", line)
+		}
+	}
+	if checked == 0 {
+		t.Error("no recommendation in the greeting was checked, so this test proves nothing")
+	}
+}
+
+// The logo is the first thing a person sees, and it is only for a person: the
+// JSON surface is a data structure, and one command's help answers a narrower
+// question than "what is this tool", so neither carries decoration.
+func TestHumanHelpOpensWithTheLogo(t *testing.T) {
+	code, stdout, _ := runHelp(t, true, "help")
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.HasPrefix(stdout, "\n"+mark+"\n\n") {
+		t.Errorf("the human help does not open with the logo:\n%s", stdout)
+	}
+	// Under it, with a blank line between, so the mark is not jammed against
+	// the words. Capitalised the way the brand is written, and two lines, so
+	// the version and what krowk is can be read separately.
+	if !strings.Contains(stdout, "\n\nKrowk "+Version+"\nPermalinks for agent output\n\n") {
+		t.Errorf("the version lines are not under the logo:\n%s", stdout)
+	}
+
+	for _, args := range [][]string{
+		{"help", "--json"},
+		{"push", "--help"},
+	} {
+		if _, out, _ := runHelp(t, true, args...); strings.Contains(out, mark) {
+			t.Errorf("`krowk %s` carries the logo:\n%s", strings.Join(args, " "), out)
+		}
+	}
+}
+
 // markdown and url are the two paste forms of an artifact's link — an embed and
 // the card page's URL — and have nothing to say about a command, so they fall
 // back to what a person would read rather than to something shaped like a

@@ -9,8 +9,21 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-08-28
+
 ### Added
 
+- The Krowk mark at the top of `krowk` and `krowk help`: the four-by-four grid
+  of squares from the logo, drawn in half block characters so that two rows of
+  the grid share one row of text — a character cell is twice as tall as it is
+  wide, so a square of the grid drawn as a whole character would stretch the
+  mark, and half a character keeps it square at the smallest size it can be
+  drawn at. A blank line above and below so it is not jammed against the chrome
+  or the words, and no colour, so it takes the foreground of whatever theme is
+  running. Under it, `Krowk` and the version on one line and what krowk is on
+  the next. It opens what a person reads and nothing else — the JSON surface
+  stays a data structure, and one command's help stays an answer to the
+  narrower question.
 - A moving major tag for the GitHub Action: `uses: krowkcom/cli@v0` follows the
   0.x line rather than freezing a workflow on one patch release, and each
   release moves it once the archives and the npm packages are up. A release tag
@@ -19,6 +32,19 @@ the versions are the `v*` tags a release is cut from. Entries land under
   latest — and the action now refuses to install across a major line rather
   than hand a workflow pinned to `@v0` a 1.x binary with a changed command
   surface.
+
+### Changed
+
+- `krowk` on its own now greets rather than printing the manual. Typing the name
+  to see what happens used to answer with every flag, every exit code and every
+  paragraph of prose — about 150 lines, and neither "what is this" nor "what do
+  I type" was any easier to find for it. It is now the mark, what krowk is, and
+  three lines: the first upload, the key that makes uploads keep, and
+  `krowk help` for the rest. Those three are the ones the installer signs off
+  with, so a first run says what the install said. `krowk help` and
+  `krowk --help` are unchanged and still answer in full, and a program reading
+  `krowk` — piped, `--json`, or with a `--jq` expression — still gets the whole
+  surface, since prose is no use to it and the surface is what it came for.
 
 ### Fixed
 
@@ -201,7 +227,8 @@ was released on GitHub but never published to npm.
   credentials travel, and a refusal is written to stderr and into the JSON
   envelope.
 
-[Unreleased]: https://github.com/krowkcom/cli/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/krowkcom/cli/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/krowkcom/cli/compare/v0.8.0...v0.8.2
 [0.8.0]: https://github.com/krowkcom/cli/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/krowkcom/cli/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/krowkcom/cli/compare/v0.5.0...v0.6.0

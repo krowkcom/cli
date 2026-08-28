@@ -34,13 +34,50 @@ var Version = "dev"
 // second positional either looks like one or is a mistake worth naming.
 const claimTokenPrefix = "krowk_claim_"
 
+// mark is the Krowk logo, drawn the way a terminal can draw it: the same
+// four-by-four grid of squares as .github/logo.svg.
+//
+// A character cell is about twice as tall as it is wide, so a square of the
+// grid cannot be one character — that draws the mark at half its width. It is
+// half a character instead: two rows of the grid share one row of text, the
+// upper half block and the lower half block carrying one each. That keeps the
+// grid square at the smallest size it can be drawn at, two text rows.
+//
+// No colour, so it takes the theme's foreground on a light terminal as readily
+// as on a dark one. It is UTF-8, which the help text already is.
+const mark = `█  █
+█▀▀▄`
+
+// bannerTemplate is the mark and the two lines under it, shared by the greeting
+// and the help so they cannot drift. A blank line above and below the mark, so
+// it is not jammed against the terminal chrome or the words.
+const bannerTemplate = `
+` + mark + `
+
+Krowk %s
+Permalinks for agent output
+
+`
+
+// greetingTemplate is what `krowk` alone says. It is a different question from
+// `krowk help`: somebody who typed the name and nothing else is asking what this
+// is and what to type next, and answering with every flag buries both. So this
+// is the first upload, the key that makes uploads keep, and where the rest is —
+// three lines, and the reference is one of them.
+//
+// The commands here are onboarding copy rather than the catalog's summaries,
+// which describe a command to somebody already looking it up. They are the same
+// three the installer signs off with, so a first run says what the install said.
+const greetingTemplate = bannerTemplate + `  krowk push screenshot.png     Upload a file and get a link — no key needed, lasts a day
+  krowk auth login --token …    Add a key: uploads keep, group under runs, and stay yours
+  krowk help                    Every command and flag — add --json for the surface as data
+`
+
 // helpTemplate is the human help. Its Usage block is not written here: it is
 // rendered from the catalog, so a command cannot exist in the JSON surface and
 // not in the text, or the other way round. Everything after it is prose, which
 // is the half a struct has no way to say.
-const helpTemplate = `krowk %s — permalinks for agent output
-
-Usage
+const helpTemplate = bannerTemplate + `Usage
 %s
 
 Upload flags
@@ -374,6 +411,14 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	switch {
 	case f.version:
 		fmt.Fprintln(stdout, Version)
+		return 0
+	case len(positionals) == 0 && !f.help && format != output.JSON:
+		// The greeting, for the person who typed the name to see what happens.
+		// Asking for the help — `krowk help`, `krowk --help` — is asking for all
+		// of it, and gets all of it. Piped or asked for as JSON, `krowk` alone
+		// still answers with the whole surface: that reader is a program, three
+		// lines of prose are no use to it, and the surface is what it came for.
+		fmt.Fprintf(stdout, greetingTemplate, Version)
 		return 0
 	case f.help, len(positionals) == 0, positionals[0] == "help":
 		// What was asked about: `krowk help uploads attach` and

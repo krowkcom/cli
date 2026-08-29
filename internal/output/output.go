@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1267,8 +1268,39 @@ func clipLabel(s string) string {
 	return string(runes[:maxLabelRunes]) + "…"
 }
 
-// Error renders a failure. Human output leads with the code and ends with the
-// fix; JSON hands back the flattened body.
+// runCommandRe finds a runnable command embedded in a fix message, so it can
+// be pulled onto its own line rather than buried mid-sentence.
+var runCommandRe = regexp.MustCompile("run `([^`]+)`")
+
+// splitCommand pulls a "run `cmd`" clause out of a fix message. What is left
+// is the prose either side of it, stitched back together so it still reads as
+// one sentence; the command comes back on its own so it can be printed as
+// something a person can paste and run, not prose to parse.
+func splitCommand(fix string) (prose, command string) {
+	loc := runCommandRe.FindStringSubmatchIndex(fix)
+	if loc == nil {
+		return fix, ""
+	}
+	command = fix[loc[2]:loc[3]]
+	before := strings.TrimRight(fix[:loc[0]], " —,")
+	after := strings.TrimLeft(fix[loc[1]:], " ,")
+	switch {
+	case before == "":
+		prose = after
+	case after == "":
+		prose = before
+	default:
+		prose = before + ", " + after
+	}
+	return prose, command
+}
+
+// Error renders a failure. Human output leads with the fix as prose, since
+// that is what a person acts on; the wire's snake_case code is demoted to a
+// dim aside rather than shouted as the headline. A fix that names a runnable
+// command gets that command pulled onto its own line, so it can be copied and
+// run rather than parsed out of a sentence. JSON hands back the flattened
+// body unchanged.
 func Error(err error, f Format, quiet, colour bool) string {
 	body := map[string]any{"error": "cli_error", "detail": err.Error()}
 
@@ -1287,11 +1319,23 @@ func Error(err error, f Format, quiet, colour bool) string {
 		return encode(Envelope{OK: false, Error: body})
 	}
 
-	head := fmt.Sprintf("%s %s", paint(colour, red, "✗"), body["error"])
+	code, _ := body["error"].(string)
+	fix, _ := body["fix"].(string)
+	prose, command := splitCommand(fix)
+
+	head := paint(colour, red, "✗") + " "
+	if prose != "" {
+		head += prose
+	} else {
+		head += code
+	}
 	if status, ok := body["status"].(int); ok {
 		head += paint(colour, dim, fmt.Sprintf("  (HTTP %d)", status))
 	}
 	lines := []string{head}
+	if prose != "" {
+		lines = append(lines, paint(colour, dim, "  ("+code+")"))
+	}
 
 	// Sorted, so the same failure always prints the same way.
 	for _, k := range slices.Sorted(maps.Keys(body)) {
@@ -1310,8 +1354,8 @@ func Error(err error, f Format, quiet, colour bool) string {
 		}
 		lines = append(lines, paint(colour, dim, fmt.Sprintf("  %s: %v", k, body[k])))
 	}
-	if fix, ok := body["fix"].(string); ok && fix != "" {
-		lines = append(lines, "  fix: "+fix)
+	if command != "" {
+		lines = append(lines, "  Try: "+command)
 	}
 	if retryable, ok := body["retryable"].(bool); ok && retryable {
 		lines = append(lines, paint(colour, dim, "  retryable: yes"))

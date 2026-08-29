@@ -73,10 +73,26 @@ func TestErrorRendersLimitAndFix(t *testing.T) {
 	}}
 
 	got := Error(err, Human, false, false)
-	want := "✗ artifact_too_large  (HTTP 413)\n" +
+	want := "✗ re-encode below 100 MB or push frames separately  (HTTP 413)\n" +
+		"  (artifact_too_large)\n" +
 		"  got_bytes: 214958080\n" +
-		"  limit_bytes: 104857600\n" +
-		"  fix: re-encode below 100 MB or push frames separately"
+		"  limit_bytes: 104857600"
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestErrorPullsRunnableCommandOntoItsOwnLine(t *testing.T) {
+	err := &api.Error{Status: 401, Body: map[string]any{
+		"error":     "unauthorized",
+		"fix":       "this endpoint needs an API key — run `krowk auth login --token krowk_sk_...`, or set KROWK_TOKEN",
+		"retryable": false,
+	}}
+
+	got := Error(err, Human, false, false)
+	want := "✗ this endpoint needs an API key, or set KROWK_TOKEN  (HTTP 401)\n" +
+		"  (unauthorized)\n" +
+		"  Try: krowk auth login --token krowk_sk_..."
 	if got != want {
 		t.Errorf("got:\n%s\nwant:\n%s", got, want)
 	}

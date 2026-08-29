@@ -186,11 +186,15 @@ func TestHumanHelpIsStillHumanOnATerminal(t *testing.T) {
 		t.Fatalf("exit %d", code)
 	}
 	for _, want := range []string{
-		"krowk push <file...> [flags]",
-		"Upload flags",
-		"Global flags",
-		"Environment",
+		// The commands, under the headings that group them, rather than a flat
+		// column of usage lines.
+		"PUSH & PASTE",
+		"  push             Upload files, get a link for each",
+		"UPLOAD FLAGS",
+		"GLOBAL FLAGS",
+		"ENVIRONMENT",
 		"Registry precedence",
+		"LEARN MORE",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("the human help is missing %q", want)
@@ -216,7 +220,7 @@ func TestBareKrowkGreetsRatherThanPrintingTheWholeHelp(t *testing.T) {
 	if !strings.Contains(stdout, "krowk help") {
 		t.Errorf("the greeting does not point at the help:\n%s", stdout)
 	}
-	for _, section := range []string{"Usage", "Upload flags", "Exit codes"} {
+	for _, section := range []string{"USAGE", "UPLOAD FLAGS", "EXIT CODES"} {
 		if strings.Contains(stdout, section) {
 			t.Errorf("the greeting carries the %q section of the help:\n%s", section, stdout)
 		}
@@ -224,7 +228,7 @@ func TestBareKrowkGreetsRatherThanPrintingTheWholeHelp(t *testing.T) {
 
 	// And asking for the help is still asking for all of it.
 	_, full, _ := runHelp(t, true, "help")
-	for _, want := range []string{"Usage", "Upload flags", "Exit codes"} {
+	for _, want := range []string{"USAGE", "UPLOAD FLAGS", "EXIT CODES"} {
 		if !strings.Contains(full, want) {
 			t.Errorf("`krowk help` no longer carries %q", want)
 		}
@@ -247,14 +251,13 @@ func TestBareKrowkAnswersAProgramWithTheSurface(t *testing.T) {
 func TestTheGreetingRecommendsCommandsThatExist(t *testing.T) {
 	c := Surface()
 	checked := 0
-	for _, line := range strings.Split(greetingTemplate, "\n") {
-		// The indented lines, which are the recommendations. The line above them
-		// starts with the name too, and is what krowk is rather than what to type.
-		if !strings.HasPrefix(line, "  krowk ") {
+	for _, h := range append(append([]hint{}, greetingHints...), learnMore...) {
+		checked++
+		fields := strings.Fields(h.Cmd)
+		if len(fields) == 0 || fields[0] != "krowk" {
+			t.Errorf("`%s` is not spelled as something to type", h.Cmd)
 			continue
 		}
-		checked++
-		fields := strings.Fields(line)
 		// Longest first, so `auth login` is checked as the pair it is, then
 		// shortened past the arguments and flags standing after the command.
 		words := fields[1:]
@@ -264,8 +267,10 @@ func TestTheGreetingRecommendsCommandsThatExist(t *testing.T) {
 			}
 			words = words[:len(words)-1]
 		}
-		if len(words) == 0 {
-			t.Errorf("the greeting recommends `%s`, which is not a krowk command", line)
+		// `krowk` alone is the greeting itself, and `krowk push …` is the one
+		// command that needs no subcommand named after it.
+		if len(words) == 0 && len(fields) > 1 {
+			t.Errorf("the greeting recommends `%s`, which is not a krowk command", h.Cmd)
 		}
 	}
 	if checked == 0 {
@@ -311,7 +316,7 @@ func TestHelpInAPasteFormatFallsBackToTheText(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("--format=%s exited %d", format, code)
 		}
-		if !strings.Contains(stdout, "Usage") {
+		if !strings.Contains(stdout, "USAGE") {
 			t.Errorf("--format=%s did not print the help text:\n%s", format, stdout)
 		}
 	}

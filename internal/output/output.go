@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -212,16 +211,9 @@ func HumanBytes(n int64) string {
 
 // RelativeExpiry turns an RFC 3339 timestamp into "expires in 24h".
 func RelativeExpiry(iso string, now time.Time) string {
-	if iso == "" {
+	at, ok := parseExpiry(iso)
+	if !ok {
 		return ""
-	}
-	at, err := time.Parse(time.RFC3339, iso)
-	if err != nil {
-		// The registry sends sub-second precision, which RFC3339Nano parses and
-		// RFC3339 does not.
-		if at, err = time.Parse(time.RFC3339Nano, iso); err != nil {
-			return ""
-		}
 	}
 	d := at.Sub(now)
 	if d <= 0 {
@@ -231,6 +223,70 @@ func RelativeExpiry(iso string, now time.Time) string {
 		return fmt.Sprintf("expires in %dh", hours)
 	}
 	return fmt.Sprintf("expires in %dd", int(d.Round(24*time.Hour).Hours()/24))
+}
+
+// friendlyExpiry is the same fact for a person: how long is left, said the way
+// somebody would say it out loud rather than as a duration to parse.
+//
+// "24h" is exact and nobody talks like that; "tomorrow" is what an anonymous
+// upload's day actually means to whoever has to decide whether to claim it. So
+// the count is of calendar days rather than of elapsed hours — an upload made
+// at eleven at night expires tomorrow, not today, however few hours that is —
+// and the day is reckoned in now's own zone, which on a terminal is the zone
+// the person reading is in.
+//
+// RelativeExpiry stays as it was, and stays exported: the MCP server prints it
+// to an agent, which is a reader that does better with a number.
+func friendlyExpiry(iso string, now time.Time) string {
+	at, ok := parseExpiry(iso)
+	if !ok {
+		return ""
+	}
+	at = at.In(now.Location())
+	d := at.Sub(now)
+	switch {
+	case d <= 0:
+		return "expired"
+	case d < time.Hour:
+		return "expires in " + plural(max(int(d.Round(time.Minute).Minutes()), 1), "minute")
+	}
+	switch days := calendarDaysApart(now, at); days {
+	case 0:
+		return "expires in " + plural(int(d.Round(time.Hour).Hours()), "hour")
+	case 1:
+		return "expires tomorrow"
+	}
+	return "expires in " + plural(calendarDaysApart(now, at), "day")
+}
+
+// calendarDaysApart counts the midnights between two moments in the same zone,
+// which is what "tomorrow" means and what a difference in hours does not say.
+func calendarDaysApart(from, to time.Time) int {
+	fromDay := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, from.Location())
+	toDay := time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, to.Location())
+	return int(toDay.Sub(fromDay).Hours() / 24)
+}
+
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// parseExpiry reads the timestamp the registry sends, which carries sub-second
+// precision that RFC3339Nano parses and RFC3339 does not.
+func parseExpiry(iso string) (time.Time, bool) {
+	if iso == "" {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339, iso)
+	if err != nil {
+		if at, err = time.Parse(time.RFC3339Nano, iso); err != nil {
+			return time.Time{}, false
+		}
+	}
+	return at, true
 }
 
 // Destination renders this result the way the named tool wants it pasted:
@@ -425,19 +481,20 @@ func markdownResult(r Result) string {
 	return strings.Join(blocks, "\n\n")
 }
 
+// humanResult is what a person is told an upload did. It opens on a sentence
+// rather than on the record: "Uploaded shot.png → <link>" is the answer to what
+// was just run, where a column of filename, size and state is the artifact read
+// back at somebody who already knows what they pushed. The record is still
+// there, one line down and dimmed, for whoever wants the size or the expiry.
 func humanResult(r Result, quiet, colour bool, now time.Time) string {
 	tick := paint(colour, green, "✓")
-	total := HumanBytes(r.Bytes())
 
 	var lines []string
 	if len(r.Artifacts) == 1 {
 		a := r.Artifacts[0]
-		lines = append(lines,
-			fmt.Sprintf("%s uploaded  %s  %s", tick, a.Filename, total),
-			"  "+a.URL,
-		)
+		lines = append(lines, fmt.Sprintf("%s Uploaded %s → %s", tick, a.Filename, a.URL))
 	} else {
-		lines = append(lines, fmt.Sprintf("%s uploaded  %d files  %s", tick, len(r.Artifacts), total))
+		lines = append(lines, fmt.Sprintf("%s Uploaded %d files", tick, len(r.Artifacts)))
 		width := 0
 		for _, a := range r.Artifacts {
 			width = max(width, len(a.Filename))
@@ -448,7 +505,7 @@ func humanResult(r Result, quiet, colour bool, now time.Time) string {
 	}
 
 	// One trailing line for the facts that apply to the whole upload.
-	var facts []string
+	facts := []string{HumanBytes(r.Bytes())}
 	// The same run the envelope's summary names, so the two formats do not disagree
 	// about which run an upload went into — a push given --run has one recorded on
 	// its artifacts and none of its own.
@@ -459,13 +516,11 @@ func humanResult(r Result, quiet, colour bool, now time.Time) string {
 		facts = append(facts, r.Title)
 	}
 	if len(r.Artifacts) > 0 {
-		if expiry := RelativeExpiry(r.Artifacts[0].ExpiresAt, now); expiry != "" {
+		if expiry := friendlyExpiry(r.Artifacts[0].ExpiresAt, now); expiry != "" {
 			facts = append(facts, expiry)
 		}
 	}
-	if len(facts) > 0 {
-		lines = append(lines, paint(colour, dim, "  "+strings.Join(facts, " · ")))
-	}
+	lines = append(lines, paint(colour, dim, "  "+strings.Join(facts, " · ")))
 	for _, note := range r.Notes {
 		lines = append(lines, paint(colour, dim, "  ! "+note))
 	}
@@ -590,7 +645,7 @@ func humanList(p *api.Page, l Listing, colour bool, now time.Time) string {
 		if a.State != "ready" {
 			line += paint(colour, dim, "  ("+a.State+")")
 		}
-		if expiry := RelativeExpiry(a.ExpiresAt, now); expiry != "" {
+		if expiry := friendlyExpiry(a.ExpiresAt, now); expiry != "" {
 			line += paint(colour, dim, "  "+expiry)
 		}
 		lines = append(lines, line)
@@ -646,14 +701,21 @@ func Artifact(a *api.Artifact, f Format, quiet, colour bool, now time.Time) stri
 // one a person actually sees — never learning that `uploads attach` exists,
 // which is the whole gap this closes.
 func Claimed(a *api.Artifact, f Format, quiet, colour bool, now time.Time) string {
+	if f == Human {
+		// A claim is something that just happened, so it reads as a confirmation
+		// rather than as the artifact read back — `uploads show` is the command
+		// for that, and it did not change anything.
+		said := humanClaimed(a, colour)
+		if !quiet && a.RunSlug() == "" {
+			said += "\n" + crumbLine("group it", AttachCrumb(a).Cmd, colour)
+		}
+		return said
+	}
 	switch {
 	// Nothing to add: the upload is already under a run, or the caller asked for
 	// the bare record, or the format is a paste form carrying only a link.
 	case a.RunSlug() != "", quiet, f == Markdown, f == URL:
 		return Artifact(a, f, quiet, colour, now)
-	case f == Human:
-		return Artifact(a, f, quiet, colour, now) + "\n" +
-			crumbLine("group it", AttachCrumb(a).Cmd, colour)
 	}
 	// Everything else goes through the envelope, spelled as the formats that opt
 	// out rather than as "only JSON", so a format added later is carried by
@@ -861,6 +923,19 @@ func Authorizing(a Authorization, f Format, colour bool) string {
 	}, "\n")
 }
 
+// humanClaimed is what a claim just did: the upload is kept, and the link it
+// was already pasted under is the same one. Saying so beats printing the record
+// again — the only thing that changed is the one fact this line names.
+func humanClaimed(a *api.Artifact, colour bool) string {
+	facts := []string{HumanBytes(a.ByteSize)}
+	if run := a.RunSlug(); run != "" {
+		facts = append(facts, "run "+run)
+	}
+	facts = append(facts, "kept for good")
+	return fmt.Sprintf("%s Claimed %s → %s", paint(colour, green, "✓"), a.Filename, a.URL) +
+		"\n" + paint(colour, dim, "  "+strings.Join(facts, " · "))
+}
+
 func humanArtifact(a *api.Artifact, colour bool, now time.Time) string {
 	head := fmt.Sprintf("%s  %s", a.Filename, HumanBytes(a.ByteSize))
 	if a.State != "" {
@@ -872,7 +947,7 @@ func humanArtifact(a *api.Artifact, colour bool, now time.Time) string {
 	if run := a.RunSlug(); run != "" {
 		facts = append(facts, "run "+run)
 	}
-	if expiry := RelativeExpiry(a.ExpiresAt, now); expiry != "" {
+	if expiry := friendlyExpiry(a.ExpiresAt, now); expiry != "" {
 		facts = append(facts, expiry)
 	}
 	if len(facts) > 0 {
@@ -908,8 +983,8 @@ func Removed(slug string, f Format, quiet, colour bool) string {
 		})
 	}
 	return strings.Join([]string{
-		fmt.Sprintf("%s taken down  %s", paint(colour, green, "✓"), slug),
-		paint(colour, dim, "  the bytes are gone for good; the link now reports it was taken down"),
+		fmt.Sprintf("%s Took %s down", paint(colour, green, "✓"), slug),
+		paint(colour, dim, "  the bytes are gone for good, and the link now says so"),
 	}, "\n")
 }
 
@@ -917,11 +992,17 @@ func Removed(slug string, f Format, quiet, colour bool) string {
 func Run(r *api.Run, f Format, quiet, colour bool) string {
 	switch f {
 	case Human, Markdown:
-		status := r.Status
-		if r.FinishedAt != "" {
-			status += " at " + r.FinishedAt
+		// What just happened, rather than the record that resulted from it. The
+		// status is the whole of the difference between the two commands that
+		// render here, so it is what the sentence is chosen by — and a status
+		// this build has no word for still gets a true line rather than a guess.
+		switch r.Status {
+		case StatusFinished:
+			return fmt.Sprintf("%s Finished run %s", paint(colour, green, "✓"), r.Slug)
+		case "open":
+			return fmt.Sprintf("%s Started run %s", paint(colour, green, "✓"), r.Slug)
 		}
-		return fmt.Sprintf("%s run %s  %s", paint(colour, green, "✓"), r.Slug, status)
+		return fmt.Sprintf("%s Run %s is %s", paint(colour, green, "✓"), r.Slug, r.Status)
 	}
 	if quiet {
 		return encode(r)
@@ -1268,39 +1349,12 @@ func clipLabel(s string) string {
 	return string(runes[:maxLabelRunes]) + "…"
 }
 
-// runCommandRe finds a runnable command embedded in a fix message, so it can
-// be pulled onto its own line rather than buried mid-sentence.
-var runCommandRe = regexp.MustCompile("run `([^`]+)`")
-
-// splitCommand pulls a "run `cmd`" clause out of a fix message. What is left
-// is the prose either side of it, stitched back together so it still reads as
-// one sentence; the command comes back on its own so it can be printed as
-// something a person can paste and run, not prose to parse.
-func splitCommand(fix string) (prose, command string) {
-	loc := runCommandRe.FindStringSubmatchIndex(fix)
-	if loc == nil {
-		return fix, ""
-	}
-	command = fix[loc[2]:loc[3]]
-	before := strings.TrimRight(fix[:loc[0]], " —,")
-	after := strings.TrimLeft(fix[loc[1]:], " ,")
-	switch {
-	case before == "":
-		prose = after
-	case after == "":
-		prose = before
-	default:
-		prose = before + ", " + after
-	}
-	return prose, command
-}
-
-// Error renders a failure. Human output leads with the fix as prose, since
-// that is what a person acts on; the wire's snake_case code is demoted to a
-// dim aside rather than shouted as the headline. A fix that names a runnable
-// command gets that command pulled onto its own line, so it can be copied and
-// run rather than parsed out of a sentence. JSON hands back the flattened
-// body unchanged.
+// Error renders a failure. Human output leads with the fix as a sentence,
+// since that is what a person acts on; the wire's snake_case code is demoted
+// to a dim aside rather than shouted as the headline, and a command the fix
+// names is pulled onto its own line so it can be copied rather than parsed out
+// of prose. JSON hands back the flattened body unchanged — the agent's whole
+// fix string included, because that reader wants every clause of it.
 func Error(err error, f Format, quiet, colour bool) string {
 	body := map[string]any{"error": "cli_error", "detail": err.Error()}
 
@@ -1321,11 +1375,11 @@ func Error(err error, f Format, quiet, colour bool) string {
 
 	code, _ := body["error"].(string)
 	fix, _ := body["fix"].(string)
-	prose, command := splitCommand(fix)
+	said := fixLines(fix)
 
 	head := paint(colour, red, "✗") + " "
-	if prose != "" {
-		head += prose
+	if len(said) > 0 {
+		head += said[0].Say
 	} else {
 		head += code
 	}
@@ -1333,7 +1387,7 @@ func Error(err error, f Format, quiet, colour bool) string {
 		head += paint(colour, dim, fmt.Sprintf("  (HTTP %d)", status))
 	}
 	lines := []string{head}
-	if prose != "" {
+	if len(said) > 0 {
 		lines = append(lines, paint(colour, dim, "  ("+code+")"))
 	}
 
@@ -1354,8 +1408,20 @@ func Error(err error, f Format, quiet, colour bool) string {
 		}
 		lines = append(lines, paint(colour, dim, fmt.Sprintf("  %s: %v", k, body[k])))
 	}
-	if command != "" {
-		lines = append(lines, "  Try: "+command)
+	// What to do comes after the facts, so the failure reads as news, then the
+	// evidence, then the chore. Each clause keeps its own: a push that failed
+	// with a run still open is two things left to do, and one `try:` line would
+	// name only one.
+	for i, line := range said {
+		if i > 0 {
+			lines = append(lines, paint(colour, dim, "  "+line.Say))
+		}
+		if line.Then != "" {
+			lines = append(lines, paint(colour, dim, "  "+line.Then))
+		}
+		if line.Cmd != "" {
+			lines = append(lines, crumbLine("try", line.Cmd, colour))
+		}
 	}
 	if retryable, ok := body["retryable"].(bool); ok && retryable {
 		lines = append(lines, paint(colour, dim, "  retryable: yes"))

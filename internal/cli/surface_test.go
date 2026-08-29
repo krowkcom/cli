@@ -276,18 +276,47 @@ func TestEveryFlagInTheHelpTextIsReal(t *testing.T) {
 	}
 }
 
-// TestEveryCommandInTheHelpTextIsInTheCatalog holds the usage block to the
+// TestEveryCommandInTheHelpTextIsInTheCatalog holds the command block to the
 // catalog it is rendered from — cheap insurance that the rendering itself did
 // not start dropping rows.
 func TestEveryCommandInTheHelpTextIsInTheCatalog(t *testing.T) {
 	help := renderedHelp()
 	for _, cmd := range catalog().Leaves() {
-		if !strings.Contains(help, cmd.Usage) {
-			t.Errorf("the help text does not show %q", cmd.Usage)
+		if !strings.Contains(help, cmd.Name) {
+			t.Errorf("the help text does not show `krowk %s`", cmd.Name)
 		}
 		if !strings.Contains(help, cmd.Summary) {
 			t.Errorf("the help text does not show the summary of `krowk %s`", cmd.Name)
 		}
+	}
+}
+
+// The headings are written down by hand while the commands under them are the
+// catalog's, so the two can drift: a command added to the catalog and to the
+// routing switch, and to no section, would run and be documented by
+// `krowk help --json` while never appearing in the help a person reads. A name
+// under two headings is the same problem read the other way — the reader is
+// told twice and neither place is the one to look in.
+func TestEveryCommandIsUnderExactlyOneHeading(t *testing.T) {
+	under := map[string][]string{}
+	for _, s := range sections {
+		for _, name := range s.Commands {
+			under[name] = append(under[name], s.Title)
+		}
+	}
+
+	for _, cmd := range catalog().Leaves() {
+		switch titles := under[cmd.Name]; len(titles) {
+		case 1:
+			delete(under, cmd.Name)
+		case 0:
+			t.Errorf("`krowk %s` is in the catalog and under no heading in the help", cmd.Name)
+		default:
+			t.Errorf("`krowk %s` is under %d headings: %v", cmd.Name, len(titles), titles)
+		}
+	}
+	for name := range under {
+		t.Errorf("the help lists `krowk %s`, which is not a command", name)
 	}
 }
 

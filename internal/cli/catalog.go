@@ -392,6 +392,60 @@ func catalog() Catalog {
 	}
 }
 
+// section is one heading in the human help: a handful of commands that get
+// reached for together, under a name that says what they are for.
+//
+// It is deliberately not a field on Command. Grouping is a reading aid for the
+// person scanning the help, and the JSON surface is a data structure whose
+// consumers route on names — adding a heading to it would be inventing a fact
+// about the interface to make one rendering of it nicer. So the sections live
+// here, and a test holds them to the catalog: every runnable command appears
+// under exactly one heading, or the human help has quietly stopped mentioning
+// something krowk can do.
+type section struct {
+	Title string
+	// Commands are leaf names as Leaves spells them — "uploads attach", not
+	// "attach" — in the order they read rather than alphabetically.
+	Commands []string
+}
+
+var sections = []section{
+	{"PUSH & PASTE", []string{"push", "uploads create"}},
+	{"RUNS", []string{"runs start", "runs finish", "runs show", "runs list"}},
+	{"UPLOADS", []string{"uploads list", "uploads show", "uploads attach", "uploads delete", "claim"}},
+	{"ACCOUNT & SYSTEM", []string{
+		"auth login", "auth verify", "auth token",
+		"workspaces list", "workspaces use",
+		"config show", "config set", "config unset",
+		"doctor", "upgrade", "help",
+	}},
+}
+
+// hint is one command recommended to somebody who has not typed one yet: what
+// to type, and what typing it gets them.
+type hint struct {
+	Cmd string
+	Why string
+}
+
+// greetingHints are what `krowk` alone suggests. They are onboarding copy
+// rather than the catalog's summaries, which describe a command to somebody
+// already looking it up: the first upload, the key that makes uploads keep, and
+// where the rest is. The same three the installer signs off with, so a first
+// run says what the install said.
+var greetingHints = []hint{
+	{"krowk push screenshot.png", "Upload a file and get a link — no key needed, lasts a day"},
+	{"krowk auth login --token …", "Add a key: uploads keep, group under runs, and stay yours"},
+	{"krowk help", "Every command and flag — add --json for the surface as data"},
+}
+
+// learnMore closes the help the way it opens: with the next thing to type.
+var learnMore = []hint{
+	{"krowk help <command>", "One command's own arguments and flags"},
+	{"krowk help --json", "The whole surface as data, for tooling"},
+	{"krowk doctor", "Check this machine's setup and reach the registry"},
+}
+
 // Surface is the catalog as this build of krowk would report it.
 func Surface() Catalog {
 	c := catalog()
@@ -447,20 +501,53 @@ func (c Catalog) Find(path []string) (Command, bool) {
 	return Command{}, false
 }
 
-// usageBlock renders the command list at the top of the help text. It is
-// generated rather than written down so that a command cannot be added to the
-// catalog, and to the JSON, without appearing here too.
-func usageBlock(c Catalog) string {
-	leaves := c.Leaves()
+// commandBlock renders the command list at the top of the help text: the
+// sections, in order, each command beside what it does.
+//
+// The names are what a caller types and nothing more. A usage line spelling out
+// every positional and `[flags]` is the right answer to "how do I run this one",
+// which is what `krowk help push` is for; in a list of twenty it is a column of
+// punctuation to read past before reaching the words.
+//
+// The column is one width across every section, so the summaries line up down
+// the whole page rather than stepping in and out at each heading.
+func commandBlock(c Catalog) string {
+	summaries := make(map[string]string, len(c.Leaves()))
+	for _, cmd := range c.Leaves() {
+		summaries[cmd.Name] = cmd.Summary
+	}
 
 	width := 0
-	for _, cmd := range leaves {
-		width = max(width, len(cmd.Usage))
+	for _, s := range sections {
+		for _, name := range s.Commands {
+			width = max(width, len(name))
+		}
 	}
 
 	var b strings.Builder
-	for _, cmd := range leaves {
-		fmt.Fprintf(&b, "  %-*s%s\n", width+4, cmd.Usage, cmd.Summary)
+	for i, s := range sections {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(s.Title + "\n")
+		for _, name := range s.Commands {
+			fmt.Fprintf(&b, "  %-*s  %s\n", width, name, summaries[name])
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// hintBlock renders a short list of commands beside why they are worth running,
+// which is what the greeting and the help's closing section both are. One
+// function, so the two cannot drift into two column widths.
+func hintBlock(hints []hint) string {
+	width := 0
+	for _, h := range hints {
+		width = max(width, len(h.Cmd))
+	}
+	var b strings.Builder
+	for _, h := range hints {
+		fmt.Fprintf(&b, "  %-*s  %s\n", width, h.Cmd, h.Why)
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -472,10 +559,10 @@ func commandHelp(cmd Command) string {
 	lines := []string{"krowk " + cmd.Name + " — " + strings.ToLower(cmd.Summary[:1]) + cmd.Summary[1:]}
 
 	if cmd.Usage != "" {
-		lines = append(lines, "", "Usage", "  "+cmd.Usage)
+		lines = append(lines, "", "USAGE", "  "+cmd.Usage)
 	}
 	if len(cmd.Subcommands) > 0 {
-		lines = append(lines, "", "Commands")
+		lines = append(lines, "", "COMMANDS")
 		width := 0
 		for _, sub := range cmd.Subcommands {
 			width = max(width, len(sub.Usage))
@@ -499,18 +586,18 @@ func commandHelp(cmd Command) string {
 	}
 
 	if len(cmd.Args) > 0 {
-		lines = append(lines, "", "Arguments")
+		lines = append(lines, "", "ARGUMENTS")
 		for _, arg := range cmd.Args {
 			lines = append(lines, row(argLabel(arg), arg.Summary))
 		}
 	}
 	if len(cmd.Flags) > 0 {
-		lines = append(lines, "", "Flags")
+		lines = append(lines, "", "FLAGS")
 		for _, f := range cmd.Flags {
 			lines = append(lines, row(flagLabel(f), f.Usage))
 		}
 	}
-	lines = append(lines, "", "Global flags")
+	lines = append(lines, "", "GLOBAL FLAGS")
 	for _, f := range globals {
 		lines = append(lines, row(flagLabel(f), f.Usage))
 	}

@@ -9,9 +9,8 @@ npx @krowk/cli push screenshot.png \
 ```
 
 ```
-✓ uploaded  screenshot.png  412 KB
-  https://cdn.krowk.com/ws_9f3c/art_2e1d/screenshot.png
-  run run_8Kd2wq · expires in 24h
+✓ Uploaded screenshot.png → https://krowk.com/a/art_2e1d
+  412 KB · expires tomorrow
 ```
 
 ## What this package is

@@ -44,6 +44,33 @@ func TestRelativeExpiry(t *testing.T) {
 	}
 }
 
+// The human path counts days rather than hours: "24h" is exact and nobody
+// talks like that, and whether an anonymous upload survives the night is the
+// question a person is actually asking.
+func TestFriendlyExpiry(t *testing.T) {
+	now := time.Date(2026, 8, 3, 22, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{now.Add(90 * time.Second).Format(time.RFC3339), "expires in 2 minutes"},
+		{now.Add(70 * time.Second).Format(time.RFC3339), "expires in 1 minute"},
+		{now.Add(90 * time.Minute).Format(time.RFC3339), "expires in 2 hours"},
+		// Two and a half hours from ten at night is tomorrow, and the hours are
+		// not what somebody deciding whether to claim it is asking about.
+		{now.Add(150 * time.Minute).Format(time.RFC3339), "expires tomorrow"},
+		{now.Add(24 * time.Hour).Format(time.RFC3339), "expires tomorrow"},
+		{now.Add(72 * time.Hour).Format(time.RFC3339), "expires in 3 days"},
+		{now.Add(-time.Second).Format(time.RFC3339), "expired"},
+		{"", ""},
+		{"not a timestamp", ""},
+	} {
+		if got := friendlyExpiry(tc.in, now); got != tc.want {
+			t.Errorf("friendlyExpiry(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestResolveFormat(t *testing.T) {
 	// Piped output defaults to JSON so an agent gets structure for free.
 	if got, _ := ResolveFormat("", false, false); got != JSON {
@@ -73,7 +100,7 @@ func TestErrorRendersLimitAndFix(t *testing.T) {
 	}}
 
 	got := Error(err, Human, false, false)
-	want := "✗ re-encode below 100 MB or push frames separately  (HTTP 413)\n" +
+	want := "✗ Re-encode below 100 MB or push frames separately.  (HTTP 413)\n" +
 		"  (artifact_too_large)\n" +
 		"  got_bytes: 214958080\n" +
 		"  limit_bytes: 104857600"
@@ -82,7 +109,10 @@ func TestErrorRendersLimitAndFix(t *testing.T) {
 	}
 }
 
-func TestErrorPullsRunnableCommandOntoItsOwnLine(t *testing.T) {
+// A fix is written for an agent: what happened, then what to check, then the
+// caveat. A person gets the first of those as a sentence and the command on a
+// line to copy — and the agent still gets every clause, in the envelope.
+func TestErrorSaysTheFixInAPersonsRegister(t *testing.T) {
 	err := &api.Error{Status: 401, Body: map[string]any{
 		"error":     "unauthorized",
 		"fix":       "this endpoint needs an API key — run `krowk auth login --token krowk_sk_...`, or set KROWK_TOKEN",
@@ -90,9 +120,78 @@ func TestErrorPullsRunnableCommandOntoItsOwnLine(t *testing.T) {
 	}}
 
 	got := Error(err, Human, false, false)
-	want := "✗ this endpoint needs an API key, or set KROWK_TOKEN  (HTTP 401)\n" +
+	want := "✗ This endpoint needs an API key.  (HTTP 401)\n" +
 		"  (unauthorized)\n" +
-		"  Try: krowk auth login --token krowk_sk_..."
+		"  try:  krowk auth login --token krowk_sk_..."
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+
+	// The envelope is the agent's, and it keeps the whole string: nothing that
+	// reads JSON should have to go back to the terminal for the clauses the
+	// human line left out.
+	var e struct {
+		Error map[string]any `json:"error"`
+	}
+	if jsonErr := json.Unmarshal([]byte(Error(err, JSON, false, false)), &e); jsonErr != nil {
+		t.Fatal(jsonErr)
+	}
+	if e.Error["fix"] != err.Body["fix"] {
+		t.Errorf("envelope fix = %q, want the agent's whole string", e.Error["fix"])
+	}
+}
+
+// A command a fix names is worth copying whatever the sentence around it looks
+// like, and a clause that ends in one must not print it twice.
+func TestErrorFindsTheCommandWhereverTheFixPutsIt(t *testing.T) {
+	for name, tc := range map[string]struct{ fix, want string }{
+		"after a colon": {
+			"pass at least one path: `krowk push screenshot.png`",
+			"✗ Pass at least one path.\n  (no_file)\n  try:  krowk push screenshot.png",
+		},
+		"before the dash": {
+			"a key has to go behind the flag: `krowk auth login --token krowk_sk_...` — " +
+				"passed as a bare argument it is ignored",
+			"✗ A key has to go behind the flag.\n  (no_file)\n  try:  krowk auth login --token krowk_sk_...",
+		},
+		// A clause opening on something typed verbatim keeps its own spelling:
+		// capitalising it would print a flag or a name that does not exist.
+		"opening on a quoted name": {
+			"`frobnicate` is not a krowk command — run `krowk help` for the list",
+			"✗ `frobnicate` is not a krowk command.\n  (no_file)\n  try:  krowk help",
+		},
+		// No command, so the clause past the dash is the only advice there is
+		// and it stays. The one above it names a command, and the command
+		// answers everything its own clause was qualifying.
+		"opening on a flag": {
+			"--jq reads the JSON, so it cannot be combined with --format markdown — drop one of the two",
+			"✗ --jq reads the JSON, so it cannot be combined with --format markdown.\n" +
+				"  (no_file)\n  Drop one of the two.",
+		},
+	} {
+		got := Error(api.Fail("no_file", tc.fix), Human, false, false)
+		if got != tc.want {
+			t.Errorf("%s:\ngot:\n%s\nwant:\n%s", name, got, tc.want)
+		}
+	}
+}
+
+// Two failures at once are joined with a semicolon — a push that failed with a
+// run left open is how the CLI builds one — and they are two separate things
+// left to do, so neither the sentence nor the command of the second is dropped.
+func TestErrorKeepsBothHalvesOfATwoPartFailure(t *testing.T) {
+	err := &api.Error{Status: 403, Body: map[string]any{
+		"error": "storage_rejected_upload",
+		"fix": "object storage refused the bytes — most often the file changed after it was measured; " +
+			"the run is still open — close it with `krowk runs finish run_7f`",
+	}}
+
+	got := Error(err, Human, false, false)
+	want := "✗ Object storage refused the bytes.  (HTTP 403)\n" +
+		"  (storage_rejected_upload)\n" +
+		"  Most often the file changed after it was measured.\n" +
+		"  The run is still open.\n" +
+		"  try:  krowk runs finish run_7f"
 	if got != want {
 		t.Errorf("got:\n%s\nwant:\n%s", got, want)
 	}
@@ -509,6 +608,50 @@ func TestHumanAndJSONAgreeOnACallerSuppliedRun(t *testing.T) {
 	}
 	if !strings.Contains(e.Summary, "run run_y") {
 		t.Errorf("summary = %q, want the run named", e.Summary)
+	}
+}
+
+// A person who just ran a command is owed a sentence about what it did, not
+// the record it produced. The record is still on the line under it.
+func TestSuccessReadsAsAConfirmation(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	anon := &api.Artifact{
+		Slug: "art_2e1d", Filename: "shot.png", ByteSize: 1234, State: "ready",
+		URL: "https://krowk.com/a/art_2e1d", ClaimToken: "krowk_claim_2b7f",
+		ExpiresAt: now.Add(24 * time.Hour).Format(time.RFC3339),
+	}
+
+	push := Upload(Result{Artifacts: []*api.Artifact{anon}}, Human, false, false, now)
+	wantHead := "✓ Uploaded shot.png → https://krowk.com/a/art_2e1d\n  1.2 KB · expires tomorrow"
+	if !strings.HasPrefix(push, wantHead) {
+		t.Errorf("push:\n%s\nwant it to open with:\n%s", push, wantHead)
+	}
+
+	claimed := &api.Artifact{Slug: "art_2e1d", Filename: "shot.png", ByteSize: 1234,
+		URL: "https://krowk.com/a/art_2e1d"}
+	claim := Claimed(claimed, Human, false, false, now)
+	if !strings.HasPrefix(claim, "✓ Claimed shot.png → https://krowk.com/a/art_2e1d\n  1.2 KB · kept for good") {
+		t.Errorf("claim:\n%s", claim)
+	}
+
+	if got := Removed("art_2e1d", Human, false, false); !strings.HasPrefix(got, "✓ Took art_2e1d down\n") {
+		t.Errorf("takedown:\n%s", got)
+	}
+
+	// `runs start` and `runs finish` render through one function, so what it
+	// says has to follow the run's state rather than the command's name.
+	if got := Run(&api.Run{Slug: "run_7f", Status: "open"}, Human, false, false); got != "✓ Started run run_7f" {
+		t.Errorf("runs start = %q", got)
+	}
+	finished := Run(&api.Run{Slug: "run_7f", Status: StatusFinished,
+		FinishedAt: "2026-08-03T12:00:00.123456Z"}, Human, false, false)
+	if finished != "✓ Finished run run_7f" {
+		t.Errorf("runs finish = %q, want no wire timestamp read at a person", finished)
+	}
+	// A status this build has no word for still gets a true line rather than a
+	// guess at which of the two commands produced it.
+	if got := Run(&api.Run{Slug: "run_7f", Status: "abandoned"}, Human, false, false); got != "✓ Run run_7f is abandoned" {
+		t.Errorf("unknown status = %q", got)
 	}
 }
 

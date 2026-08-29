@@ -17,9 +17,8 @@ krowk push screenshot.png \
 ```
 
 ```
-✓ uploaded  screenshot.png  412 KB
-  https://krowk.com/a/art_2e1d
-  run run_8Kd2wq
+✓ Uploaded screenshot.png → https://krowk.com/a/art_2e1d
+  412 KB · run run_8Kd2wq
 ```
 
 ### Features

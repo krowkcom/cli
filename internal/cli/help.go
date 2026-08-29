@@ -34,9 +34,9 @@ func showHelp(w io.Writer, topic []string, format output.Format, f flags) error 
 		if format == output.JSON {
 			return encodeJSON(w, c, f)
 		}
-		fmt.Fprintf(w, helpTemplate, Version, usageBlock(c),
+		fmt.Fprintf(w, helpTemplate, Version, commandBlock(c),
 			api.DevBaseURL, api.DefaultBaseURL,
-			api.CredentialsPath(), config.GlobalPath())
+			api.CredentialsPath(), config.GlobalPath(), hintBlock(learnMore))
 		return nil
 	}
 

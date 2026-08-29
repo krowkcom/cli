@@ -2546,6 +2546,38 @@ func TestHumanOutputEndsWithTheBlock(t *testing.T) {
 	}
 }
 
+// An upload is the one thing krowk does that takes long enough to look hung, so
+// a person waiting on a terminal is told it is still working. Nobody else is:
+// the spinner is transient decoration, and on any stream that is read rather
+// than watched it would be escape codes in a file.
+func TestTheUploadSpinnerIsOnlyForSomebodyWatching(t *testing.T) {
+	h := newHarness(t, 0)
+
+	// Watching: stderr is a terminal and the answer is prose.
+	if _, _, stderr := h.runOn(true, "push", h.fixture); !strings.Contains(stderr, "Uploading") {
+		t.Errorf("nothing said the upload was under way: %q", stderr)
+	} else if strings.Contains(stderr, "\n") {
+		t.Errorf("the spinner is more than the one line it erases: %q", stderr)
+	}
+
+	// Not watching. --json and --quiet are asked for on a terminal, and are
+	// asked for by something that will read the answer rather than watch it.
+	for _, args := range [][]string{
+		{"push", h.fixture, "--json"},
+		{"push", h.fixture, "--quiet"},
+		{"push", h.fixture, "--destination=github"},
+	} {
+		if _, _, stderr := h.runOn(true, args...); stderr != "" {
+			t.Errorf("`krowk %s` wrote to stderr: %q", strings.Join(args, " "), stderr)
+		}
+	}
+
+	// And piped, where the spinner's own stream is the one being captured.
+	if _, _, stderr := h.runOnStreams(true, false, "push", h.fixture); stderr != "" {
+		t.Errorf("stderr is not a terminal and got %q", stderr)
+	}
+}
+
 // No paste form may be composed on this side: how a krowk reference looks has
 // to be one registry deploy away from changing everywhere, including in the
 // installs that already exist. The image embed is the shape that matters —

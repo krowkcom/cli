@@ -9,6 +9,51 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Added
+
+- A spinner on the one thing krowk does that takes long enough to look hung. An
+  upload of a few hundred kilobytes over a slow link is four seconds of a
+  terminal that has printed nothing, which is indistinguishable from one that has
+  stopped, so a single line on stderr says what is being sent and keeps moving —
+  naming each file in turn when there are several. It is not progress and does
+  not pretend to be: krowk hands the file to object storage in one request and is
+  never told how much of it has landed, so a percentage would be a number krowk
+  invented. It erases itself before the durable line is printed, so nothing about
+  it reaches the scrollback and a transcript reads as though the wait never
+  happened. Shown only when stderr is a terminal and the answer is prose:
+  `--json`, `--quiet`, `--destination`, the paste formats and any piped stream
+  are read rather than watched, and escape codes in a captured file help nobody.
+
+### Changed
+
+- Human output now reads as a person would say it, while the JSON envelope keeps
+  every code and every fix string exactly as it was — agents parse the envelope,
+  and none of this reaches them.
+  - A failure leads with the fix as a sentence rather than with the wire code:
+    `✗ Re-encode below 100 MB or push frames separately.` where it used to open
+    on `artifact_too_large`. The code is still there, dimmed, one line down and
+    in the envelope; a command the fix names is pulled onto its own line so it
+    can be copied rather than picked out of prose, and a fix that names two
+    things to do says both, one per line.
+  - A success reads as a confirmation rather than as the record read back at
+    somebody who already knows what they pushed:
+    `✓ Uploaded shot.png → https://krowk.com/a/art_2e1d`, with the size, the run
+    and the expiry dimmed on the line under it. `claim`, `uploads delete` and
+    `runs start` / `runs finish` got the same treatment — `✓ Took art_2e1d down`,
+    `✓ Finished run run_7f`, and no wire timestamp read out at a person.
+  - An expiry is said the way somebody would say it out loud: `expires tomorrow`
+    rather than `expires in 24h`, counted in midnights and in the reader's own
+    zone, so an upload at eleven at night expires tomorrow however few hours that
+    is. The MCP server still prints the exact duration, since an agent does
+    better with a number.
+- `krowk help` is now laid out for reading rather than for completeness: the
+  commands are grouped under `PUSH & PASTE`, `RUNS`, `UPLOADS` and
+  `ACCOUNT & SYSTEM` in two aligned columns, under a `USAGE` block that leads
+  with the one command that matters, and it closes on what to type next. The
+  groups are written down once and filled from the same catalog `krowk help
+  --json` is rendered from, so a command cannot exist in one and not the other.
+  The machine surface is unchanged.
+
 ## [0.8.1] - 2026-08-28
 
 ### Added

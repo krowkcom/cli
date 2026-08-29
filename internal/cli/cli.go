@@ -13,6 +13,7 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -65,22 +66,22 @@ Permalinks for agent output
 // is the first upload, the key that makes uploads keep, and where the rest is —
 // three lines, and the reference is one of them.
 //
-// The commands here are onboarding copy rather than the catalog's summaries,
-// which describe a command to somebody already looking it up. They are the same
-// three the installer signs off with, so a first run says what the install said.
-const greetingTemplate = bannerTemplate + `  krowk push screenshot.png     Upload a file and get a link — no key needed, lasts a day
-  krowk auth login --token …    Add a key: uploads keep, group under runs, and stay yours
-  krowk help                    Every command and flag — add --json for the surface as data
+// The three are greetingHints, rendered by the same two-column helper the help
+// uses, so the greeting and the page it points at are laid out alike.
+const greetingTemplate = bannerTemplate + `%s
 `
 
-// helpTemplate is the human help. Its Usage block is not written here: it is
-// rendered from the catalog, so a command cannot exist in the JSON surface and
-// not in the text, or the other way round. Everything after it is prose, which
-// is the half a struct has no way to say.
-const helpTemplate = bannerTemplate + `Usage
+// helpTemplate is the human help. Its command list is not written here: it is
+// rendered from the catalog under the headings in `sections`, so a command
+// cannot exist in the JSON surface and not in the text, or the other way round.
+// Everything after it is prose, which is the half a struct has no way to say.
+const helpTemplate = bannerTemplate + `USAGE
+  krowk <command> [flags]
+  krowk push shot.png     Upload a file, get a link
+
 %s
 
-Upload flags
+UPLOAD FLAGS
   --run <slug|link>      Attach to an existing run instead of opening one, by
                          slug or by any link carrying one. On
                          ` + "`claim`" + ` and ` + "`uploads attach`" + ` it names the run an upload
@@ -111,21 +112,21 @@ Upload flags
                          lands on each artifact; on ` + "`runs start`" + `, on the run.
                          Your value wins over a detected one. Metadata is public.
 
-List flags
+LIST FLAGS
   --limit <n>            Rows per page (1–100, default 50)
   --before <slug>        Start after this row — the ` + "`next`" + ` of the last page
   --run <slug|link>      On ` + "`uploads list`" + `, narrow it to what one run produced
 
-Auth flags
+AUTH FLAGS
   --token <key>          Store this key rather than asking the browser — how CI
                          logs in, and it opens nothing
   --no-browser           Print the code and the page instead of opening a browser
 
-Config flags
+CONFIG FLAGS
   --global               On ` + "`config set`" + ` and ` + "`config unset`" + `, write the machine-wide
                          file instead of the repository's
 
-Global flags
+GLOBAL FLAGS
   --workspace <name>     Use this workspace's stored key for this one command
   --dev                  Talk to a local registry at %s
   --format <fmt>         human | json | markdown | url (default: human on a TTY, json when piped)
@@ -137,7 +138,7 @@ Global flags
   -h, --help             Show this
   -v, --version          Print the version
 
-Environment
+ENVIRONMENT
   KROWK_TOKEN            API token — wins over the credentials file
   KROWK_WORKSPACE        Workspace to use, as if by --workspace
   KROWK_API_URL          API base URL (default %s)
@@ -145,7 +146,7 @@ Environment
   KROWK_AGENT            Agent name to report
   KROWK_NO_UPDATE_CHECK  1/true/yes/on — never check for or mention new releases
 
-Exit codes
+EXIT CODES
   0  it worked
   1  the command was wrong, or krowk failed on its own — also anything unclassified
   2  not found — no such artifact or run in this workspace, or no such endpoint
@@ -198,6 +199,9 @@ agent or person — lands there without saying so.
 
 Credentials live in %s (0600).
 Config lives in %s, and per repository in <git-root>/.krowk/config.json.
+
+LEARN MORE
+%s
 `
 
 type flags struct {
@@ -418,7 +422,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		// of it, and gets all of it. Piped or asked for as JSON, `krowk` alone
 		// still answers with the whole surface: that reader is a program, three
 		// lines of prose are no use to it, and the surface is what it came for.
-		fmt.Fprintf(stdout, greetingTemplate, Version)
+		fmt.Fprintf(stdout, greetingTemplate, Version, hintBlock(greetingHints))
 		return 0
 	case f.help, len(positionals) == 0, positionals[0] == "help":
 		// What was asked about: `krowk help uploads attach` and
@@ -437,9 +441,9 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	var err error
 	switch {
 	case positionals[0] == "push":
-		err = upload(stdout, positionals[1:], f, format, env, colour)
+		err = upload(stdout, stderr, positionals[1:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "uploads" && positionals[1] == "create":
-		err = upload(stdout, positionals[2:], f, format, env, colour)
+		err = upload(stdout, stderr, positionals[2:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "uploads" && positionals[1] == "list":
 		err = uploadsList(stdout, f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "uploads" && positionals[1] == "show":
@@ -725,7 +729,7 @@ func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
 
 // upload is the whole point of the CLI: every file becomes its own artifact, and
 // a run is what groups them and carries the metadata about where they came from.
-func upload(w io.Writer, files []string, f flags, format output.Format, env runctx.Env, colour bool) error {
+func upload(w, progress io.Writer, files []string, f flags, format output.Format, env runctx.Env, colour bool) error {
 	if len(files) == 0 {
 		return api.Fail("no_file", "pass at least one path: `krowk push screenshot.png`")
 	}
@@ -763,6 +767,9 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 
 	result := output.Result{Title: f.title}
 
+	spin := output.Spin(progress, watching(f, format), uploading(specs, 0))
+	defer spin.Stop()
+
 	runSlug, ownRun, err := resolveRun(ctx, client, f, env, &result)
 	if err != nil {
 		return err
@@ -786,6 +793,7 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 		if authenticated {
 			spec.Metadata = stamp.WithExtras(withCaption(extras, captions, i))
 		}
+		spin.Say(uploading(specs, i))
 		artifact, err := client.Push(ctx, spec)
 		if err != nil {
 			return withProgress(err, result.Artifacts, runSlug, ownRun)
@@ -805,10 +813,37 @@ func upload(w io.Writer, files []string, f flags, format output.Format, env runc
 		}
 	}
 
+	// Before anything durable is printed, not merely when upload returns: the
+	// spinner and the result share a terminal, and a frame written after the
+	// first line of the result would sit on top of it.
+	spin.Stop()
+
 	if f.destination != "" {
 		return emit(w, output.Destination(result, f.destination), f)
 	}
 	return emit(w, output.Upload(result, format, f.quiet, colour, time.Now()), f)
+}
+
+// watching is whether anybody is looking at the wait rather than reading the
+// answer afterwards. The spinner is transient decoration on stderr, so it is
+// shown only when stderr is a terminal — but a terminal is not enough on its
+// own. Every other clause here is somebody saying, on a terminal, that they
+// want the answer as data: --json and --quiet, --format=markdown or url,
+// --destination. They are how a person captures krowk's output by hand, and
+// nobody capturing output wants escape codes in what they captured.
+func watching(f flags, format output.Format) bool {
+	return f.errTTY && format == output.Human && !f.quiet && f.destination == ""
+}
+
+// uploading names the file being sent, and counts only when there are several —
+// "Uploading shot.png" is the whole truth for the usual push, and "(2/5)" on it
+// would be noise.
+func uploading(specs []api.Spec, i int) string {
+	say := "Uploading " + filepath.Base(specs[i].Path)
+	if len(specs) > 1 {
+		say += fmt.Sprintf(" (%d/%d)", i+1, len(specs))
+	}
+	return say
 }
 
 // resolveRun decides which run the artifacts belong to: the one named on the

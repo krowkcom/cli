@@ -749,3 +749,85 @@ func TestAnUploadWithNoSlugIsNotRepresigned(t *testing.T) {
 		t.Errorf("calls = %v, want the one attempt and no represign", got)
 	}
 }
+
+// A registry that ignores `visibility` accepts the declare and answers without
+// it, which is a silent downgrade to public — and the bytes have not moved yet,
+// which makes this the last moment the downgrade can be refused rather than
+// discovered on a CDN.
+func TestPushRefusesToUploadWhenTheVisibilityWasNotApplied(t *testing.T) {
+	var uploaded bool
+	var uploadTarget string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Object storage, which is the only PUT that means the bytes moved.
+		if r.URL.Path == "/bytes" {
+			uploaded = true
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		// An older registry: it takes the declare and the finalize and says
+		// nothing about visibility either time, so the artifact it made is
+		// public whatever was asked for.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"slug":"art_1","state":"pending",
+			"upload":{"method":"PUT","url":"`+uploadTarget+`","headers":{}}}`)
+	}))
+	defer server.Close()
+	uploadTarget = server.URL + "/bytes"
+
+	client, _ := testClient(server)
+	_, err := client.Push(context.Background(), Spec{
+		Path: "shot.png", Filename: "shot.png", ContentType: "image/png",
+		ByteSize: 5, Visibility: VisibilityPrivate,
+	})
+	if err == nil {
+		t.Fatal("Push succeeded against a registry that ignored the visibility")
+	}
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code() != "visibility_not_applied" {
+		t.Fatalf("err = %v, want visibility_not_applied", err)
+	}
+	if uploaded {
+		t.Error("the bytes were uploaded anyway, which is the downgrade this refusal exists to stop")
+	}
+	if fix := apiErr.Fix(); !strings.Contains(fix, "Nothing was uploaded") {
+		t.Errorf("fix = %q, want it to say the bytes did not move", fix)
+	}
+
+	// A push that named no visibility is not held to anything: it takes whatever
+	// default the registry applies, which is the point of leaving it unnamed. It
+	// needs a real file, because it gets as far as sending the bytes — which is
+	// itself the proof that the refusal above stopped short of doing so.
+	path := filepath.Join(t.TempDir(), "shot.png")
+	if err := os.WriteFile(path, []byte("bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Push(context.Background(), Spec{
+		Path: path, Filename: "shot.png", ContentType: "image/png", ByteSize: 5,
+	}); err != nil {
+		t.Errorf("a push naming no visibility failed: %v", err)
+	}
+	if !uploaded {
+		t.Error("the unflagged push never sent its bytes, so this proves nothing about the refusal")
+	}
+}
+
+// Public and Private are two questions, not one negated. `shared` is defined as
+// the visibility whose card a keyless holder of the link does see, so a build
+// that has not heard of it must answer no to both rather than calling it
+// private — understating who can read an artifact is the dangerous way to be
+// wrong about a privacy feature.
+func TestAnUnrecognisedVisibilityIsNeitherPublicNorPrivate(t *testing.T) {
+	for visibility, want := range map[string][2]bool{
+		"":        {true, false}, // an older registry, which is to say public
+		"public":  {true, false},
+		"private": {false, true},
+		"shared":  {false, false},
+		"newer":   {false, false},
+	} {
+		a := &Artifact{Visibility: visibility}
+		if got := [2]bool{a.Public(), a.Private()}; got != want {
+			t.Errorf("%q: public/private = %v, want %v", visibility, got, want)
+		}
+	}
+}

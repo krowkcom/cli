@@ -104,6 +104,11 @@ UPLOAD FLAGS
                          block for ` + "`github`" + `, ` + "`linear`" + ` and the like, the bare link for
                          the ones that unfurl it themselves, like ` + "`slack`" + `. A tool
                          krowk has not been told about gets the block
+  --private              Upload where only this workspace can read it. The
+                         image still embeds anywhere — its byte URL is the
+                         capability — but the card opens only for a signed-in
+                         member, reads as not found to everyone else, and
+                         unfurls nowhere. Needs an API key
   --session <id>         Override the detected agent session
   --repo <owner/name>    Override the detected repository
   --commit <sha>         Override the detected commit
@@ -214,6 +219,7 @@ type flags struct {
 	metadata    stringSlice
 	caption     stringSlice
 	destination string
+	private     bool
 	session     string
 	title       string
 	repo        string
@@ -323,6 +329,7 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.Var(&f.metadata, "metadata", "")
 	fs.Var(&f.caption, "caption", "")
 	fs.StringVar(&f.destination, "destination", "", "")
+	fs.BoolVar(&f.private, "private", false, "")
 	fs.StringVar(&f.session, "session", "", "")
 	fs.StringVar(&f.title, "title", "", "")
 	fs.StringVar(&f.repo, "repo", "", "")
@@ -763,6 +770,13 @@ func upload(w, progress io.Writer, files []string, f flags, format output.Format
 	if err != nil {
 		return err
 	}
+	// Before the run is opened and before a single byte is declared: a keyless
+	// --private push cannot be given what it asked for, and the one outcome to
+	// head off is publishing the file anyway. The registry refuses it too, under
+	// this same code — this only spares the round trip and the orphan run.
+	if f.private && !client.Authenticated() {
+		return api.PrivateNeedsKey()
+	}
 	ctx := context.Background()
 
 	result := output.Result{Title: f.title}
@@ -790,6 +804,12 @@ func upload(w, progress io.Writer, files []string, f flags, format output.Format
 
 	for i, spec := range specs {
 		spec.Run = runSlug
+		// Named only when it is asked for, so an unnamed push takes whatever
+		// default the registry — and one day the workspace — applies, rather
+		// than this client pinning public on every upload it makes.
+		if f.private {
+			spec.Visibility = api.VisibilityPrivate
+		}
 		if authenticated {
 			spec.Metadata = stamp.WithExtras(withCaption(extras, captions, i))
 		}
@@ -817,6 +837,13 @@ func upload(w, progress io.Writer, files []string, f flags, format output.Format
 	// spinner and the result share a terminal, and a frame written after the
 	// first line of the result would sit on top of it.
 	spin.Stop()
+
+	// On stderr, and after the spinner has cleared: what goes to stdout here is
+	// meant to be captured and pasted, so a warning belongs on the other stream
+	// or it ends up inside the paste.
+	if warning := output.UnfurlWarning(result, format, f.destination); warning != "" {
+		fmt.Fprintln(progress, "! "+warning)
+	}
 
 	if f.destination != "" {
 		return emit(w, output.Destination(result, f.destination), f)

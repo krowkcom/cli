@@ -178,6 +178,41 @@ func (c *Client) Insecure() bool {
 	return err == nil && u.Scheme == "http"
 }
 
+// The visibilities this client declares and reads. They are names rather than a
+// flag on purpose: `shared` exists in the registry's enum and is not declarable
+// yet, so a reader that branches on the name keeps working when it arrives,
+// where one reading a boolean would have to be changed on the same day.
+//
+// What they mean is canon's (glossary.md -> Visibility), and only two of them
+// concern a client today:
+//
+//   - public   the bytes are on the CDN, the metadata reads keyless by slug,
+//     and the card page unfurls. Every artifact before visibility existed.
+//   - private  workspace-only metadata: a keyless read, or a key from another
+//     workspace, is answered 404 — existence itself is private. The bytes stay
+//     embeddable, at a CDN URL whose secret path segment is the whole of the
+//     authorization, so an image still renders in a PR comment. The card page
+//     behind it is served by the app to a signed-in member and unfurls nowhere.
+const (
+	VisibilityPublic  = "public"
+	VisibilityPrivate = "private"
+)
+
+// PrivateNeedsKey is the refusal a private upload with no key gets. Raised
+// before anything is sent, because there is nothing to send: a keyless upload
+// lands in the one shared anonymous workspace, so there is no membership for it
+// to be private to, and the registry answers the same refusal under the same
+// code. Built here so both front doors — the CLI's --private and the MCP
+// server's `private` — refuse in the same words as each other; the registry's
+// own wording differs, because the fix it names is a header where the fix here
+// is a command.
+func PrivateNeedsKey() *Error {
+	return Fail("private_needs_key",
+		"a private upload needs an API key: a keyless upload lands in the shared anonymous "+
+			"workspace, which nobody is a member of, so there is nothing for it to be private to — "+
+			"run `krowk auth login`, or push it public")
+}
+
 // Upload is where the bytes go, signed for one specific body.
 type Upload struct {
 	Method    string            `json:"method"`
@@ -209,6 +244,10 @@ type Artifact struct {
 	Checksum    string       `json:"checksum,omitempty"`
 	Region      string       `json:"region,omitempty"`
 	Run         *ArtifactRun `json:"run,omitempty"`
+	// Visibility is who may read this artifact — see the constants above. Empty
+	// where a registry predating the field answered, which Public reads as the
+	// behaviour every artifact had then.
+	Visibility string `json:"visibility,omitempty"`
 	// URL is the card page, krowk.com/a/{slug}: the link to paste. It is what
 	// unfurls into a preview card, and it stays a link to the artifact rather
 	// than to whatever object storage happens to be serving the bytes.
@@ -273,6 +312,34 @@ func (p *Paste) FormFor(destination string) string {
 		return form
 	}
 	return p.Destinations["_default"]
+}
+
+// Public reports whether this artifact is the open kind: readable by slug,
+// unfurling wherever its link is pasted. Everything that decides what to
+// promise about a link asks here, so an unset visibility — an older registry —
+// reads as public in one place rather than in each of them.
+func (a *Artifact) Public() bool {
+	return a == nil || a.Visibility == "" || a.Visibility == VisibilityPublic
+}
+
+// Private reports the one non-public visibility this build knows how to
+// describe. It is deliberately not `!Public()`: `shared` is defined as the
+// visibility whose card a keyless holder of the link *does* see, so a build
+// that has not heard of it must not tell somebody their link is workspace-only.
+// Understating who can read an artifact is the dangerous way to be wrong about
+// a privacy feature, and it is the way a two-way split gets it wrong.
+func (a *Artifact) Private() bool {
+	return a != nil && a.Visibility == VisibilityPrivate
+}
+
+// visibilityAnswered is what to call what came back, for a refusal that has to
+// name it: the visibility the registry reported, or the fact that it reported
+// none — which is what an older registry does and is the likelier of the two.
+func visibilityAnswered(a *Artifact) string {
+	if a.Visibility == "" {
+		return "no visibility at all"
+	}
+	return a.Visibility
 }
 
 // RunSlug names the run this artifact belongs to, or "" when it belongs to
@@ -525,6 +592,10 @@ type Spec struct {
 	ByteSize    int64  `json:"byte_size"`
 	Checksum    string `json:"checksum"`
 	Run         string `json:"run,omitempty"`
+	// Visibility is what this upload declares itself to be. Omitted when it is
+	// not named, so the registry applies its own default rather than this client
+	// pinning one — a workspace default is the registry's to decide.
+	Visibility string `json:"visibility,omitempty"`
 	// Metadata is the artifact's own production record — stamped at the moment
 	// this file is pushed, so it travels with the artifact wherever it is
 	// claimed or attached. Metadata is public: the card page is keyless.
@@ -590,6 +661,21 @@ func (c *Client) Push(ctx context.Context, spec Spec) (*Artifact, error) {
 	prepared, err := c.PrepareArtifact(ctx, spec)
 	if err != nil {
 		return nil, err
+	}
+
+	// Checked before the bytes move, and this is the only moment it can be:
+	// after the PUT the file is on a CDN, and a registry that ignored the field
+	// has published exactly what the caller asked to keep in. A registry
+	// predating `visibility` accepts the declare and answers without it, which
+	// is a silent downgrade to public — the one failure the whole flag exists to
+	// prevent. Nothing is uploaded, so the artifact it made is a pending row
+	// that expires on its own.
+	if spec.Visibility != "" && prepared.Visibility != spec.Visibility {
+		return nil, Fail("visibility_not_applied",
+			"this registry did not apply the visibility the upload asked for — declared "+
+				spec.Visibility+", got "+visibilityAnswered(prepared)+
+				". Nothing was uploaded. Check KROWK_API_URL points at a registry that "+
+				"supports private artifacts, or push it public")
 	}
 
 	if err := c.PutBytes(ctx, prepared, spec); err != nil {

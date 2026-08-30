@@ -194,6 +194,7 @@ type artifact struct {
 	URL        string `json:"url"`
 	FileURL    string `json:"file_url"`
 	Markdown   string `json:"markdown"`
+	Visibility string `json:"visibility"`
 	ExpiresAt  string `json:"expires_at"`
 	ClaimToken string `json:"claim_token"`
 
@@ -799,15 +800,38 @@ func TestUploadsShowReadsAnArtifactBack(t *testing.T) {
 	}
 }
 
-// A slug is not a capability across workspaces: another key must not be able to
-// read an artifact by guessing at it.
-func TestUploadsShowIsScopedToTheKey(t *testing.T) {
+// Who a slug is a capability for, which is a different answer per visibility.
+//
+// A public artifact reads for anyone holding its slug, in no workspace's scope
+// and whether or not a key is sent: the card page fetches keylessly and the
+// bytes are on the CDN regardless, so a scope another key could escape by
+// dropping its Authorization header would protect nothing — it would only make
+// holding a key show less than holding none.
+//
+// A private one is where the scope does protect something. Its bytes are behind
+// a capability URL, but its filename, size and run metadata are not, and those
+// are what this read discloses. So it answers its own workspace and answers
+// everyone else as missing rather than as forbidden: forbidden would confirm
+// the artifact is there, and existence itself is what private keeps.
+func TestAPrivateSlugIsNotACapabilityAndAPublicOneIs(t *testing.T) {
 	h := newHarness(t, 0)
-	pushed := only(t, h.ok("push", h.fixture))
+	open := only(t, h.ok("push", h.fixture))
+	shut := only(t, h.ok("push", h.fixture, "--private"))
 
 	h.env["KROWK_TOKEN"] = "krowk_sk_someone_else"
-	if got := h.fails("uploads", "show", pushed.Slug)["error"]; got != "not_found" {
-		t.Errorf("another key read it: %v", got)
+	if shown := only(t, h.ok("uploads", "show", open.Slug)); shown.Slug != open.Slug {
+		t.Errorf("another key read the public artifact as %+v, want it served", shown)
+	}
+	if got := h.fails("uploads", "show", shut.Slug)["error"]; got != "not_found" {
+		t.Errorf("another key read the private artifact: %v", got)
+	}
+
+	delete(h.env, "KROWK_TOKEN")
+	if shown := only(t, h.ok("uploads", "show", open.Slug)); shown.Slug != open.Slug {
+		t.Errorf("a keyless read of the public artifact gave %+v, want it served", shown)
+	}
+	if got := h.fails("uploads", "show", shut.Slug)["error"]; got != "not_found" {
+		t.Errorf("a keyless read of the private artifact: %v", got)
 	}
 }
 
@@ -2607,5 +2631,106 @@ func TestNoPasteFormIsComposedInTheCLI(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// --private is the whole of the flag's job: the artifact comes back private,
+// and the human line says so — an upload that reads differently from every
+// other one is worth a word, and the word is the registry's own so a visibility
+// this build has never heard of still reaches the person reading.
+func TestPrivatePushDeclaresAndReportsTheVisibility(t *testing.T) {
+	h := newHarness(t, 0)
+
+	pushed := only(t, h.ok("push", h.fixture, "--private"))
+	if pushed.Visibility != "private" {
+		t.Errorf("visibility = %q, want private", pushed.Visibility)
+	}
+	if open := only(t, h.ok("push", h.fixture)); open.Visibility != "public" {
+		t.Errorf("an unflagged push came back %q, want public", open.Visibility)
+	}
+
+	_, stdout, _ := h.runOn(true, "push", h.fixture, "--private")
+	if !strings.Contains(stdout, "private") {
+		t.Errorf("human output never says the upload is private:\n%s", stdout)
+	}
+}
+
+// The breadcrumb is advice about what to do with the link, so it has to know
+// who can open it. "Hand this on — it is public" for a link that answers
+// everyone outside the workspace as not found is the one sentence here worth
+// getting right.
+func TestThePrivateShareCrumbDoesNotCallTheLinkPublic(t *testing.T) {
+	h := newHarness(t, 0)
+
+	for _, crumb := range h.ok("push", h.fixture, "--private").Breadcrumbs {
+		if crumb.Action != "share" {
+			continue
+		}
+		if strings.Contains(crumb.Description, "it is public") {
+			t.Errorf("share crumb calls a private link public: %q", crumb.Description)
+		}
+		if !strings.Contains(crumb.Description, "sign in") {
+			t.Errorf("share crumb never says the card asks for a sign-in: %q", crumb.Description)
+		}
+		return
+	}
+	t.Fatal("no share breadcrumb on a private push")
+}
+
+// Refused before anything is sent, because there is nothing to send: a keyless
+// upload lands in the shared anonymous workspace, which nobody is a member of.
+// The one outcome to head off is publishing the file anyway — an agent told
+// afterwards that its --private was dropped has already published it.
+func TestAKeylessPrivatePushIsRefusedRatherThanPublished(t *testing.T) {
+	h := newHarness(t, 0).anonymous()
+
+	failure := h.failsWith(exitRefused, "push", h.fixture, "--private")
+	if failure["error"] != "private_needs_key" {
+		t.Fatalf("error = %v, want private_needs_key", failure)
+	}
+	if fix, _ := failure["fix"].(string); !strings.Contains(fix, "API key") {
+		t.Errorf("fix = %q, want it to name the key", fix)
+	}
+
+	// And nothing reached the registry: a refusal that had already uploaded the
+	// file would be the failure this check exists to catch.
+	h.env["KROWK_TOKEN"] = "krowk_sk_test"
+	if listed := h.ok("uploads", "list").Data.Artifacts; len(listed) != 0 {
+		t.Errorf("the refused push left %d artifacts behind", len(listed))
+	}
+}
+
+// The bare-link forms are the ones that exist to be unfurled, and a private
+// card unfurls nowhere. Printing one with nothing said would be exactly the
+// promise the labels elsewhere stopped making — so it is said, on stderr, where
+// it cannot end up inside what was about to be pasted.
+func TestABarePrivateLinkWarnsOnStderrAndNotInThePaste(t *testing.T) {
+	h := newHarness(t, 0)
+
+	for _, args := range [][]string{
+		{"push", h.fixture, "--private", "--format", "url"},
+		{"push", h.fixture, "--private", "--destination", "slack"},
+	} {
+		code, stdout, stderr := h.run(args...)
+		if code != 0 {
+			h.t.Fatalf("`krowk %s` exited %d: %s", strings.Join(args, " "), code, stderr)
+		}
+		if !strings.Contains(stderr, "does not unfurl") {
+			t.Errorf("`krowk %s` printed a bare private link with no warning, stderr:\n%s",
+				strings.Join(args, " "), stderr)
+		}
+		if strings.Contains(stdout, "unfurl") {
+			t.Errorf("`krowk %s` put the warning in what gets pasted:\n%s",
+				strings.Join(args, " "), stdout)
+		}
+	}
+
+	// The markdown form still shows the image, so it is not warned about — and
+	// neither is a public push, whose link does exactly what the form promises.
+	if _, _, stderr := h.run("push", h.fixture, "--private", "--destination", "github"); strings.Contains(stderr, "unfurl") {
+		t.Errorf("the markdown form was warned about:\n%s", stderr)
+	}
+	if _, _, stderr := h.run("push", h.fixture, "--format", "url"); strings.Contains(stderr, "unfurl") {
+		t.Errorf("a public bare link was warned about:\n%s", stderr)
 	}
 }

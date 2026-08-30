@@ -9,6 +9,77 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Added
+
+- `krowk push --private` uploads where only your workspace can read it, and
+  `krowk_push` takes `private: true` for the same thing. The image still embeds
+  anywhere: a private artifact's bytes sit on the CDN under a key whose secret
+  segment is the whole of the authorization, which is what lets GitHub, Jira or
+  Slack — fetching an embed server-side and anonymously, carrying nobody's
+  session — render it at all. What changes is the card. `krowk.com/a/{slug}`
+  opens only for a signed-in workspace member and answers everyone else exactly
+  as it answers a slug that was never minted, and the API read is gated the same
+  way, so nothing unfurls a private link.
+
+  It needs an API key and is refused rather than published without one: a
+  keyless upload lands in the shared anonymous workspace, which nobody is a
+  member of, so there is nothing for it to be private to. The refusal comes
+  before anything is sent — an agent told afterwards that its `--private` was
+  dropped would have already published the file.
+
+- Every artifact now reports its own `visibility`, on every read, as a name
+  rather than a flag. A visibility this build has not heard of — `shared`, when
+  it lands — is described by name and promised nothing, rather than being
+  described as private: `shared` is the visibility whose card a keyless holder
+  of the link *does* see, and telling somebody their link is workspace-only when
+  it is not is the dangerous way to be wrong about a privacy feature.
+
+- A push that asks for a visibility now checks it was applied before it sends
+  the bytes. A registry predating the field accepts the declare and answers
+  without it, which is a silent downgrade to public — and once the bytes are on
+  a CDN there is nothing left to refuse. Nothing is uploaded, and the artifact
+  the declare made is a pending row that expires on its own.
+
+### Changed
+
+- The paste labels stop promising what a private card cannot do. `Paste into
+  Slack, Basecamp — they unfurl the link themselves` is true of a public
+  artifact and false of a private one, so a private push is labelled for the
+  audience that can actually open it, and the breadcrumb that used to say "hand
+  this link on — it is public and needs no key to read" says who it opens for
+  instead. The markdown label still promises the image, because the image still
+  renders. Human output names the visibility beside the size when it is not the
+  public default, and `krowk uploads list` names it per row.
+
+- `--format url`, and any `--destination` the registry's table says wants the
+  bare link, warn on stderr when what they printed is a private card. That form
+  exists to be unfurled and a private card unfurls nowhere, so
+  printing one silently would be the same broken promise in a different place.
+  The warning is on stderr rather than in the output, because the output is
+  about to be pasted.
+
+- The bundled stand-in registry (`go run ./internal/devregistry`) enforces the
+  same contract, so a client developed against it behaves the same in
+  production: visibility is declared, validated and served; a private artifact's
+  metadata answers its own workspace and answers everyone else `404`; its card
+  page is indistinguishable from a slug that never existed; its byte URL names
+  neither the workspace nor the artifact; and `PUT /v1/artifacts/{slug}/visibility`
+  moves an artifact between public and private, re-keying the bytes and killing
+  the old URL in both directions.
+
+  One behaviour it had wrong is fixed with it: a **public** artifact's metadata
+  read is now scoped to no workspace, keyed or not — matching the registry,
+  where a scope a reader escapes by dropping the `Authorization` header would
+  protect nothing.
+
+  Its `Idempotency-Key` digest is also now taken over the declared artifact as
+  an object — the permitted parameters, canonicalized with keys sorted at every
+  level — rather than over a list of fields somebody had to remember to extend,
+  which is how `metadata` had fallen out of it. Two things follow that a field
+  list could not express: a parameter left out stays distinct from one sent
+  empty, and a client that re-serialized its own body between attempts gets its
+  first answer back rather than a second artifact.
+
 ## [0.8.2] - 2026-08-29
 
 ### Added

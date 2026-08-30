@@ -341,7 +341,7 @@ func TestJSONEnvelopeCarriesBothPasteForms(t *testing.T) {
 // there is a blue anchor. Slack is where that link becomes a card, and Slack
 // takes the url form. So the label stays "no preview to embed".
 func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
-	image := PasteOf(&api.Artifact{
+	imageArtifact := &api.Artifact{
 		Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
 		URL: "https://krowk.com/a/art_2e1d", FileURL: "https://cdn.krowk.com/ws_9f3c/art_2e1d/shot.png",
 		Paste: &api.Paste{
@@ -349,22 +349,24 @@ func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
 				"(https://krowk.com/a/art_2e1d)\nshot.png · [View preview ↗](https://krowk.com/a/art_2e1d)",
 			URL: "https://krowk.com/a/art_2e1d",
 		},
-	})
+	}
+	image := PasteOf(imageArtifact)
 	if !strings.Contains(image.Markdown, "![") {
 		t.Fatalf("markdown = %q, want an image embed", image.Markdown)
 	}
-	if got := MarkdownSurfacesFor(image); got != EmbedSurfaces {
+	if got := MarkdownSurfacesFor(imageArtifact); got != EmbedSurfaces {
 		t.Errorf("image label = %q, want %q", got, EmbedSurfaces)
 	}
 
-	log := PasteOf(&api.Artifact{
+	logArtifact := &api.Artifact{
 		Slug: "art_9f3c", Filename: "build.log", ContentType: "text/plain",
 		URL: "https://krowk.com/a/art_9f3c", FileURL: "https://cdn.krowk.com/ws_9f3c/art_9f3c/build.log",
 		Paste: &api.Paste{
 			Markdown: "**build.log** · [View preview ↗](https://krowk.com/a/art_9f3c)",
 			URL:      "https://krowk.com/a/art_9f3c",
 		},
-	})
+	}
+	log := PasteOf(logArtifact)
 	if strings.Contains(log.Markdown, "![") {
 		t.Fatalf("markdown = %q, want a plain link when there is nothing to embed", log.Markdown)
 	}
@@ -374,8 +376,30 @@ func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
 	if !strings.Contains(log.Markdown, "(https://krowk.com/a/art_9f3c)") {
 		t.Errorf("markdown = %q, want it to link to the card page", log.Markdown)
 	}
-	if got := MarkdownSurfacesFor(log); got != PlainSurfaces {
+	if got := MarkdownSurfacesFor(logArtifact); got != PlainSurfaces {
 		t.Errorf("plain-link label = %q, want %q", got, PlainSurfaces)
+	}
+
+	// The same two forms for a private artifact promise something else. The
+	// image still renders — its byte URL is the capability, and an unfurl bot
+	// fetching anonymously is exactly who it was drawn for — but every label
+	// that named a destination's preview card has to stop, because the card is
+	// served by the app to a signed-in member and answers everyone else as
+	// though the slug had never been minted.
+	if got := LinkSurfacesFor(imageArtifact); got != LinkSurfaces {
+		t.Errorf("public link label = %q, want %q", got, LinkSurfaces)
+	}
+
+	imageArtifact.Visibility = api.VisibilityPrivate
+	logArtifact.Visibility = api.VisibilityPrivate
+	if got := MarkdownSurfacesFor(imageArtifact); got != PrivateEmbedSurfaces {
+		t.Errorf("private image label = %q, want %q", got, PrivateEmbedSurfaces)
+	}
+	if got := MarkdownSurfacesFor(logArtifact); got != PrivatePlainSurfaces {
+		t.Errorf("private plain-link label = %q, want %q", got, PrivatePlainSurfaces)
+	}
+	if got := LinkSurfacesFor(imageArtifact); got != PrivateLinkSurfaces {
+		t.Errorf("private link label = %q, want %q", got, PrivateLinkSurfaces)
 	}
 }
 
@@ -813,5 +837,43 @@ func TestARunLabelIsClippedOnceWhateverItIsBuiltFrom(t *testing.T) {
 	}
 	if n := len([]rune(got)); n > maxLabelRunes+1 {
 		t.Errorf("multi-byte label is %d runes, want at most %d plus the ellipsis", n, maxLabelRunes)
+	}
+}
+
+// A visibility this build has never heard of is described by name and promised
+// nothing. The next one to arrive is `shared` — the visibility whose card a
+// keyless holder of the link *does* see — so calling it private would tell
+// somebody their link is workspace-only when it is not. Understating who can
+// read an artifact is the dangerous way to be wrong about a privacy feature.
+func TestAnUnknownVisibilityIsNeverDescribedAsPrivate(t *testing.T) {
+	a := &api.Artifact{
+		Slug: "art_2e1d", Filename: "report.html", ContentType: "text/html",
+		Visibility: "shared",
+		URL:        "https://krowk.com/a/art_2e1d",
+		Paste: &api.Paste{
+			Markdown: "**report.html** · [View preview ↗](https://krowk.com/a/art_2e1d)",
+			URL:      "https://krowk.com/a/art_2e1d",
+		},
+	}
+
+	said := []string{
+		MarkdownSurfacesFor(a),
+		LinkSurfacesFor(a),
+		shareCrumb(a).Description,
+		UnfurlWarning(Result{Artifacts: []*api.Artifact{a}}, URL, ""),
+	}
+	for _, line := range said {
+		if line == "" {
+			t.Error("an unknown visibility went undescribed where a private one would not")
+		}
+		if strings.Contains(line, "workspace member") || strings.Contains(line, "signed-in") {
+			t.Errorf("an unknown visibility was described as private: %q", line)
+		}
+		if strings.Contains(line, "Slack") || strings.Contains(line, "unfurl the link themselves") {
+			t.Errorf("an unknown visibility was promised an unfurl: %q", line)
+		}
+		if !strings.Contains(line, "shared") {
+			t.Errorf("the visibility that came back is not named: %q", line)
+		}
 	}
 }

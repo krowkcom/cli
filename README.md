@@ -63,7 +63,15 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 
 Wherever a command takes `<artifact>`, `<run>` or `--run`, it takes the link as readily as the slug: paste `https://krowk.com/a/art_…` or the CDN URL under it, and the slug is read out of it.
 
-Push flags: `--run`, `--pull-request`, `--link <url>` (repeatable, with `--link-title` / `--link-rel` describing the `--link` before them), `--reference` (repeatable, for identifiers that are not URLs), `--session`, `--title`, `--caption` (repeatable), `--destination <tool>`, `--metadata key=value` (repeatable), plus `--repo` / `--commit` / `--agent` to override detection. Without a key, uploads land anonymously, expire in 24 hours and return a one-shot claim token.
+Push flags: `--run`, `--pull-request`, `--link <url>` (repeatable, with `--link-title` / `--link-rel` describing the `--link` before them), `--reference` (repeatable, for identifiers that are not URLs), `--session`, `--title`, `--caption` (repeatable), `--destination <tool>`, `--private`, `--metadata key=value` (repeatable), plus `--repo` / `--commit` / `--agent` to override detection. Without a key, uploads land anonymously, expire in 24 hours and return a one-shot claim token.
+
+### Private uploads
+
+`krowk push shot.png --private` uploads where only your workspace can read it. The image still embeds anywhere — a private artifact's bytes sit on the CDN under a key whose secret segment is the whole of the authorization, which is what lets an unfurl bot, carrying nobody's session, render it in a PR comment at all. What changes is the card: `krowk.com/a/{slug}` opens only for a signed-in workspace member and answers everyone else exactly as it answers a slug that was never minted, so nothing unfurls it. The API read is gated the same way.
+
+It needs an API key — a keyless upload lands in the shared anonymous workspace, which nobody is a member of, so there is nothing for it to be private to — and it is refused rather than published without one. Every artifact reports its own `visibility`, and krowk's paste labels stop promising a preview for a card no destination can fetch.
+
+Switching an artifact's visibility later — from the dashboard, or `PUT /v1/artifacts/:slug/visibility`; krowk has no command for it yet — re-keys its bytes and withdraws the URL they were under. The slug never changes, so the card link that was pasted is always the card link. The byte URL is not symmetric: a private key is a fresh random secret each time, so an embed built on one dies for good when the artifact moves, while a public key is derived from the workspace and the slug rather than drawn — republishing an artifact that has not changed hands puts the bytes back at exactly the URL privatizing took away.
 
 ### Metadata
 
@@ -156,7 +164,7 @@ The agent skill at [`skills/krowk/SKILL.md`](skills/krowk/SKILL.md) teaches an a
 }
 ```
 
-Tools: `krowk_push`, `krowk_list_artifacts`, `krowk_get_artifact`, `krowk_claim_artifact`, `krowk_get_run`, `krowk_verify_key`. Every result carries both paste forms, labelled by destination. `krowk_push` is confined to a root directory and refuses credential files (`.env*`, keys, `.ssh` and friends) wherever they sit, so a prompt-injected path cannot turn it into an exfiltration channel.
+Tools: `krowk_push`, `krowk_list_artifacts`, `krowk_get_artifact`, `krowk_claim_artifact`, `krowk_get_run`, `krowk_verify_key`. Every result carries both paste forms, labelled by destination — and labelled honestly for a private artifact, whose image embeds but whose card unfurls nowhere. `krowk_push` takes `private: true` for the same upload `--private` makes. `krowk_push` is confined to a root directory and refuses credential files (`.env*`, keys, `.ssh` and friends) wherever they sit, so a prompt-injected path cannot turn it into an exfiltration channel.
 
 ## Configuration
 

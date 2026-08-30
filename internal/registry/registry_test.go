@@ -1914,3 +1914,612 @@ func TestPasteCarriesTheDestinationTable(t *testing.T) {
 		}
 	}
 }
+
+// ---- visibility ----------------------------------------------------------
+
+// declareVisible posts an artifact that names its visibility, which the plain
+// declare helper deliberately does not: an unnamed visibility is the default
+// path, and every other test here wants that one.
+func declareVisible(t *testing.T, server *httptest.Server, token, visibility, filename, body string) (int, map[string]any) {
+	t.Helper()
+	return request(t, http.MethodPost, server.URL+"/v1/artifacts", token, "application/json",
+		fmt.Sprintf(`{"artifact":{"filename":%q,"content_type":"text/plain","byte_size":%d,"visibility":%q}}`,
+			filename, len(body), visibility))
+}
+
+// pushed declares, uploads and finalizes one artifact at the given visibility,
+// which is the only state a visibility change will move.
+func pushed(t *testing.T, server *httptest.Server, token, visibility, filename, body string) map[string]any {
+	t.Helper()
+	status, payload := declareVisible(t, server, token, visibility, filename, body)
+	if status != http.StatusCreated {
+		t.Fatalf("declare = %d %v", status, payload)
+	}
+	if code := putSigned(t, payload, body); code != http.StatusOK {
+		t.Fatalf("upload = %d", code)
+	}
+	status, final := finalize(t, server, token, payload)
+	if status != http.StatusOK {
+		t.Fatalf("finalize = %d %v", status, final)
+	}
+	return final
+}
+
+func setVisibility(t *testing.T, server *httptest.Server, token, slug, body string) (int, map[string]any) {
+	t.Helper()
+	return request(t, http.MethodPut, server.URL+"/v1/artifacts/"+slug+"/visibility",
+		token, "application/json", body)
+}
+
+func fileURLOf(t *testing.T, payload map[string]any) string {
+	t.Helper()
+	url, _ := payload["file_url"].(string)
+	if url == "" {
+		t.Fatalf("no file_url in %v", payload)
+	}
+	return url
+}
+
+// Visibility is serialized on every read, as a name rather than as a flag: a
+// client branching on the word keeps working when `shared` arrives, where one
+// reading a boolean would have to change on the same day. Unnamed means public,
+// which is what every artifact was before visibility existed.
+func TestVisibilityIsDeclaredAndServedOnEveryRead(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	if got := declare(t, server, key, "shot.png", "bytes")["visibility"]; got != "public" {
+		t.Errorf("unnamed visibility = %v, want public", got)
+	}
+
+	status, private := declareVisible(t, server, key, "private", "secret.txt", "bytes")
+	if status != http.StatusCreated {
+		t.Fatalf("private declare = %d %v", status, private)
+	}
+	if got := private["visibility"]; got != "private" {
+		t.Errorf("declared private, read back %v", got)
+	}
+
+	slug, _ := private["slug"].(string)
+	_, read := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, key, "", "")
+	if got := read["visibility"]; got != "private" {
+		t.Errorf("read back = %v, want private", got)
+	}
+}
+
+// `shared` is a real value below the API in the registry and is refused at it
+// until it has a revocation contract, so a stand-in that accepted the word
+// would let a client pass here and fail in production. Anything else is refused
+// the same way rather than quietly downgraded to public: the client asked for
+// bytes not to be public and would not be getting that.
+func TestAVisibilityTheAPIDoesNotTakeIsRefusedRatherThanDowngraded(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	for _, asked := range []string{"shared", "secret", "PUBLIC"} {
+		status, payload := declareVisible(t, server, "krowk_sk_owner", asked, "shot.png", "bytes")
+		if status != http.StatusUnprocessableEntity || errorCode(payload) != "visibility_unavailable" {
+			t.Errorf("declared %q = %d %s, want 422 visibility_unavailable",
+				asked, status, errorCode(payload))
+		}
+	}
+}
+
+// A keyless upload lands in the one shared anonymous workspace, which nobody is
+// a member of, so there is no membership for a private artifact to be private
+// to. Refused rather than published as public: the client asked for bytes not
+// to be readable, and answering 201 for an upload that is would look like
+// success and be the opposite of it.
+func TestAKeylessUploadCannotBePrivate(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	status, payload := declareVisible(t, server, "", "private", "secret.txt", "bytes")
+	if status != http.StatusUnprocessableEntity || errorCode(payload) != "private_needs_key" {
+		t.Fatalf("keyless private declare = %d %s, want 422 private_needs_key", status, errorCode(payload))
+	}
+	// The client's mistake here is not the word it sent: it wanted a private
+	// artifact and can have one, with a key. Told only that the request was
+	// invalid it would retry public, which is the outcome it was avoiding.
+	if message, _ := payload["error"].(map[string]any)["message"].(string); !strings.Contains(message, "API key") {
+		t.Errorf("message = %q, want it to name the key that would work", message)
+	}
+}
+
+// A private artifact's storage key is a secret and nothing else. Everyone the
+// URL reaches reads it — unfurl bots, whoever it is forwarded to, the CDN's own
+// access log — so a workspace segment there would be a join key proving two
+// forwarded links belong to one customer, and an artifact segment would be the
+// card address, confirming the existence the metadata boundary just refused to
+// confirm.
+func TestAPrivateByteURLNamesNeitherTheWorkspaceNorTheArtifact(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	private := pushed(t, server, key, "private", "secret.txt", "bytes")
+	slug, _ := private["slug"].(string)
+	fileURL := fileURLOf(t, private)
+
+	if strings.Contains(fileURL, slug) {
+		t.Errorf("private file_url %q carries the artifact slug", fileURL)
+	}
+	if strings.Contains(fileURL, workspaceFor(key)) {
+		t.Errorf("private file_url %q carries the workspace slug", fileURL)
+	}
+	// Holding it is the whole of the authorization, which is what lets a private
+	// image render in a PR comment: no vendor's unfurler carries a session, so
+	// bytes behind one are bytes nobody sees.
+	if status, body := requestText(t, fileURL); status != http.StatusOK || body != "bytes" {
+		t.Errorf("keyless fetch of the capability URL = %d %q, want the bytes", status, body)
+	}
+
+	// A public one keeps the shape it always had, so no key already written has
+	// to move and nothing that reads one has to learn a second form.
+	public := pushed(t, server, key, "public", "shot.txt", "bytes")
+	publicURL := fileURLOf(t, public)
+	publicSlug, _ := public["slug"].(string)
+	if !strings.Contains(publicURL, publicSlug) || !strings.Contains(publicURL, workspaceFor(key)) {
+		t.Errorf("public file_url = %q, want the workspace and artifact segments", publicURL)
+	}
+}
+
+// The metadata boundary, which is a different boundary from the bytes: the
+// filename, the size and the run's metadata are what this read discloses, and
+// they are not behind the capability URL. So a private artifact answers its own
+// workspace and answers everyone else as missing rather than as forbidden —
+// forbidden confirms the artifact is there, and existence itself is the secret.
+//
+// A public one is unscoped in the other direction, keyed or not: a scope a
+// reader escapes by dropping the Authorization header protects nothing, and
+// would make holding a key show less than holding none.
+func TestPrivateMetadataAnswersItsOwnWorkspaceAndNobodyElse(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const owner, stranger = "krowk_sk_owner", "krowk_sk_stranger"
+
+	private := pushed(t, server, owner, "private", "secret.txt", "bytes")
+	public := pushed(t, server, owner, "public", "shot.txt", "bytes")
+	privateSlug, _ := private["slug"].(string)
+	publicSlug, _ := public["slug"].(string)
+
+	for name, token := range map[string]string{"another key": stranger, "no key": ""} {
+		status, payload := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+privateSlug, token, "", "")
+		if status != http.StatusNotFound || errorCode(payload) != "not_found" {
+			t.Errorf("private read with %s = %d %s, want 404 not_found", name, status, errorCode(payload))
+		}
+		if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+publicSlug, token, "", ""); status != http.StatusOK {
+			t.Errorf("public read with %s = %d, want 200", name, status)
+		}
+	}
+
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+privateSlug, owner, "", ""); status != http.StatusOK {
+		t.Errorf("the owning key read its own private artifact as %d, want 200", status)
+	}
+}
+
+// A private artifact has no keyless card, and answers as though the slug had
+// never been minted — not as a tombstone, which would confirm it existed. In
+// production the website sends this reader to the app, which renders the card
+// behind the workspace session it already has; what an unfurl bot or a stranger
+// with the link gets is this.
+func TestThePrivateCardPageIsIndistinguishableFromASlugThatNeverExisted(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	private := pushed(t, server, key, "private", "secret.txt", "bytes")
+	card, _ := private["url"].(string)
+
+	status, page := requestText(t, card)
+	if status != http.StatusNotFound {
+		t.Fatalf("private card = %d, want 404", status)
+	}
+	if strings.Contains(page, "secret.txt") || strings.Contains(page, "og:image") {
+		t.Errorf("private card page named the artifact:\n%s", page)
+	}
+
+	_, missing := requestText(t, server.URL+"/a/art_nosuchartifact0000000")
+	if page != missing {
+		t.Errorf("private card page differs from a never-minted one:\n%s\n---\n%s", page, missing)
+	}
+}
+
+// Changing visibility re-keys the bytes, in both directions, because that is
+// what revocation is: nothing can un-send a URL, so withdrawing one means
+// making it resolve to nothing. Privatizing without re-keying would leave the
+// bytes exactly where the last holder of the public link left off.
+//
+// The slug never changes, so the card link that was pasted is still the card
+// link. `file_url` does not survive the round trip, and that is the design.
+func TestAVisibilityChangeRekeysTheBytesAndKillsTheOldURL(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	public := pushed(t, server, key, "public", "shot.txt", "bytes")
+	slug, _ := public["slug"].(string)
+	card, _ := public["url"].(string)
+	wasPublic := fileURLOf(t, public)
+
+	status, private := setVisibility(t, server, key, slug, `{"visibility":"private"}`)
+	if status != http.StatusOK || private["visibility"] != "private" {
+		t.Fatalf("privatize = %d %v", status, private)
+	}
+	if got, _ := private["slug"].(string); got != slug {
+		t.Errorf("slug moved to %q — the pasted card link must survive", got)
+	}
+	if got, _ := private["url"].(string); got != card {
+		t.Errorf("card url moved to %q, want %q", got, card)
+	}
+
+	nowPrivate := fileURLOf(t, private)
+	if nowPrivate == wasPublic {
+		t.Fatal("file_url survived privatization — the old URL was public, so leaving the " +
+			"bytes under it privatizes nothing")
+	}
+	if status, _ := requestText(t, wasPublic); status != http.StatusNotFound {
+		t.Errorf("the withdrawn URL still serves: %d", status)
+	}
+	if status, body := requestText(t, nowPrivate); status != http.StatusOK || body != "bytes" {
+		t.Errorf("the new capability URL = %d %q, want the bytes", status, body)
+	}
+
+	// And back. Public again means the shape a public key has always had, and
+	// the private URL dies in its turn — a re-key is a re-key whichever
+	// direction it runs in.
+	status, back := setVisibility(t, server, key, slug, `{"visibility":"public"}`)
+	if status != http.StatusOK || back["visibility"] != "public" {
+		t.Fatalf("republish = %d %v", status, back)
+	}
+	if fileURLOf(t, back) == nowPrivate {
+		t.Error("file_url survived republishing — the private key was a capability to withdraw")
+	}
+	// And it is the URL privatizing took away, not a third one. A public key is
+	// derived from the region, the workspace and the slug rather than drawn, so
+	// an artifact that has not changed hands comes back to exactly where it was
+	// — which is the half of a round trip that does survive.
+	if got := fileURLOf(t, back); got != wasPublic {
+		t.Errorf("republished file_url = %q, want the original %q", got, wasPublic)
+	}
+	if status, _ := requestText(t, nowPrivate); status != http.StatusNotFound {
+		t.Errorf("the withdrawn private URL still serves: %d", status)
+	}
+	if status, body := requestText(t, fileURLOf(t, back)); status != http.StatusOK || body != "bytes" {
+		t.Errorf("the republished URL = %d %q, want the bytes", status, body)
+	}
+}
+
+// A PUT because asking twice leaves the same state, and specifically because
+// asking twice must not re-key: a re-key withdraws a capability URL, and nobody
+// asked for that by retrying or by clicking a control that landed twice.
+func TestNamingTheVisibilityAnArtifactAlreadyHasWithdrawsNothing(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	private := pushed(t, server, key, "private", "secret.txt", "bytes")
+	slug, _ := private["slug"].(string)
+	first := fileURLOf(t, private)
+
+	status, again := setVisibility(t, server, key, slug, `{"visibility":"private"}`)
+	if status != http.StatusOK {
+		t.Fatalf("repeat = %d %v", status, again)
+	}
+	if got := fileURLOf(t, again); got != first {
+		t.Errorf("file_url = %q, want %q — a repeat is not a revocation", got, first)
+	}
+	if status, body := requestText(t, first); status != http.StatusOK || body != "bytes" {
+		t.Errorf("the URL the repeat should have left alone = %d %q", status, body)
+	}
+}
+
+// Every way a visibility change is refused. The key is required with no keyless
+// path at all — the change withdraws a URL, and a keyless caller has no
+// workspace for a private artifact to be private to — and another tenant's slug
+// reads as not existing rather than as forbidden.
+func TestTheVisibilityChangeRefusesWhatItCannotDo(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const owner, stranger = "krowk_sk_owner", "krowk_sk_stranger"
+
+	ready := pushed(t, server, owner, "public", "shot.txt", "bytes")
+	slug, _ := ready["slug"].(string)
+
+	if status, payload := setVisibility(t, server, "", slug, `{"visibility":"private"}`); status !=
+		http.StatusUnauthorized {
+		t.Errorf("keyless = %d %s, want 401", status, errorCode(payload))
+	}
+	if status, payload := setVisibility(t, server, stranger, slug, `{"visibility":"private"}`); status !=
+		http.StatusNotFound || errorCode(payload) != "not_found" {
+		t.Errorf("another workspace = %d %s, want 404 not_found", status, errorCode(payload))
+	}
+	if status, payload := setVisibility(t, server, owner, slug, `{}`); status !=
+		http.StatusBadRequest || errorCode(payload) != "parameter_missing" {
+		t.Errorf("no visibility named = %d %s, want 400 parameter_missing", status, errorCode(payload))
+	}
+	if status, payload := setVisibility(t, server, owner, slug, `{"visibility":"shared"}`); status !=
+		http.StatusUnprocessableEntity || errorCode(payload) != "visibility_unavailable" {
+		t.Errorf("shared = %d %s, want 422 visibility_unavailable", status, errorCode(payload))
+	}
+
+	// A pending artifact has no bytes anything has confirmed, so there is
+	// nothing to copy to the new key.
+	pending := declare(t, server, owner, "later.txt", "bytes")
+	pendingSlug, _ := pending["slug"].(string)
+	if status, payload := setVisibility(t, server, owner, pendingSlug, `{"visibility":"private"}`); status !=
+		http.StatusUnprocessableEntity || errorCode(payload) != "immovable" {
+		t.Errorf("pending = %d %s, want 422 immovable", status, errorCode(payload))
+	}
+
+	// A tombstone is not a visibility you can flip: the bytes are gone, and a
+	// caller deserves to be told that rather than that its slug was mistyped.
+	if status, payload := request(t, http.MethodDelete, server.URL+"/v1/artifacts/"+slug,
+		owner, "", ""); status != http.StatusNoContent {
+		t.Fatalf("takedown = %d %v", status, payload)
+	}
+	if status, payload := setVisibility(t, server, owner, slug, `{"visibility":"private"}`); status !=
+		http.StatusGone || errorCode(payload) != "taken_down" {
+		t.Errorf("tombstone = %d %s, want 410 taken_down", status, errorCode(payload))
+	}
+}
+
+// An Idempotency-Key names one attempt at one request, and the registry digests
+// the whole declared payload. So the same key sent again for a file that is now
+// private is a different request — and answering it with the public artifact
+// the first attempt made would publish exactly what the retry asked to keep in.
+func TestReusingAnIdempotencyKeyAtAnotherVisibilityIsRefused(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	declared := func(visibility string) (int, map[string]any) {
+		t.Helper()
+		return keyed(t, http.MethodPost, server.URL+"/v1/artifacts", key, "one-attempt", true,
+			fmt.Sprintf(`{"artifact":{"filename":"shot.png","content_type":"image/png",`+
+				`"byte_size":5,"visibility":%q}}`, visibility))
+	}
+
+	if status, payload := declared("public"); status != http.StatusCreated {
+		t.Fatalf("first declare = %d %v", status, payload)
+	}
+	if status, payload := declared("private"); status != http.StatusConflict ||
+		errorCode(payload) != "idempotency_key_reused" {
+		t.Errorf("same key, now private = %d %s, want 409 idempotency_key_reused",
+			status, errorCode(payload))
+	}
+
+	// And the digest is of the payload as declared, not as this stand-in
+	// resolved it: an unnamed visibility and an explicit "public" are the same
+	// artifact but not the same request, so the second is a refusal rather than
+	// a replay handing back the first attempt's artifact.
+	unnamed, first := keyed(t, http.MethodPost, server.URL+"/v1/artifacts", key, "another-attempt", true,
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5}}`)
+	if unnamed != http.StatusCreated {
+		t.Fatalf("declare with no visibility named = %d %v", unnamed, first)
+	}
+	status, payload := keyed(t, http.MethodPost, server.URL+"/v1/artifacts", key, "another-attempt", true,
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,"visibility":"public"}}`)
+	if status != http.StatusConflict || errorCode(payload) != "idempotency_key_reused" {
+		t.Errorf("same key, visibility now spelled out = %d %s, want 409 idempotency_key_reused",
+			status, errorCode(payload))
+	}
+}
+
+// Asking for the visibility an artifact already has is a no-op, and a no-op is
+// not a refusal: the registry answers it before it asks whether the artifact
+// could move at all, so a pending artifact told to stay public gets the 200 that
+// says nothing changed rather than a complaint about bytes no move would touch.
+func TestTheVisibilityAnArtifactAlreadyHasIsANoOpEvenWhenItCouldNotMove(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	pending := declare(t, server, key, "later.txt", "bytes")
+	slug, _ := pending["slug"].(string)
+
+	status, payload := setVisibility(t, server, key, slug, `{"visibility":"public"}`)
+	if status != http.StatusOK || payload["visibility"] != "public" {
+		t.Errorf("pending artifact told to stay public = %d %v, want 200", status, payload)
+	}
+	// Moving it is still refused, because that is the part with no bytes to copy.
+	if status, payload := setVisibility(t, server, key, slug, `{"visibility":"private"}`); status !=
+		http.StatusUnprocessableEntity || errorCode(payload) != "immovable" {
+		t.Errorf("pending artifact told to move = %d %s, want 422 immovable", status, errorCode(payload))
+	}
+}
+
+// Which refusal answers when more than one could. The workspace scope goes
+// first, because the registry evaluates the artifact before the parameter — and
+// because a complaint about the body would confirm the slug resolved to
+// something this caller is not allowed to know exists.
+func TestTheWorkspaceScopeAnswersBeforeTheBodyDoes(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const owner, stranger = "krowk_sk_owner", "krowk_sk_stranger"
+
+	ready := pushed(t, server, owner, "public", "shot.txt", "bytes")
+	slug, _ := ready["slug"].(string)
+
+	for name, body := range map[string]string{
+		"an undeclarable visibility": `{"visibility":"shared"}`,
+		"no visibility at all":       `{}`,
+	} {
+		if status, payload := setVisibility(t, server, stranger, slug, body); status !=
+			http.StatusNotFound || errorCode(payload) != "not_found" {
+			t.Errorf("another workspace sending %s = %d %s, want 404 not_found",
+				name, status, errorCode(payload))
+		}
+	}
+
+	// Whitespace is a visibility nobody named rather than one spelled wrong,
+	// because the registry reads the parameter through `.presence`.
+	if status, payload := setVisibility(t, server, owner, slug, `{"visibility":"   "}`); status !=
+		http.StatusBadRequest || errorCode(payload) != "parameter_missing" {
+		t.Errorf("whitespace visibility = %d %s, want 400 parameter_missing", status, errorCode(payload))
+	}
+}
+
+// An artifact parameter carrying nothing is the parameter being absent, which is
+// what the registry's `require` makes of a blank value. Answered as a missing
+// parameter rather than as a blank filename, which would send a client to fix a
+// field it never sent.
+func TestAnArtifactParameterCarryingNothingReadsAsMissing(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	for name, body := range map[string]string{
+		"absent":       `{}`,
+		"null":         `{"artifact":null}`,
+		"empty object": `{"artifact":{}}`,
+		// The registry filters to the permitted parameters before it requires
+		// one, so an object holding nothing the API reads is empty by the time
+		// the requirement is checked.
+		"only unread keys": `{"artifact":{"nonsense":1}}`,
+	} {
+		status, payload := request(t, http.MethodPost, server.URL+"/v1/artifacts",
+			"krowk_sk_owner", "application/json", body)
+		if status != http.StatusBadRequest || errorCode(payload) != "parameter_missing" {
+			t.Errorf("%s artifact = %d %s, want 400 parameter_missing",
+				name, status, errorCode(payload))
+		}
+	}
+}
+
+// `.presence` nils a blank string; it does not strip a padded one. So a
+// visibility that is only whitespace is one nobody named, while " private" is
+// one spelled wrong — and a stand-in that quietly accepted the second would let
+// a client pass here and be refused in production.
+func TestAPaddedVisibilityIsSpelledWrongRatherThanTrimmed(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	status, payload := declareVisible(t, server, key, " private", "secret.txt", "bytes")
+	if status != http.StatusUnprocessableEntity || errorCode(payload) != "visibility_unavailable" {
+		t.Errorf("declared \" private\" = %d %s, want 422 visibility_unavailable",
+			status, errorCode(payload))
+	}
+	// Whitespace alone is nothing named at all, which on a declare is the default.
+	if status, payload := declareVisible(t, server, key, "   ", "shot.txt", "bytes"); status !=
+		http.StatusCreated || payload["visibility"] != "public" {
+		t.Errorf("declared \"   \" = %d %v, want 201 public", status, payload)
+	}
+
+	ready := pushed(t, server, key, "public", "one.txt", "bytes")
+	slug, _ := ready["slug"].(string)
+	if status, payload := setVisibility(t, server, key, slug, `{"visibility":" private"}`); status !=
+		http.StatusUnprocessableEntity || errorCode(payload) != "visibility_unavailable" {
+		t.Errorf("set \" private\" = %d %s, want 422 visibility_unavailable", status, errorCode(payload))
+	}
+}
+
+// A tombstone says it was taken down and nothing else. When somebody took an
+// artifact down is their incident to know, not its reader's — and the empty
+// details is how the envelope says this error has nothing more to tell rather
+// than that its details were forgotten.
+func TestATombstoneNamesNoTimeAndCarriesAnEmptyDetails(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	ready := pushed(t, server, key, "public", "shot.txt", "bytes")
+	slug, _ := ready["slug"].(string)
+	if status, _ := request(t, http.MethodDelete, server.URL+"/v1/artifacts/"+slug, key, "", ""); status !=
+		http.StatusNoContent {
+		t.Fatalf("takedown = %d", status)
+	}
+
+	status, payload := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, key, "", "")
+	if status != http.StatusGone || errorCode(payload) != "taken_down" {
+		t.Fatalf("read back = %d %s, want 410 taken_down", status, errorCode(payload))
+	}
+	failure, _ := payload["error"].(map[string]any)
+	if message, _ := failure["message"].(string); message != slug+" was taken down" {
+		t.Errorf("message = %q, want it to name no time", message)
+	}
+	details, present := failure["details"]
+	if !present {
+		t.Fatal("no details key — an empty details is the envelope saying there is nothing more")
+	}
+	if got, ok := details.(map[string]any); !ok || len(got) != 0 {
+		t.Errorf("details = %v, want an empty object", details)
+	}
+}
+
+// What an Idempotency-Key is matched on: the declared artifact as an object,
+// canonicalized. The registry digests the permitted parameters with their keys
+// sorted at every level, so two spellings of one request are one digest and an
+// absent parameter is not the same as an empty one.
+func TestTheIdempotencyDigestIsTheDeclaredObjectCanonicalized(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	declared := func(attempt, body string) (int, map[string]any) {
+		t.Helper()
+		return keyed(t, http.MethodPost, server.URL+"/v1/artifacts", key, attempt, true, body)
+	}
+
+	// A client that re-serialized its own body between attempts sent the same
+	// request: the map order and the whitespace are not the request.
+	const first = `{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,
+		"metadata":{"b":"2","a":"1"}}}`
+	const reserialized = `{"artifact":{"metadata":{"a":"1","b":"2"},"byte_size":5,` +
+		`"content_type":"image/png","filename":"shot.png"}}`
+
+	status, made := declared("re-serialized", first)
+	if status != http.StatusCreated {
+		t.Fatalf("first declare = %d %v", status, made)
+	}
+	status, replayed := declared("re-serialized", reserialized)
+	if status != http.StatusCreated {
+		t.Fatalf("re-serialized retry = %d %v", status, replayed)
+	}
+	if replayed["slug"] != made["slug"] {
+		t.Errorf("re-serialized retry made a second artifact (%v, was %v) — the key order and "+
+			"the whitespace are not the request", replayed["slug"], made["slug"])
+	}
+
+	// A metadata key that actually changed is a different request, so the same
+	// key is a refusal rather than a replay.
+	if status, payload := declared("re-serialized",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,`+
+			`"metadata":{"a":"1","b":"3"}}}`); status != http.StatusConflict ||
+		errorCode(payload) != "idempotency_key_reused" {
+		t.Errorf("changed metadata = %d %s, want 409 idempotency_key_reused",
+			status, errorCode(payload))
+	}
+
+	// And a parameter left out is not a parameter sent empty — the registry's
+	// declared params carry the key in one and not the other.
+	if status, payload := declared("absent-or-empty",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5}}`); status !=
+		http.StatusCreated {
+		t.Fatalf("declare omitting checksum = %d %v", status, payload)
+	}
+	if status, payload := declared("absent-or-empty",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,`+
+			`"checksum":""}}`); status != http.StatusConflict ||
+		errorCode(payload) != "idempotency_key_reused" {
+		t.Errorf("retry adding an empty checksum = %d %s, want 409 idempotency_key_reused",
+			status, errorCode(payload))
+	}
+
+	// A number is the number it was written as. Unmarshalling into `any` turns
+	// every one into a float64, which collapses two integers past 2^53 into one
+	// digest — and a digest that says two different declares are one request
+	// hands the second the first one's artifact.
+	if status, payload := declared("exact-numbers",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,`+
+			`"metadata":{"n":9007199254740993}}}`); status != http.StatusCreated {
+		t.Fatalf("declare = %d %v", status, payload)
+	}
+	if status, payload := declared("exact-numbers",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,`+
+			`"metadata":{"n":9007199254740992}}}`); status != http.StatusConflict ||
+		errorCode(payload) != "idempotency_key_reused" {
+		t.Errorf("retry one apart past 2^53 = %d %s, want 409 idempotency_key_reused",
+			status, errorCode(payload))
+	}
+
+	// A parameter the API does not read cannot make two requests different: the
+	// registry digests what it permitted, not what arrived.
+	if status, payload := declared("unpermitted",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5}}`); status !=
+		http.StatusCreated {
+		t.Fatalf("declare = %d %v", status, payload)
+	}
+	status, tolerated := declared("unpermitted",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,`+
+			`"nonsense":"ignored"}}`)
+	if status != http.StatusCreated || tolerated["slug"] == nil {
+		t.Errorf("retry carrying an unread parameter = %d %v, want the first artifact back",
+			status, tolerated)
+	}
+}

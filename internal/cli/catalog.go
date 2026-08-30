@@ -109,6 +109,14 @@ func uploadFlags() []Flag {
 		{Name: "destination", Type: typeString,
 			Usage: "Print what this tool wants pasted into it, e.g. github or slack. " +
 				"A tool krowk has not been told about gets the markdown block"},
+		// A boolean rather than --visibility <name>, and it stays one: `shared`
+		// is deliberate distribution to a named outsider, with a link to revoke
+		// and rotate, so it arrives as a command of its own rather than as a
+		// third value here.
+		{Name: "private", Type: typeBool, Default: "false",
+			Usage: "Upload where only this workspace can read it. The image still embeds — " +
+				"the byte URL is the capability — but the card opens only for a signed-in " +
+				"member and unfurls nowhere. Needs an API key"},
 	}, metadataFlags()...)
 }
 

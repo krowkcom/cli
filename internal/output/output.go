@@ -53,7 +53,37 @@ const (
 	// the markdown form is only a plain link, so the label stays honest.
 	PlainSurfaces = "GitHub, Linear, Notion — plain link, no preview to embed"
 	LinkSurfaces  = "Slack, Basecamp — they unfurl the link themselves"
+
+	// The same two forms for a private artifact, where they mean something
+	// different and the public labels would be a promise krowk cannot keep.
+	//
+	// The image still renders: a private artifact's bytes sit on the CDN under a
+	// key whose secret segment is the whole of the authorization, which is what
+	// lets an unfurl bot — fetching anonymously, carrying nobody's session —
+	// load it at all. What changes is everything the *card* link promised. That
+	// page is served by the app to a signed-in workspace member, so a keyless
+	// fetch of it is answered as though the slug had never been minted: no
+	// preview card anywhere, and nothing for Slack or Basecamp to unfurl.
+	PrivateEmbedSurfaces = "GitHub, Linear, Notion — renders the image; " +
+		"the card behind it opens only for a signed-in workspace member"
+	PrivatePlainSurfaces = "GitHub, Linear, Notion — plain link to a card that opens " +
+		"only for a signed-in workspace member"
+	PrivateLinkSurfaces = "a place only workspace members read — nothing unfurls this " +
+		"link, and the card opens only after they sign in"
+
+	// And what a visibility this build has never heard of is called. It names
+	// the value and promises nothing, because the next one to arrive is
+	// `shared` — the visibility whose card a keyless holder of the link *does*
+	// see — and describing it as private would tell somebody their link is
+	// workspace-only when it is not. That is the dangerous way to be wrong.
+	UnknownSurfaces = "nowhere yet — this artifact's visibility is %q, which this krowk " +
+		"does not know how to describe. Upgrade before promising anybody anything about the link"
 )
+
+// surfacesForUnknown fills UnknownSurfaces in with the name that came back.
+func surfacesForUnknown(a *api.Artifact) string {
+	return fmt.Sprintf(UnknownSurfaces, a.Visibility)
+}
 
 // PasteOf is one artifact's forms, as the registry computed them.
 func PasteOf(a *api.Artifact) Paste {
@@ -99,11 +129,46 @@ func cardFor(a *api.Artifact) string {
 // start calling every image a plain link the day the registry changes what it
 // wraps the embed in. A label cannot counterfeit one: the escaper turns a `[`
 // in a filename into `\[`.
-func MarkdownSurfacesFor(p Paste) string {
-	if strings.Contains(p.Markdown, "![") {
-		return EmbedSurfaces
+func MarkdownSurfacesFor(a *api.Artifact) string {
+	if !a.Public() && !a.Private() {
+		return surfacesForUnknown(a)
 	}
-	return PlainSurfaces
+	switch {
+	case strings.Contains(blockFor(a), "!["):
+		if a.Public() {
+			return EmbedSurfaces
+		}
+		return PrivateEmbedSurfaces
+	case a.Public():
+		return PlainSurfaces
+	}
+	return PrivatePlainSurfaces
+}
+
+// LinkSurfacesFor is the honest label for the bare-link form. Only a public card
+// unfurls, so only a public one may be described as something to hand to Slack.
+func LinkSurfacesFor(a *api.Artifact) string {
+	switch {
+	case a.Public():
+		return LinkSurfaces
+	case a.Private():
+		return PrivateLinkSurfaces
+	}
+	return surfacesForUnknown(a)
+}
+
+// visibilityFact is what a human line says about who may read an artifact, and
+// nothing where the answer is the one every artifact used to give. Public is
+// the default and saying it on every push would be noise; anything else changes
+// where the link can be pasted, so it is said out loud.
+//
+// It reports the registry's own word rather than a translation of it, so a
+// visibility this build has never heard of still reaches the person reading.
+func visibilityFact(a *api.Artifact) string {
+	if a.Public() {
+		return ""
+	}
+	return a.Visibility
 }
 
 // Breadcrumb is one call left to make, spelled out well enough to run without
@@ -318,6 +383,43 @@ func destinationForm(r Result, destination string) string {
 	return string(Markdown)
 }
 
+// UnfurlWarning is the one line to say on stderr when what a push printed to
+// stdout is a bare card link for an artifact whose card no keyless reader may
+// open — a `--destination slack` or a `--format url` on a private push.
+//
+// A push and not every command that can print a bare link: `uploads show
+// --format url` and `uploads list --format url` are reading a field out of a
+// record, where a push with a destination is composing something to paste. The
+// warning belongs to the composing path, which is also the only one that offers
+// a destination at all.
+//
+// It is a warning rather than a refusal because the link is not useless: a
+// workspace member who clicks it signs in and sees the card. What it will not
+// do is the thing that form exists for, which is turn into a preview where it
+// is pasted, and printing it with nothing said would be the promise this whole
+// change is about not making.
+//
+// Empty where there is nothing to warn about, so the caller has one question to
+// ask rather than three.
+func UnfurlWarning(r Result, f Format, destination string) string {
+	bare := f == URL || (destination != "" && destinationForm(r, destination) == string(URL))
+	if !bare {
+		return ""
+	}
+	for _, a := range r.Artifacts {
+		switch {
+		case a.Private():
+			return a.Visibility + " card link: it does not unfurl into a preview, and it " +
+				"opens only for a signed-in workspace member. The markdown form still " +
+				"shows the image"
+		case !a.Public():
+			return a.Visibility + " card link: this krowk does not know who that reaches " +
+				"or whether it unfurls — upgrade before pasting it anywhere"
+		}
+	}
+	return ""
+}
+
 // Upload renders a successful upload.
 func Upload(r Result, f Format, quiet, colour bool, now time.Time) string {
 	switch f {
@@ -448,11 +550,28 @@ func breadcrumbs(r Result) []Breadcrumb {
 //
 // One per artifact, for the same reason the claim crumbs are: a push of three
 // files has three links, and naming only the first would leave two unshared.
+//
+// The description is the artifact's own, because "hand this on" is only good
+// advice for a link the recipient can open. A private card is served by the app
+// to a signed-in workspace member and answers everyone else as though it were
+// never minted, so the crumb says who it is worth handing to and what the
+// person on the other end will be asked for.
 func shareCrumb(a *api.Artifact) Breadcrumb {
+	description := "hand this link on — it is public and needs no key to read"
+	switch {
+	case a.Private():
+		description = "hand this link to a workspace member — it opens the card after they " +
+			"sign in to the app, and reads as not found to everyone else. The image embeds " +
+			"anywhere: its byte URL is the capability, so paste the markdown form outside the " +
+			"workspace only when the picture itself is meant to be seen"
+	case !a.Public():
+		description = "check who this link reaches before handing it on: its visibility is " +
+			a.Visibility + ", which this krowk does not know how to describe"
+	}
 	return Breadcrumb{
 		Action:      "share",
 		Cmd:         a.URL,
-		Description: "hand this link on — it is public and needs no key to read",
+		Description: description,
 	}
 }
 
@@ -506,6 +625,13 @@ func humanResult(r Result, quiet, colour bool, now time.Time) string {
 
 	// One trailing line for the facts that apply to the whole upload.
 	facts := []string{HumanBytes(r.Bytes())}
+	// Said once for the whole push, since every file of one push is declared
+	// with the same visibility, and only when it is not the public default.
+	if len(r.Artifacts) > 0 {
+		if visibility := visibilityFact(r.Artifacts[0]); visibility != "" {
+			facts = append(facts, visibility)
+		}
+	}
 	// The same run the envelope's summary names, so the two formats do not disagree
 	// about which run an upload went into — a push given --run has one recorded on
 	// its artifacts and none of its own.
@@ -644,6 +770,12 @@ func humanList(p *api.Page, l Listing, colour bool, now time.Time) string {
 		// seeing in a listing rather than having to infer from a dead link.
 		if a.State != "ready" {
 			line += paint(colour, dim, "  ("+a.State+")")
+		}
+		// Which rows are not the open kind, for the same reason the state is
+		// here: it decides what the link beside it is good for, and inferring it
+		// from a link that answers 404 for the reader is the wrong way to learn.
+		if visibility := visibilityFact(a); visibility != "" {
+			line += paint(colour, dim, "  "+visibility)
 		}
 		if expiry := friendlyExpiry(a.ExpiresAt, now); expiry != "" {
 			line += paint(colour, dim, "  "+expiry)
@@ -944,6 +1076,9 @@ func humanArtifact(a *api.Artifact, colour bool, now time.Time) string {
 	lines := []string{head, "  " + a.URL}
 
 	var facts []string
+	if visibility := visibilityFact(a); visibility != "" {
+		facts = append(facts, visibility)
+	}
 	if run := a.RunSlug(); run != "" {
 		facts = append(facts, "run "+run)
 	}

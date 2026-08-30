@@ -41,7 +41,8 @@ const instructions = `krowk turns local files into permalinks, one artifact per 
 run that carries the metadata about where they came from.
 
 Call krowk_push with the paths you want to share. Every artifact comes back in
-two paste-ready forms and you must pick by destination:
+two paste-ready forms and you must pick by destination. For a public artifact,
+which is what a push is unless it asks otherwise:
 
   - markdown  ` + output.EmbedSurfaces + `
   - url       ` + output.LinkSurfaces + `
@@ -49,6 +50,13 @@ two paste-ready forms and you must pick by destination:
 Pasting the markdown form into Slack shows raw text; pasting the bare URL into a
 GitHub comment shows a plain link with no image. Neither surface renders the
 other's form, so choose deliberately.
+
+Those two lines describe a public artifact and nothing else. Every result labels
+its own two forms, and a private artifact's labels say something different: the
+image still embeds anywhere, because its byte URL is itself the authorization,
+but the card behind it opens only for a signed-in workspace member and unfurls
+nowhere. Read the labels on the result rather than these two lines — and never
+tell somebody a link will preview without having read them.
 
 If a push comes back anonymous, each artifact carries a claim_token. Spending it
 — krowk_claim_artifact, or ` + "`krowk claim <slug> <token>`" + ` — is the only way to
@@ -60,9 +68,10 @@ to krowk_claim_artifact if the upload should be grouped with the rest of them.
 krowk_push only uploads files from the working directory and below. Anything
 outside it is refused, symlinks included, and credential files are refused even
 inside it — .env, .ssh, .aws, .netrc, private keys, credentials.json. An artifact
-is published at a URL that needs no credential to read, so do not try to route
-around this: if a file you were asked to share sits elsewhere, say so and let the
-human move it.`
+is published at a URL that needs no credential to read — ` + "`private: true`" + ` narrows
+who finds the card, not who can fetch the bytes off the link — so do not try to
+route around this: if a file you were asked to share sits elsewhere, say so and
+let the human move it.`
 
 // Server speaks MCP over a pair of streams.
 type Server struct {
@@ -545,6 +554,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Commit      string            `json:"commit"`
 		Agent       string            `json:"agent"`
 		Metadata    map[string]string `json:"metadata"`
+		Private     bool              `json:"private"`
 	}
 	if len(args) > 0 {
 		if err := json.Unmarshal(args, &a); err != nil {
@@ -576,6 +586,13 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 	// workspace on the next call instead.
 	if s.WorkspaceErr != nil {
 		return "", nil, s.WorkspaceErr
+	}
+	// Refused here for the reason the CLI refuses --private there: a keyless push
+	// cannot be private, and the outcome to head off is publishing the file
+	// anyway. An agent told afterwards that its `private` was dropped has already
+	// published what it meant to keep in.
+	if a.Private && !s.Client.Authenticated() {
+		return "", nil, api.PrivateNeedsKey()
 	}
 	// A run named by link is a run named: the agent holding one usually holds the
 	// result of the call that opened it, links and all.
@@ -665,6 +682,11 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 	artifacts := make([]*api.Artifact, 0, len(specs))
 	for _, spec := range specs {
 		spec.Run = runSlug
+		// Named only when asked for, so an unnamed push takes the registry's
+		// default rather than this client pinning public on every upload.
+		if a.Private {
+			spec.Visibility = api.VisibilityPrivate
+		}
 		spec.Metadata = stamp
 		artifact, err := s.Client.Push(ctx, spec)
 		if err != nil {
@@ -952,7 +974,7 @@ func (s *Server) render(a *api.Artifact) (string, any, error) {
 	if expiry := output.RelativeExpiry(a.ExpiresAt, s.Now()); expiry != "" {
 		lines = append(lines, expiry)
 	}
-	lines = append(lines, pasteLines(paste)...)
+	lines = append(lines, pasteLines(a, paste)...)
 	lines = append(lines, claimLines(a)...)
 
 	return strings.Join(lines, "\n"), map[string]any{
@@ -977,7 +999,7 @@ func (s *Server) renderPush(artifacts []*api.Artifact, run *api.Run, notes []str
 		if expiry := output.RelativeExpiry(a.ExpiresAt, s.Now()); expiry != "" {
 			lines = append(lines, expiry)
 		}
-		lines = append(lines, pasteLines(paste)...)
+		lines = append(lines, pasteLines(a, paste)...)
 		lines = append(lines, claimLines(a)...)
 	}
 	if run != nil {
@@ -1001,14 +1023,15 @@ func (s *Server) renderPush(artifacts []*api.Artifact, run *api.Run, notes []str
 }
 
 // pasteLines shows both paste forms, labelled honestly: the markdown label only
-// promises an image where the markdown actually embeds one.
-func pasteLines(paste output.Paste) []string {
+// promises an image where the markdown actually embeds one, and neither label
+// promises an unfurl for an artifact whose card no keyless reader may open.
+func pasteLines(a *api.Artifact, paste output.Paste) []string {
 	return []string{
 		"",
-		"Paste into " + output.MarkdownSurfacesFor(paste) + ":",
+		"Paste into " + output.MarkdownSurfacesFor(a) + ":",
 		paste.Markdown,
 		"",
-		"Paste into " + output.LinkSurfaces + ":",
+		"Paste into " + output.LinkSurfacesFor(a) + ":",
 		paste.URL,
 	}
 }
@@ -1041,7 +1064,8 @@ func toolSchemas() []map[string]any {
 				"a permalink, grouped under a run when an API key is configured. Returns both " +
 				"paste-ready forms per artifact: the markdown image embed for GitHub, Linear and " +
 				"Notion, and the bare URL for Slack and Basecamp. Repo, commit, branch and agent " +
-				"are detected automatically.",
+				"are detected automatically. Uploads are public unless `private` says otherwise, " +
+				"and each artifact reports its own `visibility`.",
 			"inputSchema": map[string]any{
 				"type":     "object",
 				"required": []string{"files"},
@@ -1059,6 +1083,15 @@ func toolSchemas() []map[string]any {
 						"type": "string",
 						"description": "Attach to an existing run instead of opening one. Its slug, " +
 							"or any link carrying it.",
+					},
+					"private": map[string]any{
+						"type": "boolean",
+						"description": "Upload where only this workspace can read it. The image still " +
+							"embeds anywhere — a private artifact's byte URL is itself the " +
+							"authorization — but the card page it links to opens only for a " +
+							"signed-in workspace member, reads as not found to everyone else, and " +
+							"unfurls nowhere. Needs an API key: a keyless upload has no workspace " +
+							"to be private to and is refused rather than published.",
 					},
 					"title": map[string]any{
 						"type":        "string",

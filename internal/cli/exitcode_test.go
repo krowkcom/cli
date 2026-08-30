@@ -207,3 +207,15 @@ func TestHelpDocumentsEveryExitCode(t *testing.T) {
 func registryErr(status int, code string) *api.Error {
 	return &api.Error{Status: status, Body: map[string]any{"error": code}}
 }
+
+// A registry that took the declare and answered without the visibility it asked
+// for. krowk refused before sending the bytes, so nothing was published — and
+// the number says what the caller does next: change the request, or point at a
+// registry that supports private artifacts. Retrying it unchanged answers the
+// same, which is what exitRefused means.
+func TestVisibilityNotAppliedIsRefusedRatherThanTheCatchAll(t *testing.T) {
+	err := api.Fail("visibility_not_applied", "this registry did not apply the visibility")
+	if got := exitCodeFor(err); got != exitRefused {
+		t.Errorf("exit = %d, want %d — an unclassified code falls into the catch-all", got, exitRefused)
+	}
+}

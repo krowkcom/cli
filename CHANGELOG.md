@@ -70,10 +70,15 @@ the versions are the `v*` tags a release is cut from. Entries land under
   One behaviour it had wrong is fixed with it: a **public** artifact's metadata
   read is now scoped to no workspace, keyed or not — matching the registry,
   where a scope a reader escapes by dropping the `Authorization` header would
-  protect nothing. Its `Idempotency-Key` digest also now covers the payload as
-  declared rather than as the stand-in resolved it, so a key replayed with a
-  different visibility, different metadata or a differently-cased checksum is
-  the refusal the registry gives rather than a replay of the first answer.
+  protect nothing.
+
+  Its `Idempotency-Key` digest is also now taken over the declared artifact as
+  an object — the permitted parameters, canonicalized with keys sorted at every
+  level — rather than over a list of fields somebody had to remember to extend,
+  which is how `metadata` had fallen out of it. Two things follow that a field
+  list could not express: a parameter left out stays distinct from one sent
+  empty, and a client that re-serialized its own body between attempts gets its
+  first answer back rather than a second artifact.
 
 ## [0.8.2] - 2026-08-29
 

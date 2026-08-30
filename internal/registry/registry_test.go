@@ -2400,3 +2400,77 @@ func TestATombstoneNamesNoTimeAndCarriesAnEmptyDetails(t *testing.T) {
 		t.Errorf("details = %v, want an empty object", details)
 	}
 }
+
+// What an Idempotency-Key is matched on: the declared artifact as an object,
+// canonicalized. The registry digests the permitted parameters with their keys
+// sorted at every level, so two spellings of one request are one digest and an
+// absent parameter is not the same as an empty one.
+func TestTheIdempotencyDigestIsTheDeclaredObjectCanonicalized(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	declared := func(attempt, body string) (int, map[string]any) {
+		t.Helper()
+		return keyed(t, http.MethodPost, server.URL+"/v1/artifacts", key, attempt, true, body)
+	}
+
+	// A client that re-serialized its own body between attempts sent the same
+	// request: the map order and the whitespace are not the request.
+	const first = `{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,
+		"metadata":{"b":"2","a":"1"}}}`
+	const reserialized = `{"artifact":{"metadata":{"a":"1","b":"2"},"byte_size":5,` +
+		`"content_type":"image/png","filename":"shot.png"}}`
+
+	status, made := declared("re-serialized", first)
+	if status != http.StatusCreated {
+		t.Fatalf("first declare = %d %v", status, made)
+	}
+	status, replayed := declared("re-serialized", reserialized)
+	if status != http.StatusCreated {
+		t.Fatalf("re-serialized retry = %d %v", status, replayed)
+	}
+	if replayed["slug"] != made["slug"] {
+		t.Errorf("re-serialized retry made a second artifact (%v, was %v) — the key order and "+
+			"the whitespace are not the request", replayed["slug"], made["slug"])
+	}
+
+	// A metadata key that actually changed is a different request, so the same
+	// key is a refusal rather than a replay.
+	if status, payload := declared("re-serialized",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,`+
+			`"metadata":{"a":"1","b":"3"}}}`); status != http.StatusConflict ||
+		errorCode(payload) != "idempotency_key_reused" {
+		t.Errorf("changed metadata = %d %s, want 409 idempotency_key_reused",
+			status, errorCode(payload))
+	}
+
+	// And a parameter left out is not a parameter sent empty — the registry's
+	// declared params carry the key in one and not the other.
+	if status, payload := declared("absent-or-empty",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5}}`); status !=
+		http.StatusCreated {
+		t.Fatalf("declare omitting checksum = %d %v", status, payload)
+	}
+	if status, payload := declared("absent-or-empty",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,`+
+			`"checksum":""}}`); status != http.StatusConflict ||
+		errorCode(payload) != "idempotency_key_reused" {
+		t.Errorf("retry adding an empty checksum = %d %s, want 409 idempotency_key_reused",
+			status, errorCode(payload))
+	}
+
+	// A parameter the API does not read cannot make two requests different: the
+	// registry digests what it permitted, not what arrived.
+	if status, payload := declared("unpermitted",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5}}`); status !=
+		http.StatusCreated {
+		t.Fatalf("declare = %d %v", status, payload)
+	}
+	status, tolerated := declared("unpermitted",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,`+
+			`"nonsense":"ignored"}}`)
+	if status != http.StatusCreated || tolerated["slug"] == nil {
+		t.Errorf("retry carrying an unread parameter = %d %v, want the first artifact back",
+			status, tolerated)
+	}
+}

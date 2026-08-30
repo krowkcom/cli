@@ -395,16 +395,20 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		return
 	}
 
+	// Read as raw first, then into the shape. Both, because the digest an
+	// Idempotency-Key is matched on is taken over the declared object itself —
+	// see declaredDigest — while everything else here wants the fields typed.
 	var body struct {
-		Artifact struct {
-			Filename    string          `json:"filename"`
-			ContentType string          `json:"content_type"`
-			ByteSize    int64           `json:"byte_size"`
-			Checksum    string          `json:"checksum"`
-			Run         string          `json:"run"`
-			Visibility  string          `json:"visibility"`
-			Metadata    json.RawMessage `json:"metadata"`
-		} `json:"artifact"`
+		Artifact json.RawMessage `json:"artifact"`
+	}
+	var in struct {
+		Filename    string          `json:"filename"`
+		ContentType string          `json:"content_type"`
+		ByteSize    int64           `json:"byte_size"`
+		Checksum    string          `json:"checksum"`
+		Run         string          `json:"run"`
+		Visibility  string          `json:"visibility"`
+		Metadata    json.RawMessage `json:"metadata"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		if unreadableBody(w, err) {
@@ -414,7 +418,11 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 			"Missing required parameter: artifact.", nil)
 		return
 	}
-	in := body.Artifact
+	if len(body.Artifact) == 0 || json.Unmarshal(body.Artifact, &in) != nil {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: artifact.", nil)
+		return
+	}
 
 	switch {
 	case in.Filename == "":
@@ -472,6 +480,16 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	if strings.TrimSpace(visibility) == "" {
 		visibility = defaultVisibility
 	}
+	// Two known differences from the registry live in this block, both minor and
+	// both about shapes no client sends. A non-string scalar — `{"visibility":5}`
+	// — is a decode failure here and reaches the membership check there, where
+	// Rails' `params.permit` keeps the scalar: 400 here, 422 there. And these
+	// refusals run before the Idempotency-Key replay is looked up, where the
+	// registry evaluates the replay first, so a key replayed with a visibility
+	// that is both changed and invalid is refused here and answered
+	// `idempotency_key_reused` there. The pre-existing filename and byte_size
+	// checks sit in the same place, so moving this one alone would only make the
+	// order less predictable.
 	if !slices.Contains(declarableVisibilities, visibility) {
 		refuseVisibility(w, visibility, "declare")
 		return
@@ -505,17 +523,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	if anonymous {
 		scope = "ip:" + clientAddress(r)
 	}
-	// The registry digests the whole declared payload, so this has to as well,
-	// and it has to digest it *as declared*: `in.Visibility` rather than the
-	// value defaulted above, `in.Checksum` in the case it arrived in, and the
-	// metadata bytes verbatim. A digest taken after normalisation is a digest
-	// that calls two different requests the same — and for visibility that is
-	// the expensive way to be wrong, since replaying the first answer would
-	// hand back the public artifact a retry asked to be private.
-	requestHash := sha256Hex([]byte(fmt.Sprintf("%q", []string{
-		in.Filename, in.ContentType, itoa(in.ByteSize), in.Checksum, in.Run,
-		in.Visibility, string(in.Metadata),
-	})))
+	requestHash := declaredDigest(body.Artifact)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1335,6 +1343,18 @@ func (s *store) updateVisibility(w http.ResponseWriter, r *http.Request, site st
 		refuseVisibility(w, asked, "set")
 		return
 	}
+	// The one answer here that is deliberately not the registry's. Its
+	// `change_visibility!` returns early on the same-visibility comparison
+	// *above* `refuse_if_immovable!`, which is the only thing that asks whether
+	// the artifact is gone — so a tombstone told to keep the visibility it
+	// already has is answered 200 there, with a serializer naming a url, a
+	// file_url and a paste for bytes the takedown deleted. Every other path on
+	// that row answers 410.
+	//
+	// This answers 410, because a stand-in that reproduced it would be teaching
+	// every client built against it that a live-looking payload for destroyed
+	// bytes is something to expect. One line fixes it there — `refuse_if_gone!`
+	// above the short-circuit — and this comment goes when it lands.
 	if s.refuseIfGone(w, a) {
 		return
 	}
@@ -2646,6 +2666,56 @@ func idempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
 // would have the stand-in refuse replays the registry allows, which is the drift
 // that matters. Honouring them for as long as the process lives errs the safe way,
 // and nothing a client does depends on a key going stale.
+// artifactParams are the declare parameters the API permits, which is what the
+// registry digests: a key it never reads must not be able to make two requests
+// different.
+var artifactParams = []string{
+	"byte_size", "checksum", "content_type", "filename", "metadata", "run", "visibility",
+}
+
+// declaredDigest is the request an Idempotency-Key names, hashed the way the
+// registry hashes it: the declared artifact reduced to the permitted parameters
+// and then canonicalized, keys sorted at every level.
+//
+// Over the object rather than over a list of fields, which is what this used to
+// be and what let `metadata` fall out of it unnoticed. Two things follow that a
+// field list cannot express. A parameter that is absent stays distinct from one
+// sent empty, because one is a key in the map and the other is a key with an
+// empty value — the registry's `declared.to_h` makes the same distinction. And
+// a client that re-serialized its own body between attempts, in a different key
+// order or with different whitespace, sent the same request and gets the same
+// answer, because sorting is what canonical means here (Go's encoder sorts map
+// keys at every level, which is the whole of it).
+//
+// A body that will not parse falls back to hashing the bytes. Nothing reaches
+// here with one — the caller has already refused it — and a digest that panicked
+// on the impossible would be worse than one that is merely conservative.
+func declaredDigest(declared json.RawMessage) string {
+	var sent map[string]json.RawMessage
+	if err := json.Unmarshal(declared, &sent); err != nil {
+		return sha256Hex(declared)
+	}
+
+	permitted := make(map[string]any, len(sent))
+	for _, name := range artifactParams {
+		raw, given := sent[name]
+		if !given {
+			continue
+		}
+		var value any
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return sha256Hex(declared)
+		}
+		permitted[name] = value
+	}
+
+	canonical, err := json.Marshal(permitted)
+	if err != nil {
+		return sha256Hex(declared)
+	}
+	return sha256Hex(canonical)
+}
+
 func (s *store) replay(kind, scope, key, requestHash string) (*answered, bool) {
 	found, ok := s.idempotent[kind+"\n"+scope+"\n"+key]
 	if !ok {

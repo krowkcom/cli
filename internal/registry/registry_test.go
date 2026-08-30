@@ -2342,6 +2342,27 @@ func TestTheWorkspaceScopeAnswersBeforeTheBodyDoes(t *testing.T) {
 	}
 }
 
+// An artifact parameter carrying nothing is the parameter being absent, which is
+// what the registry's `require` makes of a blank value. Answered as a missing
+// parameter rather than as a blank filename, which would send a client to fix a
+// field it never sent.
+func TestAnArtifactParameterCarryingNothingReadsAsMissing(t *testing.T) {
+	server, _ := newClockedServer(t)
+
+	for name, body := range map[string]string{
+		"absent":       `{}`,
+		"null":         `{"artifact":null}`,
+		"empty object": `{"artifact":{}}`,
+	} {
+		status, payload := request(t, http.MethodPost, server.URL+"/v1/artifacts",
+			"krowk_sk_owner", "application/json", body)
+		if status != http.StatusBadRequest || errorCode(payload) != "parameter_missing" {
+			t.Errorf("%s artifact = %d %s, want 400 parameter_missing",
+				name, status, errorCode(payload))
+		}
+	}
+}
+
 // `.presence` nils a blank string; it does not strip a padded one. So a
 // visibility that is only whitespace is one nobody named, while " private" is
 // one spelled wrong — and a stand-in that quietly accepted the second would let
@@ -2456,6 +2477,23 @@ func TestTheIdempotencyDigestIsTheDeclaredObjectCanonicalized(t *testing.T) {
 			`"checksum":""}}`); status != http.StatusConflict ||
 		errorCode(payload) != "idempotency_key_reused" {
 		t.Errorf("retry adding an empty checksum = %d %s, want 409 idempotency_key_reused",
+			status, errorCode(payload))
+	}
+
+	// A number is the number it was written as. Unmarshalling into `any` turns
+	// every one into a float64, which collapses two integers past 2^53 into one
+	// digest — and a digest that says two different declares are one request
+	// hands the second the first one's artifact.
+	if status, payload := declared("exact-numbers",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,`+
+			`"metadata":{"n":9007199254740993}}}`); status != http.StatusCreated {
+		t.Fatalf("declare = %d %v", status, payload)
+	}
+	if status, payload := declared("exact-numbers",
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,`+
+			`"metadata":{"n":9007199254740992}}}`); status != http.StatusConflict ||
+		errorCode(payload) != "idempotency_key_reused" {
+		t.Errorf("retry one apart past 2^53 = %d %s, want 409 idempotency_key_reused",
 			status, errorCode(payload))
 	}
 

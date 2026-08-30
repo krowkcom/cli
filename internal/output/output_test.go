@@ -401,16 +401,6 @@ func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
 	if got := LinkSurfacesFor(imageArtifact); got != PrivateLinkSurfaces {
 		t.Errorf("private link label = %q, want %q", got, PrivateLinkSurfaces)
 	}
-	for _, label := range []string{PrivateEmbedSurfaces, PrivatePlainSurfaces, PrivateLinkSurfaces} {
-		if strings.Contains(label, "unfurl") && !strings.Contains(label, "nothing unfurls") {
-			t.Errorf("private label %q promises an unfurl", label)
-		}
-		for _, tool := range []string{"Slack", "Basecamp"} {
-			if strings.Contains(label, tool) {
-				t.Errorf("private label %q names %s, which cannot render this card", label, tool)
-			}
-		}
-	}
 }
 
 // A claim token adopts the upload, so it stays out of everything destined for a

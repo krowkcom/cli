@@ -418,7 +418,8 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 			"Missing required parameter: artifact.", nil)
 		return
 	}
-	if len(body.Artifact) == 0 || json.Unmarshal(body.Artifact, &in) != nil {
+	if len(body.Artifact) == 0 || json.Unmarshal(body.Artifact, &in) != nil ||
+		declaredBlank(body.Artifact) {
 		writeError(w, http.StatusBadRequest, "parameter_missing",
 			"Missing required parameter: artifact.", nil)
 		return
@@ -483,7 +484,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	// Two known differences from the registry live in this block, both minor and
 	// both about shapes no client sends. A non-string scalar — `{"visibility":5}`
 	// — is a decode failure here and reaches the membership check there, where
-	// Rails' `params.permit` keeps the scalar: 400 here, 422 there. And these
+	// the registry's `params.expect` keeps the scalar: 400 here, 422 there. And these
 	// refusals run before the Idempotency-Key replay is looked up, where the
 	// registry evaluates the replay first, so a key replayed with a visibility
 	// that is both changed and invalid is refused here and answered
@@ -2657,15 +2658,6 @@ func idempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return key, true
 }
 
-// replay finds what a key already created, and reports whether the payload it
-// arrived with is the one it was first used for.
-//
-// No expiry, deliberately. The real registry promises a key is honoured for *at
-// least* a day and sweeps it hourly after that, so a key it still answers for is
-// one this process must answer for too — cutting them off at exactly a day here
-// would have the stand-in refuse replays the registry allows, which is the drift
-// that matters. Honouring them for as long as the process lives errs the safe way,
-// and nothing a client does depends on a key going stale.
 // artifactParams are the declare parameters the API permits, which is what the
 // registry digests: a key it never reads must not be able to make two requests
 // different.
@@ -2690,6 +2682,44 @@ var artifactParams = []string{
 // A body that will not parse falls back to hashing the bytes. Nothing reaches
 // here with one — the caller has already refused it — and a digest that panicked
 // on the impossible would be worse than one that is merely conservative.
+// declaredBlank reports whether the artifact parameter carries nothing at all:
+// null, or an object with no keys. The registry's `params.expect` requires the
+// parameter, and `require` refuses a blank value — so a null and an empty object
+// are the parameter being missing there, not an artifact that fails validation.
+// Without this they would be answered 422 about a blank filename, which sends a
+// client to fix a field it never sent.
+func declaredBlank(declared json.RawMessage) bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(declared, &fields); err != nil {
+		// Not an object at all, which the struct unmarshal above has already
+		// refused. Not this function's answer to give.
+		return false
+	}
+	return len(fields) == 0
+}
+
+// decodeExactly reads JSON into a value that re-encodes to what it came from.
+//
+// The plain unmarshal into `any` does not: every number becomes a float64, so
+// 9007199254740993 and 9007199254740992 are one value by the time they are
+// hashed, and 1 and 1.0 are too. For a digest that decides whether to replay an
+// answer, that is the dangerous direction — two different declares would match
+// one key and the second would be handed the first one's artifact. The registry
+// parses into Ruby Integers and keeps them exact.
+//
+// UseNumber keeps every number as the literal it was written as, and
+// json.Number re-encodes verbatim, which is what makes the round trip faithful.
+func decodeExactly(raw json.RawMessage) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
 func declaredDigest(declared json.RawMessage) string {
 	var sent map[string]json.RawMessage
 	if err := json.Unmarshal(declared, &sent); err != nil {
@@ -2702,8 +2732,8 @@ func declaredDigest(declared json.RawMessage) string {
 		if !given {
 			continue
 		}
-		var value any
-		if err := json.Unmarshal(raw, &value); err != nil {
+		value, err := decodeExactly(raw)
+		if err != nil {
 			return sha256Hex(declared)
 		}
 		permitted[name] = value
@@ -2716,6 +2746,15 @@ func declaredDigest(declared json.RawMessage) string {
 	return sha256Hex(canonical)
 }
 
+// replay finds what a key already created, and reports whether the payload it
+// arrived with is the one it was first used for.
+//
+// No expiry, deliberately. The real registry promises a key is honoured for *at
+// least* a day and sweeps it hourly after that, so a key it still answers for is
+// one this process must answer for too — cutting them off at exactly a day here
+// would have the stand-in refuse replays the registry allows, which is the drift
+// that matters. Honouring them for as long as the process lives errs the safe way,
+// and nothing a client does depends on a key going stale.
 func (s *store) replay(kind, scope, key, requestHash string) (*answered, bool) {
 	found, ok := s.idempotent[kind+"\n"+scope+"\n"+key]
 	if !ok {

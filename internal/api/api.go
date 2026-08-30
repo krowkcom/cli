@@ -322,6 +322,26 @@ func (a *Artifact) Public() bool {
 	return a == nil || a.Visibility == "" || a.Visibility == VisibilityPublic
 }
 
+// Private reports the one non-public visibility this build knows how to
+// describe. It is deliberately not `!Public()`: `shared` is defined as the
+// visibility whose card a keyless holder of the link *does* see, so a build
+// that has not heard of it must not tell somebody their link is workspace-only.
+// Understating who can read an artifact is the dangerous way to be wrong about
+// a privacy feature, and it is the way a two-way split gets it wrong.
+func (a *Artifact) Private() bool {
+	return a != nil && a.Visibility == VisibilityPrivate
+}
+
+// visibilityAnswered is what to call what came back, for a refusal that has to
+// name it: the visibility the registry reported, or the fact that it reported
+// none — which is what an older registry does and is the likelier of the two.
+func visibilityAnswered(a *Artifact) string {
+	if a.Visibility == "" {
+		return "no visibility at all"
+	}
+	return a.Visibility
+}
+
 // RunSlug names the run this artifact belongs to, or "" when it belongs to
 // none. Everything that only wants the slug goes through here, so a nil run
 // reads as absent rather than panicking on the way to finding that out.
@@ -641,6 +661,21 @@ func (c *Client) Push(ctx context.Context, spec Spec) (*Artifact, error) {
 	prepared, err := c.PrepareArtifact(ctx, spec)
 	if err != nil {
 		return nil, err
+	}
+
+	// Checked before the bytes move, and this is the only moment it can be:
+	// after the PUT the file is on a CDN, and a registry that ignored the field
+	// has published exactly what the caller asked to keep in. A registry
+	// predating `visibility` accepts the declare and answers without it, which
+	// is a silent downgrade to public — the one failure the whole flag exists to
+	// prevent. Nothing is uploaded, so the artifact it made is a pending row
+	// that expires on its own.
+	if spec.Visibility != "" && prepared.Visibility != spec.Visibility {
+		return nil, Fail("visibility_not_applied",
+			"this registry did not apply the visibility the upload asked for — declared "+
+				spec.Visibility+", got "+visibilityAnswered(prepared)+
+				". Nothing was uploaded. Check KROWK_API_URL points at a registry that "+
+				"supports private artifacts, or push it public")
 	}
 
 	if err := c.PutBytes(ctx, prepared, spec); err != nil {

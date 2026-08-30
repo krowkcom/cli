@@ -849,3 +849,41 @@ func TestARunLabelIsClippedOnceWhateverItIsBuiltFrom(t *testing.T) {
 		t.Errorf("multi-byte label is %d runes, want at most %d plus the ellipsis", n, maxLabelRunes)
 	}
 }
+
+// A visibility this build has never heard of is described by name and promised
+// nothing. The next one to arrive is `shared` — the visibility whose card a
+// keyless holder of the link *does* see — so calling it private would tell
+// somebody their link is workspace-only when it is not. Understating who can
+// read an artifact is the dangerous way to be wrong about a privacy feature.
+func TestAnUnknownVisibilityIsNeverDescribedAsPrivate(t *testing.T) {
+	a := &api.Artifact{
+		Slug: "art_2e1d", Filename: "report.html", ContentType: "text/html",
+		Visibility: "shared",
+		URL:        "https://krowk.com/a/art_2e1d",
+		Paste: &api.Paste{
+			Markdown: "**report.html** · [View preview ↗](https://krowk.com/a/art_2e1d)",
+			URL:      "https://krowk.com/a/art_2e1d",
+		},
+	}
+
+	said := []string{
+		MarkdownSurfacesFor(a),
+		LinkSurfacesFor(a),
+		shareCrumb(a).Description,
+		UnfurlWarning(Result{Artifacts: []*api.Artifact{a}}, URL, ""),
+	}
+	for _, line := range said {
+		if line == "" {
+			t.Error("an unknown visibility went undescribed where a private one would not")
+		}
+		if strings.Contains(line, "workspace member") || strings.Contains(line, "signed-in") {
+			t.Errorf("an unknown visibility was described as private: %q", line)
+		}
+		if strings.Contains(line, "Slack") || strings.Contains(line, "unfurl the link themselves") {
+			t.Errorf("an unknown visibility was promised an unfurl: %q", line)
+		}
+		if !strings.Contains(line, "shared") {
+			t.Errorf("the visibility that came back is not named: %q", line)
+		}
+	}
+}

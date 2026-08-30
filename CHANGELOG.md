@@ -28,8 +28,17 @@ the versions are the `v*` tags a release is cut from. Entries land under
   dropped would have already published the file.
 
 - Every artifact now reports its own `visibility`, on every read, as a name
-  rather than a flag — so a client branching on the word keeps working when the
-  third one arrives.
+  rather than a flag. A visibility this build has not heard of — `shared`, when
+  it lands — is described by name and promised nothing, rather than being
+  described as private: `shared` is the visibility whose card a keyless holder
+  of the link *does* see, and telling somebody their link is workspace-only when
+  it is not is the dangerous way to be wrong about a privacy feature.
+
+- A push that asks for a visibility now checks it was applied before it sends
+  the bytes. A registry predating the field accepts the declare and answers
+  without it, which is a silent downgrade to public — and once the bytes are on
+  a CDN there is nothing left to refuse. Nothing is uploaded, and the artifact
+  the declare made is a pending row that expires on its own.
 
 ### Changed
 

@@ -70,7 +70,20 @@ const (
 		"only for a signed-in workspace member"
 	PrivateLinkSurfaces = "a place only workspace members read — nothing unfurls this " +
 		"link, and the card opens only after they sign in"
+
+	// And what a visibility this build has never heard of is called. It names
+	// the value and promises nothing, because the next one to arrive is
+	// `shared` — the visibility whose card a keyless holder of the link *does*
+	// see — and describing it as private would tell somebody their link is
+	// workspace-only when it is not. That is the dangerous way to be wrong.
+	UnknownSurfaces = "nowhere yet — this artifact's visibility is %q, which this krowk " +
+		"does not know how to describe. Upgrade before promising anybody anything about the link"
 )
+
+// surfacesForUnknown fills UnknownSurfaces in with the name that came back.
+func surfacesForUnknown(a *api.Artifact) string {
+	return fmt.Sprintf(UnknownSurfaces, a.Visibility)
+}
 
 // PasteOf is one artifact's forms, as the registry computed them.
 func PasteOf(a *api.Artifact) Paste {
@@ -117,6 +130,9 @@ func cardFor(a *api.Artifact) string {
 // wraps the embed in. A label cannot counterfeit one: the escaper turns a `[`
 // in a filename into `\[`.
 func MarkdownSurfacesFor(a *api.Artifact) string {
+	if !a.Public() && !a.Private() {
+		return surfacesForUnknown(a)
+	}
 	switch {
 	case strings.Contains(blockFor(a), "!["):
 		if a.Public() {
@@ -132,10 +148,13 @@ func MarkdownSurfacesFor(a *api.Artifact) string {
 // LinkSurfacesFor is the honest label for the bare-link form. Only a public card
 // unfurls, so only a public one may be described as something to hand to Slack.
 func LinkSurfacesFor(a *api.Artifact) string {
-	if a.Public() {
+	switch {
+	case a.Public():
 		return LinkSurfaces
+	case a.Private():
+		return PrivateLinkSurfaces
 	}
-	return PrivateLinkSurfaces
+	return surfacesForUnknown(a)
 }
 
 // visibilityFact is what a human line says about who may read an artifact, and
@@ -388,10 +407,14 @@ func UnfurlWarning(r Result, f Format, destination string) string {
 		return ""
 	}
 	for _, a := range r.Artifacts {
-		if !a.Public() {
+		switch {
+		case a.Private():
 			return a.Visibility + " card link: it does not unfurl into a preview, and it " +
 				"opens only for a signed-in workspace member. The markdown form still " +
 				"shows the image"
+		case !a.Public():
+			return a.Visibility + " card link: this krowk does not know who that reaches " +
+				"or whether it unfurls — upgrade before pasting it anywhere"
 		}
 	}
 	return ""
@@ -535,11 +558,15 @@ func breadcrumbs(r Result) []Breadcrumb {
 // person on the other end will be asked for.
 func shareCrumb(a *api.Artifact) Breadcrumb {
 	description := "hand this link on — it is public and needs no key to read"
-	if !a.Public() {
+	switch {
+	case a.Private():
 		description = "hand this link to a workspace member — it opens the card after they " +
 			"sign in to the app, and reads as not found to everyone else. The image embeds " +
 			"anywhere: its byte URL is the capability, so paste the markdown form outside the " +
 			"workspace only when the picture itself is meant to be seen"
+	case !a.Public():
+		description = "check who this link reaches before handing it on: its visibility is " +
+			a.Visibility + ", which this krowk does not know how to describe"
 	}
 	return Breadcrumb{
 		Action:      "share",

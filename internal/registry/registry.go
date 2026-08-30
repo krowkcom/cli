@@ -463,8 +463,13 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	// about. And a keyless caller cannot have one at all — a keyless upload
 	// lands in the shared anonymous workspace, which nobody is a member of, so
 	// there is no membership for it to be private to.
-	visibility := strings.TrimSpace(in.Visibility)
-	if visibility == "" {
+	// Trimmed only to decide whether anything was named. The membership check
+	// runs on the value as sent, because the registry reads this through
+	// `.presence`, which nils a blank string and does not strip a padded one:
+	// " private" is a visibility spelled wrong there, and a stand-in that
+	// accepted it would let a client pass here and fail in production.
+	visibility := in.Visibility
+	if strings.TrimSpace(visibility) == "" {
 		visibility = defaultVisibility
 	}
 	if !slices.Contains(declarableVisibilities, visibility) {
@@ -743,11 +748,10 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
 	// them bare.
 	s.mu.Lock()
 	a := s.byStorageKey(key)
-	var wantKey, wantTok, wantType, wantSum string
+	var wantTok, wantType, wantSum string
 	var wantSize int64
 	var until time.Time
 	if a != nil {
-		wantKey = a.storageKey
 		wantTok, wantType, wantSum = a.uploadTok, a.ContentType, a.Checksum
 		wantSize, until = a.ByteSize, a.uploadTil
 	}
@@ -755,8 +759,10 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
 
 	// A real presigned URL signs the key, not just the object: bytes must land
 	// exactly where the artifact says they live, never under a rewritten
-	// filename or another workspace's prefix.
-	if a == nil || key != wantKey || wantTok == "" || r.URL.Query().Get("upload_token") != wantTok {
+	// filename or another workspace's prefix. That is what `a == nil` decides
+	// here — the artifact is looked up *by* the key, so a PUT to a key no
+	// artifact claims finds nothing rather than finding the wrong artifact.
+	if a == nil || wantTok == "" || r.URL.Query().Get("upload_token") != wantTok {
 		// Storage speaks XML, as R2 and S3 do, so a client cannot get away with
 		// assuming every failure is a krowk envelope. A finalized artifact's token
 		// is spent, so a re-PUT of a ready permalink lands here too.
@@ -874,6 +880,12 @@ func (s *store) artifactPage(w http.ResponseWriter, r *http.Request) {
 	// card behind the workspace session it already has; there is nothing here
 	// for it to sign in to, so the stand-in stops at the 404 that a keyless
 	// fetch — an unfurl bot, a stranger with the link — actually gets.
+	//
+	// Anything that is not public is refused, rather than private specifically,
+	// because failing closed is the only safe default for a visibility this
+	// build has not heard of. `shared` will need a branch here when it lands:
+	// it is defined as the one visibility whose card a keyless holder of the
+	// link does see.
 	if a != nil && a.Visibility != defaultVisibility {
 		a = nil
 	}
@@ -1309,11 +1321,12 @@ func (s *store) updateVisibility(w http.ResponseWriter, r *http.Request, site st
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
-	// Trimmed before the emptiness check, because the registry reads this
-	// parameter through `.presence`: whitespace is a visibility nobody named,
-	// not a visibility spelled wrong.
-	asked := strings.TrimSpace(body.Visibility)
-	if asked == "" {
+	// Blankness is decided on the trimmed value and membership on the value as
+	// sent, for the reason the declare gives: the registry reads this parameter
+	// through `.presence`, so whitespace is a visibility nobody named while
+	// " private" is one spelled wrong.
+	asked := body.Visibility
+	if strings.TrimSpace(asked) == "" {
 		writeError(w, http.StatusBadRequest, "parameter_missing",
 			"Missing required parameter: visibility.", nil)
 		return

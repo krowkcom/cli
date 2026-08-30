@@ -2341,3 +2341,62 @@ func TestTheWorkspaceScopeAnswersBeforeTheBodyDoes(t *testing.T) {
 		t.Errorf("whitespace visibility = %d %s, want 400 parameter_missing", status, errorCode(payload))
 	}
 }
+
+// `.presence` nils a blank string; it does not strip a padded one. So a
+// visibility that is only whitespace is one nobody named, while " private" is
+// one spelled wrong — and a stand-in that quietly accepted the second would let
+// a client pass here and be refused in production.
+func TestAPaddedVisibilityIsSpelledWrongRatherThanTrimmed(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	status, payload := declareVisible(t, server, key, " private", "secret.txt", "bytes")
+	if status != http.StatusUnprocessableEntity || errorCode(payload) != "visibility_unavailable" {
+		t.Errorf("declared \" private\" = %d %s, want 422 visibility_unavailable",
+			status, errorCode(payload))
+	}
+	// Whitespace alone is nothing named at all, which on a declare is the default.
+	if status, payload := declareVisible(t, server, key, "   ", "shot.txt", "bytes"); status !=
+		http.StatusCreated || payload["visibility"] != "public" {
+		t.Errorf("declared \"   \" = %d %v, want 201 public", status, payload)
+	}
+
+	ready := pushed(t, server, key, "public", "one.txt", "bytes")
+	slug, _ := ready["slug"].(string)
+	if status, payload := setVisibility(t, server, key, slug, `{"visibility":" private"}`); status !=
+		http.StatusUnprocessableEntity || errorCode(payload) != "visibility_unavailable" {
+		t.Errorf("set \" private\" = %d %s, want 422 visibility_unavailable", status, errorCode(payload))
+	}
+}
+
+// A tombstone says it was taken down and nothing else. When somebody took an
+// artifact down is their incident to know, not its reader's — and the empty
+// details is how the envelope says this error has nothing more to tell rather
+// than that its details were forgotten.
+func TestATombstoneNamesNoTimeAndCarriesAnEmptyDetails(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	ready := pushed(t, server, key, "public", "shot.txt", "bytes")
+	slug, _ := ready["slug"].(string)
+	if status, _ := request(t, http.MethodDelete, server.URL+"/v1/artifacts/"+slug, key, "", ""); status !=
+		http.StatusNoContent {
+		t.Fatalf("takedown = %d", status)
+	}
+
+	status, payload := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, key, "", "")
+	if status != http.StatusGone || errorCode(payload) != "taken_down" {
+		t.Fatalf("read back = %d %s, want 410 taken_down", status, errorCode(payload))
+	}
+	failure, _ := payload["error"].(map[string]any)
+	if message, _ := failure["message"].(string); message != slug+" was taken down" {
+		t.Errorf("message = %q, want it to name no time", message)
+	}
+	details, present := failure["details"]
+	if !present {
+		t.Fatal("no details key — an empty details is the envelope saying there is nothing more")
+	}
+	if got, ok := details.(map[string]any); !ok || len(got) != 0 {
+		t.Errorf("details = %v, want an empty object", details)
+	}
+}

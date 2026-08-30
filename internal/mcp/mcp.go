@@ -41,7 +41,8 @@ const instructions = `krowk turns local files into permalinks, one artifact per 
 run that carries the metadata about where they came from.
 
 Call krowk_push with the paths you want to share. Every artifact comes back in
-two paste-ready forms and you must pick by destination:
+two paste-ready forms and you must pick by destination. For a public artifact,
+which is what a push is unless it asks otherwise:
 
   - markdown  ` + output.EmbedSurfaces + `
   - url       ` + output.LinkSurfaces + `
@@ -49,6 +50,13 @@ two paste-ready forms and you must pick by destination:
 Pasting the markdown form into Slack shows raw text; pasting the bare URL into a
 GitHub comment shows a plain link with no image. Neither surface renders the
 other's form, so choose deliberately.
+
+Those two lines describe a public artifact and nothing else. Every result labels
+its own two forms, and a private artifact's labels say something different: the
+image still embeds anywhere, because its byte URL is itself the authorization,
+but the card behind it opens only for a signed-in workspace member and unfurls
+nowhere. Read the labels on the result rather than these two lines — and never
+tell somebody a link will preview without having read them.
 
 If a push comes back anonymous, each artifact carries a claim_token. Spending it
 — krowk_claim_artifact, or ` + "`krowk claim <slug> <token>`" + ` — is the only way to
@@ -60,9 +68,10 @@ to krowk_claim_artifact if the upload should be grouped with the rest of them.
 krowk_push only uploads files from the working directory and below. Anything
 outside it is refused, symlinks included, and credential files are refused even
 inside it — .env, .ssh, .aws, .netrc, private keys, credentials.json. An artifact
-is published at a URL that needs no credential to read, so do not try to route
-around this: if a file you were asked to share sits elsewhere, say so and let the
-human move it.`
+is published at a URL that needs no credential to read — ` + "`private: true`" + ` narrows
+who finds the card, not who can fetch the bytes off the link — so do not try to
+route around this: if a file you were asked to share sits elsewhere, say so and
+let the human move it.`
 
 // Server speaks MCP over a pair of streams.
 type Server struct {

@@ -71,7 +71,7 @@ Push flags: `--run`, `--pull-request`, `--link <url>` (repeatable, with `--link-
 
 It needs an API key — a keyless upload lands in the shared anonymous workspace, which nobody is a member of, so there is nothing for it to be private to — and it is refused rather than published without one. Every artifact reports its own `visibility`, and krowk's paste labels stop promising a preview for a card no destination can fetch.
 
-Switching an artifact's visibility later — from the dashboard, or `PUT /v1/artifacts/:slug/visibility`; krowk has no command for it yet — re-keys its bytes and withdraws the old byte URL: the slug never changes, so the card link that was pasted is still the card link, but any embed built on the previous `file_url` stops resolving. That is what revocation is.
+Switching an artifact's visibility later — from the dashboard, or `PUT /v1/artifacts/:slug/visibility`; krowk has no command for it yet — re-keys its bytes and withdraws the URL they were under. The slug never changes, so the card link that was pasted is always the card link. The byte URL is not symmetric: a private key is a fresh random secret each time, so an embed built on one dies for good when the artifact moves, while a public key is derived from the workspace and the slug rather than drawn — republishing an artifact that has not changed hands puts the bytes back at exactly the URL privatizing took away.
 
 ### Metadata
 

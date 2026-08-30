@@ -1396,10 +1396,18 @@ func (s *store) updateVisibility(w http.ResponseWriter, r *http.Request, site st
 // Nothing can un-send a URL, so withdrawing one means making it resolve to
 // nothing — and privatizing without re-keying would leave the bytes exactly
 // where the last holder of the public link left off, which would be privacy in
-// name only. The consequence is worth stating plainly to anyone developing
-// against this: the slug never changes, so the card link that was pasted is
-// still the card link, but `file_url` does not survive a round trip and every
-// embed built on the old one dies. That is the design, not a wobble.
+// name only.
+//
+// What survives each direction is worth being exact about, because the two are
+// not symmetric. The slug never changes, so the card link that was pasted is
+// always the card link. A private key is a fresh random secret every time, so
+// privatizing withdraws the public URL and republishing withdraws that private
+// URL — every embed built on a private one dies for good. A public key is
+// derived from the region, the workspace and the slug rather than drawn, so
+// republishing an artifact that has not changed hands puts the bytes back at
+// exactly the URL privatizing took away, and an embed pasted from before the
+// round trip starts resolving again. That is what deriving the key means, not
+// an accident.
 //
 // The real registry reserves the destination, copies, and then spends the old
 // object — in an order that differs by direction, because leaving public means
@@ -2196,9 +2204,6 @@ func (s *store) expired(a *artifact) bool {
 	return err == nil && at.Before(s.now())
 }
 
-// serializeArtifact is the artifact as the API reports it. A method rather than
-// a free function because `run` is now the run itself rather than its slug, and
-// the run lives in the store — every caller already holds the lock.
 // dimensionHeaderBytes is how much of an image is read to measure it, and it is
 // the registry's number rather than a convenience: a stand-in that measured a
 // file the registry gives up on would let a client pass here and find no
@@ -2362,6 +2367,9 @@ func nullableInt(value int) any {
 	return value
 }
 
+// serializeArtifact is the artifact as the API reports it. A method rather than
+// a free function because `run` is now the run itself rather than its slug, and
+// the run lives in the store — every caller already holds the lock.
 func (s *store) serializeArtifact(a *artifact) map[string]any {
 	out := map[string]any{
 		"slug":         a.Slug,
@@ -2665,23 +2673,6 @@ var artifactParams = []string{
 	"byte_size", "checksum", "content_type", "filename", "metadata", "run", "visibility",
 }
 
-// declaredDigest is the request an Idempotency-Key names, hashed the way the
-// registry hashes it: the declared artifact reduced to the permitted parameters
-// and then canonicalized, keys sorted at every level.
-//
-// Over the object rather than over a list of fields, which is what this used to
-// be and what let `metadata` fall out of it unnoticed. Two things follow that a
-// field list cannot express. A parameter that is absent stays distinct from one
-// sent empty, because one is a key in the map and the other is a key with an
-// empty value — the registry's `declared.to_h` makes the same distinction. And
-// a client that re-serialized its own body between attempts, in a different key
-// order or with different whitespace, sent the same request and gets the same
-// answer, because sorting is what canonical means here (Go's encoder sorts map
-// keys at every level, which is the whole of it).
-//
-// A body that will not parse falls back to hashing the bytes. Nothing reaches
-// here with one — the caller has already refused it — and a digest that panicked
-// on the impossible would be worse than one that is merely conservative.
 // declaredBlank reports whether the artifact parameter carries nothing at all:
 // null, or an object with no keys. The registry's `params.expect` requires the
 // parameter, and `require` refuses a blank value — so a null and an empty object
@@ -2695,7 +2686,16 @@ func declaredBlank(declared json.RawMessage) bool {
 		// refused. Not this function's answer to give.
 		return false
 	}
-	return len(fields) == 0
+	// Counted among the permitted parameters rather than among the keys sent,
+	// because the registry filters before it requires: an object holding
+	// nothing the API reads is empty by the time `require` looks at it, so
+	// {"nonsense": 1} is the parameter being missing there too.
+	for _, name := range artifactParams {
+		if _, given := fields[name]; given {
+			return false
+		}
+	}
+	return true
 }
 
 // decodeExactly reads JSON into a value that re-encodes to what it came from.
@@ -2720,6 +2720,24 @@ func decodeExactly(raw json.RawMessage) (any, error) {
 	return value, nil
 }
 
+// declaredDigest is the request an Idempotency-Key names, hashed the way the
+// registry hashes it: the declared artifact reduced to the permitted parameters
+// and then canonicalized, keys sorted at every level.
+//
+// Over the object rather than over a list of fields, which is what this used to
+// be and what let `metadata` fall out of it unnoticed. Two things follow that a
+// field list cannot express. A parameter that is absent stays distinct from one
+// sent empty, because one is a key in the map and the other is a key with an
+// empty value — the registry's `declared.to_h` makes the same distinction. And
+// a client that re-serialized its own body between attempts, in a different key
+// order or with different whitespace, sent the same request and gets the same
+// answer, because sorting is what canonical means here (Go's encoder sorts map
+// keys at every level, which is the whole of it).
+//
+// The fallbacks to hashing the raw bytes are unreachable: the caller decoded
+// these same bytes to get here, so nothing that fails below could have arrived.
+// They are there because a digest is not the place to discover that, and one
+// that panicked would be worse than one that is merely useless.
 func declaredDigest(declared json.RawMessage) string {
 	var sent map[string]json.RawMessage
 	if err := json.Unmarshal(declared, &sent); err != nil {

@@ -2169,6 +2169,13 @@ func TestAVisibilityChangeRekeysTheBytesAndKillsTheOldURL(t *testing.T) {
 	if fileURLOf(t, back) == nowPrivate {
 		t.Error("file_url survived republishing — the private key was a capability to withdraw")
 	}
+	// And it is the URL privatizing took away, not a third one. A public key is
+	// derived from the region, the workspace and the slug rather than drawn, so
+	// an artifact that has not changed hands comes back to exactly where it was
+	// — which is the half of a round trip that does survive.
+	if got := fileURLOf(t, back); got != wasPublic {
+		t.Errorf("republished file_url = %q, want the original %q", got, wasPublic)
+	}
 	if status, _ := requestText(t, nowPrivate); status != http.StatusNotFound {
 		t.Errorf("the withdrawn private URL still serves: %d", status)
 	}
@@ -2353,6 +2360,10 @@ func TestAnArtifactParameterCarryingNothingReadsAsMissing(t *testing.T) {
 		"absent":       `{}`,
 		"null":         `{"artifact":null}`,
 		"empty object": `{"artifact":{}}`,
+		// The registry filters to the permitted parameters before it requires
+		// one, so an object holding nothing the API reads is empty by the time
+		// the requirement is checked.
+		"only unread keys": `{"artifact":{"nonsense":1}}`,
 	} {
 		status, payload := request(t, http.MethodPost, server.URL+"/v1/artifacts",
 			"krowk_sk_owner", "application/json", body)

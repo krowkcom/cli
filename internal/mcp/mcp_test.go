@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/krowkcom/cli/internal/api"
+	"github.com/krowkcom/cli/internal/output"
 	"github.com/krowkcom/cli/internal/registry"
 )
 
@@ -1193,4 +1194,61 @@ func runSlugOf(artifact map[string]any) string {
 	run, _ := artifact["run"].(map[string]any)
 	slug, _ := run["slug"].(string)
 	return slug
+}
+
+// The agent-facing surface of a private push. Both paste forms are still there
+// — the image renders wherever a destination embeds bytes, because the byte URL
+// is the capability and an unfurl bot carries nobody's session — but the labels
+// stop promising a preview card. An agent that pasted the bare link into Slack
+// on the strength of the public label would be pasting a link that unfurls into
+// nothing and opens for nobody.
+func TestAPrivatePushLabelsItsPasteFormsWithoutPromisingAnUnfurl(t *testing.T) {
+	s := newSession(t, "krk_test")
+
+	result := s.callTool("krowk_push", map[string]any{
+		"files": []any{s.fixture}, "private": true,
+	})
+	if result["isError"] == true {
+		t.Fatalf("private push failed: %s", text(t, result))
+	}
+
+	structured, _ := result["structuredContent"].(map[string]any)
+	artifacts, _ := structured["artifacts"].([]any)
+	if len(artifacts) != 1 {
+		t.Fatalf("got %d artifacts, want 1: %+v", len(artifacts), structured)
+	}
+	first, _ := artifacts[0].(map[string]any)
+	if first["visibility"] != "private" {
+		t.Errorf("visibility = %v, want private — an agent branches on this", first["visibility"])
+	}
+
+	said := text(t, result)
+	if strings.Contains(said, output.LinkSurfaces) {
+		t.Errorf("a private push offered the public unfurl label:\n%s", said)
+	}
+	if !strings.Contains(said, output.PrivateLinkSurfaces) {
+		t.Errorf("a private push never says who can open the card:\n%s", said)
+	}
+	// The picture still renders, and saying otherwise would cost the agent the
+	// one thing private artifacts exist to keep.
+	if !strings.Contains(said, output.PrivateEmbedSurfaces) {
+		t.Errorf("a private push never says the image still embeds:\n%s", said)
+	}
+}
+
+// A keyless server cannot give an agent what `private` asked for, and the
+// refusal is the answer rather than a public upload with a note attached: by
+// the time the agent read the note it would have published the file.
+func TestAKeylessPrivatePushIsRefused(t *testing.T) {
+	s := newSession(t, "")
+
+	result := s.callTool("krowk_push", map[string]any{
+		"files": []any{s.fixture}, "private": true,
+	})
+	if result["isError"] != true {
+		t.Fatalf("keyless private push succeeded: %s", text(t, result))
+	}
+	if said := text(t, result); !strings.Contains(said, "API key") {
+		t.Errorf("refusal = %q, want it to name the key that would work", said)
+	}
 }

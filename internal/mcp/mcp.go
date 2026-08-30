@@ -545,6 +545,7 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		Commit      string            `json:"commit"`
 		Agent       string            `json:"agent"`
 		Metadata    map[string]string `json:"metadata"`
+		Private     bool              `json:"private"`
 	}
 	if len(args) > 0 {
 		if err := json.Unmarshal(args, &a); err != nil {
@@ -576,6 +577,13 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 	// workspace on the next call instead.
 	if s.WorkspaceErr != nil {
 		return "", nil, s.WorkspaceErr
+	}
+	// Refused here for the reason the CLI refuses --private there: a keyless push
+	// cannot be private, and the outcome to head off is publishing the file
+	// anyway. An agent told afterwards that its `private` was dropped has already
+	// published what it meant to keep in.
+	if a.Private && !s.Client.Authenticated() {
+		return "", nil, api.PrivateNeedsKey()
 	}
 	// A run named by link is a run named: the agent holding one usually holds the
 	// result of the call that opened it, links and all.
@@ -662,9 +670,17 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		stamp = resolved.Artifact().WithExtras(a.Metadata)
 	}
 
+	// Named only when asked for, so an unnamed push takes the registry's default
+	// rather than this client pinning public on every upload it makes.
+	visibility := ""
+	if a.Private {
+		visibility = api.VisibilityPrivate
+	}
+
 	artifacts := make([]*api.Artifact, 0, len(specs))
 	for _, spec := range specs {
 		spec.Run = runSlug
+		spec.Visibility = visibility
 		spec.Metadata = stamp
 		artifact, err := s.Client.Push(ctx, spec)
 		if err != nil {
@@ -952,7 +968,7 @@ func (s *Server) render(a *api.Artifact) (string, any, error) {
 	if expiry := output.RelativeExpiry(a.ExpiresAt, s.Now()); expiry != "" {
 		lines = append(lines, expiry)
 	}
-	lines = append(lines, pasteLines(paste)...)
+	lines = append(lines, pasteLines(a, paste)...)
 	lines = append(lines, claimLines(a)...)
 
 	return strings.Join(lines, "\n"), map[string]any{
@@ -977,7 +993,7 @@ func (s *Server) renderPush(artifacts []*api.Artifact, run *api.Run, notes []str
 		if expiry := output.RelativeExpiry(a.ExpiresAt, s.Now()); expiry != "" {
 			lines = append(lines, expiry)
 		}
-		lines = append(lines, pasteLines(paste)...)
+		lines = append(lines, pasteLines(a, paste)...)
 		lines = append(lines, claimLines(a)...)
 	}
 	if run != nil {
@@ -1001,14 +1017,16 @@ func (s *Server) renderPush(artifacts []*api.Artifact, run *api.Run, notes []str
 }
 
 // pasteLines shows both paste forms, labelled honestly: the markdown label only
-// promises an image where the markdown actually embeds one.
-func pasteLines(paste output.Paste) []string {
+// promises an image where the markdown actually embeds one, and neither label
+// promises an unfurl for an artifact whose card no keyless reader may open.
+func pasteLines(a *api.Artifact, paste output.Paste) []string {
+	public := a.Public()
 	return []string{
 		"",
-		"Paste into " + output.MarkdownSurfacesFor(paste) + ":",
+		"Paste into " + output.MarkdownSurfacesFor(paste, public) + ":",
 		paste.Markdown,
 		"",
-		"Paste into " + output.LinkSurfaces + ":",
+		"Paste into " + output.LinkSurfacesFor(public) + ":",
 		paste.URL,
 	}
 }
@@ -1041,7 +1059,8 @@ func toolSchemas() []map[string]any {
 				"a permalink, grouped under a run when an API key is configured. Returns both " +
 				"paste-ready forms per artifact: the markdown image embed for GitHub, Linear and " +
 				"Notion, and the bare URL for Slack and Basecamp. Repo, commit, branch and agent " +
-				"are detected automatically.",
+				"are detected automatically. Uploads are public unless `private` says otherwise, " +
+				"and each artifact reports its own `visibility`.",
 			"inputSchema": map[string]any{
 				"type":     "object",
 				"required": []string{"files"},
@@ -1059,6 +1078,15 @@ func toolSchemas() []map[string]any {
 						"type": "string",
 						"description": "Attach to an existing run instead of opening one. Its slug, " +
 							"or any link carrying it.",
+					},
+					"private": map[string]any{
+						"type": "boolean",
+						"description": "Upload where only this workspace can read it. The image still " +
+							"embeds anywhere — a private artifact's byte URL is itself the " +
+							"authorization — but the card page it links to opens only for a " +
+							"signed-in workspace member, reads as not found to everyone else, and " +
+							"unfurls nowhere. Needs an API key: a keyless upload has no workspace " +
+							"to be private to and is refused rather than published.",
 					},
 					"title": map[string]any{
 						"type":        "string",

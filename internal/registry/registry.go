@@ -89,7 +89,19 @@ const (
 	// the real registry, so the storage keys look the same — padded to canon's
 	// 24 characters so it reads as a slug rather than as an exception to one.
 	anonymousWorkspace = "ws_anonymous000000000000000"
+
+	// What an artifact is when nothing says otherwise, and what a keyless upload
+	// always is. Public here means what it means in canon: the bytes are on the
+	// CDN, the metadata reads keyless by slug, and the card page unfurls.
+	defaultVisibility = "public"
 )
+
+// declarableVisibilities are the ones a client may name, on a declare or on a
+// visibility change. Deliberately shorter than the registry's own enum, which
+// also holds `shared`: that one is real below the API and refused at it until
+// it has a token, revocation and expiry contract, so a stand-in that accepted
+// the word would let a client pass here and fail in production.
+var declarableVisibilities = []string{"public", "private"}
 
 type artifact struct {
 	Slug        string `json:"slug"`
@@ -99,6 +111,11 @@ type artifact struct {
 	ByteSize    int64  `json:"byte_size"`
 	Checksum    string `json:"checksum,omitempty"`
 	Region      string `json:"region"`
+	// Visibility is who may read this artifact. It decides three separate
+	// things, which is why it is carried on the row rather than derived: the
+	// shape of the storage key, whether a read outside the owning workspace is
+	// answered at all, and whether the card page renders to a keyless fetch.
+	Visibility string `json:"visibility"`
 	// Run is the slug of the run this artifact belongs to, empty for none. On
 	// the wire it goes out as the nested run object serializeArtifact builds,
 	// which is why this field is not serialized from here.
@@ -283,6 +300,17 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 	mux.HandleFunc("PUT /v1/artifacts/{slug}/run", s.attachRun)
 	mux.HandleFunc("PATCH /v1/artifacts/{slug}/run", s.attachRun)
 
+	// Who may read an artifact — the same singular-resource shape, and a PUT for
+	// the same reason: naming the same visibility twice leaves the artifact
+	// exactly as it was, so a retry and a double-clicked control are successes
+	// rather than errors, and what comes back is the artifact. A visibility is
+	// not a record to point at.
+	visibility := func(w http.ResponseWriter, r *http.Request) {
+		s.updateVisibility(w, r, site(r, siteURL))
+	}
+	mux.HandleFunc("PUT /v1/artifacts/{slug}/visibility", visibility)
+	mux.HandleFunc("PATCH /v1/artifacts/{slug}/visibility", visibility)
+
 	// The key the request is made with — a singular resource, read with a GET.
 	mux.HandleFunc("GET /v1/key", showKey)
 
@@ -325,8 +353,12 @@ func HandlerWithClock(limitBytes int64, siteURL string, now func() time.Time) ht
 
 	// Object storage, standing in for R2. PUT is the presigned upload target;
 	// GET is the CDN, so a link this stand-in hands out actually resolves.
-	mux.HandleFunc("PUT /_storage/{workspace}/{slug}/{filename}", s.putObject)
-	mux.HandleFunc("GET /_storage/{workspace}/{slug}/{filename}", s.getObject)
+	// The key is a wildcard rather than three named segments because a key has
+	// two shapes: {workspace}/{artifact}/{filename} for a public artifact, and
+	// {secret}/{filename} for every other — see storageKeyFor for why the
+	// private one names nothing.
+	mux.HandleFunc("PUT /_storage/{key...}", s.putObject)
+	mux.HandleFunc("GET /_storage/{key...}", s.getObject)
 
 	// The card page: what `url` now points at, and the whole reason it stopped
 	// pointing at the object. Server-rendered, sessionless and keyless, because
@@ -365,6 +397,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 			ByteSize    int64           `json:"byte_size"`
 			Checksum    string          `json:"checksum"`
 			Run         string          `json:"run"`
+			Visibility  string          `json:"visibility"`
 			Metadata    json.RawMessage `json:"metadata"`
 		} `json:"artifact"`
 	}
@@ -416,6 +449,31 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		workspace = anonymousWorkspace
 	}
 
+	// Defaulted here rather than left to the row, because it decides which key
+	// the bytes go under and that is chosen while the record is being built.
+	//
+	// A visibility this API does not take is refused rather than quietly
+	// downgraded to public: the client asked for bytes not to be public and
+	// would not be getting that, which is the one mistake worth being loud
+	// about. And a keyless caller cannot have one at all — a keyless upload
+	// lands in the shared anonymous workspace, which nobody is a member of, so
+	// there is no membership for it to be private to.
+	visibility := in.Visibility
+	if visibility == "" {
+		visibility = defaultVisibility
+	}
+	if !slices.Contains(declarableVisibilities, visibility) {
+		refuseVisibility(w, visibility, "declare")
+		return
+	}
+	if anonymous && visibility != defaultVisibility {
+		writeError(w, http.StatusUnprocessableEntity, "private_needs_key",
+			"A private artifact needs an API key — a keyless upload lands in the shared anonymous "+
+				"workspace, which nobody is a member of. Send Authorization: Bearer <key>, or declare "+
+				"it public.", nil)
+		return
+	}
+
 	// A keyless upload naming a run is refused rather than quietly ignored:
 	// answering 201 for an upload not attached to the run the client asked for
 	// looks like success and is not.
@@ -437,8 +495,13 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	if anonymous {
 		scope = "ip:" + clientAddress(r)
 	}
+	// Visibility is in the digest because the registry digests the whole
+	// declared payload: the same key sent again for a file that is now private
+	// is a different request, and answering it with the public artifact the
+	// first attempt made would publish what the retry asked to keep in.
 	requestHash := sha256Hex([]byte(fmt.Sprintf("%q", []string{
 		in.Filename, in.ContentType, itoa(in.ByteSize), strings.ToLower(in.Checksum), in.Run,
+		visibility,
 	})))
 
 	s.mu.Lock()
@@ -460,7 +523,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	}
 
 	slug := generateSlug("art")
-	key := path.Join(workspace, slug, safeFilename(in.Filename))
+	key := storageKeyFor(visibility, workspace, slug, in.Filename)
 	// The card page is the link, the storage path is where the bytes are. The
 	// real registry serves the first from krowk.com and the second from the
 	// CDN; here one origin serves both, which is enough for a paste against
@@ -477,6 +540,7 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		ByteSize:    in.ByteSize,
 		Checksum:    strings.ToLower(in.Checksum),
 		Region:      "weur",
+		Visibility:  visibility,
 		URL:         url,
 		FileURL:     fileURL,
 		Markdown:    markdown(in.Filename, in.ContentType, fileURL, url),
@@ -664,13 +728,13 @@ func (s *store) presignUpload(w http.ResponseWriter, r *http.Request) {
 // putObject is object storage. It enforces what the real presigned URL enforces
 // through its signature: the token, the declared length and the declared digest.
 func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
-	key := path.Join(r.PathValue("workspace"), r.PathValue("slug"), r.PathValue("filename"))
+	key := r.PathValue("key")
 
 	// Everything the checks need is copied under the lock: finalizeArtifact
 	// mutates ByteSize and Checksum, and a PUT racing a finalize must not read
 	// them bare.
 	s.mu.Lock()
-	a := s.artifacts[r.PathValue("slug")]
+	a := s.byStorageKey(key)
 	var wantKey, wantTok, wantType, wantSum string
 	var wantSize int64
 	var until time.Time
@@ -747,15 +811,21 @@ func (s *store) putObject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *store) getObject(w http.ResponseWriter, r *http.Request) {
-	key := path.Join(r.PathValue("workspace"), r.PathValue("slug"), r.PathValue("filename"))
+	key := r.PathValue("key")
 
 	s.mu.Lock()
 	bytes, ok := s.objects[key]
 	var contentType string
+	// Keyless at every visibility, and deliberately so: a private artifact's
+	// bytes are on the same CDN, and the unguessable key is the whole of the
+	// authorization. Demanding a session here would stop the one thing private
+	// artifacts exist to keep working — an embed, fetched anonymously by a
+	// vendor that carries nobody's credentials.
+	//
 	// The 24-hour promise covers the bytes, not just the record: an expired
-	// artifact's public URL stops serving, as the real registry's lifecycle
-	// rule deletes the object. Gone reads as never-there, the way storage does.
-	if a := s.artifacts[r.PathValue("slug")]; a != nil {
+	// artifact's URL stops serving, as the real registry's lifecycle rule
+	// deletes the object. Gone reads as never-there, the way storage does.
+	if a := s.byStorageKey(key); a != nil {
 		if s.expired(a) {
 			ok = false
 		}
@@ -789,6 +859,16 @@ func (s *store) artifactPage(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	a := s.artifacts[slug]
+	// A private artifact has no keyless card, and answers as though the slug had
+	// never been minted: not a tombstone, because a tombstone confirms it
+	// existed, and for a private artifact existence itself is the secret. In
+	// production the website sends this reader to the app, which renders the
+	// card behind the workspace session it already has; there is nothing here
+	// for it to sign in to, so the stand-in stops at the 404 that a keyless
+	// fetch — an unfurl bot, a stranger with the link — actually gets.
+	if a != nil && a.Visibility != defaultVisibility {
+		a = nil
+	}
 	var (
 		gone     string
 		filename string
@@ -1046,8 +1126,8 @@ func (s *store) showArtifact(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	a := s.find(workspace, r.PathValue("slug"))
-	if a == nil {
+	a := s.artifacts[r.PathValue("slug")]
+	if a == nil || !readable(a, workspace) {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
@@ -1171,6 +1251,127 @@ func (s *store) refuseIfGone(w http.ResponseWriter, a *artifact) bool {
 		return false
 	}
 	return true
+}
+
+// updateVisibility changes who may read an artifact, and moves its bytes to a
+// key drawn for where they are going.
+//
+// A key is required, with no keyless path at all: changing visibility withdraws
+// a URL, and a keyless caller has no workspace for a private artifact to be
+// private to. Scoped to the key's workspace, so another tenant's slug reads as
+// not existing rather than as forbidden.
+//
+// Repeating it is a success. The same visibility named twice leaves the
+// artifact exactly as it was — and specifically does *not* re-key, because a
+// re-key withdraws a capability URL, and nobody asked for that by clicking a
+// control twice.
+func (s *store) updateVisibility(w http.ResponseWriter, r *http.Request, site string) {
+	workspace, ok := requireKey(w, r)
+	if !ok {
+		return
+	}
+
+	var body struct {
+		Visibility string `json:"visibility"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); unreadableBody(w, err) {
+		return
+	}
+	if body.Visibility == "" {
+		writeError(w, http.StatusBadRequest, "parameter_missing",
+			"Missing required parameter: visibility.", nil)
+		return
+	}
+	if !slices.Contains(declarableVisibilities, body.Visibility) {
+		refuseVisibility(w, body.Visibility, "set")
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a := s.artifacts[r.PathValue("slug")]
+	if a == nil || a.workspace != workspace {
+		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
+		return
+	}
+	if s.refuseIfGone(w, a) {
+		return
+	}
+	// The request is well formed; the artifact is not in a state that can move.
+	// A pending one has no bytes anything has confirmed, so there is nothing to
+	// copy to the new key.
+	//
+	// The registry refuses an anonymous artifact here too, and this does not,
+	// because it cannot arrive: an anonymous upload belongs to the shared
+	// anonymous workspace, no key resolves to that workspace, and the scope
+	// above has already answered it as not found. Claiming is what moves an
+	// artifact out of there, and a claimed one belongs to the key that claimed
+	// it.
+	if a.State != "ready" {
+		writeError(w, http.StatusUnprocessableEntity, "immovable",
+			a.Slug+" has no confirmed bytes to move", nil)
+		return
+	}
+
+	if a.Visibility != body.Visibility {
+		s.rekey(a, body.Visibility, site)
+	}
+	writeJSON(w, http.StatusOK, s.serializeArtifact(a))
+}
+
+// rekey is what a visibility change actually does: the bytes move to a key
+// drawn for the visibility they are arriving at, and the key they left is
+// emptied.
+//
+// Unconditional, in both directions, because that is what revocation is.
+// Nothing can un-send a URL, so withdrawing one means making it resolve to
+// nothing — and privatizing without re-keying would leave the bytes exactly
+// where the last holder of the public link left off, which would be privacy in
+// name only. The consequence is worth stating plainly to anyone developing
+// against this: the slug never changes, so the card link that was pasted is
+// still the card link, but `file_url` does not survive a round trip and every
+// embed built on the old one dies. That is the design, not a wobble.
+//
+// The real registry copies, flips and then deletes, so a half-failed move
+// strands a copy rather than losing the object, and purges the edge before it
+// calls the move done. Here the three steps happen under one lock and cannot
+// half-fail, and there is no edge to purge.
+func (s *store) rekey(a *artifact, to, site string) {
+	key := storageKeyFor(to, a.workspace, a.Slug, a.Filename)
+	if bytes, ok := s.objects[a.storageKey]; ok {
+		s.objects[key] = bytes
+	}
+	delete(s.objects, a.storageKey)
+
+	a.storageKey = key
+	a.Visibility = to
+	a.FileURL = site + "/_storage/" + key
+	a.Markdown = markdown(a.Filename, a.ContentType, a.FileURL, a.URL)
+}
+
+// refuseVisibility is the one refusal for a word this API does not take, said
+// for whichever call asked. The verb differs — a client declares a visibility
+// on an upload and sets one afterwards — and the registry's two messages differ
+// with it, so a client matching on the prose finds the same sentence here.
+func refuseVisibility(w http.ResponseWriter, asked, verb string) {
+	// Truncated on the way into the message: this is echoed back, and it is
+	// whatever the client sent.
+	writeError(w, http.StatusUnprocessableEntity, "visibility_unavailable",
+		fmt.Sprintf("%q is not a visibility you can %s. Send one of: %s.",
+			clipRunes(asked, 30), verb, strings.Join(declarableVisibilities, ", ")), nil)
+}
+
+// clipRunes shortens what is echoed back to a client to at most n characters,
+// the ellipsis included — which is what Rails' String#truncate does, and this
+// string is echoed straight back into a refusal the registry also writes. On a
+// rune boundary, so a multi-byte character is never cut in half.
+func clipRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n-3]) + "..."
 }
 
 // claimArtifact moves an anonymous artifact into the key's workspace, where it
@@ -1529,8 +1730,40 @@ func (s *store) finishRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entry)
 }
 
+// readable is the read boundary, and it is deliberately not the write one.
+//
+// A public artifact is found by slug in no workspace's scope, keyed or not: the
+// slug is the capability, the card page fetches keylessly, and the bytes are on
+// the CDN regardless — so a scope a reader escapes by dropping the
+// Authorization header would protect nothing and would make holding a key show
+// less than holding none.
+//
+// Anything else is the case where the scope does protect something: the bytes
+// are behind a capability URL, but the filename, the size and the run's
+// metadata are not, and those are what this read would disclose. So it answers
+// only the owning workspace, and answers everyone else as missing rather than
+// as forbidden — forbidden confirms the artifact is there, and for a private
+// artifact existence itself is the secret.
+func readable(a *artifact, workspace string) bool {
+	return a.Visibility == defaultVisibility || (workspace != "" && a.workspace == workspace)
+}
+
+// byStorageKey finds the artifact whose bytes live under key. A scan rather
+// than a second map: a visibility change moves a key, and an index that has to
+// be kept in step with the rows is a way for the two to disagree. A dev session
+// holds a handful of artifacts, and this is the only thing that ever asks.
+func (s *store) byStorageKey(key string) *artifact {
+	for _, a := range s.artifacts {
+		if a.storageKey == key {
+			return a
+		}
+	}
+	return nil
+}
+
 // find scopes a lookup to the workspace the request belongs to, so a slug from
-// another one reads as simply not existing.
+// another one reads as simply not existing. The write paths use it; reading
+// goes through readable, which is a looser boundary on purpose.
 func (s *store) find(workspace, slug string) *artifact {
 	if workspace == "" {
 		workspace = anonymousWorkspace
@@ -2076,6 +2309,7 @@ func (s *store) serializeArtifact(a *artifact) map[string]any {
 		"height":     nullableInt(a.height),
 		"checksum":   a.Checksum,
 		"region":     a.Region,
+		"visibility": a.Visibility,
 		"run":        s.serializeArtifactRun(a),
 		"url":        a.URL,
 		"file_url":   a.FileURL,
@@ -2264,6 +2498,14 @@ const slugAlphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
 const slugRandomLength = 24
 
 func generateSlug(prefix string) string {
+	return prefix + "_" + randomBase36()
+}
+
+// randomBase36 is a slug's random half on its own. It is drawn separately
+// because a non-public storage key needs the same draw with no prefix in front
+// of it — the secret segment of a capability URL — and the two must not diverge
+// into different alphabets or lengths.
+func randomBase36() string {
 	b := make([]byte, slugRandomLength)
 	if _, err := rand.Read(b); err != nil {
 		panic(err) // a stand-in with no randomness cannot issue slugs
@@ -2271,7 +2513,29 @@ func generateSlug(prefix string) string {
 	for i, v := range b {
 		b[i] = slugAlphabet[int(v)%len(slugAlphabet)]
 	}
-	return prefix + "_" + string(b)
+	return string(b)
+}
+
+// storageKeyFor is where an artifact's bytes live, and the shape of the key is
+// the whole of what makes a non-public artifact private.
+//
+// A public key names the workspace and the artifact, as it always has. Every
+// other visibility replaces both with one random secret — not joins them, the
+// way the real registry's R2.object_key does — because everyone the URL reaches
+// reads it, including unfurl bots, whoever it is forwarded to and the CDN's own
+// access log. A workspace segment there is a join key proving two forwarded
+// links belong to one customer; an artifact segment is the card address, and so
+// confirms the existence the metadata boundary just refused to confirm (canon,
+// engineering/architecture.md -> Private artifacts).
+//
+// Holding the URL is therefore the whole of the authorization, which is what
+// lets a private image render in a PR comment at all: no vendor's unfurler
+// carries a session, so bytes behind one are bytes nobody sees.
+func storageKeyFor(visibility, workspace, slug, filename string) string {
+	if visibility == defaultVisibility {
+		return path.Join(workspace, slug, safeFilename(filename))
+	}
+	return path.Join(randomBase36(), safeFilename(filename))
 }
 
 func randomToken() string {

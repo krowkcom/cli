@@ -353,7 +353,7 @@ func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
 	if !strings.Contains(image.Markdown, "![") {
 		t.Fatalf("markdown = %q, want an image embed", image.Markdown)
 	}
-	if got := MarkdownSurfacesFor(image); got != EmbedSurfaces {
+	if got := MarkdownSurfacesFor(image, true); got != EmbedSurfaces {
 		t.Errorf("image label = %q, want %q", got, EmbedSurfaces)
 	}
 
@@ -374,8 +374,37 @@ func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
 	if !strings.Contains(log.Markdown, "(https://krowk.com/a/art_9f3c)") {
 		t.Errorf("markdown = %q, want it to link to the card page", log.Markdown)
 	}
-	if got := MarkdownSurfacesFor(log); got != PlainSurfaces {
+	if got := MarkdownSurfacesFor(log, true); got != PlainSurfaces {
 		t.Errorf("plain-link label = %q, want %q", got, PlainSurfaces)
+	}
+
+	// The same two forms for a private artifact promise something else. The
+	// image still renders — its byte URL is the capability, and an unfurl bot
+	// fetching anonymously is exactly who it was drawn for — but every label
+	// that named a destination's preview card has to stop, because the card is
+	// served by the app to a signed-in member and answers everyone else as
+	// though the slug had never been minted.
+	if got := MarkdownSurfacesFor(image, false); got != PrivateEmbedSurfaces {
+		t.Errorf("private image label = %q, want %q", got, PrivateEmbedSurfaces)
+	}
+	if got := MarkdownSurfacesFor(log, false); got != PrivatePlainSurfaces {
+		t.Errorf("private plain-link label = %q, want %q", got, PrivatePlainSurfaces)
+	}
+	if got := LinkSurfacesFor(true); got != LinkSurfaces {
+		t.Errorf("public link label = %q, want %q", got, LinkSurfaces)
+	}
+	if got := LinkSurfacesFor(false); got != PrivateLinkSurfaces {
+		t.Errorf("private link label = %q, want %q", got, PrivateLinkSurfaces)
+	}
+	for _, label := range []string{PrivateEmbedSurfaces, PrivatePlainSurfaces, PrivateLinkSurfaces} {
+		if strings.Contains(label, "unfurl") && !strings.Contains(label, "nothing unfurls") {
+			t.Errorf("private label %q promises an unfurl", label)
+		}
+		for _, tool := range []string{"Slack", "Basecamp"} {
+			if strings.Contains(label, tool) {
+				t.Errorf("private label %q names %s, which cannot render this card", label, tool)
+			}
+		}
 	}
 }
 

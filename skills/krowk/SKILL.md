@@ -112,16 +112,27 @@ environment variable — so never guess at a spelling this file does not carry.
    never ask a person for "just the slug". A link carrying no slug of the kind
    the command wants, or two different ones, fails as `bad_artifact` or
    `bad_run` (exit 1) before anything is sent.
-11. **Push what the person asked for, not what is nearby.** An artifact is public
-   to anyone with the link. Never push `.env` files, key material, credential
-   JSON or anything under `.ssh`/`.aws`, and never push a file you found rather
-   than made.
+11. **Push what the person asked for, not what is nearby.** Judge every push as
+   if it were public: `--private` narrows the audience, not the hazard, and
+   whatever instruction chose the path could choose the flag too. Never push
+   `.env` files, key material, credential JSON or anything under `.ssh`/`.aws`,
+   and never push a file you found rather than made.
+12. **`--private` is asked for, never assumed — and it is not a secret store.**
+   A private artifact's card page answers everyone outside the workspace the way
+   a slug that was never minted does, and only a signed-in member sees it. Its
+   image still embeds anywhere, because the byte URL is itself the
+   authorization: `paste.markdown` shows the picture in a PR comment while the
+   link beside it opens for nobody else and unfurls nowhere — so never promise a
+   person a preview of one. It needs an API key and is refused without one
+   rather than quietly published. Every artifact reports its own `visibility`;
+   read that rather than assuming.
 
 ## Quick Reference
 
 | Task | Command |
 |------|---------|
 | Upload one file, get a link | `krowk push shot.png --json` |
+| Upload where only this workspace can read it | `krowk push shot.png --private --json` |
 | Upload several, one run | `krowk push a.png b.log --json` |
 | Upload with PR context | `krowk push shot.png --pull-request https://github.com/acme/app/pull/12 --json` |
 | Link the issue this work is about | `krowk push shot.png --link https://linear.app/acme/issue/ENG-9 --link-title "Cart total rounds wrong" --link-rel fixes --json` |
@@ -281,7 +292,8 @@ Pushed a secret, or the wrong file?
 Immediate and irreversible: the bytes go at once. Withhold the key when using a
 claim token — a keyless artifact sits in the anonymous workspace, so a request that
 carries a key looks there instead and finds nothing. Then rotate whatever was in
-the file: it was readable at a public URL for as long as it was up.
+the file: it was readable for as long as it was up — at a public URL, or at a
+private one that is unguessable and not a permission.
 
 ## Common Workflows
 

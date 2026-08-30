@@ -88,6 +88,15 @@ var clientCodes = map[string]int{
 	"no_key_for_workspace": exitAuth,
 	"dangling_default":     exitAuth,
 
+	// `--private` with no key, refused before anything is sent. The registry
+	// answers the same code for the same request, so this entry classifies both
+	// — which is the point of it being in this table rather than the next one:
+	// deciding it locally must not report a different number than being told.
+	// exitRefused rather than exitAuth, matching `run_needs_key`, its sibling:
+	// the registry answers both 422, and both are a request that has to change
+	// as much as a credential that has to appear.
+	"private_needs_key": exitRefused,
+
 	// A page krowk will not hand to the desktop's URL handler: a scheme that is not
 	// the web, or http where the API itself is https. It sits with
 	// `malformed_response` because it is the same news — the registry answered

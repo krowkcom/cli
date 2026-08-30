@@ -37,6 +37,12 @@
             "usage": "Print what this tool wants pasted into it, e.g. github or slack. A tool krowk has not been told about gets the markdown block"
           },
           {
+            "name": "private",
+            "type": "bool",
+            "default": "false",
+            "usage": "Upload where only this workspace can read it. The image still embeds — the byte URL is the capability — but the card opens only for a signed-in member and unfurls nowhere. Needs an API key"
+          },
+          {
             "name": "pull-request",
             "type": "string",
             "default": "",
@@ -144,6 +150,12 @@
                 "type": "string",
                 "default": "",
                 "usage": "Print what this tool wants pasted into it, e.g. github or slack. A tool krowk has not been told about gets the markdown block"
+              },
+              {
+                "name": "private",
+                "type": "bool",
+                "default": "false",
+                "usage": "Upload where only this workspace can read it. The image still embeds — the byte URL is the capability — but the card opens only for a signed-in member and unfurls nowhere. Needs an API key"
               },
               {
                 "name": "pull-request",
@@ -711,6 +723,7 @@
         "files",
         "links",
         "metadata",
+        "private",
         "pull_request",
         "references",
         "repo",

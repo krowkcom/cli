@@ -670,17 +670,14 @@ func push(ctx context.Context, s *Server, args json.RawMessage) (string, any, er
 		stamp = resolved.Artifact().WithExtras(a.Metadata)
 	}
 
-	// Named only when asked for, so an unnamed push takes the registry's default
-	// rather than this client pinning public on every upload it makes.
-	visibility := ""
-	if a.Private {
-		visibility = api.VisibilityPrivate
-	}
-
 	artifacts := make([]*api.Artifact, 0, len(specs))
 	for _, spec := range specs {
 		spec.Run = runSlug
-		spec.Visibility = visibility
+		// Named only when asked for, so an unnamed push takes the registry's
+		// default rather than this client pinning public on every upload.
+		if a.Private {
+			spec.Visibility = api.VisibilityPrivate
+		}
 		spec.Metadata = stamp
 		artifact, err := s.Client.Push(ctx, spec)
 		if err != nil {
@@ -1020,13 +1017,12 @@ func (s *Server) renderPush(artifacts []*api.Artifact, run *api.Run, notes []str
 // promises an image where the markdown actually embeds one, and neither label
 // promises an unfurl for an artifact whose card no keyless reader may open.
 func pasteLines(a *api.Artifact, paste output.Paste) []string {
-	public := a.Public()
 	return []string{
 		"",
-		"Paste into " + output.MarkdownSurfacesFor(paste, public) + ":",
+		"Paste into " + output.MarkdownSurfacesFor(a) + ":",
 		paste.Markdown,
 		"",
-		"Paste into " + output.LinkSurfacesFor(public) + ":",
+		"Paste into " + output.LinkSurfacesFor(a) + ":",
 		paste.URL,
 	}
 }

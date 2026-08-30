@@ -802,17 +802,14 @@ func upload(w, progress io.Writer, files []string, f flags, format output.Format
 		stamp = metadataFor(f, env).Artifact()
 	}
 
-	// Named only when it is asked for, so an unnamed push takes whatever default
-	// the registry — and one day the workspace — applies, rather than this
-	// client pinning public on every upload it makes.
-	visibility := ""
-	if f.private {
-		visibility = api.VisibilityPrivate
-	}
-
 	for i, spec := range specs {
 		spec.Run = runSlug
-		spec.Visibility = visibility
+		// Named only when it is asked for, so an unnamed push takes whatever
+		// default the registry — and one day the workspace — applies, rather
+		// than this client pinning public on every upload it makes.
+		if f.private {
+			spec.Visibility = api.VisibilityPrivate
+		}
 		if authenticated {
 			spec.Metadata = stamp.WithExtras(withCaption(extras, captions, i))
 		}

@@ -341,7 +341,7 @@ func TestJSONEnvelopeCarriesBothPasteForms(t *testing.T) {
 // there is a blue anchor. Slack is where that link becomes a card, and Slack
 // takes the url form. So the label stays "no preview to embed".
 func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
-	image := PasteOf(&api.Artifact{
+	imageArtifact := &api.Artifact{
 		Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
 		URL: "https://krowk.com/a/art_2e1d", FileURL: "https://cdn.krowk.com/ws_9f3c/art_2e1d/shot.png",
 		Paste: &api.Paste{
@@ -349,22 +349,24 @@ func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
 				"(https://krowk.com/a/art_2e1d)\nshot.png · [View preview ↗](https://krowk.com/a/art_2e1d)",
 			URL: "https://krowk.com/a/art_2e1d",
 		},
-	})
+	}
+	image := PasteOf(imageArtifact)
 	if !strings.Contains(image.Markdown, "![") {
 		t.Fatalf("markdown = %q, want an image embed", image.Markdown)
 	}
-	if got := MarkdownSurfacesFor(image, true); got != EmbedSurfaces {
+	if got := MarkdownSurfacesFor(imageArtifact); got != EmbedSurfaces {
 		t.Errorf("image label = %q, want %q", got, EmbedSurfaces)
 	}
 
-	log := PasteOf(&api.Artifact{
+	logArtifact := &api.Artifact{
 		Slug: "art_9f3c", Filename: "build.log", ContentType: "text/plain",
 		URL: "https://krowk.com/a/art_9f3c", FileURL: "https://cdn.krowk.com/ws_9f3c/art_9f3c/build.log",
 		Paste: &api.Paste{
 			Markdown: "**build.log** · [View preview ↗](https://krowk.com/a/art_9f3c)",
 			URL:      "https://krowk.com/a/art_9f3c",
 		},
-	})
+	}
+	log := PasteOf(logArtifact)
 	if strings.Contains(log.Markdown, "![") {
 		t.Fatalf("markdown = %q, want a plain link when there is nothing to embed", log.Markdown)
 	}
@@ -374,7 +376,7 @@ func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
 	if !strings.Contains(log.Markdown, "(https://krowk.com/a/art_9f3c)") {
 		t.Errorf("markdown = %q, want it to link to the card page", log.Markdown)
 	}
-	if got := MarkdownSurfacesFor(log, true); got != PlainSurfaces {
+	if got := MarkdownSurfacesFor(logArtifact); got != PlainSurfaces {
 		t.Errorf("plain-link label = %q, want %q", got, PlainSurfaces)
 	}
 
@@ -384,16 +386,19 @@ func TestMarkdownSurfacesLabelIsHonest(t *testing.T) {
 	// that named a destination's preview card has to stop, because the card is
 	// served by the app to a signed-in member and answers everyone else as
 	// though the slug had never been minted.
-	if got := MarkdownSurfacesFor(image, false); got != PrivateEmbedSurfaces {
-		t.Errorf("private image label = %q, want %q", got, PrivateEmbedSurfaces)
-	}
-	if got := MarkdownSurfacesFor(log, false); got != PrivatePlainSurfaces {
-		t.Errorf("private plain-link label = %q, want %q", got, PrivatePlainSurfaces)
-	}
-	if got := LinkSurfacesFor(true); got != LinkSurfaces {
+	if got := LinkSurfacesFor(imageArtifact); got != LinkSurfaces {
 		t.Errorf("public link label = %q, want %q", got, LinkSurfaces)
 	}
-	if got := LinkSurfacesFor(false); got != PrivateLinkSurfaces {
+
+	imageArtifact.Visibility = api.VisibilityPrivate
+	logArtifact.Visibility = api.VisibilityPrivate
+	if got := MarkdownSurfacesFor(imageArtifact); got != PrivateEmbedSurfaces {
+		t.Errorf("private image label = %q, want %q", got, PrivateEmbedSurfaces)
+	}
+	if got := MarkdownSurfacesFor(logArtifact); got != PrivatePlainSurfaces {
+		t.Errorf("private plain-link label = %q, want %q", got, PrivatePlainSurfaces)
+	}
+	if got := LinkSurfacesFor(imageArtifact); got != PrivateLinkSurfaces {
 		t.Errorf("private link label = %q, want %q", got, PrivateLinkSurfaces)
 	}
 	for _, label := range []string{PrivateEmbedSurfaces, PrivatePlainSurfaces, PrivateLinkSurfaces} {

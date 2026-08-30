@@ -42,9 +42,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   renders. Human output names the visibility beside the size when it is not the
   public default, and `krowk uploads list` names it per row.
 
-- `--format url` and a `--destination` that wants the bare link — `slack`,
-  `basecamp`, `asana` — warn on stderr when what they just printed is a private
-  card. That form exists to be unfurled and a private card unfurls nowhere, so
+- `--format url`, and any `--destination` the registry's table says wants the
+  bare link, warn on stderr when what they printed is a private card. That form
+  exists to be unfurled and a private card unfurls nowhere, so
   printing one silently would be the same broken promise in a different place.
   The warning is on stderr rather than in the output, because the output is
   about to be pasted.
@@ -58,12 +58,13 @@ the versions are the `v*` tags a release is cut from. Entries land under
   moves an artifact between public and private, re-keying the bytes and killing
   the old URL in both directions.
 
-  Two behaviours it had wrong are fixed with it: a **public** artifact's
-  metadata read is now scoped to no workspace, keyed or not — matching the
-  registry, where a scope a reader escapes by dropping the `Authorization`
-  header would protect nothing — and an `Idempotency-Key` replayed with a
-  different visibility is refused rather than answered with the artifact the
-  first attempt made.
+  One behaviour it had wrong is fixed with it: a **public** artifact's metadata
+  read is now scoped to no workspace, keyed or not — matching the registry,
+  where a scope a reader escapes by dropping the `Authorization` header would
+  protect nothing. Its `Idempotency-Key` digest also now covers the payload as
+  declared rather than as the stand-in resolved it, so a key replayed with a
+  different visibility, different metadata or a differently-cased checksum is
+  the refusal the registry gives rather than a replay of the first answer.
 
 ## [0.8.2] - 2026-08-29
 

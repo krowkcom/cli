@@ -116,24 +116,23 @@ func cardFor(a *api.Artifact) string {
 // start calling every image a plain link the day the registry changes what it
 // wraps the embed in. A label cannot counterfeit one: the escaper turns a `[`
 // in a filename into `\[`.
-func MarkdownSurfacesFor(p Paste, public bool) string {
+func MarkdownSurfacesFor(a *api.Artifact) string {
 	switch {
-	case strings.Contains(p.Markdown, "!["):
-		if public {
+	case strings.Contains(blockFor(a), "!["):
+		if a.Public() {
 			return EmbedSurfaces
 		}
 		return PrivateEmbedSurfaces
-	case public:
+	case a.Public():
 		return PlainSurfaces
 	}
 	return PrivatePlainSurfaces
 }
 
-// LinkSurfacesFor is the honest label for a paste's bare-link form. Only a
-// public card unfurls, so only a public one may be described as something to
-// hand to Slack.
-func LinkSurfacesFor(public bool) string {
-	if public {
+// LinkSurfacesFor is the honest label for the bare-link form. Only a public card
+// unfurls, so only a public one may be described as something to hand to Slack.
+func LinkSurfacesFor(a *api.Artifact) string {
+	if a.Public() {
 		return LinkSurfaces
 	}
 	return PrivateLinkSurfaces
@@ -365,9 +364,15 @@ func destinationForm(r Result, destination string) string {
 	return string(Markdown)
 }
 
-// UnfurlWarning is the one line to say on stderr when what was just printed to
+// UnfurlWarning is the one line to say on stderr when what a push printed to
 // stdout is a bare card link for an artifact whose card no keyless reader may
 // open — a `--destination slack` or a `--format url` on a private push.
+//
+// A push and not every command that can print a bare link: `uploads show
+// --format url` and `uploads list --format url` are reading a field out of a
+// record, where a push with a destination is composing something to paste. The
+// warning belongs to the composing path, which is also the only one that offers
+// a destination at all.
 //
 // It is a warning rather than a refusal because the link is not useless: a
 // workspace member who clicks it signs in and sees the card. What it will not
@@ -385,8 +390,8 @@ func UnfurlWarning(r Result, f Format, destination string) string {
 	for _, a := range r.Artifacts {
 		if !a.Public() {
 			return a.Visibility + " card link: it does not unfurl into a preview, and it " +
-				"opens only for a signed-in workspace member. The markdown form still shows " +
-				"the image — `--format markdown`"
+				"opens only for a signed-in workspace member. The markdown form still " +
+				"shows the image"
 		}
 	}
 	return ""

@@ -2258,23 +2258,10 @@ func TestReusingAnIdempotencyKeyAtAnotherVisibilityIsRefused(t *testing.T) {
 	const key = "krowk_sk_owner"
 
 	declared := func(visibility string) (int, map[string]any) {
-		req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/artifacts", strings.NewReader(
+		t.Helper()
+		return keyed(t, http.MethodPost, server.URL+"/v1/artifacts", key, "one-attempt", true,
 			fmt.Sprintf(`{"artifact":{"filename":"shot.png","content_type":"image/png",`+
-				`"byte_size":5,"visibility":%q}}`, visibility)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Authorization", "Bearer "+key)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Idempotency-Key", "one-attempt")
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer res.Body.Close()
-		var payload map[string]any
-		_ = json.NewDecoder(res.Body).Decode(&payload)
-		return res.StatusCode, payload
+				`"byte_size":5,"visibility":%q}}`, visibility))
 	}
 
 	if status, payload := declared("public"); status != http.StatusCreated {
@@ -2284,5 +2271,73 @@ func TestReusingAnIdempotencyKeyAtAnotherVisibilityIsRefused(t *testing.T) {
 		errorCode(payload) != "idempotency_key_reused" {
 		t.Errorf("same key, now private = %d %s, want 409 idempotency_key_reused",
 			status, errorCode(payload))
+	}
+
+	// And the digest is of the payload as declared, not as this stand-in
+	// resolved it: an unnamed visibility and an explicit "public" are the same
+	// artifact but not the same request, so the second is a refusal rather than
+	// a replay handing back the first attempt's artifact.
+	unnamed, first := keyed(t, http.MethodPost, server.URL+"/v1/artifacts", key, "another-attempt", true,
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5}}`)
+	if unnamed != http.StatusCreated {
+		t.Fatalf("declare with no visibility named = %d %v", unnamed, first)
+	}
+	status, payload := keyed(t, http.MethodPost, server.URL+"/v1/artifacts", key, "another-attempt", true,
+		`{"artifact":{"filename":"shot.png","content_type":"image/png","byte_size":5,"visibility":"public"}}`)
+	if status != http.StatusConflict || errorCode(payload) != "idempotency_key_reused" {
+		t.Errorf("same key, visibility now spelled out = %d %s, want 409 idempotency_key_reused",
+			status, errorCode(payload))
+	}
+}
+
+// Asking for the visibility an artifact already has is a no-op, and a no-op is
+// not a refusal: the registry answers it before it asks whether the artifact
+// could move at all, so a pending artifact told to stay public gets the 200 that
+// says nothing changed rather than a complaint about bytes no move would touch.
+func TestTheVisibilityAnArtifactAlreadyHasIsANoOpEvenWhenItCouldNotMove(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+
+	pending := declare(t, server, key, "later.txt", "bytes")
+	slug, _ := pending["slug"].(string)
+
+	status, payload := setVisibility(t, server, key, slug, `{"visibility":"public"}`)
+	if status != http.StatusOK || payload["visibility"] != "public" {
+		t.Errorf("pending artifact told to stay public = %d %v, want 200", status, payload)
+	}
+	// Moving it is still refused, because that is the part with no bytes to copy.
+	if status, payload := setVisibility(t, server, key, slug, `{"visibility":"private"}`); status !=
+		http.StatusUnprocessableEntity || errorCode(payload) != "immovable" {
+		t.Errorf("pending artifact told to move = %d %s, want 422 immovable", status, errorCode(payload))
+	}
+}
+
+// Which refusal answers when more than one could. The workspace scope goes
+// first, because the registry evaluates the artifact before the parameter — and
+// because a complaint about the body would confirm the slug resolved to
+// something this caller is not allowed to know exists.
+func TestTheWorkspaceScopeAnswersBeforeTheBodyDoes(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const owner, stranger = "krowk_sk_owner", "krowk_sk_stranger"
+
+	ready := pushed(t, server, owner, "public", "shot.txt", "bytes")
+	slug, _ := ready["slug"].(string)
+
+	for name, body := range map[string]string{
+		"an undeclarable visibility": `{"visibility":"shared"}`,
+		"no visibility at all":       `{}`,
+	} {
+		if status, payload := setVisibility(t, server, stranger, slug, body); status !=
+			http.StatusNotFound || errorCode(payload) != "not_found" {
+			t.Errorf("another workspace sending %s = %d %s, want 404 not_found",
+				name, status, errorCode(payload))
+		}
+	}
+
+	// Whitespace is a visibility nobody named rather than one spelled wrong,
+	// because the registry reads the parameter through `.presence`.
+	if status, payload := setVisibility(t, server, owner, slug, `{"visibility":"   "}`); status !=
+		http.StatusBadRequest || errorCode(payload) != "parameter_missing" {
+		t.Errorf("whitespace visibility = %d %s, want 400 parameter_missing", status, errorCode(payload))
 	}
 }

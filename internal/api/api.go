@@ -203,8 +203,9 @@ const (
 // lands in the one shared anonymous workspace, so there is no membership for it
 // to be private to, and the registry answers the same refusal under the same
 // code. Built here so both front doors — the CLI's --private and the MCP
-// server's `private` — refuse in the same words as each other and as the
-// registry.
+// server's `private` — refuse in the same words as each other; the registry's
+// own wording differs, because the fix it names is a header where the fix here
+// is a command.
 func PrivateNeedsKey() *Error {
 	return Fail("private_needs_key",
 		"a private upload needs an API key: a keyless upload lands in the shared anonymous "+

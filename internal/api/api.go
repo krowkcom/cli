@@ -676,9 +676,13 @@ func contentTypeFor(path string, head []byte) string {
 		t = strings.TrimSpace(t[:i])
 	}
 	if len(head) > 0 && isMatroskaExt(path) && hasMatroskaVideoTrack(head) {
-		if strings.HasPrefix(t, "audio/") || t == "application/octet-stream" {
-			ext := strings.ToLower(filepath.Ext(path))
-			if ext == ".mkv" {
+		// The subtype is kept: audio/webm becomes video/webm, so the answer
+		// does not depend on which extension table this machine read.
+		if rest, ok := strings.CutPrefix(t, "audio/"); ok {
+			return "video/" + rest
+		}
+		if t == "application/octet-stream" {
+			if strings.ToLower(filepath.Ext(path)) == ".mkv" {
 				return "video/x-matroska"
 			}
 			return "video/webm"

@@ -2058,6 +2058,21 @@ func TestSharedArtifactsCarryShareURL(t *testing.T) {
 	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug+"?share="+token, "", "", ""); status != http.StatusOK {
 		t.Errorf("matching share token = %d, want 200", status)
 	}
+	// The token is the authority, not the workspace: another workspace's key
+	// with the token reads, without it learns nothing.
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug+"?share="+token, "krowk_sk_stranger", "", ""); status != http.StatusOK {
+		t.Errorf("stranger key + matching token = %d, want 200", status)
+	}
+	if status, payload := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "krowk_sk_stranger", "", ""); status != http.StatusNotFound || errorCode(payload) != "not_found" {
+		t.Errorf("stranger key without token = %d %s, want 404 not_found", status, errorCode(payload))
+	}
+	// The card page follows the same posture: bare is never-minted, the token opens it.
+	if status, _ := requestText(t, server.URL+"/a/"+slug); status != http.StatusNotFound {
+		t.Errorf("bare shared card = %d, want 404", status)
+	}
+	if status, body := requestText(t, first); status != http.StatusOK || !strings.Contains(body, first) {
+		t.Errorf("shared card with token = %d, want 200 naming the share_url", status)
+	}
 	for name, target := range map[string]string{
 		"absent":  server.URL + "/v1/artifacts/" + slug,
 		"wrong":   server.URL + "/v1/artifacts/" + slug + "?share=krowk_share_000000000000000000000000",

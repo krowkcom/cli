@@ -139,6 +139,12 @@ func MarkdownSurfacesFor(a *api.Artifact) string {
 	if !a.Public() && !a.Private() && !a.Shared() {
 		return surfacesForUnknown(a)
 	}
+	// A shared artifact without its share_url is a link nobody keyless can open
+	// — an older registry, or a null where the token should be — so it is
+	// promised nothing rather than a public unfurl.
+	if a.Shared() && a.ShareURL == "" {
+		return surfacesForUnknown(a)
+	}
 	switch {
 	case strings.Contains(blockFor(a), "!["):
 		if a.Shared() || a.Public() {
@@ -155,6 +161,9 @@ func MarkdownSurfacesFor(a *api.Artifact) string {
 // unfurls, and so does a shared one — its share_url carries the token a keyless
 // reader opens it with — so both may be described as something to hand to Slack.
 func LinkSurfacesFor(a *api.Artifact) string {
+	if a.Shared() && a.ShareURL == "" {
+		return surfacesForUnknown(a)
+	}
 	switch {
 	case a.Public() || a.Shared():
 		return LinkSurfaces
@@ -419,7 +428,9 @@ func UnfurlWarning(r Result, f Format, destination string) string {
 			return a.Visibility + " card link: it does not unfurl into a preview, and it " +
 				"opens only for a signed-in workspace member. The markdown form still " +
 				"shows the image"
-		case a.Shared() || a.Public():
+		case a.Public():
+			continue
+		case a.Shared() && a.ShareURL != "":
 			continue
 		default:
 			return a.Visibility + " card link: this krowk does not know who that reaches " +

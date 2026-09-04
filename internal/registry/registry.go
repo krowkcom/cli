@@ -1344,8 +1344,9 @@ func (s *store) updateVisibility(w http.ResponseWriter, r *http.Request, site st
 	// fix, before the key requirement answers: the 401 would say only that a key
 	// is missing, where shared_needs_key says a shared artifact needs one and
 	// names Authorization: Bearer. Private keeps its existing posture (401 here;
-	// private_needs_key on create).
-	if _, found := bearer(r.Header.Get("Authorization")); !found && body.Visibility == sharedVisibility {
+	// private_needs_key on create). Only a missing header takes this path — a
+	// malformed one is a credential bug, and falls through to requireKey's 401.
+	if r.Header.Get("Authorization") == "" && body.Visibility == sharedVisibility {
 		writeError(w, http.StatusUnprocessableEntity, "shared_needs_key",
 			"A shared artifact needs an API key — a keyless upload lands in the shared anonymous "+
 				"workspace, which nobody is a member of. Send Authorization: Bearer <key>, or declare "+

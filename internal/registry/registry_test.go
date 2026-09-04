@@ -2073,6 +2073,23 @@ func TestSharedArtifactsCarryShareURL(t *testing.T) {
 	if status, body := requestText(t, first); status != http.StatusOK || !strings.Contains(body, first) {
 		t.Errorf("shared card with token = %d, want 200 naming the share_url", status)
 	}
+	// Privatizing kills the token: the old share link reads as never-minted.
+	priv := pushed(t, server, key, "shared", "cycle.txt", "bytes")
+	privSlug, _ := priv["slug"].(string)
+	privShare, _ := priv["share_url"].(string)
+	privToken := strings.SplitN(privShare, "share=", 2)[1]
+	if status, _ := setVisibility(t, server, key, privSlug, `{"visibility":"private"}`); status != http.StatusOK {
+		t.Fatalf("shared->private = %d", status)
+	}
+	if status, payload := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+privSlug+"?share="+privToken, "", "", ""); status != http.StatusNotFound || errorCode(payload) != "not_found" {
+		t.Errorf("token after privatizing = %d %s, want 404 not_found", status, errorCode(payload))
+	}
+	// A listing never leaks another workspace's slugs.
+	if status, payload := request(t, http.MethodGet, server.URL+"/v1/artifacts?limit=100", "krowk_sk_stranger", "", ""); status != http.StatusOK {
+		t.Fatalf("stranger list = %d %v", status, payload)
+	} else if body, _ := json.Marshal(payload); strings.Contains(string(body), slug) {
+		t.Errorf("stranger listing contains %q", slug)
+	}
 	for name, target := range map[string]string{
 		"absent":  server.URL + "/v1/artifacts/" + slug,
 		"wrong":   server.URL + "/v1/artifacts/" + slug + "?share=krowk_share_000000000000000000000000",

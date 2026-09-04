@@ -141,8 +141,11 @@ func MarkdownSurfacesFor(a *api.Artifact) string {
 	}
 	// A shared artifact without its share_url is a link nobody keyless can open
 	// — an older registry, or a null where the token should be — so it is
-	// promised nothing rather than a public unfurl.
-	if a.Shared() && a.ShareURL == "" {
+	// promised nothing rather than a public unfurl. A share_url the paste does
+	// not actually carry is the same broken promise from the other side: a
+	// stale or hand-made block pointing at the bare card, which answers 404
+	// without the token.
+	if a.Shared() && (a.ShareURL == "" || !strings.Contains(blockFor(a), a.ShareURL)) {
 		return surfacesForUnknown(a)
 	}
 	switch {

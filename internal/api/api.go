@@ -179,9 +179,9 @@ func (c *Client) Insecure() bool {
 }
 
 // The visibilities this client declares and reads. They are names rather than a
-// flag on purpose: `shared` exists in the registry's enum and is not declarable
-// yet, so a reader that branches on the name keeps working when it arrives,
-// where one reading a boolean would have to be changed on the same day.
+// flag on purpose, so a reader that branches on the name keeps working when a
+// new one arrives, where one reading a boolean would have to be changed on the
+// same day.
 //
 // What they mean is canon's (glossary.md -> Visibility), and only two of them
 // concern a client today:

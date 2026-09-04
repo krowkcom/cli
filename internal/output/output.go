@@ -109,11 +109,17 @@ func blockFor(a *api.Artifact) string {
 	if a.Markdown != "" {
 		return a.Markdown
 	}
-	return a.URL
+	return cardFor(a)
 }
 
-// cardFor is the bare link form: the registry's, where it sent one.
+// cardFor is the bare link form: the registry's, where it sent one. A shared
+// artifact's link is its share_url, not the bare card page — the bare page
+// answers 404 without the token, so pasting it would hand on a link nobody
+// keyless can open.
 func cardFor(a *api.Artifact) string {
+	if a.Shared() && a.ShareURL != "" {
+		return a.ShareURL
+	}
 	if a.Paste != nil && a.Paste.URL != "" {
 		return a.Paste.URL
 	}
@@ -130,26 +136,27 @@ func cardFor(a *api.Artifact) string {
 // wraps the embed in. A label cannot counterfeit one: the escaper turns a `[`
 // in a filename into `\[`.
 func MarkdownSurfacesFor(a *api.Artifact) string {
-	if !a.Public() && !a.Private() {
+	if !a.Public() && !a.Private() && !a.Shared() {
 		return surfacesForUnknown(a)
 	}
 	switch {
 	case strings.Contains(blockFor(a), "!["):
-		if a.Public() {
+		if a.Shared() || a.Public() {
 			return EmbedSurfaces
 		}
 		return PrivateEmbedSurfaces
-	case a.Public():
+	case a.Shared() || a.Public():
 		return PlainSurfaces
 	}
 	return PrivatePlainSurfaces
 }
 
-// LinkSurfacesFor is the honest label for the bare-link form. Only a public card
-// unfurls, so only a public one may be described as something to hand to Slack.
+// LinkSurfacesFor is the honest label for the bare-link form. A public card
+// unfurls, and so does a shared one — its share_url carries the token a keyless
+// reader opens it with — so both may be described as something to hand to Slack.
 func LinkSurfacesFor(a *api.Artifact) string {
 	switch {
-	case a.Public():
+	case a.Public() || a.Shared():
 		return LinkSurfaces
 	case a.Private():
 		return PrivateLinkSurfaces
@@ -412,7 +419,9 @@ func UnfurlWarning(r Result, f Format, destination string) string {
 			return a.Visibility + " card link: it does not unfurl into a preview, and it " +
 				"opens only for a signed-in workspace member. The markdown form still " +
 				"shows the image"
-		case !a.Public():
+		case a.Shared() || a.Public():
+			continue
+		default:
 			return a.Visibility + " card link: this krowk does not know who that reaches " +
 				"or whether it unfurls — upgrade before pasting it anywhere"
 		}
@@ -564,13 +573,16 @@ func shareCrumb(a *api.Artifact) Breadcrumb {
 			"sign in to the app, and reads as not found to everyone else. The image embeds " +
 			"anywhere: its byte URL is the capability, so paste the markdown form outside the " +
 			"workspace only when the picture itself is meant to be seen"
+	case a.Shared():
+		description = "hand this link on — whoever holds it opens the card with no key, " +
+			"so share it only with who should see it"
 	case !a.Public():
 		description = "check who this link reaches before handing it on: its visibility is " +
 			a.Visibility + ", which this krowk does not know how to describe"
 	}
 	return Breadcrumb{
 		Action:      "share",
-		Cmd:         a.URL,
+		Cmd:         cardFor(a),
 		Description: description,
 	}
 }
@@ -611,7 +623,7 @@ func humanResult(r Result, quiet, colour bool, now time.Time) string {
 	var lines []string
 	if len(r.Artifacts) == 1 {
 		a := r.Artifacts[0]
-		lines = append(lines, fmt.Sprintf("%s Uploaded %s → %s", tick, a.Filename, a.URL))
+		lines = append(lines, fmt.Sprintf("%s Uploaded %s → %s", tick, a.Filename, cardFor(a)))
 	} else {
 		lines = append(lines, fmt.Sprintf("%s Uploaded %d files", tick, len(r.Artifacts)))
 		width := 0
@@ -619,7 +631,7 @@ func humanResult(r Result, quiet, colour bool, now time.Time) string {
 			width = max(width, len(a.Filename))
 		}
 		for _, a := range r.Artifacts {
-			lines = append(lines, fmt.Sprintf("  %-*s  %s", width, a.Filename, a.URL))
+			lines = append(lines, fmt.Sprintf("  %-*s  %s", width, a.Filename, cardFor(a)))
 		}
 	}
 
@@ -765,7 +777,7 @@ func humanList(p *api.Page, l Listing, colour bool, now time.Time) string {
 	lines := make([]string, 0, len(p.Artifacts)+1)
 	for _, a := range p.Artifacts {
 		line := fmt.Sprintf("%-*s  %*s  %s", nameWidth, a.Filename,
-			sizeWidth, HumanBytes(a.ByteSize), a.URL)
+			sizeWidth, HumanBytes(a.ByteSize), cardFor(a))
 		// A pending artifact is one whose bytes never landed, which is worth
 		// seeing in a listing rather than having to infer from a dead link.
 		if a.State != "ready" {
@@ -1064,7 +1076,7 @@ func humanClaimed(a *api.Artifact, colour bool) string {
 		facts = append(facts, "run "+run)
 	}
 	facts = append(facts, "kept for good")
-	return fmt.Sprintf("%s Claimed %s → %s", paint(colour, green, "✓"), a.Filename, a.URL) +
+	return fmt.Sprintf("%s Claimed %s → %s", paint(colour, green, "✓"), a.Filename, cardFor(a)) +
 		"\n" + paint(colour, dim, "  "+strings.Join(facts, " · "))
 }
 
@@ -1073,7 +1085,7 @@ func humanArtifact(a *api.Artifact, colour bool, now time.Time) string {
 	if a.State != "" {
 		head += paint(colour, dim, "  "+a.State)
 	}
-	lines := []string{head, "  " + a.URL}
+	lines := []string{head, "  " + cardFor(a)}
 
 	var facts []string
 	if visibility := visibilityFact(a); visibility != "" {

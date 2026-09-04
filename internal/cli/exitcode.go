@@ -96,6 +96,10 @@ var clientCodes = map[string]int{
 	// the registry answers both 422, and both are a request that has to change
 	// as much as a credential that has to appear.
 	"private_needs_key": exitRefused,
+	// A shared artifact with no key, refused the same way and for the same
+	// reason. The registry answers 422 shared_needs_key for a keyless declare or
+	// visibility change naming shared, so a local refusal must classify the same.
+	"shared_needs_key": exitRefused,
 
 	// The registry took a declare and answered without the visibility it asked
 	// for, so krowk refused before sending the bytes. exitRefused for the same

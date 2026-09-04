@@ -196,6 +196,10 @@ func (c *Client) Insecure() bool {
 const (
 	VisibilityPublic  = "public"
 	VisibilityPrivate = "private"
+	// VisibilityShared is the visibility whose card a keyless holder of the link
+	// does see, via the share_url carrying the token. Declarable; the token is
+	// minted fresh on every entry to shared and cleared on leaving.
+	VisibilityShared = "shared"
 )
 
 // PrivateNeedsKey is the refusal a private upload with no key gets. Raised
@@ -258,6 +262,10 @@ type Artifact struct {
 	// a person or an agent is handed points at the card instead.
 	FileURL  string `json:"file_url,omitempty"`
 	Markdown string `json:"markdown,omitempty"`
+	// ShareURL is the link a shared artifact is handed on as: the card page with
+	// the token in the query string. Null unless visibility is shared. Empty on
+	// this side when the registry sent null or predates the field.
+	ShareURL string `json:"share_url,omitempty"`
 	// Paste is this artifact in the forms its destinations need, computed by
 	// the registry. It is served rather than assembled so that how a krowk
 	// reference looks is one deploy away from changing everywhere, including in
@@ -330,6 +338,12 @@ func (a *Artifact) Public() bool {
 // a privacy feature, and it is the way a two-way split gets it wrong.
 func (a *Artifact) Private() bool {
 	return a != nil && a.Visibility == VisibilityPrivate
+}
+
+// Shared reports whether this artifact is shared: readable keyless by whoever
+// holds the share_url, whose token is the whole of that authority.
+func (a *Artifact) Shared() bool {
+	return a != nil && a.Visibility == VisibilityShared
 }
 
 // visibilityAnswered is what to call what came back, for a refusal that has to

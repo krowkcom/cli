@@ -629,10 +629,27 @@ func Inspect(path string) (Spec, error) {
 		return Spec{}, Fail("file_unreadable", "could not read all of `"+path+"`: "+err.Error())
 	}
 
+	// A .webm/.mkv carrying a video track is video, whatever the extension
+	// table says: Go's own table reports audio/webm for .webm, so a screen
+	// recording declared from the extension alone uploads as audio and
+	// previews as audio. The head is re-read here rather than streamed
+	// above, because the digest pass already consumed the handle.
+	var head []byte
+	if isMatroskaExt(path) {
+		if _, err := f.Seek(0, io.SeekStart); err == nil {
+			head = make([]byte, matroskaHeadLimit)
+			if n, err := io.ReadFull(f, head); err == nil || err == io.ErrUnexpectedEOF {
+				head = head[:n]
+			} else {
+				head = nil
+			}
+		}
+	}
+
 	return Spec{
 		Path:        path,
 		Filename:    filepath.Base(path),
-		ContentType: ContentType(path),
+		ContentType: contentTypeFor(path, head),
 		ByteSize:    info.Size(),
 		Checksum:    hex.EncodeToString(digest.Sum(nil)),
 	}, nil
@@ -642,14 +659,104 @@ func Inspect(path string) (Spec, error) {
 // type is signed into the upload URL and stored on the artifact, so the shortest
 // accurate string is the one worth committing to.
 func ContentType(path string) string {
+	return contentTypeFor(path, nil)
+}
+
+// contentTypeFor is ContentType with the file's head where one exists. The
+// head only matters for Matroska containers (.webm/.mkv): the extension table
+// answers audio/webm for .webm, so a video recorded into one uploads as audio
+// unless the bytes are consulted. With a video track in the head the answer is
+// always video/*, never audio/*; without one — audio-only or an unreadable
+// head — the extension answer stands.
+func contentTypeFor(path string, head []byte) string {
 	t := mime.TypeByExtension(filepath.Ext(path))
 	if t == "" {
-		return "application/octet-stream"
-	}
-	if i := strings.IndexByte(t, ';'); i >= 0 {
+		t = "application/octet-stream"
+	} else if i := strings.IndexByte(t, ';'); i >= 0 {
 		t = strings.TrimSpace(t[:i])
 	}
+	if len(head) > 0 && isMatroskaExt(path) && hasMatroskaVideoTrack(head) {
+		if strings.HasPrefix(t, "audio/") || t == "application/octet-stream" {
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == ".mkv" {
+				return "video/x-matroska"
+			}
+			return "video/webm"
+		}
+	}
 	return t
+}
+
+// matroskaHeadLimit is how much of the file the video-track sniff reads.
+// Tracks sit near the start of a Matroska file, so this covers real recordings
+// without reading a whole video into memory to declare it.
+const matroskaHeadLimit = 512 << 10
+
+// isMatroskaExt reports whether the path names a Matroska container, where a
+// video track decides the declared kind.
+func isMatroskaExt(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".webm", ".mkv":
+		return true
+	}
+	return false
+}
+
+// hasMatroskaVideoTrack reports whether head holds a Matroska video track: an
+// EBML header followed by a TrackType of video (1) or a video CodecID. The
+// EBML gate comes first so bytes that merely mention "V_VP9" in some other
+// format cannot promote a renamed file to video.
+func hasMatroskaVideoTrack(head []byte) bool {
+	if len(head) < 4 || !bytes.Equal(head[:4], []byte{0x1A, 0x45, 0xDF, 0xA3}) {
+		return false
+	}
+	if hasVideoTrackType(head) {
+		return true
+	}
+	for _, codec := range matroskaVideoCodecs {
+		if bytes.Contains(head, codec) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasVideoTrackType scans for a TrackType element (ID 0x83) whose value is 1
+// (video). The size is decoded as an EBML varint rather than assumed, so a
+// writer that sizes the one-byte value differently still matches.
+func hasVideoTrackType(head []byte) bool {
+	for i := 0; i+2 < len(head); i++ {
+		if head[i] != 0x83 {
+			continue
+		}
+		sizeByte := head[i+1]
+		width := 0
+		for b := sizeByte; b&0x80 == 0 && width < 8; b <<= 1 {
+			width++
+		}
+		// A TrackType value is one byte; anything longer is not this element.
+		if width != 0 {
+			continue
+		}
+		if head[i+1]&0x7F != 1 {
+			continue
+		}
+		if head[i+2] == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// matroskaVideoCodecs are the CodecID strings a video TrackEntry carries. The
+// list names the families rather than every fourcc: CodecID is a container-level
+// constant ("V_VP9", "V_AV1"), so matching the family covers every file using it.
+var matroskaVideoCodecs = [][]byte{
+	[]byte("V_MPEG1"), []byte("V_MPEG2"), []byte("V_MPEG4"),
+	[]byte("V_MPEGH"), []byte("V_MPEGI"), []byte("V_MS/VFW"),
+	[]byte("V_THEORA"), []byte("V_REAL"), []byte("V_QUICKTIME"),
+	[]byte("V_VP8"), []byte("V_VP9"), []byte("V_AV1"),
+	[]byte("V_VC1"), []byte("V_DIRAC"), []byte("V_PRORES"),
 }
 
 // Push runs the whole upload for one file: declare, send the bytes, finalize.

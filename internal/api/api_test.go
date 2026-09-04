@@ -831,3 +831,87 @@ func TestAnUnrecognisedVisibilityIsNeitherPublicNorPrivate(t *testing.T) {
 		}
 	}
 }
+
+// A .webm holding video is video, never audio: Go's extension table answers
+// audio/webm for .webm, so declaring from the extension alone uploads a screen
+// recording as audio. An audio-only .webm, and bytes that are not Matroska at
+// all, keep the extension answer — the video kind needs a video track.
+func TestWebmWithVideoTrackIsDeclaredVideo(t *testing.T) {
+	matroska := func(video bool, codec string) []byte {
+		head := []byte{0x1A, 0x45, 0xDF, 0xA3}
+		head = append(head, []byte("webm")...)
+		if video {
+			head = append(head, 0x83, 0x81, 0x01)
+			if codec != "" {
+				head = append(head, []byte(codec)...)
+			}
+		} else {
+			head = append(head, 0x83, 0x81, 0x02)
+			head = append(head, []byte("A_OPUS")...)
+		}
+		return append(head, make([]byte, 64)...)
+	}
+
+	write := func(t *testing.T, name string, b []byte) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	video := write(t, "clip.webm", matroska(true, "V_VP9"))
+	spec, err := Inspect(video)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.ContentType != "video/webm" {
+		t.Errorf("video .webm content type = %q, want video/webm", spec.ContentType)
+	}
+
+	codecOnly := write(t, "codec.webm", append([]byte{0x1A, 0x45, 0xDF, 0xA3}, append([]byte("webm"), []byte("V_AV1")...)...))
+	spec, err = Inspect(codecOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.ContentType != "video/webm" {
+		t.Errorf("codec-only .webm content type = %q, want video/webm", spec.ContentType)
+	}
+
+	audio := write(t, "voice.webm", matroska(false, ""))
+	spec, err = Inspect(audio)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.ContentType; strings.HasPrefix(got, "video/") {
+		t.Errorf("audio-only .webm content type = %q, want it to stay audio", got)
+	}
+
+	renamed := write(t, "notes.webm", []byte("just text in a webm suit"))
+	spec, err = Inspect(renamed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.ContentType != ContentType(renamed) {
+		t.Errorf("non-Matroska .webm = %q, want the extension answer %q", spec.ContentType, ContentType(renamed))
+	}
+
+	mkv := write(t, "clip.mkv", matroska(true, "V_AV1"))
+	spec, err = Inspect(mkv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.ContentType; !strings.HasPrefix(got, "video/") || strings.HasPrefix(got, "audio/") {
+		t.Errorf(".mkv with a video track = %q, want video/*, never audio/*", got)
+	}
+
+	upper := write(t, "CLIP.WEBM", matroska(true, "V_VP9"))
+	spec, err = Inspect(upper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.ContentType != "video/webm" {
+		t.Errorf("upper-extension video .webm = %q, want video/webm", spec.ContentType)
+	}
+}

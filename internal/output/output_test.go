@@ -845,7 +845,8 @@ func TestARunLabelIsClippedOnceWhateverItIsBuiltFrom(t *testing.T) {
 // in — calling it private would tell somebody their link is workspace-only
 // when it is not. Understating who can read an artifact is the dangerous way
 // to be wrong about a privacy feature.
-func TestAnUnknownVisibilityIsNeverDescribedAsPrivate(t *testing.T) {	a := &api.Artifact{
+func TestAnUnknownVisibilityIsNeverDescribedAsPrivate(t *testing.T) {
+	a := &api.Artifact{
 		Slug: "art_2e1d", Filename: "report.html", ContentType: "text/html",
 		Visibility: "secret",
 		URL:        "https://krowk.com/a/art_2e1d",

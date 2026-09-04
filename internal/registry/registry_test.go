@@ -2439,7 +2439,8 @@ func TestTheWorkspaceScopeAnswersBeforeTheBodyDoes(t *testing.T) {
 
 	for name, body := range map[string]string{
 		"an undeclarable visibility": `{"visibility":"secret"}`,
-		"no visibility at all":       `{}`,	} {
+		"no visibility at all":       `{}`,
+	} {
 		if status, payload := setVisibility(t, server, stranger, slug, body); status !=
 			http.StatusNotFound || errorCode(payload) != "not_found" {
 			t.Errorf("another workspace sending %s = %d %s, want 404 not_found",

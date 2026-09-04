@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.krowkcom/krowk",
+  "description": "Publish agent output — screenshots, recordings, logs, reports — to a permanent link that unfurls as a card in GitHub, Slack, Basecamp and Linear.",
+  "repository": {
+    "url": "https://github.com/krowkcom/cli",
+    "source": "github"
+  },
+  "version": "0.8.2",
+  "websiteUrl": "https://krowk.com",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@krowk/mcp",
+      "version": "0.8.2",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "KROWK_API_KEY",
+          "description": "Optional. Adds run grouping, listings and permanence past the 24-hour anonymous expiry. Pushing works without it.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "krowk",
+  "version": "0.8.2",
+  "description": "See what your agent built without spinning it up — publish screenshots, recordings and reports to permalinks that unfurl in GitHub, Slack, Basecamp and Linear.",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "krowk": {
+      "command": "npx",
+      "args": ["-y", "@krowk/mcp"]
+    }
+  },
+  "settings": [
+    {
+      "name": "Krowk API key",
+      "description": "Optional. Adds run grouping, listings and permanence.",
+      "envVar": "KROWK_API_KEY",
+      "sensitive": true
+    }
+  ]
+}

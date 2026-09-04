@@ -841,14 +841,14 @@ func TestARunLabelIsClippedOnceWhateverItIsBuiltFrom(t *testing.T) {
 }
 
 // A visibility this build has never heard of is described by name and promised
-// nothing. The next one to arrive is `shared` — the visibility whose card a
-// keyless holder of the link *does* see — so calling it private would tell
-// somebody their link is workspace-only when it is not. Understating who can
-// read an artifact is the dangerous way to be wrong about a privacy feature.
+// nothing. `shared` used to be the example here; now known, so `secret` stands
+// in — calling it private would tell somebody their link is workspace-only
+// when it is not. Understating who can read an artifact is the dangerous way
+// to be wrong about a privacy feature.
 func TestAnUnknownVisibilityIsNeverDescribedAsPrivate(t *testing.T) {
 	a := &api.Artifact{
 		Slug: "art_2e1d", Filename: "report.html", ContentType: "text/html",
-		Visibility: "shared",
+		Visibility: "secret",
 		URL:        "https://krowk.com/a/art_2e1d",
 		Paste: &api.Paste{
 			Markdown: "**report.html** · [View preview ↗](https://krowk.com/a/art_2e1d)",
@@ -872,8 +872,35 @@ func TestAnUnknownVisibilityIsNeverDescribedAsPrivate(t *testing.T) {
 		if strings.Contains(line, "Slack") || strings.Contains(line, "unfurl the link themselves") {
 			t.Errorf("an unknown visibility was promised an unfurl: %q", line)
 		}
-		if !strings.Contains(line, "shared") {
+		if !strings.Contains(line, "secret") {
 			t.Errorf("the visibility that came back is not named: %q", line)
 		}
+	}
+}
+
+// A shared artifact is promised an unfurl only where the paste actually
+// carries the share_url. A stale block pointing at the bare card — which
+// answers 404 without the token — or a missing token must not be labelled
+// public.
+func TestSharedSurfacesNeedTheShareURLInThePaste(t *testing.T) {
+	share := "https://krowk.com/a/art_2e1d?share=krowk_share_aaaaaaaaaaaaaaaaaaaaaaaa"
+	bare := "https://krowk.com/a/art_2e1d"
+	linked := &api.Artifact{Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
+		Visibility: "shared", URL: bare, ShareURL: share,
+		Paste: &api.Paste{Markdown: "[![shot.png](https://cdn/x/shot.png)](" + share + ")", URL: share}}
+	if got := MarkdownSurfacesFor(linked); got != EmbedSurfaces {
+		t.Errorf("linked shared surfaces = %q, want %q", got, EmbedSurfaces)
+	}
+	stale := &api.Artifact{Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
+		Visibility: "shared", URL: bare, ShareURL: share,
+		Paste: &api.Paste{Markdown: "[![shot.png](https://cdn/x/shot.png)](" + bare + ")", URL: bare}}
+	if got := MarkdownSurfacesFor(stale); !strings.Contains(got, "shared") || strings.Contains(got, "Slack") {
+		t.Errorf("stale shared surfaces = %q, want unknown naming shared", got)
+	}
+	empty := &api.Artifact{Slug: "art_2e1d", Filename: "shot.png", ContentType: "image/png",
+		Visibility: "shared", URL: bare,
+		Paste: &api.Paste{Markdown: "[shot.png](" + bare + ")", URL: bare}}
+	if got := LinkSurfacesFor(empty); strings.Contains(got, "Slack") {
+		t.Errorf("tokenless shared link surfaces = %q, want no unfurl promise", got)
 	}
 }

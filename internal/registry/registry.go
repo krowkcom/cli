@@ -101,12 +101,15 @@ const (
 	artifactRegion = "weur"
 )
 
+// sharedVisibility is the visibility whose card a keyless holder of the link
+// does see, via the share_url carrying the token. Declarable now that the
+// token, revocation (re-key + fresh token on every entry, cleared on leaving)
+// and 404-not-403 posture below match the registry's contract (registry#90).
+const sharedVisibility = "shared"
+
 // declarableVisibilities are the ones a client may name, on a declare or on a
-// visibility change. Deliberately shorter than the registry's own enum, which
-// also holds `shared`: that one is real below the API and refused at it until
-// it has a token, revocation and expiry contract, so a stand-in that accepted
-// the word would let a client pass here and fail in production.
-var declarableVisibilities = []string{defaultVisibility, "private"}
+// visibility change.
+var declarableVisibilities = []string{defaultVisibility, "private", sharedVisibility}
 
 type artifact struct {
 	Slug        string `json:"slug"`
@@ -161,6 +164,9 @@ type artifact struct {
 	// storageKey is pinned at declare time: claiming moves the artifact to a
 	// new workspace, but the bytes stay where the presigned URL was signed for.
 	storageKey string
+	// shareToken is the secret behind share_url, minted fresh on every entry to
+	// shared and cleared on leaving. Empty unless visibility is shared.
+	shareToken string
 	// seq orders a listing. A timestamp would tie when two artifacts are created
 	// in the same instant, and a page has to be totally ordered or rows swap
 	// places between pages.
@@ -496,10 +502,17 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		return
 	}
 	if anonymous && visibility != defaultVisibility {
-		writeError(w, http.StatusUnprocessableEntity, "private_needs_key",
-			"A private artifact needs an API key — a keyless upload lands in the shared anonymous "+
-				"workspace, which nobody is a member of. Send Authorization: Bearer <key>, or declare "+
-				"it public.", nil)
+		if visibility == sharedVisibility {
+			writeError(w, http.StatusUnprocessableEntity, "shared_needs_key",
+				"A shared artifact needs an API key — a keyless upload lands in the shared anonymous "+
+					"workspace, which nobody is a member of. Send Authorization: Bearer <key>, or declare "+
+					"it public.", nil)
+		} else {
+			writeError(w, http.StatusUnprocessableEntity, "private_needs_key",
+				"A private artifact needs an API key — a keyless upload lands in the shared anonymous "+
+					"workspace, which nobody is a member of. Send Authorization: Bearer <key>, or declare "+
+					"it public.", nil)
+		}
 		return
 	}
 
@@ -554,6 +567,16 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	url := site + "/a/" + slug
 	now := s.now().UTC()
 
+	// A shared artifact's link is the share_url, not the bare card page: the
+	// token is minted fresh on every entry to shared, so re-sharing yields a
+	// different share_url and revokes the last one.
+	shareToken := ""
+	cardLink := url
+	if visibility == sharedVisibility {
+		shareToken = newShareToken()
+		cardLink = shareURL(url, shareToken)
+	}
+
 	a := &artifact{
 		Slug:        slug,
 		State:       "pending",
@@ -565,13 +588,14 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 		Visibility:  visibility,
 		URL:         url,
 		FileURL:     fileURL,
-		Markdown:    markdown(in.Filename, in.ContentType, fileURL, url),
+		Markdown:    markdown(in.Filename, in.ContentType, fileURL, cardLink),
 		CreatedAt:   now.Format(time.RFC3339Nano),
 		Metadata:    metadata,
 		workspace:   workspace,
 		uploadTok:   randomToken(),
 		uploadTil:   now.Add(UploadURLLifetime),
 		storageKey:  key,
+		shareToken:  shareToken,
 	}
 	if in.Run != "" {
 		a.Run = in.Run
@@ -892,10 +916,10 @@ func (s *store) artifactPage(w http.ResponseWriter, r *http.Request) {
 	//
 	// Anything that is not public is refused, rather than private specifically,
 	// because failing closed is the only safe default for a visibility this
-	// build has not heard of. `shared` will need a branch here when it lands:
-	// it is defined as the one visibility whose card a keyless holder of the
-	// link does see.
-	if a != nil && a.Visibility != defaultVisibility {
+	// build has not heard of. The one exception is shared: it is defined as the
+	// visibility whose card a keyless holder of the link does see, via the
+	// share_url token — a wrong, absent or revoked token reads as never-minted.
+	if a != nil && a.Visibility != defaultVisibility && !s.shareReadable(a, r) {
 		a = nil
 	}
 	var (
@@ -915,6 +939,12 @@ func (s *store) artifactPage(w http.ResponseWriter, r *http.Request) {
 			gone = "expired"
 		}
 		filename, fileURL, cardURL = a.Filename, a.FileURL, a.URL
+		// A shared card is addressed by its share_url: the bare page answers 404
+		// without the token, so the page that did render names the link that
+		// reaches it.
+		if a.Visibility == sharedVisibility && a.shareToken != "" {
+			cardURL = shareURL(a.URL, a.shareToken)
+		}
 		image = strings.HasPrefix(a.ContentType, "image/")
 		pending = a.State != "ready"
 		size = a.ByteSize
@@ -1156,7 +1186,7 @@ func (s *store) showArtifact(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 
 	a := s.artifacts[r.PathValue("slug")]
-	if a == nil || !readable(a, workspace) {
+	if a == nil || !(readable(a, workspace) || s.shareReadable(a, r)) {
 		writeError(w, http.StatusNotFound, "not_found", "No such record.", nil)
 		return
 	}
@@ -1304,15 +1334,28 @@ func (s *store) refuseIfGone(w http.ResponseWriter, a *artifact) bool {
 // unreachable or unconfigured. There is no edge in front of this, so a client
 // handler for either is something the local suite proves nothing about.
 func (s *store) updateVisibility(w http.ResponseWriter, r *http.Request, site string) {
-	workspace, ok := requireKey(w, r)
-	if !ok {
-		return
-	}
-
 	var body struct {
 		Visibility string `json:"visibility"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); unreadableBody(w, err) {
+		return
+	}
+	// A keyless caller declaring shared is refused with the code that names the
+	// fix, before the key requirement answers: the 401 would say only that a key
+	// is missing, where shared_needs_key says a shared artifact needs one and
+	// names Authorization: Bearer. Private keeps its existing posture (401 here;
+	// private_needs_key on create). Only a missing header takes this path — a
+	// malformed one is a credential bug, and falls through to requireKey's 401.
+	if r.Header.Get("Authorization") == "" && body.Visibility == sharedVisibility {
+		writeError(w, http.StatusUnprocessableEntity, "shared_needs_key",
+			"A shared artifact needs an API key — a keyless upload lands in the shared anonymous "+
+				"workspace, which nobody is a member of. Send Authorization: Bearer <key>, or declare "+
+				"it public.", nil)
+		return
+	}
+
+	workspace, ok := requireKey(w, r)
+	if !ok {
 		return
 	}
 
@@ -1421,10 +1464,22 @@ func (s *store) rekey(a *artifact, to, site string) {
 	}
 	delete(s.objects, a.storageKey)
 
+	// Entering shared mints a fresh token, so re-sharing yields a different
+	// share_url and revokes the last one; leaving clears it. Repeating the same
+	// visibility never reaches here — the no-op above returns first — so a retry
+	// withdraws nothing.
+	cardLink := a.URL
+	if to == sharedVisibility {
+		a.shareToken = newShareToken()
+		cardLink = shareURL(a.URL, a.shareToken)
+	} else {
+		a.shareToken = ""
+	}
+
 	a.storageKey = key
 	a.Visibility = to
 	a.FileURL = site + "/_storage/" + key
-	a.Markdown = markdown(a.Filename, a.ContentType, a.FileURL, a.URL)
+	a.Markdown = markdown(a.Filename, a.ContentType, a.FileURL, cardLink)
 }
 
 // refuseVisibility is the one refusal for a word this API does not take, said
@@ -2388,6 +2443,10 @@ func (s *store) serializeArtifact(a *artifact) map[string]any {
 		"run":        s.serializeArtifactRun(a),
 		"url":        a.URL,
 		"file_url":   a.FileURL,
+		// Always present, null unless shared: the link a keyless holder of a
+		// shared artifact actually opens. A reader branches on the value rather
+		// than on whether the key arrived, like width/height/metadata below.
+		"share_url":  shareURLValue(a),
 		"markdown":   a.Markdown,
 		"paste":      pasteFor(a),
 		"expires_at": a.ExpiresAt,
@@ -2456,10 +2515,20 @@ var destinationClasses = map[string]string{
 // pasteFor is the artifact in the two forms its destinations need, plus the
 // table saying which is which. Both forms are always present: a consumer picks
 // by destination and pastes verbatim, and never assembles either itself.
+//
+// A shared artifact's forms link the share_url, not the bare card page: the
+// bare page answers 404 without the token, so pasting it would hand on a link
+// nobody keyless can open.
 func pasteFor(a *artifact) map[string]any {
+	link := a.URL
+	if u := shareURLValue(a); u != nil {
+		if s, ok := u.(string); ok {
+			link = s
+		}
+	}
 	return map[string]any{
 		"markdown":     pasteBlock(a),
-		"url":          a.URL,
+		"url":          link,
 		"destinations": destinationClasses,
 	}
 }
@@ -2476,6 +2545,12 @@ func pasteFor(a *artifact) map[string]any {
 func pasteBlock(a *artifact) string {
 	caption := labelEscaper.Replace(pasteCaption(a))
 	image := strings.HasPrefix(a.ContentType, "image/")
+	link := a.URL
+	if u := shareURLValue(a); u != nil {
+		if s, ok := u.(string); ok {
+			link = s
+		}
+	}
 
 	// Bold only where the caption is the whole of the block. Under an image it
 	// is already carrying the picture's weight, and bolding it there would make
@@ -2484,7 +2559,7 @@ func pasteBlock(a *artifact) string {
 	if !image {
 		label = "**" + caption + "**"
 	}
-	parts := []string{label, "[View preview ↗](" + a.URL + ")"}
+	parts := []string{label, "[View preview ↗](" + link + ")"}
 	if until := pasteExpiry(a); until != "" {
 		parts = append(parts, "expires "+until)
 	}
@@ -2493,7 +2568,7 @@ func pasteBlock(a *artifact) string {
 	if !image {
 		return line
 	}
-	return fmt.Sprintf("[![%s](%s)](%s)\n%s", caption, a.FileURL, a.URL, line)
+	return fmt.Sprintf("[![%s](%s)](%s)\n%s", caption, a.FileURL, link, line)
 }
 
 // pasteCaption is what the block says this artifact is: the caption recorded on
@@ -2594,6 +2669,41 @@ func randomBase36() string {
 		b[i] = slugAlphabet[int(v)%len(slugAlphabet)]
 	}
 	return string(b)
+}
+
+// newShareToken mints the secret behind a share_url: the registry's own shape,
+// krowk_share_ plus 24 lowercase base36 characters — the same draw as a slug's
+// random half, so the two never diverge into different alphabets or lengths.
+func newShareToken() string {
+	return "krowk_share_" + randomBase36()
+}
+
+// shareURL is the link a shared artifact is handed on as: the card page with
+// the token in the query string. Built off the stored card URL so the origin
+// stays the one the artifact was declared against.
+func shareURL(cardURL, token string) string {
+	return cardURL + "?share=" + token
+}
+
+// shareURLValue is the share_url as the API reports it: null unless shared,
+// otherwise the card page with the token. Always present as a key — a reader
+// branches on the value rather than on whether it arrived.
+func shareURLValue(a *artifact) any {
+	if a.Visibility != sharedVisibility || a.shareToken == "" {
+		return nil
+	}
+	return shareURL(a.URL, a.shareToken)
+}
+
+// shareReadable reports whether the request carries the share token for a
+// shared artifact. A matching token reads even without a key; a wrong, absent
+// or revoked one reads as never-minted (404, not 403), the same posture as the
+// registry. Caller holds the lock — the token lives on the row.
+func (s *store) shareReadable(a *artifact, r *http.Request) bool {
+	if a == nil || a.Visibility != sharedVisibility || a.shareToken == "" {
+		return false
+	}
+	return r.URL.Query().Get("share") == a.shareToken
 }
 
 // storageKeyFor is where an artifact's bytes live, and the shape of the key is

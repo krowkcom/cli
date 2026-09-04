@@ -812,9 +812,8 @@ func TestPushRefusesToUploadWhenTheVisibilityWasNotApplied(t *testing.T) {
 	}
 }
 
-// Public and Private are two questions, not one negated. `shared` is defined as
-// the visibility whose card a keyless holder of the link does see, so a build
-// that has not heard of it must answer no to both rather than calling it
+// Public and Private are two questions, not one negated. `shared` is the third
+// answer (see Shared), so it must answer no to both rather than reading as
 // private — understating who can read an artifact is the dangerous way to be
 // wrong about a privacy feature.
 func TestAnUnrecognisedVisibilityIsNeitherPublicNorPrivate(t *testing.T) {

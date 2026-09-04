@@ -1987,15 +1987,13 @@ func TestVisibilityIsDeclaredAndServedOnEveryRead(t *testing.T) {
 	}
 }
 
-// `shared` is a real value below the API in the registry and is refused at it
-// until it has a revocation contract, so a stand-in that accepted the word
-// would let a client pass here and fail in production. Anything else is refused
-// the same way rather than quietly downgraded to public: the client asked for
-// bytes not to be public and would not be getting that.
+// Anything this API does not take is refused rather than quietly downgraded to
+// public: the client asked for bytes not to be public and would not be getting
+// that. `shared` is declarable; anything else is not.
 func TestAVisibilityTheAPIDoesNotTakeIsRefusedRatherThanDowngraded(t *testing.T) {
 	server, _ := newClockedServer(t)
 
-	for _, asked := range []string{"shared", "secret", "PUBLIC"} {
+	for _, asked := range []string{"secret", "PUBLIC"} {
 		status, payload := declareVisible(t, server, "krowk_sk_owner", asked, "shot.png", "bytes")
 		if status != http.StatusUnprocessableEntity || errorCode(payload) != "visibility_unavailable" {
 			t.Errorf("declared %q = %d %s, want 422 visibility_unavailable",
@@ -2021,6 +2019,115 @@ func TestAKeylessUploadCannotBePrivate(t *testing.T) {
 	// invalid it would retry public, which is the outcome it was avoiding.
 	if message, _ := payload["error"].(map[string]any)["message"].(string); !strings.Contains(message, "API key") {
 		t.Errorf("message = %q, want it to name the key that would work", message)
+	}
+}
+
+// A shared artifact carries share_url on every artifact response, null unless
+// shared: the card page with ?share=krowk_share_{24 base36}. Entering shared
+// mints a fresh token and leaving clears it, so re-sharing revokes the last
+// link; a matching token reads keyless and anything else reads as never-minted.
+func TestSharedArtifactsCarryShareURL(t *testing.T) {
+	server, _ := newClockedServer(t)
+	const key = "krowk_sk_owner"
+	shape := regexp.MustCompile(`/a/art_[a-z0-9]{24}\?share=krowk_share_[a-z0-9]{24}$`)
+
+	// Null unless shared, on create and on every read.
+	public := pushed(t, server, key, "public", "shot.txt", "bytes")
+	if public["share_url"] != nil {
+		t.Errorf("public share_url = %v, want null", public["share_url"])
+	}
+	private := pushed(t, server, key, "private", "secret.txt", "bytes")
+	if private["share_url"] != nil {
+		t.Errorf("private share_url = %v, want null", private["share_url"])
+	}
+	shared := pushed(t, server, key, "shared", "shared.txt", "bytes")
+	first, _ := shared["share_url"].(string)
+	if !shape.MatchString(first) {
+		t.Fatalf("shared share_url = %q, want /a/{slug}?share=krowk_share_{24 base36}", first)
+	}
+	slug, _ := shared["slug"].(string)
+	if markdown, _ := shared["markdown"].(string); !strings.Contains(markdown, first) {
+		t.Errorf("shared markdown = %q, want the share_url", markdown)
+	}
+	if got, _ := pasteOf(t, shared)["url"].(string); got != first {
+		t.Errorf("paste.url = %q, want the share_url %q", got, first)
+	}
+
+	// A matching token reads keyless; wrong, absent or revoked reads 404, not 403.
+	token := strings.SplitN(first, "share=", 2)[1]
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug+"?share="+token, "", "", ""); status != http.StatusOK {
+		t.Errorf("matching share token = %d, want 200", status)
+	}
+	// The token is the authority, not the workspace: another workspace's key
+	// with the token reads, without it learns nothing.
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug+"?share="+token, "krowk_sk_stranger", "", ""); status != http.StatusOK {
+		t.Errorf("stranger key + matching token = %d, want 200", status)
+	}
+	if status, payload := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "krowk_sk_stranger", "", ""); status != http.StatusNotFound || errorCode(payload) != "not_found" {
+		t.Errorf("stranger key without token = %d %s, want 404 not_found", status, errorCode(payload))
+	}
+	// The card page follows the same posture: bare is never-minted, the token opens it.
+	if status, _ := requestText(t, server.URL+"/a/"+slug); status != http.StatusNotFound {
+		t.Errorf("bare shared card = %d, want 404", status)
+	}
+	if status, body := requestText(t, first); status != http.StatusOK || !strings.Contains(body, first) {
+		t.Errorf("shared card with token = %d, want 200 naming the share_url", status)
+	}
+	// Privatizing kills the token: the old share link reads as never-minted.
+	priv := pushed(t, server, key, "shared", "cycle.txt", "bytes")
+	privSlug, _ := priv["slug"].(string)
+	privShare, _ := priv["share_url"].(string)
+	privToken := strings.SplitN(privShare, "share=", 2)[1]
+	if status, _ := setVisibility(t, server, key, privSlug, `{"visibility":"private"}`); status != http.StatusOK {
+		t.Fatalf("shared->private = %d", status)
+	}
+	if status, payload := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+privSlug+"?share="+privToken, "", "", ""); status != http.StatusNotFound || errorCode(payload) != "not_found" {
+		t.Errorf("token after privatizing = %d %s, want 404 not_found", status, errorCode(payload))
+	}
+	// A listing never leaks another workspace's slugs.
+	if status, payload := request(t, http.MethodGet, server.URL+"/v1/artifacts?limit=100", "krowk_sk_stranger", "", ""); status != http.StatusOK {
+		t.Fatalf("stranger list = %d %v", status, payload)
+	} else if body, _ := json.Marshal(payload); strings.Contains(string(body), slug) {
+		t.Errorf("stranger listing contains %q", slug)
+	}
+	for name, target := range map[string]string{
+		"absent":  server.URL + "/v1/artifacts/" + slug,
+		"wrong":   server.URL + "/v1/artifacts/" + slug + "?share=krowk_share_000000000000000000000000",
+		"revoked": server.URL + "/v1/artifacts/" + slug + "?share=" + token,
+	} {
+		if name == "revoked" {
+			// Leave and re-enter: leaving clears, re-sharing mints fresh.
+			if status, _ := setVisibility(t, server, key, slug, `{"visibility":"public"}`); status != http.StatusOK {
+				t.Fatalf("leave shared = %d", status)
+			}
+			status, cleared := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, key, "", "")
+			if status != http.StatusOK || cleared["share_url"] != nil {
+				t.Fatalf("left shared = %d %v, want 200 null share_url", status, cleared)
+			}
+			status, reshared := setVisibility(t, server, key, slug, `{"visibility":"shared"}`)
+			if status != http.StatusOK {
+				t.Fatalf("re-share = %d %v", status, reshared)
+			}
+			if second, _ := reshared["share_url"].(string); second == first || !shape.MatchString(second) {
+				t.Fatalf("re-shared share_url = %q, want a fresh token unlike %q", second, first)
+			}
+		}
+		if status, payload := request(t, http.MethodGet, target, "", "", ""); status != http.StatusNotFound || errorCode(payload) != "not_found" {
+			t.Errorf("%s share token = %d %s, want 404 not_found", name, status, errorCode(payload))
+		}
+	}
+
+	// Keyless shared is refused with the code naming the fix, on create and on
+	// visibility change; private keeps its own code.
+	if status, payload := declareVisible(t, server, "", "shared", "s.txt", "bytes"); status != http.StatusUnprocessableEntity || errorCode(payload) != "shared_needs_key" {
+		t.Errorf("keyless shared declare = %d %s, want 422 shared_needs_key", status, errorCode(payload))
+	} else if message, _ := payload["error"].(map[string]any)["message"].(string); !strings.Contains(message, "Authorization: Bearer") {
+		t.Errorf("shared_needs_key message = %q, want it to name Authorization: Bearer", message)
+	}
+	ready := pushed(t, server, key, "public", "move.txt", "bytes")
+	readySlug, _ := ready["slug"].(string)
+	if status, payload := setVisibility(t, server, "", readySlug, `{"visibility":"shared"}`); status != http.StatusUnprocessableEntity || errorCode(payload) != "shared_needs_key" {
+		t.Errorf("keyless share change = %d %s, want 422 shared_needs_key", status, errorCode(payload))
 	}
 }
 
@@ -2230,9 +2337,9 @@ func TestTheVisibilityChangeRefusesWhatItCannotDo(t *testing.T) {
 		http.StatusBadRequest || errorCode(payload) != "parameter_missing" {
 		t.Errorf("no visibility named = %d %s, want 400 parameter_missing", status, errorCode(payload))
 	}
-	if status, payload := setVisibility(t, server, owner, slug, `{"visibility":"shared"}`); status !=
+	if status, payload := setVisibility(t, server, owner, slug, `{"visibility":"secret"}`); status !=
 		http.StatusUnprocessableEntity || errorCode(payload) != "visibility_unavailable" {
-		t.Errorf("shared = %d %s, want 422 visibility_unavailable", status, errorCode(payload))
+		t.Errorf("secret = %d %s, want 422 visibility_unavailable", status, errorCode(payload))
 	}
 
 	// A pending artifact has no bytes anything has confirmed, so there is
@@ -2331,7 +2438,7 @@ func TestTheWorkspaceScopeAnswersBeforeTheBodyDoes(t *testing.T) {
 	slug, _ := ready["slug"].(string)
 
 	for name, body := range map[string]string{
-		"an undeclarable visibility": `{"visibility":"shared"}`,
+		"an undeclarable visibility": `{"visibility":"secret"}`,
 		"no visibility at all":       `{}`,
 	} {
 		if status, payload := setVisibility(t, server, stranger, slug, body); status !=

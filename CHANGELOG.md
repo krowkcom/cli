@@ -28,11 +28,12 @@ the versions are the `v*` tags a release is cut from. Entries land under
   dropped would have already published the file.
 
 - Every artifact now reports its own `visibility`, on every read, as a name
-  rather than a flag. A visibility this build has not heard of — `shared`, when
-  it lands — is described by name and promised nothing, rather than being
-  described as private: `shared` is the visibility whose card a keyless holder
-  of the link *does* see, and telling somebody their link is workspace-only when
-  it is not is the dangerous way to be wrong about a privacy feature.
+  rather than a flag. A visibility this build has not heard of is described by
+  name and promised nothing, rather than being described as private:
+  understating who can read an artifact is the dangerous way to be wrong about
+  a privacy feature. `shared` is the visibility whose card a keyless holder
+  of the link *does* see, via `share_url`; this build knows it, links it, and
+  labels what it unfurls.
 
 - A push that asks for a visibility now checks it was applied before it sends
   the bytes. A registry predating the field accepts the declare and answers
@@ -71,8 +72,13 @@ the versions are the `v*` tags a release is cut from. Entries land under
   metadata answers its own workspace and answers everyone else `404`; its card
   page is indistinguishable from a slug that never existed; its byte URL names
   neither the workspace nor the artifact; and `PUT /v1/artifacts/{slug}/visibility`
-  moves an artifact between public and private, re-keying the bytes and killing
-  the old URL in both directions.
+  moves an artifact between public, private and shared, re-keying the bytes and killing
+  the old URL in every direction. A shared artifact carries `share_url`
+  (`{origin}/a/{slug}?share=krowk_share_{24 base36}`) on every artifact
+  response, null otherwise; entering shared mints a fresh token and leaving
+  clears it; a keyless declare or visibility change naming shared is refused as
+  `shared_needs_key`; and `GET /v1/artifacts/{slug}?share={token}` answers 200
+  for the matching token and 404 for anything else.
 
   One behaviour it had wrong is fixed with it: a **public** artifact's metadata
   read is now scoped to no workspace, keyed or not — matching the registry,

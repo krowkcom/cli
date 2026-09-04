@@ -42,6 +42,13 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Changed
 
+- A `.webm` or `.mkv` file carrying a video track is declared as video, never
+  audio. Go's extension table answers `audio/webm` for `.webm`, so a screen
+  recording uploaded on the extension alone landed as audio and previewed as
+  audio. The uploader now sniffs the Matroska head for a video track and
+  declares `video/webm` (or the `.mkv` video kind) when one is there; audio-only
+  files keep the extension answer.
+
 - The paste labels stop promising what a private card cannot do. `Paste into
   Slack, Basecamp — they unfurl the link themselves` is true of a public
   artifact and false of a private one, so a private push is labelled for the

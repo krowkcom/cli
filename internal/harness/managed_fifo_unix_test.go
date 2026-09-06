@@ -3,6 +3,8 @@
 package harness
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -65,5 +67,31 @@ func TestIsManagedCopyDoesNotHangOnAFIFOMarker(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the check blocked on a FIFO nobody is writing to")
+	}
+}
+
+func TestWriteManagedFileRefusesAFileWithASecondName(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "somebody-elses.md")
+	if err := os.WriteFile(victim, []byte("# theirs\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "SKILL.md")
+	// A hard link is a regular file, is not a symlink, and O_TRUNC through it
+	// empties the file at the other name. The link count is the only thing
+	// that gives it away.
+	if err := os.Link(victim, path); err != nil {
+		t.Skipf("link: %v", err)
+	}
+
+	var target *UnmanagedError
+	if err := WriteManagedFile(path, []byte("# ours\n")); !errors.As(err, &target) {
+		t.Fatalf("err = %v, want an *UnmanagedError", err)
+	} else if target.Path != path {
+		t.Fatalf("refusal names %q, want %q", target.Path, path)
+	}
+	data, err := os.ReadFile(victim)
+	if err != nil || string(data) != "# theirs\n" {
+		t.Fatalf("the other name reads %q, %v — it was truncated through the link", data, err)
 	}
 }

@@ -26,26 +26,29 @@ the versions are the `v*` tags a release is cut from. Entries land under
   installs — `.managed-by-krowk-cli`, which says krowk manages the directory,
   and `.installed-version`, which says with what — and writes only where that
   marker says it wrote before: it creates a directory that is not there,
-  adopts an empty one, refreshes one it already marked, and otherwise says so
-  and leaves the directory exactly as it found it. If you have your own
-  `~/.claude/skills/krowk/`, move it aside and re-run to have krowk manage it.
+  adopts an empty one, refreshes one carrying a marker it wrote, and otherwise
+  says why and leaves the directory exactly as it found it. A directory
+  belonging to another user, or one that cannot be listed, is left alone too.
+  If you have your own `~/.claude/skills/krowk/`, move it aside and re-run to
+  have krowk manage it.
 
   Upgrading from an earlier krowk needs nothing: a skill directory holding
   nothing but the `SKILL.md` a previous installer wrote is adopted and marked
-  on the next run, since that is the file the previous installer overwrote
-  anyway. Nothing is written through a symlink any more, in either a
-  directory's name or a file's — a link is refused rather than followed, and
-  every managed file is written to a sibling temporary file and renamed into
-  place.
+  on the next run, since that is the only file that installer wrote and the
+  one it overwrote anyway. Nothing is written through a symlink any more, in
+  either a directory's name or a file's — the installer writes every managed
+  file to a sibling temporary file and renames it into place, which replaces a
+  link rather than following it.
 
-  `internal/harness` carries the same gate for Go (`ClaimDir`,
-  `WriteManagedFile`, `DirOwned`, `InstalledVersion`, `IsManagedCopy`), where
-  the symlink refusal is the kernel's — `O_NOFOLLOW`, on the descriptor that
-  is then written — rather than a check something could invalidate in
-  between. No command uses it yet; `krowk setup` and every managed file after
-  it will, so that one rule decides every write krowk makes into your home
-  directory. `krowk doctor` will report a hand-placed skill as installed, and
-  say that krowk will not refresh it.
+  `internal/harness` carries the same gate for Go — `ClaimDir`,
+  `WriteManagedFile`, `DirOwned`, `InstalledVersion`, `IsManagedCopy` — where
+  the symlink refusal is the kernel's, `O_NOFOLLOW` on the descriptor that is
+  then written, rather than a check something could invalidate in between, and
+  where a hard link or a directory somebody else owns is refused as well. No
+  command calls any of it yet: it is what `krowk setup` will go through, so
+  that one rule decides every write krowk makes into your home directory.
+  `krowk doctor` will report a skill it did not write as installed either way,
+  and say whether the next install will adopt it or leave it alone for good.
 
 ## [0.9.0] - 2026-09-06
 

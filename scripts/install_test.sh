@@ -100,6 +100,20 @@ sh_goarch=$(sed -n 's/^ *[^ ]*) *arch="\([a-z0-9]*\)".*/\1/p' scripts/install.sh
   || fail ".goreleaser.yaml builds for [$(echo "$yaml_goarch" | tr '\n' ' ')] and scripts/install.sh names [$(echo "$sh_goarch" | tr '\n' ' ')]"
 pass "the platform lists still agree: $(echo "$yaml_goos" | tr '\n' ' ')× $(echo "$yaml_goarch" | tr '\n' ' ')"
 
+# The marker sentence lives in two languages, and a directory claimed by the
+# installer has to be one the binary's gate recognises. So neither copy may
+# drift: both are read out of the files that write them and compared.
+sh_marker=$(sed -n 's/^MANAGED_MARKER_CONTENT="\(.*\)"$/\1/p' scripts/install.sh)
+[[ -n "$sh_marker" ]] || fail "scripts/install.sh no longer defines MANAGED_MARKER_CONTENT"
+grep -qF "$sh_marker" internal/harness/managed.go \
+  || fail "scripts/install.sh writes a marker saying '$sh_marker', which internal/harness/managed.go does not"
+for name in MANAGED_MARKER INSTALLED_VERSION_FILE; do
+  sh_name=$(sed -n "s/^${name}=\"\(.*\)\"\$/\1/p" scripts/install.sh)
+  grep -qF "\"$sh_name\"" internal/harness/managed.go \
+    || fail "scripts/install.sh writes $sh_name, which internal/harness/managed.go does not name"
+done
+pass "the marker sentence and the two filenames agree with internal/harness/managed.go"
+
 # The ignore list is the third piece: a combination the config refuses to build
 # must be one the installer refuses to offer, and every combination it does
 # build must be one detect_platform can name.
@@ -276,8 +290,9 @@ pass "the agent skill was written to CLAUDE_CONFIG_DIR"
 
 [[ -f "$CLAUDE/skills/krowk/.managed-by-krowk-cli" ]] \
   || fail "the installer did not mark the skill directory as its own"
-grep -q "managed by krowk" "$CLAUDE/skills/krowk/.managed-by-krowk-cli" \
-  || fail "the ownership marker does not say who manages the directory"
+MARKER_SENTENCE="This directory is managed by krowk. Manual edits will be overwritten on upgrade."
+[[ "$(cat "$CLAUDE/skills/krowk/.managed-by-krowk-cli")" == "$MARKER_SENTENCE" ]] \
+  || fail "the ownership marker says something other than the sentence krowk writes"
 [[ "$(cat "$CLAUDE/skills/krowk/.installed-version")" == "$VERSION" ]] \
   || fail "the version stamp says $(cat "$CLAUDE/skills/krowk/.installed-version"), want $VERSION"
 pass "the skill directory carries the ownership marker and the version stamp"
@@ -394,6 +409,48 @@ env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
 diff -q skills/krowk/SKILL.md "$OLD/skills/krowk/SKILL.md" >/dev/null \
   || fail "the adopted skill was not refreshed"
 pass "a skill directory a pre-marker krowk wrote is adopted and refreshed"
+
+# A directory in a managed file's name: `mv` would move the new file inside it
+# and report success, leaving the skill at a path nobody named.
+DIRNAME="$WORK/claude-dirname"
+mkdir -p "$DIRNAME/skills/krowk/SKILL.md"
+printf '%s\n' "$MARKER_SENTENCE" >"$DIRNAME/skills/krowk/.managed-by-krowk-cli"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$DIRNAME" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/dirname.log" 2>&1 \
+  || { cat "$WORK/dirname.log"; fail "the installer exited non-zero over a directory in SKILL.md's name"; }
+[[ -z "$(ls -A "$DIRNAME/skills/krowk/SKILL.md")" ]] \
+  || fail "the installer moved the skill inside a directory named SKILL.md"
+grep -q "is a directory" "$WORK/dirname.log" \
+  || { cat "$WORK/dirname.log"; fail "the installer did not say it refused a directory in the skill file's name"; }
+pass "a directory in a managed file's name is refused, with nothing moved into it"
+
+# Nothing this installer writes may be left behind on a refusal: a stranded
+# temporary file would make the next run's adoption check refuse the directory.
+[[ -z "$(ls -A "$DIRNAME/skills/krowk" | grep '^\.krowk-' || true)" ]] \
+  || fail "a temporary file was stranded in the skill directory"
+pass "no temporary file was left behind"
+
+# A skill directory belonging to somebody else is not krowk's to manage,
+# whatever its mode allows. Only root can stage that.
+if [[ "$(id -u)" != "0" ]]; then
+  echo "  – not root, so a directory owned by another user cannot be staged; skipped"
+else
+  OTHER="$WORK/claude-other"
+  mkdir -p "$OTHER/skills/krowk"
+  chown 65534:65534 "$OTHER/skills/krowk"
+  env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+    CLAUDE_CONFIG_DIR="$OTHER" \
+    KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+    bash "$REPO_ROOT/scripts/install.sh" >"$WORK/other.log" 2>&1 \
+    || { cat "$WORK/other.log"; fail "the installer exited non-zero over a directory owned by another user"; }
+  grep -q "belongs to another user" "$WORK/other.log" \
+    || { cat "$WORK/other.log"; fail "the installer did not refuse a directory owned by another user"; }
+  [[ -z "$(ls -A "$OTHER/skills/krowk")" ]] \
+    || fail "the installer wrote into a directory owned by another user"
+  pass "a skill directory owned by another user is left alone"
+fi
 
 grep -q "krowk push screenshot.png" "$WORK/install.log" || fail "the next steps were not printed"
 pass "the next steps were printed"

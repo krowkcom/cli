@@ -18,6 +18,9 @@ import "os"
 // flags of the Win32 API — and it is narrower in practice than it reads:
 // every path this opens sits inside a directory ClaimDir has already proved
 // krowk's own.
+//
+// Like the Unix half, this does not truncate during the open: the caller
+// truncates once the descriptor has said what it is.
 func openManagedFileForWrite(path string) (*os.File, error) {
 	if info, err := os.Lstat(path); err == nil {
 		if info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
@@ -29,5 +32,5 @@ func openManagedFileForWrite(path string) (*os.File, error) {
 	} else if !isNotExist(err) {
 		return nil, err
 	}
-	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644) //nolint:gosec // G302/G304: a fixed managed filename, documentation an agent reads
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o644) //nolint:gosec // G302/G304: a fixed managed filename, documentation an agent reads
 }

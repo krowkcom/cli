@@ -524,35 +524,60 @@ func TestCheckClaudeMCPServerMatchesARelativeWorkingDirectory(t *testing.T) {
 	}
 }
 
-func TestCheckClaudeSkillTellsAManagedSkillFromAHandPlacedOne(t *testing.T) {
-	t.Run("krowk wrote it", func(t *testing.T) {
-		home := t.TempDir()
-		dir := filepath.Join(home, ".claude", "skills", "krowk")
-		mkdirAll(t, dir)
-		writeFile(t, filepath.Join(dir, "SKILL.md"), "# krowk\n")
-		writeFile(t, filepath.Join(dir, ManagedMarker), managedMarkerContent)
+func TestCheckClaudeSkillTellsWhoWroteTheSkillItFound(t *testing.T) {
+	cases := []struct {
+		name    string
+		arrange func(t *testing.T, dir string)
+		want    string
+		notWant string
+	}{
+		{
+			name: "krowk wrote it",
+			arrange: func(t *testing.T, dir string) {
+				writeFile(t, filepath.Join(dir, ManagedMarker), managedMarkerContent)
+			},
+			notWant: "by hand",
+		},
+		{
+			name:    "an older krowk wrote it, before there were markers",
+			arrange: func(*testing.T, string) {},
+			want:    "the next install will adopt it",
+		},
+		{
+			name: "somebody wrote their own, and it is theirs",
+			arrange: func(t *testing.T, dir string) {
+				writeFile(t, filepath.Join(dir, "reference.md"), "notes of my own\n")
+			},
+			want: "by hand",
+		},
+		{
+			name: "a marker that says something else entirely",
+			arrange: func(t *testing.T, dir string) {
+				writeFile(t, filepath.Join(dir, ManagedMarker), "copied out of a template\n")
+			},
+			want: "by hand",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			dir := filepath.Join(home, ".claude", "skills", "krowk")
+			mkdirAll(t, dir)
+			writeFile(t, filepath.Join(dir, "SKILL.md"), "# krowk\n")
+			tc.arrange(t, dir)
 
-		check := CheckClaudeSkill(homeEnv(home))
-		if check.Status != StatusPass || strings.Contains(check.Message, "by hand") {
-			t.Fatalf("check = %+v, want a plain pass — the marker is there", check)
-		}
-	})
-
-	t.Run("somebody else wrote it", func(t *testing.T) {
-		home := t.TempDir()
-		dir := filepath.Join(home, ".claude", "skills", "krowk")
-		mkdirAll(t, dir)
-		writeFile(t, filepath.Join(dir, "SKILL.md"), "# mine\n")
-
-		// It still works, so it still passes: the agent reads a hand-placed
-		// skill exactly as it reads krowk's. What the message has to say is
-		// that no upgrade will ever touch it.
-		check := CheckClaudeSkill(homeEnv(home))
-		if check.Status != StatusPass {
-			t.Fatalf("check = %+v, want pass — a hand-placed skill works", check)
-		}
-		if !strings.Contains(check.Message, "by hand") || !strings.Contains(check.Message, "not refresh") {
-			t.Fatalf("message %q does not say krowk will leave it alone", check.Message)
-		}
-	})
+			// Every one of these passes: the agent reads the file the same
+			// way whoever put it there.
+			check := CheckClaudeSkill(homeEnv(home))
+			if check.Status != StatusPass {
+				t.Fatalf("check = %+v, want pass — the skill is there and readable", check)
+			}
+			if tc.want != "" && !strings.Contains(check.Message, tc.want) {
+				t.Fatalf("message %q does not say %q", check.Message, tc.want)
+			}
+			if tc.notWant != "" && strings.Contains(check.Message, tc.notWant) {
+				t.Fatalf("message %q says %q about a skill krowk wrote", check.Message, tc.notWant)
+			}
+		})
+	}
 }

@@ -73,6 +73,10 @@ func (e *UnmanagedError) Error() string {
 	return fmt.Sprintf("%s exists but was not written by krowk; move it aside to let krowk write there", e.Path)
 }
 
+// mkdirDir is a seam so a test can stage the one race this gate has to handle:
+// something else creating the directory between the Lstat and the Mkdir.
+var mkdirDir = os.Mkdir
+
 // ClaimDir is the one gate every managed write goes through. It creates a
 // missing directory, adopts an empty one, accepts one that already carries the
 // marker, and refuses anything else — a populated directory without the marker
@@ -85,10 +89,15 @@ func (e *UnmanagedError) Error() string {
 //
 // There is deliberately no relaxation here for directories an older krowk
 // wrote before the marker existed. scripts/install.sh has one — it adopts a
-// directory holding nothing but the SKILL.md a pre-marker installer wrote,
-// which is the file that installer overwrote anyway — and that handoff runs
+// directory holding nothing but a regular SKILL.md, which is the only file a
+// pre-marker installer ever wrote and the one it overwrote on every run — and
+// that handoff runs
 // once, in the installer, so this gate never has to carry an exception that
 // weakens it for everything else it will be asked to claim.
+//
+// The marker has to say what krowk writes, not merely exist: this is the
+// destructive side of the pair, and a file of some other shape carrying the
+// marker's name is not evidence krowk made the directory around it.
 //
 // The marker is (re)written on every successful claim, not only on creation:
 // it costs one small write, and it repairs a directory whose marker was lost
@@ -112,10 +121,10 @@ func ClaimDir(dir string) error {
 			// the Lstat and now" into "krowk made this" — the one thing this
 			// gate exists to tell apart. Mkdir says EEXIST instead, and the
 			// next pass asks what is there.
-			if mkErr := os.MkdirAll(filepath.Dir(dir), 0o755); mkErr != nil { // #nosec G301 -- a skills directory holds public documentation the agent must be able to read
+			if mkErr := os.MkdirAll(filepath.Dir(dir), 0o755); mkErr != nil { //nolint:gosec // G301: a skills directory holds public documentation the agent must be able to read
 				return fmt.Errorf("creating %s: %w", filepath.Dir(dir), mkErr)
 			}
-			if mkErr := os.Mkdir(dir, 0o755); mkErr != nil { // #nosec G301 -- same
+			if mkErr := mkdirDir(dir, 0o755); mkErr != nil { //nolint:gosec // G301: same
 				if errors.Is(mkErr, fs.ErrExist) {
 					continue
 				}
@@ -131,7 +140,12 @@ func ClaimDir(dir string) error {
 			return &UnmanagedError{Path: dir}
 		case !info.IsDir():
 			return &UnmanagedError{Path: dir}
-		case !DirOwned(dir):
+		case !ownedByCaller(info):
+			// Somebody else's directory. The permission bits may well allow a
+			// write; that is not the question. A marker in a directory its
+			// owner can empty, re-mode or replace vouches for nothing.
+			return &UnmanagedError{Path: dir}
+		case !markerIsOurs(dir):
 			entries, readErr := os.ReadDir(dir)
 			if readErr != nil {
 				return fmt.Errorf("inspecting %s: %w", dir, readErr)
@@ -179,21 +193,40 @@ func WriteManagedFile(path string, data []byte) error {
 	if !info.Mode().IsRegular() {
 		return &UnmanagedError{Path: path}
 	}
+	// A file reachable by a second name is a file somebody else may be
+	// holding: truncating it here would empty theirs through a path that
+	// passed every other test. What krowk writes, krowk is the only name for.
+	if hardLinked(info) {
+		return &UnmanagedError{Path: path}
+	}
 	// Best-effort: a file that already existed keeps its old permissions
 	// through an O_TRUNC open, and the mode krowk documents is the one an
 	// agent can read. Windows has no meaningful answer here, so a refusal is
 	// not worth failing a write over.
 	_ = f.Chmod(0o644)
 
+	// Only now, with the descriptor proved to be a regular file nobody else
+	// has a name for, is the old content thrown away.
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("truncating %s: %w", path, err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewinding %s: %w", path, err)
+	}
 	if _, err := f.Write(data); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	return f.Close()
 }
 
-// DirOwned reports whether krowk wrote the directory at dir. The marker must
-// itself be a regular file, by Lstat, so that a symlink or a directory planted
-// in the marker's name confers nothing.
+// DirOwned reports whether the marker exists at dir as a regular file, by
+// Lstat, so that a symlink or a directory planted in its name confers nothing.
+//
+// It is the presence question and only the presence question: it does not read
+// the marker. That is enough for the health check that uses it, which is
+// reporting on what is on disk rather than deciding to overwrite it. Every
+// write and every removal asks markerIsOurs instead, which reads the contents
+// — a name is cheap to forge and this is the cheap answer.
 func DirOwned(dir string) bool {
 	return dir != "" && isRegularFile(filepath.Join(dir, ManagedMarker))
 }
@@ -253,8 +286,8 @@ func readManagedFile(path string, maxBytes int64) ([]byte, error) {
 // anything. DirOwned answers "may krowk write here", which is enough to add or
 // replace a file; it is not enough to remove the directory, because a user may
 // have dropped their own file in beside krowk's. All three conditions are load
-// bearing: the marker proves provenance — by its contents as well as its
-// name, since only a file krowk wrote says what krowk writes — and the
+// bearing: the marker proves provenance — by its contents as well as its name
+// (markerIsOurs), since only a file krowk wrote says what krowk writes — and the
 // allowlist keeps anything else in the directory safe.
 //
 // Entry names are compared exactly. On a case-insensitive filesystem that can
@@ -287,7 +320,7 @@ func IsManagedCopy(dir string, allowed ...string) bool {
 			return false
 		}
 		if entry.Name() == ManagedMarker {
-			sawMarker = markerContentMatches(filepath.Join(dir, ManagedMarker))
+			sawMarker = markerIsOurs(dir)
 			continue
 		}
 		if !permitted[entry.Name()] {
@@ -297,16 +330,50 @@ func IsManagedCopy(dir string, allowed ...string) bool {
 	return sawMarker
 }
 
-// markerContentMatches reports whether the marker at path is the sentence
-// krowk writes. Presence is enough to say "krowk may write here"; saying
-// "krowk may delete this" asks more, and a file of some other shape carrying
-// the marker's name — copied into a dotfile repository, committed to a
-// template, left by a different tool — is not evidence krowk created the
-// directory around it.
-func markerContentMatches(path string) bool {
-	data, err := readManagedFile(path, maxMarkerBytes)
+// markerIsOurs reports whether dir carries a marker krowk wrote: a regular
+// file, read through the same O_NOFOLLOW open as everything else, saying what
+// krowk's markers say. It is the question both destructive paths ask — the
+// claim that leads to an overwrite, and the copy test that leads to a removal
+// — because a marker file that came from somewhere else (copied into a
+// dotfile repository, committed to a template, left by a different tool) is
+// not evidence krowk created the directory around it.
+func markerIsOurs(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	data, err := readManagedFile(filepath.Join(dir, ManagedMarker), maxMarkerBytes)
 	if err != nil {
 		return false
 	}
 	return strings.TrimSpace(string(data)) == strings.TrimSpace(managedMarkerContent)
+}
+
+// adoptableDir reports whether an unmarked directory holds nothing but files
+// a pre-marker krowk wrote — every entry a regular file, every name in
+// allowed, and no marker needed or expected.
+//
+// It is the shape scripts/install.sh adopts on the next run, and the reason
+// this exists in Go is so the health check can say so: a person whose skill
+// directory predates the marker should be told it will be picked up, not told
+// krowk will never touch it. The gate itself does not use it — ClaimDir stays
+// strict, and the handoff stays in the installer.
+func adoptableDir(dir string, allowed ...string) bool {
+	info, err := os.Lstat(dir)
+	if err != nil || !info.IsDir() || !ownedByCaller(info) {
+		return false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) == 0 {
+		return false
+	}
+	permitted := map[string]bool{}
+	for _, name := range allowed {
+		permitted[name] = true
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || !permitted[entry.Name()] {
+			return false
+		}
+	}
+	return true
 }

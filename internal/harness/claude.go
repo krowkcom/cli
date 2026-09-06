@@ -24,6 +24,11 @@ const (
 	// defensively.
 	claudeProjectConfigFile = ".mcp.json"
 	claudeDirName           = ".claude"
+	// claudeSkillDirName and claudeSkillFile are where the krowk skill lands
+	// under Claude Code's configuration directory — the same two names
+	// scripts/install.sh writes.
+	claudeSkillDirName = "krowk"
+	claudeSkillFile    = "SKILL.md"
 
 	// KrowkMCPCommand is the binary krowk's MCP server runs as.
 	KrowkMCPCommand = "krowk-mcp"
@@ -458,20 +463,25 @@ func CheckClaudeSkill(env Env) StatusCheck {
 		return Warn(CheckNameClaudeSkill, "Cannot determine where Claude Code's config lives",
 			"Set HOME to the account Claude Code runs as")
 	}
-	skillDir := filepath.Join(dir, "skills", "krowk")
-	path := filepath.Join(skillDir, "SKILL.md")
+	skillDir := filepath.Join(dir, "skills", claudeSkillDirName)
+	path := filepath.Join(skillDir, claudeSkillFile)
 	if isRegularFile(path) {
 		// A skill krowk did not write still works — the agent reads it the
-		// same way — so this passes either way. What differs is what happens
-		// next: the managed-write gate refuses to touch a directory without
-		// the marker, so an upgrade will leave a hand-placed skill exactly as
-		// it is, and the person reading a doctor report should learn that
-		// here rather than from a stale skill months later.
-		if !DirOwned(skillDir) {
+		// same way — so all three of these pass. What differs is what happens
+		// on the next install, and that is what the person reading a doctor
+		// report cannot see for themselves.
+		switch {
+		case markerIsOurs(skillDir):
+			return Pass(CheckNameClaudeSkill, "Installed ("+path+")")
+		case adoptableDir(skillDir, claudeSkillFile):
+			// Nothing here but the one file a pre-marker krowk wrote, which
+			// the installer adopts and marks on its next run.
+			return Pass(CheckNameClaudeSkill, "Installed ("+path+"), not yet marked as krowk's — the next install will adopt it")
+		default:
 			return Pass(CheckNameClaudeSkill, "Installed by hand ("+path+") — krowk will not refresh it")
 		}
-		return Pass(CheckNameClaudeSkill, "Installed ("+path+")")
 	}
+
 	if _, err := os.Lstat(path); err == nil {
 		return Fail(CheckNameClaudeSkill, path+" is not a regular file",
 			"Move it aside, then re-run the krowk installer")

@@ -23,10 +23,13 @@ import (
 // nobody is coming. With the flag the kernel answers ENXIO instead, which is
 // the refusal below. On a regular file it changes nothing.
 //
-// The truncation is part of the same open, so the file is never briefly a
-// zero-length file under a name something else could claim.
+// What this deliberately does not do is truncate. O_TRUNC empties the file
+// during the open, before anything has been able to look at what was opened —
+// and by then a hard link to somebody else's file has already been emptied.
+// The caller truncates afterwards, once the descriptor has answered what it
+// is.
 func openManagedFileForWrite(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o644) // #nosec G302 -- managed files are documentation an agent must be able to read
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o644) //nolint:gosec // G302: managed files are documentation an agent must be able to read
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, errIsSymlink

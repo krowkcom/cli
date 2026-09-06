@@ -408,13 +408,23 @@ MANAGED_MARKER_CONTENT="This directory is managed by krowk. Manual edits will be
 
 # write_managed_file writes one file krowk owns, and never through a symlink.
 # The bytes go to a temporary file in the destination's own directory and are
-# then renamed onto the final name: a rename replaces whatever is there rather
-# than following it, so a link planted in a managed file's name is destroyed
-# instead of being written through. Nothing is ever redirected or chmod-ed onto
-# a final path — a `>` follows a symlink, and `chmod` follows it too.
+# then renamed onto the final name: rename(2) replaces whatever is at that name
+# rather than following it, so a link planted in a managed file's name is
+# destroyed instead of being written through. Nothing is ever redirected or
+# chmod-ed onto a final path — a `>` follows a symlink, and `chmod` follows it
+# too.
 #
 # The temp file is a sibling on purpose: a rename is only atomic within one
-# filesystem, and $TMPDIR is regularly on another one.
+# filesystem, and $TMPDIR is regularly on another one. The RETURN trap removes
+# it on every way out, including a failure part way through — a stranded
+# .krowk-XXXXXX left in the skill directory would make the next run's adoption
+# check refuse a directory krowk itself littered.
+#
+# A directory at the destination is refused rather than replaced, and refused
+# before anything is written: `mv` onto a directory moves the file *into* it and
+# reports success, which would leave the managed file at a path nobody named.
+# The -d test follows links, which is what is wanted here — a link to a
+# directory is a directory as far as mv is concerned.
 #
 # Reads from stdin so a caller can pipe a downloaded file through it without
 # the content ever passing through a variable.
@@ -425,53 +435,87 @@ write_managed_file() {
     note "${path} is a symlink, which points somewhere this installer never looked; leaving it alone."
     return 1
   fi
+  if [[ -d "$path" ]]; then
+    note "${path} is a directory, not a file krowk wrote; leaving it alone."
+    return 1
+  fi
 
   dir=$(dirname "$path")
   tmp=$(mktemp "${dir}/.krowk-XXXXXX") || return 1
-  if ! cat >"$tmp"; then
-    rm -f "$tmp"
+  # shellcheck disable=SC2064  # expand tmp now: the trap must name this call's file.
+  trap "rm -f '${tmp}'" RETURN
+
+  cat >"$tmp" || return 1
+  chmod 0644 "$tmp" || return 1
+  mv -f "$tmp" "$path" || return 1
+
+  # What the rename was supposed to achieve, asked of the filesystem rather
+  # than assumed from an exit status: the temp file is gone because it became
+  # the destination, and the destination is a regular file and not a link.
+  if [[ -e "$tmp" || -L "$path" || ! -f "$path" ]]; then
+    note "${path} is not what this installer just wrote; leaving it alone."
     return 1
   fi
-  chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
-  # rm first, so that what the rename replaces is a name and not a link the
-  # rename would have been happy to overwrite anyway — this is belt and braces,
-  # and it also clears a directory-in-the-file's-name that mv would refuse.
-  rm -f "$path"
-  mv -f "$tmp" "$path" || { rm -f "$tmp"; return 1; }
 }
 
 # claim_skill_dir is the gate every skill write goes through, and the shell half
 # of internal/harness/managed.go's ClaimDir: it creates a missing directory,
-# adopts an empty one, accepts one that already carries the marker, and refuses
-# anything else. A populated directory without the marker is somebody's own
-# skill, and an installer that overwrote it would destroy work nobody asked it
-# to touch — so it says why and leaves it exactly as it found it.
+# adopts an empty one, accepts one that already carries krowk's marker, and
+# refuses anything else. A populated directory without the marker is somebody's
+# own skill, and an installer that overwrote it would destroy work nobody asked
+# it to touch — so it says why and leaves it exactly as it found it.
 #
 # It also adopts one shape the Go gate deliberately refuses: a directory holding
-# nothing but the files a pre-marker krowk installer wrote — SKILL.md, and the
-# version stamp if it is there — every one of them a regular file. That
-# installer overwrote exactly that SKILL.md on every run, so adopting it now
-# changes nothing for the people upgrading, while anything else in the
-# directory means somebody put it there and the refusal stands. This is a
-# one-time handoff and it lives here, in the installer, rather than weakening
-# the gate the rest of krowk writes through.
+# nothing but a regular SKILL.md, which is the only file a pre-marker krowk
+# installer ever wrote and the one it overwrote on every single run. Adopting it
+# now therefore takes nothing from anybody, while anything else in the directory
+# means somebody put it there and the refusal stands. This is a one-time handoff
+# and it lives here, in the installer, rather than weakening the gate the rest
+# of krowk writes through.
 #
 # The tests are on the directory itself, never through it: -L before -d, because
 # a symlink here points at a directory this script never looked at, and writing
-# through it would land somewhere nothing reasoned about. And a directory that
+# through it would land somewhere nothing reasoned about. A directory that
 # cannot be listed is refused rather than assumed empty — "I could not look" is
-# not "there is nothing there".
+# not "there is nothing there". A directory somebody else owns is refused
+# whatever its mode says, because its owner can empty, re-mode or replace it
+# whenever they like and a marker in it would be vouching for nothing. And the
+# marker has to say what krowk's markers say: this is the destructive side, and
+# a name is cheap to forge.
 claim_skill_dir() {
   local dir="$1" entries name
 
-  if [[ -L "$dir" ]]; then
-    note "${dir} is a symlink, which points somewhere this installer never looked; leaving it alone."
-    return 1
-  fi
+  # Two passes, like the Go gate: the first may find nothing there and try to
+  # create it, and if something else won that race the second asks what
+  # actually landed instead of assuming krowk made it. There is no third.
+  local pass
+  for pass in 1 2; do
+    if [[ -L "$dir" ]]; then
+      note "${dir} is a symlink, which points somewhere this installer never looked; leaving it alone."
+      return 1
+    fi
 
-  if [[ -e "$dir" ]]; then
+    if [[ ! -e "$dir" ]]; then
+      # mkdir -p on the parents, plain mkdir on the directory itself: mkdir -p
+      # accepts an existing directory silently, which would turn "somebody
+      # else created this" into "krowk made this" — the one thing this gate
+      # exists to tell apart.
+      mkdir -p "$(dirname "$dir")" || return 1
+      if mkdir "$dir" 2>/dev/null; then
+        return 0
+      fi
+      # Somebody else created it first. Ask what landed, once.
+      [[ "$pass" == 1 ]] || break
+      continue
+    fi
+
     if [[ ! -d "$dir" ]]; then
       note "${dir} exists and is not a directory; leaving it alone."
+      return 1
+    fi
+
+    if [[ ! -O "$dir" ]]; then
+      note "${dir} belongs to another user, so krowk is not the one managing it; leaving it alone."
       return 1
     fi
 
@@ -486,30 +530,30 @@ claim_skill_dir() {
       note "${dir} carries a symlink where krowk's marker should be; leaving it alone."
       return 1
     elif [[ -f "${dir}/${MANAGED_MARKER}" ]]; then
-      : # krowk wrote this one; refresh it.
+      if [[ "$(cat -- "${dir}/${MANAGED_MARKER}")" != "$MANAGED_MARKER_CONTENT" ]]; then
+        note "${dir} carries a marker krowk did not write; leaving it alone."
+        note "Move it aside and re-run this installer to have krowk manage it."
+        return 1
+      fi
+      return 0
     elif [[ -n "$entries" ]]; then
-      # No marker and not empty: either the pre-marker installer's own files,
-      # which are safe to adopt, or somebody's work, which is not.
+      # No marker and not empty: either the one file a pre-marker installer
+      # wrote, which is safe to adopt, or somebody's work, which is not.
       while IFS= read -r name; do
         [[ -n "$name" ]] || continue
-        case "$name" in
-          SKILL.md|"${INSTALLED_VERSION_FILE}") ;;
-          *)
-            note "${dir} was not written by krowk; leaving it alone."
-            note "Move it aside and re-run this installer to have krowk manage it."
-            return 1
-            ;;
-        esac
-        if [[ -L "${dir}/${name}" || ! -f "${dir}/${name}" ]]; then
+        if [[ "$name" != "SKILL.md" || -L "${dir}/${name}" || ! -f "${dir}/${name}" ]]; then
           note "${dir} was not written by krowk; leaving it alone."
           note "Move it aside and re-run this installer to have krowk manage it."
           return 1
         fi
       done <<<"$entries"
     fi
-  fi
 
-  mkdir -p "$dir" || return 1
+    return 0
+  done
+
+  note "${dir} keeps changing underneath this installer; leaving it alone."
+  return 1
 }
 
 # install_skill is best-effort on purpose. krowk works without it; the skill only

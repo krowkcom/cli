@@ -2,6 +2,7 @@ package harness
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -361,13 +362,15 @@ func TestClaimDirCreatesEveryMissingParent(t *testing.T) {
 }
 
 func TestClaimDirAsksAgainWhenSomethingElseWonTheRace(t *testing.T) {
-	// What os.Mkdir returning EEXIST means, staged directly: by the time the
-	// directory is created, it is somebody else's populated one. The second
-	// pass has to inspect it rather than assume krowk made it.
-	root := t.TempDir()
-	dir := filepath.Join(root, "krowk")
-	mkdirAll(t, dir)
-	writeFile(t, filepath.Join(dir, "SKILL.md"), "# theirs\n")
+	// The race staged where it actually happens: the Lstat finds nothing, and
+	// by the time Mkdir runs, somebody else's populated directory is there.
+	// The claim must inspect what landed rather than assume it made it.
+	dir := filepath.Join(t.TempDir(), "krowk")
+	swapMkdir(t, func(path string, perm os.FileMode) error {
+		mkdirAll(t, path)
+		writeFile(t, filepath.Join(path, "SKILL.md"), "# theirs\n")
+		return os.Mkdir(path, perm) // the real EEXIST, from the real call
+	})
 
 	if got := unmanaged(t, ClaimDir(dir)); got != dir {
 		t.Fatalf("refusal names %q, want %q", got, dir)
@@ -375,6 +378,29 @@ func TestClaimDirAsksAgainWhenSomethingElseWonTheRace(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(dir, ManagedMarker)); err == nil {
 		t.Fatal("the loser of the race claimed the winner's directory")
 	}
+	if data, err := os.ReadFile(filepath.Join(dir, "SKILL.md")); err != nil || string(data) != "# theirs\n" {
+		t.Fatalf("SKILL.md = %q, %v — the winner's file was written over", data, err)
+	}
+}
+
+func TestClaimDirGivesUpWhenTheDirectoryKeepsMovingUnderIt(t *testing.T) {
+	// A path created and removed underneath the claim in a loop is not a
+	// state to negotiate with: every pass sees nothing there, every Mkdir
+	// loses, and the answer after the second is a refusal rather than a spin.
+	dir := filepath.Join(t.TempDir(), "krowk")
+	swapMkdir(t, func(string, os.FileMode) error { return fs.ErrExist })
+
+	if got := unmanaged(t, ClaimDir(dir)); got != dir {
+		t.Fatalf("refusal names %q, want %q", got, dir)
+	}
+}
+
+// swapMkdir replaces the directory-creating seam for one test.
+func swapMkdir(t *testing.T, fn func(string, os.FileMode) error) {
+	t.Helper()
+	previous := mkdirDir
+	mkdirDir = fn
+	t.Cleanup(func() { mkdirDir = previous })
 }
 
 func TestIsManagedCopyRefusesAMarkerSayingSomethingElse(t *testing.T) {
@@ -412,5 +438,62 @@ func TestManagedFilesEndUpAtTheModeTheyAreDocumentedAt(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o644 {
 		t.Fatalf("mode = %v, want 0644 — an agent has to be able to read it", got)
+	}
+}
+
+func TestClaimDirAcceptsOnlyAMarkerThatSaysWhatKrowkWrites(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "krowk")
+	mkdirAll(t, dir)
+	writeFile(t, filepath.Join(dir, ManagedMarker), "copied out of a template\n")
+	writeFile(t, filepath.Join(dir, "SKILL.md"), "# theirs\n")
+
+	if got := unmanaged(t, ClaimDir(dir)); got != dir {
+		t.Fatalf("refusal names %q, want %q — a marker krowk never wrote is not a claim", got, dir)
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, "SKILL.md")); err != nil || string(data) != "# theirs\n" {
+		t.Fatalf("SKILL.md = %q, %v — the refusal was not a no-op", data, err)
+	}
+}
+
+func TestAdoptableDirIsOnlyWhatAPreMarkerInstallerLeft(t *testing.T) {
+	cases := []struct {
+		name    string
+		arrange func(t *testing.T, dir string)
+		want    bool
+	}{
+		{
+			name: "a lone SKILL.md",
+			arrange: func(t *testing.T, dir string) {
+				writeFile(t, filepath.Join(dir, "SKILL.md"), "# krowk\n")
+			},
+			want: true,
+		},
+		{
+			name: "a SKILL.md and something else",
+			arrange: func(t *testing.T, dir string) {
+				writeFile(t, filepath.Join(dir, "SKILL.md"), "# krowk\n")
+				writeFile(t, filepath.Join(dir, "reference.md"), "mine\n")
+			},
+		},
+		{
+			name:    "nothing at all",
+			arrange: func(*testing.T, string) {},
+		},
+		{
+			name: "a directory in the file's name",
+			arrange: func(t *testing.T, dir string) {
+				mkdirAll(t, filepath.Join(dir, "SKILL.md"))
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "krowk")
+			mkdirAll(t, dir)
+			tc.arrange(t, dir)
+			if got := adoptableDir(dir, "SKILL.md"); got != tc.want {
+				t.Fatalf("adoptableDir = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

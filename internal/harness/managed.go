@@ -1,8 +1,10 @@
 package harness
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +56,11 @@ const (
 	// stamp — a device, something a symlinked home pointed at — cannot be
 	// read into memory in full.
 	maxVersionStampBytes = 256
+
+	// maxMarkerBytes bounds the marker read, for the same reason: the marker
+	// is one sentence, and anything claiming to be one while being much
+	// larger is answering a different question.
+	maxMarkerBytes = 512
 )
 
 // UnmanagedError reports a path krowk did not write and therefore will not
@@ -76,6 +83,13 @@ func (e *UnmanagedError) Error() string {
 // person who ran `mkdir -p ~/.claude/skills/krowk` before running krowk meant,
 // and because there is nothing there to lose.
 //
+// There is deliberately no relaxation here for directories an older krowk
+// wrote before the marker existed. scripts/install.sh has one — it adopts a
+// directory holding nothing but the SKILL.md a pre-marker installer wrote,
+// which is the file that installer overwrote anyway — and that handoff runs
+// once, in the installer, so this gate never has to carry an exception that
+// weakens it for everything else it will be asked to claim.
+//
 // The marker is (re)written on every successful claim, not only on creation:
 // it costs one small write, and it repairs a directory whose marker was lost
 // to a half-finished run or a hand-cleaned checkout.
@@ -83,31 +97,52 @@ func ClaimDir(dir string) error {
 	if dir == "" {
 		return &UnmanagedError{Path: dir}
 	}
-	info, err := os.Lstat(dir)
-	switch {
-	case isNotExist(err):
-		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil { // #nosec G301 -- a skills directory holds public documentation the agent must be able to read
-			return fmt.Errorf("creating %s: %w", dir, mkErr)
-		}
-	case err != nil:
-		return fmt.Errorf("inspecting %s: %w", dir, err)
-	case info.Mode()&os.ModeSymlink != 0:
-		// A symlink is the user's arrangement, and its target was never
-		// inspected: writing through it would land in a directory this gate
-		// reasoned nothing about.
-		return &UnmanagedError{Path: dir}
-	case !info.IsDir():
-		return &UnmanagedError{Path: dir}
-	case !DirOwned(dir):
-		entries, readErr := os.ReadDir(dir)
-		if readErr != nil {
-			return fmt.Errorf("inspecting %s: %w", dir, readErr)
-		}
-		if len(entries) > 0 {
+	// At most two passes. The first may find nothing there and try to create
+	// it; if something else won that race, the second inspects what actually
+	// landed rather than assuming it was krowk's. There is no third, because
+	// a path being created and removed underneath this in a loop is not a
+	// state to negotiate with.
+	for attempt := 0; attempt < 2; attempt++ {
+		info, err := os.Lstat(dir)
+		switch {
+		case isNotExist(err):
+			// The parent chain is created with MkdirAll, but the directory
+			// itself with Mkdir: MkdirAll accepts an existing directory
+			// silently, which would turn "somebody else created this between
+			// the Lstat and now" into "krowk made this" — the one thing this
+			// gate exists to tell apart. Mkdir says EEXIST instead, and the
+			// next pass asks what is there.
+			if mkErr := os.MkdirAll(filepath.Dir(dir), 0o755); mkErr != nil { // #nosec G301 -- a skills directory holds public documentation the agent must be able to read
+				return fmt.Errorf("creating %s: %w", filepath.Dir(dir), mkErr)
+			}
+			if mkErr := os.Mkdir(dir, 0o755); mkErr != nil { // #nosec G301 -- same
+				if errors.Is(mkErr, fs.ErrExist) {
+					continue
+				}
+				return fmt.Errorf("creating %s: %w", dir, mkErr)
+			}
+		case err != nil:
+			return fmt.Errorf("inspecting %s: %w", dir, err)
+		case info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0:
+			// A symlink is the user's arrangement, and its target was never
+			// inspected: writing through it would land in a directory this
+			// gate reasoned nothing about. An irregular entry is not a
+			// directory krowk can reason about at all.
 			return &UnmanagedError{Path: dir}
+		case !info.IsDir():
+			return &UnmanagedError{Path: dir}
+		case !DirOwned(dir):
+			entries, readErr := os.ReadDir(dir)
+			if readErr != nil {
+				return fmt.Errorf("inspecting %s: %w", dir, readErr)
+			}
+			if len(entries) > 0 {
+				return &UnmanagedError{Path: dir}
+			}
 		}
+		return WriteManagedFile(filepath.Join(dir, ManagedMarker), []byte(managedMarkerContent))
 	}
-	return WriteManagedFile(filepath.Join(dir, ManagedMarker), []byte(managedMarkerContent))
+	return &UnmanagedError{Path: dir}
 }
 
 // WriteManagedFile writes one file krowk owns, refusing to write through a
@@ -120,16 +155,40 @@ func ClaimDir(dir string) error {
 // then several files), and making every write re-read the marker would say
 // nothing new while turning a claimed directory into a per-file syscall.
 // Callers claim first; this refuses the one thing a claim cannot cover, which
-// is what the final component turned out to be.
+// is what the final component turned out to be — and it refuses it through the
+// kernel, on the descriptor it is about to write, rather than through a check
+// something could have invalidated in between.
 func WriteManagedFile(path string, data []byte) error {
-	if info, err := os.Lstat(path); err == nil {
-		if !info.Mode().IsRegular() {
+	f, err := openManagedFileForWrite(path)
+	if err != nil {
+		if errors.Is(err, errIsSymlink) || errors.Is(err, errNotRegularFile) {
 			return &UnmanagedError{Path: path}
 		}
-	} else if !isNotExist(err) {
+		return fmt.Errorf("opening %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	// The open proved the path was not a link. It did not prove what it was:
+	// a FIFO or a device that was already sitting there opens perfectly well.
+	// The descriptor answers that, and it is the same descriptor about to be
+	// written to, so there is nothing left to swap.
+	info, err := f.Stat()
+	if err != nil {
 		return fmt.Errorf("inspecting %s: %w", path, err)
 	}
-	return os.WriteFile(path, data, 0o644) // #nosec G306 -- managed files are documentation an agent reads, gated by the Lstat above
+	if !info.Mode().IsRegular() {
+		return &UnmanagedError{Path: path}
+	}
+	// Best-effort: a file that already existed keeps its old permissions
+	// through an O_TRUNC open, and the mode krowk documents is the one an
+	// agent can read. Windows has no meaningful answer here, so a refusal is
+	// not worth failing a write over.
+	_ = f.Chmod(0o644)
+
+	if _, err := f.Write(data); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	return f.Close()
 }
 
 // DirOwned reports whether krowk wrote the directory at dir. The marker must
@@ -157,20 +216,33 @@ func InstalledVersion(dir string) string {
 	if dir == "" {
 		return ""
 	}
-	path := filepath.Join(dir, InstalledVersionFile)
-	if !isRegularFile(path) {
-		return ""
-	}
-	f, err := os.Open(path) // #nosec G304 -- a fixed filename inside a directory the caller named, proved regular above
-	if err != nil {
-		return ""
-	}
-	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, maxVersionStampBytes))
+	data, err := readManagedFile(filepath.Join(dir, InstalledVersionFile), maxVersionStampBytes)
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+// readManagedFile reads at most maxBytes of a file krowk owns, refusing
+// anything that is not a regular file. It goes through openConfigFile with
+// trusted=false, which is what makes it safe to point at a path other things
+// can write: O_NOFOLLOW refuses a final-component symlink outright, and
+// O_NONBLOCK means a FIFO planted in the name of a stamp or a marker returns
+// instead of waiting forever for a writer that is never coming.
+func readManagedFile(path string, maxBytes int64) ([]byte, error) {
+	f, err := openConfigFile(path, false)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errNotRegularFile
+	}
+	return io.ReadAll(io.LimitReader(f, maxBytes))
 }
 
 // IsManagedCopy reports whether dir is a plain directory holding nothing but
@@ -181,8 +253,21 @@ func InstalledVersion(dir string) string {
 // anything. DirOwned answers "may krowk write here", which is enough to add or
 // replace a file; it is not enough to remove the directory, because a user may
 // have dropped their own file in beside krowk's. All three conditions are load
-// bearing: the marker proves provenance (and a symlink in its name proves
-// nothing), and the allowlist keeps anything else in the directory safe.
+// bearing: the marker proves provenance — by its contents as well as its
+// name, since only a file krowk wrote says what krowk writes — and the
+// allowlist keeps anything else in the directory safe.
+//
+// Entry names are compared exactly. On a case-insensitive filesystem that can
+// make this and DirOwned disagree about one directory, and the disagreement
+// only ever runs one way: DirOwned resolves `.MANAGED-BY-KROWK-CLI` and says
+// the directory is writable, while this sees a name that is not on the
+// allowlist and says it is not removable. Writable-but-not-removable is the
+// safe half of that pair, so it is left as it is.
+//
+// This answers about a path, not about a descriptor, and the answer is stale
+// the moment it is returned. A caller that goes on to delete something must
+// re-inspect through a descriptor it holds; that is the residual this
+// predicate cannot close and does not pretend to.
 func IsManagedCopy(dir string, allowed ...string) bool {
 	info, err := os.Lstat(dir)
 	if err != nil || !info.IsDir() {
@@ -202,7 +287,7 @@ func IsManagedCopy(dir string, allowed ...string) bool {
 			return false
 		}
 		if entry.Name() == ManagedMarker {
-			sawMarker = true
+			sawMarker = markerContentMatches(filepath.Join(dir, ManagedMarker))
 			continue
 		}
 		if !permitted[entry.Name()] {
@@ -210,4 +295,18 @@ func IsManagedCopy(dir string, allowed ...string) bool {
 		}
 	}
 	return sawMarker
+}
+
+// markerContentMatches reports whether the marker at path is the sentence
+// krowk writes. Presence is enough to say "krowk may write here"; saying
+// "krowk may delete this" asks more, and a file of some other shape carrying
+// the marker's name — copied into a dotfile repository, committed to a
+// template, left by a different tool — is not evidence krowk created the
+// directory around it.
+func markerContentMatches(path string) bool {
+	data, err := readManagedFile(path, maxMarkerBytes)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(data)) == strings.TrimSpace(managedMarkerContent)
 }

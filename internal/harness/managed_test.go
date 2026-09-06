@@ -348,3 +348,69 @@ func TestUnmanagedErrorSaysWhatToDoAboutIt(t *testing.T) {
 		t.Fatalf("message %q does not name the path, the reason and the remedy", msg)
 	}
 }
+
+func TestClaimDirCreatesEveryMissingParent(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "one", "two", "three", "krowk")
+
+	if err := ClaimDir(dir); err != nil {
+		t.Fatalf("ClaimDir: %v", err)
+	}
+	if !DirOwned(dir) {
+		t.Fatal("the directory at the end of a missing chain was not claimed")
+	}
+}
+
+func TestClaimDirAsksAgainWhenSomethingElseWonTheRace(t *testing.T) {
+	// What os.Mkdir returning EEXIST means, staged directly: by the time the
+	// directory is created, it is somebody else's populated one. The second
+	// pass has to inspect it rather than assume krowk made it.
+	root := t.TempDir()
+	dir := filepath.Join(root, "krowk")
+	mkdirAll(t, dir)
+	writeFile(t, filepath.Join(dir, "SKILL.md"), "# theirs\n")
+
+	if got := unmanaged(t, ClaimDir(dir)); got != dir {
+		t.Fatalf("refusal names %q, want %q", got, dir)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, ManagedMarker)); err == nil {
+		t.Fatal("the loser of the race claimed the winner's directory")
+	}
+}
+
+func TestIsManagedCopyRefusesAMarkerSayingSomethingElse(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "krowk")
+	mkdirAll(t, dir)
+	writeFile(t, filepath.Join(dir, ManagedMarker), "copied out of somebody's dotfiles\n")
+	writeFile(t, filepath.Join(dir, "SKILL.md"), "# theirs\n")
+
+	if IsManagedCopy(dir, "SKILL.md") {
+		t.Fatal("a marker krowk never wrote vouched for a directory krowk never made")
+	}
+	// The name alone is still enough to write there — the two questions are
+	// different, and only the destructive one reads the contents.
+	if !DirOwned(dir) {
+		t.Fatal("DirOwned should still see a regular file in the marker's name")
+	}
+}
+
+func TestManagedFilesEndUpAtTheModeTheyAreDocumentedAt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no meaningful answer for a Unix mode")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "SKILL.md")
+	if err := os.WriteFile(path, []byte("# old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WriteManagedFile(path, []byte("# new\n")); err != nil {
+		t.Fatalf("WriteManagedFile: %v", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Fatalf("mode = %v, want 0644 — an agent has to be able to read it", got)
+	}
+}

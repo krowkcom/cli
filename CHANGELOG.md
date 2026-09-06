@@ -21,24 +21,31 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `krowk setup` will, and they will agree because they will be reading the
   same checks.
 
-- An ownership gate (`internal/harness`) for every directory krowk writes into
-  a home directory. krowk now leaves a `.managed-by-krowk-cli` marker and an
-  `.installed-version` stamp beside what it installs, and writes only where
-  that marker says it wrote before: it creates a directory that is not there,
-  adopts an empty one, refreshes one it already marked, and refuses everything
-  else — a populated directory without the marker is somebody's own work, and
-  the shape of the contents cannot tell a hand-authored skill from an installed
-  one. Nothing is ever written through a symlink, in either the directory's
-  name or a file's.
+- The installer no longer overwrites a Claude Code skill directory it did not
+  write. `scripts/install.sh` now leaves two files beside the skill it
+  installs — `.managed-by-krowk-cli`, which says krowk manages the directory,
+  and `.installed-version`, which says with what — and writes only where that
+  marker says it wrote before: it creates a directory that is not there,
+  adopts an empty one, refreshes one it already marked, and otherwise says so
+  and leaves the directory exactly as it found it. If you have your own
+  `~/.claude/skills/krowk/`, move it aside and re-run to have krowk manage it.
 
-  `scripts/install.sh` follows the same rules, with the same two filenames, so
-  an upgrade recognises what the installer wrote: if you already have a
-  `~/.claude/skills/krowk/` the installer did not write, it now says so and
-  leaves it alone rather than overwriting it — move it aside and re-run to have
-  krowk manage it. The harness skill check tells a hand-placed skill from a
-  managed one, so when `krowk doctor` surfaces it, it will say krowk will not
-  refresh that skill. This is the gate `krowk setup` and every future managed
-  file will go through.
+  Upgrading from an earlier krowk needs nothing: a skill directory holding
+  nothing but the `SKILL.md` a previous installer wrote is adopted and marked
+  on the next run, since that is the file the previous installer overwrote
+  anyway. Nothing is written through a symlink any more, in either a
+  directory's name or a file's — a link is refused rather than followed, and
+  every managed file is written to a sibling temporary file and renamed into
+  place.
+
+  `internal/harness` carries the same gate for Go (`ClaimDir`,
+  `WriteManagedFile`, `DirOwned`, `InstalledVersion`, `IsManagedCopy`), where
+  the symlink refusal is the kernel's — `O_NOFOLLOW`, on the descriptor that
+  is then written — rather than a check something could invalidate in
+  between. No command uses it yet; `krowk setup` and every managed file after
+  it will, so that one rule decides every write krowk makes into your home
+  directory. `krowk doctor` will report a hand-placed skill as installed, and
+  say that krowk will not refresh it.
 
 ## [0.9.0] - 2026-09-06
 

@@ -406,6 +406,40 @@ MANAGED_MARKER=".managed-by-krowk-cli"
 INSTALLED_VERSION_FILE=".installed-version"
 MANAGED_MARKER_CONTENT="This directory is managed by krowk. Manual edits will be overwritten on upgrade."
 
+# write_managed_file writes one file krowk owns, and never through a symlink.
+# The bytes go to a temporary file in the destination's own directory and are
+# then renamed onto the final name: a rename replaces whatever is there rather
+# than following it, so a link planted in a managed file's name is destroyed
+# instead of being written through. Nothing is ever redirected or chmod-ed onto
+# a final path — a `>` follows a symlink, and `chmod` follows it too.
+#
+# The temp file is a sibling on purpose: a rename is only atomic within one
+# filesystem, and $TMPDIR is regularly on another one.
+#
+# Reads from stdin so a caller can pipe a downloaded file through it without
+# the content ever passing through a variable.
+write_managed_file() {
+  local path="$1" dir tmp
+
+  if [[ -L "$path" ]]; then
+    note "${path} is a symlink, which points somewhere this installer never looked; leaving it alone."
+    return 1
+  fi
+
+  dir=$(dirname "$path")
+  tmp=$(mktemp "${dir}/.krowk-XXXXXX") || return 1
+  if ! cat >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
+  # rm first, so that what the rename replaces is a name and not a link the
+  # rename would have been happy to overwrite anyway — this is belt and braces,
+  # and it also clears a directory-in-the-file's-name that mv would refuse.
+  rm -f "$path"
+  mv -f "$tmp" "$path" || { rm -f "$tmp"; return 1; }
+}
+
 # claim_skill_dir is the gate every skill write goes through, and the shell half
 # of internal/harness/managed.go's ClaimDir: it creates a missing directory,
 # adopts an empty one, accepts one that already carries the marker, and refuses
@@ -413,11 +447,22 @@ MANAGED_MARKER_CONTENT="This directory is managed by krowk. Manual edits will be
 # skill, and an installer that overwrote it would destroy work nobody asked it
 # to touch — so it says why and leaves it exactly as it found it.
 #
+# It also adopts one shape the Go gate deliberately refuses: a directory holding
+# nothing but the files a pre-marker krowk installer wrote — SKILL.md, and the
+# version stamp if it is there — every one of them a regular file. That
+# installer overwrote exactly that SKILL.md on every run, so adopting it now
+# changes nothing for the people upgrading, while anything else in the
+# directory means somebody put it there and the refusal stands. This is a
+# one-time handoff and it lives here, in the installer, rather than weakening
+# the gate the rest of krowk writes through.
+#
 # The tests are on the directory itself, never through it: -L before -d, because
 # a symlink here points at a directory this script never looked at, and writing
-# through it would land somewhere nothing reasoned about.
+# through it would land somewhere nothing reasoned about. And a directory that
+# cannot be listed is refused rather than assumed empty — "I could not look" is
+# not "there is nothing there".
 claim_skill_dir() {
-  local dir="$1"
+  local dir="$1" entries name
 
   if [[ -L "$dir" ]]; then
     note "${dir} is a symlink, which points somewhere this installer never looked; leaving it alone."
@@ -429,13 +474,38 @@ claim_skill_dir() {
       note "${dir} exists and is not a directory; leaving it alone."
       return 1
     fi
-    # An empty directory is what somebody who ran mkdir before this meant, and
-    # there is nothing there to lose — so only a populated one is refused.
-    if [[ ! -f "${dir}/${MANAGED_MARKER}" || -L "${dir}/${MANAGED_MARKER}" ]] &&
-      [[ -n "$(ls -A "$dir" 2>/dev/null)" ]]; then
-      note "${dir} was not written by krowk; leaving it alone."
-      note "Move it aside and re-run this installer to have krowk manage it."
+
+    if ! entries=$(ls -A -- "$dir" 2>/dev/null); then
+      note "${dir} cannot be read, so what is in it is unknown; leaving it alone."
       return 1
+    fi
+
+    if [[ -L "${dir}/${MANAGED_MARKER}" ]]; then
+      # A link in the marker's name proves nothing: its target was never
+      # inspected, and shape is not ownership.
+      note "${dir} carries a symlink where krowk's marker should be; leaving it alone."
+      return 1
+    elif [[ -f "${dir}/${MANAGED_MARKER}" ]]; then
+      : # krowk wrote this one; refresh it.
+    elif [[ -n "$entries" ]]; then
+      # No marker and not empty: either the pre-marker installer's own files,
+      # which are safe to adopt, or somebody's work, which is not.
+      while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        case "$name" in
+          SKILL.md|"${INSTALLED_VERSION_FILE}") ;;
+          *)
+            note "${dir} was not written by krowk; leaving it alone."
+            note "Move it aside and re-run this installer to have krowk manage it."
+            return 1
+            ;;
+        esac
+        if [[ -L "${dir}/${name}" || ! -f "${dir}/${name}" ]]; then
+          note "${dir} was not written by krowk; leaving it alone."
+          note "Move it aside and re-run this installer to have krowk manage it."
+          return 1
+        fi
+      done <<<"$entries"
     fi
   fi
 
@@ -482,12 +552,30 @@ install_skill() {
     return 0
   fi
 
-  mv -f "$tmp" "${dir}/krowk/SKILL.md"
-  chmod 0644 "${dir}/krowk/SKILL.md"
-  printf '%s\n' "$MANAGED_MARKER_CONTENT" >"${dir}/krowk/${MANAGED_MARKER}"
-  chmod 0644 "${dir}/krowk/${MANAGED_MARKER}"
-  printf '%s\n' "$version" >"${dir}/krowk/${INSTALLED_VERSION_FILE}"
-  chmod 0644 "${dir}/krowk/${INSTALLED_VERSION_FILE}"
+  # The marker goes down first, then the skill, then the version stamp. A run
+  # interrupted anywhere in there leaves a directory that is still recognisably
+  # krowk's, so the next run refreshes it instead of refusing it; the stamp is
+  # last because a version claimed before the file it describes was written
+  # would be a lie about what is on disk.
+  #
+  # Every one of these is best-effort, like the rest of install_skill: the
+  # binaries are already in place and working, and a skill that could not be
+  # written is a sentence to print, not a reason to fail an install.
+  if ! printf '%s\n' "$MANAGED_MARKER_CONTENT" | write_managed_file "${dir}/krowk/${MANAGED_MARKER}"; then
+    rm -f "$tmp"
+    note "Could not mark ${dir}/krowk as krowk's, so no skill was written — krowk itself is installed and working."
+    return 0
+  fi
+  if ! write_managed_file "${dir}/krowk/SKILL.md" <"$tmp"; then
+    rm -f "$tmp"
+    note "Could not write ${dir}/krowk/SKILL.md — krowk itself is installed and working."
+    return 0
+  fi
+  rm -f "$tmp"
+  if ! printf '%s\n' "$version" | write_managed_file "${dir}/krowk/${INSTALLED_VERSION_FILE}"; then
+    note "The agent skill was written, but its version could not be stamped."
+    return 0
+  fi
   info "Agent skill written to ${dir}/krowk/SKILL.md"
 }
 

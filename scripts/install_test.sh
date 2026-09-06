@@ -289,6 +289,9 @@ echo "Ownership of the skill directory"
 MINE="$WORK/claude-mine"
 mkdir -p "$MINE/skills/krowk"
 printf '# my own skill\n' >"$MINE/skills/krowk/SKILL.md"
+# Something the pre-marker installer never wrote, which is what makes this
+# somebody's own directory rather than an old install to adopt.
+printf 'mine\n' >"$MINE/skills/krowk/notes.md"
 env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
   CLAUDE_CONFIG_DIR="$MINE" \
   KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
@@ -316,6 +319,81 @@ diff -q skills/krowk/SKILL.md "$CLAUDE/skills/krowk/SKILL.md" >/dev/null \
 [[ -f "$CLAUDE/skills/krowk/.managed-by-krowk-cli" ]] \
   || fail "the refresh dropped the ownership marker"
 pass "a marked skill directory is refreshed in place"
+
+# A symlink where the skill directory should be points at a directory this
+# installer never inspected, so it is not one to write through.
+LINKED="$WORK/claude-linked"
+mkdir -p "$LINKED/skills" "$WORK/link-target"
+ln -s "$WORK/link-target" "$LINKED/skills/krowk"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$LINKED" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/linked.log" 2>&1 \
+  || { cat "$WORK/linked.log"; fail "the installer exited non-zero over a symlinked skill directory"; }
+[[ -z "$(ls -A "$WORK/link-target")" ]] \
+  || fail "the installer wrote through a symlinked skill directory"
+grep -q "is a symlink" "$WORK/linked.log" \
+  || { cat "$WORK/linked.log"; fail "the installer did not say it refused a symlinked skill directory"; }
+pass "a symlinked skill directory is left alone"
+
+# Inside a directory krowk does own, a symlink in a managed file's name is
+# refused rather than followed — the same answer internal/harness gives, and
+# for the same reason: its target was never inspected, so whatever it points at
+# is somebody else's file.
+printf 'do not touch\n' >"$WORK/victim"
+rm -f "$CLAUDE/skills/krowk/.installed-version"
+ln -s "$WORK/victim" "$CLAUDE/skills/krowk/.installed-version"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$CLAUDE" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/victim.log" 2>&1 \
+  || { cat "$WORK/victim.log"; fail "the installer exited non-zero over a symlinked version stamp"; }
+[[ "$(cat "$WORK/victim")" == "do not touch" ]] \
+  || fail "the installer wrote through a symlinked version stamp"
+grep -q "is a symlink" "$WORK/victim.log" \
+  || { cat "$WORK/victim.log"; fail "the installer did not say it refused the symlinked version stamp"; }
+diff -q skills/krowk/SKILL.md "$CLAUDE/skills/krowk/SKILL.md" >/dev/null \
+  || fail "the refused stamp took the skill down with it"
+rm -f "$CLAUDE/skills/krowk/.installed-version"
+pass "a symlink in a managed file's name is refused, and its target untouched"
+
+# A directory that cannot be listed is refused rather than assumed empty.
+if [[ "$(id -u)" == "0" ]]; then
+  echo "  – running as root, where an unreadable directory is still readable; skipped"
+else
+  BLIND="$WORK/claude-blind"
+  mkdir -p "$BLIND/skills/krowk"
+  printf '# mine\n' >"$BLIND/skills/krowk/SKILL.md"
+  chmod 300 "$BLIND/skills/krowk"
+  env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+    CLAUDE_CONFIG_DIR="$BLIND" \
+    KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+    bash "$REPO_ROOT/scripts/install.sh" >"$WORK/blind.log" 2>&1 \
+    || { cat "$WORK/blind.log"; fail "the installer exited non-zero over an unreadable skill directory"; }
+  grep -q "cannot be read" "$WORK/blind.log" \
+    || { cat "$WORK/blind.log"; fail "the installer did not refuse an unreadable skill directory"; }
+  chmod 700 "$BLIND/skills/krowk"
+  [[ "$(cat "$BLIND/skills/krowk/SKILL.md")" == "# mine" ]] \
+    || fail "the installer wrote into a directory it could not read"
+  pass "a skill directory that cannot be listed is left alone"
+fi
+
+# The one shape the installer adopts: what a pre-marker krowk wrote, which is
+# a SKILL.md and nothing else. That file was overwritten by every run of the
+# old installer anyway, so adopting it takes nothing from anyone.
+OLD="$WORK/claude-old"
+mkdir -p "$OLD/skills/krowk"
+printf '# an older krowk wrote this\n' >"$OLD/skills/krowk/SKILL.md"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$OLD" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/old.log" 2>&1 \
+  || { cat "$WORK/old.log"; fail "the installer exited non-zero upgrading a pre-marker skill"; }
+[[ -f "$OLD/skills/krowk/.managed-by-krowk-cli" ]] \
+  || { cat "$WORK/old.log"; fail "a pre-marker skill directory was not adopted"; }
+diff -q skills/krowk/SKILL.md "$OLD/skills/krowk/SKILL.md" >/dev/null \
+  || fail "the adopted skill was not refreshed"
+pass "a skill directory a pre-marker krowk wrote is adopted and refreshed"
 
 grep -q "krowk push screenshot.png" "$WORK/install.log" || fail "the next steps were not printed"
 pass "the next steps were printed"

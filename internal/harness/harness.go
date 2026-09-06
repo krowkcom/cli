@@ -19,6 +19,7 @@ package harness
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -38,10 +39,20 @@ const (
 	StatusFail = "fail"
 )
 
-// maxConfigBytes bounds every config read. A megabyte is orders of magnitude
-// more than any of these files legitimately holds, and the bound is what stops
-// a symlink to /dev/zero in a cloned checkout from eating the machine.
-const maxConfigBytes = 1 << 20
+// The bounds on a config read. Both exist to stop a file that is not really a
+// config — a device, a growing log, something a cloned checkout pointed at —
+// from being read into memory in full.
+const (
+	// maxProjectConfigBytes bounds a checked-in .mcp.json. A megabyte is
+	// orders of magnitude more than a server list ever needs, and this file
+	// is written by whoever wrote the checkout.
+	maxProjectConfigBytes = 1 << 20
+	// maxUserConfigBytes bounds ~/.claude.json, which is not only a config:
+	// Claude Code keeps per-project history in it, so it grows without limit
+	// in normal use and is already tens of megabytes on some machines. The
+	// bound is here to stop unbounded allocation, not to police the size.
+	maxUserConfigBytes = 32 << 20
+)
 
 // StatusCheck is one health question and its answer. Message says what is,
 // Hint says what to do about it — so it is present only when there is
@@ -71,8 +82,7 @@ func Fail(name, message, hint string) StatusCheck {
 }
 
 // Worst is the most severe status in checks: fail beats warn beats pass. An
-// empty set passes — no question asked is no bad news. Every consumer needs
-// this single-word summary, so it lives here rather than being reinvented.
+// empty set passes — no question asked is no bad news.
 func Worst(checks []StatusCheck) string {
 	worst := StatusPass
 	for _, c := range checks {
@@ -86,11 +96,12 @@ func Worst(checks []StatusCheck) string {
 	return worst
 }
 
-// HomeDir is the home directory as env describes it. HOME wins on every
-// platform, including Windows, where Go's own runtime sets it and where a
-// deliberately emptied HOME must not be quietly rescued; USERPROFILE is
-// consulted only when HOME is empty, and only on Windows, which is the only
-// place it means anything. No home in env is an empty string, never a guess.
+// HomeDir is the home directory as env describes it. HOME wins wherever it is
+// set — including on Windows, where an MSYS or Git Bash shell sets it and
+// means it. USERPROFILE is the fallback, and only on Windows, which is the
+// only place it means anything. No home in env is an empty string, never a
+// guess: a check that invented a home directory would report on a machine
+// nobody is using.
 func HomeDir(env Env) string {
 	if env == nil {
 		return ""
@@ -143,7 +154,10 @@ func executableNames(env Env, name string) []string {
 	if runtime.GOOS != "windows" {
 		return []string{name}
 	}
-	names := []string{name}
+	// The bare name is deliberately not tried on Windows: nothing there is
+	// executable by virtue of its permissions, so a data file called `claude`
+	// would otherwise beat the `claude.cmd` that actually runs.
+	var names []string
 	exts := env("PATHEXT")
 	if strings.TrimSpace(exts) == "" {
 		exts = defaultPathExt
@@ -186,39 +200,55 @@ func isDir(path string) bool {
 	return err == nil && info.IsDir()
 }
 
-// readConfigFile reads a small JSON configuration file safely enough to read
-// one an attacker wrote. It refuses anything that is not a regular file — a
-// FIFO in the name of .mcp.json would otherwise block the check forever — and
-// stops at maxConfigBytes rather than parsing the prefix of something huge,
-// because half a config is not a config.
+// readConfigFile reads a JSON configuration file safely enough to read one an
+// attacker wrote, and refuses rather than guesses when it cannot.
+//
+// The file is opened before anything is decided about it, and every decision
+// is then made on the descriptor: a path checked and then opened is a path
+// that can be swapped in between, and the whole point of these checks is that
+// they run against directories other people can write.
+//
+// trusted says whether the path belongs to the user whose config this is.
+// An untrusted path — a .mcp.json sitting in a checkout — refuses a symlink
+// outright, because the file it names was never the file that was reviewed.
+// A trusted one follows links, since dotfiles in a home directory are
+// legitimately symlinked into a dotfile repository all the time. Neither will
+// read anything that is not a regular file, and neither reads past maxBytes.
 //
 // A missing file returns fs.ErrNotExist, which callers read as "this scope
 // says nothing" rather than as a problem.
-func readConfigFile(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.New("not a regular file")
-	}
-	f, err := os.Open(path) //nolint:gosec // G304: a path the caller named
+func readConfigFile(path string, trusted bool, maxBytes int64) ([]byte, error) {
+	f, err := openConfigFile(path, trusted)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
 
-	// One byte past the limit is read on purpose: it is how "exactly at the
-	// limit" is told apart from "truncated here".
-	data, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
+	info, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > maxConfigBytes {
-		return nil, errors.New("larger than 1 MiB")
+	if !info.Mode().IsRegular() {
+		return nil, errNotRegularFile
+	}
+
+	// One byte past the limit is read on purpose: it is how "exactly at the
+	// limit" is told apart from "truncated here".
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("larger than %d MiB", maxBytes>>20)
 	}
 	return data, nil
 }
+
+// The two refusals a caller reports differently from a plain I/O error.
+var (
+	errNotRegularFile = errors.New("not a regular file")
+	errIsSymlink      = errors.New("is a symlink")
+)
 
 // isNotExist reports whether err is the filesystem saying nothing is there.
 func isNotExist(err error) bool { return errors.Is(err, fs.ErrNotExist) }

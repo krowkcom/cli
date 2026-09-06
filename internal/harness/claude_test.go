@@ -240,6 +240,7 @@ func TestCheckClaudeMCPServerSurvivesOddServerEntries(t *testing.T) {
 	home := t.TempDir()
 	writeFile(t, filepath.Join(home, ".claude.json"),
 		`{"mcpServers":{"krowk":null,"broken":"nonsense","numeric":{"command":7},`+
+			`"stringargs":{"command":"krowk-mcp","args":"--stdio"},`+
 			`"real":{"command":"npx","args":["-y","@krowk/mcp"]}}}`)
 	if check := CheckClaudeMCPServer(homeEnv(home), ""); check.Status != StatusPass {
 		t.Fatalf("check = %+v, want pass — one odd entry must not hide a working one", check)
@@ -283,8 +284,8 @@ func TestCheckClaudeMCPServerWarnsWithNowhereToLook(t *testing.T) {
 	}
 }
 
-func TestCommandIsKrowkMCPAcceptsEverySpellingOfTheSameServer(t *testing.T) {
-	yes := []string{"krowk-mcp", "/opt/bin/krowk-mcp", "KROWK-MCP.EXE", "krowk-mcp.cmd", "  krowk-mcp  "}
+func TestCommandIsKrowkMCPMatchesTheServerAndNothingElse(t *testing.T) {
+	yes := []string{"krowk-mcp", "/opt/bin/krowk-mcp", "  krowk-mcp  "}
 	for _, command := range yes {
 		if !commandIsKrowkMCP(command) {
 			t.Errorf("commandIsKrowkMCP(%q) = false, want true", command)
@@ -295,6 +296,133 @@ func TestCommandIsKrowkMCPAcceptsEverySpellingOfTheSameServer(t *testing.T) {
 		if commandIsKrowkMCP(command) {
 			t.Errorf("commandIsKrowkMCP(%q) = true, want false", command)
 		}
+	}
+
+	// A suffix and a case are meaningful everywhere but Windows: on a
+	// case-sensitive filesystem `krowk-mcp.py` is somebody else's program.
+	windowsOnly := []string{"KROWK-MCP.EXE", "krowk-mcp.cmd", "Krowk-Mcp"}
+	for _, command := range windowsOnly {
+		if got := commandIsKrowkMCP(command); got != (runtime.GOOS == "windows") {
+			t.Errorf("commandIsKrowkMCP(%q) = %v on %s", command, got, runtime.GOOS)
+		}
+	}
+	if commandIsKrowkMCP("krowk-mcp.py") && runtime.GOOS != "windows" {
+		t.Error("krowk-mcp.py matched: an extension that is not executable was stripped")
+	}
+}
+
+func TestTheNpxFormOnlyCountsWhenAPackageRunnerLaunchesIt(t *testing.T) {
+	cases := []struct {
+		name    string
+		servers string
+		want    bool
+	}{
+		{"npx", `{"krowk":{"command":"npx","args":["-y","@krowk/mcp"]}}`, true},
+		{"npx at latest", `{"krowk":{"command":"npx","args":["@krowk/mcp@latest"]}}`, true},
+		{"npx at a version", `{"krowk":{"command":"bunx","args":["@krowk/mcp@1.2.3"]}}`, true},
+		{"a foreign command carrying the package name",
+			`{"krowk":{"command":"/tmp/evil/payload","args":["@krowk/mcp"]}}`, false},
+		{"a package that merely starts the same way",
+			`{"krowk":{"command":"npx","args":["@krowk/mcp-evil"]}}`, false},
+		{"an argument that is the binary name",
+			`{"krowk":{"command":"/tmp/evil/payload","args":["krowk-mcp"]}}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			writeFile(t, filepath.Join(home, ".claude.json"), `{"mcpServers":`+tc.servers+`}`)
+			check := CheckClaudeMCPServer(homeEnv(home), "")
+			if got := check.Status == StatusPass; got != tc.want {
+				t.Fatalf("check = %+v, want pass=%v", check, tc.want)
+			}
+		})
+	}
+}
+
+func TestCheckClaudeMCPServerNamesTheCommandItMatched(t *testing.T) {
+	home := t.TempDir()
+	writeFile(t, filepath.Join(home, ".claude.json"),
+		`{"mcpServers":{"krowk":{"command":"npx","args":["-y","@krowk/mcp@latest"]}}}`)
+
+	check := CheckClaudeMCPServer(homeEnv(home), "")
+	if !strings.Contains(check.Message, "npx @krowk/mcp@latest") {
+		t.Fatalf("message %q does not say what launches the server", check.Message)
+	}
+}
+
+func TestAMatchedCommandIsStrippedOfWhatItShouldNotPrint(t *testing.T) {
+	home := t.TempDir()
+	// An escape sequence in a doctor line is a terminal somebody else drives.
+	writeFile(t, filepath.Join(home, ".claude.json"),
+		`{"mcpServers":{"krowk":{"command":"npx","args":["@krowk/mcp@\u001b[31m`+strings.Repeat("x", 200)+`"]}}}`)
+
+	check := CheckClaudeMCPServer(homeEnv(home), "")
+	if check.Status != StatusPass {
+		t.Fatalf("check = %+v, want pass", check)
+	}
+	if strings.ContainsRune(check.Message, '\x1b') {
+		t.Fatalf("message %q carries an escape sequence", check.Message)
+	}
+	if len([]rune(check.Message)) > 200 {
+		t.Fatalf("message is %d runes long, want the command truncated", len([]rune(check.Message)))
+	}
+}
+
+func TestCheckClaudeMCPServerIgnoresAnHTTPRegistration(t *testing.T) {
+	home := t.TempDir()
+	// krowk ships no HTTP MCP server, so this is somebody else's.
+	writeFile(t, filepath.Join(home, ".claude.json"),
+		`{"mcpServers":{"krowk":{"type":"http","url":"https://example.invalid/mcp"}}}`)
+	if check := CheckClaudeMCPServer(homeEnv(home), ""); check.Status != StatusFail {
+		t.Fatalf("check = %+v, want fail", check)
+	}
+}
+
+func TestCheckClaudeMCPServerMatchesAProjectReachedThroughASymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need a privilege this test should not assume")
+	}
+	home := t.TempDir()
+	real, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "project")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	// Claude Code records the resolved path; the shell arrived through a link.
+	writeFile(t, filepath.Join(home, ".claude.json"), `{"projects":{`+
+		strconv.Quote(real)+`:{"mcpServers":{"krowk":{"command":"krowk-mcp"}}}}}`)
+
+	if check := CheckClaudeMCPServer(homeEnv(home), link); check.Status != StatusPass {
+		t.Fatalf("check = %+v, want pass — it is the same directory", check)
+	}
+}
+
+func TestCheckClaudeMCPServerRefusesASymlinkedProjectConfig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need a privilege this test should not assume")
+	}
+	home, cwd := t.TempDir(), t.TempDir()
+	target := filepath.Join(t.TempDir(), "elsewhere.json")
+	writeFile(t, target, `{"mcpServers":{"krowk":{"command":"krowk-mcp"}}}`)
+	if err := os.Symlink(target, filepath.Join(cwd, ".mcp.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckClaudeMCPServer(homeEnv(home), cwd)
+	if check.Status != StatusWarn || !strings.Contains(check.Message, "is a symlink") {
+		t.Fatalf("check = %+v, want a warn about the symlink — it names a file never reviewed", check)
+	}
+}
+
+func TestCheckClaudeMCPServerKeepsACommandWhoseArgsAreNotAList(t *testing.T) {
+	home := t.TempDir()
+	writeFile(t, filepath.Join(home, ".claude.json"),
+		`{"mcpServers":{"krowk":{"command":"krowk-mcp","args":"--stdio"}}}`)
+	if check := CheckClaudeMCPServer(homeEnv(home), ""); check.Status != StatusPass {
+		t.Fatalf("check = %+v, want pass — odd args must not discard a good command", check)
 	}
 }
 

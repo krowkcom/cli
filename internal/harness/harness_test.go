@@ -2,6 +2,7 @@ package harness
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -131,7 +132,9 @@ func TestExecutableNamesFollowPathExtOnWindows(t *testing.T) {
 		}
 		return
 	}
-	want := []string{"claude", "claude.COM", "claude.EXE"}
+	// The bare name is not among them: nothing on Windows is executable
+	// because of its permissions.
+	want := []string{"claude.COM", "claude.EXE"}
 	if len(got) != len(want) {
 		t.Fatalf("executableNames = %v, want %v", got, want)
 	}
@@ -149,7 +152,7 @@ func TestExecutableNamesFollowPathExtOnWindows(t *testing.T) {
 func TestReadConfigFileRefusesWhatItShouldNotRead(t *testing.T) {
 	dir := t.TempDir()
 
-	if _, err := readConfigFile(filepath.Join(dir, "absent.json")); !isNotExist(err) {
+	if _, err := readConfigFile(filepath.Join(dir, "absent.json"), true, maxProjectConfigBytes); !isNotExist(err) {
 		t.Fatalf("reading a missing file = %v, want a not-exist error", err)
 	}
 
@@ -157,15 +160,15 @@ func TestReadConfigFileRefusesWhatItShouldNotRead(t *testing.T) {
 	if err := os.MkdirAll(notAFile, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readConfigFile(notAFile); err == nil || isNotExist(err) {
+	if _, err := readConfigFile(notAFile, true, maxProjectConfigBytes); err == nil || isNotExist(err) {
 		t.Fatalf("reading a directory = %v, want a plain refusal", err)
 	}
 
 	big := filepath.Join(dir, "big.json")
-	if err := os.WriteFile(big, make([]byte, maxConfigBytes+1), 0o600); err != nil {
+	if err := os.WriteFile(big, make([]byte, maxProjectConfigBytes+1), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readConfigFile(big); err == nil {
+	if _, err := readConfigFile(big, false, maxProjectConfigBytes); err == nil {
 		t.Fatal("an oversized config was read instead of refused")
 	}
 
@@ -173,8 +176,31 @@ func TestReadConfigFileRefusesWhatItShouldNotRead(t *testing.T) {
 	if err := os.WriteFile(small, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	data, err := readConfigFile(small)
+	data, err := readConfigFile(small, false, maxProjectConfigBytes)
 	if err != nil || string(data) != "{}" {
 		t.Fatalf("readConfigFile = %q, %v", data, err)
+	}
+}
+
+func TestReadConfigFileRefusesASymlinkedUntrustedConfig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need a privilege this test should not assume")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.json")
+	if err := os.WriteFile(target, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := readConfigFile(link, false, maxProjectConfigBytes); !errors.Is(err, errIsSymlink) {
+		t.Fatalf("reading an untrusted symlink = %v, want %v", err, errIsSymlink)
+	}
+	// A home-owned dotfile may legitimately be a link into a dotfile repo.
+	if data, err := readConfigFile(link, true, maxUserConfigBytes); err != nil || string(data) != "{}" {
+		t.Fatalf("reading a trusted symlink = %q, %v", data, err)
 	}
 }

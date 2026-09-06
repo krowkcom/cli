@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"unicode"
 )
 
 // The names Claude Code itself uses.
@@ -33,6 +35,13 @@ const (
 	CheckNameClaudeMCP     = "Claude Code MCP server"
 	CheckNameClaudeSkill   = "Claude Code skill"
 )
+
+// skillSourceURL is where the skill can be fetched from by hand — the same
+// address scripts/install.sh names when it finds nowhere to write one. A hint
+// that said "copy skills/krowk/SKILL.md" would be addressed to somebody
+// standing in this repository, which the person reading a doctor report is
+// not.
+const skillSourceURL = "https://github.com/krowkcom/cli/blob/main/skills/krowk/SKILL.md"
 
 // mcpHint is scope-explicit on purpose. A bare `claude mcp add` writes local
 // scope — this project only, in this user's copy of ~/.claude.json — which is
@@ -78,15 +87,11 @@ func claudeConfigDir(env Env) string {
 	return ""
 }
 
-// DetectClaude reports whether Claude Code is installed: the configuration
-// directory first, because that is what a Claude Code that has ever run leaves
-// behind, and a binary second, because a fresh install has one before it has
-// the other.
+// DetectClaude reports whether Claude Code is installed. It is the install
+// check's own answer, so detection and the check a person reads can never
+// disagree about whether an agent is here.
 func DetectClaude(env Env) bool {
-	if dir := claudeConfigDir(env); dir != "" && isDir(dir) {
-		return true
-	}
-	return FindClaudeBinary(env) != ""
+	return CheckClaudeInstalled(env).Status == StatusPass
 }
 
 // FindClaudeBinary returns the path to the claude binary, or "". PATH first,
@@ -111,8 +116,10 @@ func FindClaudeBinary(env Env) string {
 }
 
 // CheckClaudeInstalled says whether Claude Code is here, and by which of the
-// two signals — the person reading a doctor report should not have to guess
-// which one answered.
+// two signals — the configuration directory, which is what a Claude Code that
+// has ever run leaves behind, or the binary, which a fresh install has before
+// it has the directory. The person reading a doctor report should not have to
+// guess which one answered.
 func CheckClaudeInstalled(env Env) StatusCheck {
 	if dir := claudeConfigDir(env); dir != "" && isDir(dir) {
 		return Pass(CheckNameClaudeInstall, "Installed ("+dir+")")
@@ -133,15 +140,23 @@ func CheckClaudeInstalled(env Env) StatusCheck {
 //   - project scope, .mcp.json in cwd — here, for everyone who clones it.
 func CheckClaudeMCPServer(env Env, cwd string) StatusCheck {
 	type candidate struct {
-		path string
-		cwd  string
+		path     string
+		cwd      string
+		trusted  bool
+		maxBytes int64
 	}
 	var candidates []candidate
 	if home := HomeDir(env); home != "" {
-		candidates = append(candidates, candidate{filepath.Join(home, claudeUserConfigFile), cwd})
+		candidates = append(candidates, candidate{
+			path: filepath.Join(home, claudeUserConfigFile), cwd: cwd,
+			trusted: true, maxBytes: maxUserConfigBytes,
+		})
 	}
 	if cwd != "" {
-		candidates = append(candidates, candidate{filepath.Join(cwd, claudeProjectConfigFile), ""})
+		candidates = append(candidates, candidate{
+			path:    filepath.Join(cwd, claudeProjectConfigFile),
+			trusted: false, maxBytes: maxProjectConfigBytes,
+		})
 	}
 	if len(candidates) == 0 {
 		// Neither a home nor a working directory: there is nowhere a
@@ -154,10 +169,10 @@ func CheckClaudeMCPServer(env Env, cwd string) StatusCheck {
 
 	var problem string
 	for _, c := range candidates {
-		found, why := mcpServerRegistered(c.path, c.cwd)
+		matched, why := mcpServerRegistered(c.path, c.cwd, c.trusted, c.maxBytes)
 		switch {
-		case found:
-			return Pass(CheckNameClaudeMCP, "Registered in "+c.path)
+		case matched != "":
+			return Pass(CheckNameClaudeMCP, "Registered in "+c.path+" ("+matched+")")
 		case why != "" && problem == "":
 			// A file that cannot be read proves nothing either way, so
 			// remember why and keep looking for one that answers.
@@ -183,32 +198,31 @@ type claudeConfig struct {
 
 // mcpServerRegistered reports whether path registers krowk's MCP server, for
 // the project at cwd when path is the user config (pass "" to skip local
-// scope). The second result is a human-readable reason the file could not
-// answer, empty when it did.
+// scope). It returns the command line that matched, for the report to quote,
+// and a human-readable reason the file could not answer — empty when it did.
 //
 // A missing file is a plain no. Nothing is matched on the name a server was
 // registered under: an entry called "krowk" that launches something else is
 // not krowk's MCP server, and one called anything at all that launches
 // krowk-mcp is.
-func mcpServerRegistered(path, cwd string) (bool, string) {
-	data, err := readConfigFile(path)
+func mcpServerRegistered(path, cwd string, trusted bool, maxBytes int64) (matched, problem string) {
+	data, err := readConfigFile(path, trusted, maxBytes)
 	if err != nil {
 		if isNotExist(err) {
-			return false, ""
+			return "", ""
 		}
-		return false, "Cannot read " + path + ": " + err.Error()
+		return "", "Cannot read " + path + ": " + err.Error()
 	}
 	var cfg claudeConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return false, "Cannot parse " + path + ": " + err.Error()
+		return "", "Cannot parse " + path + ": " + err.Error()
 	}
-	if serversLaunchKrowk(cfg.MCPServers) {
-		return true, ""
+	if matched := serversLaunchKrowk(cfg.MCPServers); matched != "" {
+		return matched, ""
 	}
 	if cwd != "" {
-		want := filepath.Clean(cwd)
 		for key, raw := range cfg.Projects {
-			if filepath.Clean(key) != want {
+			if !sameProjectDir(key, cwd) {
 				continue
 			}
 			var project struct {
@@ -217,37 +231,120 @@ func mcpServerRegistered(path, cwd string) (bool, string) {
 			if err := json.Unmarshal(raw, &project); err != nil {
 				continue
 			}
-			if serversLaunchKrowk(project.MCPServers) {
-				return true, ""
+			if matched := serversLaunchKrowk(project.MCPServers); matched != "" {
+				return matched, ""
 			}
 		}
 	}
-	return false, ""
+	return "", ""
 }
 
-// serversLaunchKrowk reports whether any entry launches krowk's MCP server.
-func serversLaunchKrowk(servers map[string]json.RawMessage) bool {
-	for _, raw := range servers {
-		var server struct {
-			Command json.RawMessage   `json:"command"`
-			Args    []json.RawMessage `json:"args"`
+// sameProjectDir reports whether a projects key names the directory cwd. Both
+// are cleaned and, where they resolve, followed through symlinks: Claude Code
+// records the path it resolved, while the shell that ran krowk may have
+// arrived through a link. Case is folded where the filesystem folds it.
+func sameProjectDir(key, cwd string) bool {
+	candidates := func(path string) []string {
+		out := []string{filepath.Clean(path)}
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			out = append(out, filepath.Clean(resolved))
 		}
-		// A malformed entry is skipped, not fatal: it is one broken server in
-		// somebody's config, and it is certainly not a working krowk.
-		if err := json.Unmarshal(raw, &server); err != nil {
-			continue
-		}
-		if commandIsKrowkMCP(jsonString(server.Command)) {
-			return true
-		}
-		for _, raw := range server.Args {
-			arg := strings.TrimSpace(jsonString(raw))
-			if arg == KrowkMCPPackage || commandIsKrowkMCP(arg) {
+		return out
+	}
+	// Windows and macOS are case-insensitive by default; Linux is not, and
+	// folding there would call two different directories the same one.
+	fold := runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+	for _, a := range candidates(key) {
+		for _, b := range candidates(cwd) {
+			if a == b || (fold && strings.EqualFold(a, b)) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// serversLaunchKrowk returns the command line of the first entry that launches
+// krowk's MCP server, or "" if none does.
+//
+// Only a stdio registration can match, because krowk ships no HTTP MCP server:
+// an entry with a `"type": "http"` and a URL is a known non-match, whatever it
+// is called. What counts is either a command that is krowk-mcp, or a package
+// runner launching the @krowk/mcp package — a package name in the arguments of
+// something that is not a package runner proves nothing about what runs.
+func serversLaunchKrowk(servers map[string]json.RawMessage) string {
+	for _, raw := range servers {
+		// command and args are decoded separately so that one written oddly
+		// — args as a string, say — does not discard the other.
+		var server struct {
+			Command json.RawMessage `json:"command"`
+			Args    json.RawMessage `json:"args"`
+		}
+		if err := json.Unmarshal(raw, &server); err != nil {
+			continue
+		}
+		command := jsonString(server.Command)
+		if commandIsKrowkMCP(command) {
+			return describeCommand(command, "")
+		}
+		if !isPackageRunner(command) {
+			continue
+		}
+		var args []json.RawMessage
+		if err := json.Unmarshal(server.Args, &args); err != nil {
+			continue
+		}
+		for _, raw := range args {
+			if arg := strings.TrimSpace(jsonString(raw)); isKrowkMCPPackage(arg) {
+				return describeCommand(command, arg)
+			}
+		}
+	}
+	return ""
+}
+
+// packageRunners are the commands that run an npm package by name. Only these
+// turn "@krowk/mcp" in an argument list into a claim about what launches.
+var packageRunners = map[string]bool{
+	"npx": true, "bunx": true, "pnpm": true, "pnpx": true,
+	"npm": true, "yarn": true, "node": true,
+}
+
+// isPackageRunner reports whether command runs a package named in its args.
+func isPackageRunner(command string) bool { return packageRunners[commandBase(command)] }
+
+// isKrowkMCPPackage reports whether arg names krowk's npm package, with or
+// without the version suffix npx accepts (@krowk/mcp@latest, @krowk/mcp@1.2.3).
+func isKrowkMCPPackage(arg string) bool {
+	rest, ok := strings.CutPrefix(arg, KrowkMCPPackage)
+	return ok && (rest == "" || strings.HasPrefix(rest, "@"))
+}
+
+// describeCommand renders a matched registration for the report. Both halves
+// came out of a file this package does not trust, so the result is stripped of
+// anything unprintable — an escape sequence in a doctor line is a terminal
+// somebody else is driving — and cut to a length that stays on one line.
+func describeCommand(command, arg string) string {
+	if arg != "" {
+		command += " " + arg
+	}
+	var b strings.Builder
+	runes := 0
+	for _, r := range command {
+		if !unicode.IsPrint(r) {
+			continue
+		}
+		if runes == 80 {
+			b.WriteRune('\u2026')
+			break
+		}
+		b.WriteRune(r)
+		runes++
+	}
+	if b.Len() == 0 {
+		return "unnamed command"
+	}
+	return b.String()
 }
 
 // jsonString is raw as a string when raw is one, and "" for a number, an
@@ -260,15 +357,40 @@ func jsonString(raw json.RawMessage) string {
 	return s
 }
 
-// commandIsKrowkMCP reports whether a command line launches krowk's MCP
-// server. The base name is what identifies it: an absolute path out of a
-// version manager, a bare name off PATH and a Windows krowk-mcp.cmd are all
-// the same server. Comparison is case-insensitive because the filesystems
-// that produce those suffixes are.
+// commandBase is the name a command would be known by: its final path element,
+// and on Windows lowercased with an executable suffix removed, because there
+// KROWK-MCP.EXE and krowk-mcp are one file. Nothing is stripped elsewhere: on
+// a case-sensitive filesystem `krowk-mcp.py` is a different program that
+// happens to be named after this one.
+func commandBase(command string) string {
+	base := filepath.Base(strings.TrimSpace(command))
+	if runtime.GOOS != "windows" {
+		return base
+	}
+	base = strings.ToLower(base)
+	if ext := filepath.Ext(base); ext != "" && windowsExecutableExts[ext] {
+		base = strings.TrimSuffix(base, ext)
+	}
+	return base
+}
+
+// windowsExecutableExts is the default PATHEXT, lowercased: the suffixes that
+// mean "this is the executable" rather than "this is a file about it".
+var windowsExecutableExts = func() map[string]bool {
+	out := map[string]bool{}
+	for _, ext := range strings.Split(defaultPathExt, ";") {
+		if ext = strings.ToLower(strings.TrimSpace(ext)); ext != "" {
+			out[ext] = true
+		}
+	}
+	return out
+}()
+
+// commandIsKrowkMCP reports whether a command launches krowk's MCP server. The
+// base name is what identifies it: an absolute path out of a version manager
+// and a bare name off PATH are the same server.
 func commandIsKrowkMCP(command string) bool {
-	base := strings.ToLower(filepath.Base(strings.TrimSpace(command)))
-	base = strings.TrimSuffix(base, filepath.Ext(base))
-	return base == KrowkMCPCommand
+	return command != "" && commandBase(command) == KrowkMCPCommand
 }
 
 // CheckClaudeSkill says whether the krowk skill is installed for Claude Code.
@@ -289,8 +411,8 @@ func CheckClaudeSkill(env Env) StatusCheck {
 	}
 	if _, err := os.Lstat(path); err == nil {
 		return Fail(CheckNameClaudeSkill, path+" is not a regular file",
-			"Move it aside, then copy skills/krowk/SKILL.md into "+skillDir+"/")
+			"Move it aside, then re-run the krowk installer")
 	}
 	return Fail(CheckNameClaudeSkill, "Not installed",
-		"Copy skills/krowk/SKILL.md into "+skillDir+"/")
+		"Re-run the krowk installer, or copy "+skillSourceURL+" into "+skillDir+"/")
 }

@@ -396,10 +396,82 @@ func TestClaimJustBeforeExpiryStillSucceeds(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("claim before expiry = %d %v", status, body)
 	}
-	// Claimed means kept: the artifact stops expiring.
+	// Claimed into a paid workspace means kept: the artifact stops expiring.
 	clk.advance(48 * time.Hour)
 	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "krowk_sk_test", "", ""); status != http.StatusOK {
 		t.Errorf("claimed artifact expired anyway: %d", status)
+	}
+}
+
+// Claiming into a free workspace moves the artifact without rescuing it: the
+// expiry is restamped rather than lifted, so it survives another day and no
+// longer. This is the half of the plan-aware claim a client is most likely to
+// get wrong, because the response is a 200 either way.
+func TestClaimIntoFreeWorkspaceRestampsExpiry(t *testing.T) {
+	server, clk := newClockedServer(t)
+
+	payload := declare(t, server, "", "a.txt", "the bytes")
+	claimToken, _ := payload["claim_token"].(string)
+	slug, _ := payload["slug"].(string)
+
+	clk.advance(ephemeralLifetime - time.Minute)
+
+	status, claimed := request(t, http.MethodPost, server.URL+"/v1/artifacts/"+slug+"/claim",
+		"krowk_sk_free", "application/json", fmt.Sprintf(`{"claim_token":%q}`, claimToken))
+	if status != http.StatusOK {
+		t.Fatalf("claim into free = %d %v", status, claimed)
+	}
+	if claimed["expires_at"] == nil {
+		t.Fatalf("claim into free lifted the expiry: %v", claimed)
+	}
+
+	// A fresh day, not the old deadline a minute away.
+	clk.advance(time.Hour)
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "krowk_sk_free", "", ""); status != http.StatusOK {
+		t.Errorf("restamped artifact was already gone: %d", status)
+	}
+	clk.advance(ephemeralLifetime)
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "krowk_sk_free", "", ""); status != http.StatusGone {
+		t.Errorf("restamped artifact outlived its fresh 24 hours: %d, want 410", status)
+	}
+}
+
+// A keyed upload into a free workspace expires like an anonymous one — the free
+// tier's lifetime follows the plan, not whether a key was presented — and it
+// carries no claim token, because what lifts its expiry is an upgrade.
+func TestKeyedUploadInFreeWorkspaceExpires(t *testing.T) {
+	server, clk := newClockedServer(t)
+
+	payload := declare(t, server, "krowk_sk_free", "a.txt", "the bytes")
+	if payload["expires_at"] == nil {
+		t.Fatalf("free keyed upload has no expiry: %v", payload)
+	}
+	if payload["claim_token"] != nil {
+		t.Errorf("free keyed upload came back with a claim token: %v", payload["claim_token"])
+	}
+	slug, _ := payload["slug"].(string)
+
+	clk.advance(ephemeralLifetime + time.Minute)
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "krowk_sk_free", "", ""); status != http.StatusGone {
+		t.Errorf("expired free upload = %d, want 410", status)
+	}
+}
+
+// And a paid workspace is the default here, so every other test in this file
+// keeps meaning what it did: a keyed upload is permanent unless the key says
+// free.
+func TestKeyedUploadInPaidWorkspaceDoesNotExpire(t *testing.T) {
+	server, clk := newClockedServer(t)
+
+	payload := declare(t, server, "krowk_sk_test", "a.txt", "the bytes")
+	if payload["expires_at"] != nil {
+		t.Fatalf("paid keyed upload expires: %v", payload["expires_at"])
+	}
+	slug, _ := payload["slug"].(string)
+
+	clk.advance(48 * time.Hour)
+	if status, _ := request(t, http.MethodGet, server.URL+"/v1/artifacts/"+slug, "krowk_sk_test", "", ""); status != http.StatusOK {
+		t.Errorf("paid keyed upload expired anyway: %d", status)
 	}
 }
 

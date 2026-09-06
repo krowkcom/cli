@@ -173,7 +173,8 @@ Registry precedence: --dev, then KROWK_API_URL, then KROWK_DEV, then the default
 Run metadata — the pull request, the links, the references, the session — is
 recorded on a run, and a run belongs to a workspace, so it needs an API key.
 Without one an upload still works: it lands anonymously, expires within a day,
-and comes back with a claim token that ` + "`krowk claim`" + ` spends to keep it.
+and comes back with a claim token that ` + "`krowk claim`" + ` spends to move it
+into a workspace — where a paid plan keeps it and a free one gives it another day.
 
 Wherever an artifact or a run is named — a positional, or --run — a link that
 carries it does just as well: the card page, the CDN URL under it, or anything

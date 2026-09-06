@@ -134,7 +134,7 @@ The repository doubles as an action, so CI can push what a test run produced and
       })
 ```
 
-`files` is the only required input — whitespace-separated paths or globs, so a path with a space in it has to go through a glob. The pull request, repo, commit and branch are detected from the runner's environment, exactly as they are on a laptop. `token` keeps the uploads past the keyless 24-hour expiry; `version` pins a CLI release; `run-slug` and `title` name or open the run they group under. Linux and macOS runners.
+`files` is the only required input — whitespace-separated paths or globs, so a path with a space in it has to go through a glob. The pull request, repo, commit and branch are detected from the runner's environment, exactly as they are on a laptop. `token` keeps the uploads past the keyless 24-hour expiry when the key belongs to a paid workspace; `version` pins a CLI release; `run-slug` and `title` name or open the run they group under. Linux and macOS runners.
 
 `@v0` moves with each 0.x release and installs the latest one. `@v0.8.0` pins the action and the binary together — the installer ships inside the action, so a pinned tag has nothing left to fetch and go stale. An explicit `version` wins over either.
 

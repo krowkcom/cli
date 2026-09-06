@@ -609,7 +609,8 @@ func ClaimCrumb(a *api.Artifact) Breadcrumb {
 		Action: "keep past expiry",
 		Cmd:    fmt.Sprintf("krowk claim %s %s", a.Slug, a.ClaimToken),
 		Description: "this upload is anonymous and expires within the day; " +
-			"claiming it with a key keeps it and moves it into that key's workspace. " +
+			"claiming it with a key moves it into that key's workspace — a Pro workspace " +
+			"keeps it, a free one gives it another 24 hours. " +
 			"The token is shown once and spent once",
 	}
 }

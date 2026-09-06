@@ -58,7 +58,10 @@ const (
 	// signature is a path worth exercising from outside this package.
 	UploadURLLifetime = 15 * time.Minute
 
-	// How long a keyless upload survives, matching Artifact::EPHEMERAL_LIFETIME.
+	// How long an upload with no paid plan behind it survives, matching
+	// Artifact::EPHEMERAL_LIFETIME. It is the lifetime of a keyless upload and of
+	// a keyed one in a free workspace alike: the free tier's door is the plan,
+	// not whether a key was presented.
 	ephemeralLifetime = 24 * time.Hour
 
 	// How long a browser login stays open, matching the real quarter hour: long
@@ -604,10 +607,17 @@ func (s *store) createArtifact(w http.ResponseWriter, r *http.Request, limitByte
 	a.seq = s.created
 
 	var claimToken string
-	if anonymous {
+	switch {
+	case anonymous:
 		a.ExpiresAt = now.Add(ephemeralLifetime).Format(time.RFC3339Nano)
 		claimToken = "krowk_claim_" + randomToken()
 		a.claimHash = sha256Hex([]byte(claimToken))
+	case freePlan(r):
+		// An upload into a free workspace expires like an anonymous one, but it
+		// gets no claim token: it already has an owner, and what lifts its expiry
+		// is the workspace moving to a paid plan rather than anything the client
+		// can spend.
+		a.ExpiresAt = now.Add(ephemeralLifetime).Format(time.RFC3339Nano)
 	}
 	s.artifacts[slug] = a
 
@@ -649,9 +659,11 @@ func (s *store) declared(a *artifact, claimToken string) map[string]any {
 	// instruction it needs when a signature lapses is the one call that keeps the
 	// slug. Whether it has to carry a claim token follows from the artifact being
 	// ephemeral, not from a token being in hand: this same payload is served on
-	// every represign, where the plaintext token is long gone.
+	// every represign, where the plaintext token is long gone. It follows the
+	// claim hash rather than the expiry, because an upload into a free workspace
+	// expires without ever having had a token to carry.
 	withToken := ""
-	if a.ExpiresAt != nil {
+	if a.claimHash != "" {
 		withToken = " with claim_token"
 	}
 	payload["next_step"] = "PUT the file to upload.url with the headers in upload.headers, " +
@@ -1499,8 +1511,10 @@ func refuseVisibility(w http.ResponseWriter, asked, verb string) {
 			asked, verb, strings.Join(declarableVisibilities, ", ")), nil)
 }
 
-// claimArtifact moves an anonymous artifact into the key's workspace, where it
-// stops expiring. Needs a key: the key is what says which workspace.
+// claimArtifact moves an anonymous artifact into the key's workspace, which
+// lifts the expiry on a paid plan and restamps a fresh 24 hours on a free one —
+// claiming into free is a move, not a rescue. Needs a key: the key is what says
+// which workspace, and now also which plan.
 func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 	workspace, ok := requireKey(w, r)
 	if !ok {
@@ -1567,7 +1581,11 @@ func (s *store) claimArtifact(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.workspace = workspace
-	a.ExpiresAt = nil
+	if freePlan(r) {
+		a.ExpiresAt = s.now().UTC().Add(ephemeralLifetime).Format(time.RFC3339Nano)
+	} else {
+		a.ExpiresAt = nil
+	}
 	a.claimed = true // a token is good once
 	writeJSON(w, http.StatusOK, s.serializeArtifact(a))
 }
@@ -1946,6 +1964,21 @@ func bearer(header string) (string, bool) {
 // is a subset of lowercase base36, so 24 of it is a slug of canon's shape.
 func workspaceFor(token string) string {
 	return "ws_" + sha256Hex([]byte(token))[:slugRandomLength]
+}
+
+// freePlanKeyMarker is what makes a stand-in workspace a free one. Every other
+// key is a paid workspace, because that is what the existing flows assume and a
+// developer poking at --dev wants permanence by default; a key with this in it
+// is the way to exercise the free tier, where an upload expires in 24 hours and
+// a claim restamps rather than lifts the expiry.
+const freePlanKeyMarker = "free"
+
+// freePlan says whether the request's key belongs to a free workspace. A keyless
+// request is not one — it is anonymous, which the callers already handle apart —
+// so this is only asked about a request that carried a key.
+func freePlan(r *http.Request) bool {
+	token, found := bearer(r.Header.Get("Authorization"))
+	return found && strings.Contains(token, freePlanKeyMarker)
 }
 
 // showKey lets the CLI self-check its key before doing any work. No key is a

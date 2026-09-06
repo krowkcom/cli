@@ -43,6 +43,15 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Changed
 
+- Claiming is plan-aware everywhere krowk explains it. The registry now keeps a
+  claimed artifact only when the workspace is on a paid plan; claiming into a
+  free workspace moves the artifact and restamps a fresh 24-hour expiry, and a
+  keyed upload into a free workspace expires in 24 hours just as an anonymous
+  one does. The `expired` fix line, the claim breadcrumb, `krowk help`, the MCP
+  tool description and the README no longer promise that a key alone keeps an
+  upload. The stand-in registry behind `--dev` follows the same rules: a key
+  with `free` in it is a free workspace, every other key is a paid one.
+
 - A `.webm` or `.mkv` file carrying a video track is declared as video, never
   audio. Go's extension table answers `audio/webm` for `.webm`, so a screen
   recording uploaded on the extension alone landed as audio and previewed as

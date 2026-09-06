@@ -105,8 +105,8 @@ pass "the platform lists still agree: $(echo "$yaml_goos" | tr '\n' ' ')× $(ech
 # drift: both are read out of the files that write them and compared.
 sh_marker=$(sed -n 's/^MANAGED_MARKER_CONTENT="\(.*\)"$/\1/p' scripts/install.sh)
 [[ -n "$sh_marker" ]] || fail "scripts/install.sh no longer defines MANAGED_MARKER_CONTENT"
-grep -qF "$sh_marker" internal/harness/managed.go \
-  || fail "scripts/install.sh writes a marker saying '$sh_marker', which internal/harness/managed.go does not"
+grep -qE "^[[:space:]]*managedMarkerContent = \"${sh_marker}\\\\n\"\$" internal/harness/managed.go \
+  || fail "scripts/install.sh writes a marker saying '$sh_marker', which is not what internal/harness/managed.go declares managedMarkerContent to be"
 for name in MANAGED_MARKER INSTALLED_VERSION_FILE; do
   sh_name=$(sed -n "s/^${name}=\"\(.*\)\"\$/\1/p" scripts/install.sh)
   grep -qF "\"$sh_name\"" internal/harness/managed.go \
@@ -421,9 +421,9 @@ mkdir -p "$LOOSE/skills"
     KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
     bash "$REPO_ROOT/scripts/install.sh" >"$WORK/umask.log" 2>&1 ) \
   || { cat "$WORK/umask.log"; fail "the installer exited non-zero under umask 000"; }
-[[ -n "$(find "$LOOSE/skills/krowk" -maxdepth 0 -perm 0755)" ]] \
-  || fail "the skill directory krowk created under umask 000 is not 0755"
-pass "a skill directory krowk creates is 0755 whatever the umask says"
+[[ -z "$(find "$LOOSE/skills/krowk" -maxdepth 0 -perm /022)" ]] \
+  || fail "the skill directory krowk created under umask 000 is writable by others"
+pass "a skill directory krowk creates is not writable by others, whatever the umask says"
 
 # A marker much larger than a marker is not a marker, however it begins. The
 # padding is newlines on purpose: those are what a naive read strips before

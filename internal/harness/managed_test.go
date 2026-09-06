@@ -602,8 +602,8 @@ func TestClaimDirTakesAWorldWritableDirectoryOffTheWorldsHands(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := info.Mode().Perm(); got != 0o755 {
-				t.Fatalf("mode = %v, want 0755 — anyone could rewrite the skill krowk vouches for", got)
+			if got := info.Mode().Perm(); got&0o022 != 0 {
+				t.Fatalf("mode = %v — anyone could rewrite the skill krowk vouches for", got)
 			}
 		})
 	}
@@ -649,5 +649,28 @@ func TestWriteManagedFileSaysADirectoryIsADirectory(t *testing.T) {
 	}
 	if target.Reason != reasonIsDir {
 		t.Fatalf("reason = %q, want %q — the message must read forwards", target.Reason, reasonIsDir)
+	}
+}
+
+func TestClaimDirRefusesADirectoryItCannotLookInside(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows modes do not withhold a directory listing this way")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a directory that says otherwise, so there is nothing to stage")
+	}
+	dir := filepath.Join(t.TempDir(), "krowk")
+	mkdirAll(t, dir)
+	writeFile(t, filepath.Join(dir, ManagedMarker), managedMarkerContent)
+	// Writable and searchable, but not listable: enough to plant a marker in,
+	// not enough to see what else is in there. "I could not look" is not
+	// "this is mine".
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	if err := ClaimDir(dir); err == nil {
+		t.Fatal("a directory that could not be listed was claimed anyway")
 	}
 }

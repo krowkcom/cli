@@ -145,6 +145,28 @@ func claimableDir(dir string) (fs.FileInfo, error) {
 // somebody else without needing a second user to borrow.
 var euid = os.Geteuid
 
+// closeToTheWorld takes the group and other write bits off a directory krowk
+// is about to call its own. A directory created under a permissive umask — or
+// by an older krowk, or by hand — can be world-writable, and krowk's marker
+// would then be vouching for a directory any local user can drop a file into.
+// Only the write bits are touched: how readable or how executable the user
+// wants their own directory is not this gate's business.
+//
+// It is best-effort by design. The mode is a hardening measure, not the claim
+// itself, and a filesystem that cannot express it (or a platform that means
+// something else by it) is not a reason to refuse a directory that is
+// otherwise plainly krowk's.
+func closeToTheWorld(dir string, info fs.FileInfo) {
+	if info == nil {
+		return
+	}
+	perm := info.Mode().Perm()
+	if perm&0o022 == 0 {
+		return
+	}
+	_ = os.Chmod(dir, perm&^0o022)
+}
+
 // mkdirDir is a seam so a test can stage the one race this gate has to handle:
 // something else creating the directory between the Lstat and the Mkdir.
 var mkdirDir = os.Mkdir
@@ -184,7 +206,7 @@ func ClaimDir(dir string) error {
 	// a path being created and removed underneath this in a loop is not a
 	// state to negotiate with.
 	for attempt := 0; attempt < 2; attempt++ {
-		_, err := claimableDir(dir)
+		info, err := claimableDir(dir)
 		switch {
 		case isNotExist(err):
 			// The parent chain is created with MkdirAll, but the directory
@@ -202,31 +224,43 @@ func ClaimDir(dir string) error {
 				}
 				return fmt.Errorf("creating %s: %w", dir, mkErr)
 			}
+			// Mkdir's mode is masked by the umask, and the installer's
+			// `mkdir -m 0755` is not: without this the two halves of krowk
+			// would create the same directory at two different modes on a
+			// machine with a restrictive umask. Best-effort, like every other
+			// mode change here.
+			_ = os.Chmod(dir, 0o755)
 		case err != nil:
 			return err
-		case markerIsOurs(dir):
-			// krowk's own directory, but not necessarily at krowk's own
-			// mode: an older krowk, or an older installer, created it under
-			// whatever umask was in force, and a world-writable one would
-			// let any local user rewrite what the marker vouches for. Same
-			// best-effort as the adoption path below.
-			_ = os.Chmod(dir, 0o755)
 		default:
+			// Before anything in the directory is read, let alone believed:
+			// a directory anybody may write to is a directory anybody may
+			// plant a marker in, and a marker read first would be authorising
+			// the claim on evidence the reader could have written. Only the
+			// group and other write bits go; the rest of the mode is the
+			// user's business, and the FileInfo in hand says what it is.
+			//
+			// Best-effort, here and everywhere else in this file: a platform
+			// or a filesystem with nothing to say about modes does not make
+			// the claim itself wrong.
+			closeToTheWorld(dir, info)
+
+			// Failing closed on a directory that cannot be listed, the same
+			// way the installer does: "I could not look" is not "there is
+			// nothing there", and it is not "this is mine" either.
 			entries, readErr := os.ReadDir(dir)
 			if readErr != nil {
 				return fmt.Errorf("inspecting %s: %w", dir, readErr)
 			}
+			if markerIsOurs(dir) {
+				break
+			}
 			if len(entries) > 0 {
 				return &UnmanagedError{Path: dir, Reason: reasonUnmanaged}
 			}
-			// An empty directory somebody else made may be world-writable —
-			// `mkdir -p` under a permissive umask is all it takes. Adopting
-			// it as it stands would let any local user drop a file in beside
-			// krowk's marker, with the marker vouching for it. The mode is
-			// therefore brought to the one krowk creates directories with.
-			// Best-effort: on a filesystem or a platform with nothing to say
-			// about modes, the claim is still the right answer.
-			_ = os.Chmod(dir, 0o755)
+			// An empty directory somebody else made is adopted — there is
+			// nothing there to lose — and it has already been closed to the
+			// world above.
 		}
 		return WriteManagedFile(filepath.Join(dir, ManagedMarker), []byte(managedMarkerContent))
 	}

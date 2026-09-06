@@ -28,7 +28,6 @@ import "os"
 // a directory whose contents are not krowk's, but it cannot promise that the
 // file it read is the file it checked. Nor is there anything to do about
 // FIFOs, which do not exist on the filesystem paths these files live at.
-
 func openConfigFile(path string, trusted bool) (*os.File, error) {
 	if !trusted {
 		info, err := os.Lstat(path)

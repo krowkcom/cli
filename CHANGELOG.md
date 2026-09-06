@@ -37,7 +37,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   nothing but the `SKILL.md` a previous installer wrote is adopted and marked
   on the next run, since that is the only file that installer wrote and the
   one it overwrote anyway. Nothing is written through a symlink any more, in
-  either a directory's name or a file's, and a file is never truncated in
+  either the skill directory's own name or a managed file's — a symlinked
+  `~/.claude` or `~/.claude/skills` still resolves, as it should — and a file
+  is never truncated in
   place: both halves of krowk write every managed file to a sibling temporary
   file and rename it into place, so a reader sees the old file or the whole
   new one, and a second hard link to somebody's file keeps its contents.

@@ -516,11 +516,12 @@ claim_skill_dir() {
         note "Cannot create $(dirname "$dir"), so no skill was written."
         return 1
       fi
-      # -m 0755 rather than the umask's idea of a directory mode: a
-      # permissive umask would otherwise leave this world-writable, and
-      # krowk's marker would then be vouching for a directory any local user
-      # can rewrite the skill in. A restrictive umask can still narrow it,
-      # which is the user's business.
+      # -m 0755 rather than the umask's idea of a directory mode, which
+      # mkdir -m ignores in both directions: a permissive umask would
+      # otherwise leave this world-writable, with krowk's marker vouching for
+      # a directory any local user can rewrite the skill in, and a restrictive
+      # one would leave it at a mode the binary half does not create. The Go
+      # gate chmods to the same 0755 after its own mkdir for that reason.
       if mkdir -m 0755 "$dir" 2>/dev/null; then
         return 0
       fi
@@ -558,6 +559,15 @@ claim_skill_dir() {
       note "${dir} carries a symlink where krowk's marker should be; leaving it alone."
       return 1
     elif [[ -f "${dir}/${MANAGED_MARKER}" ]]; then
+      # Before the marker is read, let alone believed: a directory anybody may
+      # write to is a directory anybody may plant a marker in, and reading it
+      # first would authorise the claim on evidence the reader could have
+      # written. Only the group and other write bits go — how readable the
+      # user wants their own directory is not this gate's business — and it is
+      # best-effort, because the mode is a hardening measure rather than the
+      # claim itself.
+      chmod go-w "$dir" 2>/dev/null || true
+
       # Bounded, like every read on the Go side, and compared with the
       # surrounding whitespace stripped: an editor that added a trailing
       # newline has not changed who wrote the marker.
@@ -584,11 +594,6 @@ claim_skill_dir() {
         note "Move it aside and re-run this installer to have krowk manage it."
         return 1
       fi
-      # krowk's own directory, but not necessarily at krowk's own mode: an
-      # older installer created it under whatever umask was in force, and a
-      # world-writable one would let any local user rewrite the skill with
-      # this marker vouching for it.
-      chmod 0755 "$dir" 2>/dev/null || true
       return 0
     elif [[ -n "$entries" ]]; then
       # No marker and not empty: either the one file a pre-marker installer
@@ -603,13 +608,12 @@ claim_skill_dir() {
       done <<<"$entries"
       # Adopted, so it is krowk's from here — and a directory somebody created
       # under a permissive umask may be world-writable, which would let any
-      # local user rewrite the skill with krowk's marker vouching for it. The
-      # mode is brought to the one krowk creates directories with.
-      chmod 0755 "$dir" 2>/dev/null || true
+      # local user rewrite the skill with krowk's marker vouching for it.
+      chmod go-w "$dir" 2>/dev/null || true
     else
-      # Empty and unmarked: adopted for the same reason, and re-moded for the
-      # same reason.
-      chmod 0755 "$dir" 2>/dev/null || true
+      # Empty and unmarked: adopted for the same reason, and closed to the
+      # world for the same reason.
+      chmod go-w "$dir" 2>/dev/null || true
     fi
 
     return 0

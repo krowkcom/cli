@@ -244,9 +244,11 @@ func TestInstalledVersionAnswersNothingForAStampItCannotTrust(t *testing.T) {
 	t.Run("a stamp longer than a version could be", func(t *testing.T) {
 		dir := t.TempDir()
 		writeFile(t, filepath.Join(dir, InstalledVersionFile), strings.Repeat("9", 4096))
-		got := InstalledVersion(dir)
-		if len(got) > maxVersionStampBytes {
-			t.Fatalf("InstalledVersion read %d bytes, want at most %d", len(got), maxVersionStampBytes)
+		// Refused outright rather than truncated into an answer: the first
+		// 256 bytes of something that is not a version stamp are not a
+		// version either.
+		if got := InstalledVersion(dir); got != "" {
+			t.Fatalf("InstalledVersion = %q, want \"\"", got)
 		}
 	})
 
@@ -496,4 +498,96 @@ func TestAdoptableDirIsOnlyWhatAPreMarkerInstallerLeft(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWriteManagedFileReplacesADanglingSymlinkNever(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need a privilege this test should not assume")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "SKILL.md")
+	// A link to nothing at all: Lstat sees it, Stat does not, and a writer
+	// that reached for the target would create a file wherever it pointed.
+	if err := os.Symlink(filepath.Join(dir, "never-existed.md"), path); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := unmanaged(t, WriteManagedFile(path, []byte("# ours\n"))); got != path {
+		t.Fatalf("refusal names %q, want %q", got, path)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "never-existed.md")); err == nil {
+		t.Fatal("the write created the file a dangling symlink pointed at")
+	}
+}
+
+func TestWriteManagedFileLeavesNothingBehindWhenItRefuses(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "SKILL.md")
+	mkdirAll(t, path)
+
+	if err := WriteManagedFile(path, []byte("# ours\n")); err == nil {
+		t.Fatal("WriteManagedFile wrote onto a directory")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".krowk-") {
+			t.Fatalf("a temporary file was stranded: %s", entry.Name())
+		}
+	}
+}
+
+func TestClaimDirRefusesADirectoryBelongingToSomebodyElse(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no uid to disagree about")
+	}
+	dir := filepath.Join(t.TempDir(), "krowk")
+	mkdirAll(t, dir)
+	// Staged through the seam rather than through a second account: what the
+	// gate sees either way is a uid that is not its own.
+	swapEUID(t, func() int { return os.Geteuid() + 1 })
+
+	err := ClaimDir(dir)
+	if got := unmanaged(t, err); got != dir {
+		t.Fatalf("refusal names %q, want %q", got, dir)
+	}
+	var target *UnmanagedError
+	_ = errors.As(err, &target)
+	if !strings.Contains(target.Reason, "another user") {
+		t.Fatalf("reason %q does not say the directory belongs to somebody else", target.Reason)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, ManagedMarker)); err == nil {
+		t.Fatal("a directory belonging to another user was marked as krowk's")
+	}
+}
+
+func TestClaimDirTakesAnAdoptedDirectoryOffTheWorldsHands(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows modes say nothing about who may write")
+	}
+	dir := filepath.Join(t.TempDir(), "krowk")
+	if err := os.Mkdir(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ClaimDir(dir); err != nil {
+		t.Fatalf("ClaimDir: %v", err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("mode = %v, want 0755 — anyone could rewrite the skill krowk vouches for", got)
+	}
+}
+
+// swapEUID replaces the effective-uid seam for one test.
+func swapEUID(t *testing.T, fn func() int) {
+	t.Helper()
+	previous := euid
+	euid = fn
+	t.Cleanup(func() { euid = previous })
 }

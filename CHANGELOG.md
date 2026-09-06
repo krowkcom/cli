@@ -27,8 +27,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   and `.installed-version`, which says with what — and writes only where that
   marker says it wrote before: it creates a directory that is not there,
   adopts an empty one, refreshes one carrying a marker it wrote, and otherwise
-  says why and leaves the directory exactly as it found it. A directory
-  belonging to another user, or one that cannot be listed, is left alone too.
+  says why and leaves the directory exactly as it found it. A directory that
+  cannot be listed is left alone too, as is one belonging to another user (on
+  Unix, where there is a uid to compare).
   If you have your own `~/.claude/skills/krowk/`, move it aside and re-run to
   have krowk manage it.
 
@@ -36,15 +37,16 @@ the versions are the `v*` tags a release is cut from. Entries land under
   nothing but the `SKILL.md` a previous installer wrote is adopted and marked
   on the next run, since that is the only file that installer wrote and the
   one it overwrote anyway. Nothing is written through a symlink any more, in
-  either a directory's name or a file's — the installer writes every managed
-  file to a sibling temporary file and renames it into place, which replaces a
-  link rather than following it.
+  either a directory's name or a file's, and a file is never truncated in
+  place: both halves of krowk write every managed file to a sibling temporary
+  file and rename it into place, so a reader sees the old file or the whole
+  new one, and a second hard link to somebody's file keeps its contents.
 
   `internal/harness` carries the same gate for Go — `ClaimDir`,
   `WriteManagedFile`, `DirOwned`, `InstalledVersion`, `IsManagedCopy` — where
-  the symlink refusal is the kernel's, `O_NOFOLLOW` on the descriptor that is
-  then written, rather than a check something could invalidate in between, and
-  where a hard link or a directory somebody else owns is refused as well. No
+  every read is bounded and goes through an `O_NOFOLLOW`, non-blocking open,
+  so a symlink, a FIFO or an oversized file in a managed name is refused
+  rather than followed, waited on or half-read. No
   command calls any of it yet: it is what `krowk setup` will go through, so
   that one rule decides every write krowk makes into your home directory.
   `krowk doctor` will report a skill it did not write as installed either way,

@@ -2,6 +2,7 @@ package harness
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -467,9 +468,21 @@ func CheckClaudeSkill(env Env) StatusCheck {
 	path := filepath.Join(skillDir, claudeSkillFile)
 	if isRegularFile(path) {
 		// A skill krowk did not write still works — the agent reads it the
-		// same way — so all three of these pass. What differs is what happens
-		// on the next install, and that is what the person reading a doctor
-		// report cannot see for themselves.
+		// same way — so every branch here passes. What differs is what
+		// happens on the next install, and that is the part a person cannot
+		// see for themselves.
+		//
+		// The same three questions the write gate asks come first, through
+		// the same function, so this cannot promise a refresh the gate would
+		// refuse: a skill directory that is a symlink, or that belongs to
+		// another user, is left alone whatever marker it carries.
+		if _, err := claimableDir(skillDir); err != nil {
+			var unmanaged *UnmanagedError
+			if errors.As(err, &unmanaged) {
+				return Pass(CheckNameClaudeSkill, "Installed ("+path+") — krowk will not refresh it: the directory "+unmanaged.Reason)
+			}
+			return Pass(CheckNameClaudeSkill, "Installed ("+path+")")
+		}
 		switch {
 		case markerIsOurs(skillDir):
 			return Pass(CheckNameClaudeSkill, "Installed ("+path+")")

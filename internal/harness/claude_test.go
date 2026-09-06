@@ -581,3 +581,45 @@ func TestCheckClaudeSkillTellsWhoWroteTheSkillItFound(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckClaudeSkillSaysWhenItWillNotManageTheDirectoryAtAll(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks and uids both need more than this test should assume")
+	}
+
+	t.Run("the skill directory is a symlink", func(t *testing.T) {
+		home := t.TempDir()
+		mkdirAll(t, filepath.Join(home, ".claude", "skills"))
+		elsewhere := t.TempDir()
+		writeFile(t, filepath.Join(elsewhere, "SKILL.md"), "# krowk\n")
+		writeFile(t, filepath.Join(elsewhere, ManagedMarker), managedMarkerContent)
+		if err := os.Symlink(elsewhere, filepath.Join(home, ".claude", "skills", "krowk")); err != nil {
+			t.Fatal(err)
+		}
+
+		check := CheckClaudeSkill(homeEnv(home))
+		if check.Status != StatusPass {
+			t.Fatalf("check = %+v, want pass — the agent reads it fine", check)
+		}
+		if !strings.Contains(check.Message, "will not refresh it") || !strings.Contains(check.Message, "symlink") {
+			t.Fatalf("message %q does not say the directory is a symlink krowk leaves alone", check.Message)
+		}
+	})
+
+	t.Run("the skill directory belongs to another user", func(t *testing.T) {
+		home := t.TempDir()
+		dir := filepath.Join(home, ".claude", "skills", "krowk")
+		mkdirAll(t, dir)
+		writeFile(t, filepath.Join(dir, "SKILL.md"), "# krowk\n")
+		writeFile(t, filepath.Join(dir, ManagedMarker), managedMarkerContent)
+		swapEUID(t, func() int { return os.Geteuid() + 1 })
+
+		check := CheckClaudeSkill(homeEnv(home))
+		if check.Status != StatusPass {
+			t.Fatalf("check = %+v, want pass", check)
+		}
+		if !strings.Contains(check.Message, "will not refresh it") || !strings.Contains(check.Message, "another user") {
+			t.Fatalf("message %q does not say the directory belongs to somebody else", check.Message)
+		}
+	})
+}

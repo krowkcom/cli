@@ -3,7 +3,6 @@
 package harness
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -70,28 +69,39 @@ func TestIsManagedCopyDoesNotHangOnAFIFOMarker(t *testing.T) {
 	}
 }
 
-func TestWriteManagedFileRefusesAFileWithASecondName(t *testing.T) {
+func TestWriteManagedFileLeavesAFileBehindASecondNameAlone(t *testing.T) {
 	dir := t.TempDir()
 	victim := filepath.Join(dir, "somebody-elses.md")
 	if err := os.WriteFile(victim, []byte("# theirs\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "SKILL.md")
-	// A hard link is a regular file, is not a symlink, and O_TRUNC through it
-	// empties the file at the other name. The link count is the only thing
-	// that gives it away.
+	// A hard link is a regular file and is not a symlink, so nothing about
+	// the destination gives it away. What saves the file at the other name is
+	// that the write never touches this inode: it renames a new one onto the
+	// name, which is what an overwrite through a shared inode would not do.
 	if err := os.Link(victim, path); err != nil {
 		t.Skipf("link: %v", err)
 	}
-
-	var target *UnmanagedError
-	if err := WriteManagedFile(path, []byte("# ours\n")); !errors.As(err, &target) {
-		t.Fatalf("err = %v, want an *UnmanagedError", err)
-	} else if target.Path != path {
-		t.Fatalf("refusal names %q, want %q", target.Path, path)
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	data, err := os.ReadFile(victim)
-	if err != nil || string(data) != "# theirs\n" {
-		t.Fatalf("the other name reads %q, %v — it was truncated through the link", data, err)
+
+	if err := WriteManagedFile(path, []byte("# ours\n")); err != nil {
+		t.Fatalf("WriteManagedFile: %v", err)
+	}
+	if data, err := os.ReadFile(victim); err != nil || string(data) != "# theirs\n" {
+		t.Fatalf("the other name reads %q, %v — it was written through", data, err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "# ours\n" {
+		t.Fatalf("the managed name reads %q, %v", data, err)
+	}
+	after, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("the managed name still points at the file it shared with the other name")
 	}
 }

@@ -415,10 +415,9 @@ MANAGED_MARKER_CONTENT="This directory is managed by krowk. Manual edits will be
 # too.
 #
 # The temp file is a sibling on purpose: a rename is only atomic within one
-# filesystem, and $TMPDIR is regularly on another one. The RETURN trap removes
-# it on every way out, including a failure part way through — a stranded
-# .krowk-XXXXXX left in the skill directory would make the next run's adoption
-# check refuse a directory krowk itself littered.
+# filesystem, and $TMPDIR is regularly on another one. Every failure path
+# removes it — a stranded .krowk-XXXXXX left in the skill directory would make
+# the next run's adoption check refuse a directory krowk itself littered.
 #
 # A directory at the destination is refused rather than replaced, and refused
 # before anything is written: `mv` onto a directory moves the file *into* it and
@@ -442,17 +441,23 @@ write_managed_file() {
 
   dir=$(dirname "$path")
   tmp=$(mktemp "${dir}/.krowk-XXXXXX") || return 1
-  # shellcheck disable=SC2064  # expand tmp now: the trap must name this call's file.
-  trap "rm -f '${tmp}'" RETURN
 
-  cat >"$tmp" || return 1
-  chmod 0644 "$tmp" || return 1
-  mv -f "$tmp" "$path" || return 1
+  cat >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$path" || { rm -f "$tmp"; return 1; }
 
   # What the rename was supposed to achieve, asked of the filesystem rather
   # than assumed from an exit status: the temp file is gone because it became
   # the destination, and the destination is a regular file and not a link.
   if [[ -e "$tmp" || -L "$path" || ! -f "$path" ]]; then
+    rm -f "$tmp"
+    # A directory appearing at the destination between the test above and the
+    # rename is the one way mv can succeed and leave the file inside it. Clear
+    # what this call put there, so the next run does not refuse the whole
+    # directory over krowk's own litter.
+    if [[ -d "$path" && ! -L "$path" ]]; then
+      rm -f "$path"/.krowk-*
+    fi
     note "${path} is not what this installer just wrote; leaving it alone."
     return 1
   fi
@@ -530,7 +535,9 @@ claim_skill_dir() {
       note "${dir} carries a symlink where krowk's marker should be; leaving it alone."
       return 1
     elif [[ -f "${dir}/${MANAGED_MARKER}" ]]; then
-      if [[ "$(cat -- "${dir}/${MANAGED_MARKER}")" != "$MANAGED_MARKER_CONTENT" ]]; then
+      # Bounded, like every read on the Go side: a file wearing the marker's
+      # name is not necessarily a sentence.
+      if [[ "$(head -c 512 -- "${dir}/${MANAGED_MARKER}")" != "$MANAGED_MARKER_CONTENT" ]]; then
         note "${dir} carries a marker krowk did not write; leaving it alone."
         note "Move it aside and re-run this installer to have krowk manage it."
         return 1
@@ -547,6 +554,15 @@ claim_skill_dir() {
           return 1
         fi
       done <<<"$entries"
+      # Adopted, so it is krowk's from here — and a directory somebody created
+      # under a permissive umask may be world-writable, which would let any
+      # local user rewrite the skill with krowk's marker vouching for it. The
+      # mode is brought to the one krowk creates directories with.
+      chmod 0755 "$dir" 2>/dev/null || true
+    else
+      # Empty and unmarked: adopted for the same reason, and re-moded for the
+      # same reason.
+      chmod 0755 "$dir" 2>/dev/null || true
     fi
 
     return 0

@@ -563,24 +563,49 @@ func TestClaimDirRefusesADirectoryBelongingToSomebodyElse(t *testing.T) {
 	}
 }
 
-func TestClaimDirTakesAnAdoptedDirectoryOffTheWorldsHands(t *testing.T) {
+func TestClaimDirTakesAWorldWritableDirectoryOffTheWorldsHands(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows modes say nothing about who may write")
 	}
-	dir := filepath.Join(t.TempDir(), "krowk")
-	if err := os.Mkdir(dir, 0o777); err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name    string
+		arrange func(t *testing.T, dir string)
+	}{
+		{
+			name:    "adopted empty",
+			arrange: func(*testing.T, string) {},
+		},
+		{
+			name: "already krowk's, from an installer that ran under a loose umask",
+			arrange: func(t *testing.T, dir string) {
+				writeFile(t, filepath.Join(dir, ManagedMarker), managedMarkerContent)
+				writeFile(t, filepath.Join(dir, "SKILL.md"), "# krowk\n")
+			},
+		},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "krowk")
+			if err := os.Mkdir(dir, 0o777); err != nil {
+				t.Fatal(err)
+			}
+			tc.arrange(t, dir)
+			// writeFile goes through the umask; put the mode back.
+			if err := os.Chmod(dir, 0o777); err != nil {
+				t.Fatal(err)
+			}
 
-	if err := ClaimDir(dir); err != nil {
-		t.Fatalf("ClaimDir: %v", err)
-	}
-	info, err := os.Lstat(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := info.Mode().Perm(); got != 0o755 {
-		t.Fatalf("mode = %v, want 0755 — anyone could rewrite the skill krowk vouches for", got)
+			if err := ClaimDir(dir); err != nil {
+				t.Fatalf("ClaimDir: %v", err)
+			}
+			info, err := os.Lstat(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != 0o755 {
+				t.Fatalf("mode = %v, want 0755 — anyone could rewrite the skill krowk vouches for", got)
+			}
+		})
 	}
 }
 

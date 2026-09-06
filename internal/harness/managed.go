@@ -204,7 +204,14 @@ func ClaimDir(dir string) error {
 			}
 		case err != nil:
 			return err
-		case !markerIsOurs(dir):
+		case markerIsOurs(dir):
+			// krowk's own directory, but not necessarily at krowk's own
+			// mode: an older krowk, or an older installer, created it under
+			// whatever umask was in force, and a world-writable one would
+			// let any local user rewrite what the marker vouches for. Same
+			// best-effort as the adoption path below.
+			_ = os.Chmod(dir, 0o755)
+		default:
 			entries, readErr := os.ReadDir(dir)
 			if readErr != nil {
 				return fmt.Errorf("inspecting %s: %w", dir, readErr)

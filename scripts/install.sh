@@ -438,6 +438,12 @@ write_managed_file() {
     note "${path} is a directory, not a file krowk wrote; leaving it alone."
     return 1
   fi
+  if [[ -e "$path" && ! -f "$path" ]]; then
+    # A FIFO, a socket, a device: not a file this installer wrote, and not one
+    # a rename should quietly replace.
+    note "${path} is not a regular file krowk wrote; leaving it alone."
+    return 1
+  fi
 
   dir=$(dirname "$path")
   tmp=$(mktemp "${dir}/.krowk-XXXXXX") || return 1
@@ -489,7 +495,7 @@ write_managed_file() {
 # marker has to say what krowk's markers say: this is the destructive side, and
 # a name is cheap to forge.
 claim_skill_dir() {
-  local dir="$1" entries name marker
+  local dir="$1" entries name marker marker_bytes
 
   # Two passes, like the Go gate: the first may find nothing there and try to
   # create it, and if something else won that race the second asks what
@@ -552,26 +558,37 @@ claim_skill_dir() {
       note "${dir} carries a symlink where krowk's marker should be; leaving it alone."
       return 1
     elif [[ -f "${dir}/${MANAGED_MARKER}" ]]; then
-      # Bounded, like every read on the Go side. Surrounding whitespace is
-      # stripped
-      # from both sides of the comparison, which is what the Go half's
-      # TrimSpace does — an editor that added a trailing newline has not
-      # changed who wrote the marker.
-      # One byte past the bound, so "a sentence" is told apart from "something
-      # much larger wearing a marker's name" — the second is refused rather
-      # than compared on its first 512 bytes, which is what the Go half does.
-      marker=$(head -c 513 -- "${dir}/${MANAGED_MARKER}")
-      if [[ "${#marker}" -gt 512 ]]; then
+      # Bounded, like every read on the Go side, and compared with the
+      # surrounding whitespace stripped: an editor that added a trailing
+      # newline has not changed who wrote the marker.
+      # The size is measured on the file, not on the string: `$(...)` strips
+      # trailing newlines, so a sentence followed by two thousand of them
+      # would otherwise measure as short. One byte past the bound is read, so
+      # "a sentence" is told apart from "something much larger wearing a
+      # marker's name", and the larger thing is refused rather than compared
+      # on its first 512 bytes — which is what the Go half does.
+      marker_bytes=$(head -c 513 -- "${dir}/${MANAGED_MARKER}" | wc -c)
+      if [[ "$marker_bytes" -gt 512 ]]; then
         note "${dir} carries a marker krowk did not write; leaving it alone."
         note "Move it aside and re-run this installer to have krowk manage it."
         return 1
       fi
-      marker=$(printf '%s' "$marker" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      marker=$(head -c 512 -- "${dir}/${MANAGED_MARKER}")
+      # Trimmed as a whole string, front and back, which is what Go's
+      # TrimSpace does — a line-oriented strip would leave a leading newline
+      # in place and call two identical markers different.
+      marker="${marker#"${marker%%[![:space:]]*}"}"
+      marker="${marker%"${marker##*[![:space:]]}"}"
       if [[ "$marker" != "${MANAGED_MARKER_CONTENT}" ]]; then
         note "${dir} carries a marker krowk did not write; leaving it alone."
         note "Move it aside and re-run this installer to have krowk manage it."
         return 1
       fi
+      # krowk's own directory, but not necessarily at krowk's own mode: an
+      # older installer created it under whatever umask was in force, and a
+      # world-writable one would let any local user rewrite the skill with
+      # this marker vouching for it.
+      chmod 0755 "$dir" 2>/dev/null || true
       return 0
     elif [[ -n "$entries" ]]; then
       # No marker and not empty: either the one file a pre-marker installer

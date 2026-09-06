@@ -421,10 +421,49 @@ mkdir -p "$LOOSE/skills"
     KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
     bash "$REPO_ROOT/scripts/install.sh" >"$WORK/umask.log" 2>&1 ) \
   || { cat "$WORK/umask.log"; fail "the installer exited non-zero under umask 000"; }
-mode=$(ls -ld "$LOOSE/skills/krowk" | cut -c2-10)
-[[ "$mode" == "rwxr-xr-x" ]] \
-  || fail "the skill directory is $mode under umask 000, want rwxr-xr-x"
+[[ -n "$(find "$LOOSE/skills/krowk" -maxdepth 0 -perm 0755)" ]] \
+  || fail "the skill directory krowk created under umask 000 is not 0755"
 pass "a skill directory krowk creates is 0755 whatever the umask says"
+
+# A marker much larger than a marker is not a marker, however it begins. The
+# padding is newlines on purpose: those are what a naive read strips before
+# measuring, which would let this pass.
+BIG="$WORK/claude-big"
+mkdir -p "$BIG/skills/krowk"
+{ printf '%s\n' "$MANAGED_MARKER_CONTENT"; for _ in $(seq 1 1000); do printf '\n'; done; } \
+  >"$BIG/skills/krowk/.managed-by-krowk-cli"
+printf '# mine\n' >"$BIG/skills/krowk/SKILL.md"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$BIG" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/big.log" 2>&1 \
+  || { cat "$WORK/big.log"; fail "the installer exited non-zero over an oversized marker"; }
+grep -q "carries a marker krowk did not write" "$WORK/big.log" \
+  || { cat "$WORK/big.log"; fail "the installer accepted a marker far larger than a marker"; }
+[[ "$(cat "$BIG/skills/krowk/SKILL.md")" == "# mine" ]] \
+  || fail "the installer wrote into a directory whose marker it refused"
+pass "a marker padded past the read bound is refused"
+
+# A FIFO in a managed file's name: not a file this installer wrote, and not one
+# a rename should quietly replace.
+if ! command -v mkfifo >/dev/null 2>&1; then
+  echo "  – mkfifo not available, so a non-regular file cannot be staged; skipped"
+else
+  FIFO="$WORK/claude-fifo"
+  mkdir -p "$FIFO/skills/krowk"
+  printf '%s\n' "$MANAGED_MARKER_CONTENT" >"$FIFO/skills/krowk/.managed-by-krowk-cli"
+  mkfifo "$FIFO/skills/krowk/SKILL.md"
+  env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+    CLAUDE_CONFIG_DIR="$FIFO" \
+    KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+    bash "$REPO_ROOT/scripts/install.sh" >"$WORK/fifo.log" 2>&1 \
+    || { cat "$WORK/fifo.log"; fail "the installer exited non-zero over a FIFO in the skill's name"; }
+  grep -q "not a regular file krowk wrote" "$WORK/fifo.log" \
+    || { cat "$WORK/fifo.log"; fail "the installer did not refuse a FIFO in the skill's name"; }
+  [[ -p "$FIFO/skills/krowk/SKILL.md" ]] \
+    || fail "the installer replaced a FIFO it should have left alone"
+  pass "a FIFO in a managed file's name is refused"
+fi
 
 # A directory in a managed file's name: `mv` would move the new file inside it
 # and report success, leaving the skill at a path nobody named.

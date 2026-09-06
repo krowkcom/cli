@@ -11,9 +11,16 @@
 // needs — an Env, and a working directory where the answer depends on one — so
 // a test can hand it a temporary home instead of the developer's real one, and
 // so a check is a function of its inputs rather than of the machine it ran on.
+//
+// Nothing here trusts a file either. A project-scoped config sits in the
+// checkout, which means whoever wrote the checkout wrote it, so every read is
+// bounded and every path is inspected before it is opened.
 package harness
 
 import (
+	"errors"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,7 +29,7 @@ import (
 
 // Env is a lookup function, the same shape internal/runctx uses, so tests do
 // not have to touch the process environment to move a home directory.
-type Env = func(string) string
+type Env func(string) string
 
 // Status values, ordered by how much they should worry the person reading.
 const (
@@ -30,6 +37,11 @@ const (
 	StatusWarn = "warn"
 	StatusFail = "fail"
 )
+
+// maxConfigBytes bounds every config read. A megabyte is orders of magnitude
+// more than any of these files legitimately holds, and the bound is what stops
+// a symlink to /dev/zero in a cloned checkout from eating the machine.
+const maxConfigBytes = 1 << 20
 
 // StatusCheck is one health question and its answer. Message says what is,
 // Hint says what to do about it — so it is present only when there is
@@ -74,9 +86,11 @@ func Worst(checks []StatusCheck) string {
 	return worst
 }
 
-// HomeDir is the home directory as env describes it, or "" when env describes
-// none. Windows spells it USERPROFILE and only falls back there, so a Unix
-// test that deliberately empties HOME is not rescued by a stray variable.
+// HomeDir is the home directory as env describes it. HOME wins on every
+// platform, including Windows, where Go's own runtime sets it and where a
+// deliberately emptied HOME must not be quietly rescued; USERPROFILE is
+// consulted only when HOME is empty, and only on Windows, which is the only
+// place it means anything. No home in env is an empty string, never a guess.
 func HomeDir(env Env) string {
 	if env == nil {
 		return ""
@@ -92,27 +106,68 @@ func HomeDir(env Env) string {
 	return ""
 }
 
+// defaultPathExt is what Windows uses when PATHEXT says nothing.
+const defaultPathExt = ".COM;.EXE;.BAT;.CMD"
+
 // LookPath finds name in the PATH env describes, without consulting the real
-// one. Only executable regular files count on Unix; on Windows, where the
-// execute bit does not exist, presence is the whole test.
+// one. On Windows it tries name and then each PATHEXT suffix, since that is
+// where the actual executable lives (`claude.cmd`, not `claude`), and presence
+// is the whole test because there is no execute bit. Everywhere else the file
+// must be executable.
+//
+// Only absolute PATH entries count. A relative entry — "." above all — makes
+// the answer depend on which directory the process happens to be in, and an
+// untrusted checkout carrying a file called `claude` must not be able to
+// report itself as an installed agent.
 func LookPath(env Env, name string) string {
 	if env == nil {
 		return ""
 	}
 	for _, dir := range filepath.SplitList(env("PATH")) {
-		if dir == "" {
+		if dir == "" || !filepath.IsAbs(dir) {
 			continue
 		}
-		candidate := filepath.Join(dir, name)
-		info, err := os.Stat(candidate)
-		if err != nil || !info.Mode().IsRegular() {
-			continue
-		}
-		if runtime.GOOS == "windows" || info.Mode().Perm()&0o111 != 0 {
-			return candidate
+		for _, candidate := range executableNames(env, name) {
+			path := filepath.Join(dir, candidate)
+			if isExecutableFile(path) {
+				return path
+			}
 		}
 	}
 	return ""
+}
+
+// executableNames is the file names a command could be spelled as: just the
+// name on Unix, the name plus every PATHEXT suffix on Windows.
+func executableNames(env Env, name string) []string {
+	if runtime.GOOS != "windows" {
+		return []string{name}
+	}
+	names := []string{name}
+	exts := env("PATHEXT")
+	if strings.TrimSpace(exts) == "" {
+		exts = defaultPathExt
+	}
+	for _, ext := range strings.Split(exts, string(os.PathListSeparator)) {
+		if ext = strings.TrimSpace(ext); ext != "" {
+			names = append(names, name+ext)
+		}
+	}
+	return names
+}
+
+// isExecutableFile reports whether path is a runnable file. Stat, so links
+// resolve: the official Claude Code installer drops a symlink into
+// ~/.local/bin, and a check that refused to follow it would call a working
+// install missing. What matters here is what runs, and what runs is the
+// target. (The skill check takes the opposite line, for the opposite reason —
+// see CheckClaudeSkill.)
+func isExecutableFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	return runtime.GOOS == "windows" || info.Mode().Perm()&0o111 != 0
 }
 
 // isRegularFile reports whether path's final component is a regular file.
@@ -123,18 +178,47 @@ func isRegularFile(path string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
-// isDir reports whether path is a directory, resolving links.
+// isDir reports whether path is a directory. Stat, so a symlinked config or
+// skills directory counts — people do move those onto another volume, and the
+// directory only has to exist, not to be trusted.
 func isDir(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
 }
 
-// commandIsKrowkMCP reports whether an MCP server's command line launches
-// krowk's MCP server. The base name is what identifies it: an absolute path
-// out of a version manager, a bare name off PATH and a Windows .exe are all
-// the same server.
-func commandIsKrowkMCP(command string) bool {
-	base := filepath.Base(strings.TrimSpace(command))
-	base = strings.TrimSuffix(base, ".exe")
-	return base == "krowk-mcp"
+// readConfigFile reads a small JSON configuration file safely enough to read
+// one an attacker wrote. It refuses anything that is not a regular file — a
+// FIFO in the name of .mcp.json would otherwise block the check forever — and
+// stops at maxConfigBytes rather than parsing the prefix of something huge,
+// because half a config is not a config.
+//
+// A missing file returns fs.ErrNotExist, which callers read as "this scope
+// says nothing" rather than as a problem.
+func readConfigFile(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
+	}
+	f, err := os.Open(path) //nolint:gosec // G304: a path the caller named
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	// One byte past the limit is read on purpose: it is how "exactly at the
+	// limit" is told apart from "truncated here".
+	data, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxConfigBytes {
+		return nil, errors.New("larger than 1 MiB")
+	}
+	return data, nil
 }
+
+// isNotExist reports whether err is the filesystem saying nothing is there.
+func isNotExist(err error) bool { return errors.Is(err, fs.ErrNotExist) }

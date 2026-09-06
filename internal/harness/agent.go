@@ -19,9 +19,11 @@ var (
 )
 
 // RegisterAgent adds an agent to the global registry, from the init() of the
-// file that defines it. An empty or duplicate ID is a programming mistake in
-// this repository rather than anything a user did, so it panics: a registry
-// with two "claude" entries has no defined meaning and no useful recovery.
+// file that defines it. An empty or duplicate ID, or a missing callback, is a
+// programming mistake in this repository rather than anything a user did, so
+// it panics: a registry with two "claude" entries, or with an agent that
+// cannot say whether it is installed, has no defined meaning and no useful
+// recovery. Every registered agent is therefore safe to call.
 func RegisterAgent(info AgentInfo) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
@@ -32,6 +34,12 @@ func RegisterAgent(info AgentInfo) {
 		if registry[i].ID == info.ID {
 			panic("harness: RegisterAgent called with duplicate agent ID: " + info.ID)
 		}
+	}
+	if info.Detect == nil {
+		panic("harness: RegisterAgent called without a Detect function: " + info.ID)
+	}
+	if info.Checks == nil {
+		panic("harness: RegisterAgent called without a Checks function: " + info.ID)
 	}
 	registry = append(registry, info)
 }
@@ -51,7 +59,7 @@ func AllAgents() []AgentInfo {
 func DetectedAgents(env Env) []AgentInfo {
 	var detected []AgentInfo
 	for _, a := range AllAgents() {
-		if a.Detect != nil && a.Detect(env) {
+		if a.Detect(env) {
 			detected = append(detected, a)
 		}
 	}

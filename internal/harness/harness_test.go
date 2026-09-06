@@ -105,3 +105,76 @@ func writeExecutable(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+func TestLookPathIgnoresRelativePathEntries(t *testing.T) {
+	// A checkout somebody else wrote, carrying a file called claude, with "."
+	// on PATH. Whether an agent is installed must not depend on which
+	// directory the process is standing in.
+	dir := t.TempDir()
+	writeExecutable(t, filepath.Join(dir, "claude"))
+	t.Chdir(dir)
+
+	for _, entry := range []string{".", "", "relative/bin"} {
+		env := envFrom(map[string]string{"PATH": entry})
+		if got := LookPath(env, "claude"); got != "" {
+			t.Fatalf("LookPath with PATH=%q = %q, want empty", entry, got)
+		}
+	}
+}
+
+func TestExecutableNamesFollowPathExtOnWindows(t *testing.T) {
+	env := envFrom(map[string]string{"PATHEXT": ".COM" + string(os.PathListSeparator) + ".EXE"})
+	got := executableNames(env, "claude")
+	if runtime.GOOS != "windows" {
+		if len(got) != 1 || got[0] != "claude" {
+			t.Fatalf("executableNames = %v, want just the bare name off Windows", got)
+		}
+		return
+	}
+	want := []string{"claude", "claude.COM", "claude.EXE"}
+	if len(got) != len(want) {
+		t.Fatalf("executableNames = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("executableNames = %v, want %v", got, want)
+		}
+	}
+	// An empty PATHEXT still gets the Windows defaults rather than nothing.
+	if len(executableNames(envFrom(nil), "claude")) < 2 {
+		t.Fatal("an empty PATHEXT left no executable suffixes to try")
+	}
+}
+
+func TestReadConfigFileRefusesWhatItShouldNotRead(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, err := readConfigFile(filepath.Join(dir, "absent.json")); !isNotExist(err) {
+		t.Fatalf("reading a missing file = %v, want a not-exist error", err)
+	}
+
+	notAFile := filepath.Join(dir, "directory.json")
+	if err := os.MkdirAll(notAFile, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readConfigFile(notAFile); err == nil || isNotExist(err) {
+		t.Fatalf("reading a directory = %v, want a plain refusal", err)
+	}
+
+	big := filepath.Join(dir, "big.json")
+	if err := os.WriteFile(big, make([]byte, maxConfigBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readConfigFile(big); err == nil {
+		t.Fatal("an oversized config was read instead of refused")
+	}
+
+	small := filepath.Join(dir, "small.json")
+	if err := os.WriteFile(small, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := readConfigFile(small)
+	if err != nil || string(data) != "{}" {
+		t.Fatalf("readConfigFile = %q, %v", data, err)
+	}
+}

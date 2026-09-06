@@ -45,9 +45,12 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `internal/harness` carries the same gate for Go — `ClaimDir`,
   `WriteManagedFile`, `StampVersion`, `InstalledVersion`, `DirOwned`,
   `IsManagedCopy` — where
-  every read is bounded and goes through an `O_NOFOLLOW`, non-blocking open,
-  so a symlink, a FIFO or an oversized file in a managed name is refused
-  rather than followed, waited on or half-read. No
+  every read is bounded and, on Unix, goes through an `O_NOFOLLOW`,
+  non-blocking open, so a symlink, a FIFO or an oversized file in a managed
+  name is refused rather than followed, waited on or half-read. Windows is
+  weaker and says so in the code: the marker is read by checking the path and
+  then opening it, with a small window in between, and there is no ownership
+  check at all — closing either needs the Win32 API. No
   command calls any of it yet: it is what `krowk setup` will go through, so
   that one rule decides every write krowk makes into your home directory.
   `krowk doctor` will report a skill it did not write as installed either way,

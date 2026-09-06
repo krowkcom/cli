@@ -290,8 +290,9 @@ pass "the agent skill was written to CLAUDE_CONFIG_DIR"
 
 [[ -f "$CLAUDE/skills/krowk/.managed-by-krowk-cli" ]] \
   || fail "the installer did not mark the skill directory as its own"
-MARKER_SENTENCE="This directory is managed by krowk. Manual edits will be overwritten on upgrade."
-[[ "$(cat "$CLAUDE/skills/krowk/.managed-by-krowk-cli")" == "$MARKER_SENTENCE" ]] \
+# The installer's own constant, from sourcing it above: the sentence is
+# asserted against the definition rather than against a copy of it here.
+[[ "$(cat "$CLAUDE/skills/krowk/.managed-by-krowk-cli")" == "$MANAGED_MARKER_CONTENT" ]] \
   || fail "the ownership marker says something other than the sentence krowk writes"
 [[ "$(cat "$CLAUDE/skills/krowk/.installed-version")" == "$VERSION" ]] \
   || fail "the version stamp says $(cat "$CLAUDE/skills/krowk/.installed-version"), want $VERSION"
@@ -429,7 +430,7 @@ pass "a skill directory krowk creates is 0755 whatever the umask says"
 # and report success, leaving the skill at a path nobody named.
 DIRNAME="$WORK/claude-dirname"
 mkdir -p "$DIRNAME/skills/krowk/SKILL.md"
-printf '%s\n' "$MARKER_SENTENCE" >"$DIRNAME/skills/krowk/.managed-by-krowk-cli"
+printf '%s\n' "$MANAGED_MARKER_CONTENT" >"$DIRNAME/skills/krowk/.managed-by-krowk-cli"
 env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
   CLAUDE_CONFIG_DIR="$DIRNAME" \
   KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \

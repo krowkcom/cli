@@ -297,10 +297,11 @@ func WriteManagedFile(path string, data []byte) error {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		// A directory at the destination is the one failure that is a
-		// refusal rather than a fault, and the Lstat above will normally
-		// have caught it already.
-		if errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ENOTEMPTY) {
+		// A directory that appeared at the destination after the Lstat above
+		// is the one rename failure that is a refusal rather than a fault.
+		// (Only EISDIR: ENOTEMPTY is what rename says when the *source* is a
+		// directory, and the source here is a file this call just made.)
+		if errors.Is(err, syscall.EISDIR) {
 			return &UnmanagedError{Path: path, Reason: reasonIsDir}
 		}
 		return fmt.Errorf("writing %s: %w", path, err)
@@ -437,6 +438,13 @@ func IsManagedCopy(dir string, allowed ...string) bool {
 // — because a marker file that came from somewhere else (copied into a
 // dotfile repository, committed to a template, left by a different tool) is
 // not evidence krowk created the directory around it.
+//
+// On Unix the read is as strong as the decision needs: O_NOFOLLOW means the
+// file opened is the file named. On Windows it is a check and then an open,
+// with a window between them, and no ownership test to fall back on — see
+// openConfigFile there. A claim made on Windows is that much weaker, and it is
+// weaker in the direction of trusting a marker somebody swapped, which is why
+// the allowlist in IsManagedCopy still has to hold on its own.
 func markerIsOurs(dir string) bool {
 	if dir == "" {
 		return false

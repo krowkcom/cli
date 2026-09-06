@@ -452,11 +452,12 @@ write_managed_file() {
   if [[ -e "$tmp" || -L "$path" || ! -f "$path" ]]; then
     rm -f "$tmp"
     # A directory appearing at the destination between the test above and the
-    # rename is the one way mv can succeed and leave the file inside it. Clear
-    # what this call put there, so the next run does not refuse the whole
-    # directory over krowk's own litter.
+    # rename is the one way mv can succeed and leave the file inside it. Only
+    # this call's file is cleared away — anything else in there is not this
+    # call's to remove — so the next run does not refuse the whole directory
+    # over krowk's own litter.
     if [[ -d "$path" && ! -L "$path" ]]; then
-      rm -f "$path"/.krowk-*
+      rm -f "${path}/$(basename "$tmp")"
     fi
     note "${path} is not what this installer just wrote; leaving it alone."
     return 1
@@ -505,7 +506,10 @@ claim_skill_dir() {
       # accepts an existing directory silently, which would turn "somebody
       # else created this" into "krowk made this" — the one thing this gate
       # exists to tell apart.
-      mkdir -p "$(dirname "$dir")" || return 1
+      if ! mkdir -p "$(dirname "$dir")"; then
+        note "Cannot create $(dirname "$dir"), so no skill was written."
+        return 1
+      fi
       # -m 0755 rather than the umask's idea of a directory mode: a
       # permissive umask would otherwise leave this world-writable, and
       # krowk's marker would then be vouching for a directory any local user
@@ -514,7 +518,15 @@ claim_skill_dir() {
       if mkdir -m 0755 "$dir" 2>/dev/null; then
         return 0
       fi
-      # Somebody else created it first. Ask what landed, once.
+      # mkdir failed for one of two quite different reasons. If something is
+      # there now, somebody else created it first and the next pass asks what
+      # landed. If nothing is there, the directory simply could not be made —
+      # a read-only filesystem, a full disk — and saying it "keeps changing"
+      # would send the reader looking for a race that never happened.
+      if [[ ! -e "$dir" ]]; then
+        note "Cannot create ${dir}, so no skill was written."
+        return 1
+      fi
       [[ "$pass" == 1 ]] || break
       continue
     fi
@@ -540,12 +552,21 @@ claim_skill_dir() {
       note "${dir} carries a symlink where krowk's marker should be; leaving it alone."
       return 1
     elif [[ -f "${dir}/${MANAGED_MARKER}" ]]; then
-      # Bounded, like every read on the Go side: a file wearing the marker's
-      # name is not necessarily a sentence. Surrounding whitespace is stripped
+      # Bounded, like every read on the Go side. Surrounding whitespace is
+      # stripped
       # from both sides of the comparison, which is what the Go half's
       # TrimSpace does — an editor that added a trailing newline has not
       # changed who wrote the marker.
-      marker=$(head -c 512 -- "${dir}/${MANAGED_MARKER}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      # One byte past the bound, so "a sentence" is told apart from "something
+      # much larger wearing a marker's name" — the second is refused rather
+      # than compared on its first 512 bytes, which is what the Go half does.
+      marker=$(head -c 513 -- "${dir}/${MANAGED_MARKER}")
+      if [[ "${#marker}" -gt 512 ]]; then
+        note "${dir} carries a marker krowk did not write; leaving it alone."
+        note "Move it aside and re-run this installer to have krowk manage it."
+        return 1
+      fi
+      marker=$(printf '%s' "$marker" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
       if [[ "$marker" != "${MANAGED_MARKER_CONTENT}" ]]; then
         note "${dir} carries a marker krowk did not write; leaving it alone."
         note "Move it aside and re-run this installer to have krowk manage it."

@@ -2,6 +2,7 @@ package harness
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,6 +25,11 @@ const (
 	// defensively.
 	claudeProjectConfigFile = ".mcp.json"
 	claudeDirName           = ".claude"
+	// claudeSkillDirName and claudeSkillFile are where the krowk skill lands
+	// under Claude Code's configuration directory — the same two names
+	// scripts/install.sh writes.
+	claudeSkillDirName = "krowk"
+	claudeSkillFile    = "SKILL.md"
 
 	// KrowkMCPCommand is the binary krowk's MCP server runs as.
 	KrowkMCPCommand = "krowk-mcp"
@@ -458,11 +464,40 @@ func CheckClaudeSkill(env Env) StatusCheck {
 		return Warn(CheckNameClaudeSkill, "Cannot determine where Claude Code's config lives",
 			"Set HOME to the account Claude Code runs as")
 	}
-	skillDir := filepath.Join(dir, "skills", "krowk")
-	path := filepath.Join(skillDir, "SKILL.md")
+	skillDir := filepath.Join(dir, "skills", claudeSkillDirName)
+	path := filepath.Join(skillDir, claudeSkillFile)
 	if isRegularFile(path) {
-		return Pass(CheckNameClaudeSkill, "Installed ("+path+")")
+		// A skill krowk did not write still works — the agent reads it the
+		// same way — so every branch here passes. What differs is what
+		// happens on the next install, and that is the part a person cannot
+		// see for themselves.
+		//
+		// The same three questions the write gate asks come first, through
+		// the same function, so this cannot promise a refresh the gate would
+		// refuse: a skill directory that is a symlink, or that belongs to
+		// another user, is left alone whatever marker it carries.
+		if _, err := claimableDir(skillDir); err != nil {
+			var unmanaged *UnmanagedError
+			if errors.As(err, &unmanaged) {
+				return Pass(CheckNameClaudeSkill, "Installed ("+path+") — krowk will not refresh it: the directory "+unmanaged.Reason)
+			}
+			// Something else went wrong looking at the directory. The file
+			// is there and readable, so this still passes — but it must not
+			// claim a refresh it could not establish.
+			return Pass(CheckNameClaudeSkill, "Installed ("+path+") — could not inspect the directory: "+err.Error())
+		}
+		switch {
+		case markerIsOurs(skillDir):
+			return Pass(CheckNameClaudeSkill, "Installed ("+path+")")
+		case adoptableDir(skillDir, claudeSkillFile):
+			// Nothing here but the one file a pre-marker krowk wrote, which
+			// the installer adopts and marks on its next run.
+			return Pass(CheckNameClaudeSkill, "Installed ("+path+"), not yet marked as krowk's — the next install will adopt it")
+		default:
+			return Pass(CheckNameClaudeSkill, "Installed by hand ("+path+") — krowk will not refresh it")
+		}
 	}
+
 	if _, err := os.Lstat(path); err == nil {
 		return Fail(CheckNameClaudeSkill, path+" is not a regular file",
 			"Move it aside, then re-run the krowk installer")

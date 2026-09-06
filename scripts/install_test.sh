@@ -100,6 +100,20 @@ sh_goarch=$(sed -n 's/^ *[^ ]*) *arch="\([a-z0-9]*\)".*/\1/p' scripts/install.sh
   || fail ".goreleaser.yaml builds for [$(echo "$yaml_goarch" | tr '\n' ' ')] and scripts/install.sh names [$(echo "$sh_goarch" | tr '\n' ' ')]"
 pass "the platform lists still agree: $(echo "$yaml_goos" | tr '\n' ' ')× $(echo "$yaml_goarch" | tr '\n' ' ')"
 
+# The marker sentence lives in two languages, and a directory claimed by the
+# installer has to be one the binary's gate recognises. So neither copy may
+# drift: both are read out of the files that write them and compared.
+sh_marker=$(sed -n 's/^MANAGED_MARKER_CONTENT="\(.*\)"$/\1/p' scripts/install.sh)
+[[ -n "$sh_marker" ]] || fail "scripts/install.sh no longer defines MANAGED_MARKER_CONTENT"
+grep -qE "^[[:space:]]*managedMarkerContent = \"${sh_marker}\\\\n\"\$" internal/harness/managed.go \
+  || fail "scripts/install.sh writes a marker saying '$sh_marker', which is not what internal/harness/managed.go declares managedMarkerContent to be"
+for name in MANAGED_MARKER INSTALLED_VERSION_FILE; do
+  sh_name=$(sed -n "s/^${name}=\"\(.*\)\"\$/\1/p" scripts/install.sh)
+  grep -qF "\"$sh_name\"" internal/harness/managed.go \
+    || fail "scripts/install.sh writes $sh_name, which internal/harness/managed.go does not name"
+done
+pass "the marker sentence and the two filenames agree with internal/harness/managed.go"
+
 # The ignore list is the third piece: a combination the config refuses to build
 # must be one the installer refuses to offer, and every combination it does
 # build must be one detect_platform can name.
@@ -273,6 +287,226 @@ pass "the checksum was verified"
 diff -q skills/krowk/SKILL.md "$CLAUDE/skills/krowk/SKILL.md" >/dev/null \
   || fail "the installed skill differs from the one in the repository"
 pass "the agent skill was written to CLAUDE_CONFIG_DIR"
+
+[[ -f "$CLAUDE/skills/krowk/.managed-by-krowk-cli" ]] \
+  || fail "the installer did not mark the skill directory as its own"
+# The installer's own constant, from sourcing it above: the sentence is
+# asserted against the definition rather than against a copy of it here.
+[[ "$(cat "$CLAUDE/skills/krowk/.managed-by-krowk-cli")" == "$MANAGED_MARKER_CONTENT" ]] \
+  || fail "the ownership marker says something other than the sentence krowk writes"
+[[ "$(cat "$CLAUDE/skills/krowk/.installed-version")" == "$VERSION" ]] \
+  || fail "the version stamp says $(cat "$CLAUDE/skills/krowk/.installed-version"), want $VERSION"
+pass "the skill directory carries the ownership marker and the version stamp"
+
+# The whole point of the marker: a skill directory somebody else wrote is not
+# krowk's to overwrite, and one krowk wrote is.
+echo
+echo "Ownership of the skill directory"
+MINE="$WORK/claude-mine"
+mkdir -p "$MINE/skills/krowk"
+printf '# my own skill\n' >"$MINE/skills/krowk/SKILL.md"
+# Something the pre-marker installer never wrote, which is what makes this
+# somebody's own directory rather than an old install to adopt.
+printf 'mine\n' >"$MINE/skills/krowk/notes.md"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$MINE" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/unowned.log" 2>&1 \
+  || { cat "$WORK/unowned.log"; fail "the installer exited non-zero over a skill directory it does not own"; }
+
+[[ "$(cat "$MINE/skills/krowk/SKILL.md")" == "# my own skill" ]] \
+  || fail "the installer overwrote a skill directory it did not write"
+[[ ! -e "$MINE/skills/krowk/.managed-by-krowk-cli" ]] \
+  || fail "the installer claimed a skill directory it did not write"
+grep -q "was not written by krowk" "$WORK/unowned.log" \
+  || { cat "$WORK/unowned.log"; fail "the installer did not say why it left the skill directory alone"; }
+pass "a populated skill directory krowk did not write is left untouched, and said so"
+
+# And the one it did write is refreshed in place, marker and all.
+printf '# stale\n' >"$CLAUDE/skills/krowk/SKILL.md"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$CLAUDE" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/refresh.log" 2>&1 \
+  || { cat "$WORK/refresh.log"; fail "the installer exited non-zero refreshing its own skill directory"; }
+
+diff -q skills/krowk/SKILL.md "$CLAUDE/skills/krowk/SKILL.md" >/dev/null \
+  || fail "the installer did not refresh a skill directory it wrote"
+[[ -f "$CLAUDE/skills/krowk/.managed-by-krowk-cli" ]] \
+  || fail "the refresh dropped the ownership marker"
+pass "a marked skill directory is refreshed in place"
+
+# A symlink where the skill directory should be points at a directory this
+# installer never inspected, so it is not one to write through.
+LINKED="$WORK/claude-linked"
+mkdir -p "$LINKED/skills" "$WORK/link-target"
+ln -s "$WORK/link-target" "$LINKED/skills/krowk"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$LINKED" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/linked.log" 2>&1 \
+  || { cat "$WORK/linked.log"; fail "the installer exited non-zero over a symlinked skill directory"; }
+[[ -z "$(ls -A "$WORK/link-target")" ]] \
+  || fail "the installer wrote through a symlinked skill directory"
+grep -q "is a symlink" "$WORK/linked.log" \
+  || { cat "$WORK/linked.log"; fail "the installer did not say it refused a symlinked skill directory"; }
+pass "a symlinked skill directory is left alone"
+
+# Inside a directory krowk does own, a symlink in a managed file's name is
+# refused rather than followed — the same answer internal/harness gives, and
+# for the same reason: its target was never inspected, so whatever it points at
+# is somebody else's file.
+printf 'do not touch\n' >"$WORK/victim"
+rm -f "$CLAUDE/skills/krowk/.installed-version"
+ln -s "$WORK/victim" "$CLAUDE/skills/krowk/.installed-version"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$CLAUDE" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/victim.log" 2>&1 \
+  || { cat "$WORK/victim.log"; fail "the installer exited non-zero over a symlinked version stamp"; }
+[[ "$(cat "$WORK/victim")" == "do not touch" ]] \
+  || fail "the installer wrote through a symlinked version stamp"
+grep -q "is a symlink" "$WORK/victim.log" \
+  || { cat "$WORK/victim.log"; fail "the installer did not say it refused the symlinked version stamp"; }
+diff -q skills/krowk/SKILL.md "$CLAUDE/skills/krowk/SKILL.md" >/dev/null \
+  || fail "the refused stamp took the skill down with it"
+rm -f "$CLAUDE/skills/krowk/.installed-version"
+pass "a symlink in a managed file's name is refused, and its target untouched"
+
+# A directory that cannot be listed is refused rather than assumed empty.
+if [[ "$(id -u)" == "0" ]]; then
+  echo "  – running as root, where an unreadable directory is still readable; skipped"
+else
+  BLIND="$WORK/claude-blind"
+  mkdir -p "$BLIND/skills/krowk"
+  printf '# mine\n' >"$BLIND/skills/krowk/SKILL.md"
+  chmod 300 "$BLIND/skills/krowk"
+  env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+    CLAUDE_CONFIG_DIR="$BLIND" \
+    KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+    bash "$REPO_ROOT/scripts/install.sh" >"$WORK/blind.log" 2>&1 \
+    || { cat "$WORK/blind.log"; fail "the installer exited non-zero over an unreadable skill directory"; }
+  grep -q "cannot be read" "$WORK/blind.log" \
+    || { cat "$WORK/blind.log"; fail "the installer did not refuse an unreadable skill directory"; }
+  chmod 700 "$BLIND/skills/krowk"
+  [[ "$(cat "$BLIND/skills/krowk/SKILL.md")" == "# mine" ]] \
+    || fail "the installer wrote into a directory it could not read"
+  pass "a skill directory that cannot be listed is left alone"
+fi
+
+# The one shape the installer adopts: what a pre-marker krowk wrote, which is
+# a SKILL.md and nothing else. That file was overwritten by every run of the
+# old installer anyway, so adopting it takes nothing from anyone.
+OLD="$WORK/claude-old"
+mkdir -p "$OLD/skills/krowk"
+printf '# an older krowk wrote this\n' >"$OLD/skills/krowk/SKILL.md"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$OLD" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/old.log" 2>&1 \
+  || { cat "$WORK/old.log"; fail "the installer exited non-zero upgrading a pre-marker skill"; }
+[[ -f "$OLD/skills/krowk/.managed-by-krowk-cli" ]] \
+  || { cat "$WORK/old.log"; fail "a pre-marker skill directory was not adopted"; }
+diff -q skills/krowk/SKILL.md "$OLD/skills/krowk/SKILL.md" >/dev/null \
+  || fail "the adopted skill was not refreshed"
+pass "a skill directory a pre-marker krowk wrote is adopted and refreshed"
+
+# A permissive umask must not leave the skill directory world-writable: krowk's
+# marker would then be vouching for a directory any local user can rewrite.
+LOOSE="$WORK/claude-loose"
+mkdir -p "$LOOSE/skills"
+( umask 000
+  env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+    CLAUDE_CONFIG_DIR="$LOOSE" \
+    KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+    bash "$REPO_ROOT/scripts/install.sh" >"$WORK/umask.log" 2>&1 ) \
+  || { cat "$WORK/umask.log"; fail "the installer exited non-zero under umask 000"; }
+[[ -z "$(find "$LOOSE/skills/krowk" -maxdepth 0 -perm /022)" ]] \
+  || fail "the skill directory krowk created under umask 000 is writable by others"
+pass "a skill directory krowk creates is not writable by others, whatever the umask says"
+
+# A marker much larger than a marker is not a marker, however it begins. The
+# padding is newlines on purpose: those are what a naive read strips before
+# measuring, which would let this pass.
+BIG="$WORK/claude-big"
+mkdir -p "$BIG/skills/krowk"
+{ printf '%s\n' "$MANAGED_MARKER_CONTENT"; for _ in $(seq 1 1000); do printf '\n'; done; } \
+  >"$BIG/skills/krowk/.managed-by-krowk-cli"
+printf '# mine\n' >"$BIG/skills/krowk/SKILL.md"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$BIG" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/big.log" 2>&1 \
+  || { cat "$WORK/big.log"; fail "the installer exited non-zero over an oversized marker"; }
+grep -q "carries a marker krowk did not write" "$WORK/big.log" \
+  || { cat "$WORK/big.log"; fail "the installer accepted a marker far larger than a marker"; }
+[[ "$(cat "$BIG/skills/krowk/SKILL.md")" == "# mine" ]] \
+  || fail "the installer wrote into a directory whose marker it refused"
+pass "a marker padded past the read bound is refused"
+
+# A FIFO in a managed file's name: not a file this installer wrote, and not one
+# a rename should quietly replace.
+if ! command -v mkfifo >/dev/null 2>&1; then
+  echo "  – mkfifo not available, so a non-regular file cannot be staged; skipped"
+else
+  FIFO="$WORK/claude-fifo"
+  mkdir -p "$FIFO/skills/krowk"
+  printf '%s\n' "$MANAGED_MARKER_CONTENT" >"$FIFO/skills/krowk/.managed-by-krowk-cli"
+  mkfifo "$FIFO/skills/krowk/SKILL.md"
+  env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+    CLAUDE_CONFIG_DIR="$FIFO" \
+    KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+    bash "$REPO_ROOT/scripts/install.sh" >"$WORK/fifo.log" 2>&1 \
+    || { cat "$WORK/fifo.log"; fail "the installer exited non-zero over a FIFO in the skill's name"; }
+  grep -q "not a regular file krowk wrote" "$WORK/fifo.log" \
+    || { cat "$WORK/fifo.log"; fail "the installer did not refuse a FIFO in the skill's name"; }
+  [[ -p "$FIFO/skills/krowk/SKILL.md" ]] \
+    || fail "the installer replaced a FIFO it should have left alone"
+  pass "a FIFO in a managed file's name is refused"
+fi
+
+# A directory in a managed file's name: `mv` would move the new file inside it
+# and report success, leaving the skill at a path nobody named.
+DIRNAME="$WORK/claude-dirname"
+mkdir -p "$DIRNAME/skills/krowk/SKILL.md"
+printf '%s\n' "$MANAGED_MARKER_CONTENT" >"$DIRNAME/skills/krowk/.managed-by-krowk-cli"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$DIRNAME" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/dirname.log" 2>&1 \
+  || { cat "$WORK/dirname.log"; fail "the installer exited non-zero over a directory in SKILL.md's name"; }
+[[ -z "$(ls -A "$DIRNAME/skills/krowk/SKILL.md")" ]] \
+  || fail "the installer moved the skill inside a directory named SKILL.md"
+grep -q "is a directory" "$WORK/dirname.log" \
+  || { cat "$WORK/dirname.log"; fail "the installer did not say it refused a directory in the skill file's name"; }
+pass "a directory in a managed file's name is refused, with nothing moved into it"
+
+# Nothing this installer writes may be left behind on a refusal: a stranded
+# temporary file would make the next run's adoption check refuse the directory.
+stranded=("$DIRNAME/skills/krowk"/.krowk-*)
+[[ ! -e "${stranded[0]}" ]] \
+  || fail "a temporary file was stranded in the skill directory: ${stranded[0]}"
+pass "no temporary file was left behind"
+
+# A skill directory belonging to somebody else is not krowk's to manage,
+# whatever its mode allows. Only root can stage that.
+if [[ "$(id -u)" != "0" ]]; then
+  echo "  – not root, so a directory owned by another user cannot be staged; skipped"
+else
+  OTHER="$WORK/claude-other"
+  mkdir -p "$OTHER/skills/krowk"
+  chown 65534:65534 "$OTHER/skills/krowk"
+  env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+    CLAUDE_CONFIG_DIR="$OTHER" \
+    KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+    bash "$REPO_ROOT/scripts/install.sh" >"$WORK/other.log" 2>&1 \
+    || { cat "$WORK/other.log"; fail "the installer exited non-zero over a directory owned by another user"; }
+  grep -q "belongs to another user" "$WORK/other.log" \
+    || { cat "$WORK/other.log"; fail "the installer did not refuse a directory owned by another user"; }
+  [[ -z "$(ls -A "$OTHER/skills/krowk")" ]] \
+    || fail "the installer wrote into a directory owned by another user"
+  pass "a skill directory owned by another user is left alone"
+fi
 
 grep -q "krowk push screenshot.png" "$WORK/install.log" || fail "the next steps were not printed"
 pass "the next steps were printed"

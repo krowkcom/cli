@@ -11,7 +11,8 @@ Tools: `krowk_push`, `krowk_list_artifacts`, `krowk_get_artifact`, `krowk_claim_
 `krowk_get_run`, `krowk_verify_key`.
 
 Pushing requires no account. `KROWK_API_KEY` is optional and adds run grouping, listings
-and permanence past the 24-hour anonymous expiry.
+and, on a paid plan, permanence past the 24-hour expiry — a free workspace's
+uploads expire in 24 hours too.
 
 Deleting an upload is immediate and unrecoverable — confirm with the user first.
 

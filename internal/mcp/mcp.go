@@ -1201,7 +1201,8 @@ func toolSchemas() []map[string]any {
 		{
 			"name": "krowk_claim_artifact",
 			"description": "Spend a claim token to move an anonymous artifact into the key's " +
-				"workspace, where it stops expiring. Pass `run` to also group it under a run — " +
+				"workspace. A Pro or Business workspace keeps it; a free one restamps a fresh " +
+				"24-hour expiry. Pass `run` to also group it under a run — " +
 				"an anonymous upload could not name one, so this is the only way it gets one. " +
 				"Needs an API key.",
 			"inputSchema": map[string]any{

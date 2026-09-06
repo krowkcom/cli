@@ -979,7 +979,8 @@ func (c *Client) ListRunArtifacts(ctx context.Context, runSlug, before string, l
 }
 
 // ClaimArtifact spends a claim token to move an anonymous artifact into the
-// key's workspace, where it stops expiring.
+// key's workspace. What that does to the expiry follows the plan: a paid
+// workspace lifts it, a free one restamps a fresh 24 hours.
 func (c *Client) ClaimArtifact(ctx context.Context, slug, claimToken string) (*Artifact, error) {
 	var artifact Artifact
 	body := map[string]any{"claim_token": claimToken}
@@ -1566,7 +1567,7 @@ func fixFor(code string, status int) string {
 		// worth saying out loud rather than leaving to be discovered.
 		return "this artifact's bytes are already stored and a link cannot be pointed at new ones — push again for a new artifact, which is a new link"
 	case "expired":
-		return "this artifact was anonymous and has passed its expiry — upload it again, and claim it with a key to keep it"
+		return "this artifact was anonymous and has passed its expiry — upload it again, and claim it with a key: a Pro workspace keeps it, a free one gets another 24 hours"
 	case "taken_down":
 		// 410 rather than 404 because the link is already pasted somewhere, so the
 		// fix says the artifact existed and is gone rather than sending someone

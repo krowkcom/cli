@@ -9,6 +9,18 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Added
+
+- A harness registry (`internal/harness`) that detects which coding agents are
+  installed and asks each one whether krowk is actually wired into it. Claude
+  Code is the first: detected by a `~/.claude/` directory or a `claude` binary,
+  then checked for the krowk MCP server in every scope it can be registered in
+  — user or local scope in `~/.claude.json`, project scope in a checked-in
+  `.mcp.json` — and for the krowk skill. `CLAUDE_CONFIG_DIR` is honoured, as
+  the installer already does. Nothing surfaces this yet; `krowk doctor` and
+  `krowk setup` will, and they will agree because they will be reading the
+  same checks.
+
 ## [0.9.0] - 2026-09-06
 
 ### Added

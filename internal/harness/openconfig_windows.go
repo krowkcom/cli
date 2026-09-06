@@ -1,0 +1,33 @@
+//go:build windows
+
+package harness
+
+import "os"
+
+// openConfigFile opens a configuration file, enforcing as much of the Unix
+// policy as Windows allows.
+//
+// What is enforced: an untrusted path is refused when its final component is
+// a symlink, a junction or any other reparse point, and — on every path,
+// trusted or not — the shared test on the descriptor refuses anything that is
+// not a regular file.
+//
+// What is not: there is no O_NOFOLLOW here, so the refusal is a separate
+// Lstat before the open rather than something the kernel guarantees. A path
+// swapped between the two calls would be followed. That window is accepted
+// because closing it needs the reparse-point flags of the Win32 API and this
+// is a health check, not an access decision — what it can lose is the
+// accuracy of one line of a report. Nor is there anything to do about FIFOs,
+// which do not exist on the filesystem paths these configs live at.
+func openConfigFile(path string, trusted bool) (*os.File, error) {
+	if !trusted {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			return nil, errIsSymlink
+		}
+	}
+	return os.Open(path) //nolint:gosec // G304: a path the caller named
+}

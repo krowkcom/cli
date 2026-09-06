@@ -481,7 +481,10 @@ func CheckClaudeSkill(env Env) StatusCheck {
 			if errors.As(err, &unmanaged) {
 				return Pass(CheckNameClaudeSkill, "Installed ("+path+") — krowk will not refresh it: the directory "+unmanaged.Reason)
 			}
-			return Pass(CheckNameClaudeSkill, "Installed ("+path+")")
+			// Something else went wrong looking at the directory. The file
+			// is there and readable, so this still passes — but it must not
+			// claim a refresh it could not establish.
+			return Pass(CheckNameClaudeSkill, "Installed ("+path+") — could not inspect the directory: "+err.Error())
 		}
 		switch {
 		case markerIsOurs(skillDir):

@@ -591,3 +591,38 @@ func swapEUID(t *testing.T, fn func() int) {
 	euid = fn
 	t.Cleanup(func() { euid = previous })
 }
+
+func TestIsManagedCopyRefusesADirectoryBelongingToSomebodyElse(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no uid to disagree about")
+	}
+	dir := filepath.Join(t.TempDir(), "krowk")
+	mkdirAll(t, dir)
+	writeFile(t, filepath.Join(dir, ManagedMarker), managedMarkerContent)
+	writeFile(t, filepath.Join(dir, "SKILL.md"), "# krowk\n")
+
+	if !IsManagedCopy(dir, "SKILL.md") {
+		t.Fatal("a directory krowk wrote is not recognised as its own")
+	}
+	// The same directory, seen by a process that is not its owner: nothing
+	// about the contents changed, and it is still not krowk's to delete.
+	swapEUID(t, func() int { return os.Geteuid() + 1 })
+	if IsManagedCopy(dir, "SKILL.md") {
+		t.Fatal("a directory belonging to another user was reported as krowk's to remove")
+	}
+}
+
+func TestWriteManagedFileSaysADirectoryIsADirectory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "SKILL.md")
+	mkdirAll(t, path)
+
+	err := WriteManagedFile(path, []byte("# ours\n"))
+	var target *UnmanagedError
+	if !errors.As(err, &target) {
+		t.Fatalf("err = %v, want an *UnmanagedError", err)
+	}
+	if target.Reason != reasonIsDir {
+		t.Fatalf("reason = %q, want %q — the message must read forwards", target.Reason, reasonIsDir)
+	}
+}

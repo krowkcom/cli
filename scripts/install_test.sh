@@ -410,6 +410,21 @@ diff -q skills/krowk/SKILL.md "$OLD/skills/krowk/SKILL.md" >/dev/null \
   || fail "the adopted skill was not refreshed"
 pass "a skill directory a pre-marker krowk wrote is adopted and refreshed"
 
+# A permissive umask must not leave the skill directory world-writable: krowk's
+# marker would then be vouching for a directory any local user can rewrite.
+LOOSE="$WORK/claude-loose"
+mkdir -p "$LOOSE/skills"
+( umask 000
+  env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+    CLAUDE_CONFIG_DIR="$LOOSE" \
+    KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+    bash "$REPO_ROOT/scripts/install.sh" >"$WORK/umask.log" 2>&1 ) \
+  || { cat "$WORK/umask.log"; fail "the installer exited non-zero under umask 000"; }
+mode=$(ls -ld "$LOOSE/skills/krowk" | cut -c2-10)
+[[ "$mode" == "rwxr-xr-x" ]] \
+  || fail "the skill directory is $mode under umask 000, want rwxr-xr-x"
+pass "a skill directory krowk creates is 0755 whatever the umask says"
+
 # A directory in a managed file's name: `mv` would move the new file inside it
 # and report success, leaving the skill at a path nobody named.
 DIRNAME="$WORK/claude-dirname"
@@ -428,8 +443,9 @@ pass "a directory in a managed file's name is refused, with nothing moved into i
 
 # Nothing this installer writes may be left behind on a refusal: a stranded
 # temporary file would make the next run's adoption check refuse the directory.
-[[ -z "$(ls -A "$DIRNAME/skills/krowk" | grep '^\.krowk-' || true)" ]] \
-  || fail "a temporary file was stranded in the skill directory"
+stranded=("$DIRNAME/skills/krowk"/.krowk-*)
+[[ ! -e "${stranded[0]}" ]] \
+  || fail "a temporary file was stranded in the skill directory: ${stranded[0]}"
 pass "no temporary file was left behind"
 
 # A skill directory belonging to somebody else is not krowk's to manage,

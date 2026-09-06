@@ -43,7 +43,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   new one, and a second hard link to somebody's file keeps its contents.
 
   `internal/harness` carries the same gate for Go — `ClaimDir`,
-  `WriteManagedFile`, `DirOwned`, `InstalledVersion`, `IsManagedCopy` — where
+  `WriteManagedFile`, `StampVersion`, `InstalledVersion`, `DirOwned`,
+  `IsManagedCopy` — where
   every read is bounded and goes through an `O_NOFOLLOW`, non-blocking open,
   so a symlink, a FIFO or an oversized file in a managed name is refused
   rather than followed, waited on or half-read. No

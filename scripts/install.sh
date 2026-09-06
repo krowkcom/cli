@@ -488,7 +488,7 @@ write_managed_file() {
 # marker has to say what krowk's markers say: this is the destructive side, and
 # a name is cheap to forge.
 claim_skill_dir() {
-  local dir="$1" entries name
+  local dir="$1" entries name marker
 
   # Two passes, like the Go gate: the first may find nothing there and try to
   # create it, and if something else won that race the second asks what
@@ -506,7 +506,12 @@ claim_skill_dir() {
       # else created this" into "krowk made this" — the one thing this gate
       # exists to tell apart.
       mkdir -p "$(dirname "$dir")" || return 1
-      if mkdir "$dir" 2>/dev/null; then
+      # -m 0755 rather than the umask's idea of a directory mode: a
+      # permissive umask would otherwise leave this world-writable, and
+      # krowk's marker would then be vouching for a directory any local user
+      # can rewrite the skill in. A restrictive umask can still narrow it,
+      # which is the user's business.
+      if mkdir -m 0755 "$dir" 2>/dev/null; then
         return 0
       fi
       # Somebody else created it first. Ask what landed, once.
@@ -536,8 +541,12 @@ claim_skill_dir() {
       return 1
     elif [[ -f "${dir}/${MANAGED_MARKER}" ]]; then
       # Bounded, like every read on the Go side: a file wearing the marker's
-      # name is not necessarily a sentence.
-      if [[ "$(head -c 512 -- "${dir}/${MANAGED_MARKER}")" != "$MANAGED_MARKER_CONTENT" ]]; then
+      # name is not necessarily a sentence. Surrounding whitespace is stripped
+      # from both sides of the comparison, which is what the Go half's
+      # TrimSpace does — an editor that added a trailing newline has not
+      # changed who wrote the marker.
+      marker=$(head -c 512 -- "${dir}/${MANAGED_MARKER}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      if [[ "$marker" != "${MANAGED_MARKER_CONTENT}" ]]; then
         note "${dir} carries a marker krowk did not write; leaving it alone."
         note "Move it aside and re-run this installer to have krowk manage it."
         return 1

@@ -81,6 +81,7 @@ const (
 	reasonUnmanaged    = "exists but was not written by krowk; move it aside to let krowk write there"
 	reasonSymlink      = "is a symlink, so krowk never inspected what it points at"
 	reasonNotDir       = "is not a directory"
+	reasonIsDir        = "is a directory, not a file krowk wrote"
 	reasonNotRegular   = "is not a regular file"
 	reasonForeignOwner = "belongs to another user, so krowk is not the one managing it"
 )
@@ -255,7 +256,7 @@ func WriteManagedFile(path string, data []byte) error {
 		case info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0:
 			return &UnmanagedError{Path: path, Reason: reasonSymlink}
 		case info.IsDir():
-			return &UnmanagedError{Path: path, Reason: reasonNotDir}
+			return &UnmanagedError{Path: path, Reason: reasonIsDir}
 		case !info.Mode().IsRegular():
 			return &UnmanagedError{Path: path, Reason: reasonNotRegular}
 		}
@@ -300,7 +301,7 @@ func WriteManagedFile(path string, data []byte) error {
 		// refusal rather than a fault, and the Lstat above will normally
 		// have caught it already.
 		if errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ENOTEMPTY) {
-			return &UnmanagedError{Path: path, Reason: reasonNotDir}
+			return &UnmanagedError{Path: path, Reason: reasonIsDir}
 		}
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
@@ -312,10 +313,10 @@ func WriteManagedFile(path string, data []byte) error {
 // Lstat, so that a symlink or a directory planted in its name confers nothing.
 //
 // It is the presence question and only the presence question: it does not read
-// the marker. That is enough for the health check that uses it, which is
-// reporting on what is on disk rather than deciding to overwrite it. Every
-// write and every removal asks markerIsOurs instead, which reads the contents
-// — a name is cheap to forge and this is the cheap answer.
+// the marker. Nothing in krowk decides anything on it today — it is here for a
+// status line that wants to say whether the marker is there at all, cheaply.
+// Every write and every removal asks markerIsOurs instead, which reads the
+// contents, because a name is cheap to forge and this is the cheap answer.
 func DirOwned(dir string) bool {
 	return dir != "" && isRegularFile(filepath.Join(dir, ManagedMarker))
 }
@@ -382,12 +383,13 @@ func readManagedFile(path string, maxBytes int64) ([]byte, error) {
 // Every entry must be a regular file.
 //
 // This is the predicate a removal or a refresh must ask before it deletes
-// anything. DirOwned answers "may krowk write here", which is enough to add or
-// replace a file; it is not enough to remove the directory, because a user may
-// have dropped their own file in beside krowk's. All three conditions are load
-// bearing: the marker proves provenance — by its contents as well as its name
-// (markerIsOurs), since only a file krowk wrote says what krowk writes — and the
-// allowlist keeps anything else in the directory safe.
+// anything, and every condition in it is load bearing. The directory has to be
+// a real directory this user owns (claimableDir), because a link or somebody
+// else's directory is not krowk's to empty however it is furnished. The marker
+// proves provenance by its contents as well as its name (markerIsOurs), since
+// only a file krowk wrote says what krowk writes. And the allowlist keeps
+// anything a user added alongside krowk's files safe: a directory krowk may
+// write into is not automatically a directory krowk may delete.
 //
 // Entry names are compared exactly. On a case-insensitive filesystem that can
 // make this and DirOwned disagree about one directory, and the disagreement
@@ -401,8 +403,7 @@ func readManagedFile(path string, maxBytes int64) ([]byte, error) {
 // re-inspect through a descriptor it holds; that is the residual this
 // predicate cannot close and does not pretend to.
 func IsManagedCopy(dir string, allowed ...string) bool {
-	info, err := os.Lstat(dir)
-	if err != nil || !info.IsDir() {
+	if _, err := claimableDir(dir); err != nil {
 		return false
 	}
 	entries, err := os.ReadDir(dir)

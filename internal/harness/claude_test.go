@@ -284,6 +284,18 @@ func TestCheckClaudeMCPServerWarnsWithNowhereToLook(t *testing.T) {
 	}
 }
 
+func TestCheckClaudeMCPServerWarnsWhenOnlyTheProjectScopeCouldBeRead(t *testing.T) {
+	// No home: the user config holds user and local scope, and neither was
+	// ever opened. An empty checkout does not answer for them.
+	check := CheckClaudeMCPServer(envFrom(nil), t.TempDir())
+	if check.Status != StatusWarn {
+		t.Fatalf("check = %+v, want warn — two of the three scopes were never looked at", check)
+	}
+	if !strings.Contains(check.Hint, "HOME") {
+		t.Fatalf("hint %q does not say what is missing", check.Hint)
+	}
+}
+
 func TestCommandIsKrowkMCPMatchesTheServerAndNothingElse(t *testing.T) {
 	yes := []string{"krowk-mcp", "/opt/bin/krowk-mcp", "  krowk-mcp  "}
 	for _, command := range yes {
@@ -326,6 +338,8 @@ func TestTheNpxFormOnlyCountsWhenAPackageRunnerLaunchesIt(t *testing.T) {
 			`{"krowk":{"command":"npx","args":["@krowk/mcp-evil"]}}`, false},
 		{"an argument that is the binary name",
 			`{"krowk":{"command":"/tmp/evil/payload","args":["krowk-mcp"]}}`, false},
+		{"node, which runs a file rather than a package",
+			`{"krowk":{"command":"node","args":["@krowk/mcp"]}}`, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

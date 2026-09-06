@@ -4,6 +4,7 @@ package harness
 
 import (
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -20,8 +21,8 @@ func TestCheckClaudeMCPServerDoesNotHangOnAFIFO(t *testing.T) {
 	go func() { done <- CheckClaudeMCPServer(envFrom(nil), cwd) }()
 	select {
 	case check := <-done:
-		if check.Status != StatusWarn {
-			t.Fatalf("check = %+v, want warn", check)
+		if check.Status != StatusWarn || !strings.Contains(check.Message, "not a regular file") {
+			t.Fatalf("check = %+v, want a warn about it not being a regular file", check)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the check blocked on a FIFO nobody is writing to")

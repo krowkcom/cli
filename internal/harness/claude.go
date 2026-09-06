@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"unicode"
 )
@@ -145,6 +146,7 @@ func CheckClaudeMCPServer(env Env, cwd string) StatusCheck {
 		trusted  bool
 		maxBytes int64
 	}
+	homeless := HomeDir(env) == ""
 	var candidates []candidate
 	if home := HomeDir(env); home != "" {
 		candidates = append(candidates, candidate{
@@ -158,15 +160,6 @@ func CheckClaudeMCPServer(env Env, cwd string) StatusCheck {
 			trusted: false, maxBytes: maxProjectConfigBytes,
 		})
 	}
-	if len(candidates) == 0 {
-		// Neither a home nor a working directory: there is nowhere a
-		// registration could be, so there is nothing to report either way.
-		// Asserting "not registered" here would be asserting a negative
-		// nothing was ever looked for.
-		return Warn(CheckNameClaudeMCP, "Cannot determine where Claude Code's config lives",
-			"Set HOME to the account Claude Code runs as")
-	}
-
 	var problem string
 	for _, c := range candidates {
 		matched, why := mcpServerRegistered(c.path, c.cwd, c.trusted, c.maxBytes)
@@ -182,6 +175,13 @@ func CheckClaudeMCPServer(env Env, cwd string) StatusCheck {
 
 	if problem != "" {
 		return Warn(CheckNameClaudeMCP, problem, mcpHint)
+	}
+	if homeless {
+		// The user config holds two of the three scopes and was never
+		// located, so "not registered" would be a claim about a file nothing
+		// opened. A .mcp.json that said nothing does not answer for it.
+		return Warn(CheckNameClaudeMCP, "Cannot determine where Claude Code's config lives",
+			"Set HOME to the account Claude Code runs as")
 	}
 	return Fail(CheckNameClaudeMCP, "Not registered", mcpHint)
 }
@@ -221,8 +221,9 @@ func mcpServerRegistered(path, cwd string, trusted bool, maxBytes int64) (matche
 		return matched, ""
 	}
 	if cwd != "" {
+		want := projectDirsOf(cwd)
 		for key, raw := range cfg.Projects {
-			if !sameProjectDir(key, cwd) {
+			if !matchesProjectDir(want, key) {
 				continue
 			}
 			var project struct {
@@ -239,26 +240,46 @@ func mcpServerRegistered(path, cwd string, trusted bool, maxBytes int64) (matche
 	return "", ""
 }
 
-// sameProjectDir reports whether a projects key names the directory cwd. Both
-// are cleaned and, where they resolve, followed through symlinks: Claude Code
-// records the path it resolved, while the shell that ran krowk may have
-// arrived through a link. Case is folded where the filesystem folds it.
-func sameProjectDir(key, cwd string) bool {
-	candidates := func(path string) []string {
-		out := []string{filepath.Clean(path)}
-		if resolved, err := filepath.EvalSymlinks(path); err == nil {
-			out = append(out, filepath.Clean(resolved))
-		}
-		return out
+// projectDirForms is the spellings of one directory a config key might use:
+// as given, and as it resolves through symlinks. It is computed once per
+// check, not once per key.
+type projectDirForms struct {
+	clean    string
+	resolved string
+}
+
+// projectDirsOf resolves cwd into the forms a projects key could match.
+func projectDirsOf(cwd string) projectDirForms {
+	forms := projectDirForms{clean: filepath.Clean(cwd)}
+	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
+		forms.resolved = filepath.Clean(resolved)
 	}
-	// Windows and macOS are case-insensitive by default; Linux is not, and
-	// folding there would call two different directories the same one.
+	return forms
+}
+
+// matchesProjectDir reports whether a projects key names the directory the
+// check is about.
+//
+// The key is cleaned and never resolved. Claude Code records the path it had
+// already resolved, so resolving again buys nothing — and it would cost a
+// great deal: a real ~/.claude.json holds hundreds of keys naming directories
+// that have since been deleted, unmounted or moved onto a network share, and
+// stat-ing every one of them is exactly the hang this package refuses to risk
+// elsewhere. Only the one directory the caller asked about is resolved, and
+// only once.
+//
+// Case is folded where the filesystem folds it: Windows and macOS are
+// case-insensitive by default, while folding on Linux would call two different
+// directories the same one.
+func matchesProjectDir(want projectDirForms, key string) bool {
+	key = filepath.Clean(key)
 	fold := runtime.GOOS == "windows" || runtime.GOOS == "darwin"
-	for _, a := range candidates(key) {
-		for _, b := range candidates(cwd) {
-			if a == b || (fold && strings.EqualFold(a, b)) {
-				return true
-			}
+	for _, form := range []string{want.clean, want.resolved} {
+		if form == "" {
+			continue
+		}
+		if key == form || (fold && strings.EqualFold(key, form)) {
+			return true
 		}
 	}
 	return false
@@ -273,7 +294,17 @@ func sameProjectDir(key, cwd string) bool {
 // runner launching the @krowk/mcp package — a package name in the arguments of
 // something that is not a package runner proves nothing about what runs.
 func serversLaunchKrowk(servers map[string]json.RawMessage) string {
-	for _, raw := range servers {
+	// Sorted, so that a config registering the server twice reports the same
+	// one every run: a doctor line that changes between two identical runs
+	// makes a person doubt the tool rather than the config.
+	names := make([]string, 0, len(servers))
+	for name := range servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		raw := servers[name]
 		// command and args are decoded separately so that one written oddly
 		// — args as a string, say — does not discard the other.
 		var server struct {
@@ -305,9 +336,11 @@ func serversLaunchKrowk(servers map[string]json.RawMessage) string {
 
 // packageRunners are the commands that run an npm package by name. Only these
 // turn "@krowk/mcp" in an argument list into a claim about what launches.
+// `node` is deliberately absent: node runs a file, not a package name, so
+// `node @krowk/mcp` is not an invocation anything would write.
 var packageRunners = map[string]bool{
 	"npx": true, "bunx": true, "pnpm": true, "pnpx": true,
-	"npm": true, "yarn": true, "node": true,
+	"npm": true, "yarn": true,
 }
 
 // isPackageRunner reports whether command runs a package named in its args.

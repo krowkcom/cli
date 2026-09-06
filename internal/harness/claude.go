@@ -12,11 +12,12 @@ import (
 
 // The names Claude Code itself uses.
 const (
-	// claudeUserConfigFile holds user- and local-scope MCP registrations. It
-	// stays at $HOME/.claude.json even when CLAUDE_CONFIG_DIR moves the
-	// configuration directory: Claude Code keeps this one file in the home
-	// directory regardless, so it is resolved from HomeDir and not from
-	// claudeConfigDir.
+	// claudeUserConfigFile holds user- and local-scope MCP registrations.
+	// $HOME/.claude.json is its documented location, and the one that is
+	// checked first. Whether CLAUDE_CONFIG_DIR moves it too is not documented
+	// either way, so the configuration directory is probed as well rather
+	// than assumed to be irrelevant — a file that is not there costs a failed
+	// open and says nothing.
 	claudeUserConfigFile = ".claude.json"
 	// claudeProjectConfigFile is the checked-in, project-scope form the README
 	// documents. It is written by whoever wrote the checkout, so it is read
@@ -154,6 +155,14 @@ func CheckClaudeMCPServer(env Env, cwd string) StatusCheck {
 			trusted: true, maxBytes: maxUserConfigBytes,
 		})
 	}
+	if dir := claudeConfigDir(env); dir != "" && dir != filepath.Join(HomeDir(env), claudeDirName) {
+		// A relocated configuration directory, in case the user config
+		// followed it there.
+		candidates = append(candidates, candidate{
+			path: filepath.Join(dir, claudeUserConfigFile), cwd: cwd,
+			trusted: true, maxBytes: maxUserConfigBytes,
+		})
+	}
 	if cwd != "" {
 		candidates = append(candidates, candidate{
 			path:    filepath.Join(cwd, claudeProjectConfigFile),
@@ -222,10 +231,17 @@ func mcpServerRegistered(path, cwd string, trusted bool, maxBytes int64) (matche
 	}
 	if cwd != "" {
 		want := projectDirsOf(cwd)
-		for key, raw := range cfg.Projects {
-			if !matchesProjectDir(want, key) {
-				continue
+		// Sorted for the same reason the server list is: two keys that spell
+		// the same directory must not answer differently between runs.
+		keys := make([]string, 0, len(cfg.Projects))
+		for key := range cfg.Projects {
+			if matchesProjectDir(want, key) {
+				keys = append(keys, key)
 			}
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			raw := cfg.Projects[key]
 			var project struct {
 				MCPServers map[string]json.RawMessage `json:"mcpServers"`
 			}
@@ -250,6 +266,11 @@ type projectDirForms struct {
 
 // projectDirsOf resolves cwd into the forms a projects key could match.
 func projectDirsOf(cwd string) projectDirForms {
+	// Claude Code records absolute paths, so a relative cwd has to be made
+	// absolute before it can match one.
+	if abs, err := filepath.Abs(cwd); err == nil {
+		cwd = abs
+	}
 	forms := projectDirForms{clean: filepath.Clean(cwd)}
 	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
 		forms.resolved = filepath.Clean(resolved)

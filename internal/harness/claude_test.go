@@ -456,10 +456,18 @@ func TestCheckClaudeHonoursCLAUDECONFIGDIR(t *testing.T) {
 	if check := CheckClaudeSkill(env); check.Status != StatusPass {
 		t.Fatalf("skill check = %+v, want pass — the skill is in the relocated directory", check)
 	}
-	// ~/.claude.json does not move with it.
+	// The user config is documented to stay in HOME, and is found there.
 	writeFile(t, filepath.Join(home, ".claude.json"), `{"mcpServers":{"krowk":{"command":"krowk-mcp"}}}`)
 	if check := CheckClaudeMCPServer(env, ""); check.Status != StatusPass {
-		t.Fatalf("mcp check = %+v, want pass — the user config stays in HOME", check)
+		t.Fatalf("mcp check = %+v, want pass — the user config lives in HOME", check)
+	}
+
+	// And one that followed the relocated directory instead is found too.
+	bare := t.TempDir()
+	moved := envFrom(map[string]string{"HOME": bare, "USERPROFILE": bare, "CLAUDE_CONFIG_DIR": config})
+	writeFile(t, filepath.Join(config, ".claude.json"), `{"mcpServers":{"krowk":{"command":"krowk-mcp"}}}`)
+	if check := CheckClaudeMCPServer(moved, ""); check.Status != StatusPass {
+		t.Fatalf("mcp check = %+v, want pass — the config directory was probed too", check)
 	}
 }
 
@@ -497,5 +505,21 @@ func TestFindClaudeBinaryFollowsTheInstallersSymlink(t *testing.T) {
 
 	if got := FindClaudeBinary(homeEnv(home)); got != link {
 		t.Fatalf("FindClaudeBinary = %q, want the symlink at %s", got, link)
+	}
+}
+
+func TestCheckClaudeMCPServerMatchesARelativeWorkingDirectory(t *testing.T) {
+	home := t.TempDir()
+	cwd, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Claude Code records absolute paths; a caller may hand over ".".
+	writeFile(t, filepath.Join(home, ".claude.json"), `{"projects":{`+
+		strconv.Quote(cwd)+`:{"mcpServers":{"krowk":{"command":"krowk-mcp"}}}}}`)
+	t.Chdir(cwd)
+
+	if check := CheckClaudeMCPServer(homeEnv(home), "."); check.Status != StatusPass {
+		t.Fatalf("check = %+v, want pass — \".\" is that project", check)
 	}
 }

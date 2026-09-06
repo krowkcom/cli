@@ -14,7 +14,7 @@
 //
 // Nothing here trusts a file either. A project-scoped config sits in the
 // checkout, which means whoever wrote the checkout wrote it, so every read is
-// bounded and every path is inspected before it is opened.
+// bounded and every descriptor is inspected before it is read.
 package harness
 
 import (

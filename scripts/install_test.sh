@@ -274,6 +274,49 @@ diff -q skills/krowk/SKILL.md "$CLAUDE/skills/krowk/SKILL.md" >/dev/null \
   || fail "the installed skill differs from the one in the repository"
 pass "the agent skill was written to CLAUDE_CONFIG_DIR"
 
+[[ -f "$CLAUDE/skills/krowk/.managed-by-krowk-cli" ]] \
+  || fail "the installer did not mark the skill directory as its own"
+grep -q "managed by krowk" "$CLAUDE/skills/krowk/.managed-by-krowk-cli" \
+  || fail "the ownership marker does not say who manages the directory"
+[[ "$(cat "$CLAUDE/skills/krowk/.installed-version")" == "$VERSION" ]] \
+  || fail "the version stamp says $(cat "$CLAUDE/skills/krowk/.installed-version"), want $VERSION"
+pass "the skill directory carries the ownership marker and the version stamp"
+
+# The whole point of the marker: a skill directory somebody else wrote is not
+# krowk's to overwrite, and one krowk wrote is.
+echo
+echo "Ownership of the skill directory"
+MINE="$WORK/claude-mine"
+mkdir -p "$MINE/skills/krowk"
+printf '# my own skill\n' >"$MINE/skills/krowk/SKILL.md"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$MINE" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/unowned.log" 2>&1 \
+  || { cat "$WORK/unowned.log"; fail "the installer exited non-zero over a skill directory it does not own"; }
+
+[[ "$(cat "$MINE/skills/krowk/SKILL.md")" == "# my own skill" ]] \
+  || fail "the installer overwrote a skill directory it did not write"
+[[ ! -e "$MINE/skills/krowk/.managed-by-krowk-cli" ]] \
+  || fail "the installer claimed a skill directory it did not write"
+grep -q "was not written by krowk" "$WORK/unowned.log" \
+  || { cat "$WORK/unowned.log"; fail "the installer did not say why it left the skill directory alone"; }
+pass "a populated skill directory krowk did not write is left untouched, and said so"
+
+# And the one it did write is refreshed in place, marker and all.
+printf '# stale\n' >"$CLAUDE/skills/krowk/SKILL.md"
+env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
+  CLAUDE_CONFIG_DIR="$CLAUDE" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/refresh.log" 2>&1 \
+  || { cat "$WORK/refresh.log"; fail "the installer exited non-zero refreshing its own skill directory"; }
+
+diff -q skills/krowk/SKILL.md "$CLAUDE/skills/krowk/SKILL.md" >/dev/null \
+  || fail "the installer did not refresh a skill directory it wrote"
+[[ -f "$CLAUDE/skills/krowk/.managed-by-krowk-cli" ]] \
+  || fail "the refresh dropped the ownership marker"
+pass "a marked skill directory is refreshed in place"
+
 grep -q "krowk push screenshot.png" "$WORK/install.log" || fail "the next steps were not printed"
 pass "the next steps were printed"
 

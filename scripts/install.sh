@@ -397,6 +397,51 @@ skills_dir() {
   fi
 }
 
+# The ownership marker and the version stamp krowk writes beside every skill it
+# manages. They are the same two filenames, with the same marker sentence, that
+# internal/harness/managed.go writes — a directory claimed here and one claimed
+# by the binary have to be the same directory, or an upgrade would refuse to
+# refresh what this script installed.
+MANAGED_MARKER=".managed-by-krowk-cli"
+INSTALLED_VERSION_FILE=".installed-version"
+MANAGED_MARKER_CONTENT="This directory is managed by krowk. Manual edits will be overwritten on upgrade."
+
+# claim_skill_dir is the gate every skill write goes through, and the shell half
+# of internal/harness/managed.go's ClaimDir: it creates a missing directory,
+# adopts an empty one, accepts one that already carries the marker, and refuses
+# anything else. A populated directory without the marker is somebody's own
+# skill, and an installer that overwrote it would destroy work nobody asked it
+# to touch — so it says why and leaves it exactly as it found it.
+#
+# The tests are on the directory itself, never through it: -L before -d, because
+# a symlink here points at a directory this script never looked at, and writing
+# through it would land somewhere nothing reasoned about.
+claim_skill_dir() {
+  local dir="$1"
+
+  if [[ -L "$dir" ]]; then
+    note "${dir} is a symlink, which points somewhere this installer never looked; leaving it alone."
+    return 1
+  fi
+
+  if [[ -e "$dir" ]]; then
+    if [[ ! -d "$dir" ]]; then
+      note "${dir} exists and is not a directory; leaving it alone."
+      return 1
+    fi
+    # An empty directory is what somebody who ran mkdir before this meant, and
+    # there is nothing there to lose — so only a populated one is refused.
+    if [[ ! -f "${dir}/${MANAGED_MARKER}" || -L "${dir}/${MANAGED_MARKER}" ]] &&
+      [[ -n "$(ls -A "$dir" 2>/dev/null)" ]]; then
+      note "${dir} was not written by krowk; leaving it alone."
+      note "Move it aside and re-run this installer to have krowk manage it."
+      return 1
+    fi
+  fi
+
+  mkdir -p "$dir" || return 1
+}
+
 # install_skill is best-effort on purpose. krowk works without it; the skill only
 # teaches an agent which command to reach for. So a machine with no agent config
 # gets a sentence saying where the skill lives, not an error and not a directory
@@ -432,9 +477,17 @@ install_skill() {
     return 0
   fi
 
-  mkdir -p "${dir}/krowk"
+  if ! claim_skill_dir "${dir}/krowk"; then
+    rm -f "$tmp"
+    return 0
+  fi
+
   mv -f "$tmp" "${dir}/krowk/SKILL.md"
   chmod 0644 "${dir}/krowk/SKILL.md"
+  printf '%s\n' "$MANAGED_MARKER_CONTENT" >"${dir}/krowk/${MANAGED_MARKER}"
+  chmod 0644 "${dir}/krowk/${MANAGED_MARKER}"
+  printf '%s\n' "$version" >"${dir}/krowk/${INSTALLED_VERSION_FILE}"
+  chmod 0644 "${dir}/krowk/${INSTALLED_VERSION_FILE}"
   info "Agent skill written to ${dir}/krowk/SKILL.md"
 }
 

@@ -461,6 +461,15 @@ func CheckClaudeSkill(env Env) StatusCheck {
 	skillDir := filepath.Join(dir, "skills", "krowk")
 	path := filepath.Join(skillDir, "SKILL.md")
 	if isRegularFile(path) {
+		// A skill krowk did not write still works — the agent reads it the
+		// same way — so this passes either way. What differs is what happens
+		// next: the managed-write gate refuses to touch a directory without
+		// the marker, so an upgrade will leave a hand-placed skill exactly as
+		// it is, and the person reading a doctor report should learn that
+		// here rather than from a stale skill months later.
+		if !DirOwned(skillDir) {
+			return Pass(CheckNameClaudeSkill, "Installed by hand ("+path+") — krowk will not refresh it")
+		}
 		return Pass(CheckNameClaudeSkill, "Installed ("+path+")")
 	}
 	if _, err := os.Lstat(path); err == nil {

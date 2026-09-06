@@ -523,3 +523,36 @@ func TestCheckClaudeMCPServerMatchesARelativeWorkingDirectory(t *testing.T) {
 		t.Fatalf("check = %+v, want pass — \".\" is that project", check)
 	}
 }
+
+func TestCheckClaudeSkillTellsAManagedSkillFromAHandPlacedOne(t *testing.T) {
+	t.Run("krowk wrote it", func(t *testing.T) {
+		home := t.TempDir()
+		dir := filepath.Join(home, ".claude", "skills", "krowk")
+		mkdirAll(t, dir)
+		writeFile(t, filepath.Join(dir, "SKILL.md"), "# krowk\n")
+		writeFile(t, filepath.Join(dir, ManagedMarker), managedMarkerContent)
+
+		check := CheckClaudeSkill(homeEnv(home))
+		if check.Status != StatusPass || strings.Contains(check.Message, "by hand") {
+			t.Fatalf("check = %+v, want a plain pass — the marker is there", check)
+		}
+	})
+
+	t.Run("somebody else wrote it", func(t *testing.T) {
+		home := t.TempDir()
+		dir := filepath.Join(home, ".claude", "skills", "krowk")
+		mkdirAll(t, dir)
+		writeFile(t, filepath.Join(dir, "SKILL.md"), "# mine\n")
+
+		// It still works, so it still passes: the agent reads a hand-placed
+		// skill exactly as it reads krowk's. What the message has to say is
+		// that no upgrade will ever touch it.
+		check := CheckClaudeSkill(homeEnv(home))
+		if check.Status != StatusPass {
+			t.Fatalf("check = %+v, want pass — a hand-placed skill works", check)
+		}
+		if !strings.Contains(check.Message, "by hand") || !strings.Contains(check.Message, "not refresh") {
+			t.Fatalf("message %q does not say krowk will leave it alone", check.Message)
+		}
+	})
+}

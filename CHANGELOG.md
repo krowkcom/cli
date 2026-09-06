@@ -21,6 +21,25 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `krowk setup` will, and they will agree because they will be reading the
   same checks.
 
+- An ownership gate (`internal/harness`) for every directory krowk writes into
+  a home directory. krowk now leaves a `.managed-by-krowk-cli` marker and an
+  `.installed-version` stamp beside what it installs, and writes only where
+  that marker says it wrote before: it creates a directory that is not there,
+  adopts an empty one, refreshes one it already marked, and refuses everything
+  else — a populated directory without the marker is somebody's own work, and
+  the shape of the contents cannot tell a hand-authored skill from an installed
+  one. Nothing is ever written through a symlink, in either the directory's
+  name or a file's.
+
+  `scripts/install.sh` follows the same rules, with the same two filenames, so
+  an upgrade recognises what the installer wrote: if you already have a
+  `~/.claude/skills/krowk/` the installer did not write, it now says so and
+  leaves it alone rather than overwriting it — move it aside and re-run to have
+  krowk manage it. The harness skill check tells a hand-placed skill from a
+  managed one, so when `krowk doctor` surfaces it, it will say krowk will not
+  refresh that skill. This is the gate `krowk setup` and every future managed
+  file will go through.
+
 ## [0.9.0] - 2026-09-06
 
 ### Added

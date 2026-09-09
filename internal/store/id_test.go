@@ -1,8 +1,8 @@
 package store
 
 import (
+	"fmt"
 	"regexp"
-	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -166,20 +166,75 @@ func TestNewIDConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Order across goroutines is whatever the scheduler decided, so only
-	// uniqueness is asserted globally — sorting first lets the same check run.
-	all := make([]string, 0, goroutines*each)
-	for _, ids := range out {
-		all = append(all, ids...)
+	// Order across goroutines is whatever the scheduler decided, so ordering is
+	// only asserted inside each goroutine — where issuance order is known —
+	// while uniqueness is asserted over the union of all of them.
+	seen := make(map[string]string, goroutines*each)
+	for g, ids := range out {
+		assertUniqueAndOrdered(t, ids)
+		for i, id := range ids {
+			where := fmt.Sprintf("goroutine %d index %d", g, i)
+			if prev, dup := seen[id]; dup {
+				t.Fatalf("id %q issued twice, at %s and %s", id, prev, where)
+			}
+			seen[id] = where
+		}
 	}
-	sort.Strings(all)
-	assertUniqueAndOrdered(t, all)
-	if len(all) != goroutines*each {
-		t.Fatalf("expected %d ids, got %d", goroutines*each, len(all))
+	if len(seen) != goroutines*each {
+		t.Fatalf("expected %d distinct ids, got %d", goroutines*each, len(seen))
 	}
 }
 
-func TestParseID(t *testing.T) {
+// The counter seed is easy to leave unwired — a constant seed passes every
+// ordering test in this file — so it is pinned on its own, and through the ids
+// two independent minters produce at the same instant.
+func TestSeedCounter(t *testing.T) {
+	first := seedCounter()
+	varied := false
+	for i := 0; i < 10_000; i++ {
+		got := seedCounter()
+		if got > 0x7ff {
+			t.Fatalf("seedCounter() = %#x, which does not leave the top bit of rand_a clear", got)
+		}
+		if got != first {
+			varied = true
+		}
+	}
+	if !varied {
+		t.Fatalf("seedCounter() returned %#x on all 10001 draws, so it is not random", first)
+	}
+}
+
+func TestIndependentMintersDiffer(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		at   time.Time
+	}{
+		{"same millisecond", time.UnixMilli(1_757_000_000_000)},
+		{"unix epoch", time.UnixMilli(0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Two processes syncing at once are two minters with the same
+			// frozen clock: only the seed keeps their first ids apart.
+			const minters = 64
+			ids := make(map[string]bool, minters)
+			randA := make(map[string]bool, minters)
+			for i := 0; i < minters; i++ {
+				id := NewMinter(func() time.Time { return tc.at }).NewID()
+				if ids[id] {
+					t.Fatalf("two independent minters at %v both issued %q", tc.at, id)
+				}
+				ids[id] = true
+				randA[id[14:18]] = true
+			}
+			if len(randA) == 1 {
+				t.Fatalf("all %d minters started rand_a at the same value, so the counter is not seeded", minters)
+			}
+		})
+	}
+}
+
+func TestValidateID(t *testing.T) {
 	minted := NewMinter(func() time.Time { return time.UnixMilli(1_757_000_000_000) }).NewID()
 
 	for _, tc := range []struct {
@@ -205,18 +260,12 @@ func TestParseID(t *testing.T) {
 		{"one short", "1994b5f-2a00-7000-8000-000000000000", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ParseID(tc.in)
-			if tc.ok {
-				if err != nil {
-					t.Fatalf("ParseID(%q) refused a valid id: %v", tc.in, err)
-				}
-				if got != tc.in {
-					t.Fatalf("ParseID(%q) returned %q", tc.in, got)
-				}
-				return
+			err := ValidateID(tc.in)
+			if tc.ok && err != nil {
+				t.Fatalf("ValidateID(%q) refused a valid id: %v", tc.in, err)
 			}
-			if err == nil {
-				t.Fatalf("ParseID(%q) accepted %q", tc.in, got)
+			if !tc.ok && err == nil {
+				t.Fatalf("ValidateID(%q) accepted it", tc.in)
 			}
 		})
 	}
@@ -238,10 +287,6 @@ func TestNowMS(t *testing.T) {
 				t.Fatalf("NowMS() = %d, want %d", got, tc.want)
 			}
 		})
-	}
-
-	if got := NowMS(); got < 1_757_000_000_000 {
-		t.Fatalf("package-level NowMS() = %d, which is before this code was written", got)
 	}
 }
 

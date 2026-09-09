@@ -30,7 +30,13 @@ the versions are the `v*` tags a release is cut from. Entries land under
   clock that steps backwards cannot hand out an id that sorts before one
   already given away. That keeps a recent-first listing a plain `ORDER BY` on
   the primary key; the order of messages inside a session will be a `seq`
-  column, not the id.
+  column, not the id. The timestamp inside an id is monotonic rather than a
+  clock reading — when a millisecond's counter fills, or the clock steps back,
+  it advances past the last value used, so it can run ahead of the real time.
+  It orders rows; the time columns record when things happened. `ValidateID`
+  refuses at the store boundary anything this package would not have minted, so
+  a v4 uuid from a Claude transcript, an opencode `ses_…` or a registry slug
+  cannot enter as one of our own ids.
 
   Every time column in the store is milliseconds since the Unix epoch, UTC, as
   an int64 — not seconds, not nanoseconds, not a string — and the clock is

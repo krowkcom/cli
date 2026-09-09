@@ -32,11 +32,16 @@ type Minter struct {
 
 // NewMinter returns a Minter reading the given clock. A nil clock means
 // time.Now, so a zero-value-ish call site still gets a working minter.
+//
+// lastMS starts at -1 rather than 0 because 0 is a millisecond a clock can
+// actually read: a test frozen at the Unix epoch would otherwise look like a
+// second id inside a millisecond already used, take the increment path, and
+// count up from 0 identically in every process.
 func NewMinter(clock Clock) *Minter {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Minter{clock: clock}
+	return &Minter{clock: clock, lastMS: -1}
 }
 
 // defaultMinter serves the package-level NewID and NowMS, which is what
@@ -64,16 +69,21 @@ func (m *Minter) NewID() string {
 
 	var b [16]byte
 	// The timestamp is 48 bits, so it goes in as a big-endian uint64 with the
-	// top two bytes dropped rather than assembled a byte at a time.
+	// top two bytes dropped rather than assembled a byte at a time. next()
+	// guarantees ms is non-negative, so the conversion cannot wrap.
 	var ts [8]byte
 	binary.BigEndian.PutUint64(ts[:], uint64(ms))
 	copy(b[0:6], ts[2:8])
 
-	// crypto/rand.Read is documented since Go 1.24 never to return an error —
-	// it either fills the buffer or the program cannot continue — so there is
-	// no error path to handle here. That matters: a CLI that must not fail for
-	// a boring reason has no business panicking to name a row.
-	_, _ = rand.Read(b[6:])
+	// Only bytes 8 onwards are random: 6 and 7 are the version nibble and the
+	// counter, written below, and byte 8 keeps its low 6 bits.
+	//
+	// There is no error to receive here. crypto/rand.Read is documented never
+	// to return one — if the operating system's random source is unreadable the
+	// runtime aborts the program irrecoverably inside the call, so no caller of
+	// this function ever observes the failure and there is no path to write for
+	// it.
+	_, _ = rand.Read(b[8:])
 
 	b[6] = 0x70 | byte(counter>>8) // version 7, then the top 4 bits of rand_a
 	b[7] = byte(counter)           // the low 8 bits of rand_a
@@ -90,16 +100,26 @@ func (m *Minter) NowMS() int64 {
 
 // next reserves the (millisecond, counter) pair for one id.
 //
-// The timestamp it returns is not always the clock's: it never goes backwards,
-// because an id that sorts before one already issued would break the ordering
-// the whole scheme is for. So a clock that steps back — an NTP correction, a
-// suspended laptop — and a millisecond whose 4096 counter values are used up
-// are handled the same way, by taking the millisecond after the last one used.
+// The timestamp it returns is not always the clock's, and the invariant is that
+// it never decreases and is never negative. An id that sorted before one
+// already issued would break the ordering the whole scheme is for, so a clock
+// that steps back — an NTP correction, a suspended laptop — and a millisecond
+// whose 4096 counter values are used up are handled the same way, by taking the
+// millisecond after the last one used. The cost is that the timestamp in an id
+// can run ahead of the clock; it is a sort key, not a measurement.
 func (m *Minter) next() (int64, uint16) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	switch now := m.clock().UnixMilli(); {
+	now := m.clock().UnixMilli()
+	// A pre-epoch clock is nobody's real clock, but a negative millisecond
+	// would wrap when it was truncated into the 48-bit field and land far in
+	// the future, so it is floored instead of encoded.
+	if now < 0 {
+		now = 0
+	}
+
+	switch {
 	case now > m.lastMS:
 		m.lastMS = now
 		m.counter = seedCounter()
@@ -120,48 +140,51 @@ func (m *Minter) next() (int64, uint16) {
 // 2048 increments of headroom before the millisecond fills.
 func seedCounter() uint16 {
 	var b [2]byte
-	_, _ = rand.Read(b[:]) // never errors; see NewID
+	_, _ = rand.Read(b[:]) // no error to receive; see NewID
 	return binary.BigEndian.Uint16(b[:]) & 0x7ff
 }
 
-// ParseID returns s unchanged when it is an id this package would mint, and
-// otherwise says what shape was expected. It is strict about all three of case,
-// version and variant, because the ids it has to refuse are the ones that look
-// closest: a v4 uuid from a Claude transcript, an uppercase copy of one of
-// ours, an opencode `ses_…` or a registry slug `art_…` in a `foreign_id`
-// column. Anything that gets through here can go into a `uuid` column as text.
-func ParseID(s string) (string, error) {
+// ValidateID reports whether s is an id this package would mint, and otherwise
+// says what shape was expected. It is the store's boundary check, and it is
+// strict about all three of case, version and variant, because the ids it has
+// to refuse are the ones that look closest: a v4 uuid from a Claude transcript,
+// an uppercase copy of one of ours, an opencode `ses_…` or a registry slug
+// `art_…` on their way to a `foreign_id` column. Anything that gets through
+// here can go into a `uuid` column as text.
+func ValidateID(s string) error {
 	if len(s) != idLen {
-		return "", fmt.Errorf("%q is not a krowk id: expected %d characters of lowercase hyphenated uuidv7, got %d", s, idLen, len(s))
+		return fmt.Errorf("%q is not a krowk id: expected %d characters of lowercase hyphenated uuidv7, got %d", s, idLen, len(s))
 	}
 	for i := 0; i < idLen; i++ {
 		c := s[i]
 		if i == 8 || i == 13 || i == 18 || i == 23 {
 			if c != '-' {
-				return "", fmt.Errorf("%q is not a krowk id: expected a hyphen at position %d, as in 8-4-4-4-12", s, i)
+				return fmt.Errorf("%q is not a krowk id: expected a hyphen at position %d, as in 8-4-4-4-12", s, i)
 			}
 			continue
 		}
 		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return "", fmt.Errorf("%q is not a krowk id: expected lowercase hex at position %d, got %q", s, i, string(c))
+			return fmt.Errorf("%q is not a krowk id: expected lowercase hex at position %d, got %q", s, i, string(c))
 		}
 	}
 	if s[14] != '7' {
-		return "", fmt.Errorf("%q is not a krowk id: expected uuid version 7, got version %q", s, string(s[14]))
+		return fmt.Errorf("%q is not a krowk id: expected uuid version 7, got version %q", s, string(s[14]))
 	}
 	switch s[19] {
 	case '8', '9', 'a', 'b':
 	default:
-		return "", fmt.Errorf("%q is not a krowk id: expected the RFC 9562 variant, one of 8, 9, a or b, got %q", s, string(s[19]))
+		return fmt.Errorf("%q is not a krowk id: expected the RFC 9562 variant, one of 8, 9, a or b, got %q", s, string(s[19]))
 	}
-	return s, nil
+	return nil
 }
 
-// IDTime returns the millisecond the id was minted for. Useful to a test and to
-// `krowk doctor`: it means a row's age is readable from its primary key without
-// a time column being trusted.
+// IDTime returns the millisecond an id was issued for. That is a monotonic
+// stamp, not a reading of the clock at the moment of issue — after a counter
+// overflow or a backwards clock step it runs ahead — so it answers "which of
+// these came first", not "when exactly did this happen". Its callers today are
+// this package's own tests, which use it to assert exactly that ordering.
 func IDTime(id string) (time.Time, error) {
-	if _, err := ParseID(id); err != nil {
+	if err := ValidateID(id); err != nil {
 		return time.Time{}, err
 	}
 	hex := strings.ReplaceAll(id[:18], "-", "")[:12]
@@ -172,7 +195,7 @@ func IDTime(id string) (time.Time, error) {
 	return time.UnixMilli(ms).UTC(), nil
 }
 
-// unhex is only ever reached through ParseID, so the byte is known to be a
+// unhex is only ever reached through ValidateID, so the byte is known to be a
 // lowercase hex digit.
 func unhex(c byte) byte {
 	if c <= '9' {

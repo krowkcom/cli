@@ -23,8 +23,13 @@
 // transcripts we import do not keep time straight and a clock is not a
 // sequence.
 //
+// The timestamp an id carries is monotonic rather than a reading of the clock:
+// when a millisecond's counter fills, or the clock steps back, it advances past
+// the last value used, so it can run ahead of the real time. It is a sort key,
+// not a measurement — what a time column stores comes from NowMS.
+//
 // Every time column in this store is milliseconds since the Unix epoch, UTC, as
-// an int64 — never a string, never seconds, never nanoseconds. NowMS is the only
-// way this package reads a clock, and it takes the same injected clock the id
-// timestamps come from, so a test that freezes time freezes both.
+// an int64 — never a string, never seconds, never nanoseconds. The injected
+// clock is the only clock this package reads: NowMS and the timestamps in ids
+// both come from it, so a test that freezes time freezes both.
 package store

@@ -11,6 +11,38 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- A new `internal/store` package begins the local session store — the
+  `krowk.db` SQLite file that will hold the sessions, messages and parts krowk
+  syncs. This change ships only the two decisions every row in it depends on:
+  how a row is named, and how a time is written. Nothing is user-visible yet,
+  and no command touches it.
+
+  Ids are UUIDv7 in canonical lowercase hyphenated form, with no type prefix.
+  The registry's primary keys are already uuidv7, so an id of the same shape
+  lands in a native `uuid` column on sync instead of in text, and the two
+  halves index and compare the same way. The prefix was dropped on purpose:
+  the `foreign_id` columns beside ours hold ids that already carry one —
+  opencode mints `ses_`/`msg_`/`prt_`, Anthropic mints `msg_…` — and a krowk
+  prefix sitting next to those would read as though it meant the same kind of
+  thing. They are minted from the standard library, no dependency added, with
+  a 12-bit per-millisecond counter in `rand_a` (RFC 9562 §6.2) so that ids
+  issued inside one millisecond by one process still sort in the order they
+  were issued — across processes the order is millisecond-granular — and a
+  clock that steps backwards cannot hand out an id that sorts before one
+  already given away. That keeps a recent-first listing a plain `ORDER BY` on
+  the primary key; the order of messages inside a session will be a `seq`
+  column, not the id. The timestamp inside an id is monotonic rather than a
+  clock reading — when a millisecond's counter fills, or the clock steps back,
+  it advances past the last value used, so it can run ahead of the real time.
+  It orders rows; the time columns record when things happened. `ValidateID`
+  refuses at the store boundary anything this package would not have minted, so
+  a v4 uuid from a Claude transcript, an opencode `ses_…` or a registry slug
+  cannot enter as one of our own ids.
+
+  Every time column in the store is milliseconds since the Unix epoch, UTC, as
+  an int64 — not seconds, not nanoseconds, not a string — and the clock is
+  injected, so a test freezes the id timestamps and the time columns together.
+
 - A harness registry (`internal/harness`) that detects which coding agents are
   installed and asks each one whether krowk is actually wired into it. Claude
   Code is the first: detected by a `~/.claude/` directory or a `claude` binary,

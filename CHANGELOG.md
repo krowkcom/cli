@@ -26,7 +26,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   prefix sitting next to those would read as though it meant the same kind of
   thing. They are minted from the standard library, no dependency added, with
   a 12-bit per-millisecond counter in `rand_a` (RFC 9562 §6.2) so that ids
-  issued inside one millisecond still sort in the order they were issued and a
+  issued inside one millisecond by one process still sort in the order they
+  were issued — across processes the order is millisecond-granular — and a
   clock that steps backwards cannot hand out an id that sorts before one
   already given away. That keeps a recent-first listing a plain `ORDER BY` on
   the primary key; the order of messages inside a session will be a `seq`

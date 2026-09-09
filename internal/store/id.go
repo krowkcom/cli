@@ -4,7 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -21,7 +21,9 @@ type Clock func() time.Time
 // The counter is the monotonic-random half of RFC 9562 §6.2 method 3. Two ids
 // minted in the same millisecond differ only in random bits, which says nothing
 // about which came first; a counter in rand_a makes the string order the
-// issuance order, and that is what makes an id usable as a sort key.
+// issuance order for one minter, and that is what makes an id usable as a sort
+// key. Two minters seed independently, so across processes the order an id
+// sorts in is only as fine as its millisecond.
 type Minter struct {
 	clock Clock
 
@@ -46,7 +48,7 @@ func NewMinter(clock Clock) *Minter {
 
 // defaultMinter serves the package-level NewID and NowMS, which is what
 // everything outside a test uses.
-var defaultMinter = NewMinter(time.Now)
+var defaultMinter = NewMinter(nil)
 
 // NewID mints an id from the default minter.
 func NewID() string { return defaultMinter.NewID() }
@@ -187,19 +189,9 @@ func IDTime(id string) (time.Time, error) {
 	if err := ValidateID(id); err != nil {
 		return time.Time{}, err
 	}
-	hex := strings.ReplaceAll(id[:18], "-", "")[:12]
-	var ms int64
-	for i := 0; i < len(hex); i++ {
-		ms = ms<<4 | int64(unhex(hex[i]))
-	}
+	// The 12 hex digits of the timestamp, minus the hyphen between them.
+	// ValidateID has already established they are hex, so there is no parse
+	// error left to happen.
+	ms, _ := strconv.ParseInt(id[0:8]+id[9:13], 16, 64)
 	return time.UnixMilli(ms).UTC(), nil
-}
-
-// unhex is only ever reached through ValidateID, so the byte is known to be a
-// lowercase hex digit.
-func unhex(c byte) byte {
-	if c <= '9' {
-		return c - '0'
-	}
-	return c - 'a' + 10
 }

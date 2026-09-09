@@ -17,7 +17,9 @@
 //
 // UUIDv7 also sorts by time as a string, which is why the counter in Minter
 // exists: ids minted inside one millisecond still sort in the order they were
-// issued, so a listing ordered by primary key is a listing ordered by age. That
+// issued by one minter, so a listing ordered by primary key is a listing
+// ordered by age — across processes, whose counters seed independently, that
+// order is only as fine as a millisecond. That
 // is index locality and a readable recent-first list, not the transcript
 // order — within a session the order of record is the seq column, because the
 // transcripts we import do not keep time straight and a clock is not a

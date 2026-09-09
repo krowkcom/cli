@@ -309,3 +309,66 @@ func TestIDTimeRoundTrip(t *testing.T) {
 		t.Fatal("IDTime accepted a registry slug")
 	}
 }
+
+// NewMinter(nil) is the shape the package-level NewID and NowMS use, so the
+// nil-clock branch is worth a test of its own rather than only being exercised
+// in production.
+func TestNewMinterNilClock(t *testing.T) {
+	m := NewMinter(nil)
+
+	if id := m.NewID(); !idShape.MatchString(id) {
+		t.Fatalf("NewMinter(nil) minted %q, which does not match %v", id, idShape)
+	}
+	if got, want := m.NowMS(), time.Now().UnixMilli(); got < want-1000 || got > want+1000 {
+		t.Fatalf("NewMinter(nil).NowMS() = %d, which is not within a second of %d", got, want)
+	}
+}
+
+func TestNewIDPreEpochClock(t *testing.T) {
+	// A negative millisecond truncated into the 48-bit timestamp field would
+	// wrap: -1 becomes all ones, which reads back as the year 10889 and sorts
+	// after every id krowk will ever mint. It is floored to the epoch instead.
+	for _, tc := range []struct {
+		name string
+		at   time.Time
+	}{
+		{"one millisecond before the epoch", time.UnixMilli(-1)},
+		{"a second before the epoch", time.UnixMilli(-1000)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := NewMinter(func() time.Time { return tc.at }).NewID()
+			if !idShape.MatchString(id) {
+				t.Fatalf("minted %q, which does not match %v", id, idShape)
+			}
+			got, err := IDTime(id)
+			if err != nil {
+				t.Fatalf("IDTime(%q): %v", id, err)
+			}
+			if got.UnixMilli() != 0 {
+				t.Fatalf("a clock at %v produced an id stamped %d (%v), want 0", tc.at, got.UnixMilli(), got)
+			}
+		})
+	}
+}
+
+func TestNewIDRandBVaries(t *testing.T) {
+	// rand_b is the only part of an id the timestamp and the counter cannot
+	// reach, so it is checked where they have no say: the variant byte's low
+	// nibble at index 19 and the nibble after it. A minter whose rand_b was
+	// left zero still passes every ordering test in this file.
+	m := NewMinter(func() time.Time { return time.UnixMilli(1_757_000_000_000) })
+
+	variant := map[byte]bool{}
+	next := map[byte]bool{}
+	for i := 0; i < 300; i++ {
+		id := m.NewID()
+		variant[id[19]] = true
+		next[id[20]] = true
+	}
+	if len(variant) < 2 {
+		t.Fatalf("all 300 ids had the same variant nibble, so rand_b is not random: %v", variant)
+	}
+	if len(next) < 2 {
+		t.Fatalf("all 300 ids had the same nibble at index 20, so rand_b is not random: %v", next)
+	}
+}

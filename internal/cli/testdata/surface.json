@@ -579,6 +579,17 @@
         "summary": "Check the local setup"
       },
       {
+        "name": "pricing",
+        "summary": "Model price data",
+        "subcommands": [
+          {
+            "name": "refresh",
+            "usage": "krowk pricing refresh",
+            "summary": "Refresh the models.dev price cache"
+          }
+        ]
+      },
+      {
         "name": "upgrade",
         "usage": "krowk upgrade",
         "summary": "Upgrade krowk to the latest release"

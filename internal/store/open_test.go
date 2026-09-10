@@ -38,6 +38,11 @@ func TestDBPath(t *testing.T) {
 			want: filepath.Join("/home/u", ".local", "share", "krowk", "krowk.db"),
 		},
 		{
+			name: "relative HOME fails closed, never lands under cwd",
+			env:  testEnv(map[string]string{"HOME": "data"}),
+			want: "",
+		},
+		{
 			name: "no home is empty, never a guess",
 			env:  testEnv(map[string]string{}),
 			want: "",
@@ -74,6 +79,35 @@ func TestOpenCreatesParentAndKeepsFilePrivate(t *testing.T) {
 		if perm := fi.Mode().Perm(); perm&0o077 != 0 {
 			t.Errorf("krowk.db mode = %04o, want no group/other bits", perm)
 		}
+	}
+}
+
+func TestOpenTightensPreExistingFile(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".local", "share", "krowk", "krowk.db")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// An older version may have left the file world-readable; Open must
+	// take the group/other bits back off.
+	if err := os.WriteFile(path, []byte{}, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	db, err := Open(testEnv(map[string]string{"HOME": home}))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits are not portable to Windows")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("krowk.db mode = %04o, want no group/other bits", perm)
 	}
 }
 
@@ -121,6 +155,13 @@ func TestOpenSetsPragmasOnEveryConnection(t *testing.T) {
 		if sync != 1 {
 			t.Errorf("conn %d synchronous = %d, want 1 (NORMAL)", i+1, sync)
 		}
+		var busy int
+		if err := c.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busy); err != nil {
+			t.Fatalf("conn %d busy_timeout: %v", i+1, err)
+		}
+		if busy != 10000 {
+			t.Errorf("conn %d busy_timeout = %d, want 10000", i+1, busy)
+		}
 	}
 }
 
@@ -143,5 +184,30 @@ func TestOpenEmptyHomeFailsClosed(t *testing.T) {
 
 	if _, err := Open(nil); err == nil {
 		t.Fatal("Open(nil) succeeded, want error")
+	}
+}
+
+func TestOpenRelativeHomeFailsClosed(t *testing.T) {
+	if got := DBPath(testEnv(map[string]string{"HOME": "data"})); got != "" {
+		t.Fatalf("DBPath with relative HOME = %q, want empty", got)
+	}
+	if _, err := Open(testEnv(map[string]string{"HOME": "data"})); err == nil {
+		t.Fatal("Open with relative HOME succeeded, want error")
+	}
+	if _, statErr := os.Stat("krowk.db"); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("krowk.db appeared in the working directory: stat err = %v", statErr)
+	}
+}
+
+func TestDsnEscapesQueryChars(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"/tmp/a b/krowk.db", "%20"},
+		{"/tmp/a?b/krowk.db", "%3F"},
+		{"/tmp/a#b/krowk.db", "%23"},
+	} {
+		got := dsn(tc.path)
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("dsn(%q) = %q, want it to contain %q", tc.path, got, tc.want)
+		}
 	}
 }

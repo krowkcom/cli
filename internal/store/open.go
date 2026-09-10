@@ -31,7 +31,9 @@ const (
 // relative value must be ignored), otherwise ~/.local/share/krowk/krowk.db.
 // No home in env is an empty string, never a guess — the same rule as
 // harness.HomeDir, because a store that invented a home would write a
-// database on a machine nobody is using.
+// database on a machine nobody is using. A relative HOME is also empty:
+// joining it would land the store under the working directory and split it
+// per repo, which is exactly what the global file is for.
 func DBPath(env Env) string {
 	if env == nil {
 		return ""
@@ -40,7 +42,7 @@ func DBPath(env Env) string {
 		return filepath.Join(dir, dbDirName, dbFileName)
 	}
 	home := homeDir(env)
-	if home == "" {
+	if home == "" || !filepath.IsAbs(home) {
 		return ""
 	}
 	return filepath.Join(home, ".local", "share", dbDirName, dbFileName)
@@ -51,6 +53,9 @@ func DBPath(env Env) string {
 // store keeps no dependency on harness; the rule is the contract, and the
 // tests here pin it.
 func homeDir(env Env) string {
+	if env == nil {
+		return ""
+	}
 	if home := env("HOME"); home != "" {
 		return filepath.Clean(home)
 	}
@@ -109,7 +114,17 @@ func Open(env Env) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: create %s: %w", path, err)
 	}
-	f.Close()
+	// OpenFile's mode applies at creation only: tighten a pre-existing file
+	// (an older version may have left it 0644) so sessions stay private.
+	if fi, statErr := f.Stat(); statErr == nil && fi.Mode().Perm()&0o077 != 0 {
+		if err := f.Chmod(0o600); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("store: chmod %s: %w", path, err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("store: create %s: %w", path, err)
+	}
 	db, err := openSQL(dsn(path))
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)

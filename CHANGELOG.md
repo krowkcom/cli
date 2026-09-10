@@ -43,6 +43,15 @@ the versions are the `v*` tags a release is cut from. Entries land under
   an int64 — not seconds, not nanoseconds, not a string — and the clock is
   injected, so a test freezes the id timestamps and the time columns together.
 
+- The session store now has its SQLite driver: `github.com/ncruces/go-sqlite3`,
+  the cgo-free build of unmodified SQLite (Wasm through wazero), wired in as
+  the `database/sql` driver `internal/store` alone imports. It was picked
+  because the release binary must stay static with no toolchain — which rules
+  out cgo — and because it is the lighter of the two pure-Go options, roughly
+  half the binary growth and seconds rather than minutes of build. No optional
+  extensions are enabled until a product asks for one. Nothing is user-visible
+  yet, and no command opens the database; that arrives with `store.Open`.
+
 - A harness registry (`internal/harness`) that detects which coding agents are
   installed and asks each one whether krowk is actually wired into it. Claude
   Code is the first: detected by a `~/.claude/` directory or a `claude` binary,

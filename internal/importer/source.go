@@ -38,8 +38,16 @@ type Source interface {
 	// Discover lists the transcripts this source can see through env. On an
 	// unsupported OS it returns ErrUnsupportedOS and nothing else.
 	Discover(env harness.Env) ([]Ref, error)
-	// Read parses ref from cursor onward. The returned Cursor is where a
-	// later call should resume; a zero cursor in means "from the start".
+	// Read parses ref from cursor onward. A zero or nil cursor in means
+	// "from the start".
+	//
+	// The returned Cursor is the last safe watermark and is non-nil even
+	// when err is non-nil: a read that failed halfway still knows how far
+	// it got safely, and a caller that stored nothing would re-import the
+	// prefix on every attempt. The one exception is a rejected cursor —
+	// ErrCursorType below — where Read hands back the cursor it was given,
+	// untouched, because it never read anything and has nothing of its own
+	// to say.
 	//
 	// A Source must return ErrCursorType when cursor is not the concrete
 	// kind it takes. Silently falling back to a full rescan would be the

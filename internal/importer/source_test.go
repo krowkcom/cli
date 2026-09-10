@@ -81,7 +81,10 @@ func (s fakeSource) Read(env harness.Env, ref Ref, cursor Cursor) (store.Thread,
 	if cursor != nil {
 		typed, ok := cursor.(JSONLCursor)
 		if !ok {
-			return th, nil, Result{}, fmt.Errorf("%s: %w, got %T", s.Name(), ErrCursorType, cursor)
+			// The cursor comes back untouched: nothing was read, so this
+			// source has no watermark of its own to report, and handing
+			// back a zero one would look like "start again".
+			return th, cursor, Result{}, fmt.Errorf("%s: %w, got %T", s.Name(), ErrCursorType, cursor)
 		}
 		jc = typed
 	}
@@ -99,14 +102,20 @@ func (s fakeSource) Read(env harness.Env, ref Ref, cursor Cursor) (store.Thread,
 	next, res, err := ReadJSONL(f, jc, func(_ int, line []byte) error {
 		var l fakeLine
 		if err := json.Unmarshal(line, &l); err != nil {
+			// Returned plainly: a line in a shape this source cannot read
+			// is a skip, and ReadJSONL counts it. Only a failure that is
+			// not the line's fault would wrap ErrAbortFile.
 			return err
 		}
 		switch l.Type {
 		case "user", "assistant":
 		default:
 			// Transcript furniture: understood, counted, not imported.
+			// Classified rather than skipped — Result.Skipped is for lines
+			// that could not be used, and these were used, by being
+			// recognised and declined.
 			acc.Classify(l.Type)
-			return ErrSkipLine
+			return nil
 		}
 		msg := store.Message{
 			Role:      store.Role(l.Role),
@@ -196,9 +205,10 @@ func TestFakeSourceRoundTripsThroughTheStore(t *testing.T) {
 	if res.Classified["mode"] != 1 || res.Classified["summary"] != 1 {
 		t.Fatalf("Classified = %v, want the mode and summary lines counted", res.Classified)
 	}
-	if len(res.Skipped) != 3 {
-		// The two furniture lines plus the corrupt one.
-		t.Fatalf("Skipped = %+v, want three lines", res.Skipped)
+	if len(res.Skipped) != 1 || res.Skipped[0].Reason == "" {
+		// Only the corrupt line: the mode and summary lines were
+		// recognised and declined, which is Classified, not Skipped.
+		t.Fatalf("Skipped = %+v, want just the corrupt line", res.Skipped)
 	}
 	if res.Unknown != 1 || res.UnknownTypes["server_tool_use"] != 1 {
 		t.Fatalf("Unknown = %d %v, want the one server_tool_use block", res.Unknown, res.UnknownTypes)
@@ -332,8 +342,10 @@ func TestFakeSourceRefusesWrongCursorType(t *testing.T) {
 	if len(th.Messages) != 0 || len(th.Turns) != 0 {
 		t.Fatalf("refused read still produced %d messages / %d turns", len(th.Messages), len(th.Turns))
 	}
-	if cur != nil {
-		t.Fatalf("cursor = %+v, want nil on a refusal", cur)
+	// A rejected cursor comes back as it went in: the source read nothing
+	// and has no watermark of its own to offer.
+	if cur != (SQLiteCursor{TimeUpdated: 1}) {
+		t.Fatalf("cursor = %+v, want the input cursor untouched", cur)
 	}
 	if res.Lines != 0 || len(res.Skipped) != 0 {
 		t.Fatalf("refused read accounted for %+v, want nothing", res)

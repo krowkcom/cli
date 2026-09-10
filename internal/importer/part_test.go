@@ -144,6 +144,22 @@ func TestToolCallAndResultDataShapes(t *testing.T) {
 	if got := NewToolCallPart("call_3", "Read", nil).Data; got != `{"name":"Read","input":null}` {
 		t.Fatalf("nil-input call data = %s", got)
 	}
+
+	// An input that is not valid JSON is kept as a JSON string rather than
+	// replaced with null: the input is documented as verbatim, and null
+	// would discard the only record of what was actually run.
+	got := NewToolCallPart("call_4", "Bash", json.RawMessage(`{"command": ls`)).Data
+	if got != `{"name":"Bash","input":"{\"command\": ls"}` {
+		t.Fatalf("invalid-input call data = %s", got)
+	}
+	var kept ToolCallData
+	if err := json.Unmarshal([]byte(got), &kept); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var raw string
+	if err := json.Unmarshal(kept.Input, &raw); err != nil || raw != `{"command": ls` {
+		t.Fatalf("input round-trip = %q, %v", raw, err)
+	}
 }
 
 // Data always has to be something the store will accept, so a payload that

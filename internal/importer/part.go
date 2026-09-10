@@ -186,27 +186,29 @@ func rawDataOrEmpty(raw json.RawMessage) string {
 	return string(raw)
 }
 
-// normalizeRaw turns an absent payload into JSON null, so ToolCallData and
-// ToolResultData always marshal to valid JSON.
+// normalizeRaw makes a payload safe to embed without losing it. An absent
+// one becomes JSON null, because ToolCallData and ToolResultData must always
+// marshal to valid JSON. One that is not valid JSON is kept as a JSON
+// string: a tool's input is documented as verbatim, and replacing it with
+// null would quietly discard the only record of what was actually run.
 func normalizeRaw(raw json.RawMessage) json.RawMessage {
-	if len(raw) == 0 || !json.Valid(raw) {
-		return json.RawMessage("null")
-	}
-	return raw
-}
-
-// normalizeRawOmit is normalizeRaw for an omitempty field: an invalid
-// payload is kept as a JSON string rather than replaced, because in the
-// unknown case the bytes are the whole value of the row.
-func normalizeRawOmit(raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
-		return nil
+		return json.RawMessage("null")
 	}
 	if !json.Valid(raw) {
 		b, _ := json.Marshal(string(raw))
 		return b
 	}
 	return raw
+}
+
+// normalizeRawOmit is normalizeRaw for an omitempty field, where absent
+// means absent rather than null.
+func normalizeRawOmit(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	return normalizeRaw(raw)
 }
 
 // mustJSON marshals a shape defined in this package. The shapes hold only

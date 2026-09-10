@@ -1,6 +1,7 @@
 package importer
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -171,46 +172,84 @@ func TestReadJSONLBadLineIsSkippedNotFatal(t *testing.T) {
 	}
 }
 
-// A callback returning ErrSkipLine is a skip, not a failure — that is how a
-// source declines a line type it does not import while still accounting for
-// it.
-func TestReadJSONLCallbackSkipAndFail(t *testing.T) {
-	path := writeFile(t, "a.jsonl", "{\"i\":1}\n{\"i\":2}\n")
+// The callback's polarity is the point of this test: an ordinary error is a
+// skip, because a line the callback could not make sense of is exactly as
+// survivable as one that would not parse, and only ErrAbortFile stops the
+// file.
+func TestReadJSONLCallbackErrorIsSkippedNotFatal(t *testing.T) {
+	// The middle line is valid JSON in a shape a source would reject: the
+	// case that used to pin the cursor forever.
+	path := writeFile(t, "a.jsonl", "{\"i\":1}\n{\"role\":5}\n{\"i\":3}\n")
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer f.Close()
-	_, res, err := ReadJSONL(f, JSONLCursor{}, func(lineNo int, _ []byte) error {
-		if lineNo == 1 {
-			return fmt.Errorf("uninteresting: %w", ErrSkipLine)
+
+	var seen []int
+	cur, res, err := ReadJSONL(f, JSONLCursor{}, func(lineNo int, line []byte) error {
+		var probe struct {
+			Role string `json:"role"`
 		}
+		if uerr := json.Unmarshal(line, &probe); uerr != nil {
+			return uerr
+		}
+		seen = append(seen, lineNo)
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("ReadJSONL: %v", err)
 	}
-	if len(res.Skipped) != 1 || res.Skipped[0].Line != 1 {
-		t.Fatalf("Skipped = %+v, want line 1", res.Skipped)
+	if len(seen) != 2 || seen[0] != 1 || seen[1] != 3 {
+		t.Fatalf("callback saw lines %v, want 1 and 3", seen)
 	}
+	if len(res.Skipped) != 1 || res.Skipped[0].Line != 2 {
+		t.Fatalf("Skipped = %+v, want the wrong-shape line at line 2", res.Skipped)
+	}
+	if res.Skipped[0].Offset != 8 {
+		t.Fatalf("Skipped[0].Offset = %d, want 8", res.Skipped[0].Offset)
+	}
+	if res.Skipped[0].Reason == "" {
+		t.Fatal("Skipped[0].Reason is empty, want the callback's own error")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if cur.Offset != info.Size() {
+		t.Fatalf("cursor = %+v, want the whole file (%d)", cur, info.Size())
+	}
+}
 
-	// Any other callback error stops the file, with the cursor left in
-	// front of the offending line so a retry re-reads it.
-	if _, err := f.Seek(0, 0); err != nil {
-		t.Fatalf("Seek: %v", err)
+// ErrAbortFile is the escape hatch: the file stops, and the cursor stops in
+// front of the offending line so a retry re-reads it.
+func TestReadJSONLCallbackAbortStopsWithCursorBeforeLine(t *testing.T) {
+	path := writeFile(t, "a.jsonl", "{\"i\":1}\n{\"i\":2}\n{\"i\":3}\n")
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	boom := errors.New("boom")
-	cur, _, err := ReadJSONL(f, JSONLCursor{}, func(lineNo int, _ []byte) error {
+	defer f.Close()
+	cur, res, err := ReadJSONL(f, JSONLCursor{}, func(lineNo int, _ []byte) error {
 		if lineNo == 2 {
-			return boom
+			return fmt.Errorf("disk full: %w", ErrAbortFile)
 		}
 		return nil
 	})
-	if !errors.Is(err, boom) {
-		t.Fatalf("err = %v, want boom", err)
+	if !errors.Is(err, ErrAbortFile) {
+		t.Fatalf("err = %v, want ErrAbortFile", err)
 	}
 	if cur.Offset != 8 {
 		t.Fatalf("cursor = %+v, want offset 8 (in front of line 2)", cur)
+	}
+	if len(res.Skipped) != 0 {
+		t.Fatalf("Skipped = %+v, want nothing: an abort is not a skip", res.Skipped)
+	}
+	// The line that aborted is re-read from the returned cursor rather than
+	// stepped over.
+	got, _, _ := readAll(t, path, cur)
+	if len(got) != 2 || got[0] != `{"i":2}` {
+		t.Fatalf("retry got %v, want line 2 onwards", got)
 	}
 }
 

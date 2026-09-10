@@ -274,6 +274,10 @@ func TestHomePathNoHomeAndRelativeHome(t *testing.T) {
 		{name: "no home in env", env: testEnv(map[string]string{})},
 		{name: "nil env", env: nil},
 		{name: "relative home never lands under cwd", env: homeEnv("relative/home")},
+		// A home of "/" would make "under home" true of every file on the
+		// machine, which is not a home directory, it is a broken
+		// environment.
+		{name: "filesystem root is not a home directory", env: homeEnv("/")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

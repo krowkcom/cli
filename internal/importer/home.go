@@ -53,6 +53,16 @@ var (
 // bytes krowk reads are the checkout's and the trust that let it follow the
 // link was the home directory's.
 //
+// "A checkout is not trusted" is enforced as "outside home is not trusted",
+// and the difference is worth being plain about. A symlink from
+// ~/.claude/projects to a repository that itself lives under home — say
+// ~/Repositories/something — is followed. Home is trusted in full, which is
+// the same rule internal/harness applies to configs: a path is untrusted
+// because of where it is, not because of what happens to be checked out
+// there. Only leaving home is a refusal. Nothing under home can be written
+// by anyone who could not equally have written the transcript directory
+// itself, so a finer distinction would cost more than it bought.
+//
 // The home directory is itself resolved before the comparison, because on
 // macOS a temporary directory is reached through /var -> /private/var and a
 // prefix test against the unresolved path would refuse every read in a test.
@@ -80,6 +90,13 @@ func HomePath(env harness.Env, rel string) (string, error) {
 		// process happens to be in, which is the one thing this package
 		// promises not to do.
 		return "", fmt.Errorf("%w: home %q is not absolute", ErrNoHome, home)
+	}
+	if filepath.Dir(home) == home {
+		// A home directory of "/" (or a Windows drive root) would make
+		// "under home" true of every file on the machine, which is the
+		// opposite of what this function is for. It is not a home
+		// directory anybody has; it is a misconfigured environment.
+		return "", fmt.Errorf("%w: home %q is a filesystem root", ErrNoHome, home)
 	}
 
 	path := rel

@@ -14,10 +14,22 @@ import (
 // really line-oriented cannot be read into memory as a single "line".
 const maxLineBytes = 16 << 20
 
-// ErrSkipLine is what a per-line callback returns to say "this line is not
-// for me" without failing the file. Anything else it returns stops the read
-// — a callback that cannot cope is different from a line that cannot parse.
-var ErrSkipLine = errors.New("skip this line")
+// ErrAbortFile is what a per-line callback returns to stop the read.
+//
+// It exists because the polarity here has to be the other way round from
+// the obvious one. A callback's ordinary failure is a line it could not make
+// sense of — valid JSON in a shape it did not expect, a role it has never
+// heard of — and one of those is exactly as survivable as a line that would
+// not parse at all: skip it, count it, carry on. Making that fatal instead
+// would pin the cursor to the line forever, so a single odd line would cost
+// the entire rest of the transcript on every future import.
+//
+// So a callback error is a skip unless it says otherwise, and ErrAbortFile
+// is how it says otherwise: the file is not what it claimed to be, or the
+// failure was not the line's fault at all (a full disk, a cancelled
+// context). The cursor then stops in front of the line, so a retry
+// re-reads it rather than stepping over it.
+var ErrAbortFile = errors.New("abort this file")
 
 // ReadJSONL walks the complete lines of f from cur onward, hands each one to
 // fn, and returns the watermark to resume from.
@@ -46,12 +58,18 @@ var ErrSkipLine = errors.New("skip this line")
 // than parsing a truncated object and recording a skip that was never a
 // real error.
 //
-// A line that is not valid JSON is counted in Result.Skipped with its line
-// number and byte offset, and the read continues. One corrupt line in a
-// transcript loses that line, not the session. So does a complete line past
-// maxLineBytes: failing on it would pin the cursor to that line's start and
-// every retry would fail in the same place, which means one absurd line
-// would cost the whole rest of the file, permanently.
+// A line the read cannot use is counted in Result.Skipped with its line
+// number and byte offset, and the read continues. That covers a line that
+// is not valid JSON, a complete line past maxLineBytes, and a line fn
+// itself rejected. All three are the same failure from the cursor's point
+// of view: stopping on any of them would pin the cursor to that line's
+// start, every retry would fail in the same place, and one bad line would
+// cost the whole rest of the file, permanently. One corrupt line in a
+// transcript should lose that line, not the session.
+//
+// Only fn returning ErrAbortFile stops the read, and the two cases where
+// the file itself is not line-oriented: an I/O error, and an unterminated
+// tail already past maxLineBytes.
 func ReadJSONL(f *os.File, cur JSONLCursor, fn func(lineNo int, line []byte) error) (JSONLCursor, Result, error) {
 	var res Result
 
@@ -112,14 +130,14 @@ func ReadJSONL(f *os.File, cur JSONLCursor, fn func(lineNo int, line []byte) err
 			continue
 		}
 		if ferr := fn(lineNo, payload); ferr != nil {
-			if errors.Is(ferr, ErrSkipLine) {
-				res.Skip(lineNo, lineStart, ferr.Error())
-				continue
+			if errors.Is(ferr, ErrAbortFile) {
+				// The cursor stops at the last line the callback accepted,
+				// so a retry re-reads this one rather than stepping over
+				// the failure.
+				return JSONLCursor{Offset: lineStart, Size: size}, res, fmt.Errorf("line %d: %w", lineNo, ferr)
 			}
-			// The cursor returned stops at the last line the callback
-			// accepted, so a retry re-reads this one rather than skipping
-			// past the failure.
-			return JSONLCursor{Offset: lineStart, Size: size}, res, fmt.Errorf("line %d: %w", lineNo, ferr)
+			res.Skip(lineNo, lineStart, ferr.Error())
+			continue
 		}
 	}
 
@@ -203,10 +221,14 @@ func readLine(r *bufio.Reader) (payload []byte, consumed int64, tooLong bool, er
 		chunk, rerr := r.ReadSlice('\n')
 		consumed += int64(len(chunk))
 		if !tooLong {
-			payload = append(payload, chunk...)
-			if int64(len(payload)) > maxLineBytes {
+			// Tested before the append, not after: appending first would
+			// let the buffer peak at a chunk past the cap, which is the
+			// allocation the cap exists to bound.
+			if int64(len(payload)+len(chunk)) > maxLineBytes {
 				tooLong = true
 				payload = nil
+			} else {
+				payload = append(payload, chunk...)
 			}
 		}
 		if errors.Is(rerr, bufio.ErrBufferFull) {

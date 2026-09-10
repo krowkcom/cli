@@ -102,7 +102,7 @@ const (
 // at its own first line, because numbering from the top of the file would
 // mean re-scanning everything the cursor exists to skip. Offset is the
 // absolute byte offset of the line's first byte, which is unambiguous either
-// way. Reason is truncated to maxSkipReasonBytes.
+// way. Reason is bounded by maxSkipReasonBytes, ellipsis included.
 type SkippedLine struct {
 	Line   int
 	Offset int64
@@ -152,10 +152,11 @@ func (r *Result) Skip(line int, offset int64, reason string) {
 // than left as it fell: slicing bytes can land inside a rune, and these
 // strings end up in a database column and on a terminal.
 func truncateReason(reason string) string {
+	const ellipsis = "…"
 	if len(reason) <= maxSkipReasonBytes {
 		return reason
 	}
-	return strings.ToValidUTF8(reason[:maxSkipReasonBytes], "") + "…"
+	return strings.ToValidUTF8(reason[:maxSkipReasonBytes-len(ellipsis)], "") + ellipsis
 }
 
 // Classify records a line the source understood and chose not to import.

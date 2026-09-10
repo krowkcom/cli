@@ -58,8 +58,9 @@ var ErrAbortFile = errors.New("abort this file")
 // than parsing a truncated object and recording a skip that was never a
 // real error.
 //
-// A line the read cannot use is counted in Result.Skipped with its line
-// number and byte offset, and the read continues. That covers a line that
+// A line the read cannot use is counted in Result.SkippedCount, with the
+// first hundred described in Result.Skipped by line number and byte
+// offset, and the read continues. That covers a line that
 // is not valid JSON, a complete line past maxLineBytes, and a line fn
 // itself rejected. All three are the same failure from the cursor's point
 // of view: stopping on any of them would pin the cursor to that line's
@@ -210,10 +211,13 @@ func lineStartBefore(f *os.File, off int64) int64 {
 			n = end
 		}
 		readAt := end - n
-		if _, err := f.ReadAt(buf[:n], readAt); err != nil && !errors.Is(err, io.EOF) {
+		got, err := f.ReadAt(buf[:n], readAt)
+		if err != nil && !errors.Is(err, io.EOF) {
 			return 0
 		}
-		for i := n - 1; i >= 0; i-- {
+		// Scan only what this ReadAt filled: a short read (the file shrank
+		// under us) leaves stale bytes from the previous chunk in the tail.
+		for i := int64(got) - 1; i >= 0; i-- {
 			if buf[i] == '\n' {
 				return readAt + i + 1
 			}

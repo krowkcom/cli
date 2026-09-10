@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // StatusCheck is one health question and its answer, in the same shape as
@@ -61,27 +62,27 @@ func Check(env Env) StatusCheck {
 }
 
 // fail maps an Open error onto a StatusCheck whose hint names
-// internal/store. A schema mismatch already carries the rebuild recovery in
-// the message; the hint still names the package so a reader never hears
-// "reinstall krowk" for a store file. Anything else names the file and the
-// package without guessing the cause — a busy lock and a full disk are not
-// permission problems.
+// internal/store. A schema mismatch already carries the path and the
+// rebuild recovery in the message, so it passes through untouched —
+// prefixing the path again would stutter. Anything else names the file
+// and the package without guessing the cause: a busy lock and a full
+// disk are not permission problems.
 func fail(path string, err error) StatusCheck {
 	msg := err.Error()
-	if errors.Is(err, ErrNoHome) {
-		return StatusCheck{
-			Name:    CheckName,
-			Status:  "fail",
-			Message: msg,
-			Hint:    "set HOME (or XDG_DATA_HOME to an absolute path) so krowk.db has a place to live (internal/store)",
-		}
-	}
 	if errors.Is(err, ErrSchemaMismatch) {
 		return StatusCheck{
 			Name:    CheckName,
 			Status:  "fail",
-			Message: fmt.Sprintf("%s: %s", path, msg),
+			Message: msg,
 			Hint:    fmt.Sprintf("run `krowk sessions rebuild` (delete %s and re-import) (internal/store)", path),
+		}
+	}
+	if strings.HasPrefix(msg, "close store:") {
+		return StatusCheck{
+			Name:    CheckName,
+			Status:  "fail",
+			Message: fmt.Sprintf("%s: %s", path, msg),
+			Hint:    fmt.Sprintf("the store opened but did not close cleanly; inspect %s (internal/store)", path),
 		}
 	}
 	return StatusCheck{

@@ -59,8 +59,20 @@ func TestDoctorHumanOutputNamesTheStore(t *testing.T) {
 	if line == "" {
 		t.Fatalf("human doctor has no store line:\n%s", stdout)
 	}
-	if !strings.Contains(line, `"status":"pass"`) && !strings.Contains(line, `"status": "pass"`) {
-		t.Errorf("store line = %q, want status pass", line)
+	raw := strings.TrimSpace(strings.TrimPrefix(line, "store"))
+	var check struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+		Hint   string `json:"hint"`
+	}
+	if err := json.Unmarshal([]byte(raw), &check); err != nil {
+		t.Fatalf("store line is not a StatusCheck: %v\n%s", err, line)
+	}
+	if check.Name != "store" || check.Status != "pass" {
+		t.Errorf("store line = %+v, want name store status pass", check)
+	}
+	if check.Hint != "" {
+		t.Errorf("passing store line carries hint %q", check.Hint)
 	}
 }
 

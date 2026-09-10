@@ -1954,7 +1954,7 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 
 	keys := []string{"version", "runtime", "api", "registry", "api_status",
 		"authenticated", "token_source", "key", "workspace", "runs_available",
-		"credentials", "config", "store"}
+		"credentials", "config"}
 
 	if format != output.Human {
 		b, _ := json.MarshalIndent(report, "", "  ")
@@ -1962,22 +1962,19 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 	}
 
 	for _, k := range keys {
-		if k == "store" {
-			b, _ := json.Marshal(report[k])
-			fmt.Fprintf(w, "%-15s %s\n", k, b)
-			continue
-		}
 		fmt.Fprintf(w, "%-15s %v\n", k, report[k])
 	}
-	b, _ := json.Marshal(report["context"])
-	fmt.Fprintf(w, "%-15s %s\n", "context", b)
+	for _, k := range []string{"store", "context"} {
+		b, _ := json.Marshal(report[k])
+		fmt.Fprintf(w, "%-15s %s\n", k, b)
+	}
 	return nil
 }
 
-// storeCheck is the local session store's health answer, as a harness
-// StatusCheck so doctor reports one vocabulary. It is additive: harness
-// agent checks keep running wherever they are wired; this names the file
-// doctor otherwise never proves lives.
+// storeCheck is the local session store's health answer, reported in the
+// harness StatusCheck shape so every doctor check reads as one vocabulary.
+// Kept as a conversion (rather than importing harness into store) because
+// the store deliberately keeps no dependency on harness.
 func storeCheck(env runctx.Env) harnesscheck.StatusCheck {
 	s := store.Check(store.Env(env))
 	return harnesscheck.StatusCheck{

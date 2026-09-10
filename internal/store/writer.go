@@ -97,12 +97,18 @@ func validRole(r Role) bool {
 //   - worktree upserted by path;
 //   - session found by (provider, foreign_session_id) binding, else created
 //     with its binding (a lost create race adopts the winner);
+//   - session.parent_id set from th.Parent's binding when that binding is
+//     already in the store and the column is still NULL — a parent nobody
+//     has ingested yet leaves it NULL, and a later Ingest of the same
+//     child fills it in;
 //   - messages with a ForeignID already in the session skipped with their
 //     parts, the rest appended with seq after the current max;
 //   - turns and events treated as cumulative positional lists: position i
 //     is seq i, so a re-sent prefix is skipped and only the tail inserts —
 //     callers must still hold a cursor and never re-send with changed
-//     content, because the kept prefix wins silently;
+//     content, because the kept prefix wins silently. The one exception is
+//     the last stored turn, whose status and costs are refreshed from the
+//     re-sent list; see insertTurnTail for why that row and no other;
 //   - messages with no ForeignID always appended, so their callers must
 //     hold a cursor and never re-send at all.
 //
@@ -219,6 +225,10 @@ func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, 
 		res.Bindings.Skipped++
 	}
 
+	if err := linkParent(ctx, tx, sessionID, th.Parent); err != nil {
+		return Result{}, err
+	}
+
 	ti, ts, err := insertTurnTail(ctx, tx, w.minter, now, sessionID, th.Turns)
 	if err != nil {
 		return Result{}, err
@@ -293,7 +303,17 @@ func upsertWorktree(ctx context.Context, tx *sql.Tx, m *Minter, now int64, wt Wo
 
 // findOrCreateSession resolves the session through the binding key and
 // creates session plus binding when neither exists. Reports whether each
-// row was inserted. A lost binding race adopts the winner's session and
+// row was inserted.
+//
+// A session found by its binding has its worktree re-pointed as well as
+// its display fields refreshed. That is not merely tidiness: an importer
+// that could not tell where a session ran the first time — the Claude
+// reader falls back to the transcript's own directory when no line carried
+// a cwd — would otherwise be stuck with that placeholder forever, even
+// once a later read of the same transcript found the real checkout. The
+// worktree row itself is upserted by path and never deleted, so
+// re-pointing a session moves the session and leaves the old worktree
+// standing. A lost binding race adopts the winner's session and
 // refreshes its display fields, so two Threads naming the same
 // (provider, foreign_session_id) converge on one session row and one
 // binding row.
@@ -304,8 +324,8 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 		b.Provider, b.ForeignSessionID).Scan(&sessionID)
 	if err == nil {
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE session SET directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
-			s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, sessionID); err != nil {
+			`UPDATE session SET worktree_id = ?, directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
+			worktreeID, s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, sessionID); err != nil {
 			return "", false, false, fmt.Errorf("store: ingest update session: %w", err)
 		}
 		return sessionID, false, false, nil
@@ -337,8 +357,8 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 				return "", false, false, fmt.Errorf("store: ingest adopt session: %w", derr)
 			}
 			if _, uerr := tx.ExecContext(ctx,
-				`UPDATE session SET directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
-				s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, winner); uerr != nil {
+				`UPDATE session SET worktree_id = ?, directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
+				worktreeID, s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, winner); uerr != nil {
 				return "", false, false, fmt.Errorf("store: ingest update session: %w", uerr)
 			}
 			return winner, false, false, nil
@@ -348,9 +368,54 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 	return sessionID, true, true, nil
 }
 
+// linkParent points sessionID at the session its parent binding names, when
+// there is one to point at.
+//
+// Three things are deliberate here. A parent binding nobody has ingested yet
+// is not an error: a Claude subagent transcript is a file of its own, and a
+// caller importing files in whatever order the filesystem handed them back
+// would otherwise fail on every child that arrived early. It is left NULL and
+// a later Ingest of the same child — which happens on the next import, since
+// the child's messages dedup but its session row is always revisited — fills
+// it in.
+//
+// The UPDATE only touches a NULL column. Re-parenting a session that already
+// has a parent would be the store silently rewriting history on the strength
+// of one importer's reading of one file, and a wrong parent is harder to
+// notice than a missing one.
+//
+// A session is never its own parent. The guard is cheap and the alternative
+// is a row the parent_id foreign key happily accepts and every tree walk
+// downstream loops on.
+func linkParent(ctx context.Context, tx *sql.Tx, sessionID string, parent *Binding) error {
+	if parent == nil || parent.ForeignSessionID == "" {
+		return nil
+	}
+	var parentID string
+	err := tx.QueryRowContext(ctx,
+		`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
+		parent.Provider, parent.ForeignSessionID).Scan(&parentID)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("store: ingest find parent binding: %w", err)
+	}
+	if parentID == sessionID {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE session SET parent_id = ? WHERE id = ? AND parent_id IS NULL`,
+		parentID, sessionID); err != nil {
+		return fmt.Errorf("store: ingest set parent: %w", err)
+	}
+	return nil
+}
+
 // insertTurnTail appends the turns past the stored prefix: position i is
 // seq i, so the first len(stored) entries are the known prefix and only
-// the tail inserts. Reports inserted vs skipped. The next seq comes from
+// the tail inserts. Reports inserted vs skipped — the refreshed last turn
+// counts as skipped, because it is a row that was already there. The next seq comes from
 // MAX, not COUNT, so it stays correct even if the table ever held a gap.
 func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessionID string, turns []Turn) (int, int, error) {
 	var have, maxSeq int
@@ -360,6 +425,18 @@ func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessi
 	skipped := len(turns)
 	if skipped > have {
 		skipped = have
+	}
+	// The last stored turn is the only prefix row allowed to change, and
+	// it has to be allowed to: see refreshLastTurn. The guard on
+	// have == maxSeq+1 is what keeps the pairing honest — position i is
+	// seq i only while the seqs run 0..have-1 without a gap, and pairing
+	// the row at MAX(seq) with turns[have-1] across a gap would refresh
+	// one turn from another turn's costs. A gapped table refreshes
+	// nothing and still appends correctly.
+	if have > 0 && have == maxSeq+1 && len(turns) >= have {
+		if err := refreshLastTurn(ctx, tx, now, sessionID, maxSeq, turns[have-1]); err != nil {
+			return 0, skipped, err
+		}
 	}
 	inserted := 0
 	for i, t := range turns[skipped:] {
@@ -375,6 +452,46 @@ func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessi
 		inserted++
 	}
 	return inserted, skipped, nil
+}
+
+// refreshLastTurn rewrites the status and costs of the turn at seq from the
+// re-sent list.
+//
+// This is the one place the store lets a positional prefix change, and the
+// reason is that the alternative is silently wrong on every live session.
+// An importer reads a transcript while somebody is still using it, so the
+// last turn it sees is a turn in flight: the prompt has landed, two of its
+// eventual twelve API calls have happened, and the cost the store is handed
+// is a fraction of what that turn will end up costing. The importer re-reads
+// the whole file next time and hands over the finished figure — and a
+// prefix skipped verbatim would keep the fraction forever. The transcript is
+// not wrong and the store is not wrong; the row is just old, and nothing
+// would ever correct it.
+//
+// It is safe for exactly one row because of what closes a turn: a turn ends
+// when the next one opens, so every turn but the last is already final by
+// the time a later turn exists to follow it. Refreshing further back would
+// be the store rewriting settled history on one importer's re-reading of one
+// file, which is the thing the positional-prefix rule is there to prevent.
+//
+// Costs are overwritten rather than added to. The incoming list is
+// cumulative — it is the whole turn as read from the whole file, not a delta
+// — so summing would double the part already stored. Which is also the one
+// way to misuse this: ingesting a Thread from a Read that failed partway,
+// whose turn list happens to be as long as the stored one, rewrites the
+// last turn downward with the truncated figure, so a caller must not ingest
+// a thread whose Read returned an error.
+func refreshLastTurn(ctx context.Context, tx *sql.Tx, now int64, sessionID string, seq int, t Turn) error {
+	var usd any
+	if t.CostUSDMicros != nil {
+		usd = *t.CostUSDMicros
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE turn SET status = ?, cost_input_tokens = ?, cost_output_tokens = ?, cost_total_tokens = ?, cost_cache_read_tokens = ?, cost_cache_write_tokens = ?, cost_reasoning_tokens = ?, cost_usd_micros = ?, time_updated = ? WHERE session_id = ? AND seq = ?`,
+		t.Status, t.CostInput, t.CostOutput, t.CostTotal, t.CostCacheRead, t.CostCacheWrite, t.CostReasoning, usd, now, sessionID, seq); err != nil {
+		return fmt.Errorf("store: ingest refresh turn: %w", err)
+	}
+	return nil
 }
 
 // insertEventTail is insertTurnTail for session events: position i is

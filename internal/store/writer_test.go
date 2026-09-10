@@ -704,3 +704,321 @@ func TestWriterPositionRowsNeedNoResend(t *testing.T) {
 		t.Errorf("message seqs = %v, want [0 1]: cursor-less resend appends", seqs)
 	}
 }
+
+// parentOf reads a session's parent_id through its binding, as NULL or as
+// the id it points at.
+func parentOf(t *testing.T, db *sql.DB, provider, foreignID string) (string, bool) {
+	t.Helper()
+	var parent sql.NullString
+	err := db.QueryRow(
+		`SELECT s.parent_id FROM session s JOIN session_binding b ON b.session_id = s.id
+		 WHERE b.provider = ? AND b.foreign_session_id = ?`, provider, foreignID).Scan(&parent)
+	if err != nil {
+		t.Fatalf("read parent of %s: %v", foreignID, err)
+	}
+	return parent.String, parent.Valid
+}
+
+// sessionIDOf is the store id behind a binding, for the tests that have to
+// compare a parent_id against the row it should name.
+func sessionIDOf(t *testing.T, db *sql.DB, provider, foreignID string) string {
+	t.Helper()
+	var id string
+	if err := db.QueryRow(
+		`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
+		provider, foreignID).Scan(&id); err != nil {
+		t.Fatalf("find session %s: %v", foreignID, err)
+	}
+	return id
+}
+
+// childThread is a Thread naming another session as its parent, which is
+// what a Claude subagent transcript produces.
+func childThread(provider, foreignID, parentForeignID string) Thread {
+	th := sampleThread(provider, foreignID)
+	th.Parent = &Binding{Provider: provider, Harness: "claude", ForeignSessionID: parentForeignID}
+	return th
+}
+
+func TestIngestSetsParentWhenTheParentIsAlreadyThere(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	if _, err := w.Ingest(ctx, sampleThread("claude", "parent")); err != nil {
+		t.Fatalf("Ingest parent: %v", err)
+	}
+	if _, err := w.Ingest(ctx, childThread("claude", "child", "parent")); err != nil {
+		t.Fatalf("Ingest child: %v", err)
+	}
+
+	got, ok := parentOf(t, db, "claude", "child")
+	if !ok {
+		t.Fatal("child has no parent_id")
+	}
+	if want := sessionIDOf(t, db, "claude", "parent"); got != want {
+		t.Fatalf("parent_id = %q, want the parent session %q", got, want)
+	}
+	// And the parent is nobody's child.
+	if _, ok := parentOf(t, db, "claude", "parent"); ok {
+		t.Fatal("the parent acquired a parent")
+	}
+}
+
+func TestIngestLeavesParentNullWhenTheParentIsMissing(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	// The child arrives first, which is what happens to a caller walking
+	// files in whatever order the filesystem gave them.
+	if _, err := w.Ingest(ctx, childThread("claude", "child", "parent")); err != nil {
+		t.Fatalf("Ingest child: %v", err)
+	}
+	if _, ok := parentOf(t, db, "claude", "child"); ok {
+		t.Fatal("child was given a parent nobody has ingested")
+	}
+}
+
+func TestReingestFillsInAParentThatArrivedLate(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	child := childThread("claude", "child", "parent")
+	if _, err := w.Ingest(ctx, child); err != nil {
+		t.Fatalf("Ingest child: %v", err)
+	}
+	if _, err := w.Ingest(ctx, sampleThread("claude", "parent")); err != nil {
+		t.Fatalf("Ingest parent: %v", err)
+	}
+
+	// The second pass over the child is what converges: nothing new is
+	// inserted, and the NULL is filled in.
+	res, err := w.Ingest(ctx, child)
+	if err != nil {
+		t.Fatalf("re-Ingest child: %v", err)
+	}
+	if res.Messages.Inserted != 0 || res.Turns.Inserted != 0 || res.Sessions.Inserted != 0 {
+		t.Fatalf("re-ingest inserted rows: %+v", res)
+	}
+	got, ok := parentOf(t, db, "claude", "child")
+	if !ok {
+		t.Fatal("re-ingest did not fill in the parent")
+	}
+	if want := sessionIDOf(t, db, "claude", "parent"); got != want {
+		t.Fatalf("parent_id = %q, want %q", got, want)
+	}
+}
+
+// A session that names itself is not stored as its own parent: the foreign
+// key would accept it and every tree walk downstream would loop.
+func TestIngestRefusesToMakeASessionItsOwnParent(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	if _, err := w.Ingest(ctx, childThread("claude", "loop", "loop")); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if _, ok := parentOf(t, db, "claude", "loop"); ok {
+		t.Fatal("a session became its own parent")
+	}
+}
+
+// A parent already set is not rewritten: one importer's reading of one file
+// must not silently re-home a session that another pass already placed.
+func TestIngestDoesNotRepointAnExistingParent(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	for _, id := range []string{"first", "second"} {
+		if _, err := w.Ingest(ctx, sampleThread("claude", id)); err != nil {
+			t.Fatalf("Ingest %s: %v", id, err)
+		}
+	}
+	if _, err := w.Ingest(ctx, childThread("claude", "child", "first")); err != nil {
+		t.Fatalf("Ingest child: %v", err)
+	}
+	if _, err := w.Ingest(ctx, childThread("claude", "child", "second")); err != nil {
+		t.Fatalf("re-Ingest child: %v", err)
+	}
+	got, _ := parentOf(t, db, "claude", "child")
+	if want := sessionIDOf(t, db, "claude", "first"); got != want {
+		t.Fatalf("parent_id = %q, want it still pointing at the first parent %q", got, want)
+	}
+}
+
+// turnCosts reads a session's turns in seq order as their input costs, which
+// is enough to tell the growing-session cases apart without spelling out
+// seven columns per row.
+func turnCosts(t *testing.T, db *sql.DB, provider, foreignID string) []int64 {
+	t.Helper()
+	rows, err := db.Query(
+		`SELECT t.cost_input_tokens FROM turn t
+		 JOIN session_binding b ON b.session_id = t.session_id
+		 WHERE b.provider = ? AND b.foreign_session_id = ? ORDER BY t.seq`, provider, foreignID)
+	if err != nil {
+		t.Fatalf("read turns: %v", err)
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var c int64
+		if err := rows.Scan(&c); err != nil {
+			t.Fatalf("scan turn: %v", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read turns: %v", err)
+	}
+	return out
+}
+
+// TestGrowingSessionRefreshesTheTurnItCaughtInFlight is the live-transcript
+// case. The first import lands while a turn is still being worked on, so
+// its cost is a fraction of the final one; the second import carries the
+// finished figure, and the row has to take it. Skipping the prefix verbatim
+// would leave the partial cost in the store forever, which is wrong on
+// every session anybody imports while using it.
+func TestGrowingSessionRefreshesTheTurnItCaughtInFlight(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	partial := sampleThread("claude", "live")
+	partial.Turns = []Turn{{Status: "done", CostInput: 10, CostTotal: 10}}
+	if _, err := w.Ingest(ctx, partial); err != nil {
+		t.Fatalf("Ingest partial: %v", err)
+	}
+	if got := turnCosts(t, db, "claude", "live"); len(got) != 1 || got[0] != 10 {
+		t.Fatalf("after the first import turns = %v, want [10]", got)
+	}
+
+	grown := sampleThread("claude", "live")
+	grown.Turns = []Turn{
+		{Status: "done", CostInput: 30, CostTotal: 30},
+		{Status: "done", CostInput: 5, CostTotal: 5},
+	}
+	res, err := w.Ingest(ctx, grown)
+	if err != nil {
+		t.Fatalf("Ingest grown: %v", err)
+	}
+	// The refreshed row is not a new one: it counts as skipped, and only
+	// the genuinely new turn inserts.
+	if res.Turns.Inserted != 1 || res.Turns.Skipped != 1 {
+		t.Fatalf("turn counts = %+v, want one inserted and one skipped", res.Turns)
+	}
+	got := turnCosts(t, db, "claude", "live")
+	if len(got) != 2 || got[0] != 30 || got[1] != 5 {
+		t.Fatalf("turns = %v, want [30 5]: the in-flight turn kept its partial cost", got)
+	}
+}
+
+// A turn that is not the last one is settled and stays settled: a turn
+// closes when the next opens, so anything before the tail cannot honestly
+// have changed, and letting it change would be the store rewriting history
+// on one caller's re-reading of one file.
+func TestReingestDoesNotRewriteSettledTurns(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	th := sampleThread("claude", "settled")
+	th.Turns = []Turn{
+		{Status: "done", CostInput: 1, CostTotal: 1},
+		{Status: "done", CostInput: 2, CostTotal: 2},
+		{Status: "done", CostInput: 3, CostTotal: 3},
+	}
+	if _, err := w.Ingest(ctx, th); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	rewritten := sampleThread("claude", "settled")
+	rewritten.Turns = []Turn{
+		{Status: "done", CostInput: 100, CostTotal: 100},
+		{Status: "done", CostInput: 200, CostTotal: 200},
+		{Status: "done", CostInput: 300, CostTotal: 300},
+	}
+	if _, err := w.Ingest(ctx, rewritten); err != nil {
+		t.Fatalf("re-Ingest: %v", err)
+	}
+	got := turnCosts(t, db, "claude", "settled")
+	// Only the tail moved. The first two are as they were.
+	if len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 300 {
+		t.Fatalf("turns = %v, want [1 2 300]", got)
+	}
+}
+
+// A shorter list than the store holds is a caller that has lost its place.
+// Nothing is refreshed and nothing is inserted, because the position the
+// last incoming turn occupies is not the position of the last stored one
+// and matching them up would corrupt both.
+func TestReingestOfAShorterTurnListChangesNothing(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	th := sampleThread("claude", "shrunk")
+	th.Turns = []Turn{
+		{Status: "done", CostInput: 7, CostTotal: 7},
+		{Status: "done", CostInput: 8, CostTotal: 8},
+	}
+	if _, err := w.Ingest(ctx, th); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	short := sampleThread("claude", "shrunk")
+	short.Turns = []Turn{{Status: "done", CostInput: 999, CostTotal: 999}}
+	if _, err := w.Ingest(ctx, short); err != nil {
+		t.Fatalf("re-Ingest: %v", err)
+	}
+	got := turnCosts(t, db, "claude", "shrunk")
+	if len(got) != 2 || got[0] != 7 || got[1] != 8 {
+		t.Fatalf("turns = %v, want [7 8]", got)
+	}
+}
+
+// worktreePathOf reads the path of the worktree a session is filed under.
+func worktreePathOf(t *testing.T, db *sql.DB, provider, foreignID string) string {
+	t.Helper()
+	var path string
+	if err := db.QueryRow(
+		`SELECT w.path FROM worktree w
+		 JOIN session s ON s.worktree_id = w.id
+		 JOIN session_binding b ON b.session_id = s.id
+		 WHERE b.provider = ? AND b.foreign_session_id = ?`, provider, foreignID).Scan(&path); err != nil {
+		t.Fatalf("read worktree of %s: %v", foreignID, err)
+	}
+	return path
+}
+
+// TestReingestRepointsTheSessionAtItsWorktree is the case an importer that
+// cannot always tell where a session ran will hit. The Claude reader falls
+// back to the transcript's own directory when no line carried a cwd, and
+// without this the session would stay filed under that placeholder even
+// once a later read found the real checkout.
+func TestReingestRepointsTheSessionAtItsWorktree(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	first := sampleThread("claude", "moved")
+	first.Worktree = Worktree{Path: "/placeholder", VCS: "none", Name: "placeholder"}
+	if _, err := w.Ingest(ctx, first); err != nil {
+		t.Fatalf("Ingest first: %v", err)
+	}
+	if got := worktreePathOf(t, db, "claude", "moved"); got != "/placeholder" {
+		t.Fatalf("worktree = %q, want /placeholder", got)
+	}
+
+	second := sampleThread("claude", "moved")
+	second.Worktree = Worktree{Path: "/repo/real", VCS: "git", Name: "real"}
+	if _, err := w.Ingest(ctx, second); err != nil {
+		t.Fatalf("Ingest second: %v", err)
+	}
+	if got := worktreePathOf(t, db, "claude", "moved"); got != "/repo/real" {
+		t.Fatalf("worktree = %q, want the session re-pointed at /repo/real", got)
+	}
+	// The old worktree row is left standing: it is keyed by path and may
+	// well be somebody else's.
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM worktree WHERE path = ?`, "/placeholder").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("the placeholder worktree was deleted (%d rows)", n)
+	}
+}

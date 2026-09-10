@@ -75,8 +75,12 @@ func isRetryable(err error) bool {
 		return false
 	}
 	msg := err.Error()
+	// "is locked" covers all three SQLite lock texts: "database is
+	// locked" (BUSY), "database table is locked" (LOCKED) and "database
+	// schema is locked". Ingest never alters the schema, so any of them
+	// means a concurrent writer, never a DDL conflict of its own.
 	return strings.Contains(msg, "UNIQUE constraint failed") ||
-		strings.Contains(msg, "database is locked")
+		strings.Contains(msg, "is locked")
 }
 
 // validRole reports whether r is in the message CHECK set.
@@ -109,7 +113,11 @@ func validRole(r Role) bool {
 // behind, but a retry converges: every step skips what is already there,
 // which is also what makes the whole-call retry below safe — a uniqueness
 // conflict or a lock-upgrade loss against a concurrent writer re-runs
-// against fresh state instead of surfacing, up to three attempts.
+// against fresh state instead of surfacing, up to three attempts. A
+// retried call merges per-attempt counts, so under contention one row can
+// appear both inserted (first attempt wrote it) and skipped (the retry
+// re-observed it) — the exact success-path counts the tests pin never
+// retry, so they stay exact.
 func (w *Writer) Ingest(ctx context.Context, th Thread) (Result, error) {
 	var res Result
 	if th.Worktree.Path == "" {
@@ -131,11 +139,15 @@ func (w *Writer) Ingest(ctx context.Context, th Thread) (Result, error) {
 			// Stagger the re-run: without a pause two losers retry in
 			// lockstep and collide again. Same shape as busyRetry — the
 			// lock holder's transactions are short, so milliseconds
-			// suffice. Honors cancellation while waiting.
+			// suffice — plus a nanosecond jitter so two processes that
+			// failed together do not wake together. (The jitter reads
+			// the wall clock, not the injected one: it sets no stored
+			// value.) Honors cancellation while waiting.
+			jitter := time.Duration(time.Now().UnixNano()%25) * time.Millisecond
 			select {
 			case <-ctx.Done():
 				return res, ctx.Err()
-			case <-time.After(time.Duration(attempt) * 25 * time.Millisecond):
+			case <-time.After(time.Duration(attempt)*25*time.Millisecond + jitter):
 			}
 		}
 		var r Result
@@ -163,7 +175,11 @@ func (w *Writer) Ingest(ctx context.Context, th Thread) (Result, error) {
 
 // ingestOnce is one Ingest attempt: short transactions that each roll back
 // on failure, so a uniqueness conflict with a concurrent writer leaves the
-// store in a state the next attempt converges on.
+// store in a state the next attempt converges on. Counts from the first
+// transaction are reported only once it commits: anything earlier returns
+// zero, so a rolled-back attempt never contributes phantom Inserted rows.
+// Message-chunk counts are commit-local for the same reason, and only
+// committed chunks reach the total.
 func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, error) {
 	var res Result
 
@@ -180,7 +196,7 @@ func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, 
 
 	worktreeID, inserted, err := upsertWorktree(ctx, tx, w.minter, now, th.Worktree)
 	if err != nil {
-		return res, err
+		return Result{}, err
 	}
 	if inserted {
 		res.Worktrees.Inserted++
@@ -190,7 +206,7 @@ func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, 
 
 	sessionID, sessIns, bindIns, err := findOrCreateSession(ctx, tx, w.minter, now, worktreeID, th.Session, th.Binding)
 	if err != nil {
-		return res, err
+		return Result{}, err
 	}
 	if sessIns {
 		res.Sessions.Inserted++
@@ -205,20 +221,20 @@ func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, 
 
 	ti, ts, err := insertTurnTail(ctx, tx, w.minter, now, sessionID, th.Turns)
 	if err != nil {
-		return res, err
+		return Result{}, err
 	}
 	res.Turns.Inserted += ti
 	res.Turns.Skipped += ts
 
 	ei, es, err := insertEventTail(ctx, tx, w.minter, now, sessionID, th.Events)
 	if err != nil {
-		return res, err
+		return Result{}, err
 	}
 	res.Events.Inserted += ei
 	res.Events.Skipped += es
 
 	if err := tx.Commit(); err != nil {
-		return res, fmt.Errorf("store: ingest commit: %w", err)
+		return Result{}, fmt.Errorf("store: ingest commit: %w", err)
 	}
 	committed = true
 

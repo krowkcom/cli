@@ -322,6 +322,35 @@ func applySchema(db *sql.DB, schema string) error {
 	return nil
 }
 
+// verifySchema is the check-only gate: read, then accept or refuse, never
+// initialise. The steady handle in Open uses this, not ensureSchema — a
+// file that regressed to version 0 between the two opens was swapped or
+// truncated, and silently re-initialising it would mask the loss.
+func verifySchema(db *sql.DB, path, schema string) error {
+	version, tables, err := readVersionAndTables(db)
+	if err != nil {
+		return fmt.Errorf("store: read schema version %s: %w", path, err)
+	}
+	if version == 0 {
+		return rebuildHint(path, "krowk.db regressed to schema version 0 after the gate accepted it")
+	}
+	return checkSchemaContent(path, version, tables, schema)
+}
+
+// retryDecision picks the error when a schema apply fails: the re-read
+// decides. A file that now matches was concurrently initialised — adopt it.
+// A file that now disagrees is refused as a mismatch, even though an apply
+// also failed; only a still-empty file reports the apply failure itself.
+func retryDecision(path string, version int, tables map[string]bool, schema string, applyErr error) error {
+	if err := checkSchemaContent(path, version, tables, schema); err != nil {
+		return err
+	}
+	if version != 0 {
+		return nil
+	}
+	return fmt.Errorf("store: init schema %s: %w", path, applyErr)
+}
+
 // ensureSchema brings the read-write handle to the gate: re-read the version
 // on this handle (the file may have moved since checkSchemaFile), initialise
 // a fresh file, accept an exact match, or fail with the rebuild hint before
@@ -341,14 +370,10 @@ func ensureSchema(db *sql.DB, path, schema string) error {
 		if err := applySchema(db, schema); err != nil {
 			applyErr := err
 			// Re-read: a concurrent Open may have initialised while this
-			// apply waited on the write lock. Accept its result — but only
-			// if the state actually moved: a still-zero version means this
-			// apply itself failed (broken DDL rolls back whole), and its
-			// error is the one to report.
-			if v2, t2, rerr := readVersionAndTables(db); rerr == nil && v2 != 0 {
-				if checkSchemaContent(path, v2, t2, schema) == nil {
-					return nil
-				}
+			// apply waited on the write lock. The re-read decides what
+			// the failure means (see retryDecision).
+			if v2, t2, rerr := readVersionAndTables(db); rerr == nil {
+				return retryDecision(path, v2, t2, schema, applyErr)
 			}
 			return fmt.Errorf("store: init schema %s: %w", path, applyErr)
 		}

@@ -471,8 +471,7 @@ func TestOpenTightensStoreDir(t *testing.T) {
 	}
 }
 
-func TestApplySchemaRunsDDLAndStampInOneTransaction(t *testing.T) {
-	// The shipped SchemaSQL is comment-only until the v1 schema change, so
+func TestApplySchemaRunsDDLAndStampInOneTransaction(t *testing.T) { // The shipped SchemaSQL is comment-only until the v1 schema change, so
 	// the multi-statement apply path is pinned here with a synthetic
 	// schema: tables land and the stamp reads back on the same handle, and
 	// a second ensure is an exact-match accept, not a re-apply.
@@ -511,5 +510,64 @@ CREATE TABLE b (id TEXT PRIMARY KEY, a_id TEXT REFERENCES a(id));`
 	}
 	if err := ensureSchema(db, path, synthetic); err != nil {
 		t.Errorf("second ensureSchema refused its own apply: %v", err)
+	}
+}
+
+func TestRetryDecision(t *testing.T) {
+	applyErr := errors.New("boom")
+	for _, tc := range []struct {
+		name    string
+		version int
+		tables  map[string]bool
+		wantNil bool
+		wantIs  error
+	}{
+		{"concurrent winner adopted", 1, map[string]bool{"t": true}, true, nil},
+		{"still empty reports apply failure", 0, map[string]bool{}, false, applyErr},
+		{"future version reports mismatch", 2, map[string]bool{"t": true}, false, ErrSchemaMismatch},
+		{"foreign tables at v0 report mismatch", 0, map[string]bool{"t": true}, false, ErrSchemaMismatch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := retryDecision("p", tc.version, tc.tables, `CREATE TABLE t (x TEXT)`, applyErr)
+			if tc.wantNil {
+				if err != nil {
+					t.Errorf("got %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantIs) {
+				t.Errorf("got %q, want errors.Is %v", err, tc.wantIs)
+			}
+			if errors.Is(err, ErrSchemaMismatch) != (tc.wantIs == ErrSchemaMismatch) {
+				t.Errorf("mismatch classification wrong for %q", err)
+			}
+		})
+	}
+}
+
+func TestVerifySchemaNeverInitialises(t *testing.T) {
+	// The steady handle's check-only pass must refuse a regressed file,
+	// never silently re-init over the loss.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "regressed.db")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("seed empty: %v", err)
+	}
+	db, err := openSQL(dsn(path))
+	if err != nil {
+		t.Fatalf("openSQL: %v", err)
+	}
+	defer db.Close()
+	if err := verifySchema(db, path, `CREATE TABLE t (x TEXT)`); err == nil {
+		t.Fatal("verifySchema initialised an empty file; it must only refuse")
+	} else if !errors.Is(err, ErrSchemaMismatch) {
+		t.Errorf("error %q is not ErrSchemaMismatch", err)
+	}
+	var v int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if v != 0 {
+		t.Errorf("user_version = %d, want 0 (untouched)", v)
 	}
 }

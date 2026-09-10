@@ -78,8 +78,11 @@ the versions are the `v*` tags a release is cut from. Entries land under
   re-import): there is no silent repair and no in-place migration path in
   v1, because every row is still re-derivable from transcripts on disk. A
   refused file is left byte-identical, mode bits included: the version
-  check runs read-only before the read-write open, and the read-write
-  handle itself carries no persistent pragma until the re-check accepts.
+  check runs read-only before the read-write open, the opened file is
+  pinned by device-and-inode identity before it is tightened, and the
+  read-write handle itself carries no persistent pragma until the re-check
+  accepts. The steady handle re-verifies check-only and never
+  re-initialises a regressed file.
   Two first-launch opens racing each other converge instead of erroring —
   the loser adopts the winner's schema. The store directory is tightened
   to `0700` like the database file. There is still no `migrations` table;

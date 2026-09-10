@@ -139,8 +139,12 @@ func Open(env Env) (*sql.DB, error) {
 	// after them, would otherwise rewrite the header or mode bits of a
 	// file Open is about to reject. A missing file skips this — there is
 	// nothing to refuse yet — and the write path re-checks on its own
-	// handle, so a file swapped in between still fails closed.
-	if _, err := os.Stat(path); err == nil {
+	// handle, so a file swapped in between still fails closed. preStat
+	// pins the checked file's identity for the SameFile comparison after
+	// open, closing the swap-then-chmod window deterministically.
+	var preStat os.FileInfo
+	if st, err := os.Stat(path); err == nil {
+		preStat = st
 		if err := checkSchemaFile(path, SchemaSQL); err != nil {
 			return nil, err
 		}
@@ -165,6 +169,14 @@ func Open(env Env) (*sql.DB, error) {
 	fi, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("store: stat %s: %w", path, err)
+	}
+	// The path may have been swapped for another file after the pre-check
+	// passed: refuse the stranger before chmodding or initialising it.
+	// SameFile compares device and inode, so only the checked file
+	// proceeds. (A swap after this point is a same-user race against
+	// syscalls nanoseconds apart; the content re-checks still refuse it.)
+	if preStat != nil && !os.SameFile(preStat, fi) {
+		return nil, fmt.Errorf("store: %s changed during open, refusing", path)
 	}
 	if fi.Mode().Perm()&0o077 != 0 {
 		if err := f.Chmod(0o600); err != nil {
@@ -210,10 +222,8 @@ func Open(env Env) (*sql.DB, error) {
 	}
 	// The gate handle carries the gate DSN, whose later pool connections
 	// would miss the WAL replay. Trade it for the steady handle every
-	// other Open caller sees — and re-verify on it, closing the swap
-	// window between the two opens. The re-verify issues no writes on an
-	// accepted file: only the version-0 branch writes, and a file that
-	// regressed to version 0 is a fresh file by the gate's own rule.
+	// other Open caller sees, and check-only verify on it: the gate
+	// already initialised or accepted, so this pass only refuses.
 	// Disarm the deferred cleanup first: the explicit Close below owns
 	// the gate handle from here on.
 	dbFailed = false
@@ -231,7 +241,11 @@ func Open(env Env) (*sql.DB, error) {
 	if err := busyRetry(db.Ping); err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
-	if err := ensureSchema(db, path, SchemaSQL); err != nil {
+	// Check-only: the gate handle already initialised or accepted. A file
+	// that reads version 0 here was swapped or truncated between the two
+	// opens — verifySchema refuses it rather than re-initialising over
+	// the loss. Never writes.
+	if err := verifySchema(db, path, SchemaSQL); err != nil {
 		return nil, err
 	}
 	// A previous run on a permissive umask may have left world-readable

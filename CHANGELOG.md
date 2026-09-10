@@ -11,6 +11,29 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- The v1 session-store schema: `001_init.sql` now defines the eight tables
+  the plan promised — `worktree`, `session`, `session_binding`,
+  `session_event`, `turn`, `message`, `part` and `import_state` — instead of
+  a comment. Every `id` is a `TEXT PRIMARY KEY` holding a uuidv7 minted by
+  `internal/store` (now spelled `store.ParseID` at the boundary, as an alias
+  of `ValidateID`, so the two can never disagree). `seq` is the only
+  ordering key; dedup is a unique index, never a derived id: a second import
+  of the same Claude session converges on one row through
+  `UNIQUE(provider, foreign_session_id)`, and a re-imported message through
+  the partial `UNIQUE(session_id, foreign_id) WHERE foreign_id IS NOT NULL`,
+  which lets NULLs repeat. Foreign keys run `ON DELETE CASCADE` from
+  `session` down, so deleting a session takes its bindings, events, turns,
+  messages and parts with it but never its worktree. Every `time_*` column
+  is `INTEGER` milliseconds; `role` is a closed `CHECK`
+  (`user|assistant|system|tool|error`) while `provider`, `harness` and `type`
+  stay open strings. The gate tests name every table and every unique index,
+  assert every own `*_id` column carries a cascading FK with a leading index
+  (`foreign_session_id`, `foreign_id` and `tool_call_id` hold other systems'
+  ids and must carry none), and pin the deliberate absences: no
+  `turn_attempt`, `attachment`, `model_cache`, `convention` or `migrations`
+  table, and no unique gate on one assistant message per turn. Nothing is
+  user-visible yet; no command writes these tables.
+
 - A new `internal/store` package begins the local session store — the
   `krowk.db` SQLite file that will hold the sessions, messages and parts krowk
   syncs. This change ships only the two decisions every row in it depends on:

@@ -146,6 +146,15 @@ func seedCounter() uint16 {
 	return binary.BigEndian.Uint16(b[:]) & 0x7ff
 }
 
+// ParseID is the store boundary for ids this package mints: it reports
+// whether s is a canonical lowercase hyphenated uuidv7 with no type
+// prefix. An alias of ValidateID under the name the schema contract
+// uses — every id column value passes ParseID — so the two can never
+// disagree about what an id is.
+func ParseID(s string) error {
+	return ValidateID(s)
+}
+
 // ValidateID reports whether s is an id this package would mint, and otherwise
 // says what shape was expected. It is the store's boundary check, and it is
 // strict about all three of case, version and variant, because the ids it has

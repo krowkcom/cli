@@ -63,10 +63,12 @@ func Check(env Env) StatusCheck {
 
 // fail maps an Open error onto a StatusCheck whose hint names
 // internal/store. A schema mismatch already carries the path and the
-// rebuild recovery in the message, so it passes through untouched —
-// prefixing the path again would stutter. Anything else names the file
-// and the package without guessing the cause: a busy lock and a full
-// disk are not permission problems.
+// rebuild recovery in the message, so it passes through untouched. Most
+// other Open errors embed the path too (mkdir/stat/open/chmod/inspect),
+// so the path is prefixed only when absent — never stuttered. The hint
+// never guesses the cause: a busy lock and a full disk are not permission
+// problems, and a close failure after a successful open is still just a
+// store to inspect.
 func fail(path string, err error) StatusCheck {
 	msg := err.Error()
 	if errors.Is(err, ErrSchemaMismatch) {
@@ -77,18 +79,13 @@ func fail(path string, err error) StatusCheck {
 			Hint:    fmt.Sprintf("run `krowk sessions rebuild` (delete %s and re-import) (internal/store)", path),
 		}
 	}
-	if strings.HasPrefix(msg, "close store:") {
-		return StatusCheck{
-			Name:    CheckName,
-			Status:  "fail",
-			Message: fmt.Sprintf("%s: %s", path, msg),
-			Hint:    fmt.Sprintf("the store opened but did not close cleanly; inspect %s (internal/store)", path),
-		}
+	if !strings.Contains(msg, path) {
+		msg = path + ": " + msg
 	}
 	return StatusCheck{
 		Name:    CheckName,
 		Status:  "fail",
-		Message: fmt.Sprintf("%s: %s", path, msg),
+		Message: msg,
 		Hint:    fmt.Sprintf("inspect %s (internal/store)", path),
 	}
 }

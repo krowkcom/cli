@@ -11,6 +11,34 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- The importer contract, so three importers cannot become three exporters:
+  `internal/importer` fixes the vocabulary the Claude, cursor and opencode
+  readers all have to speak. A `Source` is `Name`, `Discover` and `Read`,
+  producing a `store.Thread` plus the watermark to resume from; the
+  watermark is a byte offset into a named file (`JSONLCursor{offset, size}`)
+  or a row update time (`SQLiteCursor{time_updated}`), serialised as JSON
+  into `import_state.cursor` under `"<provider>:<ref>"`, never a
+  modification time — a transcript that got shorter is a rescan, not an
+  append. The `part.type` set is closed here at `text`, `thinking`,
+  `tool_call`, `tool_result`, `image`, `file`, `patch`, `step` and
+  `unknown`, with `tool_call` and `tool_result` data shapes fixed and paired
+  by `tool_call_id`, and a block this build does not recognise landing as
+  `unknown` carrying its raw payload and counted rather than dropped.
+  Reading a transcript goes through `OpenHome`, which resolves under the
+  home directory, refuses a path that leaves it, refuses a symlink that
+  leads out of it into a checkout, and refuses a file over 64 MiB — the
+  same "home is trusted, a checkout is not" rule `internal/harness`
+  applies to configs. `ReadJSONL` resumes from a cursor, restarts from the
+  top when the file has been rewritten shorter, rewinds to the last
+  complete line when an offset landed mid-line, leaves a half-flushed
+  trailing line for the next read, and counts an unparseable line in
+  `Result.Skipped` with its line number instead of failing the file. The
+  turn rule is one shared function: a turn opens at a user message that a
+  person actually sent, so hook output, attachments and `tool_result`-only
+  user lines no longer report ten turns where somebody asked one question.
+  `Discover` returns `ErrUnsupportedOS` on Windows rather than reporting an
+  empty machine. Nothing is user-visible yet; no command imports anything.
+
 - The canonical thread model plus the store `Writer`: `internal/store` now
   defines the one shape every importer produces — a `Thread` carrying its
   `Worktree`, `Session` display fields, `Binding` identity and the

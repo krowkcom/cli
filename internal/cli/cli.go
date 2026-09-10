@@ -21,8 +21,10 @@ import (
 
 	"github.com/krowkcom/cli/internal/api"
 	"github.com/krowkcom/cli/internal/config"
+	harnesscheck "github.com/krowkcom/cli/internal/harness"
 	"github.com/krowkcom/cli/internal/output"
 	"github.com/krowkcom/cli/internal/runctx"
+	"github.com/krowkcom/cli/internal/store"
 )
 
 // Version is stamped at build time: -ldflags "-X .../internal/cli.Version=1.2.3".
@@ -1946,12 +1948,13 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 		"runs_available": client.Authenticated(),
 		"credentials":    api.CredentialsPath(),
 		"config":         configSummary(),
+		"store":          storeCheck(env),
 		"context":        runctx.Detect(env),
 	}
 
 	keys := []string{"version", "runtime", "api", "registry", "api_status",
 		"authenticated", "token_source", "key", "workspace", "runs_available",
-		"credentials", "config"}
+		"credentials", "config", "store"}
 
 	if format != output.Human {
 		b, _ := json.MarshalIndent(report, "", "  ")
@@ -1959,11 +1962,30 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 	}
 
 	for _, k := range keys {
+		if k == "store" {
+			b, _ := json.Marshal(report[k])
+			fmt.Fprintf(w, "%-15s %s\n", k, b)
+			continue
+		}
 		fmt.Fprintf(w, "%-15s %v\n", k, report[k])
 	}
 	b, _ := json.Marshal(report["context"])
 	fmt.Fprintf(w, "%-15s %s\n", "context", b)
 	return nil
+}
+
+// storeCheck is the local session store's health answer, as a harness
+// StatusCheck so doctor reports one vocabulary. It is additive: harness
+// agent checks keep running wherever they are wired; this names the file
+// doctor otherwise never proves lives.
+func storeCheck(env runctx.Env) harnesscheck.StatusCheck {
+	s := store.Check(store.Env(env))
+	return harnesscheck.StatusCheck{
+		Name:    s.Name,
+		Status:  s.Status,
+		Message: s.Message,
+		Hint:    s.Hint,
+	}
 }
 
 // probe reads the service descriptor at the API root. It needs neither a key nor

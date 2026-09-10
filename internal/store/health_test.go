@@ -1,9 +1,9 @@
 package store
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -65,8 +65,16 @@ func TestCheckFailsOnAStaleMigration(t *testing.T) {
 	}
 }
 
-// An unreadable file fails with a permission hint naming the package.
+// An unreadable file fails with a hint naming the package. Mode bits are
+// not portable to Windows and mean nothing to root, so both skip: the
+// foreign-file test below covers the refusal deterministically everywhere.
 func TestCheckFailsOnAnUnreadableFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits are not portable to Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root reads through mode bits")
+	}
 	home := t.TempDir()
 	env := testEnv(map[string]string{"HOME": home})
 	db, err := Open(env)
@@ -108,8 +116,8 @@ func TestCheckFailsOnAForeignFile(t *testing.T) {
 	if got.Status != "fail" {
 		t.Fatalf("Check = %+v, want fail on foreign file", got)
 	}
-	if !errors.Is(ErrSchemaMismatch, ErrSchemaMismatch) {
-		t.Fatal("unreachable")
+	if !strings.Contains(got.Message, "mismatch") && !strings.Contains(got.Message, "unreadable") {
+		t.Errorf("message = %q, want the refusal reason", got.Message)
 	}
 	if !strings.Contains(got.Hint, "internal/store") {
 		t.Errorf("hint = %q, want it to name internal/store", got.Hint)

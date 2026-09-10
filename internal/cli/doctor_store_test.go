@@ -39,6 +39,31 @@ func TestDoctorIncludesAStoreCheck(t *testing.T) {
 	}
 }
 
+// The human rendering carries the same store line, as JSON on the row,
+// the way context already renders.
+func TestDoctorHumanOutputNamesTheStore(t *testing.T) {
+	h := newHarness(t, 0)
+	h.env["HOME"] = t.TempDir()
+	h.env["XDG_DATA_HOME"] = ""
+
+	code, stdout, stderr := h.runOn(true, "doctor")
+	if code != 0 {
+		t.Fatalf("doctor exited %d, stderr: %s", code, stderr)
+	}
+	line := ""
+	for _, l := range strings.Split(stdout, "\n") {
+		if strings.HasPrefix(l, "store") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("human doctor has no store line:\n%s", stdout)
+	}
+	if !strings.Contains(line, `"status":"pass"`) && !strings.Contains(line, `"status": "pass"`) {
+		t.Errorf("store line = %q, want status pass", line)
+	}
+}
+
 // A bad HOME fails the check with a hint naming internal/store, never a
 // reinstall — and doctor itself still exits 0, because its job is to
 // describe a broken setup, not to be stopped by one.

@@ -11,6 +11,54 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- The importer contract, so three importers cannot become three exporters:
+  `internal/importer` fixes the vocabulary the Claude, cursor and opencode
+  readers all have to speak. A `Source` is `Name`, `Discover` and `Read`,
+  producing a `store.Thread` plus the watermark to resume from; the
+  watermark is a byte offset into a named file (`JSONLCursor{offset, size}`)
+  or a row update time (`SQLiteCursor{time_updated}`), serialised as JSON
+  into `import_state.cursor` under `"<provider>:<ref>"`, never a
+  modification time — a transcript that got shorter is a rescan, not an
+  append, and the watermark says plainly that it assumes an append-only
+  file and leans on the store's `foreign_id` dedup for the rest. The
+  `part.type` set is closed here at `text`, `thinking`,
+  `tool_call`, `tool_result`, `image`, `file`, `patch`, `step` and
+  `unknown`, with `tool_call` and `tool_result` data shapes fixed and paired
+  by `tool_call_id`, and a block this build does not recognise landing as
+  `unknown` carrying its raw payload and counted rather than dropped.
+  Reading a transcript goes through `OpenHome`, which resolves under the
+  home directory, refuses a path that leaves it, refuses a symlink whose
+  target is outside it — including one whose target does not exist yet,
+  which would otherwise be approved on the strength of a file nobody has
+  created — and refuses a file over 64 MiB or anything that is not a
+  regular file. That is the same "home is trusted, a checkout is not" rule
+  `internal/harness` applies to configs, and "a checkout" means outside
+  home: a symlink into a repository that itself lives under home is
+  followed, because home is trusted in full and a path is untrusted for
+  where it is rather than for what happens to be checked out there.
+  `ReadJSONL` resumes from a cursor, restarts from the top when the file
+  has been rewritten shorter, rewinds to the last complete line when an
+  offset landed mid-line, and leaves a half-flushed trailing line for the
+  next read. A line it cannot use — unparseable, past the 16 MiB line cap,
+  or rejected by the source reading it — is counted in
+  `Result.SkippedCount` and the read carries on, because stopping would pin
+  the cursor to that line and one bad line would cost the rest of the file
+  on every attempt from then on. The first hundred of those lines are also
+  described individually in `Result.Skipped`, with the line number and byte
+  offset; the count stays exact past that, so a file that is nothing but
+  junk is reported as a number rather than accumulating a record per line
+  until the importer runs out of memory. Only three things stop a read: an I/O
+  error, an unterminated final line that is already past the line cap, and
+  a source explicitly returning `ErrAbortFile` for a failure that was not
+  the line's fault. The turn rule is one shared function: a turn opens at a
+  user message that a person actually sent, so hook output, attachments and
+  `tool_result`-only user lines no longer report ten turns where somebody
+  asked one question.
+  `Discover` returns `ErrUnsupportedOS` on Windows rather than reporting an
+  empty machine, and a `Source` handed a cursor of the wrong kind returns
+  `ErrCursorType` rather than silently rescanning from the top. Nothing is
+  user-visible yet; no command imports anything.
+
 - The canonical thread model plus the store `Writer`: `internal/store` now
   defines the one shape every importer produces — a `Thread` carrying its
   `Worktree`, `Session` display fields, `Binding` identity and the

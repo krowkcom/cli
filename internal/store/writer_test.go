@@ -410,8 +410,31 @@ func TestWriterConcurrentProcesses(t *testing.T) {
 			os.Exit(2)
 		}
 		w := NewWriter(db, nil)
-		th := sampleThread("claude", "ses-child-"+child)
-		th.Worktree.Path = filepath.Join(home, "wt-"+child)
+		var th Thread
+		switch child {
+		case "same1", "same2":
+			// Same binding key, overlapping messages: exercises the
+			// whole-Ingest retry on UNIQUE conflicts.
+			th = sampleThread("claude", "ses-child-same")
+			th.Worktree.Path = filepath.Join(home, "wt-same")
+			th.Turns = []Turn{{Status: "done"}}
+			th.Events = []Event{{Type: "tick"}}
+			shared := Message{Role: RoleUser, ForeignID: "shared-m2", Parts: []Part{{Type: "text"}}}
+			if child == "same1" {
+				th.Messages = []Message{
+					{Role: RoleUser, ForeignID: "shared-m1", Parts: []Part{{Type: "text"}}},
+					shared,
+				}
+			} else {
+				th.Messages = []Message{
+					shared,
+					{Role: RoleUser, ForeignID: "shared-m3", Parts: []Part{{Type: "text"}}},
+				}
+			}
+		default:
+			th = sampleThread("claude", "ses-child-"+child)
+			th.Worktree.Path = filepath.Join(home, "wt-"+child)
+		}
 		if _, err := w.Ingest(context.Background(), th); err != nil {
 			fmt.Fprintln(os.Stderr, "ingest:", err)
 			db.Close()
@@ -465,10 +488,189 @@ func TestWriterConcurrentProcesses(t *testing.T) {
 	}
 }
 
+// TestWriterConcurrentSameSession runs two processes against one binding
+// key with overlapping messages. One writer wins each race; the loser
+// retries the whole Ingest against fresh state and converges instead of
+// surfacing a UNIQUE failure.
+func TestWriterConcurrentSameSession(t *testing.T) {
+	if os.Getenv("KROWK_WRITER_CHILD") != "" {
+		t.Skip("child process runs inside TestWriterConcurrentProcesses")
+	}
+	home := t.TempDir()
+	run := func(child string) (string, error) {
+		cmd := exec.Command(os.Args[0], "-test.run", "TestWriterConcurrentProcesses", "-test.count=1")
+		cmd.Env = append(os.Environ(),
+			"KROWK_WRITER_CHILD="+child,
+			"KROWK_WRITER_HOME="+home,
+		)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	type outcome struct {
+		out string
+		err error
+	}
+	ch := make(chan outcome, 2)
+	go func() { o, e := run("same1"); ch <- outcome{o, e} }()
+	go func() { o, e := run("same2"); ch <- outcome{o, e} }()
+	for i := 0; i < 2; i++ {
+		o := <-ch
+		if o.err != nil {
+			t.Fatalf("child failed: %v\n%s", o.err, o.out)
+		}
+		if strings.Contains(o.out, "database is locked") {
+			t.Fatalf("child surfaced a lock error:\n%s", o.out)
+		}
+		if strings.Contains(o.out, "UNIQUE constraint failed") {
+			t.Fatalf("child surfaced a uniqueness error:\n%s", o.out)
+		}
+	}
+
+	db, err := Open(testEnv(map[string]string{"HOME": home}))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	var sessions, bindings, messages, turns, events int
+	for _, q := range []struct {
+		query string
+		dest  *int
+	}{
+		{`SELECT COUNT(*) FROM session`, &sessions},
+		{`SELECT COUNT(*) FROM session_binding`, &bindings},
+		{`SELECT COUNT(*) FROM message`, &messages},
+		{`SELECT COUNT(*) FROM turn`, &turns},
+		{`SELECT COUNT(*) FROM session_event`, &events},
+	} {
+		if err := db.QueryRow(q.query).Scan(q.dest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if sessions != 1 || bindings != 1 {
+		t.Errorf("sessions=%d bindings=%d, want 1 and 1", sessions, bindings)
+	}
+	if messages != 3 {
+		t.Errorf("messages=%d, want 3 (the union of both children)", messages)
+	}
+	if turns != 1 || events != 1 {
+		t.Errorf("turns=%d events=%d, want 1 and 1", turns, events)
+	}
+	rows, err := db.Query(`SELECT seq FROM message ORDER BY seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seqs []int
+	for rows.Next() {
+		var s int
+		if err := rows.Scan(&s); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		seqs = append(seqs, s)
+	}
+	rows.Close()
+	if len(seqs) != 3 || seqs[0] != 0 || seqs[1] != 1 || seqs[2] != 2 {
+		t.Errorf("message seqs = %v, want [0 1 2]", seqs)
+	}
+}
+
+// TestWriterLargeBatchCrossesChunks ingests more than ingestBatchSize
+// messages: seq must stay dense across chunk transactions, and a re-ingest
+// must insert nothing.
+func TestWriterLargeBatchCrossesChunks(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+	th := sampleThread("claude", "ses_big")
+	th.Turns = nil
+	th.Events = nil
+	for i := 0; i < 1200; i++ {
+		th.Messages = append(th.Messages, Message{
+			Role: RoleUser, ForeignID: fmt.Sprintf("ses_big-m%04d", i),
+			Parts: []Part{{Type: "text"}},
+		})
+	}
+	first, err := w.Ingest(ctx, th)
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if first.Messages.Inserted != 1203 || first.Parts.Inserted != 1204 {
+		t.Errorf("inserted messages=%d parts=%d, want 1203 and 1204", first.Messages.Inserted, first.Parts.Inserted)
+	}
+	var n, mn, mx int
+	if err := db.QueryRow(`SELECT COUNT(*), MIN(seq), MAX(seq) FROM message`).Scan(&n, &mn, &mx); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1203 || mn != 0 || mx != 1202 {
+		t.Errorf("count=%d min=%d max=%d, want 1203 0 1202", n, mn, mx)
+	}
+	before := tableCounts(t, db)
+	second, err := w.Ingest(ctx, th)
+	if err != nil {
+		t.Fatalf("re-ingest: %v", err)
+	}
+	if !zeroInserted(second) {
+		t.Errorf("re-ingest inserted rows: %+v", second)
+	}
+	if after := tableCounts(t, db); !equalCounts(before, after) {
+		t.Errorf("counts changed on re-ingest")
+	}
+}
+
+// TestWriterIntraBatchDuplicateForeignID names the same foreign id twice in
+// one Thread: the second occurrence is skipped, never double-inserted.
+func TestWriterIntraBatchDuplicateForeignID(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	th := sampleThread("claude", "ses_dup")
+	th.Turns = nil
+	th.Events = nil
+	th.Messages = []Message{
+		{Role: RoleUser, ForeignID: "dup-m", Parts: []Part{{Type: "text"}}},
+		{Role: RoleUser, ForeignID: "dup-m", Parts: []Part{{Type: "text"}}},
+	}
+	res, err := w.Ingest(context.Background(), th)
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if res.Messages.Inserted != 1 || res.Messages.Skipped != 1 {
+		t.Errorf("messages inserted=%d skipped=%d, want 1 and 1", res.Messages.Inserted, res.Messages.Skipped)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM message`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("messages=%d, want 1", n)
+	}
+}
+
+// TestRoleMatchesCheck pins validRole against the DDL: every role the Go
+// boundary admits must appear in the message CHECK, and vice versa.
+func TestRoleMatchesCheck(t *testing.T) {
+	db, _ := openWriterDB(t, nil)
+	var sql string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'message'`).Scan(&sql); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []Role{RoleUser, RoleAssistant, RoleSystem, RoleTool, RoleError} {
+		if !validRole(r) {
+			t.Errorf("validRole rejects %q", r)
+		}
+		if !strings.Contains(sql, `'`+string(r)+`'`) {
+			t.Errorf("message CHECK does not mention role %q", r)
+		}
+	}
+	if validRole("admin") {
+		t.Errorf("validRole accepts admin")
+	}
+	if strings.Contains(sql, `'admin'`) {
+		t.Errorf("message CHECK mentions admin")
+	}
+}
+
 func TestWriterPositionRowsNeedNoResend(t *testing.T) {
-	// Documents the cursor contract: a message with no ForeignID has no
-	// dedup key, so re-sending it appends again with a continuing seq.
-	// Importers must hold a cursor for those instead of re-sending.
+	// A message with no ForeignID has no dedup key, so re-sending it
+	// appends again with a continuing seq. Importers must hold a cursor
+	// for those instead of re-sending.
 	db, w := openWriterDB(t, nil)
 	ctx := context.Background()
 	mk := func() Thread {

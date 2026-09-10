@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
+	"time"
 )
 
 // ingestBatchSize caps how many messages one Ingest transaction holds.
@@ -53,6 +55,30 @@ func NewWriter(db *sql.DB, clock Clock) *Writer {
 	return &Writer{db: db, clock: clock, minter: NewMinter(clock)}
 }
 
+// isConstraintViolation reports whether err is a SQLite uniqueness
+// failure. Only that class triggers the adopt-the-winner paths: a disk
+// error or a CHECK failure must surface, never be mistaken for a
+// concurrent writer.
+func isConstraintViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// isRetryable reports whether err is worth one more Ingest attempt against
+// fresh state: a uniqueness conflict with a concurrent writer, or a lock
+// the writer would not wait out. The lock case is the DEFERRED-transaction
+// upgrade window — both writers read, one commits, the other's upgrade
+// fails as SQLITE_BUSY_SNAPSHOT without invoking the busy timeout — so a
+// re-run that re-reads converges instead of surfacing "database is locked".
+// Anything else (disk, CHECK, context) is returned at once.
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed") ||
+		strings.Contains(msg, "database is locked")
+}
+
 // validRole reports whether r is in the message CHECK set.
 func validRole(r Role) bool {
 	switch r {
@@ -80,7 +106,10 @@ func validRole(r Role) bool {
 // session, binding, turns and events go in one short transaction first.
 // Validation runs before any write, so a bad role fails with the store
 // untouched. A mid-ingest failure may leave committed prefix transactions
-// behind, but a retry converges: every step skips what is already there.
+// behind, but a retry converges: every step skips what is already there,
+// which is also what makes the whole-call retry below safe — a uniqueness
+// conflict or a lock-upgrade loss against a concurrent writer re-runs
+// against fresh state instead of surfacing, up to three attempts.
 func (w *Writer) Ingest(ctx context.Context, th Thread) (Result, error) {
 	var res Result
 	if th.Worktree.Path == "" {
@@ -96,6 +125,47 @@ func (w *Writer) Ingest(ctx context.Context, th Thread) (Result, error) {
 	}
 
 	now := w.minter.NowMS()
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			// Stagger the re-run: without a pause two losers retry in
+			// lockstep and collide again. Same shape as busyRetry — the
+			// lock holder's transactions are short, so milliseconds
+			// suffice. Honors cancellation while waiting.
+			select {
+			case <-ctx.Done():
+				return res, ctx.Err()
+			case <-time.After(time.Duration(attempt) * 25 * time.Millisecond):
+			}
+		}
+		var r Result
+		r, err = w.ingestOnce(ctx, th, now)
+		res.Worktrees.Inserted += r.Worktrees.Inserted
+		res.Worktrees.Skipped += r.Worktrees.Skipped
+		res.Sessions.Inserted += r.Sessions.Inserted
+		res.Sessions.Skipped += r.Sessions.Skipped
+		res.Bindings.Inserted += r.Bindings.Inserted
+		res.Bindings.Skipped += r.Bindings.Skipped
+		res.Turns.Inserted += r.Turns.Inserted
+		res.Turns.Skipped += r.Turns.Skipped
+		res.Messages.Inserted += r.Messages.Inserted
+		res.Messages.Skipped += r.Messages.Skipped
+		res.Parts.Inserted += r.Parts.Inserted
+		res.Parts.Skipped += r.Parts.Skipped
+		res.Events.Inserted += r.Events.Inserted
+		res.Events.Skipped += r.Events.Skipped
+		if err == nil || !isRetryable(err) {
+			return res, err
+		}
+	}
+	return res, err
+}
+
+// ingestOnce is one Ingest attempt: short transactions that each roll back
+// on failure, so a uniqueness conflict with a concurrent writer leaves the
+// store in a state the next attempt converges on.
+func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, error) {
+	var res Result
 
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -185,7 +255,12 @@ func upsertWorktree(ctx context.Context, tx *sql.Tx, m *Minter, now int64, wt Wo
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO worktree (id, path, vcs, name, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)`,
 		id, wt.Path, wt.VCS, wt.Name, now, now); err != nil {
-		// A concurrent Ingest inserted the same path first: adopt it.
+		// A concurrent Ingest inserted the same path first: adopt it. Any
+		// other failure (disk, CHECK) is returned, never mistaken for a
+		// race.
+		if !isConstraintViolation(err) {
+			return "", false, fmt.Errorf("store: ingest insert worktree: %w", err)
+		}
 		var winner string
 		if qerr := tx.QueryRowContext(ctx, `SELECT id FROM worktree WHERE path = ?`, wt.Path).Scan(&winner); qerr == nil {
 			if _, uerr := tx.ExecContext(ctx,
@@ -233,7 +308,11 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 		m.NewID(), sessionID, b.Provider, b.Harness, b.ForeignSessionID, b.ResumeCmd, now, now); err != nil {
 		// A concurrent Ingest bound the same foreign session first: drop
 		// this session row inside the same transaction and adopt the
-		// winner, so the key still names exactly one session.
+		// winner, so the key still names exactly one session. Any other
+		// failure is returned, never mistaken for a race.
+		if !isConstraintViolation(err) {
+			return "", false, false, fmt.Errorf("store: ingest insert binding: %w", err)
+		}
 		var winner string
 		if qerr := tx.QueryRowContext(ctx,
 			`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
@@ -255,10 +334,11 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 
 // insertTurnTail appends the turns past the stored prefix: position i is
 // seq i, so the first len(stored) entries are the known prefix and only
-// the tail inserts. Reports inserted vs skipped.
+// the tail inserts. Reports inserted vs skipped. The next seq comes from
+// MAX, not COUNT, so it stays correct even if the table ever held a gap.
 func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessionID string, turns []Turn) (int, int, error) {
-	var have int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM turn WHERE session_id = ?`, sessionID).Scan(&have); err != nil {
+	var have, maxSeq int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(seq), -1) FROM turn WHERE session_id = ?`, sessionID).Scan(&have, &maxSeq); err != nil {
 		return 0, 0, fmt.Errorf("store: ingest count turns: %w", err)
 	}
 	skipped := len(turns)
@@ -273,7 +353,7 @@ func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessi
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO turn (id, session_id, seq, status, cost_input_tokens, cost_output_tokens, cost_total_tokens, cost_cache_read_tokens, cost_cache_write_tokens, cost_reasoning_tokens, cost_usd_micros, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			m.NewID(), sessionID, have+i, t.Status, t.CostInput, t.CostOutput, t.CostTotal, t.CostCacheRead, t.CostCacheWrite, t.CostReasoning, usd, now, now); err != nil {
+			m.NewID(), sessionID, maxSeq+1+i, t.Status, t.CostInput, t.CostOutput, t.CostTotal, t.CostCacheRead, t.CostCacheWrite, t.CostReasoning, usd, now, now); err != nil {
 			return inserted, skipped, fmt.Errorf("store: ingest insert turn: %w", err)
 		}
 		inserted++
@@ -284,8 +364,8 @@ func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessi
 // insertEventTail is insertTurnTail for session events: position i is
 // seq i, the stored prefix is skipped, the tail inserts.
 func insertEventTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessionID string, events []Event) (int, int, error) {
-	var have int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM session_event WHERE session_id = ?`, sessionID).Scan(&have); err != nil {
+	var have, maxSeq int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(seq), -1) FROM session_event WHERE session_id = ?`, sessionID).Scan(&have, &maxSeq); err != nil {
 		return 0, 0, fmt.Errorf("store: ingest count events: %w", err)
 	}
 	skipped := len(events)
@@ -300,7 +380,7 @@ func insertEventTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sess
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO session_event (id, session_id, seq, type, data, time_created) VALUES (?, ?, ?, ?, ?, ?)`,
-			m.NewID(), sessionID, have+i, e.Type, data, now); err != nil {
+			m.NewID(), sessionID, maxSeq+1+i, e.Type, data, now); err != nil {
 			return inserted, skipped, fmt.Errorf("store: ingest insert event: %w", err)
 		}
 		inserted++
@@ -370,28 +450,33 @@ func (w *Writer) insertMessages(ctx context.Context, sessionID string, now int64
 		// Rollback on every failure below; the Commit past them reports
 		// its own error, so a failed commit fails here, not on retry.
 		// No defer: this runs per chunk, and a stacked rollback after a
-		// commit would only report ErrTxDone noise.
+		// commit would only report ErrTxDone noise. Counts stay local
+		// until the commit lands, so a failed chunk reports nothing for
+		// rows it did not write.
+		var cmi, cpi int
 		for _, p := range chunk {
-			if _, nparts, ferr := insertOneMessage(ctx, tx, w.minter, now, sessionID, p.msg, p.seq); ferr != nil {
+			nparts, ferr := insertOneMessage(ctx, tx, w.minter, now, sessionID, p.msg, p.seq)
+			if ferr != nil {
 				tx.Rollback()
 				return mi, ms, pi, ps, ferr
-			} else {
-				mi++
-				pi += nparts
 			}
+			cmi++
+			cpi += nparts
 		}
 		if err := tx.Commit(); err != nil {
 			tx.Rollback()
 			return mi, ms, pi, ps, fmt.Errorf("store: ingest commit: %w", err)
 		}
+		mi += cmi
+		pi += cpi
 	}
 	return mi, ms, pi, ps, nil
 }
 
 // insertOneMessage writes one message row plus its parts and returns the
-// new message id and part count. An empty ForeignID, ToolCallID or
-// Signature stores NULL; empty Usage or Data stores '{}'.
-func insertOneMessage(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessionID string, msg Message, seq int) (string, int, error) {
+// part count. An empty ForeignID, ToolCallID or Signature stores NULL;
+// empty Usage or Data stores '{}'.
+func insertOneMessage(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessionID string, msg Message, seq int) (int, error) {
 	var foreign any
 	if msg.ForeignID != "" {
 		foreign = msg.ForeignID
@@ -408,7 +493,7 @@ func insertOneMessage(ctx context.Context, tx *sql.Tx, m *Minter, now int64, ses
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO message (id, session_id, turn_id, seq, role, provider, model, foreign_id, usage, raw_json, time_created) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		msgID, sessionID, seq, string(msg.Role), msg.Provider, msg.Model, foreign, usage, raw, now); err != nil {
-		return "", 0, fmt.Errorf("store: ingest insert message: %w", err)
+		return 0, fmt.Errorf("store: ingest insert message: %w", err)
 	}
 	for i, p := range msg.Parts {
 		data := p.Data
@@ -428,8 +513,8 @@ func insertOneMessage(ctx context.Context, tx *sql.Tx, m *Minter, now int64, ses
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO part (id, message_id, session_id, seq, type, tool_call_id, signature, data, foreign_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			m.NewID(), msgID, sessionID, i, p.Type, toolCall, sig, data, pforeign); err != nil {
-			return "", 0, fmt.Errorf("store: ingest insert part: %w", err)
+			return 0, fmt.Errorf("store: ingest insert part: %w", err)
 		}
 	}
-	return msgID, len(msg.Parts), nil
+	return len(msg.Parts), nil
 }

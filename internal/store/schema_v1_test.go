@@ -701,3 +701,127 @@ func TestParseIDMatchesValidateID(t *testing.T) {
 		t.Errorf("ParseID(minted) = %v, want nil", err)
 	}
 }
+
+func TestV1TurnCostColumns(t *testing.T) {
+	db := openV1(t)
+	rows, err := db.Query(`PRAGMA table_info(turn)`)
+	if err != nil {
+		t.Fatalf("table_info turn: %v", err)
+	}
+	type col struct {
+		ctype   string
+		notnull int
+		dflt    sql.NullString
+	}
+	cols := map[string]col{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			t.Fatalf("scan col: %v", err)
+		}
+		cols[name] = col{ctype, notnull, dflt}
+	}
+	rows.Close()
+	// Every summed counter is NOT NULL DEFAULT 0; the priced copy is NULL
+	// until the source reports a dollar figure (micro-dollars, never REAL).
+	for _, name := range []string{"cost_input_tokens", "cost_output_tokens", "cost_total_tokens", "cost_cache_read_tokens", "cost_cache_write_tokens", "cost_reasoning_tokens"} {
+		got, ok := cols[name]
+		if !ok {
+			t.Errorf("turn.%s missing from 001_init.sql", name)
+			continue
+		}
+		if strings.ToUpper(got.ctype) != "INTEGER" {
+			t.Errorf("turn.%s type = %q, want INTEGER", name, got.ctype)
+		}
+		if got.notnull != 1 {
+			t.Errorf("turn.%s NOT NULL = %d, want 1", name, got.notnull)
+		}
+		if !got.dflt.Valid || strings.TrimSpace(got.dflt.String) != "0" {
+			t.Errorf("turn.%s default = %q, want 0", name, got.dflt.String)
+		}
+	}
+	got, ok := cols["cost_usd_micros"]
+	if !ok {
+		t.Fatal("turn.cost_usd_micros missing from 001_init.sql")
+	}
+	if strings.ToUpper(got.ctype) != "INTEGER" {
+		t.Errorf("turn.cost_usd_micros type = %q, want INTEGER", got.ctype)
+	}
+	if got.notnull != 0 {
+		t.Errorf("turn.cost_usd_micros NOT NULL = %d, want nullable", got.notnull)
+	}
+	if got.dflt.Valid {
+		t.Errorf("turn.cost_usd_micros default = %q, want NULL", got.dflt.String)
+	}
+	slug, ok := cols["remote_slug"]
+	if !ok {
+		t.Fatal("turn.remote_slug missing from 001_init.sql")
+	}
+	if strings.ToUpper(slug.ctype) != "TEXT" {
+		t.Errorf("turn.remote_slug type = %q, want TEXT", slug.ctype)
+	}
+	if slug.notnull != 0 {
+		t.Errorf("turn.remote_slug NOT NULL = %d, want nullable", slug.notnull)
+	}
+	// Phase 1 default row: all summed costs zero, price and slug NULL.
+	w := insertWorktree(t, db, "/turncost")
+	s := insertSession(t, db, w)
+	tn := insertTurn(t, db, s, 0)
+	var read, write, reasoning, input, output, total int
+	var micros sql.NullInt64
+	var rslug sql.NullString
+	if err := db.QueryRow(`SELECT cost_input_tokens, cost_output_tokens, cost_total_tokens, cost_cache_read_tokens, cost_cache_write_tokens, cost_reasoning_tokens, cost_usd_micros, remote_slug FROM turn WHERE id = ?`, tn).Scan(&input, &output, &total, &read, &write, &reasoning, &micros, &rslug); err != nil {
+		t.Fatalf("select turn defaults: %v", err)
+	}
+	for name, v := range map[string]int{"cost_input_tokens": input, "cost_output_tokens": output, "cost_total_tokens": total, "cost_cache_read_tokens": read, "cost_cache_write_tokens": write, "cost_reasoning_tokens": reasoning} {
+		if v != 0 {
+			t.Errorf("turn.%s default = %d, want 0", name, v)
+		}
+	}
+	if micros.Valid {
+		t.Errorf("turn.cost_usd_micros default valid, want NULL")
+	}
+	if rslug.Valid {
+		t.Errorf("turn.remote_slug default = %q, want NULL", rslug.String)
+	}
+	// NULL slugs repeat (Phase 1 leaves them null); a repeated slug fails.
+	tn2 := insertTurn(t, db, s, 1)
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM turn WHERE remote_slug IS NULL`).Scan(&n); err != nil {
+		t.Fatalf("null slug probe: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("NULL remote_slug rows = %d, want 2 (UNIQUE must allow repeated NULLs)", n)
+	}
+	if _, err := db.Exec(`UPDATE turn SET remote_slug = 'run-1' WHERE id = ?`, tn); err != nil {
+		t.Fatalf("slug: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE turn SET remote_slug = 'run-1' WHERE id = ?`, tn2); err == nil {
+		t.Error("second turn with the same remote_slug succeeded")
+	}
+}
+
+func TestV1NoRealColumns(t *testing.T) {
+	db := openV1(t)
+	for _, table := range v1Tables {
+		rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+		if err != nil {
+			t.Fatalf("table_info %s: %v", table, err)
+		}
+		for rows.Next() {
+			var cid, notnull, pk int
+			var name, ctype string
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+				t.Fatalf("scan %s: %v", table, err)
+			}
+			// Money is micro-dollar INTEGERs; REAL would not round-trip.
+			if strings.Contains(strings.ToUpper(ctype), "REAL") {
+				t.Errorf("%s.%s type = %q, want no REAL anywhere", table, name, ctype)
+			}
+		}
+		rows.Close()
+	}
+}

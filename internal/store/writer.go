@@ -1,0 +1,435 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+)
+
+// ingestBatchSize caps how many messages one Ingest transaction holds.
+// Short transactions are the concurrency contract: a concurrent krowk push
+// waits on busy_timeout (10s, armed by Open) instead of meeting a lock held
+// for a whole import, so the writer must never widen a transaction to fit.
+const ingestBatchSize = 500
+
+// Count is rows inserted vs rows skipped for one table in one Ingest.
+// Skipped means the row was already there: an upserted worktree, a known
+// binding, a foreign_id seen before, or a position-keyed prefix re-sent.
+type Count struct {
+	Inserted int
+	Skipped  int
+}
+
+// Result reports one Ingest call per table. A re-ingest of the same Thread
+// shows 0 Inserted on every table.
+type Result struct {
+	Worktrees Count
+	Sessions  Count
+	Bindings  Count
+	Turns     Count
+	Messages  Count
+	Parts     Count
+	Events    Count
+}
+
+// Writer ingests canonical Threads into an opened store. It holds the
+// database handle and the clock — never the environment: Open resolves the
+// path, so nothing here consults process variables or the real home, and
+// every id it mints and every time_* it writes comes from the injected
+// clock.
+type Writer struct {
+	db     *sql.DB
+	clock  Clock
+	minter *Minter
+}
+
+// NewWriter returns a Writer over db, which must come from Open. A nil
+// clock means time.Now; tests pass a frozen clock so ids and time columns
+// agree.
+func NewWriter(db *sql.DB, clock Clock) *Writer {
+	if clock == nil {
+		clock = defaultMinter.clock
+	}
+	return &Writer{db: db, clock: clock, minter: NewMinter(clock)}
+}
+
+// validRole reports whether r is in the message CHECK set.
+func validRole(r Role) bool {
+	switch r {
+	case RoleUser, RoleAssistant, RoleSystem, RoleTool, RoleError:
+		return true
+	}
+	return false
+}
+
+// Ingest writes th into the store and reports what it inserted vs skipped:
+//
+//   - worktree upserted by path;
+//   - session found by (provider, foreign_session_id) binding, else created
+//     with its binding (a lost create race adopts the winner);
+//   - messages with a ForeignID already in the session skipped with their
+//     parts, the rest appended with seq after the current max;
+//   - turns and events treated as cumulative positional lists: position i
+//     is seq i, so a re-sent prefix is skipped and only the tail inserts —
+//     callers must still hold a cursor and never re-send with changed
+//     content, because the kept prefix wins silently;
+//   - messages with no ForeignID always appended, so their callers must
+//     hold a cursor and never re-send at all.
+//
+// Messages go in chunks of ingestBatchSize per transaction; worktree,
+// session, binding, turns and events go in one short transaction first.
+// Validation runs before any write, so a bad role fails with the store
+// untouched. A mid-ingest failure may leave committed prefix transactions
+// behind, but a retry converges: every step skips what is already there.
+func (w *Writer) Ingest(ctx context.Context, th Thread) (Result, error) {
+	var res Result
+	if th.Worktree.Path == "" {
+		return res, fmt.Errorf("store: ingest needs a worktree path")
+	}
+	if th.Binding.ForeignSessionID == "" {
+		return res, fmt.Errorf("store: ingest needs a binding foreign_session_id")
+	}
+	for i, m := range th.Messages {
+		if !validRole(m.Role) {
+			return res, fmt.Errorf("store: message %d has role %q, want user|assistant|system|tool|error", i, m.Role)
+		}
+	}
+
+	now := w.minter.NowMS()
+
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return res, fmt.Errorf("store: ingest begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
+	worktreeID, inserted, err := upsertWorktree(ctx, tx, w.minter, now, th.Worktree)
+	if err != nil {
+		return res, err
+	}
+	if inserted {
+		res.Worktrees.Inserted++
+	} else {
+		res.Worktrees.Skipped++
+	}
+
+	sessionID, sessIns, bindIns, err := findOrCreateSession(ctx, tx, w.minter, now, worktreeID, th.Session, th.Binding)
+	if err != nil {
+		return res, err
+	}
+	if sessIns {
+		res.Sessions.Inserted++
+	} else {
+		res.Sessions.Skipped++
+	}
+	if bindIns {
+		res.Bindings.Inserted++
+	} else {
+		res.Bindings.Skipped++
+	}
+
+	ti, ts, err := insertTurnTail(ctx, tx, w.minter, now, sessionID, th.Turns)
+	if err != nil {
+		return res, err
+	}
+	res.Turns.Inserted += ti
+	res.Turns.Skipped += ts
+
+	ei, es, err := insertEventTail(ctx, tx, w.minter, now, sessionID, th.Events)
+	if err != nil {
+		return res, err
+	}
+	res.Events.Inserted += ei
+	res.Events.Skipped += es
+
+	if err := tx.Commit(); err != nil {
+		return res, fmt.Errorf("store: ingest commit: %w", err)
+	}
+	committed = true
+
+	mi, ms, pi, ps, err := w.insertMessages(ctx, sessionID, now, th.Messages)
+	if err != nil {
+		return res, err
+	}
+	res.Messages.Inserted += mi
+	res.Messages.Skipped += ms
+	res.Parts.Inserted += pi
+	res.Parts.Skipped += ps
+
+	return res, nil
+}
+
+// upsertWorktree finds the worktree by path or creates it, refreshing the
+// display fields on a hit. It reports whether it inserted. A lost insert
+// race re-reads the winner instead of erroring.
+func upsertWorktree(ctx context.Context, tx *sql.Tx, m *Minter, now int64, wt Worktree) (string, bool, error) {
+	var id string
+	err := tx.QueryRowContext(ctx, `SELECT id FROM worktree WHERE path = ?`, wt.Path).Scan(&id)
+	if err == nil {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE worktree SET vcs = ?, name = ?, time_updated = ? WHERE id = ?`,
+			wt.VCS, wt.Name, now, id); err != nil {
+			return "", false, fmt.Errorf("store: ingest update worktree: %w", err)
+		}
+		return id, false, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", false, fmt.Errorf("store: ingest find worktree: %w", err)
+	}
+	id = m.NewID()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO worktree (id, path, vcs, name, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)`,
+		id, wt.Path, wt.VCS, wt.Name, now, now); err != nil {
+		// A concurrent Ingest inserted the same path first: adopt it.
+		var winner string
+		if qerr := tx.QueryRowContext(ctx, `SELECT id FROM worktree WHERE path = ?`, wt.Path).Scan(&winner); qerr == nil {
+			if _, uerr := tx.ExecContext(ctx,
+				`UPDATE worktree SET vcs = ?, name = ?, time_updated = ? WHERE id = ?`,
+				wt.VCS, wt.Name, now, winner); uerr != nil {
+				return "", false, fmt.Errorf("store: ingest update worktree: %w", uerr)
+			}
+			return winner, false, nil
+		}
+		return "", false, fmt.Errorf("store: ingest insert worktree: %w", err)
+	}
+	return id, true, nil
+}
+
+// findOrCreateSession resolves the session through the binding key and
+// creates session plus binding when neither exists. Reports whether each
+// row was inserted. A lost binding race adopts the winner's session and
+// refreshes its display fields, so two Threads naming the same
+// (provider, foreign_session_id) converge on one session row and one
+// binding row.
+func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, worktreeID string, s Session, b Binding) (string, bool, bool, error) {
+	var sessionID string
+	err := tx.QueryRowContext(ctx,
+		`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
+		b.Provider, b.ForeignSessionID).Scan(&sessionID)
+	if err == nil {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE session SET directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
+			s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, sessionID); err != nil {
+			return "", false, false, fmt.Errorf("store: ingest update session: %w", err)
+		}
+		return sessionID, false, false, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", false, false, fmt.Errorf("store: ingest find binding: %w", err)
+	}
+	sessionID = m.NewID()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO session (id, worktree_id, directory, title, model, provider, harness, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sessionID, worktreeID, s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, now); err != nil {
+		return "", false, false, fmt.Errorf("store: ingest insert session: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO session_binding (id, session_id, provider, harness, foreign_session_id, resume_cmd, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.NewID(), sessionID, b.Provider, b.Harness, b.ForeignSessionID, b.ResumeCmd, now, now); err != nil {
+		// A concurrent Ingest bound the same foreign session first: drop
+		// this session row inside the same transaction and adopt the
+		// winner, so the key still names exactly one session.
+		var winner string
+		if qerr := tx.QueryRowContext(ctx,
+			`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
+			b.Provider, b.ForeignSessionID).Scan(&winner); qerr == nil {
+			if _, derr := tx.ExecContext(ctx, `DELETE FROM session WHERE id = ?`, sessionID); derr != nil {
+				return "", false, false, fmt.Errorf("store: ingest adopt session: %w", derr)
+			}
+			if _, uerr := tx.ExecContext(ctx,
+				`UPDATE session SET directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
+				s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, winner); uerr != nil {
+				return "", false, false, fmt.Errorf("store: ingest update session: %w", uerr)
+			}
+			return winner, false, false, nil
+		}
+		return "", false, false, fmt.Errorf("store: ingest insert binding: %w", err)
+	}
+	return sessionID, true, true, nil
+}
+
+// insertTurnTail appends the turns past the stored prefix: position i is
+// seq i, so the first len(stored) entries are the known prefix and only
+// the tail inserts. Reports inserted vs skipped.
+func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessionID string, turns []Turn) (int, int, error) {
+	var have int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM turn WHERE session_id = ?`, sessionID).Scan(&have); err != nil {
+		return 0, 0, fmt.Errorf("store: ingest count turns: %w", err)
+	}
+	skipped := len(turns)
+	if skipped > have {
+		skipped = have
+	}
+	inserted := 0
+	for i, t := range turns[skipped:] {
+		var usd any
+		if t.CostUSDMicros != nil {
+			usd = *t.CostUSDMicros
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO turn (id, session_id, seq, status, cost_input_tokens, cost_output_tokens, cost_total_tokens, cost_cache_read_tokens, cost_cache_write_tokens, cost_reasoning_tokens, cost_usd_micros, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			m.NewID(), sessionID, have+i, t.Status, t.CostInput, t.CostOutput, t.CostTotal, t.CostCacheRead, t.CostCacheWrite, t.CostReasoning, usd, now, now); err != nil {
+			return inserted, skipped, fmt.Errorf("store: ingest insert turn: %w", err)
+		}
+		inserted++
+	}
+	return inserted, skipped, nil
+}
+
+// insertEventTail is insertTurnTail for session events: position i is
+// seq i, the stored prefix is skipped, the tail inserts.
+func insertEventTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessionID string, events []Event) (int, int, error) {
+	var have int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM session_event WHERE session_id = ?`, sessionID).Scan(&have); err != nil {
+		return 0, 0, fmt.Errorf("store: ingest count events: %w", err)
+	}
+	skipped := len(events)
+	if skipped > have {
+		skipped = have
+	}
+	inserted := 0
+	for i, e := range events[skipped:] {
+		data := e.Data
+		if data == "" {
+			data = "{}"
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO session_event (id, session_id, seq, type, data, time_created) VALUES (?, ?, ?, ?, ?, ?)`,
+			m.NewID(), sessionID, have+i, e.Type, data, now); err != nil {
+			return inserted, skipped, fmt.Errorf("store: ingest insert event: %w", err)
+		}
+		inserted++
+	}
+	return inserted, skipped, nil
+}
+
+// insertMessages appends the messages whose ForeignID is new to the
+// session, in Thread order, with seq after the current max, in chunks of
+// ingestBatchSize per transaction. Parts ride the same transaction as
+// their message with per-message seq. Reports message and part counts.
+func (w *Writer) insertMessages(ctx context.Context, sessionID string, now int64, msgs []Message) (mi, ms, pi, ps int, err error) {
+	known := map[string]bool{}
+	rows, err := w.db.QueryContext(ctx, `SELECT foreign_id FROM message WHERE session_id = ? AND foreign_id IS NOT NULL`, sessionID)
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("store: ingest list foreign ids: %w", err)
+	}
+	for rows.Next() {
+		var f string
+		if err := rows.Scan(&f); err != nil {
+			rows.Close()
+			return 0, 0, 0, 0, fmt.Errorf("store: ingest scan foreign ids: %w", err)
+		}
+		known[f] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("store: ingest list foreign ids: %w", err)
+	}
+
+	var maxSeq int
+	if err := w.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), -1) FROM message WHERE session_id = ?`, sessionID).Scan(&maxSeq); err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("store: ingest max message seq: %w", err)
+	}
+	nextSeq := maxSeq + 1
+
+	// Filter first so chunk boundaries never split a skip decision: new
+	// holds exactly the messages this call will append, in order.
+	type pending struct {
+		msg Message
+		seq int
+	}
+	var new []pending
+	for _, msg := range msgs {
+		if msg.ForeignID != "" && known[msg.ForeignID] {
+			ms++
+			ps += len(msg.Parts)
+			continue
+		}
+		if msg.ForeignID != "" {
+			known[msg.ForeignID] = true
+		}
+		new = append(new, pending{msg: msg, seq: nextSeq})
+		nextSeq++
+	}
+
+	for start := 0; start < len(new); start += ingestBatchSize {
+		end := start + ingestBatchSize
+		if end > len(new) {
+			end = len(new)
+		}
+		chunk := new[start:end]
+		tx, err := w.db.BeginTx(ctx, nil)
+		if err != nil {
+			return mi, ms, pi, ps, fmt.Errorf("store: ingest begin: %w", err)
+		}
+		// Rollback on every failure below; the Commit past them reports
+		// its own error, so a failed commit fails here, not on retry.
+		// No defer: this runs per chunk, and a stacked rollback after a
+		// commit would only report ErrTxDone noise.
+		for _, p := range chunk {
+			if _, nparts, ferr := insertOneMessage(ctx, tx, w.minter, now, sessionID, p.msg, p.seq); ferr != nil {
+				tx.Rollback()
+				return mi, ms, pi, ps, ferr
+			} else {
+				mi++
+				pi += nparts
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			tx.Rollback()
+			return mi, ms, pi, ps, fmt.Errorf("store: ingest commit: %w", err)
+		}
+	}
+	return mi, ms, pi, ps, nil
+}
+
+// insertOneMessage writes one message row plus its parts and returns the
+// new message id and part count. An empty ForeignID, ToolCallID or
+// Signature stores NULL; empty Usage or Data stores '{}'.
+func insertOneMessage(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessionID string, msg Message, seq int) (string, int, error) {
+	var foreign any
+	if msg.ForeignID != "" {
+		foreign = msg.ForeignID
+	}
+	usage := msg.Usage
+	if usage == "" {
+		usage = "{}"
+	}
+	var raw any
+	if msg.RawJSON != nil {
+		raw = *msg.RawJSON
+	}
+	msgID := m.NewID()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO message (id, session_id, turn_id, seq, role, provider, model, foreign_id, usage, raw_json, time_created) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		msgID, sessionID, seq, string(msg.Role), msg.Provider, msg.Model, foreign, usage, raw, now); err != nil {
+		return "", 0, fmt.Errorf("store: ingest insert message: %w", err)
+	}
+	for i, p := range msg.Parts {
+		data := p.Data
+		if data == "" {
+			data = "{}"
+		}
+		var toolCall, sig, pforeign any
+		if p.ToolCallID != "" {
+			toolCall = p.ToolCallID
+		}
+		if p.Signature != "" {
+			sig = p.Signature
+		}
+		if p.ForeignID != "" {
+			pforeign = p.ForeignID
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO part (id, message_id, session_id, seq, type, tool_call_id, signature, data, foreign_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			m.NewID(), msgID, sessionID, i, p.Type, toolCall, sig, data, pforeign); err != nil {
+			return "", 0, fmt.Errorf("store: ingest insert part: %w", err)
+		}
+	}
+	return msgID, len(msg.Parts), nil
+}

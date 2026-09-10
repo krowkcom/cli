@@ -133,8 +133,13 @@ func NewToolResultTextPart(callID, output string, isError bool) store.Part {
 // ok reports whether rawType was canonical, which is what a caller counts.
 // Sources that need the counting done for them should use
 // Result.NormalizePart instead.
+// Normalizing is idempotent, which matters because a part can pass through
+// here twice — once as a source read it, once as a caller re-wrapped it.
+// PartUnknown in is PartUnknown out, with the payload untouched and nothing
+// counted again: a second pass must not nest an unknown inside an unknown
+// and report a second missing type that was already reported.
 func NormalizePart(rawType string, raw json.RawMessage) (part store.Part, ok bool) {
-	if KnownPartType(rawType) && rawType != PartUnknown {
+	if KnownPartType(rawType) {
 		return store.Part{Type: rawType, Data: rawDataOrEmpty(raw)}, true
 	}
 	// The raw type would otherwise be lost: Type is now `unknown`, and

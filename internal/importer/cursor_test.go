@@ -71,14 +71,18 @@ func TestDecodeCursorGarbageAndNegatives(t *testing.T) {
 // Both cursor shapes satisfy Cursor, which is what lets a caller store one
 // without knowing which it holds.
 func TestCursorsImplementCursor(t *testing.T) {
-	var cursors = []Cursor{JSONLCursor{Offset: 1}, SQLiteCursor{TimeUpdated: 1}}
-	for _, c := range cursors {
-		if c.Zero() {
-			t.Fatalf("%T with a watermark reported zero", c)
-		}
+	for _, c := range []Cursor{JSONLCursor{Offset: 1}, SQLiteCursor{TimeUpdated: 1}} {
 		if _, err := c.Encode(); err != nil {
 			t.Fatalf("%T Encode: %v", c, err)
 		}
+	}
+	// Zero is on the concrete cursors, not on the interface: a caller
+	// deciding whether to resume already knows which source it is driving.
+	if !(JSONLCursor{}).Zero() || (JSONLCursor{Offset: 1}).Zero() {
+		t.Fatal("JSONLCursor.Zero is wrong")
+	}
+	if !(SQLiteCursor{}).Zero() || (SQLiteCursor{TimeUpdated: 1}).Zero() {
+		t.Fatal("SQLiteCursor.Zero is wrong")
 	}
 }
 

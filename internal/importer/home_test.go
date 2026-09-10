@@ -84,6 +84,15 @@ func TestOpenHomeRefusesOutsideHome(t *testing.T) {
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("err = %v, want %v", err, tt.want)
 			}
+			// And nothing was read: the refusal has to happen before any
+			// byte of the file it refused.
+			data, err := ReadHome(homeEnv(home), tt.rel, 0)
+			if data != nil {
+				t.Fatalf("ReadHome returned %d bytes, want none", len(data))
+			}
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("ReadHome err = %v, want %v", err, tt.want)
+			}
 		})
 	}
 }
@@ -126,6 +135,78 @@ func TestOpenHomeRefusesEscapingSymlink(t *testing.T) {
 			}
 			if !errors.Is(err, ErrEscapingSymlink) {
 				t.Fatalf("err = %v, want ErrEscapingSymlink", err)
+			}
+			data, rerr := ReadHome(homeEnv(home), rel, 0)
+			if data != nil {
+				t.Fatalf("ReadHome returned %d bytes, want none", len(data))
+			}
+			if !errors.Is(rerr, ErrEscapingSymlink) {
+				t.Fatalf("ReadHome err = %v, want ErrEscapingSymlink", rerr)
+			}
+		})
+	}
+}
+
+// A symlink whose target does not exist yet is the case path resolution is
+// most likely to get wrong: EvalSymlinks reports it as not existing, which
+// is true of the target and false of the link. Filing it as a missing
+// component would vouch for a path that starts reading outside home the
+// moment somebody creates the target.
+//
+// It is refused whichever way it dangles. An inward-dangling link is
+// harmless today and would be approved on the strength of a file that does
+// not exist; an answer that changes when somebody else creates a file is not
+// an answer worth giving.
+func TestHomePathRefusesDanglingSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on Windows")
+	}
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		link   string
+		target string
+	}{
+		{
+			name:   "dangling out of home",
+			link:   "out.jsonl",
+			target: filepath.Join(root, "checkout", "not-yet.jsonl"),
+		},
+		{
+			name:   "dangling inside home",
+			link:   "in.jsonl",
+			target: filepath.Join(home, "not-yet.jsonl"),
+		},
+		{
+			name:   "dangling directory component",
+			link:   filepath.Join("linkdir", "a.jsonl"),
+			target: filepath.Join(root, "checkout", "sessions"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			link := filepath.Join(home, tt.link)
+			if filepath.Dir(tt.link) != "." {
+				link = filepath.Join(home, filepath.Dir(tt.link))
+			}
+			if err := os.Symlink(tt.target, link); err != nil {
+				t.Fatalf("Symlink: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Remove(link) })
+			if _, err := HomePath(homeEnv(home), tt.link); !errors.Is(err, ErrEscapingSymlink) {
+				t.Fatalf("HomePath = %v, want ErrEscapingSymlink", err)
+			}
+			data, err := ReadHome(homeEnv(home), tt.link, 0)
+			if data != nil {
+				t.Fatalf("ReadHome returned %d bytes, want none", len(data))
+			}
+			if !errors.Is(err, ErrEscapingSymlink) {
+				t.Fatalf("ReadHome err = %v, want ErrEscapingSymlink", err)
 			}
 		})
 	}

@@ -40,6 +40,11 @@ type Source interface {
 	Discover(env harness.Env) ([]Ref, error)
 	// Read parses ref from cursor onward. The returned Cursor is where a
 	// later call should resume; a zero cursor in means "from the start".
+	//
+	// A Source must return ErrCursorType when cursor is not the concrete
+	// kind it takes. Silently falling back to a full rescan would be the
+	// tempting alternative and is the wrong one: it turns a caller's bug
+	// into an intermittent performance problem nobody can find.
 	Read(env harness.Env, ref Ref, cursor Cursor) (store.Thread, Cursor, Result, error)
 }
 
@@ -82,7 +87,9 @@ type SkippedLine struct {
 // Result is what one Read did, in rows rather than in prose. It exists so a
 // lossy import is reportable instead of either fatal or invisible.
 type Result struct {
-	// Lines is every line the reader consumed, skipped ones included.
+	// Lines is every non-blank line the reader consumed, skipped ones
+	// included. Blank lines are padding and are not counted: a Lines total
+	// inflated by whitespace would make the skip ratio meaningless.
 	Lines int
 	// Unknown counts parts whose source type was not in the fixed set and
 	// so landed as `unknown`.
@@ -137,6 +144,12 @@ func (r *Result) Merge(other Result) {
 // would report an empty machine rather than an unsupported one, and an empty
 // machine is the answer a user would believe.
 var ErrUnsupportedOS = errors.New("importing is not supported on this operating system")
+
+// ErrCursorType is a cursor of the wrong concrete kind for the Source it was
+// handed to — a SQLiteCursor given to a JSONL source, or a cursor type from
+// a later build. It is a refusal rather than a rescan so the mistake surfaces
+// where it was made.
+var ErrCursorType = errors.New("cursor is not the kind this source takes")
 
 // CheckOS is the first line of every Discover implementation. Keeping the
 // refusal in one build-tagged function is what lets the sources stay

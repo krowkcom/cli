@@ -25,7 +25,10 @@ func TestNormalizePartMapsOntoTheFixedSet(t *testing.T) {
 		{name: "step", rawType: PartStep, raw: `{}`, want: PartStep, known: true},
 		{name: "a type nobody has seen", rawType: "redacted_reasoning", raw: `{"x":1}`, want: PartUnknown},
 		{name: "empty type", rawType: "", raw: `{"x":1}`, want: PartUnknown},
-		{name: "unknown asked for by name is still unknown", rawType: PartUnknown, raw: `{"x":1}`, want: PartUnknown},
+		// Normalizing twice must not nest: a part already marked unknown
+		// passes through as itself, so a second pass neither re-wraps the
+		// payload nor reports the same missing type again.
+		{name: "unknown passes through untouched", rawType: PartUnknown, raw: `{"source_type":"x","raw":{}}`, want: PartUnknown, known: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -42,7 +45,7 @@ func TestNormalizePartMapsOntoTheFixedSet(t *testing.T) {
 			if part.Data != "" && !json.Valid([]byte(part.Data)) {
 				t.Fatalf("Data is not valid JSON: %q", part.Data)
 			}
-			if tt.want != PartUnknown {
+			if tt.want != PartUnknown || tt.known {
 				return
 			}
 			// The unknown case has to keep both the raw payload and the
@@ -69,10 +72,19 @@ func TestNormalizePartMapsOntoTheFixedSet(t *testing.T) {
 func TestResultNormalizePartCountsUnknown(t *testing.T) {
 	var res Result
 	res.NormalizePart(PartText, json.RawMessage(`{"text":"hi"}`))
-	res.NormalizePart("server_tool_use", json.RawMessage(`{}`))
+	first := res.NormalizePart("server_tool_use", json.RawMessage(`{}`))
 	res.NormalizePart("server_tool_use", json.RawMessage(`{}`))
 	if res.Unknown != 2 {
 		t.Fatalf("Unknown = %d, want 2", res.Unknown)
+	}
+	// Re-normalizing an already-unknown part counts nothing further and
+	// changes nothing: the operation is idempotent.
+	again := res.NormalizePart(first.Type, json.RawMessage(first.Data))
+	if again.Type != PartUnknown || again.Data != first.Data {
+		t.Fatalf("re-normalized = %+v, want %+v unchanged", again, first)
+	}
+	if res.Unknown != 2 {
+		t.Fatalf("Unknown = %d after re-normalizing, want 2", res.Unknown)
 	}
 	if res.UnknownTypes["server_tool_use"] != 2 {
 		t.Fatalf("UnknownTypes = %v", res.UnknownTypes)

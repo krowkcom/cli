@@ -22,14 +22,17 @@ var ErrSkipLine = errors.New("skip this line")
 // ReadJSONL walks the complete lines of f from cur onward, hands each one to
 // fn, and returns the watermark to resume from.
 //
-// Three things make this more than a bufio.Scanner.
+// Several things make this more than a bufio.Scanner.
 //
-// A stale cursor is detected and ignored. If the file is shorter now than
-// when the cursor was taken, or the offset is past the end, the file was
-// rewritten rather than appended to and the read restarts at zero. Resuming
-// into a rewritten file would silently import the wrong bytes, which is a
-// worse failure than re-importing the right ones — the store dedups by
-// foreign id, so a rescan converges.
+// A shrunken file is detected and rescanned. If the file is shorter now
+// than when the cursor was taken, or the offset is past the end, it was
+// rewritten rather than appended to, and nothing before the offset is known
+// to be the same bytes any more. Restarting at zero is cheap because the
+// store dedups by foreign id, so a rescan converges instead of duplicating.
+//
+// A file rewritten to the same length or longer is not detected, and is not
+// meant to be — see JSONLCursor for why that is the transcripts' bargain
+// rather than an oversight.
 //
 // A cursor that landed mid-line is backed up. Nothing in this package ever
 // takes such a cursor, but a crash, a hand-edited row or an older build
@@ -45,7 +48,10 @@ var ErrSkipLine = errors.New("skip this line")
 //
 // A line that is not valid JSON is counted in Result.Skipped with its line
 // number and byte offset, and the read continues. One corrupt line in a
-// transcript loses that line, not the session.
+// transcript loses that line, not the session. So does a complete line past
+// maxLineBytes: failing on it would pin the cursor to that line's start and
+// every retry would fail in the same place, which means one absurd line
+// would cost the whole rest of the file, permanently.
 func ReadJSONL(f *os.File, cur JSONLCursor, fn func(lineNo int, line []byte) error) (JSONLCursor, Result, error) {
 	var res Result
 
@@ -65,54 +71,65 @@ func ReadJSONL(f *os.File, cur JSONLCursor, fn func(lineNo int, line []byte) err
 	lineNo := 0
 
 	for {
-		line, err := readLine(reader)
-		if len(line) > 0 && err == nil {
-			lineNo++
-			lineStart := offset
-			offset += int64(len(line))
-			payload := trimEOL(line)
-			// An empty line is not a failure worth reporting: writers pad
-			// transcripts with them, and a "skipped" count full of blanks
-			// would bury the lines that actually failed.
-			if len(payload) > 0 {
-				res.Lines++
-				if !json.Valid(payload) {
-					res.Skip(lineNo, lineStart, "invalid json")
-					continue
-				}
-				if ferr := fn(lineNo, payload); ferr != nil {
-					if errors.Is(ferr, ErrSkipLine) {
-						res.Skip(lineNo, lineStart, ferr.Error())
-						continue
-					}
-					// The cursor returned stops at the last line the
-					// callback accepted, so a retry re-reads this one
-					// rather than skipping past the failure.
-					return JSONLCursor{Offset: lineStart, Size: size}, res, fmt.Errorf("line %d: %w", lineNo, ferr)
-				}
-			}
-			continue
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				// Whatever is left has no newline: a partial write. Leave
-				// the offset in front of it.
-				break
-			}
-			if errors.Is(err, bufio.ErrBufferFull) {
-				return JSONLCursor{Offset: offset, Size: size}, res, fmt.Errorf("line %d: %w", lineNo+1, errLineTooLong)
-			}
+		payload, consumed, tooLong, err := readLine(reader)
+		if err != nil && !errors.Is(err, io.EOF) {
 			return JSONLCursor{Offset: offset, Size: size}, res, err
 		}
-		break
+		if errors.Is(err, io.EOF) {
+			// Whatever is left has no newline: a partial write. Leave the
+			// offset in front of it so a later append completes it.
+			if tooLong {
+				// Except when the tail is already past the cap. Nothing
+				// will complete a line that long, and buffering on in the
+				// hope that something does is the exact cost the cap
+				// exists to refuse. The cursor still stops in front of it,
+				// so a caller that fixes the file resumes cleanly.
+				return JSONLCursor{Offset: offset, Size: size}, res, fmt.Errorf("line %d: %w", lineNo+1, errLineTooLong)
+			}
+			break
+		}
+		lineNo++
+		lineStart := offset
+		offset += consumed
+
+		// A complete line past the cap is skipped, not fatal. Failing here
+		// would leave the cursor at the line start forever, so one absurd
+		// line would mean the rest of the file was never imported again.
+		if tooLong {
+			res.Lines++
+			res.Skip(lineNo, lineStart, errLineTooLong.Error())
+			continue
+		}
+		// An empty line is not a failure worth reporting: writers pad
+		// transcripts with them, and a "skipped" count full of blanks
+		// would bury the lines that actually failed.
+		if len(payload) == 0 {
+			continue
+		}
+		res.Lines++
+		if !json.Valid(payload) {
+			res.Skip(lineNo, lineStart, "invalid json")
+			continue
+		}
+		if ferr := fn(lineNo, payload); ferr != nil {
+			if errors.Is(ferr, ErrSkipLine) {
+				res.Skip(lineNo, lineStart, ferr.Error())
+				continue
+			}
+			// The cursor returned stops at the last line the callback
+			// accepted, so a retry re-reads this one rather than skipping
+			// past the failure.
+			return JSONLCursor{Offset: lineStart, Size: size}, res, fmt.Errorf("line %d: %w", lineNo, ferr)
+		}
 	}
 
 	return JSONLCursor{Offset: offset, Size: size}, res, nil
 }
 
-// errLineTooLong is a line past maxLineBytes. It stops the file rather than
-// skipping the line, because a file whose lines do not end is not a JSONL
-// file and reading on would be reading noise.
+// errLineTooLong is a line past maxLineBytes. A complete one is skipped
+// like any other unusable line; an unterminated tail that is already that
+// long stops the read, because a file whose lines do not end is not a JSONL
+// file and buffering on would be buffering noise.
 var errLineTooLong = errors.New("line exceeds the maximum length")
 
 // startOffset decides where a read begins: the cursor, zero if the cursor
@@ -123,7 +140,9 @@ func startOffset(f *os.File, cur JSONLCursor, size int64) int64 {
 	}
 	// Shorter than when the watermark was taken, or a watermark past the
 	// end: the file was rewritten, so nothing before the offset is known to
-	// be the same bytes any more.
+	// be the same bytes any more. A rewrite that left the file the same
+	// length or longer is invisible here, by the design JSONLCursor
+	// documents.
 	if cur.Size > size || cur.Offset > size {
 		return 0
 	}
@@ -169,28 +188,34 @@ func lineStartBefore(f *os.File, off int64) int64 {
 	return 0
 }
 
-// readLine returns one line including its newline, so the caller can advance
-// the byte offset by exactly what it consumed. io.EOF with bytes in hand
-// means an unterminated trailing line, which the caller declines to consume.
-func readLine(r *bufio.Reader) ([]byte, error) {
-	var line []byte
+// readLine reads one line and reports three things: the payload without its
+// terminator, how many bytes were consumed (which is what the byte offset
+// advances by, so the terminator counts), and whether the line ran past
+// maxLineBytes.
+//
+// An over-long line is consumed to its end and its payload dropped rather
+// than returned: the caller cannot use it, and holding on to it is the
+// unbounded allocation the cap is there to prevent. io.EOF with bytes in
+// hand means an unterminated trailing line, which the caller declines to
+// consume.
+func readLine(r *bufio.Reader) (payload []byte, consumed int64, tooLong bool, err error) {
 	for {
-		chunk, err := r.ReadSlice('\n')
-		if errors.Is(err, bufio.ErrBufferFull) {
-			line = append(line, chunk...)
-			if len(line) > maxLineBytes {
-				return line, bufio.ErrBufferFull
+		chunk, rerr := r.ReadSlice('\n')
+		consumed += int64(len(chunk))
+		if !tooLong {
+			payload = append(payload, chunk...)
+			if int64(len(payload)) > maxLineBytes {
+				tooLong = true
+				payload = nil
 			}
+		}
+		if errors.Is(rerr, bufio.ErrBufferFull) {
 			continue
 		}
-		line = append(line, chunk...)
-		if err != nil {
-			return line, err
+		if rerr != nil {
+			return payload, consumed, tooLong, rerr
 		}
-		if len(line) > maxLineBytes {
-			return line, bufio.ErrBufferFull
-		}
-		return line, nil
+		return trimEOL(payload), consumed, tooLong, nil
 	}
 }
 

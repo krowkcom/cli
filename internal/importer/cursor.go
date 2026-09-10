@@ -14,25 +14,34 @@ import (
 // and read by whoever resumes from it; nothing in between needs to know
 // which kind it holds, and a caller that does know decodes the concrete type
 // directly.
+// Encode is the whole interface. Zero is a method on the concrete cursors
+// rather than part of the contract, because deciding whether to resume is
+// something a caller does once it knows which kind of source it is driving.
 type Cursor interface {
 	// Encode is the JSON to store. It never fails for the shapes in this
 	// package, but the signature admits it so a future cursor carrying a
 	// map does not have to change every call site.
 	Encode() (string, error)
-	// Zero reports a cursor that means "read from the beginning", which is
-	// what an absent import_state row decodes to.
-	Zero() bool
 }
 
 // JSONLCursor is how far a line-oriented transcript has been read: Offset
 // bytes consumed, taken when the file was Size bytes long.
 //
-// Size is not redundant. An offset alone cannot tell a resumed read whether
-// the file it is about to seek into is the file the offset was taken from: a
-// rotated, rewritten or truncated transcript can easily be longer at the
-// same path with entirely different bytes before Offset. A file that is
-// shorter than Size now is a file that was rewritten, and the only safe
-// reading of it is the whole thing.
+// Size is what makes a shrink detectable. A file shorter than Size now is a
+// file that was rewritten rather than appended to, and the only safe reading
+// of it is the whole thing.
+//
+// It detects nothing else, and is not meant to. The watermark assumes an
+// append-only transcript: a rewrite that leaves the file the same length or
+// longer at the same path is invisible here, and a resumed read will trust
+// bytes it never saw. That is accepted rather than overlooked. The
+// transcripts krowk imports are append-only in practice — Claude and cursor
+// both only ever add lines to a session file — and the cost of being wrong
+// is bounded by the store, which dedups messages on
+// (session_id, foreign_id): a session whose file really was rewritten
+// re-imports what changed and converges instead of duplicating. Hashing a
+// prefix on every read to close the gap would cost more than the failure it
+// prevents.
 type JSONLCursor struct {
 	Offset int64 `json:"offset"`
 	Size   int64 `json:"size"`

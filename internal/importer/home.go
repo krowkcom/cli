@@ -28,10 +28,12 @@ var (
 	// ErrOutsideHome is a resolved path that does not live under the home
 	// directory. Home is the only place this package trusts.
 	ErrOutsideHome = errors.New("path is outside the home directory")
-	// ErrEscapingSymlink is a symlink on the path whose target leaves home.
-	// A checkout can contain a link to anywhere; following it would let
-	// whoever wrote the checkout choose what krowk reads.
-	ErrEscapingSymlink = errors.New("symlink escapes the home directory")
+	// ErrEscapingSymlink is a symlink on the path that does not resolve to
+	// somewhere inside home — because its target is elsewhere, or because
+	// it does not resolve at all. A checkout can contain a link to
+	// anywhere; following it would let whoever wrote the checkout choose
+	// what krowk reads.
+	ErrEscapingSymlink = errors.New("symlink does not resolve inside the home directory")
 	// ErrNotRegularFile is a directory, a FIFO or a device where a
 	// transcript was expected.
 	ErrNotRegularFile = errors.New("not a regular file")
@@ -58,7 +60,16 @@ var (
 // A path that does not exist yet resolves as far as it can and is checked on
 // what exists: EvalSymlinks fails on a missing leaf, so the leaf is checked
 // lexically and its parent chain is checked for real. That is what lets
-// HomePath answer for a file a Discover is about to look for.
+// HomePath answer for a file a Discover is about to look for. A component
+// that exists but does not resolve — a dangling symlink — is refused rather
+// than treated as missing; see resolveExisting.
+//
+// What path resolution cannot see, it does not pretend to. A hard link under
+// home to a file outside it is indistinguishable from the file itself: there
+// is no path to inspect, because a hard link is not a reference to a path.
+// Such a file is read. That is the same bargain as trusting home in the
+// first place — creating one requires write access to the home directory,
+// and anything with that could simply put the bytes there.
 func HomePath(env harness.Env, rel string) (string, error) {
 	home := harness.HomeDir(env)
 	if home == "" {
@@ -105,8 +116,18 @@ func HomePath(env harness.Env, rel string) (string, error) {
 
 // resolveExisting is EvalSymlinks for a path whose leaf may not exist yet.
 // The deepest existing ancestor is resolved for real; the components below
-// it cannot be symlinks, because they are not there, so rejoining them
-// lexically is exact rather than a guess.
+// it are then rejoined lexically, which is exact rather than a guess only
+// because a component that is not there cannot be a symlink.
+//
+// That last clause is why the Lstat is here. EvalSymlinks reports a dangling
+// symlink as not existing, which is true of its target and false of the link
+// — so without the check, a link under home pointing at a checkout would be
+// filed as a missing component, rejoined lexically, and vouched for. The
+// moment its target appeared, a read that had already been approved would be
+// reading outside home. A component that Lstat can see is therefore refused,
+// whether it dangles inward or outward: which it is depends on a file that
+// does not exist yet, and an answer that changes when somebody else creates
+// a file is not an answer.
 func resolveExisting(path string) (string, error) {
 	missing := []string{}
 	cur := path
@@ -117,6 +138,10 @@ func resolveExisting(path string) (string, error) {
 		}
 		if !os.IsNotExist(err) {
 			return "", fmt.Errorf("resolve %s: %w", cur, err)
+		}
+		if _, lerr := os.Lstat(cur); lerr == nil {
+			// The component is there; only its target is not.
+			return "", fmt.Errorf("%w: %s does not resolve", ErrEscapingSymlink, cur)
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
@@ -165,31 +190,40 @@ func underDir(dir, path string) bool {
 // and own closing it — the size check is on the descriptor, so the file they
 // hold is the file that was measured.
 func OpenHome(env harness.Env, rel string, maxBytes int64) (*os.File, error) {
+	f, _, err := openHome(env, rel, maxBytes)
+	return f, err
+}
+
+// openHome is OpenHome plus the resolved path, so ReadHome can name the same
+// path in its errors that OpenHome named in its own — a caller comparing two
+// messages about one file should not have to work out that they are about one
+// file.
+func openHome(env harness.Env, rel string, maxBytes int64) (*os.File, string, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxBytes
 	}
 	path, err := HomePath(env, rel)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	f, err := openNoFollow(path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	info, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return nil, err
+		return nil, "", err
 	}
 	if !info.Mode().IsRegular() {
 		_ = f.Close()
-		return nil, fmt.Errorf("%s: %w", path, ErrNotRegularFile)
+		return nil, "", fmt.Errorf("%s: %w", path, ErrNotRegularFile)
 	}
 	if info.Size() > maxBytes {
 		_ = f.Close()
-		return nil, fmt.Errorf("%s: %w (%d > %d bytes)", path, ErrTooLarge, info.Size(), maxBytes)
+		return nil, "", fmt.Errorf("%s: %w (%d > %d bytes)", path, ErrTooLarge, info.Size(), maxBytes)
 	}
-	return f, nil
+	return f, path, nil
 }
 
 // ReadHome is OpenHome for a caller that wants the whole file — a SQLite
@@ -200,7 +234,7 @@ func ReadHome(env harness.Env, rel string, maxBytes int64) ([]byte, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxBytes
 	}
-	f, err := OpenHome(env, rel, maxBytes)
+	f, path, err := openHome(env, rel, maxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +246,7 @@ func ReadHome(env harness.Env, rel string, maxBytes int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("%s: %w (over %d bytes)", rel, ErrTooLarge, maxBytes)
+		return nil, fmt.Errorf("%s: %w (over %d bytes)", path, ErrTooLarge, maxBytes)
 	}
 	return data, nil
 }

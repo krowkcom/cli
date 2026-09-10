@@ -3,6 +3,7 @@ package importer
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -72,7 +73,18 @@ func (s fakeSource) Read(env harness.Env, ref Ref, cursor Cursor) (store.Thread,
 		Session:  store.Session{Directory: "/repo", Title: ref.ID, Provider: s.Name(), Harness: s.Name()},
 		Binding:  store.Binding{Provider: s.Name(), Harness: s.Name(), ForeignSessionID: ref.ID},
 	}
-	jc, _ := cursor.(JSONLCursor)
+	// A cursor of the wrong kind is refused rather than treated as a fresh
+	// read: a silent full rescan would turn a caller's bug into a
+	// performance mystery. A nil cursor is not a mismatch — it is how a
+	// caller says "from the start".
+	jc := JSONLCursor{}
+	if cursor != nil {
+		typed, ok := cursor.(JSONLCursor)
+		if !ok {
+			return th, nil, Result{}, fmt.Errorf("%s: %w, got %T", s.Name(), ErrCursorType, cursor)
+		}
+		jc = typed
+	}
 
 	f, err := OpenHome(env, ref.Path, 0)
 	if err != nil {
@@ -303,6 +315,34 @@ func TestCheckOSMatchesPlatform(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("CheckOS on %s = %v, want nil", runtime.GOOS, err)
+	}
+}
+
+// Acceptance for the cursor-type clause of the Source contract: a cursor of
+// the wrong concrete kind is a typed refusal, and nothing is read.
+func TestFakeSourceRefusesWrongCursorType(t *testing.T) {
+	home := t.TempDir()
+	writeFakeTranscript(t, home, "sess-3.jsonl", fakeTranscript)
+	ref := Ref{Provider: ProviderClaude, ID: "sess-3", Path: filepath.Join(fakeDir, "sess-3.jsonl")}
+
+	th, cur, res, err := (fakeSource{}).Read(homeEnv(home), ref, SQLiteCursor{TimeUpdated: 1})
+	if !errors.Is(err, ErrCursorType) {
+		t.Fatalf("err = %v, want ErrCursorType", err)
+	}
+	if len(th.Messages) != 0 || len(th.Turns) != 0 {
+		t.Fatalf("refused read still produced %d messages / %d turns", len(th.Messages), len(th.Turns))
+	}
+	if cur != nil {
+		t.Fatalf("cursor = %+v, want nil on a refusal", cur)
+	}
+	if res.Lines != 0 || len(res.Skipped) != 0 {
+		t.Fatalf("refused read accounted for %+v, want nothing", res)
+	}
+
+	// A nil cursor is not a mismatch: it is how a caller asks for a full
+	// read.
+	if _, _, _, err := (fakeSource{}).Read(homeEnv(home), ref, nil); err != nil {
+		t.Fatalf("Read with a nil cursor = %v, want a full read", err)
 	}
 }
 

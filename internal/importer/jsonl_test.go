@@ -264,3 +264,58 @@ func TestReadJSONLCarriageReturnsTrimmed(t *testing.T) {
 		t.Fatalf("got %q, want the line without its CR", got)
 	}
 }
+
+// A complete line past maxLineBytes is a skip, not a wall: the read must get
+// past it, or one absurd line would cost the whole rest of the file on every
+// retry from then on.
+func TestReadJSONLOverLongLineIsSkippedAndReadContinues(t *testing.T) {
+	long := `{"pad":"` + strings.Repeat("x", 17<<20) + `"}`
+	content := "{\"i\":1}\n" + long + "\n{\"i\":3}\n"
+	path := writeFile(t, "long.jsonl", content)
+
+	got, cur, res := readAll(t, path, JSONLCursor{})
+	want := []string{`{"i":1}`, `{"i":3}`}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("got %d lines (%v), want both short lines", len(got), got)
+	}
+	if len(res.Skipped) != 1 || res.Skipped[0].Line != 2 {
+		t.Fatalf("Skipped = %+v, want the long line at line 2", res.Skipped)
+	}
+	if res.Skipped[0].Offset != 8 {
+		t.Fatalf("Skipped[0].Offset = %d, want 8", res.Skipped[0].Offset)
+	}
+	// The cursor is past the whole file, so the next read is empty rather
+	// than stuck on the same line.
+	if cur.Offset != int64(len(content)) {
+		t.Fatalf("cursor = %+v, want offset %d", cur, len(content))
+	}
+	got, _, res = readAll(t, path, cur)
+	if len(got) != 0 || len(res.Skipped) != 0 {
+		t.Fatalf("resumed read got %v / %+v, want nothing", got, res.Skipped)
+	}
+}
+
+// An unterminated tail already past the cap is the one fatal case: nothing
+// is going to complete a line that long, and buffering on is the cost the
+// cap refuses. The cursor still stops in front of it.
+func TestReadJSONLOverLongUnterminatedTailIsFatal(t *testing.T) {
+	path := writeFile(t, "tail.jsonl", "{\"i\":1}\n{\"pad\":\""+strings.Repeat("x", 17<<20))
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer f.Close()
+	cur, res, err := ReadJSONL(f, JSONLCursor{}, func(_ int, _ []byte) error { return nil })
+	if err == nil {
+		t.Fatal("ReadJSONL succeeded, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "maximum length") {
+		t.Fatalf("err = %v, want the line-length refusal", err)
+	}
+	if cur.Offset != 8 {
+		t.Fatalf("cursor = %+v, want offset 8 (in front of the tail)", cur)
+	}
+	if res.Lines != 1 {
+		t.Fatalf("Lines = %d, want the one good line", res.Lines)
+	}
+}

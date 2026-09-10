@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // SchemaSQL is 001_init.sql, the single source of truth for the v1 schema,
@@ -42,8 +44,9 @@ var ErrSchemaMismatch = errors.New("store: schema mismatch")
 
 // createTableRe finds the table each CREATE TABLE in the schema defines.
 // The schema is this package's own file, so the pattern stays narrow on
-// purpose rather than parsing arbitrary DDL.
-var createTableRe = regexp.MustCompile(`(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["'` + "`" + `\[]?([A-Za-z_][A-Za-z0-9_]*)`)
+// purpose rather than parsing arbitrary DDL — but it skips TEMP and an
+// optional schema qualifier, so neither leaks into the expected name.
+var createTableRe = regexp.MustCompile(`(?i)CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:["'` + "`" + `\[]?[A-Za-z_][A-Za-z0-9_]*["'` + "`" + `\]]?\.)?["'` + "`" + `\[]?([A-Za-z_][A-Za-z0-9_]*)`)
 
 // expectedTables lists the tables 001_init.sql defines, in file order.
 // Deduplicated: a later v1 edit must not make a re-listed table look like
@@ -73,10 +76,42 @@ func fileURI(path, rawQuery string) string {
 	return u.String()
 }
 
+// gatePragmas ride the read-write handle only until the schema gate passes:
+// busy_timeout and foreign_keys are per-connection, so opening with them
+// rewrites no header bytes. journal_mode and synchronous are persistent —
+// replaying them at connect would flip a refused file to WAL before the
+// re-check even runs — so Open applies those explicitly after the accept.
+const gatePragmas = "_pragma=busy_timeout(10000)" +
+	"&_pragma=foreign_keys(1)"
+
+// gateDSN opens path read-write without the persistent pragmas, for the
+// gate and the init transaction. A file refused after this open is still
+// byte-identical: nothing yet had a reason to rewrite its header.
+func gateDSN(path string) string {
+	return fileURI(path, gatePragmas)
+}
+
+// persistPragmas flips the accepted file to the steady-state durability the
+// DSN replays on every later connection: WAL so readers never block the
+// writer, NORMAL synchronous which is safe under WAL. Runs once, after the
+// gate accepts — never before a refusal.
+func persistPragmas(db *sql.DB, path string) error {
+	if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+		return fmt.Errorf("store: persist journal_mode %s: %w", path, err)
+	}
+	if _, err := db.Exec(`PRAGMA synchronous = NORMAL`); err != nil {
+		return fmt.Errorf("store: persist synchronous %s: %w", path, err)
+	}
+	return nil
+}
+
 // inspectDSN opens path read-only and immutable: no lock, no WAL recovery,
 // no journal-mode flip, so a file Open is about to refuse stays
 // byte-identical. No pragmas ride it either — even replaying journal_mode
 // would rewrite the header of a file that is none of our business.
+// Immutable still reads committed WAL frames (verified, not assumed), so a
+// version stamped but never checkpointed is seen, not missed; a writer
+// mid-commit is the residual TOCTOU the read-write re-check backstops.
 func inspectDSN(path string) string {
 	return fileURI(path, "mode=ro&immutable=1")
 }
@@ -104,6 +139,57 @@ func listTables(q interface {
 	return tables, nil
 }
 
+// busyRetry runs fn until it succeeds or fails with anything but
+// SQLITE_BUSY ("database is locked"), bounding the wait. It is the missing
+// half of busy_timeout for opens and gate reads: the driver replays the
+// connect-time _pragma list before busy_timeout itself is armed, so a
+// commit landing in that window fails the open instead of waiting. The lock
+// holder always finishes in milliseconds (short txns by contract), so a
+// short retry turns a spurious failure into a success; a genuinely stuck
+// writer still surfaces after ~0.5s.
+func busyRetry(fn func() error) error {
+	var err error
+	for i := 0; i < 10; i++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "database is locked") {
+			return err
+		}
+		time.Sleep(time.Duration(i+1) * 10 * time.Millisecond)
+	}
+	return err
+}
+
+// readVersionAndTables reads the version and table set as one atomic unit:
+// a read-only transaction pins the snapshot, so the pair can never straddle
+// a concurrent commit (version 0 from before, tables from after). The store
+// has no context plumbing; Background is the whole contract.
+func readVersionAndTables(db *sql.DB) (int, map[string]bool, error) {
+	var version int
+	var tables map[string]bool
+	err := busyRetry(func() error {
+		tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := tx.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+			return err
+		}
+		t, err := listTables(tx)
+		if err != nil {
+			return err
+		}
+		tables = t
+		return tx.Commit()
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	return version, tables, nil
+}
+
 // inspectSchema reads the version and table set without modifying anything.
 // The caller decides what versions and shapes are acceptable.
 func inspectSchema(path string) (version int, tables map[string]bool, err error) {
@@ -112,16 +198,10 @@ func inspectSchema(path string) (version int, tables map[string]bool, err error)
 		return 0, nil, err
 	}
 	defer db.Close()
-	// A single connection keeps the two reads on the same snapshot.
+	// A single connection keeps the two reads on the same handle; the
+	// read transaction keeps them on the same snapshot.
 	db.SetMaxOpenConns(1)
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-		return 0, nil, err
-	}
-	tables, err = listTables(db)
-	if err != nil {
-		return 0, nil, err
-	}
-	return version, tables, nil
+	return readVersionAndTables(db)
 }
 
 // rebuildHint tells the human the one supported recovery: the file holds
@@ -130,12 +210,32 @@ func rebuildHint(path, why string) error {
 	return fmt.Errorf("%w: %s; run `krowk sessions rebuild` (delete %s and re-import)", ErrSchemaMismatch, why, path)
 }
 
+// hasUserTables reports whether the file holds tables Open did not create.
+// sqlite_% internals (sqlite_sequence from AUTOINCREMENT, sqlite_stat1 from
+// ANALYZE) never stand alone — a file with only those is still fresh.
+func hasUserTables(tables map[string]bool) bool {
+	for name := range tables {
+		if !strings.HasPrefix(name, "sqlite_") {
+			return true
+		}
+	}
+	return false
+}
+
 // checkSchemaContent applies the gate to an inspected file: version must be
-// 0 (fresh) or exactly SchemaVersion with every expected table present, and
-// a migrations table must never be there in v1 — its presence means a newer
-// writer touched the file.
+// 0 on an empty file (fresh) or exactly SchemaVersion with every expected
+// table present, and a migrations table must never be there in v1 — its
+// presence means a newer writer touched the file. Version 0 with tables is
+// refused, never adopted: stamping a foreign file would bless content this
+// package did not create.
 func checkSchemaContent(path string, version int, tables map[string]bool, schema string) error {
-	if version != 0 && version != SchemaVersion {
+	if version == 0 {
+		if hasUserTables(tables) {
+			return rebuildHint(path, "krowk.db holds tables at schema version 0, which Open never writes")
+		}
+		return nil
+	}
+	if version != SchemaVersion {
 		return rebuildHint(path, fmt.Sprintf("krowk.db schema version %d (want %d)", version, SchemaVersion))
 	}
 	if tables["migrations"] {
@@ -153,13 +253,22 @@ func checkSchemaContent(path string, version int, tables map[string]bool, schema
 
 // checkSchemaFile runs the gate against the file without modifying it —
 // immutable and read-only, so a refusal leaves no WAL sidecar and flips no
-// journal mode. Open calls this before the read-write open; the write path
-// re-checks on its own handle, so a file swapped between the two still fails
-// closed (only DSN connect pragmas could have touched it, which is the
-// concurrent writer's doing, not this Open's).
+// journal mode. A file that is not a database at all maps to the rebuild
+// hint too: the message names the driver error, so the hint is actionable
+// instead of raw. Other inspect failures (permissions, I/O) stay plain
+// errors — hinting a rebuild there would blame the file for the filesystem.
+// Open calls this before the read-write open; the write path re-checks on
+// its own handle, so a file swapped between the two still fails closed
+// (and, on the gate DSN, without a header rewrite first).
 func checkSchemaFile(path, schema string) error {
 	version, tables, err := inspectSchema(path)
 	if err != nil {
+		if msg := err.Error(); strings.Contains(msg, "file is not a database") ||
+			strings.Contains(msg, "database disk image is malformed") {
+			// Both wordings are SQLite's own stable SQLITE_NOTADB /
+			// SQLITE_CORRUPT texts, not ours to rephrase away.
+			return rebuildHint(path, fmt.Sprintf("krowk.db is unreadable (%s)", msg))
+		}
 		return fmt.Errorf("store: inspect %s: %w", path, err)
 	}
 	return checkSchemaContent(path, version, tables, schema)
@@ -216,21 +325,34 @@ func applySchema(db *sql.DB, schema string) error {
 // ensureSchema brings the read-write handle to the gate: re-read the version
 // on this handle (the file may have moved since checkSchemaFile), initialise
 // a fresh file, accept an exact match, or fail with the rebuild hint before
-// any write of its own. Callers close db on error.
+// any write of its own. A lost init race is accepted, not errored: two
+// first-launch Opens may both read version 0, and the loser must adopt the
+// winner's schema rather than report "table already exists". Callers close
+// db on error.
 func ensureSchema(db *sql.DB, path, schema string) error {
-	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+	version, tables, err := readVersionAndTables(db)
+	if err != nil {
 		return fmt.Errorf("store: read schema version %s: %w", path, err)
 	}
 	if version == 0 {
+		if err := checkSchemaContent(path, version, tables, schema); err != nil {
+			return err
+		}
 		if err := applySchema(db, schema); err != nil {
-			return fmt.Errorf("store: init schema %s: %w", path, err)
+			applyErr := err
+			// Re-read: a concurrent Open may have initialised while this
+			// apply waited on the write lock. Accept its result — but only
+			// if the state actually moved: a still-zero version means this
+			// apply itself failed (broken DDL rolls back whole), and its
+			// error is the one to report.
+			if v2, t2, rerr := readVersionAndTables(db); rerr == nil && v2 != 0 {
+				if checkSchemaContent(path, v2, t2, schema) == nil {
+					return nil
+				}
+			}
+			return fmt.Errorf("store: init schema %s: %w", path, applyErr)
 		}
 		return nil
-	}
-	tables, err := listTables(db)
-	if err != nil {
-		return fmt.Errorf("store: inspect %s: %w", path, err)
 	}
 	return checkSchemaContent(path, version, tables, schema)
 }

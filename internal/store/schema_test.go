@@ -6,8 +6,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -72,6 +74,17 @@ func TestExpectedTables(t *testing.T) {
 	}
 	if len(expectedTables("-- only a comment\n")) != 0 {
 		t.Fatal("comment-only schema lists tables")
+	}
+	// TEMP and schema qualifiers must not leak into the expected name.
+	for _, tc := range []struct{ ddl, want string }{
+		{`CREATE TEMP TABLE tmp (x TEXT)`, "tmp"},
+		{`CREATE TEMPORARY TABLE IF NOT EXISTS tmp2 (x TEXT)`, "tmp2"},
+		{`CREATE TABLE main.session (x TEXT)`, "session"},
+	} {
+		got := expectedTables(tc.ddl)
+		if len(got) != 1 || got[0] != tc.want {
+			t.Errorf("expectedTables(%q) = %q, want [%q]", tc.ddl, got, tc.want)
+		}
 	}
 }
 
@@ -273,6 +286,188 @@ func TestSchemaGateMigrationsTableRefused(t *testing.T) {
 	}
 	if after := fileHash(t, path); after != before {
 		t.Error("refused file was modified")
+	}
+}
+
+func TestSchemaGateVersionZeroWithTablesRefused(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".local", "share", "krowk", "krowk.db")
+	// A foreign file: tables Open never wrote, and no version stamp to
+	// claim them with. Stamping it would bless content this package did
+	// not create.
+	seedPlainDB(t, path, 0, `CREATE TABLE stranger (x TEXT)`)
+	before := fileHash(t, path)
+
+	_, err := Open(testEnv(map[string]string{"HOME": home}))
+	if err == nil {
+		t.Fatal("Open adopted a version-0 file with foreign tables")
+	}
+	if !errors.Is(err, ErrSchemaMismatch) || !strings.Contains(err.Error(), "krowk sessions rebuild") {
+		t.Errorf("error %q is not a rebuild-hint ErrSchemaMismatch", err)
+	}
+	if after := fileHash(t, path); after != before {
+		t.Error("refused file was modified")
+	}
+}
+
+func TestSchemaGateCorruptFileGetsRebuildHint(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".local", "share", "krowk")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(dir, "krowk.db")
+	if err := os.WriteFile(path, []byte("this is not a database file at all"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	before := fileHash(t, path)
+
+	_, err := Open(testEnv(map[string]string{"HOME": home}))
+	if err == nil {
+		t.Fatal("Open passed a corrupt file")
+	}
+	if !errors.Is(err, ErrSchemaMismatch) || !strings.Contains(err.Error(), "krowk sessions rebuild") {
+		t.Errorf("error %q is not a rebuild-hint ErrSchemaMismatch", err)
+	}
+	if after := fileHash(t, path); after != before {
+		t.Error("refused file was modified")
+	}
+}
+
+func TestSchemaGateRefusedFileKeepsModeBits(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits are not portable to Windows")
+	}
+	home := t.TempDir()
+	path := filepath.Join(home, ".local", "share", "krowk", "krowk.db")
+	seedPlainDB(t, path, 2, `CREATE TABLE future (x TEXT)`)
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod seed: %v", err)
+	}
+	before := fileHash(t, path)
+
+	if _, err := Open(testEnv(map[string]string{"HOME": home})); err == nil {
+		t.Fatal("Open passed a version-2 file")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o644 {
+		t.Errorf("refused file mode = %04o, want 0644 untouched", perm)
+	}
+	if after := fileHash(t, path); after != before {
+		t.Error("refused file content was modified")
+	}
+}
+
+func TestSchemaGateInitFailureStillFailsClosed(t *testing.T) {
+	// Broken DDL is a programmer bug, not a foreign file: the error must
+	// say init, not rebuild — and the file must stay at version 0 with
+	// no half-applied tables.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "broken.db")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("seed empty: %v", err)
+	}
+	db, err := openSQL(dsn(path))
+	if err != nil {
+		t.Fatalf("openSQL: %v", err)
+	}
+	defer db.Close()
+	err = ensureSchema(db, path, `CREATE TABLE a (id TEXT PRIMARY KEY); CREATE TABLE a (dup TEXT);`)
+	if err == nil {
+		t.Fatal("ensureSchema passed broken DDL")
+	}
+	if errors.Is(err, ErrSchemaMismatch) {
+		t.Errorf("DDL failure %q misreported as schema mismatch", err)
+	}
+	var v int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if v != 0 {
+		t.Errorf("user_version = %d after failed init, want 0", v)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='a'`).Scan(&n); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if n != 0 {
+		t.Error("half-applied table survived a failed init; the apply is not atomic")
+	}
+}
+
+func TestSchemaGateConcurrentFirstOpen(t *testing.T) {
+	// Two first-launch Opens may both read version 0; the loser must adopt
+	// the winner's schema rather than report "table already exists". One
+	// handle per goroutine, like one process each; the DSN busy_timeout
+	// serialises the writers so the loser fails only after the winner
+	// commits, and its retry then accepts.
+	const synthetic = `CREATE TABLE c1 (id TEXT PRIMARY KEY); CREATE TABLE c2 (id TEXT PRIMARY KEY);`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "race.db")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("seed empty: %v", err)
+	}
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			db, err := openSQL(dsn(path))
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer db.Close()
+			errs[i] = ensureSchema(db, path, synthetic)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: %v", i, err)
+		}
+	}
+	db, err := openSQL("file:" + path + "?mode=ro&immutable=1")
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	defer db.Close()
+	if err := ensureSchema(db, path, synthetic); err != nil {
+		t.Errorf("final accept: %v", err)
+	}
+}
+
+func TestOpenTightensStoreDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits are not portable to Windows")
+	}
+	home := t.TempDir()
+	dir := filepath.Join(home, ".local", "share", "krowk")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Pin the precondition explicitly: under umask 077 the dir could
+	// otherwise arrive already 0700 and the tightening path would go
+	// unexercised.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod seed: %v", err)
+	}
+	db, err := Open(testEnv(map[string]string{"HOME": home}))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	db.Close()
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("store dir mode = %04o, want no group/other bits", perm)
 	}
 }
 

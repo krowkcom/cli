@@ -15,6 +15,17 @@ import (
 // never call Refresh, so this timeout only ever delays an explicit refresh.
 const refreshTimeout = 5 * time.Second
 
+// maxBody caps the price file: the live file is ~4.5 MB, so 32 MB leaves
+// headroom while a runaway body fails closed instead of filling memory.
+const maxBody = 32 << 20
+
+// maxETagLen caps the ETag the sidecar stores and the next refresh sends.
+// ETags are short response metadata; an unbounded one from a hostile server
+// would grow the sidecar and ride along on every future request and proxy
+// log. Overlong or non-token values are dropped, degrading to one
+// unconditional GET.
+const maxETagLen = 4096
+
 // metaFileName is the sidecar beside the cached price file: the ETag the last
 // fetch stored and when it fetched, so the next refresh can ask
 // conditionally with If-None-Match.
@@ -45,36 +56,34 @@ func MetaPath(cachePath string) string {
 // A 200 whose body is not a price file is treated like a failure —
 // untouched, (false, nil) — so a captive portal can never poison the cache.
 //
-// client may be nil (a default client with the refresh timeout is built);
-// tests hand in a client with a failing transport to prove the hot paths
-// never needed it. url overrides ModelsURL when non-empty — tests point it
-// at a local server; callers leave it empty for the real file. env may be
-// nil, meaning the platform cache dir.
+// client may be nil (a default is built); tests hand in a client with a
+// failing transport to prove the hot paths never needed it. Redirects are
+// never followed — a 3xx answers like any other unexpected status, silent
+// with the file untouched — so a portal or MITM cannot bounce the fetch onto
+// an attacker host mid-refresh. url overrides ModelsURL when non-empty —
+// tests point it at a local server; callers leave it empty for the real
+// file. env may be nil, meaning the platform cache dir. The proxy, if any,
+// is the process default (ProxyFromEnvironment): the request carries no
+// secrets, only an ETag, and a machine that needs a proxy to reach the
+// network needs it here too.
 func Refresh(ctx context.Context, env Env, client *http.Client, url string) (refreshed bool, err error) {
 	path := CachePath(env)
 	if path == "" {
 		return false, fmt.Errorf("pricing: no cache directory in environment")
 	}
-	if client == nil {
-		client = &http.Client{Timeout: refreshTimeout}
-	}
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, refreshTimeout)
-		defer cancel()
-	}
+	client = noRedirectClient(client)
+	// Always bounded: with a sooner deadline the context's own wins, and a
+	// timeout-less client under a bare context can no longer hang the
+	// explicit refresh this was called from.
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(ctx, refreshTimeout)
+	defer cancel()
 
-	var etag string
-	if raw, err := os.ReadFile(MetaPath(path)); err == nil {
-		var meta cacheMeta
-		if json.Unmarshal(raw, &meta) == nil {
-			etag = meta.ETag
-		}
-	}
+	etag := loadETag(path)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, firstNonEmpty(url, ModelsURL), nil)
 	if err != nil {
-		return false, nil
+		return false, err
 	}
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
@@ -91,18 +100,28 @@ func Refresh(ctx context.Context, env Env, client *http.Client, url string) (ref
 		return false, nil
 	case http.StatusOK:
 		// Into memory first, validated before anything on disk moves: a
-		// truncated or portal-served body must not replace good prices.
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+		// truncated or portal-served body must not replace good prices. The
+		// +1 byte tells a body over the cap apart from one exactly at it —
+		// LimitReader alone fails silently at the boundary.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 		if err != nil {
 			return false, nil
 		}
-		if _, err := parseRates(body); err != nil {
+		if len(body) > maxBody {
+			return false, nil
+		}
+		parsed, err := parseRates(body)
+		if err != nil || len(parsed) == 0 {
+			// Not a price file — captive portal, empty upstream, truncated
+			// JSON — so the previous cache stays and nobody is told beyond
+			// refreshed=false. An empty map parses without error and would
+			// otherwise clobber good prices with nothing.
 			return false, nil
 		}
 		if err := writeFileAtomic(path, body); err != nil {
 			return false, err
 		}
-		newETag := resp.Header.Get("ETag")
+		newETag := sanitizeETag(resp.Header.Get("ETag"))
 		if newETag == "" {
 			newETag = etag
 		}
@@ -111,6 +130,54 @@ func Refresh(ctx context.Context, env Env, client *http.Client, url string) (ref
 	default:
 		return false, nil
 	}
+}
+
+// noRedirectClient clones the client with redirects disabled, preserving its
+// transport (test servers, proxies) and timeout. A nil client becomes the
+// default with the refresh timeout.
+func noRedirectClient(client *http.Client) *http.Client {
+	out := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	if client != nil {
+		out.Transport = client.Transport
+		out.Timeout = client.Timeout
+	}
+	if out.Timeout == 0 {
+		out.Timeout = refreshTimeout
+	}
+	return out
+}
+
+// loadETag reads the stored ETag, dropping anything the server should never
+// have sent: overlong or non-token bytes degrade to an unconditional GET
+// rather than riding along forever.
+func loadETag(cachePath string) string {
+	raw, err := os.ReadFile(MetaPath(cachePath))
+	if err != nil {
+		return ""
+	}
+	var meta cacheMeta
+	if json.Unmarshal(raw, &meta) != nil {
+		return ""
+	}
+	return sanitizeETag(meta.ETag)
+}
+
+// sanitizeETag keeps printable ASCII token bytes up to the cap: what ETags
+// are, and all a conditional GET needs.
+func sanitizeETag(etag string) string {
+	if len(etag) == 0 || len(etag) > maxETagLen {
+		return ""
+	}
+	for i := 0; i < len(etag); i++ {
+		if etag[i] < 0x21 || etag[i] > 0x7e {
+			return ""
+		}
+	}
+	return etag
 }
 
 func firstNonEmpty(vals ...string) string {

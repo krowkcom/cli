@@ -86,7 +86,16 @@ func fetchLive() ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("models.dev answered %s", resp.Status)
 	}
-	return io.ReadAll(resp.Body)
+	// Capped like the refresh path: a runaway body fails here, in a dev
+	// command, instead of filling memory.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (32<<20)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > 32<<20 {
+		return nil, fmt.Errorf("models.dev body over 32 MB, refusing")
+	}
+	return raw, nil
 }
 
 // trim keeps only the known providers with only the numeric per-token cost

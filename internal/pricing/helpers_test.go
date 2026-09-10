@@ -42,7 +42,6 @@ func testServerBody(t *testing.T, body string) *httptest.Server {
 		_, _ = w.Write([]byte(body))
 	}))
 }
-
 func testServerSlow(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,5 +51,12 @@ func testServerSlow(t *testing.T) *httptest.Server {
 		case <-time.After(5 * time.Second):
 			_, _ = w.Write([]byte(`{}`))
 		}
+	}))
+}
+
+func testServerRedirect(t *testing.T, to string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Redirect(w, &http.Request{}, to, http.StatusFound)
 	}))
 }

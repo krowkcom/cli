@@ -81,17 +81,26 @@ type Tokens struct {
 // Reasoning tokens use the reasoning rate when the model publishes one, else
 // the output rate. Nothing about the result is persisted: message.cost_usd
 // stays source-reported only, and this is computed at display time.
+// Negative counts clamp to zero — they are caller bugs, not negative prices —
+// and int64 counts convert losslessly only below 2^53, past which the last
+// tokens blur: display-time only, so that blur never compounds.
 func (r Rates) Cost(t Tokens) float64 {
 	const perMillion = 1e6
 	reasoning := r.Reasoning
 	if !r.HasReasoning {
 		reasoning = r.Output
 	}
-	return float64(t.Input)/perMillion*r.Input +
-		float64(t.Output)/perMillion*r.Output +
-		float64(t.CacheRead)/perMillion*r.CacheRead +
-		float64(t.CacheWrite)/perMillion*r.CacheWrite +
-		float64(t.Reasoning)/perMillion*reasoning
+	clamp := func(n int64) float64 {
+		if n < 0 {
+			return 0
+		}
+		return float64(n)
+	}
+	return clamp(t.Input)/perMillion*r.Input +
+		clamp(t.Output)/perMillion*r.Output +
+		clamp(t.CacheRead)/perMillion*r.CacheRead +
+		clamp(t.CacheWrite)/perMillion*r.CacheWrite +
+		clamp(t.Reasoning)/perMillion*reasoning
 }
 
 // Normalize maps an importer's model string to the models.dev id for its
@@ -126,14 +135,18 @@ var (
 
 // Bind sets the environment Price resolves the cache file against. The CLI
 // calls it once at startup with the process environment; tests bind a fake.
-// Unbound, Price falls back to the platform cache dir. Either way the lookup
-// reads files only — never the network, never the process environment.
+// Unbound, Price falls back to the platform cache dir. The lookup reads
+// files only — never the network — and consults only the bound Env for
+// where the cache lives (or the platform default when unbound).
 func Bind(env Env) {
 	mu.Lock()
 	defer mu.Unlock()
 	bound = env
-	cacheSeen = false
+	cachePath = ""
+	cacheMod = time.Time{}
+	cacheSize = 0
 	cached = nil
+	cacheSeen = false
 }
 
 // CachePath is where the refreshed price file lives:
@@ -158,18 +171,20 @@ func CachePath(env Env) string {
 }
 
 // Price answers the rates for one (provider, model) pair: the cache file
-// when present and parseable, else the embedded snapshot. Unknown pairs
-// answer ok=false — the caller renders "—", never 0.
+// when present and parseable, else the embedded snapshot. The two sources
+// fail independently — a corrupt snapshot never hides a good cache, and a
+// corrupt cache never hides the snapshot. Unknown pairs answer ok=false —
+// the caller renders "—", never 0.
 func Price(provider, model string) (Rates, bool) {
 	embedOnce.Do(func() {
 		embedded, embedErr = parseRates(embeddedJSON)
 	})
 	mu.Lock()
 	defer mu.Unlock()
+	if r, ok := lookupLocked(provider, model); ok {
+		return r, true
+	}
 	if embedErr == nil {
-		if r, ok := lookupLocked(provider, model); ok {
-			return r, true
-		}
 		if r, ok := embedded[key{provider, model}]; ok {
 			return r, true
 		}
@@ -178,31 +193,36 @@ func Price(provider, model string) (Rates, bool) {
 }
 
 // lookupLocked consults the cache file, reloading it only when its path,
-// mtime or size moved since the last load. A missing file is not an error —
-// it means no refresh has run yet. A corrupt one falls back to embedded
-// without an error, so a half-written refresh can never break pricing.
+// mtime or size moved since the last load — including a remembered failure,
+// so a missing or corrupt file costs one stat per call, never a read and a
+// parse per row. The file is read before it is statted, and the post-read
+// stat is the cache key: a writer racing between the two only causes one
+// extra parse on the next call, never a half-read map. A missing file is not
+// an error — it means no refresh has run yet. A corrupt one falls back to
+// embedded without an error, so a half-written refresh can never break
+// pricing.
 func lookupLocked(provider, model string) (Rates, bool) {
 	path := CachePath(bound)
 	if path == "" {
 		return Rates{}, false
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		cacheSeen = false
-		cached = nil
+	raw, readErr := os.ReadFile(path)
+	info, statErr := os.Stat(path)
+	if readErr != nil || statErr != nil {
+		// Remember the miss for this path so a dead file does not cost a
+		// re-read every row; a file appearing later stats differently and
+		// reloads below.
+		if !cacheSeen || cachePath != path {
+			cachePath, cacheMod, cacheSize, cached, cacheSeen =
+				path, time.Time{}, 0, nil, true
+		}
 		return Rates{}, false
 	}
 	if !cacheSeen || cachePath != path || !info.ModTime().Equal(cacheMod) || info.Size() != cacheSize {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			cacheSeen = false
-			cached = nil
-			return Rates{}, false
-		}
 		parsed, err := parseRates(raw)
 		if err != nil {
-			cacheSeen = false
-			cached = nil
+			cachePath, cacheMod, cacheSize, cached, cacheSeen =
+				path, info.ModTime(), info.Size(), nil, true
 			return Rates{}, false
 		}
 		cached = parsed
@@ -217,40 +237,43 @@ func lookupLocked(provider, model string) (Rates, bool) {
 
 // parseRates reads either shape prices come in: the trimmed snapshot
 // ({provider: {model: cost}}) and the full models.dev file
-// ({provider: {models: {id: {cost...}}, ...}}). The discriminator is the
-// "models" key full-shape providers carry and snapshot providers never do.
-// Only the numeric base per-token rates are kept — tiered overrides and
-// modality rates are skipped value by value, so a refreshed full-file cache
-// with tomorrow's models still parses. Extra providers and models pass
-// through: the generate script is what trims the snapshot, not this.
+// ({provider: {models: {id: {cost...}}, ...}}). Each provider decodes on its
+// own: a provider that decodes as a full-shape models map is read that way,
+// anything else is read as model→cost, and a provider that decodes as
+// neither is skipped without failing the rest — one top-level metadata field
+// or one renamed provider must never drop every other provider's prices.
+// (A snapshot model literally named "models" lands in the second branch as
+// long as its value is a cost object, which is why the discriminator tries
+// the models decode instead of sniffing the key.) Only the numeric base
+// per-token rates are kept — tiered overrides and modality rates are skipped
+// value by value, so a refreshed full-file cache with tomorrow's models
+// still parses. Extra providers and models pass through: the generate script
+// is what trims the snapshot, not this.
 func parseRates(raw []byte) (map[key]Rates, error) {
-	var top map[string]map[string]json.RawMessage
+	var top map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &top); err != nil {
 		return nil, err
 	}
 	out := make(map[key]Rates)
-	for provider, fields := range top {
-		modelsRaw, ok := fields["models"]
-		if !ok {
-			for model, costRaw := range fields {
-				var cost map[string]json.RawMessage
-				if err := json.Unmarshal(costRaw, &cost); err != nil {
-					continue
-				}
+	for provider, fieldsRaw := range top {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(fieldsRaw, &fields); err != nil {
+			continue
+		}
+		if models, ok := decodeModels(fields); ok {
+			for model, cost := range models {
 				if r, ok := ratesFromRaw(cost); ok {
 					out[key{provider, model}] = r
 				}
 			}
 			continue
 		}
-		var models map[string]struct {
-			Cost map[string]json.RawMessage `json:"cost"`
-		}
-		if err := json.Unmarshal(modelsRaw, &models); err != nil {
-			continue
-		}
-		for model, m := range models {
-			if r, ok := ratesFromRaw(m.Cost); ok {
+		for model, costRaw := range fields {
+			var cost map[string]json.RawMessage
+			if err := json.Unmarshal(costRaw, &cost); err != nil {
+				continue
+			}
+			if r, ok := ratesFromRaw(cost); ok {
 				out[key{provider, model}] = r
 			}
 		}
@@ -258,15 +281,45 @@ func parseRates(raw []byte) (map[key]Rates, error) {
 	return out, nil
 }
 
+// decodeModels reads a full-shape provider's models map, reporting whether
+// the "models" member actually held models with costs. Trying the decode is
+// what keeps a cost object that happens to be named "models" on the snapshot
+// path instead of vanishing down the full-shape one.
+func decodeModels(fields map[string]json.RawMessage) (map[string]map[string]json.RawMessage, bool) {
+	modelsRaw, ok := fields["models"]
+	if !ok {
+		return nil, false
+	}
+	var models map[string]struct {
+		Cost map[string]json.RawMessage `json:"cost"`
+	}
+	if err := json.Unmarshal(modelsRaw, &models); err != nil {
+		return nil, false
+	}
+	out := make(map[string]map[string]json.RawMessage, len(models))
+	for model, m := range models {
+		if len(m.Cost) == 0 {
+			continue
+		}
+		out[model] = m.Cost
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
 // ratesFromRaw keeps the numeric base rates out of a cost object and reports
-// whether it found any. Non-numeric members (tiers, context_over_200k) are
-// skipped, and a cost with no numeric rate at all is not a price.
+// whether it found any. Non-numeric members (tiers, context_over_200k) and
+// explicit nulls are skipped — a null is an unpublished rate, not a zero
+// one, and pricing it at 0 would undercharge. A cost with no numeric rate at
+// all is not a price.
 func ratesFromRaw(cost map[string]json.RawMessage) (Rates, bool) {
 	var r Rates
 	found := false
-	take := func(name string, dst *float64) {
+	take := func(name string, dst *float64, mark *bool) {
 		raw, ok := cost[name]
-		if !ok {
+		if !ok || string(raw) == "null" {
 			return
 		}
 		var v float64
@@ -274,16 +327,14 @@ func ratesFromRaw(cost map[string]json.RawMessage) (Rates, bool) {
 			return
 		}
 		*dst, found = v, true
-	}
-	take("input", &r.Input)
-	take("output", &r.Output)
-	take("cache_read", &r.CacheRead)
-	take("cache_write", &r.CacheWrite)
-	if raw, ok := cost["reasoning"]; ok {
-		var v float64
-		if err := json.Unmarshal(raw, &v); err == nil {
-			r.Reasoning, r.HasReasoning, found = v, true, true
+		if mark != nil {
+			*mark = true
 		}
 	}
+	take("input", &r.Input, nil)
+	take("output", &r.Output, nil)
+	take("cache_read", &r.CacheRead, nil)
+	take("cache_write", &r.CacheWrite, nil)
+	take("reasoning", &r.Reasoning, &r.HasReasoning)
 	return r, found
 }

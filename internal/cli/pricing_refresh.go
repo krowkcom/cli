@@ -22,7 +22,6 @@ import (
 // land; this subcommand exists so a price refresh never requires a sync.
 func pricingRefresh(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 	penv := pricing.Env(env)
-	pricing.Bind(penv)
 	refreshed, err := pricing.Refresh(context.Background(), penv,
 		&http.Client{Timeout: 5 * time.Second}, "")
 	if err != nil {
@@ -32,6 +31,7 @@ func pricingRefresh(w io.Writer, format output.Format, f flags, env runctx.Env) 
 	report := map[string]any{
 		"refreshed":     refreshed,
 		"path":          path,
+		"meta_path":     pricing.MetaPath(path),
 		"snapshot_date": pricing.SnapshotDate,
 		"source":        pricing.ModelsURL,
 	}

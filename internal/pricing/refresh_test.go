@@ -164,6 +164,39 @@ func TestRefreshFailureIsSilent(t *testing.T) {
 	}
 }
 
+func TestRefreshEmptyBodyKeepsCache(t *testing.T) {
+	env, cache := tempEnv(t)
+	seed := `{"anthropic":{"claude-fable-5-1":{"input":10,"output":50}}}`
+	path := writeCache(t, cache, seed)
+	for _, body := range []string{`{}`, `{"anthropic":{}}`, `{"anthropic":{"models":{}}}`} {
+		srv := testServerBody(t, body)
+		ok, err := Refresh(context.Background(), env, srv.Client(), srv.URL)
+		if err != nil || ok {
+			t.Fatalf("empty refresh %q = (%v, %v), want (false, nil)", body, ok, err)
+		}
+		if after, _ := os.ReadFile(path); string(after) != seed {
+			t.Fatalf("empty refresh %q changed the file", body)
+		}
+		if r, ok := Price("anthropic", "claude-fable-5-1"); !ok || r.Input != 10 {
+			t.Fatalf("empty refresh %q broke pricing: %+v ok=%v", body, r, ok)
+		}
+	}
+}
+
+func TestRefreshRedirectIsSilent(t *testing.T) {
+	env, cache := tempEnv(t)
+	seed := `{"anthropic":{"claude-fable-5-1":{"input":10,"output":50}}}`
+	path := writeCache(t, cache, seed)
+	redir := testServerRedirect(t, "https://example.com/evil.json")
+	ok, err := Refresh(context.Background(), env, redir.Client(), redir.URL)
+	if err != nil || ok {
+		t.Fatalf("redirect refresh = (%v, %v), want (false, nil)", ok, err)
+	}
+	if after, _ := os.ReadFile(path); string(after) != seed {
+		t.Fatal("redirect refresh changed the file")
+	}
+}
+
 // TestSnapshotRegeneratesFromFixture re-runs the generate script against the
 // committed fixture with the committed date and requires the committed
 // snapshot to match byte-for-byte. The network is never consulted: the live

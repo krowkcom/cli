@@ -184,3 +184,75 @@ func TestSnapshotBudget(t *testing.T) {
 		t.Fatal("SnapshotDate is empty")
 	}
 }
+
+func TestNullRatesAreUnknownNotZero(t *testing.T) {
+	_, _ = tempEnv(t)
+	parsed, err := parseRates([]byte(`{"anthropic":{"null-model":{"input":null,"output":5}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, ok := parsed[key{"anthropic", "null-model"}]
+	if !ok {
+		t.Fatal("model with one null and one rate vanished, want kept")
+	}
+	if r.Input != 0 {
+		t.Fatalf("null input priced %v, want skipped (0 without ok)", r.Input)
+	}
+	if r.Output != 5 {
+		t.Fatalf("output = %v, want 5", r.Output)
+	}
+	allNull, err := parseRates([]byte(`{"anthropic":{"ghost":{"input":null}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := allNull[key{"anthropic", "ghost"}]; ok {
+		t.Fatal("all-null cost parsed as a price — null must mean unpublished, not 0")
+	}
+}
+
+func TestTopLevelMetadataDoesNotKillProviders(t *testing.T) {
+	_, _ = tempEnv(t)
+	parsed, err := parseRates([]byte(`{"updated":"2026-09-10","anthropic":{"claude-fable-5-1":{"input":10,"output":50}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := parsed[key{"anthropic", "claude-fable-5-1"}]; !ok || r.Input != 10 {
+		t.Fatalf("provider beside top-level metadata lost: %+v ok=%v", r, ok)
+	}
+}
+
+func TestBindSwitchIsolatesCaches(t *testing.T) {
+	envA, cacheA := tempEnv(t)
+	pathA := filepath.Join(cacheA, "krowk", "models.json")
+	if err := os.MkdirAll(filepath.Dir(pathA), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pathA, []byte(`{"anthropic":{"claude-fable-5-1":{"input":1,"output":2}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := Price("anthropic", "claude-fable-5-1"); !ok || r.Input != 1 {
+		t.Fatalf("env A price = %+v ok=%v, want input 1", r, ok)
+	}
+	// Rebinding to an empty cache hides A's file entirely: the old path's
+	// prices must not leak into the new environment.
+	_, _ = tempEnv(t)
+	_ = envA
+	if r, ok := Price("anthropic", "claude-fable-5-1"); !ok || r.Input != 10 {
+		t.Fatalf("after rebind price = %+v ok=%v, want embedded input 10", r, ok)
+	}
+}
+
+func TestNormalizeIsIdentity(t *testing.T) {
+	// The seam the importers grow into: today both houses already speak
+	// models.dev ids, so nothing rewrites. Pinned so a future mapping lands
+	// here and not scattered across call sites.
+	for _, tc := range [][2]string{
+		{"anthropic", "claude-fable-5"},
+		{"anthropic", "claude-fable-5-1"},
+		{"amazon-bedrock", "us.anthropic.claude-fable-5-1"},
+	} {
+		if got := Normalize(tc[0], tc[1]); got != tc[1] {
+			t.Fatalf("Normalize(%q, %q) = %q, want identity", tc[0], tc[1], got)
+		}
+	}
+}

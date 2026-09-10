@@ -193,45 +193,42 @@ func Price(provider, model string) (Rates, bool) {
 }
 
 // lookupLocked consults the cache file, reloading it only when its path,
-// mtime or size moved since the last load — including a remembered failure,
-// so a missing or corrupt file costs one stat per call, never a read and a
-// parse per row. The file is read before it is statted, and the post-read
-// stat is the cache key: a writer racing between the two only causes one
-// extra parse on the next call, never a half-read map. A missing file is not
-// an error — it means no refresh has run yet. A corrupt one falls back to
-// embedded without an error, so a half-written refresh can never break
-// pricing.
+// mtime or size moved since the last load. The stat comes first: an
+// unchanged file costs one syscall per call, never a read and a parse per
+// row — a 10k-row listing over a 4.5 MB cache must not read 45 GB. Misses
+// are remembered under the same key, so a missing or corrupt file costs one
+// stat per call too; anything appearing, fixed or rewritten under a new key
+// reloads on the next call. (A rewrite inside one mtime tick at the same
+// size stays stale until the key moves — nanosecond mtimes make that a
+// same-nanosecond rewrite, which only a test harness does on purpose.) A
+// missing file is not an error — it means no refresh has run yet. A corrupt
+// one falls back to embedded without an error, so a half-written refresh can
+// never break pricing. The stat-then-read race is benign by construction: a
+// writer swapping the file between the two only schedules one extra parse
+// on the next call.
 func lookupLocked(provider, model string) (Rates, bool) {
 	path := CachePath(bound)
 	if path == "" {
 		return Rates{}, false
 	}
-	raw, readErr := os.ReadFile(path)
 	info, statErr := os.Stat(path)
-	if readErr != nil || statErr != nil {
-		// Remember the miss for this path so a dead file does not cost a
-		// re-read every row; a file appearing later stats differently and
-		// reloads below.
-		if !cacheSeen || cachePath != path {
-			cachePath, cacheMod, cacheSize, cached, cacheSeen =
-				path, time.Time{}, 0, nil, true
-		}
-		return Rates{}, false
+	var mod time.Time
+	var size int64
+	if statErr == nil {
+		mod, size = info.ModTime(), info.Size()
 	}
-	if !cacheSeen || cachePath != path || !info.ModTime().Equal(cacheMod) || info.Size() != cacheSize {
-		parsed, err := parseRates(raw)
-		if err != nil {
-			cachePath, cacheMod, cacheSize, cached, cacheSeen =
-				path, info.ModTime(), info.Size(), nil, true
-			return Rates{}, false
-		}
-		cached = parsed
-		cachePath = path
-		cacheMod = info.ModTime()
-		cacheSize = info.Size()
-		cacheSeen = true
+	if cacheSeen && cachePath == path && mod.Equal(cacheMod) && size == cacheSize {
+		r, ok := cached[key{provider, model}]
+		return r, ok
 	}
-	r, ok := cached[key{provider, model}]
+	var parsed map[key]Rates
+	if statErr == nil {
+		if raw, err := os.ReadFile(path); err == nil {
+			parsed, _ = parseRates(raw)
+		}
+	}
+	cachePath, cacheMod, cacheSize, cached, cacheSeen = path, mod, size, parsed, true
+	r, ok := parsed[key{provider, model}]
 	return r, ok
 }
 
@@ -323,7 +320,9 @@ func ratesFromRaw(cost map[string]json.RawMessage) (Rates, bool) {
 			return
 		}
 		var v float64
-		if err := json.Unmarshal(raw, &v); err != nil {
+		if err := json.Unmarshal(raw, &v); err != nil || v < 0 {
+			// Negative is not a price either: a hostile or broken cache
+			// must not price rows below zero.
 			return
 		}
 		*dst, found = v, true

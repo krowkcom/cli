@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -203,11 +204,13 @@ func stampMeta(cachePath, etag string) {
 // writeFileAtomic lands a file without a half-written window: write aside,
 // then rename over. A crash mid-write leaves the previous file, never a
 // prefix of the new one — which is what keeps a corrupt cache a case Price
-// never sees.
+// never sees. Stale aside-files from a killed earlier refresh (older than an
+// hour, so never one still being written) are swept first, best effort.
 func writeFileAtomic(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	sweepStaleTemp(filepath.Dir(path))
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err
@@ -231,4 +234,24 @@ func writeFileAtomic(path string, data []byte) error {
 		return err
 	}
 	return nil
+}
+
+// sweepStaleTemp removes aside-files an earlier refresh died leaving. Only
+// ours (the .tmp-* prefix CreateTemp uses), only stale, errors ignored —
+// litter is cosmetic and must never fail a refresh.
+func sweepStaleTemp(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), ".tmp-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || time.Since(info.ModTime()) < time.Hour {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+	}
 }

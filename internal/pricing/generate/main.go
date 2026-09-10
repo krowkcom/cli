@@ -77,7 +77,14 @@ func fatal(err error) {
 }
 
 func fetchLive() ([]byte, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	// Redirects disabled like the refresh path: a -live fetch that lands on
+	// an attacker's host would be committed to the repo as the price truth.
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Get("https://models.dev/api.json")
 	if err != nil {
 		return nil, err

@@ -2,6 +2,7 @@ package claude
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -676,7 +677,7 @@ func TestReadRefusesACursorOfTheWrongKind(t *testing.T) {
 	if err == nil {
 		t.Fatal("Read accepted a SQLite cursor")
 	}
-	if !errorsIs(err, importer.ErrCursorType) {
+	if !errors.Is(err, importer.ErrCursorType) {
 		t.Fatalf("Read err = %v, want ErrCursorType", err)
 	}
 	// The cursor comes back untouched: nothing was read, so there is no
@@ -713,20 +714,6 @@ func TestReadIgnoresTheCursorOffset(t *testing.T) {
 		t.Fatalf("resumed read got %d messages and %d turns, want %d and %d",
 			len(resumed.Messages), len(resumed.Turns), len(full.Messages), len(full.Turns))
 	}
-}
-
-func errorsIs(err, target error) bool {
-	for err != nil {
-		if err == target {
-			return true
-		}
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
-	return false
 }
 
 // canonicalThread is the golden's shape. It exists rather than marshalling

@@ -188,6 +188,14 @@ func rawDataOrEmpty(raw json.RawMessage) string {
 	return string(raw)
 }
 
+// UsableJSON reports whether a payload can go into the store as it stands,
+// which is the question a source asks before copying a provider's blob into
+// a column rather than reshaping it. It is exported because the sources ask
+// it too — a Claude `usage` block, an opencode metadata bag — and three
+// copies of the same two-clause test would be three chances to forget the
+// second one.
+func UsableJSON(raw json.RawMessage) bool { return usableJSON(raw) }
+
 // usableJSON reports whether a payload can be stored as it stands. Valid
 // JSON is not enough: JSON syntax admits arbitrary bytes inside a string
 // literal, and TEXT columns, terminals and JSON consumers downstream all

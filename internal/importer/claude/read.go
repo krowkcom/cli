@@ -216,7 +216,7 @@ func (b *builder) message(kind string, l line, raw []byte, lineNo int) error {
 		if msg.Model != "" {
 			b.model = msg.Model
 		}
-		msg.Usage = usableJSON(l.Message.Usage)
+		msg.Usage = storable(l.Message.Usage)
 		if len(l.Message.Usage) > 0 {
 			// A usage block that will not decode is not worth failing the
 			// line over: the raw JSON is on the row either way, and a
@@ -295,7 +295,7 @@ func (b *builder) parts(content json.RawMessage) []store.Part {
 		// build has not met. It becomes one unknown part carrying the
 		// whole thing, which is counted, rather than a message with no
 		// content, which is not.
-		return []store.Part{b.acc.NormalizePart("content", content)}
+		return []store.Part{b.acc.NormalizePart("message_content", content)}
 	}
 	var parts []store.Part
 	for _, raw := range blocks {
@@ -366,7 +366,7 @@ func (b *builder) system(l line, raw []byte, lineNo int) error {
 		case err == nil && text != "":
 			msg.Parts = []store.Part{{Type: importer.PartText, Data: textData(text)}}
 		case err != nil:
-			msg.Parts = []store.Part{b.acc.NormalizePart("content", l.Content)}
+			msg.Parts = []store.Part{b.acc.NormalizePart("system_content", l.Content)}
 		}
 	}
 	b.messages = append(b.messages, msg)
@@ -507,11 +507,11 @@ var injectedTags = []string{
 // person, which the turn rule treats exactly as it treats Claude's own
 // isMeta: not a prompt, so not the start of a turn.
 //
-// This is the difference between 1782 turns on this machine and 2153. An
-// agent reporting back to the conversation that dispatched it arrives as a
-// user-role line with real text in it, and counting those as prompts
-// inflates the turn count by a fifth and divides every per-turn cost by the
-// same factor.
+// This is the difference between 2138 turns on this machine and 1733, in
+// one run over the same 548 transcripts. An agent reporting back to the
+// conversation that dispatched it arrives as a user-role line with real
+// text in it, and counting those as prompts inflates the turn count by
+// nearly a quarter and divides every per-turn cost by the same factor.
 //
 // Two fields answer the question and only one of them answers it well.
 // `origin.kind` is exact: `human` is a person, and `task-notification`,
@@ -520,9 +520,10 @@ var injectedTags = []string{
 // 901 of the 1201 `sdk` lines are a person typing "merge", "push", "done"
 // or a Basecamp URL into a front end that is not the terminal. Refusing
 // them would lose more real prompts than the whole rule saves. Only
-// `system` is safe to read as injected, and it earns its place by being
-// belt and braces: every `system` line on this machine already carries an
-// injected `origin.kind` too.
+// `system` is safe to read as injected, and it is load-bearing rather than
+// belt and braces: all but one of the 76 `system` lines on this machine
+// also carry an injected `origin.kind`, and that one would be counted as a
+// prompt without this clause.
 //
 // A line predating both fields — which is most of them — falls through to
 // the text check and then to being a prompt, which is the right default:
@@ -586,20 +587,21 @@ func eventData(hook string, attachment json.RawMessage) string {
 	b, err := json.Marshal(struct {
 		HookEvent  string          `json:"hook_event"`
 		Attachment json.RawMessage `json:"attachment,omitempty"`
-	}{HookEvent: hook, Attachment: json.RawMessage(usableJSON(attachment))})
+	}{HookEvent: hook, Attachment: json.RawMessage(storable(attachment))})
 	if err != nil {
 		return ""
 	}
 	return string(b)
 }
 
-// usableJSON returns raw when it can be stored as it stands and "" when it
-// cannot. Valid JSON is not enough: the columns are TEXT and everything
-// downstream assumes UTF-8, so a payload carrying raw bytes is dropped to
-// the store's '{}' default rather than written and read back as mojibake.
-// The line's own raw_json still holds it either way.
-func usableJSON(raw json.RawMessage) string {
-	if len(raw) == 0 || !json.Valid(raw) || !utf8.Valid(raw) {
+// storable returns raw when it can go into a TEXT column as it stands and
+// "" when it cannot, leaving the store to write its '{}' default. The
+// judgement is importer.UsableJSON's — valid JSON is not enough, since
+// JSON syntax admits bytes that are not UTF-8 and every reader downstream
+// assumes they are — and the line's own raw_json still holds the payload
+// either way.
+func storable(raw json.RawMessage) string {
+	if !importer.UsableJSON(raw) {
 		return ""
 	}
 	return string(raw)

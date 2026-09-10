@@ -115,10 +115,10 @@ func (s Source) Discover(env harness.Env) ([]importer.Ref, error) {
 		// store leaves parent_id NULL and fills it in if the parent ever
 		// turns up — and losing them is not, since a subagent transcript
 		// is a whole conversation.
-		orphans := map[string]bool{}
+		var orphans []string
 		for _, f := range files {
 			if f.IsDir() && hasSubagents(root, slug.Name(), f.Name()) {
-				orphans[f.Name()] = true
+				orphans = append(orphans, f.Name())
 			}
 		}
 		for _, f := range files {
@@ -126,7 +126,7 @@ func (s Source) Discover(env harness.Env) ([]importer.Ref, error) {
 				continue
 			}
 			sessionID := strings.TrimSuffix(f.Name(), ".jsonl")
-			delete(orphans, sessionID)
+			orphans = without(orphans, sessionID)
 			refs = append(refs, importer.Ref{
 				Provider: s.Name(),
 				ID:       sessionID,
@@ -134,7 +134,9 @@ func (s Source) Discover(env harness.Env) ([]importer.Ref, error) {
 			})
 			refs = append(refs, s.subagentRefs(root, slug.Name(), sessionID)...)
 		}
-		for _, sessionID := range sortedKeys(orphans) {
+		// files was sorted before either loop, so orphans is already in
+		// name order and needs no second sort.
+		for _, sessionID := range orphans {
 			refs = append(refs, s.subagentRefs(root, slug.Name(), sessionID)...)
 		}
 	}
@@ -149,15 +151,17 @@ func hasSubagents(root, slug, sessionID string) bool {
 	return err == nil && info.IsDir()
 }
 
-// sortedKeys is the set as an ordered slice, so a sweep of orphaned
-// subagent directories comes back in the same order on every run.
-func sortedKeys(set map[string]bool) []string {
-	out := make([]string, 0, len(set))
-	for k := range set {
-		out = append(out, k)
+// without is names with one entry struck off, order preserved. A slice
+// rather than a set because the list is one session directory long in the
+// ordinary case and already sorted, and a map would cost an extra sort to
+// get back the order it destroyed.
+func without(names []string, drop string) []string {
+	for i, n := range names {
+		if n == drop {
+			return append(names[:i:i], names[i+1:]...)
+		}
 	}
-	sort.Strings(out)
-	return out
+	return names
 }
 
 // subagentRefs lists the transcripts of the agents one session dispatched.

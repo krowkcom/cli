@@ -134,7 +134,13 @@ type Thread struct {
 	// The link is best-effort by design. If the parent has not been
 	// ingested yet the child's parent_id stays NULL and a later Ingest of
 	// the same child fills it in, so a caller that walks children first
-	// converges rather than failing. Callers should still ingest parents
+	// converges rather than failing. The column is ON DELETE CASCADE, so
+	// deleting a parent session deletes its subagent sessions and
+	// everything under them — which is what a person deleting a
+	// conversation means, since a subagent transcript is that
+	// conversation's work and not a session anybody started.
+	//
+	// Callers should still ingest parents
 	// before children — internal/importer/claude's Discover returns them
 	// in that order for exactly this reason — because converging costs a
 	// second pass and a NULL in between.

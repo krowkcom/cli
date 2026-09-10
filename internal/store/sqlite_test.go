@@ -13,6 +13,10 @@ func TestDriverWired(t *testing.T) {
 	}
 	defer db.Close()
 
+	// :memory: is per-connection, so hold the pool to one connection;
+	// otherwise CREATE and SELECT can land on different empty databases.
+	db.SetMaxOpenConns(1)
+
 	if err := db.Ping(); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
@@ -29,7 +33,7 @@ func TestDriverWired(t *testing.T) {
 	if _, err := db.Exec(`CREATE TABLE driver_probe (id TEXT PRIMARY KEY, v INTEGER)`); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO driver_probe (id, v) VALUES (?, ?)`, NewID(), 1); err != nil {
+	if _, err := db.Exec(`INSERT INTO driver_probe (id, v) VALUES (?, ?)`, "probe-1", 1); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	var n int

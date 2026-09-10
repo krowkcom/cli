@@ -358,3 +358,64 @@ func TestReadJSONLOverLongUnterminatedTailIsFatal(t *testing.T) {
 		t.Fatalf("Lines = %d, want the one good line", res.Lines)
 	}
 }
+
+// A corrupt file must be reported, not survived at any cost: a Result that
+// grew a struct per bad line would turn a 64 MiB file of junk into an
+// out-of-memory failure, which is a much worse way to say "this file is
+// junk" than a number is.
+func TestReadJSONLManyBadLinesAreCountedNotAccumulated(t *testing.T) {
+	const bad = 1000
+	var b strings.Builder
+	// Each reason will be the callback's error carrying the line, so this
+	// also exercises the reason bound.
+	long := strings.Repeat("q", 4096)
+	for i := 0; i < bad; i++ {
+		b.WriteString("not json " + long + "\n")
+	}
+	b.WriteString("{\"i\":1}\n")
+	path := writeFile(t, "junk.jsonl", b.String())
+
+	got, cur, res := readAll(t, path, JSONLCursor{})
+	if len(got) != 1 {
+		t.Fatalf("got %v, want the one good line", got)
+	}
+	if res.SkippedCount != bad {
+		t.Fatalf("SkippedCount = %d, want %d", res.SkippedCount, bad)
+	}
+	if len(res.Skipped) != maxSkippedRetained {
+		t.Fatalf("len(Skipped) = %d, want the retained sample of %d", len(res.Skipped), maxSkippedRetained)
+	}
+	// The retained entries are the first ones, and they still carry the
+	// line number the acceptance bullet asks for.
+	for i, sl := range res.Skipped {
+		if sl.Line != i+1 {
+			t.Fatalf("Skipped[%d].Line = %d, want %d", i, sl.Line, i+1)
+		}
+		if len(sl.Reason) > maxSkipReasonBytes+len("…") {
+			t.Fatalf("Skipped[%d].Reason is %d bytes, want it bounded", i, len(sl.Reason))
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if cur.Offset != info.Size() {
+		t.Fatalf("cursor = %+v, want the whole file (%d)", cur, info.Size())
+	}
+}
+
+// A returned cursor whose Size was below its Offset would look, on the next
+// read, exactly like the shrink that triggers a full rescan — so it is an
+// invariant, not an accident of when the stat happened.
+func TestReadJSONLCursorSizeNeverBelowOffset(t *testing.T) {
+	path := writeFile(t, "a.jsonl", "{\"i\":1}\n{\"i\":2}\n")
+	_, cur, _ := readAll(t, path, JSONLCursor{})
+	if cur.Size < cur.Offset {
+		t.Fatalf("cursor = %+v, want Size >= Offset", cur)
+	}
+	// And the invariant holds however the offset was arrived at, including
+	// a read the callback aborted partway.
+	if got := cursorAt(500, 100); got.Size != 500 {
+		t.Fatalf("cursorAt(500, 100) = %+v, want Size raised to the offset", got)
+	}
+}

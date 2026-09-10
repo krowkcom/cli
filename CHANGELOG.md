@@ -40,10 +40,14 @@ the versions are the `v*` tags a release is cut from. Entries land under
   has been rewritten shorter, rewinds to the last complete line when an
   offset landed mid-line, and leaves a half-flushed trailing line for the
   next read. A line it cannot use — unparseable, past the 16 MiB line cap,
-  or rejected by the source reading it — is counted in `Result.Skipped`
-  with its line number and the read carries on, because stopping would pin
+  or rejected by the source reading it — is counted in
+  `Result.SkippedCount` and the read carries on, because stopping would pin
   the cursor to that line and one bad line would cost the rest of the file
-  on every attempt from then on. Only three things stop a read: an I/O
+  on every attempt from then on. The first hundred of those lines are also
+  described individually in `Result.Skipped`, with the line number and byte
+  offset; the count stays exact past that, so a file that is nothing but
+  junk is reported as a number rather than accumulating a record per line
+  until the importer runs out of memory. Only three things stop a read: an I/O
   error, an unterminated final line that is already past the line cap, and
   a source explicitly returning `ErrAbortFile` for a failure that was not
   the line's fault. The turn rule is one shared function: a turn opens at a

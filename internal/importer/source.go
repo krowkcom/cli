@@ -3,6 +3,7 @@ package importer
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/krowkcom/cli/internal/harness"
 	"github.com/krowkcom/cli/internal/store"
@@ -80,12 +81,28 @@ func (r Ref) Key() string {
 	return r.Provider + ":" + id
 }
 
-// SkippedLine is one line that did not parse, kept rather than counted so
-// that "12 skipped" can be answered with which twelve. Line is 1-based
-// within the read that produced it — a resumed read starts counting at its
-// own first line, because numbering from the top of the file would mean
-// re-scanning everything the cursor exists to skip. Offset is the absolute
-// byte offset of the line's first byte, which is unambiguous either way.
+// The bounds on what a Result remembers. A Result is held for the whole of
+// one Read, so anything it accumulates per line is memory the importer pays
+// for per line — and the pathological input is not exotic: a 64 MiB file of
+// short non-JSON lines is 33 million skips, and a reason string can be a
+// callback's error carrying a whole 16 MiB line inside it.
+const (
+	// maxSkippedRetained is how many skipped lines are kept in detail. The
+	// first hundred answer "which lines?" as well as thirty-three million
+	// would; the count answers "how many?" on its own.
+	maxSkippedRetained = 100
+	// maxSkipReasonBytes bounds one reason. A reason is a sentence, and
+	// anything longer is a caller having embedded the line in its error.
+	maxSkipReasonBytes = 256
+)
+
+// SkippedLine is one line that did not parse, kept rather than merely
+// counted so that "12 skipped" can be answered with which twelve. Line is
+// 1-based within the read that produced it — a resumed read starts counting
+// at its own first line, because numbering from the top of the file would
+// mean re-scanning everything the cursor exists to skip. Offset is the
+// absolute byte offset of the line's first byte, which is unambiguous either
+// way. Reason is truncated to maxSkipReasonBytes.
 type SkippedLine struct {
 	Line   int
 	Offset int64
@@ -110,13 +127,35 @@ type Result struct {
 	// `last-prompt` and `summary` lines are transcript furniture, not
 	// transcript.
 	Classified map[string]int
-	// Skipped is every line that could not be parsed at all.
+	// SkippedCount is how many lines could not be used. It is the honest
+	// total and always exact.
+	SkippedCount int
+	// Skipped is the first maxSkippedRetained of those lines in detail.
+	// It is a sample, not the total — SkippedCount is the total — because
+	// a Result that grew a struct per bad line would turn a corrupt file
+	// into an out-of-memory failure, which is a far worse way to report a
+	// corrupt file than a number.
 	Skipped []SkippedLine
 }
 
-// Skip records a line that could not be used, with why.
+// Skip records a line that could not be used, with why. Every call counts;
+// only the first maxSkippedRetained are described.
 func (r *Result) Skip(line int, offset int64, reason string) {
-	r.Skipped = append(r.Skipped, SkippedLine{Line: line, Offset: offset, Reason: reason})
+	r.SkippedCount++
+	if len(r.Skipped) >= maxSkippedRetained {
+		return
+	}
+	r.Skipped = append(r.Skipped, SkippedLine{Line: line, Offset: offset, Reason: truncateReason(reason)})
+}
+
+// truncateReason bounds a reason string. The cut is made valid again rather
+// than left as it fell: slicing bytes can land inside a rune, and these
+// strings end up in a database column and on a terminal.
+func truncateReason(reason string) string {
+	if len(reason) <= maxSkipReasonBytes {
+		return reason
+	}
+	return strings.ToValidUTF8(reason[:maxSkipReasonBytes], "") + "…"
 }
 
 // Classify records a line the source understood and chose not to import.
@@ -143,7 +182,13 @@ func (r *Result) Merge(other Result) {
 		}
 		r.Classified[k] += v
 	}
-	r.Skipped = append(r.Skipped, other.Skipped...)
+	r.SkippedCount += other.SkippedCount
+	for _, sl := range other.Skipped {
+		if len(r.Skipped) >= maxSkippedRetained {
+			break
+		}
+		r.Skipped = append(r.Skipped, sl)
+	}
 }
 
 // ErrUnsupportedOS is what Discover returns where krowk cannot find

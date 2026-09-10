@@ -2,6 +2,7 @@ package importer
 
 import (
 	"encoding/json"
+	"unicode/utf8"
 
 	"github.com/krowkcom/cli/internal/store"
 )
@@ -78,7 +79,9 @@ func PartTypes() []string {
 // ToolCallData is the fixed shape of a PartToolCall's Data. Name is the tool
 // as the provider named it — unmapped, because a tool called `Bash` in one
 // agent and `bash` in another are genuinely different tools with different
-// input schemas. Input is whatever the provider sent, verbatim.
+// input schemas. Input is whatever the provider sent, unchanged when it is
+// valid UTF-8 JSON; see normalizeRaw for what happens when it is not, which
+// is the one case where the bytes are not preserved exactly.
 type ToolCallData struct {
 	Name  string          `json:"name"`
 	Input json.RawMessage `json:"input,omitempty"`
@@ -120,8 +123,7 @@ func NewToolResultPart(callID string, output json.RawMessage, isError bool) stor
 // that returned a plain string, saving every caller a json.Marshal of a
 // string.
 func NewToolResultTextPart(callID, output string, isError bool) store.Part {
-	b, _ := json.Marshal(output)
-	return NewToolResultPart(callID, b, isError)
+	return NewToolResultPart(callID, json.RawMessage(mustJSON(output)), isError)
 }
 
 // NormalizePart maps a source's own block type onto the canonical set. A
@@ -171,14 +173,14 @@ func unknownData(rawType string, raw json.RawMessage) string {
 }
 
 // rawDataOrEmpty is the part Data for a payload that needs no reshaping.
-// The store defaults an empty Data to '{}', and an invalid one would fail
-// the read later and further from the cause, so anything that is not valid
-// JSON is wrapped rather than passed through.
+// The store defaults an empty Data to '{}', and a payload that is not usable
+// JSON would fail further down and further from the cause, so it is wrapped
+// rather than passed through.
 func rawDataOrEmpty(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
 	}
-	if !json.Valid(raw) {
+	if !usableJSON(raw) {
 		return mustJSON(struct {
 			Raw string `json:"raw"`
 		}{Raw: string(raw)})
@@ -186,18 +188,34 @@ func rawDataOrEmpty(raw json.RawMessage) string {
 	return string(raw)
 }
 
-// normalizeRaw makes a payload safe to embed without losing it. An absent
-// one becomes JSON null, because ToolCallData and ToolResultData must always
-// marshal to valid JSON. One that is not valid JSON is kept as a JSON
-// string: a tool's input is documented as verbatim, and replacing it with
-// null would quietly discard the only record of what was actually run.
+// usableJSON reports whether a payload can be stored as it stands. Valid
+// JSON is not enough: JSON syntax admits arbitrary bytes inside a string
+// literal, and TEXT columns, terminals and JSON consumers downstream all
+// assume UTF-8. A payload that is valid JSON carrying invalid UTF-8 is
+// therefore refused here and wrapped instead, where Go's marshaller
+// normalises it.
+func usableJSON(raw json.RawMessage) bool {
+	return json.Valid(raw) && utf8.Valid(raw)
+}
+
+// normalizeRaw makes a payload safe to embed without throwing it away. An
+// absent one becomes JSON null, because ToolCallData and ToolResultData must
+// always marshal to valid JSON. One that is not usable as it stands — bad
+// syntax, or valid syntax carrying bytes that are not UTF-8 — is kept as a
+// JSON string rather than replaced with null: discarding it would lose the
+// only record of what was actually run.
+//
+// "Kept" is not quite "byte for byte", and that is the one place this
+// package does not preserve what it read. Marshalling the bytes as a Go
+// string replaces each invalid UTF-8 sequence with U+FFFD, so a payload
+// carrying raw binary comes back readable but not identical. The
+// alternative was storing bytes that no reader of the column could decode.
 func normalizeRaw(raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
 		return json.RawMessage("null")
 	}
-	if !json.Valid(raw) {
-		b, _ := json.Marshal(string(raw))
-		return b
+	if !usableJSON(raw) {
+		return json.RawMessage(mustJSON(string(raw)))
 	}
 	return raw
 }

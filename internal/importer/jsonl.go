@@ -77,6 +77,12 @@ func ReadJSONL(f *os.File, cur JSONLCursor, fn func(lineNo int, line []byte) err
 	if err != nil {
 		return cur, res, err
 	}
+	// The size is the size at the start of the read. A transcript is being
+	// written while it is read, so the file may well be longer by the time
+	// the loop ends — which is why every cursor returned below reports
+	// max(size, offset) rather than this number. A cursor whose Size was
+	// less than its Offset would look, on the next read, exactly like the
+	// shrink that triggers a full rescan.
 	size := info.Size()
 
 	start := startOffset(f, cur, size)
@@ -91,7 +97,7 @@ func ReadJSONL(f *os.File, cur JSONLCursor, fn func(lineNo int, line []byte) err
 	for {
 		payload, consumed, tooLong, err := readLine(reader)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return JSONLCursor{Offset: offset, Size: size}, res, err
+			return cursorAt(offset, size), res, err
 		}
 		if errors.Is(err, io.EOF) {
 			// Whatever is left has no newline: a partial write. Leave the
@@ -102,7 +108,7 @@ func ReadJSONL(f *os.File, cur JSONLCursor, fn func(lineNo int, line []byte) err
 				// hope that something does is the exact cost the cap
 				// exists to refuse. The cursor still stops in front of it,
 				// so a caller that fixes the file resumes cleanly.
-				return JSONLCursor{Offset: offset, Size: size}, res, fmt.Errorf("line %d: %w", lineNo+1, errLineTooLong)
+				return cursorAt(offset, size), res, fmt.Errorf("line %d: %w", lineNo+1, errLineTooLong)
 			}
 			break
 		}
@@ -134,14 +140,25 @@ func ReadJSONL(f *os.File, cur JSONLCursor, fn func(lineNo int, line []byte) err
 				// The cursor stops at the last line the callback accepted,
 				// so a retry re-reads this one rather than stepping over
 				// the failure.
-				return JSONLCursor{Offset: lineStart, Size: size}, res, fmt.Errorf("line %d: %w", lineNo, ferr)
+				return cursorAt(lineStart, size), res, fmt.Errorf("line %d: %w", lineNo, ferr)
 			}
 			res.Skip(lineNo, lineStart, ferr.Error())
 			continue
 		}
 	}
 
-	return JSONLCursor{Offset: offset, Size: size}, res, nil
+	return cursorAt(offset, size), res, nil
+}
+
+// cursorAt is the watermark for a read that consumed up to offset in a file
+// that was size bytes when the read began. Size can only ever be reported as
+// at least Offset: the file grew during the read, and saying otherwise would
+// make the next read mistake growth for truncation.
+func cursorAt(offset, size int64) JSONLCursor {
+	if offset > size {
+		size = offset
+	}
+	return JSONLCursor{Offset: offset, Size: size}
 }
 
 // errLineTooLong is a line past maxLineBytes. A complete one is skipped

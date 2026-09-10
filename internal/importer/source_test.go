@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/krowkcom/cli/internal/harness"
 	"github.com/krowkcom/cli/internal/store"
@@ -379,5 +381,39 @@ func TestResultMerge(t *testing.T) {
 	}
 	if len(a.Skipped) != 2 {
 		t.Fatalf("Skipped = %+v", a.Skipped)
+	}
+}
+
+// Merge has to respect the same bounds as Skip, or folding two Results
+// would be a way around them.
+func TestResultMergeRespectsSkipBounds(t *testing.T) {
+	var a, b Result
+	for i := 0; i < 80; i++ {
+		a.Skip(i+1, int64(i), "invalid json")
+		b.Skip(i+1, int64(i), "invalid json")
+	}
+	a.Merge(b)
+	if a.SkippedCount != 160 {
+		t.Fatalf("SkippedCount = %d, want 160", a.SkippedCount)
+	}
+	if len(a.Skipped) != maxSkippedRetained {
+		t.Fatalf("len(Skipped) = %d, want %d", len(a.Skipped), maxSkippedRetained)
+	}
+}
+
+func TestSkipTruncatesReason(t *testing.T) {
+	var res Result
+	// An invalid UTF-8 tail, so the cut cannot be left as it fell: these
+	// strings end up in a database column and on a terminal.
+	res.Skip(1, 0, strings.Repeat("é", 200)+"\xff")
+	if got := res.Skipped[0].Reason; len(got) > maxSkipReasonBytes+len("…") {
+		t.Fatalf("Reason is %d bytes, want it bounded", len(got))
+	} else if !utf8.ValidString(got) {
+		t.Fatalf("Reason is not valid UTF-8: %q", got)
+	}
+	// A short reason is left exactly as given.
+	res.Skip(2, 0, "invalid json")
+	if got := res.Skipped[1].Reason; got != "invalid json" {
+		t.Fatalf("Reason = %q, want it untouched", got)
 	}
 }

@@ -203,6 +203,14 @@ func underDir(dir, path string) bool {
 // is and how big. Nothing is read before all of that, so a refusal costs
 // one stat rather than a file.
 //
+// O_NOFOLLOW closes that window for the leaf and only the leaf. An
+// intermediate directory replaced by a symlink between the resolve and the
+// open would be followed, because the path is walked by the kernel a second
+// time and only the last component is guarded. Closing it properly needs an
+// openat walk holding a descriptor per component, which is not worth it
+// here: every component is under a home directory, and anything able to
+// swap one could have written the transcript itself.
+//
 // maxBytes of zero or less means DefaultMaxBytes. Callers get the open file
 // and own closing it — the size check is on the descriptor, so the file they
 // hold is the file that was measured.

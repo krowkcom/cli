@@ -3,6 +3,9 @@ package importer
 import (
 	"encoding/json"
 	"testing"
+	"unicode/utf8"
+
+	"github.com/krowkcom/cli/internal/store"
 )
 
 // Acceptance: every part.type a Source emits is in the fixed set, and an
@@ -174,5 +177,39 @@ func TestNormalizePartWrapsInvalidJSONPayload(t *testing.T) {
 	}
 	if part.Data != `{"raw":"not json"}` {
 		t.Fatalf("Data = %q", part.Data)
+	}
+}
+
+// Valid JSON is not enough to store as it stands: JSON syntax admits any
+// byte inside a string literal, while the TEXT column it lands in, the
+// terminal it is printed on and every JSON reader downstream assume UTF-8.
+// Such a payload is wrapped, which normalises it — the one place this
+// package does not return exactly the bytes it read.
+func TestPartDataIsAlwaysValidJSONAndUTF8(t *testing.T) {
+	// A JSON string carrying bytes that are not UTF-8.
+	raw := json.RawMessage("\"a\xff\xfeb\"")
+	if !json.Valid(raw) {
+		t.Skip("this Go version rejects invalid UTF-8 in a JSON string outright")
+	}
+	if utf8.Valid(raw) {
+		t.Fatal("the fixture is supposed to be invalid UTF-8")
+	}
+
+	parts := map[string]store.Part{}
+	parts["normalized text"], _ = NormalizePart(PartText, raw)
+	parts["unknown"], _ = NormalizePart("server_tool_use", raw)
+	parts["tool_call input"] = NewToolCallPart("call_1", "Bash", raw)
+	parts["tool_result output"] = NewToolResultPart("call_1", raw, false)
+
+	for name, part := range parts {
+		if part.Data == "" {
+			t.Fatalf("%s: Data is empty", name)
+		}
+		if !json.Valid([]byte(part.Data)) {
+			t.Fatalf("%s: Data is not valid JSON: %q", name, part.Data)
+		}
+		if !utf8.ValidString(part.Data) {
+			t.Fatalf("%s: Data is not valid UTF-8: %q", name, part.Data)
+		}
 	}
 }

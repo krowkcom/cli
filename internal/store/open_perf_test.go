@@ -33,7 +33,7 @@ func coldOpenBudget(short bool) time.Duration {
 	return 50 * time.Millisecond
 }
 
-// perfPayloads returns the two ~1KB blobs the fixture stores: raw_json on
+// perfPayloads returns the two ~0.9KB blobs the fixture stores: raw_json on
 // message and data on part. One builder serves the test and both benchmarks
 // so the measured blob shape cannot diverge between them.
 func perfPayloads() (rawJSON, partData string) {
@@ -105,11 +105,17 @@ func buildPerfFixture(tb testing.TB, db *sql.DB, sessionID string) {
 // checkpointPerf collapses the WAL the bulk load wrote so a later cold open
 // sees a steady-state file rather than paying a checkpoint a production
 // reopen would rarely see. Shared so the test and both benchmarks measure
-// the same file state.
+// the same file state. A busy checkpoint fails the fixture loudly: the file
+// is isolated to this test, so no concurrent writer can hold it, and a
+// half-checkpointed file would measure checkpoint cost as open cost.
 func checkpointPerf(tb testing.TB, db *sql.DB) {
 	tb.Helper()
-	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+	var busy, logFrames, checkpointed int
+	if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
 		tb.Fatalf("checkpoint perf fixture: %v", err)
+	}
+	if busy != 0 {
+		tb.Fatalf("checkpoint perf fixture busy (busy=%d log=%d checkpointed=%d)", busy, logFrames, checkpointed)
 	}
 }
 
@@ -123,15 +129,16 @@ var blobTokenRe = regexp.MustCompile(`(?i)\b(raw_json|data|part)\b`)
 // assertCountQueryShape pins the probe text: exact normalized equality plus a
 // token scan for blob identifiers. Either fires if a future edit drags blobs
 // into the listing path — SELECT *, SELECT raw_json, JOIN part, or an
-// aliased part reference.
-func assertCountQueryShape(t *testing.T) {
-	t.Helper()
+// aliased part reference. The token scan doubles as the plan-detail check
+// below, where exact equality cannot apply.
+func assertCountQueryShape(tb testing.TB) {
+	tb.Helper()
 	normalized := strings.Join(strings.Fields(strings.ToUpper(messageCountQuery)), " ")
 	if normalized != "SELECT COUNT(*) FROM MESSAGE" {
-		t.Errorf("count query drifted to %q, want exactly %q (blob-free listing shape)", messageCountQuery, "SELECT COUNT(*) FROM message")
+		tb.Errorf("count query drifted to %q, want exactly %q (blob-free listing shape)", messageCountQuery, "SELECT COUNT(*) FROM message")
 	}
 	if blobTokenRe.MatchString(strings.ReplaceAll(normalized, "COUNT(*)", "COUNT_ROWS")) {
-		t.Errorf("count query must not name blob columns or the part table: %q", messageCountQuery)
+		tb.Errorf("count query must not name blob columns or the part table: %q", messageCountQuery)
 	}
 }
 
@@ -168,7 +175,11 @@ func TestColdOpen10kMessages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cold Open: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close cold open: %v", err)
+		}
+	}()
 	t.Logf("cold Open on %d-message fixture: %s (budget %s, short=%v)", perfMessageCount, elapsed, budget, testing.Short())
 	if elapsed > budget {
 		t.Errorf("cold Open took %s, budget %s on %d-message fixture", elapsed, budget, perfMessageCount)
@@ -202,6 +213,9 @@ func TestColdOpen10kMessages(t *testing.T) {
 		t.Errorf("COUNT(*) = %d, want %d", n, perfMessageCount)
 	}
 	var nParts int
+	// Exempt from assertCountQueryShape by design: this probe counts the blob
+	// table deliberately, to prove the fixture holds one blob part per
+	// message — it is the fixture-size check, not a listing query.
 	if err := db.QueryRow(`SELECT COUNT(*) FROM part`).Scan(&nParts); err != nil {
 		t.Fatalf("count parts: %v", err)
 	}
@@ -241,7 +255,9 @@ func BenchmarkColdOpen10k(b *testing.B) {
 }
 
 // BenchmarkMessageCount10k times the blob-free count probe on the 10k
-// fixture for -bench runs.
+// fixture for -bench runs. It reuses the test's warm handle on purpose: the
+// cold path is BenchmarkColdOpen10k's job, this one tracks steady-state
+// listing cost beside it.
 func BenchmarkMessageCount10k(b *testing.B) {
 	home := b.TempDir()
 	env := testEnv(map[string]string{"HOME": home})

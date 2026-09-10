@@ -11,6 +11,15 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- The session store now carries a 10k-message cold-open budget: `internal/store`
+  builds ten thousand messages (each with a blob part) in a temp database and
+  fails the gate if a cold `Open` on that fixture exceeds 50ms (500ms under
+  `-short`, where loaded CI runners flake on tight wall-clock asserts). The
+  same test pins the listing-shape probe — `SELECT COUNT(*) FROM message` —
+  and fails if it ever names `raw_json` or touches the `part` table, so later
+  listings cannot drag blobs by accident. Fixture setup sits outside the
+  measured window. Nothing is user-visible yet; no command reads these rows.
+
 - `krowk doctor` now reports the local session store's health as a `store`
   StatusCheck, sibling to the harness checks: the `krowk.db` path, the schema
   version and the steady-state pragmas (WAL, NORMAL, foreign keys). It passes

@@ -11,6 +11,43 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- The Claude importer, `internal/importer/claude`, which reads Claude
+  Code's JSONL transcripts out of `~/.claude/projects` and produces the
+  canonical `store.Thread`. The thing it is careful about is not losing
+  anything: on a real machine a third of the lines are `attachment` and
+  another slice is `mode`, `last-prompt`, `queue-operation`, `atis-latch`,
+  `pr-link`, `permission-mode`, `cost-state`, `file-history-snapshot`,
+  `file-history-delta`, `ai-title`, `frame-link`, `continued-in` and
+  `agent-name`, so a reader that matched `user` and `assistant` would drop
+  most of the file and report a clean import. Every line lands in exactly
+  one of four places — a message, a session event, `Result.Classified` or
+  `Result.Skipped` — including a line type this build has never met, which
+  is classified under its own name rather than ignored, and a test adds the
+  four up against the fixture's line count. An `attachment` becomes a
+  `session_event` only when it carries a hook event; the rest are context
+  Claude injected, and importing them as user messages would put words in a
+  person's mouth and double the turn count. The worktree comes from the
+  line's `cwd` and never from the directory slug, because
+  `-home-elvinas--buzz` is not invertible: the checkout is the git toplevel
+  found by walking up from `cwd`, and a session run outside version control
+  gets its own directory with `vcs` of `none`. A subagent transcript under
+  `<session>/subagents/agent-*.jsonl` becomes a session of its own, bound
+  on its agent id and pointed at the conversation that dispatched it, and
+  `Discover` returns a parent immediately before its children so a caller
+  ingesting in order never leaves the link unset. `session.provider` is
+  `anthropic` and `session.harness` is `claude`, while the binding stays on
+  `claude` because that half of the key is already persisted. `Read` reads
+  from the top of the file every time and says so: turns are cumulative
+  positional lists whose costs are summed over a whole span, so a read
+  resumed from the middle could neither number them nor cost them, and the
+  store's `foreign_id` dedup makes the re-read free.
+- `store.Thread.Parent`, a binding naming the session a session was spawned
+  from. On ingest it is resolved through `session_binding` and written to
+  `session.parent_id`, but only when the parent is already in the store and
+  only when the column is still NULL — a child imported before its parent
+  keeps a NULL and a later ingest of the same child fills it in, and a
+  parent already recorded is never silently repointed.
+
 - The importer contract, so three importers cannot become three exporters:
   `internal/importer` fixes the vocabulary the Claude, cursor and opencode
   readers all have to speak. A `Source` is `Name`, `Discover` and `Read`,

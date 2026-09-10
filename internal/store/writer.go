@@ -97,6 +97,10 @@ func validRole(r Role) bool {
 //   - worktree upserted by path;
 //   - session found by (provider, foreign_session_id) binding, else created
 //     with its binding (a lost create race adopts the winner);
+//   - session.parent_id set from th.Parent's binding when that binding is
+//     already in the store and the column is still NULL — a parent nobody
+//     has ingested yet leaves it NULL, and a later Ingest of the same
+//     child fills it in;
 //   - messages with a ForeignID already in the session skipped with their
 //     parts, the rest appended with seq after the current max;
 //   - turns and events treated as cumulative positional lists: position i
@@ -217,6 +221,10 @@ func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, 
 		res.Bindings.Inserted++
 	} else {
 		res.Bindings.Skipped++
+	}
+
+	if err := linkParent(ctx, tx, sessionID, th.Parent); err != nil {
+		return Result{}, err
 	}
 
 	ti, ts, err := insertTurnTail(ctx, tx, w.minter, now, sessionID, th.Turns)
@@ -346,6 +354,50 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 		return "", false, false, fmt.Errorf("store: ingest insert binding: %w", err)
 	}
 	return sessionID, true, true, nil
+}
+
+// linkParent points sessionID at the session its parent binding names, when
+// there is one to point at.
+//
+// Three things are deliberate here. A parent binding nobody has ingested yet
+// is not an error: a Claude subagent transcript is a file of its own, and a
+// caller importing files in whatever order the filesystem handed them back
+// would otherwise fail on every child that arrived early. It is left NULL and
+// a later Ingest of the same child — which happens on the next import, since
+// the child's messages dedup but its session row is always revisited — fills
+// it in.
+//
+// The UPDATE only touches a NULL column. Re-parenting a session that already
+// has a parent would be the store silently rewriting history on the strength
+// of one importer's reading of one file, and a wrong parent is harder to
+// notice than a missing one.
+//
+// A session is never its own parent. The guard is cheap and the alternative
+// is a row the parent_id foreign key happily accepts and every tree walk
+// downstream loops on.
+func linkParent(ctx context.Context, tx *sql.Tx, sessionID string, parent *Binding) error {
+	if parent == nil || parent.ForeignSessionID == "" {
+		return nil
+	}
+	var parentID string
+	err := tx.QueryRowContext(ctx,
+		`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
+		parent.Provider, parent.ForeignSessionID).Scan(&parentID)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("store: ingest find parent binding: %w", err)
+	}
+	if parentID == sessionID {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE session SET parent_id = ? WHERE id = ? AND parent_id IS NULL`,
+		parentID, sessionID); err != nil {
+		return fmt.Errorf("store: ingest set parent: %w", err)
+	}
+	return nil
 }
 
 // insertTurnTail appends the turns past the stored prefix: position i is

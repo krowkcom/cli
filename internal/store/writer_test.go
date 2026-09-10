@@ -704,3 +704,143 @@ func TestWriterPositionRowsNeedNoResend(t *testing.T) {
 		t.Errorf("message seqs = %v, want [0 1]: cursor-less resend appends", seqs)
 	}
 }
+
+// parentOf reads a session's parent_id through its binding, as NULL or as
+// the id it points at.
+func parentOf(t *testing.T, db *sql.DB, provider, foreignID string) (string, bool) {
+	t.Helper()
+	var parent sql.NullString
+	err := db.QueryRow(
+		`SELECT s.parent_id FROM session s JOIN session_binding b ON b.session_id = s.id
+		 WHERE b.provider = ? AND b.foreign_session_id = ?`, provider, foreignID).Scan(&parent)
+	if err != nil {
+		t.Fatalf("read parent of %s: %v", foreignID, err)
+	}
+	return parent.String, parent.Valid
+}
+
+// sessionIDOf is the store id behind a binding, for the tests that have to
+// compare a parent_id against the row it should name.
+func sessionIDOf(t *testing.T, db *sql.DB, provider, foreignID string) string {
+	t.Helper()
+	var id string
+	if err := db.QueryRow(
+		`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
+		provider, foreignID).Scan(&id); err != nil {
+		t.Fatalf("find session %s: %v", foreignID, err)
+	}
+	return id
+}
+
+// childThread is a Thread naming another session as its parent, which is
+// what a Claude subagent transcript produces.
+func childThread(provider, foreignID, parentForeignID string) Thread {
+	th := sampleThread(provider, foreignID)
+	th.Parent = &Binding{Provider: provider, Harness: "claude", ForeignSessionID: parentForeignID}
+	return th
+}
+
+func TestIngestSetsParentWhenTheParentIsAlreadyThere(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	if _, err := w.Ingest(ctx, sampleThread("claude", "parent")); err != nil {
+		t.Fatalf("Ingest parent: %v", err)
+	}
+	if _, err := w.Ingest(ctx, childThread("claude", "child", "parent")); err != nil {
+		t.Fatalf("Ingest child: %v", err)
+	}
+
+	got, ok := parentOf(t, db, "claude", "child")
+	if !ok {
+		t.Fatal("child has no parent_id")
+	}
+	if want := sessionIDOf(t, db, "claude", "parent"); got != want {
+		t.Fatalf("parent_id = %q, want the parent session %q", got, want)
+	}
+	// And the parent is nobody's child.
+	if _, ok := parentOf(t, db, "claude", "parent"); ok {
+		t.Fatal("the parent acquired a parent")
+	}
+}
+
+func TestIngestLeavesParentNullWhenTheParentIsMissing(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	// The child arrives first, which is what happens to a caller walking
+	// files in whatever order the filesystem gave them.
+	if _, err := w.Ingest(ctx, childThread("claude", "child", "parent")); err != nil {
+		t.Fatalf("Ingest child: %v", err)
+	}
+	if _, ok := parentOf(t, db, "claude", "child"); ok {
+		t.Fatal("child was given a parent nobody has ingested")
+	}
+}
+
+func TestReingestFillsInAParentThatArrivedLate(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	child := childThread("claude", "child", "parent")
+	if _, err := w.Ingest(ctx, child); err != nil {
+		t.Fatalf("Ingest child: %v", err)
+	}
+	if _, err := w.Ingest(ctx, sampleThread("claude", "parent")); err != nil {
+		t.Fatalf("Ingest parent: %v", err)
+	}
+
+	// The second pass over the child is what converges: nothing new is
+	// inserted, and the NULL is filled in.
+	res, err := w.Ingest(ctx, child)
+	if err != nil {
+		t.Fatalf("re-Ingest child: %v", err)
+	}
+	if res.Messages.Inserted != 0 || res.Turns.Inserted != 0 || res.Sessions.Inserted != 0 {
+		t.Fatalf("re-ingest inserted rows: %+v", res)
+	}
+	got, ok := parentOf(t, db, "claude", "child")
+	if !ok {
+		t.Fatal("re-ingest did not fill in the parent")
+	}
+	if want := sessionIDOf(t, db, "claude", "parent"); got != want {
+		t.Fatalf("parent_id = %q, want %q", got, want)
+	}
+}
+
+// A session that names itself is not stored as its own parent: the foreign
+// key would accept it and every tree walk downstream would loop.
+func TestIngestRefusesToMakeASessionItsOwnParent(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	if _, err := w.Ingest(ctx, childThread("claude", "loop", "loop")); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if _, ok := parentOf(t, db, "claude", "loop"); ok {
+		t.Fatal("a session became its own parent")
+	}
+}
+
+// A parent already set is not rewritten: one importer's reading of one file
+// must not silently re-home a session that another pass already placed.
+func TestIngestDoesNotRepointAnExistingParent(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	for _, id := range []string{"first", "second"} {
+		if _, err := w.Ingest(ctx, sampleThread("claude", id)); err != nil {
+			t.Fatalf("Ingest %s: %v", id, err)
+		}
+	}
+	if _, err := w.Ingest(ctx, childThread("claude", "child", "first")); err != nil {
+		t.Fatalf("Ingest child: %v", err)
+	}
+	if _, err := w.Ingest(ctx, childThread("claude", "child", "second")); err != nil {
+		t.Fatalf("re-Ingest child: %v", err)
+	}
+	got, _ := parentOf(t, db, "claude", "child")
+	if want := sessionIDOf(t, db, "claude", "first"); got != want {
+		t.Fatalf("parent_id = %q, want it still pointing at the first parent %q", got, want)
+	}
+}

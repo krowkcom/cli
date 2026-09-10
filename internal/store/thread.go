@@ -124,6 +124,21 @@ type Thread struct {
 	Worktree Worktree
 	Session  Session
 	Binding  Binding
+	// Parent is the binding of the session this one was spawned from — a
+	// Claude subagent naming the conversation that dispatched it — or nil
+	// for a session nobody spawned. It is a Binding rather than a session
+	// id because an importer never sees store ids: it knows the foreign
+	// session it read, and the store is the only thing that can turn that
+	// into a row id.
+	//
+	// The link is best-effort by design. If the parent has not been
+	// ingested yet the child's parent_id stays NULL and a later Ingest of
+	// the same child fills it in, so a caller that walks children first
+	// converges rather than failing. Callers should still ingest parents
+	// before children — internal/importer/claude's Discover returns them
+	// in that order for exactly this reason — because converging costs a
+	// second pass and a NULL in between.
+	Parent   *Binding
 	Turns    []Turn
 	Events   []Event
 	Messages []Message

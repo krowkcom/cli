@@ -51,6 +51,24 @@ the versions are the `v*` tags a release is cut from. Entries land under
   extensions are enabled until a product asks for one. Nothing is user-visible
   yet, and no command opens the database; that arrives with `store.Open`.
 
+- `store.Open` opens the session store: one global file at
+  `$XDG_DATA_HOME/krowk/krowk.db` (a relative `XDG_DATA_HOME` is ignored, as
+  the basedir spec says), otherwise `~/.local/share/krowk/krowk.db`. Global on
+  purpose — a cwd-based path would split the store per repo. The environment
+  is injected, and a missing or relative home means Open fails with a hint
+  instead of inventing a path at `/` or the working directory. The parent
+  directory is created when missing and the database file is created `0600`
+  before SQLite touches it — a file or sidecar (`-wal`, `-shm`) an earlier
+  run left world-readable is tightened back to `0600` on open, so the store
+  itself stays private to the user. (Side files SQLite creates after `Open`
+  returns follow the process umask; the write path owns those.) Every connection the pool
+  opens carries the same pragmas via the DSN: `journal_mode=WAL` so readers
+  never block the writer, `synchronous=NORMAL` (safe under WAL — a power cut
+  can lose the last moments, never corrupt the file), `foreign_keys=1` because
+  SQLite ships with them off and every schema here assumes them on, and a 10s
+  `busy_timeout` so a briefly locked database waits instead of failing.
+  Nothing is user-visible yet; no command opens the database.
+
 - A harness registry (`internal/harness`) that detects which coding agents are
   installed and asks each one whether krowk is actually wired into it. Claude
   Code is the first: detected by a `~/.claude/` directory or a `claude` binary,

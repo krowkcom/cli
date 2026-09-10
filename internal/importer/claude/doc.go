@@ -52,6 +52,18 @@
 // arrives; a caller that does not gets a NULL parent_id and the next import
 // fixes it.
 //
+// # A turn is a costing unit, not a link
+//
+// store.Message carries no turn_id from this importer, because the contract
+// carries none: the writer inserts NULL and Thread has nowhere to say
+// otherwise. Turns are still computed and still exact — the spans are
+// positional over the same message list, so the mapping exists — but it
+// lives in this package's arithmetic rather than in a column, which means a
+// turn is what per-turn cost is summed over and nothing else. A reader that
+// wants "which messages were in turn 3" cannot get it from the store yet,
+// and should not be told it can by a column full of NULLs that looks like
+// it could.
+//
 // # Read always reads from the start
 //
 // Read type-checks the cursor it is given and then ignores its offset. Turns

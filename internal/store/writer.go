@@ -106,7 +106,9 @@ func validRole(r Role) bool {
 //   - turns and events treated as cumulative positional lists: position i
 //     is seq i, so a re-sent prefix is skipped and only the tail inserts —
 //     callers must still hold a cursor and never re-send with changed
-//     content, because the kept prefix wins silently;
+//     content, because the kept prefix wins silently. The one exception is
+//     the last stored turn, whose status and costs are refreshed from the
+//     re-sent list; see insertTurnTail for why that row and no other;
 //   - messages with no ForeignID always appended, so their callers must
 //     hold a cursor and never re-send at all.
 //
@@ -402,7 +404,8 @@ func linkParent(ctx context.Context, tx *sql.Tx, sessionID string, parent *Bindi
 
 // insertTurnTail appends the turns past the stored prefix: position i is
 // seq i, so the first len(stored) entries are the known prefix and only
-// the tail inserts. Reports inserted vs skipped. The next seq comes from
+// the tail inserts. Reports inserted vs skipped — the refreshed last turn
+// counts as skipped, because it is a row that was already there. The next seq comes from
 // MAX, not COUNT, so it stays correct even if the table ever held a gap.
 func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessionID string, turns []Turn) (int, int, error) {
 	var have, maxSeq int
@@ -412,6 +415,13 @@ func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessi
 	skipped := len(turns)
 	if skipped > have {
 		skipped = have
+	}
+	// The last stored turn is the only prefix row allowed to change, and
+	// it has to be allowed to: see refreshLastTurn.
+	if have > 0 && len(turns) >= have {
+		if err := refreshLastTurn(ctx, tx, now, sessionID, maxSeq, turns[have-1]); err != nil {
+			return 0, skipped, err
+		}
 	}
 	inserted := 0
 	for i, t := range turns[skipped:] {
@@ -427,6 +437,42 @@ func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessi
 		inserted++
 	}
 	return inserted, skipped, nil
+}
+
+// refreshLastTurn rewrites the status and costs of the turn at seq from the
+// re-sent list.
+//
+// This is the one place the store lets a positional prefix change, and the
+// reason is that the alternative is silently wrong on every live session.
+// An importer reads a transcript while somebody is still using it, so the
+// last turn it sees is a turn in flight: the prompt has landed, two of its
+// eventual twelve API calls have happened, and the cost the store is handed
+// is a fraction of what that turn will end up costing. The importer re-reads
+// the whole file next time and hands over the finished figure — and a
+// prefix skipped verbatim would keep the fraction forever. The transcript is
+// not wrong and the store is not wrong; the row is just old, and nothing
+// would ever correct it.
+//
+// It is safe for exactly one row because of what closes a turn: a turn ends
+// when the next one opens, so every turn but the last is already final by
+// the time a later turn exists to follow it. Refreshing further back would
+// be the store rewriting settled history on one importer's re-reading of one
+// file, which is the thing the positional-prefix rule is there to prevent.
+//
+// Costs are overwritten rather than added to. The incoming list is
+// cumulative — it is the whole turn as read from the whole file, not a delta
+// — so summing would double the part already stored.
+func refreshLastTurn(ctx context.Context, tx *sql.Tx, now int64, sessionID string, seq int, t Turn) error {
+	var usd any
+	if t.CostUSDMicros != nil {
+		usd = *t.CostUSDMicros
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE turn SET status = ?, cost_input_tokens = ?, cost_output_tokens = ?, cost_total_tokens = ?, cost_cache_read_tokens = ?, cost_cache_write_tokens = ?, cost_reasoning_tokens = ?, cost_usd_micros = ?, time_updated = ? WHERE session_id = ? AND seq = ?`,
+		t.Status, t.CostInput, t.CostOutput, t.CostTotal, t.CostCacheRead, t.CostCacheWrite, t.CostReasoning, usd, now, sessionID, seq); err != nil {
+		return fmt.Errorf("store: ingest refresh turn: %w", err)
+	}
+	return nil
 }
 
 // insertEventTail is insertTurnTail for session events: position i is

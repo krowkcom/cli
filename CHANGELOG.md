@@ -40,7 +40,14 @@ the versions are the `v*` tags a release is cut from. Entries land under
   from the top of the file every time and says so: turns are cumulative
   positional lists whose costs are summed over a whole span, so a read
   resumed from the middle could neither number them nor cost them, and the
-  store's `foreign_id` dedup makes the re-read free.
+  store's `foreign_id` dedup makes the re-read free — and the store now
+  refreshes the last stored turn, so a session imported while it was still
+  being used converges on its real costs rather than keeping the partial
+  ones. A message line missing its `uuid` gets a synthesised foreign id so
+  it dedups like any other, and a `user` line whose content is null
+  produces no parts and so opens no turn. Turns carry no `turn_id` link
+  back to their messages, because the contract carries none: a turn is the
+  costing unit and nothing else yet.
 - `store.Thread.Parent`, a binding naming the session a session was spawned
   from. On ingest it is resolved through `session_binding` and written to
   `session.parent_id`, but only when the parent is already in the store and
@@ -108,7 +115,12 @@ the versions are the `v*` tags a release is cut from. Entries land under
   lost create race), messages carrying a known `foreign_id` are skipped
   with their parts and the rest appended with `seq` after the current max,
   while turns and events are cumulative positional lists (position `i` is
-  `seq` `i`, so a re-sent prefix is skipped). Message batches commit 500
+  `seq` `i`, so a re-sent prefix is skipped — except for the last stored
+  turn, whose status and costs are refreshed from the re-sent list,
+  because an importer that read a live transcript caught that turn in
+  flight and the fraction of its cost it saw would otherwise stand
+  forever; every earlier turn is settled, since a turn closes only when
+  the next one opens). Message batches commit 500
   per transaction, so a concurrent push waits on `busy_timeout` instead of
   meeting a lock held for a whole import. Every minted id passes
   `ValidateID`, every `time_*` comes from the injected clock, and the

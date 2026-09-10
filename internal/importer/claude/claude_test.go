@@ -45,7 +45,7 @@ const fixturePrompts = 3
 // fixtureLines is the line count of the main fixture, also by hand, so the
 // accounting test has something to hold the four buckets against that did
 // not come out of the reader.
-const fixtureLines = 31
+const fixtureLines = 33
 
 // The placeholders the fixture keeps in place of real paths, so a
 // transcript checked into the repository names no directory on any
@@ -112,7 +112,7 @@ func newFixture(t *testing.T) fixture {
 		if err != nil {
 			return err
 		}
-		dst := filepath.Join(f.home, rel)
+		dst := filepath.Join(f.home, undotted(rel))
 		if d.IsDir() {
 			return os.MkdirAll(dst, 0o700)
 		}
@@ -135,6 +135,31 @@ func newFixture(t *testing.T) fixture {
 	}
 	f.realHome = real
 	return f
+}
+
+// dottedDir is what testdata calls the directory Claude spells `.claude`.
+//
+// The rename is not cosmetic. The repository's .gitignore has a `.claude/`
+// rule, meant for the working copy's own agent configuration, and it
+// matches at any depth — so a fixture checked in under its real name is
+// silently not checked in at all, and the tests pass for whoever wrote them
+// and fail on a fresh clone. Storing it undotted and restoring the dot when
+// the fixture is materialised keeps the file tracked and keeps the
+// directory the importer sees exactly the one Claude writes. `git add -f`
+// would have been the other way and is worse: it fixes one commit rather
+// than the rule, and the next file added under testdata is ignored again.
+const dottedDir = "dot-claude"
+
+// undotted rewrites a testdata-relative path into the layout the importer
+// expects, which is the same path with dottedDir spelled `.claude`.
+func undotted(rel string) string {
+	parts := strings.Split(rel, string(filepath.Separator))
+	for i, p := range parts {
+		if p == dottedDir {
+			parts[i] = ".claude"
+		}
+	}
+	return filepath.Join(parts...)
 }
 
 // unresolve puts the placeholders back, so a golden file holds
@@ -857,4 +882,75 @@ func canonicalise(f fixture, ref importer.Ref, th store.Thread, res importer.Res
 	}
 	sort.Ints(out.Result.SkippedLines)
 	return out
+}
+
+// TestALineWithNoUUIDGetsAStableForeignID covers the gap that would grow a
+// session by a row per import: a message with no foreign id is appended
+// unconditionally by the store, because the dedup is on
+// (session_id, foreign_id) and NULL matches nothing.
+func TestALineWithNoUUIDGetsAStableForeignID(t *testing.T) {
+	f := newFixture(t)
+	ref := refByID(t, discover(t, f), fixtureSession)
+	th, _, _ := f.read(t, ref)
+
+	var synthesised []string
+	for _, m := range th.Messages {
+		if m.ForeignID == "" {
+			t.Fatalf("message with role %s has no foreign id at all", m.Role)
+		}
+		if strings.HasPrefix(m.ForeignID, ref.ID+":line:") {
+			synthesised = append(synthesised, m.ForeignID)
+		}
+	}
+	if len(synthesised) != 1 {
+		t.Fatalf("synthesised ids = %v, want the one uuid-less line", synthesised)
+	}
+	// Stable across reads, which is the whole point: an id that moved
+	// would dedup against nothing next time.
+	again, _, _ := f.read(t, ref)
+	if again.Messages[len(again.Messages)-1].ForeignID != th.Messages[len(th.Messages)-1].ForeignID {
+		t.Fatal("foreign ids are not stable across reads")
+	}
+}
+
+// TestNullContentIsNoPartsAndNoTurn is the other half of the turn rule
+// being about prompts: a user line whose content is JSON null is not a
+// person asking anything, and an empty text part standing in for it would
+// open a turn and divide every per-turn cost by one too many.
+func TestNullContentIsNoPartsAndNoTurn(t *testing.T) {
+	f := newFixture(t)
+	th, _, _ := f.read(t, refByID(t, discover(t, f), fixtureSession))
+
+	var found bool
+	for _, m := range th.Messages {
+		if m.ForeignID == "bbbb0007-0000-4000-8000-000000000007" {
+			found = true
+			if len(m.Parts) != 0 {
+				t.Fatalf("null content produced %d parts: %+v", len(m.Parts), m.Parts)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the fixture no longer has a null-content user line")
+	}
+	// Still the hand-counted prompts plus the leading span: the null line
+	// did not open one.
+	if got, want := len(th.Turns), fixturePrompts+1; got != want {
+		t.Fatalf("got %d turns, want %d", got, want)
+	}
+}
+
+// TestEmptyStringContentIsNoParts is the same rule for the other spelling,
+// held as a unit test because no transcript on the machine this was written
+// against produces it and a fixture line would be inventing evidence.
+func TestEmptyStringContentIsNoParts(t *testing.T) {
+	var b builder
+	for _, content := range []string{`null`, `""`, ``} {
+		if got := b.parts([]byte(content)); len(got) != 0 {
+			t.Fatalf("content %q produced %+v, want no parts", content, got)
+		}
+	}
+	if got := b.parts([]byte(`"hello"`)); len(got) != 1 || got[0].Type != importer.PartText {
+		t.Fatalf("content \"hello\" produced %+v", got)
+	}
 }

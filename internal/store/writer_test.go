@@ -844,3 +844,130 @@ func TestIngestDoesNotRepointAnExistingParent(t *testing.T) {
 		t.Fatalf("parent_id = %q, want it still pointing at the first parent %q", got, want)
 	}
 }
+
+// turnCosts reads a session's turns in seq order as their input costs, which
+// is enough to tell the growing-session cases apart without spelling out
+// seven columns per row.
+func turnCosts(t *testing.T, db *sql.DB, provider, foreignID string) []int64 {
+	t.Helper()
+	rows, err := db.Query(
+		`SELECT t.cost_input_tokens FROM turn t
+		 JOIN session_binding b ON b.session_id = t.session_id
+		 WHERE b.provider = ? AND b.foreign_session_id = ? ORDER BY t.seq`, provider, foreignID)
+	if err != nil {
+		t.Fatalf("read turns: %v", err)
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var c int64
+		if err := rows.Scan(&c); err != nil {
+			t.Fatalf("scan turn: %v", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read turns: %v", err)
+	}
+	return out
+}
+
+// TestGrowingSessionRefreshesTheTurnItCaughtInFlight is the live-transcript
+// case. The first import lands while a turn is still being worked on, so
+// its cost is a fraction of the final one; the second import carries the
+// finished figure, and the row has to take it. Skipping the prefix verbatim
+// would leave the partial cost in the store forever, which is wrong on
+// every session anybody imports while using it.
+func TestGrowingSessionRefreshesTheTurnItCaughtInFlight(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	partial := sampleThread("claude", "live")
+	partial.Turns = []Turn{{Status: "done", CostInput: 10, CostTotal: 10}}
+	if _, err := w.Ingest(ctx, partial); err != nil {
+		t.Fatalf("Ingest partial: %v", err)
+	}
+	if got := turnCosts(t, db, "claude", "live"); len(got) != 1 || got[0] != 10 {
+		t.Fatalf("after the first import turns = %v, want [10]", got)
+	}
+
+	grown := sampleThread("claude", "live")
+	grown.Turns = []Turn{
+		{Status: "done", CostInput: 30, CostTotal: 30},
+		{Status: "done", CostInput: 5, CostTotal: 5},
+	}
+	res, err := w.Ingest(ctx, grown)
+	if err != nil {
+		t.Fatalf("Ingest grown: %v", err)
+	}
+	// The refreshed row is not a new one: it counts as skipped, and only
+	// the genuinely new turn inserts.
+	if res.Turns.Inserted != 1 || res.Turns.Skipped != 1 {
+		t.Fatalf("turn counts = %+v, want one inserted and one skipped", res.Turns)
+	}
+	got := turnCosts(t, db, "claude", "live")
+	if len(got) != 2 || got[0] != 30 || got[1] != 5 {
+		t.Fatalf("turns = %v, want [30 5]: the in-flight turn kept its partial cost", got)
+	}
+}
+
+// A turn that is not the last one is settled and stays settled: a turn
+// closes when the next opens, so anything before the tail cannot honestly
+// have changed, and letting it change would be the store rewriting history
+// on one caller's re-reading of one file.
+func TestReingestDoesNotRewriteSettledTurns(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	th := sampleThread("claude", "settled")
+	th.Turns = []Turn{
+		{Status: "done", CostInput: 1, CostTotal: 1},
+		{Status: "done", CostInput: 2, CostTotal: 2},
+		{Status: "done", CostInput: 3, CostTotal: 3},
+	}
+	if _, err := w.Ingest(ctx, th); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	rewritten := sampleThread("claude", "settled")
+	rewritten.Turns = []Turn{
+		{Status: "done", CostInput: 100, CostTotal: 100},
+		{Status: "done", CostInput: 200, CostTotal: 200},
+		{Status: "done", CostInput: 300, CostTotal: 300},
+	}
+	if _, err := w.Ingest(ctx, rewritten); err != nil {
+		t.Fatalf("re-Ingest: %v", err)
+	}
+	got := turnCosts(t, db, "claude", "settled")
+	// Only the tail moved. The first two are as they were.
+	if len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 300 {
+		t.Fatalf("turns = %v, want [1 2 300]", got)
+	}
+}
+
+// A shorter list than the store holds is a caller that has lost its place.
+// Nothing is refreshed and nothing is inserted, because the position the
+// last incoming turn occupies is not the position of the last stored one
+// and matching them up would corrupt both.
+func TestReingestOfAShorterTurnListChangesNothing(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	th := sampleThread("claude", "shrunk")
+	th.Turns = []Turn{
+		{Status: "done", CostInput: 7, CostTotal: 7},
+		{Status: "done", CostInput: 8, CostTotal: 8},
+	}
+	if _, err := w.Ingest(ctx, th); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	short := sampleThread("claude", "shrunk")
+	short.Turns = []Turn{{Status: "done", CostInput: 999, CostTotal: 999}}
+	if _, err := w.Ingest(ctx, short); err != nil {
+		t.Fatalf("re-Ingest: %v", err)
+	}
+	got := turnCosts(t, db, "claude", "shrunk")
+	if len(got) != 2 || got[0] != 7 || got[1] != 8 {
+		t.Fatalf("turns = %v, want [7 8]", got)
+	}
+}

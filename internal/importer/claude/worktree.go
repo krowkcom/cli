@@ -30,6 +30,20 @@ const (
 // collapsing it onto its main repository would file two sessions that shared
 // no files under one path.
 //
+// The walk stats directories the home-trust rule says nothing about, and
+// that is deliberate rather than an oversight. importer.OpenHome exists to
+// bound what krowk *reads*: a transcript is a file whose contents end up in
+// the store, so where it may come from is worth policing. This walk reads
+// nothing. It asks whether a name exists, along a path the user's own
+// transcript named as the directory the user's own session ran in, and the
+// worst a hostile answer can produce is a worktree row pointing at the
+// wrong directory — which is a row, not an execution and not a disclosure.
+// Refusing to look outside home instead would file every session in a
+// checkout under /srv or /opt as having no repository, which is the common
+// case being broken to guard against no case at all. The walk is bounded by
+// the filesystem root, so a symlink loop cannot spin it: filepath.Dir
+// reaches a fixed point in as many steps as the path has components.
+//
 // A directory with no `.git` above it is not an error and not skipped. The
 // store needs a worktree row, so the directory becomes its own, with vcs
 // `none` — which says plainly "this ran outside version control" rather than

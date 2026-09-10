@@ -2,7 +2,10 @@ package claude
 
 import (
 	"context"
+	"database/sql"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/krowkcom/cli/internal/importer"
@@ -12,7 +15,7 @@ import (
 // openStore opens a real sqlite store in its own temporary home, kept apart
 // from the fixture's home so that ingesting transcripts cannot be confused
 // with reading them.
-func openStore(t *testing.T) *store.Writer {
+func openStore(t *testing.T) (*sql.DB, *store.Writer) {
 	t.Helper()
 	home := t.TempDir()
 	db, err := store.Open(func(k string) string {
@@ -25,7 +28,7 @@ func openStore(t *testing.T) *store.Writer {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return store.NewWriter(db, nil)
+	return db, store.NewWriter(db, nil)
 }
 
 // TestIngestingTheFixtureTwiceInsertsNothingTheSecondTime is the
@@ -36,7 +39,7 @@ func openStore(t *testing.T) *store.Writer {
 // every read.
 func TestIngestingTheFixtureTwiceInsertsNothingTheSecondTime(t *testing.T) {
 	f := newFixture(t)
-	w := openStore(t)
+	_, w := openStore(t)
 	ctx := context.Background()
 	refs := discover(t, f)
 
@@ -107,7 +110,7 @@ func TestRealTranscriptsImport(t *testing.T) {
 	}
 	t.Logf("discovered %d transcripts", len(refs))
 
-	w := openStore(t)
+	_, w := openStore(t)
 	ctx := context.Background()
 	var (
 		total       importer.Result
@@ -184,4 +187,113 @@ func sortedCounts(m map[string]int) []countPair {
 		}
 	}
 	return out
+}
+
+// turnCosts reads a session's turn costs out of the store in seq order.
+func turnCosts(t *testing.T, db *sql.DB, foreignID string) [][2]int64 {
+	t.Helper()
+	rows, err := db.Query(
+		`SELECT t.cost_input_tokens, t.cost_total_tokens FROM turn t
+		 JOIN session_binding b ON b.session_id = t.session_id
+		 WHERE b.provider = ? AND b.foreign_session_id = ? ORDER BY t.seq`,
+		importer.ProviderClaude, foreignID)
+	if err != nil {
+		t.Fatalf("read turns: %v", err)
+	}
+	defer rows.Close()
+	var out [][2]int64
+	for rows.Next() {
+		var in, total int64
+		if err := rows.Scan(&in, &total); err != nil {
+			t.Fatalf("scan turn: %v", err)
+		}
+		out = append(out, [2]int64{in, total})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read turns: %v", err)
+	}
+	return out
+}
+
+// truncate rewrites a fixture transcript to its first n lines, standing in
+// for a session that was still being worked on when the importer ran.
+func truncate(t *testing.T, path string, n int) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	if n > len(lines) {
+		t.Fatalf("fixture has %d lines, cannot truncate to %d", len(lines), n)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines[:n], "")), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+// TestImportingALiveSessionConvergesOnTheFinalCosts is the end-to-end of
+// the store's turn refresh: a transcript caught mid-turn is imported, then
+// the finished transcript is imported over it, and the stored costs have to
+// be the ones a single import of the finished file would have produced. It
+// is the case every real machine hits, because a person imports while using
+// the agent, and it was silently wrong before the last stored turn became
+// refreshable.
+func TestImportingALiveSessionConvergesOnTheFinalCosts(t *testing.T) {
+	ctx := context.Background()
+
+	// What the finished transcript is worth, imported in one go.
+	whole := newFixture(t)
+	wholeDB, wholeW := openStore(t)
+	wholeRef := refByID(t, discover(t, whole), fixtureSession)
+	th, _, _ := whole.read(t, wholeRef)
+	if _, err := wholeW.Ingest(ctx, th); err != nil {
+		t.Fatalf("Ingest whole: %v", err)
+	}
+	want := turnCosts(t, wholeDB, fixtureSession)
+	if len(want) != fixturePrompts+1 {
+		t.Fatalf("one-shot import produced %d turns, want %d", len(want), fixturePrompts+1)
+	}
+
+	// The same session imported twice: once cut off in the middle of the
+	// first real turn, once complete.
+	live := newFixture(t)
+	liveDB, liveW := openStore(t)
+	ref := refByID(t, discover(t, live), fixtureSession)
+	path := filepath.Join(live.home, ref.Path)
+	full, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// Seven lines is partway through the first prompt's tool loop: the
+	// prompt has landed and one of its two assistant messages has, so the
+	// turn is real and its cost is a fraction of the final one.
+	truncate(t, path, 7)
+
+	partial, _, _ := live.read(t, ref)
+	if _, err := liveW.Ingest(ctx, partial); err != nil {
+		t.Fatalf("Ingest partial: %v", err)
+	}
+	mid := turnCosts(t, liveDB, fixtureSession)
+	if len(mid) != 2 || mid[1][1] == want[1][1] {
+		t.Fatalf("the truncated import produced %v, which is not a session caught mid-turn", mid)
+	}
+
+	if err := os.WriteFile(path, full, 0o600); err != nil {
+		t.Fatalf("restore fixture: %v", err)
+	}
+	grown, _, _ := live.read(t, ref)
+	if _, err := liveW.Ingest(ctx, grown); err != nil {
+		t.Fatalf("Ingest grown: %v", err)
+	}
+
+	got := turnCosts(t, liveDB, fixtureSession)
+	if len(got) != len(want) {
+		t.Fatalf("got %d turns, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("turn %d = %v after two imports, want %v as one import produces", i, got[i], want[i])
+		}
+	}
 }

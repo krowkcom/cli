@@ -1,7 +1,9 @@
 package claude
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -72,14 +74,18 @@ func (s Source) Discover(env harness.Env) ([]importer.Ref, error) {
 	}
 	root, err := importer.HomePath(env, projectsDir)
 	if err != nil {
-		if os.IsNotExist(err) {
+		// errors.Is rather than os.IsNotExist: HomePath wraps with %w,
+		// and the older predicate does not unwrap, so a machine with no
+		// Claude on it would have surfaced as an error rather than as an
+		// empty list.
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("claude: resolve projects directory: %w", err)
 	}
 	slugs, err := os.ReadDir(root)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("claude: list projects: %w", err)

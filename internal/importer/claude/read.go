@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -64,8 +65,12 @@ func (s Source) Read(env harness.Env, ref importer.Ref, cursor importer.Cursor) 
 // contents because the answer is needed before the first line is read — a
 // subagent binds on its agent id and a session binds on its session id, and
 // the two are different keys into the same table.
+//
+// The test is on the parent directory rather than on a substring, so it
+// does not depend on the separator being a slash and cannot be fooled by a
+// session directory that happens to be called `subagents`.
 func isSubagentPath(path string) bool {
-	return strings.Contains(path, "/"+subagentsDir+"/")
+	return filepath.Base(filepath.Dir(path)) == subagentsDir
 }
 
 // builder accumulates one transcript as it is walked. It exists so the
@@ -108,7 +113,7 @@ type builder struct {
 // counts it; only a failure that is not the line's fault would wrap
 // importer.ErrAbortFile, and nothing here is that — a Claude transcript is
 // read best-effort, one bad line at a time.
-func (b *builder) line(_ int, raw []byte) error {
+func (b *builder) line(lineNo int, raw []byte) error {
 	var l line
 	if err := json.Unmarshal(raw, &l); err != nil {
 		return fmt.Errorf("claude: unreadable line: %w", err)
@@ -133,9 +138,9 @@ func (b *builder) line(_ int, raw []byte) error {
 
 	switch kind {
 	case "user", "assistant":
-		return b.message(kind, l, raw)
+		return b.message(kind, l, raw, lineNo)
 	case "system":
-		return b.system(l, raw)
+		return b.system(l, raw, lineNo)
 	case "attachment":
 		return b.attachment(l, kind)
 	case "ai-title", "summary":
@@ -182,7 +187,7 @@ func lineType(raw json.RawMessage) (string, bool) {
 // which marks an assistant line that is the API's failure rather than the
 // model's answer — storing that as an ordinary assistant reply would put
 // error text in the transcript as if the model had said it.
-func (b *builder) message(kind string, l line, raw []byte) error {
+func (b *builder) message(kind string, l line, raw []byte, lineNo int) error {
 	role := store.RoleUser
 	if kind == "assistant" {
 		role = store.RoleAssistant
@@ -194,7 +199,7 @@ func (b *builder) message(kind string, l line, raw []byte) error {
 	msg := store.Message{
 		Role:      role,
 		Provider:  Provider,
-		ForeignID: l.UUID,
+		ForeignID: b.foreignID(l.UUID, lineNo),
 		RawJSON:   rawJSON(raw),
 	}
 	var usage tokenUsage
@@ -229,16 +234,50 @@ func (b *builder) message(kind string, l line, raw []byte) error {
 	return nil
 }
 
+// foreignID is the message's idempotency key: the line's own `uuid` when it
+// has one, and a synthesised one when it does not.
+//
+// A message with no foreign id is appended by the store on every ingest,
+// unconditionally — the dedup is on (session_id, foreign_id) and a NULL
+// matches nothing — so a single transcript line missing its uuid would
+// grow the session by one message per import, forever. Every line observed
+// on a real machine carries one, which is exactly why the case is worth
+// covering: it is the kind of gap nobody notices until a table has a
+// hundred copies of the same row in it.
+//
+// The synthesised key is the ref id and the line number, which is stable
+// because Read always starts at the top of the file (see the package doc)
+// and because transcripts are appended to rather than rewritten. Both
+// assumptions are the ones the whole importer already rests on, so a
+// synthesised id is exactly as durable as the cursor is. It is prefixed
+// with the ref so it cannot collide with a real uuid or with a synthesised
+// id from a subagent file of the same session.
+func (b *builder) foreignID(uuid string, lineNo int) string {
+	if uuid != "" {
+		return uuid
+	}
+	return b.ref.ID + ":line:" + strconv.Itoa(lineNo)
+}
+
 // parts turns a message's content into canonical parts. Content is a string
 // on the user lines a person typed straight into the terminal and an array
 // of blocks everywhere else, so both are handled here rather than at the
 // two call sites that would otherwise each have to know.
 func (b *builder) parts(content json.RawMessage) []store.Part {
-	if len(content) == 0 {
+	// Absent, JSON null, or the empty string: no parts, not one empty
+	// text part. The difference is not cosmetic — the turn rule opens a
+	// turn on any user line carrying a part that is not a tool result, so
+	// an empty text part on a content-less line would open a turn nobody
+	// prompted and every per-turn cost downstream would be divided by one
+	// too many.
+	if len(content) == 0 || string(content) == "null" {
 		return nil
 	}
 	var text string
 	if err := json.Unmarshal(content, &text); err == nil {
+		if text == "" {
+			return nil
+		}
 		return []store.Part{{Type: importer.PartText, Data: textData(text)}}
 	}
 	var blocks []json.RawMessage
@@ -295,11 +334,11 @@ func (b *builder) block(raw json.RawMessage) store.Part {
 // hook failures — and are a message rather than an event because they read
 // as transcript: dropping them loses the only record that a request was
 // retried four times.
-func (b *builder) system(l line, raw []byte) error {
+func (b *builder) system(l line, raw []byte, lineNo int) error {
 	msg := store.Message{
 		Role:      store.RoleSystem,
 		Provider:  Provider,
-		ForeignID: l.UUID,
+		ForeignID: b.foreignID(l.UUID, lineNo),
 		RawJSON:   rawJSON(raw),
 	}
 	if l.Content != "" {

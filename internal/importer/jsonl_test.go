@@ -391,7 +391,7 @@ func TestReadJSONLManyBadLinesAreCountedNotAccumulated(t *testing.T) {
 		if sl.Line != i+1 {
 			t.Fatalf("Skipped[%d].Line = %d, want %d", i, sl.Line, i+1)
 		}
-		if len(sl.Reason) > maxSkipReasonBytes+len("…") {
+		if len(sl.Reason) > maxSkipReasonBytes {
 			t.Fatalf("Skipped[%d].Reason is %d bytes, want it bounded", i, len(sl.Reason))
 		}
 	}

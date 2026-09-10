@@ -406,7 +406,7 @@ func TestSkipTruncatesReason(t *testing.T) {
 	// An invalid UTF-8 tail, so the cut cannot be left as it fell: these
 	// strings end up in a database column and on a terminal.
 	res.Skip(1, 0, strings.Repeat("é", 200)+"\xff")
-	if got := res.Skipped[0].Reason; len(got) > maxSkipReasonBytes+len("…") {
+	if got := res.Skipped[0].Reason; len(got) > maxSkipReasonBytes {
 		t.Fatalf("Reason is %d bytes, want it bounded", len(got))
 	} else if !utf8.ValidString(got) {
 		t.Fatalf("Reason is not valid UTF-8: %q", got)

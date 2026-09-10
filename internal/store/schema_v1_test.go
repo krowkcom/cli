@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -70,10 +71,9 @@ func insertMessage(t *testing.T, db *sql.DB, sessionID, turnID string, seq int, 
 	} else {
 		turnArg = turnID
 	}
-	if _, err := db.Exec(`INSERT INTO message (id, session_id, turn_id, seq, role, time_created) VALUES (?, ?, ?, ?, ?, 1)`, id, sessionID, turnArg, seq, role); err != nil {
+	if _, err := db.Exec(`INSERT INTO message (id, session_id, turn_id, seq, role, foreign_id, time_created) VALUES (?, ?, ?, ?, ?, ?, 1)`, id, sessionID, turnArg, seq, role, foreignID); err != nil {
 		t.Fatalf("insert message: %v", err)
 	}
-	_ = foreignID
 	return id
 }
 
@@ -198,15 +198,24 @@ func TestV1UniqueIndexes(t *testing.T) {
 			t.Errorf("no UNIQUE index on %s(%s)", tc.table, strings.Join(tc.cols, ", "))
 		}
 	}
-	// Column-level UNIQUEs surface as auto-indexes with NULL sql; check
-	// them through table_info instead of the scan above.
-	for _, tc := range []struct{ table, column string }{
-		{"worktree", "path"},
-		{"session", "remote_slug"},
-	} {
-		// Insert two NULLs must succeed (SQLite UNIQUE allows it); the
-		// positive dup case is pinned in TestV1DedupBehavior for path.
-		_ = tc
+	// Column-level UNIQUEs (worktree.path, session.remote_slug) are
+	// behavior-pinned, not catalog-scanned: two NULL remote_slugs
+	// succeed (SQLite UNIQUE allows it), a repeated slug fails, and a
+	// repeated path fails. The dup-path and dup-slug failures live in
+	// TestV1DedupBehavior and TestV1RoleCheckAndDefaults; the NULL-slug
+	// pair is pinned here.
+	nullSlug := func() error {
+		_, err := db.Exec(`INSERT INTO session (id, worktree_id, time_created, time_updated) VALUES (?, (SELECT id FROM worktree LIMIT 1), 1, 2)`, mustID(t))
+		return err
+	}
+	if _, err := db.Exec(`INSERT INTO worktree (id, path, time_created, time_updated) VALUES (?, '/nullslug', 1, 2)`, mustID(t)); err != nil {
+		t.Fatalf("seed worktree: %v", err)
+	}
+	if err := nullSlug(); err != nil {
+		t.Fatalf("first NULL remote_slug: %v", err)
+	}
+	if err := nullSlug(); err != nil {
+		t.Errorf("second NULL remote_slug failed; UNIQUE must allow repeated NULLs: %v", err)
 	}
 	var nPartial int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_message_session_foreign'`).Scan(&nPartial); err != nil {
@@ -373,9 +382,9 @@ func TestV1TimeColumnsAreIntegerMS(t *testing.T) {
 				if strings.ToUpper(ctype) != "INTEGER" {
 					t.Errorf("%s.%s type = %q, want INTEGER ms", table, name, ctype)
 				}
-				if name == "deleted_at" {
-					t.Errorf("%s.deleted_at must not be named time_*: NULL means alive", table)
-				}
+			}
+			if name == "deleted_at" && table != "session" {
+				t.Errorf("%s.deleted_at: soft-delete lives on session only", table)
 			}
 		}
 		colRows.Close()
@@ -546,8 +555,8 @@ func TestV1RoleCheckAndDefaults(t *testing.T) {
 	db := openV1(t)
 	w := insertWorktree(t, db, "/role")
 	s := insertSession(t, db, w)
-	for _, role := range []string{"user", "assistant", "system", "tool", "error"} {
-		if _, err := db.Exec(`INSERT INTO message (id, session_id, seq, role, time_created) VALUES (?, ?, 100 + (SELECT COUNT(*) FROM message), ?, 1)`, mustID(t), s, role); err != nil {
+	for i, role := range []string{"user", "assistant", "system", "tool", "error"} {
+		if _, err := db.Exec(`INSERT INTO message (id, session_id, seq, role, time_created) VALUES (?, ?, ?, ?, 1)`, mustID(t), s, 200+i, role); err != nil {
 			t.Errorf("role %q refused: %v", role, err)
 		}
 	}
@@ -586,5 +595,109 @@ func TestV1OpenCreatesV1Shape(t *testing.T) {
 		if !tables[want] {
 			t.Errorf("fresh Open missing table %q", want)
 		}
+	}
+}
+
+func TestV1TurnDeleteTakesItsMessages(t *testing.T) {
+	// message.turn_id is ON DELETE CASCADE: removing a turn removes the
+	// transcript lines that belong to it, and nothing else. Pinned here
+	// so a later reader cannot mistake the cascade for an accident.
+	db := openV1(t)
+	w := insertWorktree(t, db, "/turndel")
+	s := insertSession(t, db, w)
+	tn := insertTurn(t, db, s, 0)
+	mID := mustID(t)
+	if _, err := db.Exec(`INSERT INTO message (id, session_id, turn_id, seq, role, time_created) VALUES (?, ?, ?, 0, 'assistant', 1)`, mID, s, tn); err != nil {
+		t.Fatalf("message: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO part (id, message_id, session_id, seq) VALUES (?, ?, ?, 0)`, mustID(t), mID, s); err != nil {
+		t.Fatalf("part: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM turn WHERE id = ?`, tn); err != nil {
+		t.Fatalf("delete turn: %v", err)
+	}
+	for _, q := range []string{
+		`SELECT COUNT(*) FROM message WHERE id = '` + mID + `'`,
+		`SELECT COUNT(*) FROM part WHERE message_id = '` + mID + `'`,
+	} {
+		var n int
+		if err := db.QueryRow(q).Scan(&n); err != nil {
+			t.Fatalf("probe: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("%s still holds rows after the turn delete", q)
+		}
+	}
+	var nSession int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM session WHERE id = ?`, s).Scan(&nSession); err != nil {
+		t.Fatalf("session probe: %v", err)
+	}
+	if nSession != 1 {
+		t.Error("deleting a turn deleted its session; the cascade runs turn-down only")
+	}
+}
+
+func TestV1ConcurrentInitWithRealSchema(t *testing.T) {
+	// The gate's concurrent-first-open retry is pinned with a 2-table
+	// synthetic in TestSchemaGateConcurrentFirstOpen; replay it against
+	// the real 8-table schema, whose apply holds the write lock longer.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "race-v1.db")
+	db0, err := openSQL(dsn(path))
+	if err != nil {
+		t.Fatalf("openSQL: %v", err)
+	}
+	db0.SetMaxOpenConns(1)
+	if err := ensureSchema(db0, path, SchemaSQL); err != nil {
+		t.Fatalf("seed init: %v", err)
+	}
+	db0.Close()
+	// Re-run the race on a second file starting empty.
+	path2 := filepath.Join(dir, "race-v1-empty.db")
+	const n = 4
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			db, err := openSQL(dsn(path2))
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer db.Close()
+			errs[i] = ensureSchema(db, path2, SchemaSQL)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: %v", i, err)
+		}
+	}
+}
+
+func TestParseIDMatchesValidateID(t *testing.T) {
+	// ParseID is assigned, not wrapped — this pins the equivalence on
+	// invalid inputs too, including the lookalikes the boundary exists
+	// to refuse: a v4 id, an uppercase copy, an opencode ses_ id.
+	for _, bad := range []string{
+		"not-an-id",
+		"0195c2b2-8c7e-4f1a-9b2c-3d4e5f607182", // v4, not v7
+		"0195C2B2-8C7E-7F1A-9B2C-3D4E5F607182", // uppercase
+		"ses_abc123",
+		"",
+	} {
+		if (ParseID(bad) == nil) != (ValidateID(bad) == nil) {
+			t.Errorf("ParseID/ValidateID disagree on %q", bad)
+		}
+		if err := ParseID(bad); err == nil {
+			t.Errorf("ParseID(%q) = nil, want rejection", bad)
+		}
+	}
+	id := NewID()
+	if err := ParseID(id); err != nil {
+		t.Errorf("ParseID(minted) = %v, want nil", err)
 	}
 }

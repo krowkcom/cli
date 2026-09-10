@@ -104,6 +104,9 @@ CREATE TABLE message (
 
 CREATE UNIQUE INDEX idx_message_session_foreign ON message(session_id, foreign_id) WHERE foreign_id IS NOT NULL;
 
+-- part.session_id repeats its message's session: a denormalized FK so
+-- session-scoped part scans never join through message. The importer
+-- keeps the two in agreement; nothing in DDL can check across rows.
 CREATE TABLE part (
   id TEXT PRIMARY KEY,
   message_id TEXT NOT NULL,

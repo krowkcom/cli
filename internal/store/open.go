@@ -5,11 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 )
 
 // Env is a lookup function, the same shape internal/harness and internal/runctx
@@ -94,12 +92,7 @@ const pragmas = "_pragma=busy_timeout(10000)" +
 // behind Open's back. url.URL escapes the characters a path could smuggle
 // into the query string ('?', '#').
 func dsn(path string) string {
-	p := filepath.ToSlash(path)
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	u := url.URL{Scheme: "file", OmitHost: true, Path: p, RawQuery: pragmas}
-	return u.String()
+	return fileURI(path, pragmas)
 }
 
 // Open opens the store at DBPath(env), creating the parent directory when it
@@ -110,6 +103,15 @@ func dsn(path string) string {
 // sessions stay private to the user. Side files SQLite creates later (-wal,
 // -shm) follow the process umask — Open tightens whatever a previous run
 // left behind; files created after Open returns belong to the write path.
+//
+// A missing or empty file is initialised from 001_init.sql in one
+// transaction, stamped PRAGMA user_version = 1. A file at any other version,
+// at version 0 with tables Open never wrote, or at version 1 with a table
+// missing, fails with a `krowk sessions rebuild` hint and is left
+// unmodified — refused by a read-only pre-check before the read-write open,
+// and the read-write handle itself carries no persistent pragma until the
+// re-check accepts, so not even a swapped-in file gets its header flipped
+// first. No silent repair, no in-place ALTER path in v1.
 // The returned handle is pinged, so a path that cannot hold a database fails
 // here rather than on first use.
 func Open(env Env) (*sql.DB, error) {
@@ -119,6 +121,35 @@ func Open(env Env) (*sql.DB, error) {
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("store: mkdir %s: %w", filepath.Dir(path), err)
+	}
+	// MkdirAll creates with 0700 but tightens nothing: take the group/other
+	// bits back off a directory an older run left world-readable, the same
+	// rule as the database file below. Windows has no mode bits to take.
+	if runtime.GOOS != "windows" {
+		if fi, err := os.Stat(filepath.Dir(path)); err != nil {
+			return nil, fmt.Errorf("store: stat %s: %w", filepath.Dir(path), err)
+		} else if fi.Mode().Perm()&0o077 != 0 {
+			if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+				return nil, fmt.Errorf("store: chmod %s: %w", filepath.Dir(path), err)
+			}
+		}
+	}
+	// Refuse a foreign or future file before touching it: the create and
+	// tighten below, and the DSN connect pragmas (journal_mode especially)
+	// after them, would otherwise rewrite the header or mode bits of a
+	// file Open is about to reject. A missing file skips this — there is
+	// nothing to refuse yet — and the write path re-checks on its own
+	// handle, so a file swapped in between still fails closed. preStat
+	// pins the checked file's identity for the SameFile comparison after
+	// open, closing the swap-then-chmod window deterministically.
+	var preStat os.FileInfo
+	if st, err := os.Stat(path); err == nil {
+		preStat = st
+		if err := checkSchemaFile(path, SchemaSQL); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("store: stat %s: %w", path, err)
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
@@ -139,6 +170,14 @@ func Open(env Env) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: stat %s: %w", path, err)
 	}
+	// The path may have been swapped for another file after the pre-check
+	// passed: refuse the stranger before chmodding or initialising it.
+	// SameFile compares device and inode, so only the checked file
+	// proceeds. (A swap after this point is a same-user race against
+	// syscalls nanoseconds apart; the content re-checks still refuse it.)
+	if preStat != nil && !os.SameFile(preStat, fi) {
+		return nil, fmt.Errorf("store: %s changed during open, refusing", path)
+	}
 	if fi.Mode().Perm()&0o077 != 0 {
 		if err := f.Chmod(0o600); err != nil {
 			return nil, fmt.Errorf("store: chmod %s: %w", path, err)
@@ -148,21 +187,66 @@ func Open(env Env) (*sql.DB, error) {
 		return nil, fmt.Errorf("store: close %s: %w", path, err)
 	}
 	failed = false
-	db, err := openSQL(dsn(path))
+	// Gate-phase DSN: no persistent pragma rides this open (see gateDSN),
+	// so a file the re-check below refuses keeps its exact header bytes.
+	db, err := openSQL(gateDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
-	// Cleanup only: with no query ever run on it, Close has nothing to
-	// flush and no failure to report — the returned error below is the
-	// one that matters.
+	// Cleanup only: the deferred Close reports nothing — the returned
+	// error below is the one that matters.
 	dbFailed := true
 	defer func() {
 		if dbFailed {
 			db.Close()
 		}
 	}()
-	if err := db.Ping(); err != nil {
+	// Busy-retry: the connect-time pragma replay runs before busy_timeout
+	// is armed, so a commit landing in that window fails here instead of
+	// waiting (see busyRetry).
+	if err := busyRetry(db.Ping); err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
+	}
+	// Initialise a fresh file or accept an exact match. Re-reads the
+	// version on this handle, so a file swapped after the pre-open check
+	// still fails closed — and on the gate DSN, without a header rewrite
+	// first.
+	if err := ensureSchema(db, path, SchemaSQL); err != nil {
+		return nil, err
+	}
+	// Flip the accepted file to the steady-state durability the full DSN
+	// replays on every later connection. Runs only after the accept, so a
+	// refusal never persists anything.
+	if err := persistPragmas(db, path); err != nil {
+		return nil, err
+	}
+	// The gate handle carries the gate DSN, whose later pool connections
+	// would miss the WAL replay. Trade it for the steady handle every
+	// other Open caller sees, and check-only verify on it: the gate
+	// already initialised or accepted, so this pass only refuses.
+	// Disarm the deferred cleanup first: the explicit Close below owns
+	// the gate handle from here on.
+	dbFailed = false
+	if err := db.Close(); err != nil {
+		return nil, fmt.Errorf("store: close %s: %w", path, err)
+	}
+	db, err = openSQL(dsn(path))
+	if err != nil {
+		return nil, fmt.Errorf("store: open %s: %w", path, err)
+	}
+	dbFailed = true
+	// Busy-retry: the connect-time pragma replay runs before busy_timeout
+	// is armed, so a commit landing in that window fails here instead of
+	// waiting (see busyRetry).
+	if err := busyRetry(db.Ping); err != nil {
+		return nil, fmt.Errorf("store: open %s: %w", path, err)
+	}
+	// Check-only: the gate handle already initialised or accepted. A file
+	// that reads version 0 here was swapped or truncated between the two
+	// opens — verifySchema refuses it rather than re-initialising over
+	// the loss. Never writes.
+	if err := verifySchema(db, path, SchemaSQL); err != nil {
+		return nil, err
 	}
 	// A previous run on a permissive umask may have left world-readable
 	// sidecars behind (SQLite creates them lazily under the umask, not

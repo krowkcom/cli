@@ -1,0 +1,9 @@
+-- 001_init.sql is the whole v1 schema story: applied once, in one
+-- transaction, on a fresh file, then PRAGMA user_version is set to 1.
+-- Open never runs an in-place ALTER in v1 and there is no migrations
+-- table until Phase 2 (the first phase that writes state the source
+-- files do not hold). A version or shape mismatch fails Open with a
+-- rebuild hint instead of a silent repair.
+--
+-- The v1 tables (worktree, session, ...) land here with the v1 schema
+-- change, which also grows the gate tests to name them.

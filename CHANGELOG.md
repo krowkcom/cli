@@ -69,6 +69,26 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `busy_timeout` so a briefly locked database waits instead of failing.
   Nothing is user-visible yet; no command opens the database.
 
+- `store.Open` now versions the session store: the first open of a fresh
+  `krowk.db` applies `001_init.sql` in one transaction and stamps
+  `PRAGMA user_version = 1`; a reopen runs no DDL. A file at any other
+  version, at version 0 with tables `Open` never wrote, or at version 1
+  with a table missing — or a file that is not a database at all — fails
+  to open with a hint to run `krowk sessions rebuild` (delete the file and
+  re-import): there is no silent repair and no in-place migration path in
+  v1, because every row is still re-derivable from transcripts on disk. A
+  refused file is left byte-identical, mode bits included: the version
+  check runs read-only before the read-write open, the opened file is
+  pinned by device-and-inode identity before it is tightened, and the
+  read-write handle itself carries no persistent pragma until the re-check
+  accepts. The steady handle re-verifies check-only and never
+  re-initialises a regressed file.
+  Two first-launch opens racing each other converge instead of erroring —
+  the loser adopts the winner's schema. The store directory is tightened
+  to `0700` like the database file. There is still no `migrations` table;
+  it arrives with the first state the source files do not hold. Nothing is
+  user-visible yet; no command opens the database.
+
 - A harness registry (`internal/harness`) that detects which coding agents are
   installed and asks each one whether krowk is actually wired into it. Claude
   Code is the first: detected by a `~/.claude/` directory or a `claude` binary,

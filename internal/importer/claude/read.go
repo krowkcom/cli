@@ -32,15 +32,23 @@ const eventAttachment = "attachment"
 // caller's bug turned into a silent full rescan is the one failure mode the
 // contract asks sources to avoid.
 func (s Source) Read(env harness.Env, ref importer.Ref, cursor importer.Cursor) (store.Thread, importer.Cursor, importer.Result, error) {
+	// The watermark to report if the read never gets started. The contract
+	// asks for the last safe one, and a file that could not be opened has
+	// not invalidated the one the caller was holding — returning a zero
+	// cursor instead would tell a caller whose transcript is momentarily
+	// unreadable to re-import the whole session next time.
+	held := importer.JSONLCursor{}
 	if cursor != nil {
-		if _, ok := cursor.(importer.JSONLCursor); !ok {
+		typed, ok := cursor.(importer.JSONLCursor)
+		if !ok {
 			return store.Thread{}, cursor, importer.Result{}, fmt.Errorf("claude: %w, got %T", importer.ErrCursorType, cursor)
 		}
+		held = typed
 	}
 
 	f, err := importer.OpenHome(env, ref.Path, importer.DefaultMaxBytes)
 	if err != nil {
-		return store.Thread{}, importer.JSONLCursor{}, importer.Result{}, fmt.Errorf("claude: open %s: %w", ref.Path, err)
+		return store.Thread{}, held, importer.Result{}, fmt.Errorf("claude: open %s: %w", ref.Path, err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -219,10 +227,11 @@ func (b *builder) message(kind string, l line, raw []byte, lineNo int) error {
 		msg.Parts = b.parts(l.Message.Content)
 	}
 
+	text := leadingText(l.Message)
 	cand := importer.TurnCandidate{
 		Role:      role,
-		Meta:      l.IsMeta,
-		Interrupt: role == store.RoleUser && isInterrupt(l.Message),
+		Meta:      l.IsMeta || (role == store.RoleUser && injected(l, text)),
+		Interrupt: role == store.RoleUser && strings.HasPrefix(text, interruptPrefix),
 	}
 	for _, p := range msg.Parts {
 		cand.PartTypes = append(cand.PartTypes, p.Type)
@@ -313,8 +322,14 @@ func (b *builder) block(raw json.RawMessage) store.Part {
 		return importer.NewToolCallPart(blk.ID, blk.Name, blk.Input)
 	case "tool_result":
 		return importer.NewToolResultPart(blk.ToolUseID, blk.Content, blk.IsError)
-	case importer.PartThinking:
-		part := b.acc.NormalizePart(blk.Type, raw)
+	case importer.PartThinking, "redacted_thinking":
+		// A redacted thinking block is still thinking: internal/importer
+		// says so in as many words, and a reader asking "did the model
+		// reason here" must get yes whether or not it is allowed to see
+		// what about. Normalising under the canonical name rather than
+		// the source's keeps it out of the unknown column, where it
+		// would read as a block type nobody had handled.
+		part := b.acc.NormalizePart(importer.PartThinking, raw)
 		// The signature is lifted into its own column because it is what
 		// lets a thinking block be replayed to the API: buried in Data it
 		// would be a string nobody could find without knowing Anthropic's
@@ -341,8 +356,18 @@ func (b *builder) system(l line, raw []byte, lineNo int) error {
 		ForeignID: b.foreignID(l.UUID, lineNo),
 		RawJSON:   rawJSON(raw),
 	}
-	if l.Content != "" {
-		msg.Parts = []store.Part{{Type: importer.PartText, Data: textData(l.Content)}}
+	// A system line's content is a string on every transcript observed,
+	// and is decoded leniently in case it stops being one: a string
+	// becomes a text part, and anything else keeps its raw payload
+	// through NormalizePart rather than costing the whole line.
+	if len(l.Content) > 0 && string(l.Content) != "null" {
+		var text string
+		switch err := json.Unmarshal(l.Content, &text); {
+		case err == nil && text != "":
+			msg.Parts = []store.Part{{Type: importer.PartText, Data: textData(text)}}
+		case err != nil:
+			msg.Parts = []store.Part{b.acc.NormalizePart("content", l.Content)}
+		}
 	}
 	b.messages = append(b.messages, msg)
 	b.usages = append(b.usages, tokenUsage{})
@@ -462,23 +487,84 @@ func (b *builder) turns() []store.Turn {
 	return turns
 }
 
-// isInterrupt reports whether a user message is a cancellation notice
-// rather than something a person asked for. It reads the leading text
-// wherever the content keeps it, string or first block, because the notice
-// is written both ways depending on what was interrupted.
-func isInterrupt(msg *apiMessage) bool {
+// injectedTags are the openings of a user message that nothing typed.
+//
+// The list is short because the census says it should be. `<command-name>`
+// and `<command-message>` look like machinery and are not: they are how a
+// person invoking a slash command is recorded, and marking them meta would
+// throw away the prompt rather than the noise. `<bash-input>` is the same —
+// a person in bash mode. What is left is output being echoed back into the
+// conversation and notices addressed to the agent, which nobody asked for
+// and which must not open a turn.
+var injectedTags = []string{
+	"<local-command-stdout>",
+	"<bash-stdout>",
+	"<task-notification>",
+	"<system-reminder>",
+}
+
+// injected reports whether a user line arrived from something other than a
+// person, which the turn rule treats exactly as it treats Claude's own
+// isMeta: not a prompt, so not the start of a turn.
+//
+// This is the difference between 1782 turns on this machine and 2153. An
+// agent reporting back to the conversation that dispatched it arrives as a
+// user-role line with real text in it, and counting those as prompts
+// inflates the turn count by a fifth and divides every per-turn cost by the
+// same factor.
+//
+// Two fields answer the question and only one of them answers it well.
+// `origin.kind` is exact: `human` is a person, and `task-notification`,
+// `coordinator` and `peer` are agents talking. `promptSource` is not —
+// `sdk` is the tempting one to refuse and is wrong, because on this machine
+// 901 of the 1201 `sdk` lines are a person typing "merge", "push", "done"
+// or a Basecamp URL into a front end that is not the terminal. Refusing
+// them would lose more real prompts than the whole rule saves. Only
+// `system` is safe to read as injected, and it earns its place by being
+// belt and braces: every `system` line on this machine already carries an
+// injected `origin.kind` too.
+//
+// A line predating both fields — which is most of them — falls through to
+// the text check and then to being a prompt, which is the right default:
+// the failure of counting one notice as a prompt is smaller than the
+// failure of dropping somebody's question.
+func injected(l line, text string) bool {
+	if l.Origin != nil && l.Origin.Kind != "" && l.Origin.Kind != "human" {
+		return true
+	}
+	if l.PromptSource == "system" {
+		return true
+	}
+	for _, tag := range injectedTags {
+		if strings.HasPrefix(text, tag) {
+			return true
+		}
+	}
+	return false
+}
+
+// leadingText is the start of a user message's prose, wherever the content
+// keeps it: the whole thing when content is a string, the first text block
+// otherwise. Both the interrupt notice and the injected-line tags are
+// written either way depending on what produced them.
+func leadingText(msg *apiMessage) string {
 	if msg == nil {
-		return false
+		return ""
 	}
 	var text string
-	if err := json.Unmarshal(msg.Content, &text); err != nil {
-		var blocks []contentBlock
-		if err := json.Unmarshal(msg.Content, &blocks); err != nil || len(blocks) == 0 {
-			return false
-		}
-		text = blocks[0].Text
+	if err := json.Unmarshal(msg.Content, &text); err == nil {
+		return text
 	}
-	return strings.HasPrefix(text, interruptPrefix)
+	var blocks []contentBlock
+	if err := json.Unmarshal(msg.Content, &blocks); err != nil {
+		return ""
+	}
+	for _, b := range blocks {
+		if b.Type == importer.PartText && b.Text != "" {
+			return b.Text
+		}
+	}
+	return ""
 }
 
 // textData is the Data of a text part built from a bare string, so the one

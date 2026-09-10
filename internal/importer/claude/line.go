@@ -27,12 +27,26 @@ type line struct {
 	IsMeta            bool `json:"isMeta"`
 	IsAPIErrorMessage bool `json:"isApiErrorMessage"`
 
+	// Origin says where a user line came from when Claude recorded it:
+	// `human` for something a person sent, `task-notification` for an
+	// agent reporting back, `coordinator` and `peer` for one agent
+	// addressing another. Absent on the great majority of lines, which
+	// predate the field.
+	Origin *origin `json:"origin"`
+	// PromptSource is the other half of that question, and a coarser one.
+	// See injected in read.go for which values mean "nobody typed this"
+	// and, more importantly, which look like they should and do not.
+	PromptSource string `json:"promptSource"`
+
 	// Message is the Anthropic API message on a `user` or `assistant`
 	// line.
 	Message *apiMessage `json:"message"`
-	// Content is the text on a `system` line, which carries its content
-	// flat rather than wrapped in a message.
-	Content string `json:"content"`
+	// Content is what a `system` line carries instead of a message. It is
+	// raw because it is a string on every line observed and there is no
+	// promise that it stays one: decoding it as a string would turn the
+	// day it becomes an object into a whole line skipped, which is a
+	// large loss to take over a small change.
+	Content json.RawMessage `json:"content"`
 	// Subtype names what a `system` line is about — turn_duration,
 	// api_error and their kin. It rides along as event-ish detail on the
 	// message rather than becoming a part of its own.
@@ -54,6 +68,11 @@ type line struct {
 	// still carries one; it is read because a transcript predating the
 	// rename should not import untitled.
 	Summary string `json:"summary"`
+}
+
+// origin is the provenance stamp on a user line.
+type origin struct {
+	Kind string `json:"kind"`
 }
 
 // apiMessage is the Anthropic message inside a `user` or `assistant` line.

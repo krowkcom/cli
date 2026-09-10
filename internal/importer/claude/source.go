@@ -102,11 +102,31 @@ func (s Source) Discover(env harness.Env) ([]importer.Ref, error) {
 			continue
 		}
 		sort.Slice(files, func(i, j int) bool { return files[i].Name() < files[j].Name() })
+
+		// A session's subagent transcripts live in a directory named
+		// after it, and that directory can outlive — or arrive without —
+		// the session file itself: a transcript deleted or rotated away
+		// leaves its subagents behind, and the two are written by
+		// different code at different moments. So the directories are
+		// collected first and struck off as their session file is seen;
+		// whatever is left at the end is swept up on its own, with the
+		// directory name standing in as the parent session id. Binding
+		// the orphans to a parent nobody has ingested is fine — the
+		// store leaves parent_id NULL and fills it in if the parent ever
+		// turns up — and losing them is not, since a subagent transcript
+		// is a whole conversation.
+		orphans := map[string]bool{}
+		for _, f := range files {
+			if f.IsDir() && hasSubagents(root, slug.Name(), f.Name()) {
+				orphans[f.Name()] = true
+			}
+		}
 		for _, f := range files {
 			if f.IsDir() || filepath.Ext(f.Name()) != ".jsonl" {
 				continue
 			}
 			sessionID := strings.TrimSuffix(f.Name(), ".jsonl")
+			delete(orphans, sessionID)
 			refs = append(refs, importer.Ref{
 				Provider: s.Name(),
 				ID:       sessionID,
@@ -114,8 +134,30 @@ func (s Source) Discover(env harness.Env) ([]importer.Ref, error) {
 			})
 			refs = append(refs, s.subagentRefs(root, slug.Name(), sessionID)...)
 		}
+		for _, sessionID := range sortedKeys(orphans) {
+			refs = append(refs, s.subagentRefs(root, slug.Name(), sessionID)...)
+		}
 	}
 	return refs, nil
+}
+
+// hasSubagents reports whether a session directory holds a subagents
+// directory, which is what makes it worth sweeping rather than a stray
+// directory somebody left in the projects tree.
+func hasSubagents(root, slug, sessionID string) bool {
+	info, err := os.Stat(filepath.Join(root, slug, sessionID, subagentsDir))
+	return err == nil && info.IsDir()
+}
+
+// sortedKeys is the set as an ordered slice, so a sweep of orphaned
+// subagent directories comes back in the same order on every run.
+func sortedKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // subagentRefs lists the transcripts of the agents one session dispatched.

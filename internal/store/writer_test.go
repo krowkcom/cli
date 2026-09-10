@@ -971,3 +971,54 @@ func TestReingestOfAShorterTurnListChangesNothing(t *testing.T) {
 		t.Fatalf("turns = %v, want [7 8]", got)
 	}
 }
+
+// worktreePathOf reads the path of the worktree a session is filed under.
+func worktreePathOf(t *testing.T, db *sql.DB, provider, foreignID string) string {
+	t.Helper()
+	var path string
+	if err := db.QueryRow(
+		`SELECT w.path FROM worktree w
+		 JOIN session s ON s.worktree_id = w.id
+		 JOIN session_binding b ON b.session_id = s.id
+		 WHERE b.provider = ? AND b.foreign_session_id = ?`, provider, foreignID).Scan(&path); err != nil {
+		t.Fatalf("read worktree of %s: %v", foreignID, err)
+	}
+	return path
+}
+
+// TestReingestRepointsTheSessionAtItsWorktree is the case an importer that
+// cannot always tell where a session ran will hit. The Claude reader falls
+// back to the transcript's own directory when no line carried a cwd, and
+// without this the session would stay filed under that placeholder even
+// once a later read found the real checkout.
+func TestReingestRepointsTheSessionAtItsWorktree(t *testing.T) {
+	db, w := openWriterDB(t, nil)
+	ctx := context.Background()
+
+	first := sampleThread("claude", "moved")
+	first.Worktree = Worktree{Path: "/placeholder", VCS: "none", Name: "placeholder"}
+	if _, err := w.Ingest(ctx, first); err != nil {
+		t.Fatalf("Ingest first: %v", err)
+	}
+	if got := worktreePathOf(t, db, "claude", "moved"); got != "/placeholder" {
+		t.Fatalf("worktree = %q, want /placeholder", got)
+	}
+
+	second := sampleThread("claude", "moved")
+	second.Worktree = Worktree{Path: "/repo/real", VCS: "git", Name: "real"}
+	if _, err := w.Ingest(ctx, second); err != nil {
+		t.Fatalf("Ingest second: %v", err)
+	}
+	if got := worktreePathOf(t, db, "claude", "moved"); got != "/repo/real" {
+		t.Fatalf("worktree = %q, want the session re-pointed at /repo/real", got)
+	}
+	// The old worktree row is left standing: it is keyed by path and may
+	// well be somebody else's.
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM worktree WHERE path = ?`, "/placeholder").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("the placeholder worktree was deleted (%d rows)", n)
+	}
+}

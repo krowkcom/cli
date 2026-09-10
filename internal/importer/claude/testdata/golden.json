@@ -309,8 +309,14 @@
         "model": "claude-opus-5-20260401",
         "foreign_id": "cccc0004-0000-4000-8000-000000000004",
         "usage": "{\"input_tokens\":100,\"output_tokens\":200,\"cache_read_input_tokens\":50,\"cache_creation_input_tokens\":25}",
-        "raw_json": "{\"parentUuid\":\"bbbb0006-0000-4000-8000-000000000006\",\"isSidechain\":false,\"userType\":\"external\",\"cwd\":\"{{REPO}}/sub\",\"sessionId\":\"11111111-1111-4111-8111-111111111111\",\"version\":\"2.1.238\",\"gitBranch\":\"main\",\"type\":\"assistant\",\"message\":{\"id\":\"msg_0004\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-20260401\",\"content\":[{\"type\":\"text\",\"text\":\"redacted answer three\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":100,\"output_tokens\":200,\"cache_read_input_tokens\":50,\"cache_creation_input_tokens\":25}},\"uuid\":\"cccc0004-0000-4000-8000-000000000004\",\"timestamp\":\"2026-09-01T09:00:14.000Z\"}",
+        "raw_json": "{\"parentUuid\":\"bbbb0006-0000-4000-8000-000000000006\",\"isSidechain\":false,\"userType\":\"external\",\"cwd\":\"{{REPO}}/sub\",\"sessionId\":\"11111111-1111-4111-8111-111111111111\",\"version\":\"2.1.238\",\"gitBranch\":\"main\",\"type\":\"assistant\",\"message\":{\"id\":\"msg_0004\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-20260401\",\"content\":[{\"type\":\"redacted_thinking\",\"data\":\"redactedopaqueblob\"},{\"type\":\"text\",\"text\":\"redacted answer three\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":100,\"output_tokens\":200,\"cache_read_input_tokens\":50,\"cache_creation_input_tokens\":25}},\"uuid\":\"cccc0004-0000-4000-8000-000000000004\",\"timestamp\":\"2026-09-01T09:00:14.000Z\"}",
         "parts": [
+          {
+            "type": "thinking",
+            "tool_call_id": "",
+            "signature": "",
+            "data": "{\"type\":\"redacted_thinking\",\"data\":\"redactedopaqueblob\"}"
+          },
           {
             "type": "text",
             "tool_call_id": "",
@@ -343,10 +349,26 @@
         "usage": "",
         "raw_json": "{\"parentUuid\":\"bbbb0006-0000-4000-8000-000000000006\",\"isSidechain\":false,\"userType\":\"external\",\"cwd\":\"{{REPO}}/sub\",\"sessionId\":\"11111111-1111-4111-8111-111111111111\",\"version\":\"2.1.238\",\"gitBranch\":\"main\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":null},\"uuid\":\"bbbb0007-0000-4000-8000-000000000007\",\"timestamp\":\"2026-09-01T09:00:14.700Z\"}",
         "parts": []
+      },
+      {
+        "role": "user",
+        "provider": "anthropic",
+        "model": "",
+        "foreign_id": "bbbb0008-0000-4000-8000-000000000008",
+        "usage": "",
+        "raw_json": "{\"parentUuid\":\"bbbb0007-0000-4000-8000-000000000007\",\"isSidechain\":false,\"userType\":\"external\",\"cwd\":\"{{REPO}}/sub\",\"sessionId\":\"11111111-1111-4111-8111-111111111111\",\"version\":\"2.1.238\",\"gitBranch\":\"main\",\"type\":\"user\",\"origin\":{\"kind\":\"task-notification\"},\"promptSource\":\"sdk\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"\u003ctask-notification\u003e \u003ctask-id\u003eredacted\u003c/task-id\u003e agent finished \u003c/task-notification\u003e\"}]},\"uuid\":\"bbbb0008-0000-4000-8000-000000000008\",\"timestamp\":\"2026-09-01T09:00:14.900Z\"}",
+        "parts": [
+          {
+            "type": "text",
+            "tool_call_id": "",
+            "signature": "",
+            "data": "{\"type\":\"text\",\"text\":\"\u003ctask-notification\u003e \u003ctask-id\u003eredacted\u003c/task-id\u003e agent finished \u003c/task-notification\u003e\"}"
+          }
+        ]
       }
     ],
     "result": {
-      "lines": 33,
+      "lines": 34,
       "unknown": 1,
       "unknown_types": {
         "server_tool_use": 1
@@ -371,8 +393,8 @@
       },
       "skipped_count": 2,
       "skipped_lines": [
-        32,
-        33
+        33,
+        34
       ]
     }
   },

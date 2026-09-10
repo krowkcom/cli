@@ -303,7 +303,17 @@ func upsertWorktree(ctx context.Context, tx *sql.Tx, m *Minter, now int64, wt Wo
 
 // findOrCreateSession resolves the session through the binding key and
 // creates session plus binding when neither exists. Reports whether each
-// row was inserted. A lost binding race adopts the winner's session and
+// row was inserted.
+//
+// A session found by its binding has its worktree re-pointed as well as
+// its display fields refreshed. That is not merely tidiness: an importer
+// that could not tell where a session ran the first time — the Claude
+// reader falls back to the transcript's own directory when no line carried
+// a cwd — would otherwise be stuck with that placeholder forever, even
+// once a later read of the same transcript found the real checkout. The
+// worktree row itself is upserted by path and never deleted, so
+// re-pointing a session moves the session and leaves the old worktree
+// standing. A lost binding race adopts the winner's session and
 // refreshes its display fields, so two Threads naming the same
 // (provider, foreign_session_id) converge on one session row and one
 // binding row.
@@ -314,8 +324,8 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 		b.Provider, b.ForeignSessionID).Scan(&sessionID)
 	if err == nil {
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE session SET directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
-			s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, sessionID); err != nil {
+			`UPDATE session SET worktree_id = ?, directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
+			worktreeID, s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, sessionID); err != nil {
 			return "", false, false, fmt.Errorf("store: ingest update session: %w", err)
 		}
 		return sessionID, false, false, nil
@@ -347,8 +357,8 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 				return "", false, false, fmt.Errorf("store: ingest adopt session: %w", derr)
 			}
 			if _, uerr := tx.ExecContext(ctx,
-				`UPDATE session SET directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
-				s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, winner); uerr != nil {
+				`UPDATE session SET worktree_id = ?, directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
+				worktreeID, s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, winner); uerr != nil {
 				return "", false, false, fmt.Errorf("store: ingest update session: %w", uerr)
 			}
 			return winner, false, false, nil
@@ -417,8 +427,13 @@ func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessi
 		skipped = have
 	}
 	// The last stored turn is the only prefix row allowed to change, and
-	// it has to be allowed to: see refreshLastTurn.
-	if have > 0 && len(turns) >= have {
+	// it has to be allowed to: see refreshLastTurn. The guard on
+	// have == maxSeq+1 is what keeps the pairing honest — position i is
+	// seq i only while the seqs run 0..have-1 without a gap, and pairing
+	// the row at MAX(seq) with turns[have-1] across a gap would refresh
+	// one turn from another turn's costs. A gapped table refreshes
+	// nothing and still appends correctly.
+	if have > 0 && have == maxSeq+1 && len(turns) >= have {
 		if err := refreshLastTurn(ctx, tx, now, sessionID, maxSeq, turns[have-1]); err != nil {
 			return 0, skipped, err
 		}
@@ -461,7 +476,11 @@ func insertTurnTail(ctx context.Context, tx *sql.Tx, m *Minter, now int64, sessi
 //
 // Costs are overwritten rather than added to. The incoming list is
 // cumulative — it is the whole turn as read from the whole file, not a delta
-// — so summing would double the part already stored.
+// — so summing would double the part already stored. Which is also the one
+// way to misuse this: ingesting a Thread from a Read that failed partway,
+// whose turn list happens to be as long as the stored one, rewrites the
+// last turn downward with the truncated figure, so a caller must not ingest
+// a thread whose Read returned an error.
 func refreshLastTurn(ctx context.Context, tx *sql.Tx, now int64, sessionID string, seq int, t Turn) error {
 	var usd any
 	if t.CostUSDMicros != nil {

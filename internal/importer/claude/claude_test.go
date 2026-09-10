@@ -45,7 +45,7 @@ const fixturePrompts = 3
 // fixtureLines is the line count of the main fixture, also by hand, so the
 // accounting test has something to hold the four buckets against that did
 // not come out of the reader.
-const fixtureLines = 33
+const fixtureLines = 34
 
 // The placeholders the fixture keeps in place of real paths, so a
 // transcript checked into the repository names no directory on any
@@ -952,5 +952,155 @@ func TestEmptyStringContentIsNoParts(t *testing.T) {
 	}
 	if got := b.parts([]byte(`"hello"`)); len(got) != 1 || got[0].Type != importer.PartText {
 		t.Fatalf("content \"hello\" produced %+v", got)
+	}
+}
+
+// TestAnAgentReportingBackIsNotAPrompt is the rule that keeps the turn
+// count honest on a machine that dispatches subagents. A task notification
+// arrives with the user role and real prose in it, and counting it as a
+// prompt inflates the turn count and divides every per-turn cost by the
+// same factor.
+func TestAnAgentReportingBackIsNotAPrompt(t *testing.T) {
+	f := newFixture(t)
+	th, _, _ := f.read(t, refByID(t, discover(t, f), fixtureSession))
+
+	var found bool
+	for _, m := range th.Messages {
+		if m.ForeignID == "bbbb0008-0000-4000-8000-000000000008" {
+			found = true
+			// It is still a message: the notification is transcript, and
+			// dropping it would lose what the agent said.
+			if m.Role != store.RoleUser || len(m.Parts) != 1 {
+				t.Fatalf("task notification = %+v, want a one-part user message", m)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the fixture no longer has a task-notification line")
+	}
+	if got, want := len(th.Turns), fixturePrompts+1; got != want {
+		t.Fatalf("got %d turns, want %d: the task notification opened one", got, want)
+	}
+}
+
+// TestInjectedLineRule holds the census's verdict directly, including the
+// cases that look injected and are not. Marking `sdk` or `<command-name>`
+// as machinery would throw away 901 and 65 real prompts respectively on
+// the machine this was written against.
+func TestInjectedLineRule(t *testing.T) {
+	cases := []struct {
+		name   string
+		line   line
+		text   string
+		expect bool
+	}{
+		{"a person typing", line{PromptSource: "typed", Origin: &origin{Kind: "human"}}, "merge", false},
+		{"a person through the sdk", line{PromptSource: "sdk"}, "Good to ship?", false},
+		{"a person invoking a slash command", line{PromptSource: "sdk"}, "<command-name>/review</command-name>", false},
+		{"a person in bash mode", line{}, "<bash-input>ls</bash-input>", false},
+		{"a queued human prompt", line{PromptSource: "queued", Origin: &origin{Kind: "human"}}, "push", false},
+		{"an old line with neither field", line{}, "what is this", false},
+		{"an agent reporting back", line{PromptSource: "sdk", Origin: &origin{Kind: "task-notification"}}, "<task-notification>done</task-notification>", true},
+		{"a coordinator", line{Origin: &origin{Kind: "coordinator"}}, "The coordinator sent a message", true},
+		{"a peer agent", line{Origin: &origin{Kind: "peer"}}, "please re-run", true},
+		{"the system prompting", line{PromptSource: "system"}, "anything", true},
+		{"command output echoed back", line{}, "<local-command-stdout>ok</local-command-stdout>", true},
+		{"bash output echoed back", line{}, "<bash-stdout>ok</bash-stdout>", true},
+	}
+	for _, c := range cases {
+		if got := injected(c.line, c.text); got != c.expect {
+			t.Errorf("%s: injected = %v, want %v", c.name, got, c.expect)
+		}
+	}
+}
+
+// TestRedactedThinkingIsStillThinking: internal/importer says the thinking
+// part covers the redacted variant, so a reader asking "did the model
+// reason here" gets yes whether or not it may see what about.
+func TestRedactedThinkingIsStillThinking(t *testing.T) {
+	f := newFixture(t)
+	th, res := readSession(t, f)
+
+	var found bool
+	for _, m := range th.Messages {
+		for _, p := range m.Parts {
+			if strings.Contains(p.Data, "redacted_thinking") {
+				found = true
+				if p.Type != importer.PartThinking {
+					t.Fatalf("redacted thinking landed as %q", p.Type)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the fixture no longer has a redacted_thinking block")
+	}
+	if res.UnknownTypes["redacted_thinking"] != 0 {
+		t.Fatalf("redacted_thinking was counted as unknown: %v", res.UnknownTypes)
+	}
+}
+
+// readSession is the main fixture read, for the tests that want both the
+// thread and the accounting and nothing else.
+func readSession(t *testing.T, f fixture) (store.Thread, importer.Result) {
+	t.Helper()
+	th, _, res := f.read(t, refByID(t, discover(t, f), fixtureSession))
+	return th, res
+}
+
+// TestSystemContentThatIsNotAStringIsNotASkip: the field is a string on
+// every transcript observed, and the day it is not must cost the content,
+// not the line.
+func TestSystemContentThatIsNotAStringIsNotASkip(t *testing.T) {
+	var b builder
+	if err := b.system(line{UUID: "u1", Content: []byte(`{"text":"structured"}`)}, []byte(`{}`), 1); err != nil {
+		t.Fatalf("system: %v", err)
+	}
+	if len(b.messages) != 1 || len(b.messages[0].Parts) != 1 {
+		t.Fatalf("messages = %+v", b.messages)
+	}
+	if got := b.messages[0].Parts[0]; got.Type != importer.PartUnknown || !strings.Contains(got.Data, "structured") {
+		t.Fatalf("part = %+v, want an unknown carrying the payload", got)
+	}
+}
+
+// TestReadKeepsTheCursorWhenItCannotOpenTheFile: a transcript that is
+// momentarily unreadable has not invalidated the watermark, and handing
+// back a zero one would make the next read re-import the whole session.
+func TestReadKeepsTheCursorWhenItCannotOpenTheFile(t *testing.T) {
+	f := newFixture(t)
+	held := importer.JSONLCursor{Offset: 4096, Size: 8192}
+	missing := importer.Ref{Provider: importer.ProviderClaude, ID: "gone", Path: filepath.Join(projectsDir, "-gone", "gone.jsonl")}
+
+	_, back, _, err := Source{}.Read(f.env, missing, held)
+	if err == nil {
+		t.Fatal("Read of a missing transcript succeeded")
+	}
+	if back != importer.Cursor(held) {
+		t.Fatalf("cursor back = %+v, want the one held %+v", back, held)
+	}
+}
+
+// TestSubagentsAreFoundWithoutTheirParentFile: a session transcript can be
+// deleted or rotated away and leave its subagents behind. Losing a whole
+// conversation because the file naming it is gone is not a trade worth
+// making.
+func TestSubagentsAreFoundWithoutTheirParentFile(t *testing.T) {
+	f := newFixture(t)
+	parent := filepath.Join(f.home, projectsDir, fixtureSlug, fixtureSession+".jsonl")
+	if err := os.Remove(parent); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	refs := discover(t, f)
+	ref := refByID(t, refs, fixtureAgent)
+	for _, r := range refs {
+		if r.ID == fixtureSession {
+			t.Fatal("the deleted session was still discovered")
+		}
+	}
+	th, _, _ := f.read(t, ref)
+	if th.Parent == nil || th.Parent.ForeignSessionID != fixtureSession {
+		t.Fatalf("orphaned subagent parent = %+v, want %q", th.Parent, fixtureSession)
 	}
 }

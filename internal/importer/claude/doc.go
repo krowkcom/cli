@@ -41,6 +41,28 @@
 // contract this package is built against, and changing it would rename
 // persisted rows to make a field read better.
 //
+// # A user-role line is not a prompt
+//
+// The turn rule starts a turn at a real user prompt, and the hard part is
+// that most user-role lines are not one. Tool results wear the user role
+// because that is where the API puts them; so do attachments, hook output
+// and Claude's own reminders. Newer transcripts add another: an agent
+// reporting back to the conversation that dispatched it, which arrives with
+// real prose in it and looks exactly like somebody asking a question. Those
+// carry `origin.kind` of `task-notification`, `coordinator` or `peer`, and
+// on this machine there are enough of them to inflate the turn count by a
+// fifth — and to divide every per-turn cost by the same factor.
+//
+// So a user line is treated as meta when its `origin.kind` is present and
+// is not `human`, when its `promptSource` is `system`, or when its text
+// opens with a tag that nothing types: `<local-command-stdout>`,
+// `<bash-stdout>`, `<task-notification>`, `<system-reminder>`. What is
+// deliberately not on that list is `promptSource: "sdk"` and the
+// `<command-name>` and `<bash-input>` tags — see injected in read.go, which
+// carries the counts. Every one of those is a person, reached through
+// something other than the terminal, and refusing them would lose far more
+// prompts than the rule saves.
+//
 // # Subagents are sessions
 //
 // A Task dispatch writes its own transcript to

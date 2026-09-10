@@ -45,7 +45,17 @@ the versions are the `v*` tags a release is cut from. Entries land under
   being used converges on its real costs rather than keeping the partial
   ones. A message line missing its `uuid` gets a synthesised foreign id so
   it dedups like any other, and a `user` line whose content is null
-  produces no parts and so opens no turn. Turns carry no `turn_id` link
+  produces no parts and so opens no turn. A user-role line that no person
+  typed does not open one either: an agent reporting back to the
+  conversation that dispatched it arrives with the user role and real prose
+  in it, so a line whose `origin.kind` is anything but `human`, whose
+  `promptSource` is `system`, or whose text opens with
+  `<local-command-stdout>`, `<bash-stdout>`, `<task-notification>` or
+  `<system-reminder>` is treated as meta — which is worth a fifth of the
+  turn count on a machine that dispatches subagents, and the same factor on
+  every per-turn cost. `promptSource: "sdk"` and `<command-name>` are
+  deliberately not on that list: both are a person, reached through
+  something other than the terminal. Turns carry no `turn_id` link
   back to their messages, because the contract carries none: a turn is the
   costing unit and nothing else yet.
 - `store.Thread.Parent`, a binding naming the session a session was spawned
@@ -120,7 +130,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   because an importer that read a live transcript caught that turn in
   flight and the fraction of its cost it saw would otherwise stand
   forever; every earlier turn is settled, since a turn closes only when
-  the next one opens). Message batches commit 500
+  the next one opens), and a session found by its binding has its
+  `worktree_id` re-pointed as well as its display fields refreshed, so a
+  session first filed under a placeholder directory moves once a later
+  import works out where it really ran. Message batches commit 500
   per transaction, so a concurrent push waits on `busy_timeout` instead of
   meeting a lock held for a whole import. Every minted id passes
   `ValidateID`, every `time_*` comes from the injected clock, and the

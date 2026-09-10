@@ -5,11 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 )
 
 // Env is a lookup function, the same shape internal/harness and internal/runctx
@@ -94,12 +92,7 @@ const pragmas = "_pragma=busy_timeout(10000)" +
 // behind Open's back. url.URL escapes the characters a path could smuggle
 // into the query string ('?', '#').
 func dsn(path string) string {
-	p := filepath.ToSlash(path)
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	u := url.URL{Scheme: "file", OmitHost: true, Path: p, RawQuery: pragmas}
-	return u.String()
+	return fileURI(path, pragmas)
 }
 
 // Open opens the store at DBPath(env), creating the parent directory when it
@@ -110,6 +103,13 @@ func dsn(path string) string {
 // sessions stay private to the user. Side files SQLite creates later (-wal,
 // -shm) follow the process umask — Open tightens whatever a previous run
 // left behind; files created after Open returns belong to the write path.
+//
+// A missing or empty file is initialised from 001_init.sql in one
+// transaction, stamped PRAGMA user_version = 1. A file at any other version,
+// or at version 1 with a table missing, fails with a `krowk sessions
+// rebuild` hint and is left unmodified — refused before the read-write open,
+// so not even the DSN connect pragmas touch it. No silent repair, no
+// in-place ALTER path in v1.
 // The returned handle is pinged, so a path that cannot hold a database fails
 // here rather than on first use.
 func Open(env Env) (*sql.DB, error) {
@@ -119,6 +119,19 @@ func Open(env Env) (*sql.DB, error) {
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("store: mkdir %s: %w", filepath.Dir(path), err)
+	}
+	// Refuse a foreign or future file before touching it: the create and
+	// tighten below, and the DSN connect pragmas (journal_mode especially)
+	// after them, would otherwise rewrite the header or mode bits of a
+	// file Open is about to reject. A missing file skips this — there is
+	// nothing to refuse yet — and the write path re-checks on its own
+	// handle, so a file swapped in between still fails closed.
+	if _, err := os.Stat(path); err == nil {
+		if err := checkSchemaFile(path, SchemaSQL); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("store: stat %s: %w", path, err)
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
@@ -163,6 +176,12 @@ func Open(env Env) (*sql.DB, error) {
 	}()
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
+	}
+	// Initialise a fresh file or accept an exact match. Re-reads the
+	// version on this handle, so a file swapped after the pre-open check
+	// still fails closed.
+	if err := ensureSchema(db, path, SchemaSQL); err != nil {
+		return nil, err
 	}
 	// A previous run on a permissive umask may have left world-readable
 	// sidecars behind (SQLite creates them lazily under the umask, not

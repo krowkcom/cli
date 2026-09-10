@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -89,9 +90,15 @@ func TestOpenTightensPreExistingFile(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	// An older version may have left the file world-readable; Open must
-	// take the group/other bits back off.
+	// take the group/other bits back off. Chmod pins the precondition
+	// explicitly: WriteFile's mode is still masked by the process umask,
+	// so under umask 077 the seed could otherwise arrive already 0600
+	// and the tightening path would go unexercised.
 	if err := os.WriteFile(path, []byte{}, 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod seed: %v", err)
 	}
 	db, err := Open(testEnv(map[string]string{"HOME": home}))
 	if err != nil {
@@ -166,11 +173,16 @@ func TestOpenSetsPragmasOnEveryConnection(t *testing.T) {
 }
 
 func TestOpenEmptyHomeFailsClosed(t *testing.T) {
-	_, err := Open(testEnv(map[string]string{}))
-	if err == nil {
+	// Isolate the working directory: fail-closed means no file appears
+	// anywhere a default could leak to, and the assertion must read the
+	// test's own directory, not the package's.
+	t.Chdir(t.TempDir())
+
+	if _, err := Open(testEnv(map[string]string{})); err == nil {
 		t.Fatal("Open with no home succeeded, want error")
-	}
-	if !strings.Contains(err.Error(), "HOME") {
+	} else if !errors.Is(err, ErrNoHome) {
+		t.Errorf("error %q is not ErrNoHome", err)
+	} else if !strings.Contains(err.Error(), "HOME") {
 		t.Errorf("error %q carries no hint mentioning HOME", err)
 	}
 	// Fail closed means no file appears anywhere a default could leak to:
@@ -188,14 +200,23 @@ func TestOpenEmptyHomeFailsClosed(t *testing.T) {
 }
 
 func TestOpenRelativeHomeFailsClosed(t *testing.T) {
+	t.Chdir(t.TempDir())
+
 	if got := DBPath(testEnv(map[string]string{"HOME": "data"})); got != "" {
 		t.Fatalf("DBPath with relative HOME = %q, want empty", got)
 	}
 	if _, err := Open(testEnv(map[string]string{"HOME": "data"})); err == nil {
 		t.Fatal("Open with relative HOME succeeded, want error")
+	} else if !errors.Is(err, ErrNoHome) {
+		t.Errorf("error %q is not ErrNoHome", err)
 	}
+	// A regression joining relative HOME would write ./data/..., not
+	// ./krowk.db, so assert both are absent.
 	if _, statErr := os.Stat("krowk.db"); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Errorf("krowk.db appeared in the working directory: stat err = %v", statErr)
+	}
+	if _, statErr := os.Stat("data"); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("data/ appeared in the working directory: stat err = %v", statErr)
 	}
 }
 
@@ -209,5 +230,80 @@ func TestDsnEscapesQueryChars(t *testing.T) {
 		if !strings.Contains(got, tc.want) {
 			t.Errorf("dsn(%q) = %q, want it to contain %q", tc.path, got, tc.want)
 		}
+		// The escape must actually hold: parsing the DSN back has to
+		// recover the input path and keep every pragma key intact.
+		u, err := url.Parse(got)
+		if err != nil {
+			t.Errorf("dsn(%q) does not parse: %v", tc.path, err)
+			continue
+		}
+		if u.Path != tc.path {
+			t.Errorf("dsn(%q) parses back to path %q", tc.path, u.Path)
+		}
+		for _, key := range []string{"_pragma"} {
+			if vals := u.Query()[key]; len(vals) != 4 {
+				t.Errorf("dsn(%q) carries %d _pragma values, want 4", tc.path, len(vals))
+			}
+		}
+	}
+}
+
+func TestOpenTightensPreExistingSidecars(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits are not portable to Windows")
+	}
+	home := t.TempDir()
+	db, err := Open(testEnv(map[string]string{"HOME": home}))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// A write proves the database is real; the clean close below may
+	// checkpoint the WAL away, so crash leftovers are seeded explicitly
+	// afterwards — that is the case Open must tighten.
+	if _, err := db.Exec(`CREATE TABLE t (x TEXT); INSERT INTO t VALUES ('s');`); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	db.Close()
+
+	// Pin the precondition explicitly: creation follows the umask, so
+	// under umask 077 the seeds could otherwise arrive already 0600
+	// and the tightening path would go unexercised.
+	dir := filepath.Join(home, ".local", "share", "krowk")
+	var sides []string
+	for _, name := range []string{"krowk.db-wal", "krowk.db-shm"} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte{}, 0o644); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+		if err := os.Chmod(p, 0o644); err != nil {
+			t.Fatalf("chmod seed %s: %v", name, err)
+		}
+		sides = append(sides, p)
+	}
+
+	db, err = Open(testEnv(map[string]string{"HOME": home}))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+
+	for _, p := range sides {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("%s mode = %04o, want no group/other bits", filepath.Base(p), perm)
+		}
+	}
+
+	// The leftovers must not have broken the store itself.
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+		t.Fatalf("select after reopen: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("COUNT(*) = %d, want 1", n)
 	}
 }

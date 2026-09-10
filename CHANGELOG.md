@@ -55,10 +55,12 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `$XDG_DATA_HOME/krowk/krowk.db` (a relative `XDG_DATA_HOME` is ignored, as
   the basedir spec says), otherwise `~/.local/share/krowk/krowk.db`. Global on
   purpose — a cwd-based path would split the store per repo. The environment
-  is injected, and no home in it means Open fails with a hint instead of
-  inventing a path at `/` or the working directory. The parent directory is
-  created when missing and the database file is created `0600` before SQLite
-  touches it, so sessions stay private to the user. Every connection the pool
+  is injected, and a missing or relative home means Open fails with a hint
+  instead of inventing a path at `/` or the working directory. The parent
+  directory is created when missing and the database file is created `0600`
+  before SQLite touches it — a file or sidecar (`-wal`, `-shm`) an earlier
+  run left world-readable is tightened back to `0600` on open — so sessions
+  stay private to the user. Every connection the pool
   opens carries the same pragmas via the DSN: `journal_mode=WAL` so readers
   never block the writer, `synchronous=NORMAL` (safe under WAL — a power cut
   can lose the last moments, never corrupt the file), `foreign_keys=1` because

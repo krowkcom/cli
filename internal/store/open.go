@@ -26,6 +26,12 @@ const (
 	dbFileName = "krowk.db"
 )
 
+// ErrNoHome is why Open fails when the environment names no home: a store
+// with nowhere to live must not fall back to /krowk.db or the current
+// directory. Match it with errors.Is rather than the hint text, which is
+// for humans.
+var ErrNoHome = errors.New("store: no home directory in environment")
+
 // DBPath is where the store lives: $XDG_DATA_HOME/krowk/krowk.db when
 // XDG_DATA_HOME is set to an absolute path (the XDG basedir spec says a
 // relative value must be ignored), otherwise ~/.local/share/krowk/krowk.db.
@@ -98,33 +104,49 @@ func dsn(path string) string {
 // Open opens the store at DBPath(env), creating the parent directory when it
 // is missing, and fails closed when env names no home: a store with nowhere
 // to live must not fall back to /krowk.db or the current directory. The
-// database file is created 0600 before SQLite touches it — sessions are
-// private, and the side files (-wal, -shm) inherit the database's mode.
+// database file is created 0600 before SQLite touches it, and a pre-existing
+// file (or sidecar) with wider permissions is tightened back to 0600, so
+// sessions stay private to the user. Side files SQLite creates later (-wal,
+// -shm) follow the process umask — Open tightens whatever a previous run
+// left behind; files created after Open returns belong to the write path.
 // The returned handle is pinged, so a path that cannot hold a database fails
 // here rather than on first use.
 func Open(env Env) (*sql.DB, error) {
 	path := DBPath(env)
 	if path == "" {
-		return nil, errors.New("store: no home directory in environment: set HOME (or XDG_DATA_HOME to an absolute path) so krowk.db has a place to live")
+		return nil, fmt.Errorf("%w: set HOME (or XDG_DATA_HOME to an absolute path) so krowk.db has a place to live", ErrNoHome)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("store: create %s: %w", filepath.Dir(path), err)
+		return nil, fmt.Errorf("store: mkdir %s: %w", filepath.Dir(path), err)
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("store: create %s: %w", path, err)
 	}
+	// The handle is closed on every failure below; the final Close past
+	// them is checked, so a failed create-flush fails here, not in SQLite.
+	failed := true
+	defer func() {
+		if failed {
+			f.Close()
+		}
+	}()
 	// OpenFile's mode applies at creation only: tighten a pre-existing file
 	// (an older version may have left it 0644) so sessions stay private.
-	if fi, statErr := f.Stat(); statErr == nil && fi.Mode().Perm()&0o077 != 0 {
+	// A stat that cannot even run fails closed rather than hoping.
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("store: stat %s: %w", path, err)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
 		if err := f.Chmod(0o600); err != nil {
-			f.Close()
 			return nil, fmt.Errorf("store: chmod %s: %w", path, err)
 		}
 	}
 	if err := f.Close(); err != nil {
-		return nil, fmt.Errorf("store: create %s: %w", path, err)
+		return nil, fmt.Errorf("store: close %s: %w", path, err)
 	}
+	failed = false
 	db, err := openSQL(dsn(path))
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
@@ -132,6 +154,19 @@ func Open(env Env) (*sql.DB, error) {
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
+	}
+	// A previous run on a permissive umask may have left world-readable
+	// sidecars behind (SQLite creates them lazily under the umask, not
+	// from the database's mode). Tighten whatever is already there.
+	for _, side := range []string{path + "-wal", path + "-shm", path + "-journal"} {
+		fi, err := os.Stat(side)
+		if err != nil || fi.Mode().Perm()&0o077 == 0 {
+			continue
+		}
+		if err := os.Chmod(side, 0o600); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("store: chmod %s: %w", side, err)
+		}
 	}
 	return db, nil
 }

@@ -240,10 +240,8 @@ func TestDsnEscapesQueryChars(t *testing.T) {
 		if u.Path != tc.path {
 			t.Errorf("dsn(%q) parses back to path %q", tc.path, u.Path)
 		}
-		for _, key := range []string{"_pragma"} {
-			if vals := u.Query()[key]; len(vals) != 4 {
-				t.Errorf("dsn(%q) carries %d _pragma values, want 4", tc.path, len(vals))
-			}
+		if vals := u.Query()["_pragma"]; len(vals) != 4 {
+			t.Errorf("dsn(%q) carries %d _pragma values, want 4", tc.path, len(vals))
 		}
 	}
 }

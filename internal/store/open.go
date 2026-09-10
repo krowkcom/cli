@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -17,7 +18,7 @@ import (
 // os.Getenv.
 type Env func(string) string
 
-// dbFile is the store's one file. The path is global on purpose: sessions from
+// The store's one file is global on purpose: sessions from
 // every repo land in one database, so a listing is a listing of everything,
 // and a relative or cwd-based path that split the store per repo would defeat
 // that.
@@ -151,22 +152,35 @@ func Open(env Env) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
+	// Cleanup only: with no query ever run on it, Close has nothing to
+	// flush and no failure to report — the returned error below is the
+	// one that matters.
+	dbFailed := true
+	defer func() {
+		if dbFailed {
+			db.Close()
+		}
+	}()
 	if err := db.Ping(); err != nil {
-		db.Close()
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
 	// A previous run on a permissive umask may have left world-readable
 	// sidecars behind (SQLite creates them lazily under the umask, not
-	// from the database's mode). Tighten whatever is already there.
+	// from the database's mode). Tighten whatever is already there; only
+	// a missing file is fine to skip, anything else failing to stat
+	// fails closed like the database file itself.
 	for _, side := range []string{path + "-wal", path + "-shm", path + "-journal"} {
 		fi, err := os.Stat(side)
-		if err != nil || fi.Mode().Perm()&0o077 == 0 {
+		if errors.Is(err, fs.ErrNotExist) || (err == nil && fi.Mode().Perm()&0o077 == 0) {
 			continue
 		}
+		if err != nil {
+			return nil, fmt.Errorf("store: stat %s: %w", side, err)
+		}
 		if err := os.Chmod(side, 0o600); err != nil {
-			db.Close()
 			return nil, fmt.Errorf("store: chmod %s: %w", side, err)
 		}
 	}
+	dbFailed = false
 	return db, nil
 }

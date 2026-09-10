@@ -59,8 +59,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   instead of inventing a path at `/` or the working directory. The parent
   directory is created when missing and the database file is created `0600`
   before SQLite touches it — a file or sidecar (`-wal`, `-shm`) an earlier
-  run left world-readable is tightened back to `0600` on open — so sessions
-  stay private to the user. Every connection the pool
+  run left world-readable is tightened back to `0600` on open, so the store
+  itself stays private to the user. (Side files SQLite creates after `Open`
+  returns follow the process umask; the write path owns those.) Every connection the pool
   opens carries the same pragmas via the DSN: `journal_mode=WAL` so readers
   never block the writer, `synchronous=NORMAL` (safe under WAL — a power cut
   can lose the last moments, never corrupt the file), `foreign_keys=1` because

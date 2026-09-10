@@ -21,8 +21,10 @@ import (
 
 	"github.com/krowkcom/cli/internal/api"
 	"github.com/krowkcom/cli/internal/config"
+	harnesscheck "github.com/krowkcom/cli/internal/harness"
 	"github.com/krowkcom/cli/internal/output"
 	"github.com/krowkcom/cli/internal/runctx"
+	"github.com/krowkcom/cli/internal/store"
 )
 
 // Version is stamped at build time: -ldflags "-X .../internal/cli.Version=1.2.3".
@@ -1946,6 +1948,7 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 		"runs_available": client.Authenticated(),
 		"credentials":    api.CredentialsPath(),
 		"config":         configSummary(),
+		"store":          storeCheck(env),
 		"context":        runctx.Detect(env),
 	}
 
@@ -1961,9 +1964,25 @@ func doctor(w io.Writer, format output.Format, f flags, env runctx.Env) error {
 	for _, k := range keys {
 		fmt.Fprintf(w, "%-15s %v\n", k, report[k])
 	}
-	b, _ := json.Marshal(report["context"])
-	fmt.Fprintf(w, "%-15s %s\n", "context", b)
+	for _, k := range []string{"store", "context"} {
+		b, _ := json.Marshal(report[k])
+		fmt.Fprintf(w, "%-15s %s\n", k, b)
+	}
 	return nil
+}
+
+// storeCheck is the local session store's health answer, reported in the
+// harness StatusCheck shape so every doctor check reads as one vocabulary.
+// Kept as a conversion (rather than importing harness into store) because
+// the store deliberately keeps no dependency on harness.
+func storeCheck(env runctx.Env) harnesscheck.StatusCheck {
+	s := store.Check(store.Env(env))
+	return harnesscheck.StatusCheck{
+		Name:    s.Name,
+		Status:  s.Status,
+		Message: s.Message,
+		Hint:    s.Hint,
+	}
 }
 
 // probe reads the service descriptor at the API root. It needs neither a key nor

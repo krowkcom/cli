@@ -11,6 +11,12 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- `krowk doctor` now reports the local session store's health as a `store`
+  StatusCheck, sibling to the harness checks: the `krowk.db` path, the schema
+  version and the steady-state pragmas (WAL, NORMAL, foreign keys). It passes
+  on a fresh open and fails with an `internal/store` hint — never a reinstall
+  — when HOME is missing, the file is unreadable, or the migration is stale.
+
 - The v1 session-store schema: `001_init.sql` now defines the eight tables
   the plan promised — `worktree`, `session`, `session_binding`,
   `session_event`, `turn`, `message`, `part` and `import_state` — instead of

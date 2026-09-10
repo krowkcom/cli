@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -9,8 +10,10 @@ import (
 
 // messageCountQuery is the listing-shape probe for the 10k fixture: a COUNT
 // that must never touch blob columns. It is a constant so the gate pins the
-// exact text — a future listing query that SELECTs raw_json or joins part
-// cannot drift in behind a variable.
+// exact text — a future listing that SELECTs raw_json, SELECTs *, or joins
+// part cannot drift in behind a variable. No production listing reads these
+// rows yet; this pins the shape the first listing must keep, the way the
+// schema tests pin DDL before any command writes the tables.
 const messageCountQuery = `SELECT COUNT(*) FROM message`
 
 // perfMessageCount is the fixture size the todo names: 10k messages, each
@@ -30,21 +33,41 @@ func coldOpenBudget(short bool) time.Duration {
 	return 50 * time.Millisecond
 }
 
-// buildPerfFixture creates a temp store through Open (so the file carries the
-// production pragmas and version stamp), fills it with perfMessageCount
-// messages plus one blob part each inside a single transaction, checkpoints
-// the WAL so the later cold open sees a steady-state file, and closes the
-// handle. The caller must close the database before timing Open: fixture
-// setup is never part of the measured window.
-func buildPerfFixture(t *testing.T, db *sql.DB, sessionID string) {
-	t.Helper()
+// perfPayloads returns the two ~1KB blobs the fixture stores: raw_json on
+// message and data on part. One builder serves the test and both benchmarks
+// so the measured blob shape cannot diverge between them.
+func perfPayloads() (rawJSON, partData string) {
+	return `{"text":"` + strings.Repeat("x", 896) + `"}`, `{"text":"` + strings.Repeat("y", 896) + `"}`
+}
 
-	rawPayload := `{"text":"` + strings.Repeat("x", 896) + `"}`
-	partPayload := `{"text":"` + strings.Repeat("y", 896) + `"}`
+// seedPerfSession inserts the one worktree and session the fixture hangs off
+// and returns the session id. Shared by the test and both benchmarks.
+func seedPerfSession(tb testing.TB, db *sql.DB) string {
+	tb.Helper()
+	wID := NewID()
+	if _, err := db.Exec(`INSERT INTO worktree (id, path, time_created, time_updated) VALUES (?, '/perf', 1, 2)`, wID); err != nil {
+		tb.Fatalf("insert perf worktree: %v", err)
+	}
+	sID := NewID()
+	if _, err := db.Exec(`INSERT INTO session (id, worktree_id, directory, title, time_created, time_updated) VALUES (?, ?, '/r', 'perf', 1, 2)`, sID, wID); err != nil {
+		tb.Fatalf("insert perf session: %v", err)
+	}
+	return sID
+}
+
+// buildPerfFixture fills db with perfMessageCount messages plus one blob part
+// each inside a single transaction. Shared by the test and both benchmarks
+// so the blob shape and row counts cannot diverge between them. Fixture setup
+// is never part of the measured window: callers build, checkpoint, close,
+// and only then start the clock on Open.
+func buildPerfFixture(tb testing.TB, db *sql.DB, sessionID string) {
+	tb.Helper()
+
+	rawPayload, partPayload := perfPayloads()
 
 	tx, err := db.Begin()
 	if err != nil {
-		t.Fatalf("begin perf fixture: %v", err)
+		tb.Fatalf("begin perf fixture: %v", err)
 	}
 	committed := false
 	defer func() {
@@ -55,38 +78,74 @@ func buildPerfFixture(t *testing.T, db *sql.DB, sessionID string) {
 
 	msgStmt, err := tx.Prepare(`INSERT INTO message (id, session_id, turn_id, seq, role, raw_json, time_created) VALUES (?, ?, NULL, ?, 'user', ?, 1)`)
 	if err != nil {
-		t.Fatalf("prepare message: %v", err)
+		tb.Fatalf("prepare message: %v", err)
 	}
 	defer msgStmt.Close()
 	partStmt, err := tx.Prepare(`INSERT INTO part (id, message_id, session_id, seq, type, data) VALUES (?, ?, ?, 0, 'text', ?)`)
 	if err != nil {
-		t.Fatalf("prepare part: %v", err)
+		tb.Fatalf("prepare part: %v", err)
 	}
 	defer partStmt.Close()
 
 	for i := 0; i < perfMessageCount; i++ {
 		msgID := NewID()
 		if _, err := msgStmt.Exec(msgID, sessionID, i, rawPayload); err != nil {
-			t.Fatalf("insert perf message %d: %v", i, err)
+			tb.Fatalf("insert perf message %d: %v", i, err)
 		}
 		if _, err := partStmt.Exec(NewID(), msgID, sessionID, partPayload); err != nil {
-			t.Fatalf("insert perf part %d: %v", i, err)
+			tb.Fatalf("insert perf part %d: %v", i, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		t.Fatalf("commit perf fixture: %v", err)
+		tb.Fatalf("commit perf fixture: %v", err)
 	}
 	committed = true
+}
+
+// checkpointPerf collapses the WAL the bulk load wrote so a later cold open
+// sees a steady-state file rather than paying a checkpoint a production
+// reopen would rarely see. Shared so the test and both benchmarks measure
+// the same file state.
+func checkpointPerf(tb testing.TB, db *sql.DB) {
+	tb.Helper()
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		tb.Fatalf("checkpoint perf fixture: %v", err)
+	}
+}
+
+// blobTokenRe matches blob identifiers as whole tokens, so a future query
+// naming raw_json, a data column, or the part table fails the shape probe
+// while words merely containing those letters (particular, partition) do
+// not. COUNT(*) is the one allowed star: it counts rows without reading any
+// column.
+var blobTokenRe = regexp.MustCompile(`(?i)\b(raw_json|data|part)\b`)
+
+// assertCountQueryShape pins the probe text: exact normalized equality plus a
+// token scan for blob identifiers. Either fires if a future edit drags blobs
+// into the listing path — SELECT *, SELECT raw_json, JOIN part, or an
+// aliased part reference.
+func assertCountQueryShape(t *testing.T) {
+	t.Helper()
+	normalized := strings.Join(strings.Fields(strings.ToUpper(messageCountQuery)), " ")
+	if normalized != "SELECT COUNT(*) FROM MESSAGE" {
+		t.Errorf("count query drifted to %q, want exactly %q (blob-free listing shape)", messageCountQuery, "SELECT COUNT(*) FROM message")
+	}
+	if blobTokenRe.MatchString(strings.ReplaceAll(normalized, "COUNT(*)", "COUNT_ROWS")) {
+		t.Errorf("count query must not name blob columns or the part table: %q", messageCountQuery)
+	}
 }
 
 // TestColdOpen10kMessages builds the 10k-message fixture, closes the store,
 // then times a fresh Open plus the blob-free count probe. Setup is outside
 // the measured window; only the Open is budgeted.
 //
-// The first Open in the process warms the WASM driver, so the timed Open
-// measures the file open (permits, pragmas, schema gate) rather than runtime
-// init — that is the "cold" the todo budgets, and it is what a CLI launch
-// pays on every invocation.
+// The fixture build opens the store first, which warms the WASM driver — by
+// design the timed Open measures the file open (permits, pragmas, schema
+// gate), not runtime init. A real CLI launch pays WASM init once per process
+// on top of this; the todo budgets the per-open file cost, which is what
+// every listing pays. The 50ms budget carries ~25x headroom over the ~2ms
+// measured on dev hardware, so a single sample is the signal rather than a
+// percentile tracker.
 func TestColdOpen10kMessages(t *testing.T) {
 	home := t.TempDir()
 	env := testEnv(map[string]string{"HOME": home})
@@ -95,23 +154,9 @@ func TestColdOpen10kMessages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open for fixture: %v", err)
 	}
-	wID := NewID()
-	if _, err := db.Exec(`INSERT INTO worktree (id, path, time_created, time_updated) VALUES (?, '/perf', 1, 2)`, wID); err != nil {
-		db.Close()
-		t.Fatalf("insert perf worktree: %v", err)
-	}
-	sID := NewID()
-	if _, err := db.Exec(`INSERT INTO session (id, worktree_id, directory, title, time_created, time_updated) VALUES (?, ?, '/r', 'perf', 1, 2)`, sID, wID); err != nil {
-		db.Close()
-		t.Fatalf("insert perf session: %v", err)
-	}
+	sID := seedPerfSession(t, db)
 	buildPerfFixture(t, db, sID)
-	// Steady-state file: collapse the WAL the bulk load wrote so the timed
-	// open does not pay a checkpoint a production reopen would rarely see.
-	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		db.Close()
-		t.Fatalf("checkpoint perf fixture: %v", err)
-	}
+	checkpointPerf(t, db)
 	if err := db.Close(); err != nil {
 		t.Fatalf("close perf fixture: %v", err)
 	}
@@ -129,16 +174,7 @@ func TestColdOpen10kMessages(t *testing.T) {
 		t.Errorf("cold Open took %s, budget %s on %d-message fixture", elapsed, budget, perfMessageCount)
 	}
 
-	// The count probe must not name blob columns: raw_json lives on message,
-	// data lives on part, and either in the text means the query drags blobs.
-	upper := strings.ToUpper(messageCountQuery)
-	if strings.Contains(upper, "RAW_JSON") {
-		t.Errorf("count query must not SELECT raw_json: %q", messageCountQuery)
-	}
-	if strings.Contains(upper, "PART") {
-		t.Errorf("count query must not touch the part table: %q", messageCountQuery)
-	}
-	var plan string
+	assertCountQueryShape(t)
 	planRows, err := db.Query(`EXPLAIN QUERY PLAN ` + messageCountQuery)
 	if err != nil {
 		t.Fatalf("explain count query: %v", err)
@@ -150,9 +186,8 @@ func TestColdOpen10kMessages(t *testing.T) {
 		if err := planRows.Scan(&id, &parent, &notused, &detail); err != nil {
 			t.Fatalf("scan plan: %v", err)
 		}
-		plan += detail + "; "
-		if strings.Contains(strings.ToLower(detail), "part") {
-			t.Errorf("count query plan touches part: %q", detail)
+		if blobTokenRe.MatchString(detail) {
+			t.Errorf("count query plan touches blobs or part: %q", detail)
 		}
 	}
 	if err := planRows.Err(); err != nil {
@@ -186,43 +221,9 @@ func BenchmarkColdOpen10k(b *testing.B) {
 	if err != nil {
 		b.Fatalf("Open for fixture: %v", err)
 	}
-	wID := NewID()
-	if _, err := db.Exec(`INSERT INTO worktree (id, path, time_created, time_updated) VALUES (?, '/perf', 1, 2)`, wID); err != nil {
-		db.Close()
-		b.Fatalf("insert perf worktree: %v", err)
-	}
-	sID := NewID()
-	if _, err := db.Exec(`INSERT INTO session (id, worktree_id, directory, title, time_created, time_updated) VALUES (?, ?, '/r', 'perf', 1, 2)`, sID, wID); err != nil {
-		db.Close()
-		b.Fatalf("insert perf session: %v", err)
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		db.Close()
-		b.Fatalf("begin: %v", err)
-	}
-	payload := strings.Repeat("x", 896)
-	for i := 0; i < perfMessageCount; i++ {
-		msgID := NewID()
-		if _, err := tx.Exec(`INSERT INTO message (id, session_id, turn_id, seq, role, raw_json, time_created) VALUES (?, ?, NULL, ?, 'user', ?, 1)`, msgID, sID, i, payload); err != nil {
-			tx.Rollback()
-			db.Close()
-			b.Fatalf("insert message: %v", err)
-		}
-		if _, err := tx.Exec(`INSERT INTO part (id, message_id, session_id, seq, type, data) VALUES (?, ?, ?, 0, 'text', ?)`, NewID(), msgID, sID, payload); err != nil {
-			tx.Rollback()
-			db.Close()
-			b.Fatalf("insert part: %v", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		db.Close()
-		b.Fatalf("commit: %v", err)
-	}
-	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		db.Close()
-		b.Fatalf("checkpoint: %v", err)
-	}
+	sID := seedPerfSession(b, db)
+	buildPerfFixture(b, db, sID)
+	checkpointPerf(b, db)
 	if err := db.Close(); err != nil {
 		b.Fatalf("close fixture: %v", err)
 	}
@@ -233,7 +234,9 @@ func BenchmarkColdOpen10k(b *testing.B) {
 		if err != nil {
 			b.Fatalf("cold Open: %v", err)
 		}
-		db.Close()
+		if err := db.Close(); err != nil {
+			b.Fatalf("close cold open: %v", err)
+		}
 	}
 }
 
@@ -248,33 +251,9 @@ func BenchmarkMessageCount10k(b *testing.B) {
 		b.Fatalf("Open for fixture: %v", err)
 	}
 	defer db.Close()
-	wID := NewID()
-	if _, err := db.Exec(`INSERT INTO worktree (id, path, time_created, time_updated) VALUES (?, '/perf', 1, 2)`, wID); err != nil {
-		b.Fatalf("insert worktree: %v", err)
-	}
-	sID := NewID()
-	if _, err := db.Exec(`INSERT INTO session (id, worktree_id, directory, title, time_created, time_updated) VALUES (?, ?, '/r', 'perf', 1, 2)`, sID, wID); err != nil {
-		b.Fatalf("insert session: %v", err)
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		b.Fatalf("begin: %v", err)
-	}
-	payload := strings.Repeat("x", 896)
-	for i := 0; i < perfMessageCount; i++ {
-		msgID := NewID()
-		if _, err := tx.Exec(`INSERT INTO message (id, session_id, turn_id, seq, role, raw_json, time_created) VALUES (?, ?, NULL, ?, 'user', ?, 1)`, msgID, sID, i, payload); err != nil {
-			tx.Rollback()
-			b.Fatalf("insert message: %v", err)
-		}
-		if _, err := tx.Exec(`INSERT INTO part (id, message_id, session_id, seq, type, data) VALUES (?, ?, ?, 0, 'text', ?)`, NewID(), msgID, sID, payload); err != nil {
-			tx.Rollback()
-			b.Fatalf("insert part: %v", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		b.Fatalf("commit: %v", err)
-	}
+	sID := seedPerfSession(b, db)
+	buildPerfFixture(b, db, sID)
+	checkpointPerf(b, db)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

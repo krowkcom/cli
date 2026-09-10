@@ -23,6 +23,7 @@ import (
 	"github.com/krowkcom/cli/internal/config"
 	harnesscheck "github.com/krowkcom/cli/internal/harness"
 	"github.com/krowkcom/cli/internal/output"
+	"github.com/krowkcom/cli/internal/pricing"
 	"github.com/krowkcom/cli/internal/runctx"
 	"github.com/krowkcom/cli/internal/store"
 )
@@ -418,6 +419,10 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	f.filter = filter
 	f.tty = isTTY
 	f.errTTY = isErrTTY
+	// The price lookup's environment, bound once per invocation: Price prices
+	// from the snapshot and the cache file and never fetches, but it still
+	// needs to know where the cache file lives.
+	pricing.Bind(pricing.Env(env))
 	if err := filterHasSomethingToRead(filter, f, positionals); err != nil {
 		return report(stderr, err, format, f.quiet, colour)
 	}
@@ -490,6 +495,8 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		err = configUnset(stdout, positionals[2:], f, format, colour)
 	case positionals[0] == "doctor":
 		err = doctor(stdout, format, f, env)
+	case len(positionals) > 1 && positionals[0] == "pricing" && positionals[1] == "refresh":
+		err = pricingRefresh(stdout, format, f, env)
 	case positionals[0] == "upgrade":
 		err = upgradeCmd(stdout, f, format, env, colour)
 	default:

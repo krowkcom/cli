@@ -358,6 +358,14 @@ func catalog() Catalog {
 				},
 			},
 			{Name: "doctor", Usage: "krowk doctor", Summary: "Check the local setup"},
+			{
+				Name:    "pricing",
+				Summary: "Model price data",
+				Subcommands: []Command{
+					{Name: "refresh", Usage: "krowk pricing refresh",
+						Summary: "Refresh the models.dev price cache"},
+				},
+			},
 			{Name: "upgrade", Usage: "krowk upgrade", Summary: "Upgrade krowk to the latest release"},
 			{
 				Name:    "help",
@@ -425,7 +433,7 @@ var sections = []section{
 		"auth login", "auth verify", "auth token",
 		"workspaces list", "workspaces use",
 		"config show", "config set", "config unset",
-		"doctor", "upgrade", "help",
+		"doctor", "pricing refresh", "upgrade", "help",
 	}},
 }
 

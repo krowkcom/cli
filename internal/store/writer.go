@@ -338,14 +338,14 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 		`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
 		b.Provider, b.ForeignSessionID).Scan(&sessionID)
 	if err == nil {
-		title := s.Title
+		title := strings.TrimSpace(s.Title)
 		if fromFallback {
 			// A derived fallback must never overwrite the title already
 			// on the row — same rule as the binding-race path's
 			// storedTitleOr. A stored untitled row still backfills from
 			// the re-import; an explicit rename (fromFallback=false)
 			// still wins below.
-			stored, terr := storedTitleOr(ctx, tx, sessionID, s.Title)
+			stored, terr := storedTitleOr(ctx, tx, sessionID, s.Title, true)
 			if terr != nil {
 				return "", false, false, terr
 			}
@@ -355,6 +355,11 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 			// stored untitled row backfills here when the re-import
 			// carries user text; a row no re-import names stays untitled
 			// — there is no migration rewriting stored titles.
+			// TrimSpace above is what reaches this branch: fromFallback
+			// is false exactly when the importer read a title, so a
+			// truly empty one cannot arrive here — but a whitespace-only
+			// one can, and storing spaces would be a wipe by another
+			// name. It backfills from the row instead.
 			if terr := tx.QueryRowContext(ctx, `SELECT title FROM session WHERE id = ?`, sessionID).Scan(&title); terr != nil {
 				return "", false, false, fmt.Errorf("store: ingest read session title: %w", terr)
 			}
@@ -392,7 +397,7 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 			if _, derr := tx.ExecContext(ctx, `DELETE FROM session WHERE id = ?`, sessionID); derr != nil {
 				return "", false, false, fmt.Errorf("store: ingest adopt session: %w", derr)
 			}
-			winnerTitle, uerr := storedTitleOr(ctx, tx, winner, s.Title)
+			winnerTitle, uerr := storedTitleOr(ctx, tx, winner, s.Title, fromFallback)
 			if uerr != nil {
 				return "", false, false, uerr
 			}
@@ -408,13 +413,18 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 	return sessionID, true, true, nil
 }
 
-// storedTitleOr resolves the title the binding-race path writes: the
-// winner's stored title when it has one, else this attempt's fallback, so
-// an untitled loser never wipes the title the winner just stored.
-func storedTitleOr(ctx context.Context, tx *sql.Tx, sessionID, incoming string) (string, error) {
+// storedTitleOr resolves the title the binding-race path writes. A stored
+// title survives a derived fallback or an empty incoming — an untitled
+// loser never wipes the title the winner just stored — while an explicit
+// rename (fromFallback=false with a non-empty incoming) wins, so a rename
+// racing an import is not silently dropped.
+func storedTitleOr(ctx context.Context, tx *sql.Tx, sessionID, incoming string, fromFallback bool) (string, error) {
 	var stored string
 	if err := tx.QueryRowContext(ctx, `SELECT title FROM session WHERE id = ?`, sessionID).Scan(&stored); err != nil {
 		return "", fmt.Errorf("store: ingest read session title: %w", err)
+	}
+	if !fromFallback && strings.TrimSpace(incoming) != "" {
+		return incoming, nil
 	}
 	if stored != "" {
 		return stored, nil

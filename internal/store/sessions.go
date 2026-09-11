@@ -60,7 +60,10 @@ type SessionRow struct {
 
 // ListSessions runs sessionListQuery: harness and worktree are exact-match
 // filters (empty means no filter), limit <= 0 means no cap — callers pass
-// -1 for --all. Rows come newest-first.
+// -1 for --all, and 0 is treated the same (never "zero rows"): it is the
+// unset value the shared flag set carries, so a caller that forgot to
+// default still lists rather than answering empty. Pass a positive page or
+// -1. Rows come newest-first.
 func ListSessions(db *sql.DB, harness, worktree string, limit int) ([]SessionRow, error) {
 	q := sessionListQuery
 	lim := limit
@@ -114,10 +117,13 @@ func (e *AmbiguousSessionError) Error() string { return e.msg }
 // ResolveSessionID maps what a person typed to a store session id: a full
 // id, an unambiguous id prefix of at least 8 chars, or a foreign_session_id
 // via the binding. An ambiguous prefix fails naming every candidate.
+// A ref that matches nothing wraps sql.ErrNoRows, so callers map it with
+// errors.Is exactly like LoadSessionDetail's missing row; any other failure
+// wraps the store error underneath and is a store problem, not a miss.
 func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
-		return "", fmt.Errorf("store: pass a session id: `krowk sessions show <id>`")
+		return "", fmt.Errorf("store: pass a session id: `krowk sessions show <id>`: %w", sql.ErrNoRows)
 	}
 	var id string
 	if err := db.QueryRow(`SELECT id FROM session WHERE id = ?`, ref).Scan(&id); err == nil {
@@ -129,7 +135,7 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 		return viaBinding, nil
 	}
 	if len(ref) < 8 {
-		return "", fmt.Errorf("store: %q matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id", ref)
+		return "", fmt.Errorf("store: %q matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id: %w", ref, sql.ErrNoRows)
 	}
 	rows, err := db.Query(`SELECT id, title FROM session WHERE id LIKE ? ESCAPE '\' ORDER BY id LIMIT 11`, escapeLikePrefix(ref)+"%")
 	if err != nil {
@@ -150,7 +156,7 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 	}
 	switch len(ids) {
 	case 0:
-		return "", fmt.Errorf("store: %q matches no session", ref)
+		return "", fmt.Errorf("store: %q matches no session: %w", ref, sql.ErrNoRows)
 	case 1:
 		return ids[0], nil
 	default:

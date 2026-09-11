@@ -2151,13 +2151,15 @@ func clip[T any](s []T, n int) []T {
 }
 
 // onlyForSessionsImport refuses each sessions flag anywhere it does not
-// belong. --limit is not in any list: the listings read the same number as
-// a page size and the import as a transcript cap, so it means a maximum on
-// all of them and one flag says it. --dry-run and --from mean nothing
-// outside `sessions import`; --harness, --worktree and --all mean nothing
-// outside the bare `sessions` list; --thinking means nothing outside
-// `sessions show`. A flag that means nothing where it was typed is a flag
-// that was misunderstood by whoever typed it.
+// belong. --limit is not in the owner list: the listings read the same
+// number as a page size and the import as a transcript cap, so it means a
+// maximum on all of them and one flag says it. `sessions show` reads one
+// thread, so a maximum means nothing there — it is refused on show by
+// name below rather than silently ignored. --dry-run and --from mean
+// nothing outside `sessions import`; --harness, --worktree and --all mean
+// nothing outside the bare `sessions` list; --thinking means nothing
+// outside `sessions show`. A flag that means nothing where it was typed is
+// a flag that was misunderstood by whoever typed it.
 func onlyForSessionsImport(given map[string]bool, positionals []string) error {
 	isImport := len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "import"
 	isShow := len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "show"
@@ -2185,6 +2187,9 @@ func onlyForSessionsImport(given map[string]bool, positionals []string) error {
 		if given[name] && !allowed[name] {
 			return api.Fail("bad_flag", "`--"+name+"` is only a flag of "+owner[name])
 		}
+	}
+	if isShow && given["limit"] {
+		return api.Fail("bad_flag", "`--limit` is only a flag of `krowk sessions` and `krowk sessions import` — `krowk sessions show` reads one session")
 	}
 	return nil
 }

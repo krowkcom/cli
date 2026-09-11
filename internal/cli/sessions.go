@@ -229,6 +229,9 @@ func sessionsShow(w io.Writer, args []string, f flags, format output.Format, env
 	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
 		return api.Fail("no_session", "pass the session: `krowk sessions show <id>`")
 	}
+	if len(args) > 1 {
+		return api.Fail("bad_flag", "`krowk sessions show` takes one session id, got extra "+strings.Join(args[1:], " "))
+	}
 	db, err := store.Open(store.Env(env))
 	if err != nil {
 		return api.Fail("store_unavailable", sanitizeStoreErr(err, store.DBPath(store.Env(env))))
@@ -241,12 +244,15 @@ func sessionsShow(w io.Writer, args []string, f flags, format output.Format, env
 		if errors.As(err, &amb) {
 			return api.Fail("ambiguous_session", err.Error())
 		}
-		return api.Fail("no_session", err.Error())
+		if errors.Is(err, sql.ErrNoRows) {
+			return api.Fail("no_session", noSessionDetail(err))
+		}
+		return api.Fail("store_unavailable", sanitizeStoreErr(err, store.DBPath(store.Env(env))))
 	}
 	d, err := store.LoadSessionDetail(db, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return api.Fail("no_session", sanitizeStoreErr(err, store.DBPath(store.Env(env))))
+			return api.Fail("no_session", fmt.Sprintf("no session %q", id))
 		}
 		return api.Fail("store_unavailable", sanitizeStoreErr(err, store.DBPath(store.Env(env))))
 	}
@@ -255,6 +261,15 @@ func sessionsShow(w io.Writer, args []string, f flags, format output.Format, env
 	}
 	fmt.Fprint(w, humanSessionShow(d, f.thinking, colour, time.Now()))
 	return nil
+}
+
+// noSessionDetail keeps the store's miss hint ("matches no session — pass
+// a full id …") while dropping the driver suffix ResolveSessionID wraps
+// underneath (": sql: no rows in result set"), which is a driver fact, not
+// a fact about the session the person typed.
+func noSessionDetail(err error) string {
+	const suffix = ": sql: no rows in result set"
+	return strings.TrimSuffix(err.Error(), suffix)
 }
 
 type showPartJSON struct {

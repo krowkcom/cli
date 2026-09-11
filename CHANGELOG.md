@@ -76,7 +76,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   embedded models.dev snapshot and footnote its date; an unpriced pair shows `—`,
   never 0. An untitled thread lists by the first 80 chars of its first
   user text, stored at import; threads imported before that fallback stay
-  untitled until a re-import carries user text.
+  untitled until a re-import carries user text. The listing indexes apply
+  to fresh stores only: a `krowk.db` created before an index landed is
+  still accepted and answers correctly, just on a slower plan, until
+  `krowk sessions rebuild` recreates it — there is no backfill in v1.
 - The Cursor importer, `internal/importer/cursor`, which reads Cursor's
   agent transcripts out of `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`
   and produces the canonical `store.Thread`. The thing it is careful about

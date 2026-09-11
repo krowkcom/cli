@@ -153,6 +153,12 @@ func humanSessionsList(rows []store.SessionRow, colour bool, now time.Time) stri
 	if tw > 60 {
 		tw = 60
 	}
+	if hw > 60 {
+		hw = 60
+	}
+	if mw > 60 {
+		mw = 60
+	}
 	lines := make([]string, 0, len(rows))
 	for _, r := range rows {
 		title := cleanCell(r.Title)
@@ -163,7 +169,13 @@ func humanSessionsList(rows []store.SessionRow, colour bool, now time.Time) stri
 			title = string(r[:57]) + "..."
 		}
 		harness := cleanCell(r.Harness)
+		if r := []rune(harness); len(r) > 60 {
+			harness = string(r[:57]) + "..."
+		}
 		model := cleanCell(r.Model)
+		if r := []rune(model); len(r) > 60 {
+			model = string(r[:57]) + "..."
+		}
 		cost := "—"
 		if priced, ok := priceRow(r); ok {
 			cost = formatCost(priced)
@@ -306,6 +318,7 @@ type sessionShowJSON struct {
 	Model          string            `json:"model"`
 	Provider       string            `json:"provider"`
 	Worktree       string            `json:"worktree"`
+	Directory      string            `json:"directory,omitempty"`
 	ForeignSession string            `json:"foreign_session_id,omitempty"`
 	Turns          []showTurnJSON    `json:"turns"`
 	Messages       []showMessageJSON `json:"messages"`
@@ -361,7 +374,7 @@ func emitSessionShow(w io.Writer, f flags, d store.SessionDetail) error {
 	out := sessionShowJSON{
 		ID: d.Session.ID, Title: d.Session.Title, Harness: d.Session.Harness,
 		Model: d.Session.Model, Provider: d.Session.Provider,
-		Worktree: d.Session.WorktreePath, ForeignSession: d.Session.ForeignSessionID,
+		Worktree: d.Session.WorktreePath, Directory: d.Session.Directory, ForeignSession: d.Session.ForeignSessionID,
 		Turns: turns, Messages: msgs, CostDisplay: "—",
 	}
 	if priced, ok := priceRow(d.Session); ok {
@@ -404,6 +417,8 @@ func humanSessionShow(d store.SessionDetail, showThinking bool, colour bool, now
 	meta += "  " + relativeTime(d.Session.TimeUpdated, now)
 	if wp := cleanCell(d.Session.WorktreePath); wp != "" {
 		meta += "\n" + wp
+	} else if dir := cleanCell(d.Session.Directory); dir != "" {
+		meta += "\n" + dir
 	}
 	b.WriteString(meta + "\n")
 	for _, t := range d.Turns {

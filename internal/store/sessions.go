@@ -9,8 +9,10 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 // sessionListQuery lists sessions newest-first from columns only: session,
@@ -126,12 +128,20 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 		return "", fmt.Errorf("store: pass a session id: `krowk sessions show <id>`: %w", sql.ErrNoRows)
 	}
 	var id string
-	if err := db.QueryRow(`SELECT id FROM session WHERE id = ?`, ref).Scan(&id); err == nil {
+	if err := db.QueryRow(`SELECT id FROM session WHERE id = ?`, ref).Scan(&id); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("store: resolve session: %w", err)
+		}
+	} else {
 		return id, nil
 	}
 	// A foreign session id resolves via the binding (Claude sessionId).
 	var viaBinding string
-	if err := db.QueryRow(`SELECT session_id FROM session_binding WHERE foreign_session_id = ?`, ref).Scan(&viaBinding); err == nil {
+	if err := db.QueryRow(`SELECT session_id FROM session_binding WHERE foreign_session_id = ?`, ref).Scan(&viaBinding); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("store: resolve session: %w", err)
+		}
+	} else {
 		return viaBinding, nil
 	}
 	if len(ref) < 8 {
@@ -175,7 +185,7 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 			fmt.Fprintf(&b, "store: %q is ambiguous (%d sessions):", ref, len(ids))
 		}
 		for i := range ids {
-			title := titles[i]
+			title := sanitizeCell(titles[i])
 			if title == "" {
 				title = "(untitled)"
 			}
@@ -183,6 +193,47 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 		}
 		return "", &AmbiguousSessionError{Ref: ref, IDs: ids, msg: b.String()}
 	}
+}
+
+// sanitizeCell makes caller-controlled transcript text safe for a terminal
+// row: whitespace folds to single spaces and control / bidi / zero-width
+// runes are dropped. Local copy of the CLI cleanCell logic — store cannot
+// import the CLI package without a cycle.
+func sanitizeCell(s string) string {
+	var b strings.Builder
+	space := false
+	for _, r := range strings.TrimSpace(s) {
+		switch {
+		case unicode.IsSpace(r):
+			space = true
+		case unicode.IsControl(r), reorderRune(r):
+			// Dropped outright: an escape sequence arrives as ESC plus
+			// ordinary letters, spacing it would leave letters as text.
+		default:
+			if space && b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			space = false
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// reorderRune reports characters that move or hide text while occupying no
+// space: bidi overrides/isolates, zero-width spaces, BOM. ZWJ is kept to
+// hold multi-part emoji together.
+func reorderRune(r rune) bool {
+	switch {
+	case r == '\u200d':
+		return false
+	case r == '\ufeff',
+		r >= '\u200b' && r <= '\u200f',
+		r >= '\u202a' && r <= '\u202e',
+		r >= '\u2066' && r <= '\u2069':
+		return true
+	}
+	return false
 }
 
 // escapeLikePrefix quotes the LIKE wildcards in a typed id prefix: % and _

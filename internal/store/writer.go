@@ -199,6 +199,7 @@ func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, 
 	// title already stored, while an explicit rename still wins (see
 	// TestWriterIngestConvergesBinding).
 	fromFallback := false
+	th.Session.Title = strings.TrimSpace(th.Session.Title)
 	if th.Session.Title == "" {
 		th.Session.Title = sessionTitleFallback(th.Messages)
 		fromFallback = true
@@ -333,6 +334,7 @@ func upsertWorktree(ctx context.Context, tx *sql.Tx, m *Minter, now int64, wt Wo
 // (provider, foreign_session_id) converge on one session row and one
 // binding row.
 func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, worktreeID string, s Session, b Binding, fromFallback bool) (string, bool, bool, error) {
+	s.Title = strings.TrimSpace(s.Title)
 	var sessionID string
 	err := tx.QueryRowContext(ctx,
 		`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
@@ -424,7 +426,7 @@ func storedTitleOr(ctx context.Context, tx *sql.Tx, sessionID, incoming string, 
 		return "", fmt.Errorf("store: ingest read session title: %w", err)
 	}
 	if !fromFallback && strings.TrimSpace(incoming) != "" {
-		return incoming, nil
+		return strings.TrimSpace(incoming), nil
 	}
 	if stored != "" {
 		return stored, nil

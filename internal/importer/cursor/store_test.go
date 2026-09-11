@@ -70,7 +70,8 @@ func TestCursorRoundTripInsertsOnlyWhatIsNew(t *testing.T) {
 		t.Fatalf("re-import inserted %+v, want nothing", second)
 	}
 
-	// One line appended: exactly one message lands.
+	// One line appended: exactly one message lands and the cumulative turn
+	// list extends by one.
 	appendLine(t, filepath.Join(f.home, ref.Path),
 		`{"role":"user","message":{"content":[{"type":"text","text":"third redacted prompt"}]}}`+"\n")
 	grown, _, _, err := Source{}.Read(f.env, ref, cur2)
@@ -83,6 +84,9 @@ func TestCursorRoundTripInsertsOnlyWhatIsNew(t *testing.T) {
 	}
 	if third.Messages.Inserted != 1 {
 		t.Fatalf("appended import inserted %d messages, want 1", third.Messages.Inserted)
+	}
+	if third.Turns.Inserted != 1 {
+		t.Fatalf("appended import inserted %d turns, want 1", third.Turns.Inserted)
 	}
 }
 

@@ -20,17 +20,19 @@ the versions are the `v*` tags a release is cut from. Entries land under
    `foreign_id` NULL so the store appends them unconditionally — the
    byte-offset `JSONLCursor`, which `Read` honors (delta reads return only
    new lines) and the caller must hold and never re-send, is the only dedup —
-  unlike the Claude and opencode readers that re-read whole sessions; a
+     unlike the Claude and opencode readers that re-read whole sessions; a
   re-import with the stored cursor inserts nothing, and appending one line
-  inserts exactly one message. The worktree decodes the slug
+  inserts exactly one message and extends the cumulative turn list by one
+  (turns are always cumulative over the whole file, messages stay delta). The worktree decodes the slug
   (`home-elvinas-Repositories-krowk-cli` → `/home/elvinas/Repositories/krowk-cli`)
   only when that directory exists on disk, walking up for `.git` as the
   Claude reader does; otherwise the session files under `cursor:<slug>` with
   `vcs` of `none` and a counted `worktree-fallback`. `repo.json` beside
   `agent-transcripts` contributes one `cursor_repo` session event carrying
   the repo id, never a path. `text` blocks land as `text`, `tool_use` as
-  `tool_call` (with `cursor:<line>` as the call id when the block names
-  none, which is every block observed), `tool_result` as `tool_result`, and
+   `tool_call` (with `cursor:<line>` as the call id when the block names
+   none, which is every block observed — a second id-less `tool_use` on the
+   same line takes `cursor:<line>:<k>`), `tool_result` as `tool_result`, and
   `turn_ended` lines are classified furniture; embedded `<timestamp>` tags
   stay in the user text, unparsed. The binding stays on `cursor` with an
   empty resume command (unknown in v1). The fixture is redacted, with a

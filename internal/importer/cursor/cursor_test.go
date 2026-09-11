@@ -555,10 +555,12 @@ func TestReadHonorsTheCursor(t *testing.T) {
 	if len(grown.Messages) != 1 {
 		t.Fatalf("grown read got %d messages, want the appended one", len(grown.Messages))
 	}
-	// The delta's turn is computed over the delta: one prompt, one span,
-	// rather than the session's three.
-	if len(grown.Turns) != 1 {
-		t.Fatalf("grown read got %d turns, want 1 over the delta", len(grown.Turns))
+	// The grown read still yields exactly the one appended message, but
+	// turns are cumulative over the whole file: the fixture holds 2 and
+	// the appended user prompt opens a third, which is what the store's
+	// positional tail-insert needs to extend the list by one.
+	if len(grown.Turns) != 3 {
+		t.Fatalf("grown read got %d turns, want 3 cumulative", len(grown.Turns))
 	}
 	_ = full
 }
@@ -820,6 +822,93 @@ func TestReadKeepsTheCursorWhenItCannotOpenTheFile(t *testing.T) {
 	}
 	if back != importer.Cursor(held) {
 		t.Fatalf("cursor back = %+v, want the one held %+v", back, held)
+	}
+}
+
+// TestTwoToolUsesOnOneLineShareNothingButTheLine: the id keys the line,
+// yet real transcripts average ~3 tool_use per assistant line, so the first
+// id-less tool_use keeps "cursor:<line>" and later ones on the same line
+// take "cursor:<line>:<k>". The same file also pins that a bare-string
+// array element reads as text: ["plain string"] yields one text part rather
+// than an unknown block.
+func TestTwoToolUsesOnOneLineShareNothingButTheLine(t *testing.T) {
+	env, ref, _ := adhocTranscript(t,
+		projectsDir+"/adhoc-multiuse/agent-transcripts/adhoc-multiuse-1/adhoc-multiuse-1.jsonl", "adhoc-multiuse-1",
+		[]string{
+			`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"/a"}},{"type":"tool_use","name":"Write","input":{"path":"/b"}}]}}`,
+			`{"role":"assistant","message":{"content":["plain string"]}}`,
+		}, "")
+	th, _, _ := adhocRead(t, env, ref, nil)
+
+	var calls []string
+	for _, m := range th.Messages {
+		for _, p := range m.Parts {
+			if p.Type == importer.PartToolCall {
+				calls = append(calls, p.ToolCallID)
+			}
+		}
+	}
+	if len(calls) != 2 {
+		t.Fatalf("tool_calls = %v, want 2 from the one line", calls)
+	}
+	if calls[0] != "cursor:1" || calls[1] != "cursor:1:1" {
+		t.Fatalf("tool_calls = %v, want [cursor:1 cursor:1:1]", calls)
+	}
+	if calls[0] == calls[1] {
+		t.Fatalf("duplicate tool_call id %q", calls[0])
+	}
+	if len(th.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(th.Messages))
+	}
+	parts := th.Messages[1].Parts
+	if len(parts) != 1 || parts[0].Type != importer.PartText {
+		t.Fatalf("string-element parts = %+v, want one text part", parts)
+	}
+	if !strings.Contains(parts[0].Data, "plain string") {
+		t.Fatalf("string-element data = %s, want the plain string", parts[0].Data)
+	}
+}
+
+// TestFurnitureTypeBeatsRole: a line with a non-empty type and no message
+// envelope classifies under its type no matter what role it claims —
+// furniture carries no payload — while every other role-carrying line stays
+// a message.
+func TestFurnitureTypeBeatsRole(t *testing.T) {
+	env, ref, _ := adhocTranscript(t,
+		projectsDir+"/adhoc-furn/agent-transcripts/adhoc-furn-1/adhoc-furn-1.jsonl", "adhoc-furn-1",
+		[]string{
+			`{"role":"user","type":"turn_ended"}`,
+		}, "")
+	th, _, res := adhocRead(t, env, ref, nil)
+
+	if len(th.Messages) != 0 {
+		t.Fatalf("messages = %d, want 0: the furniture line is not a message", len(th.Messages))
+	}
+	if res.Classified["turn_ended"] != 1 {
+		t.Fatalf("Classified = %v, want the turn_ended line counted", res.Classified)
+	}
+}
+
+// TestEmptyTextBlockOpensNoTurn: a {"type":"text","text":""} block yields no
+// parts, exactly like a bare-string "" — and with no prompt part the second
+// user line opens no new turn.
+func TestEmptyTextBlockOpensNoTurn(t *testing.T) {
+	env, ref, _ := adhocTranscript(t,
+		projectsDir+"/adhoc-emptytext/agent-transcripts/adhoc-emptytext-1/adhoc-emptytext-1.jsonl", "adhoc-emptytext-1",
+		[]string{
+			`{"role":"user","message":{"content":[{"type":"text","text":"real prompt"}]}}`,
+			`{"role":"user","message":{"content":[{"type":"text","text":""}]}}`,
+		}, "")
+	th, _, _ := adhocRead(t, env, ref, nil)
+
+	if len(th.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(th.Messages))
+	}
+	if len(th.Messages[1].Parts) != 0 {
+		t.Fatalf("parts = %+v, want none for the empty text block", th.Messages[1].Parts)
+	}
+	if len(th.Turns) != 1 {
+		t.Fatalf("turns = %d, want 1: the empty block opens no new turn", len(th.Turns))
 	}
 }
 

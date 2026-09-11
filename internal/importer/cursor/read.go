@@ -23,16 +23,23 @@ const eventRepo = "cursor_repo"
 // one Thread.
 //
 // Unlike claude/opencode this read honors the cursor: it passes it to
-// importer.ReadJSONL, so a delta read returns only new lines. That is safe
+// importer.ReadJSONL, so a delta read returns only new lines for messages.
+// That is safe
 // here because messages carry no foreign id — the store appends them, so the
 // caller must hold the cursor and never re-send, and re-reading the whole
-// file would duplicate every message. A transcript rewritten shorter rescans
-// from zero (see startOffset) and re-imports every message as new rows:
-// dedup is impossible without ids, which is inherent to position-keyed
-// NULL-id imports rather than a gap the cursor could close. A thread
-// returned with err != nil must not be ingested (the store contract); the
-// repo sidecar rides full reads, error partials included, so a caller that
-// ingests anyway still converges on the event. A cursor of the
+// file would duplicate every message. Turns, however, are always cumulative:
+// a resumed read runs a second full scan from offset zero for candidates
+// only (messages/events/Result from that pass are discarded, so Unknown is
+// not double-counted), at ~1.2x parse cost on files that are small. The
+// store's turn list is positional cumulative (insertTurnTail skips the known
+// prefix), so a delta computed over the delta would insert nothing and lose
+// the new prompt's turn. Events ride full reads only. A transcript rewritten
+// shorter rescans from zero (see startOffset) and re-imports every message
+// as new rows: dedup is impossible without ids, which is inherent to
+// position-keyed NULL-id imports rather than a gap the cursor could close.
+// A thread returned with err != nil must not be ingested (the store
+// contract); the repo sidecar rides full reads, error partials included, so
+// a caller that ingests anyway still converges on the event. A cursor of the
 // wrong concrete kind is
 // refused with importer.ErrCursorType and handed straight back, because
 // nothing was read and a zero cursor would read as "start again". An open
@@ -90,6 +97,32 @@ func (s Source) Read(env harness.Env, ref importer.Ref, cursor importer.Cursor) 
 		b.repoEvent(env)
 	}
 	th := b.thread()
+	// Turns are cumulative over the whole file while messages stay delta:
+	// on a resumed read the delta pass above saw only new lines, so a
+	// second full scan from zero collects the whole-file candidates and
+	// replaces the delta-computed turn list. The throwaway pass keeps
+	// candidates only — its messages/events/Result are discarded, so
+	// Unknown is not double-counted and its calls map never leaves it
+	// (pairing stays within the delta pass). ReadJSONL seeks, so reusing
+	// the same descriptor sequentially is safe; its base is zero because
+	// it starts at zero. Full reads (held.Zero()) already scanned
+	// everything and skip this. A rescan already read from zero and is
+	// marked full — the candidate pass agrees. An empty delta still
+	// reports cumulative turns, and ingest skips the known prefix.
+	if !held.Zero() {
+		fb := &builder{ref: ref}
+		// Its error is propagated, not swallowed: a partial candidate
+		// scan would build a partial turn list, and a caller that
+		// ingested it would store turns the transcript never held. The
+		// pass's counts stay with it — merging them would double-count
+		// every line in Result.Lines.
+		if _, _, fberr := importer.ReadJSONL(f, importer.JSONLCursor{}, fb.line); fberr != nil {
+			return th, next, b.acc, fmt.Errorf("cursor: read %s: %w", ref.Path, fberr)
+		}
+		if len(fb.candidates) > 0 {
+			th.Turns = turnsFrom(fb.candidates)
+		}
+	}
 	if err != nil {
 		return th, next, b.acc, fmt.Errorf("cursor: read %s: %w", ref.Path, err)
 	}
@@ -122,6 +155,11 @@ type builder struct {
 	messages   []store.Message
 	candidates []importer.TurnCandidate
 	events     []store.Event
+	// toolAbs/toolN number the synthesised tool_call ids within one line:
+	// the first id-less tool_use on a line keeps "cursor:<line>",
+	// subsequent ones on the SAME line take "cursor:<line>:<k>".
+	toolAbs int64
+	toolN   int
 }
 
 // line is the per-line callback. Returning an error skips the line and counts
@@ -132,6 +170,14 @@ func (b *builder) line(lineNo int, raw []byte) error {
 	var l line
 	if err := json.Unmarshal(raw, &l); err != nil {
 		return fmt.Errorf("cursor: unreadable line: %w", err)
+	}
+	// Furniture wins over role: a line with a non-empty type and no
+	// message envelope carries no payload, whatever role it claims, so it
+	// classifies under its type. All other role-carrying lines become
+	// messages as before.
+	if l.Type != "" && l.Message == nil {
+		b.acc.Classify(l.Type)
+		return nil
 	}
 	role, ok := l.Role, false
 	// Any non-empty role the store admits becomes a message; only user
@@ -232,7 +278,10 @@ func (b *builder) parts(content json.RawMessage, lineNo int) []store.Part {
 // when the block names none — which is every block observed — position-keyed
 // and stable for full and delta reads alike: base is the newline count
 // before the resume offset, so base+lineNo is the file position no matter
-// where the read started. Everything else keeps its raw block as Data
+// where the read started. A second id-less tool_use on the SAME line takes
+// "cursor:<line>:<k>" (k=1,2,…), because the id keys the line yet real
+// transcripts average ~3 tool_use per assistant line; single-call lines are
+// byte-identical to before. Everything else keeps its raw block as Data
 // through NormalizePart, so a field this package does not name is still
 // stored and a type it has never met is counted as unknown instead of
 // dropped.
@@ -243,6 +292,16 @@ func (b *builder) parts(content json.RawMessage, lineNo int) []store.Part {
 // never classified: whether it is linked depends on calls later in the same
 // Read, so thread() reconciles once the pass is complete.
 func (b *builder) block(raw json.RawMessage, lineNo int) (store.Part, bool) {
+	// A bare-string array element reads as text, the same textData shape
+	// as bare-string content: without this a ["plain string"] element
+	// would fall to NormalizePart("block") unknown.
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if s == "" {
+			return store.Part{}, false
+		}
+		return store.Part{Type: importer.PartText, Data: textData(s)}, true
+	}
 	var blk contentBlock
 	if err := json.Unmarshal(raw, &blk); err != nil {
 		return b.acc.NormalizePart("block", raw), true
@@ -256,7 +315,14 @@ func (b *builder) block(raw json.RawMessage, lineNo int) (store.Part, bool) {
 	case "tool_use":
 		id := blk.ID
 		if id == "" {
-			id = "cursor:" + strconv.FormatInt(b.base+int64(lineNo), 10)
+			abs := b.base + int64(lineNo)
+			if abs == b.toolAbs {
+				b.toolN++
+				id = "cursor:" + strconv.FormatInt(abs, 10) + ":" + strconv.Itoa(b.toolN)
+			} else {
+				b.toolAbs, b.toolN = abs, 0
+				id = "cursor:" + strconv.FormatInt(abs, 10)
+			}
 		}
 		if b.calls == nil {
 			b.calls = map[string]bool{}
@@ -437,7 +503,13 @@ func countNewlines(f *os.File, end int64) int64 {
 // every turn: the transcript records no cancellation this reader could tell
 // from a finished turn, and guessing would be a guess.
 func (b *builder) turns() []store.Turn {
-	spans := importer.SplitTurns(b.candidates)
+	return turnsFrom(b.candidates)
+}
+
+// turnsFrom builds the turn list for a candidate slice, so the resumed-read
+// second scan can reuse it on whole-file candidates.
+func turnsFrom(candidates []importer.TurnCandidate) []store.Turn {
+	spans := importer.SplitTurns(candidates)
 	turns := make([]store.Turn, 0, len(spans))
 	for range spans {
 		turns = append(turns, store.Turn{Status: "done"})

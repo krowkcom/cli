@@ -25,13 +25,21 @@
 // store appends such a message unconditionally — the caller must hold the
 // JSONL byte-offset cursor and never re-send. That is why this source,
 // unlike claude/opencode, honors the cursor: Read passes it to
-// importer.ReadJSONL and delta reads return only new lines. The tool_call_id
-// for an id-less tool_use is "cursor:<absolute line>": the count of newlines
-// before the resume offset plus the per-read line number, which is the
-// file's own line number no matter where the read started — stable for full
-// reads and delta reads alike, so a delta continuation never reuses an id an
-// earlier read already emitted. Pairing only ever happens within one Read
-// pass.
+// importer.ReadJSONL and delta reads return only new lines for messages.
+// The tool_call_id for an id-less tool_use is "cursor:<absolute line>": the
+// count of newlines before the resume offset plus the per-read line number,
+// which is the file's own line number no matter where the read started —
+// stable for full reads and delta reads alike, so a delta continuation
+// never reuses an id an earlier read already emitted. A second id-less
+// tool_use on the SAME line takes "cursor:<line>:<k>" (k=1,2,…): the id keys
+// the line yet real transcripts average ~3 tool_use per assistant line, and
+// single-call lines are byte-identical to before. Pairing only ever happens
+// within one Read pass. Do not hand-edit cursors: a mid-line resume re-reads
+// the overlapping line, and a NULL-id re-read ingests twice — claude
+// absorbs the repeat through foreign-id dedup, but cursor lines are
+// indistinguishable from legitimately new lines, so the duplicate lands as
+// a new message. A crash or hand edit that leaves a mid-line cursor may
+// therefore duplicate one message.
 //
 // A transcript rewritten shorter rescans from zero and re-imports its
 // messages as new rows: dedup is impossible without ids, which is inherent
@@ -75,14 +83,17 @@
 // with err != nil must not be ingested; the sidecar still rides full reads,
 // error partials included.
 //
-// # Delta turns are over the delta
+// # Turns are always cumulative, messages are delta
 //
-// Turns are computed over just the lines this Read saw. An appended
-// assistant-only continuation therefore forms its own leading span, which the
-// store appends as a new turn. Accepted and documented: the alternative is
-// re-reading from the top on every import, which is what the cursor exists
-// to avoid, and the per-turn costs here are zero anyway — Cursor transcripts
-// price nothing.
+// Every Read returns turns over the whole file: a resumed read runs a
+// second full scan from zero for candidates only (its messages, events and
+// Result are discarded, so Unknown is not double-counted), at ~1.2x parse
+// cost on files that are small. The store's turn list is a positional
+// cumulative list — insertTurnTail skips the known prefix — so a delta
+// computed over the delta would insert nothing and lose the new prompt's
+// turn. Messages stay delta: re-reading the whole file would duplicate
+// every NULL-id row, so only new lines become messages, and the repo.json
+// event rides full reads only.
 //
 // # tool_result is a guess held leniently
 //

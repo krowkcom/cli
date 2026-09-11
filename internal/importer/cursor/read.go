@@ -3,6 +3,7 @@ package cursor
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,7 +26,11 @@ const eventRepo = "cursor_repo"
 // importer.ReadJSONL, so a delta read returns only new lines. That is safe
 // here because messages carry no foreign id — the store appends them, so the
 // caller must hold the cursor and never re-send, and re-reading the whole
-// file would duplicate every message. A cursor of the wrong concrete kind is
+// file would duplicate every message. A transcript rewritten shorter rescans
+// from zero (see startOffset) and re-imports every message as new rows:
+// dedup is impossible without ids, which is inherent to position-keyed
+// NULL-id imports rather than a gap the cursor could close. A cursor of the
+// wrong concrete kind is
 // refused with importer.ErrCursorType and handed straight back, because
 // nothing was read and a zero cursor would read as "start again". An open
 // failure likewise hands back the held cursor: the transcript has not
@@ -51,17 +56,29 @@ func (s Source) Read(env harness.Env, ref importer.Ref, cursor importer.Cursor) 
 	}
 	defer func() { _ = f.Close() }()
 
-	// The mtime is read now so a future store writer that stamps
-	// per-message times has the value in hand. Thread carries no per-message
-	// time today and the store stamps ingest time, so it is retained, not
-	// used — deliberately, not an oversight.
-	var mtime int64
+	// The size is read now so the synthesised tool_call ids below can be
+	// absolute file positions rather than per-read numbers; see lineBase.
+	// The file mtime is deliberately NOT read: Thread carries no per-message
+	// time and the store stamps ingest time, which coincides with the import
+	// — the mtime is noted as the no-better-source clock, not taken.
+	var size int64
 	if info, serr := f.Stat(); serr == nil {
-		mtime = info.ModTime().UnixMilli()
+		size = info.Size()
 	}
 
-	b := &builder{ref: ref, full: held.Zero(), fileMTime: mtime}
+	b := &builder{ref: ref, full: held.Zero(), base: lineBase(f, held, size)}
 	next, res, err := importer.ReadJSONL(f, held, b.line)
+	// A rewritten transcript rescans from zero and its NULL-foreign-id
+	// messages re-ingest as new rows — dedup is impossible without ids, so
+	// this is inherent to position-keyed imports, not a gap the cursor can
+	// close. The rescan branch in startOffset triggers exactly when the file
+	// is shorter than the held Size, and a from-zero full read of a shorter
+	// file always reports Size below the held one, so this test names the
+	// rescan airtight. The read IS a full one, so it is marked as such —
+	// notably so the repo sidecar is re-emitted rather than lost.
+	if !held.Zero() && next.Size < held.Size {
+		b.full = true
+	}
 	b.acc.Merge(res)
 	// The repo sidecar is read after the transcript so a transcript failure
 	// still reports what the transcript produced; its own failure is never
@@ -85,11 +102,14 @@ type builder struct {
 	// full is whether this Read started at the top of the file. Only a full
 	// read emits the repo.json event — turns and events are positional
 	// cumulative lists in the store, so re-emitting it on every delta read
-	// would append a duplicate per import.
+	// would append a duplicate per import. A rescan of a rewritten file is
+	// marked full after the fact in Read, because that is what it is.
 	full bool
-	// fileMTime is the transcript's mtime at import, retained for a future
-	// writer; see Read.
-	fileMTime int64
+	// base is the absolute line number this Read's first line sits after:
+	// the count of newlines before the resume offset, so an id-less tool_use
+	// on per-read line N becomes "cursor:<base+N>" — the file position, no
+	// matter where the read started. Zero on full reads.
+	base int64
 
 	// calls is every tool_call_id emitted so far in this Read, in order.
 	// Pairing only ever happens within one pass — real transcripts carry no
@@ -184,7 +204,13 @@ func (b *builder) parts(content json.RawMessage, lineNo int) []store.Part {
 	}
 	var parts []store.Part
 	for _, raw := range blocks {
-		parts = append(parts, b.block(raw, lineNo))
+		// An empty text block is dropped, not emitted: a bare-string ""
+		// yields no parts and opens no turn, and the block shape must read
+		// the same — otherwise "" would reach TurnCandidate.PartTypes as a
+		// prompt where the string shape reads as none.
+		if p, ok := b.block(raw, lineNo); ok {
+			parts = append(parts, p)
+		}
 	}
 	return parts
 }
@@ -192,47 +218,51 @@ func (b *builder) parts(content json.RawMessage, lineNo int) []store.Part {
 // block maps one content block onto a canonical part.
 //
 // tool_use goes through the contract's constructor because its Data shape is
-// fixed and the call id is what pairs it. The id is "cursor:<lineNo>" when
-// the block names none — which is every block observed — position-keyed and
-// stable for full reads; on delta reads only new lines are numbered, which
-// is exactly the append case. Everything else keeps its raw block as Data
+// fixed and the call id is what pairs it. The id is "cursor:<absolute line>"
+// when the block names none — which is every block observed — position-keyed
+// and stable for full and delta reads alike: base is the newline count
+// before the resume offset, so base+lineNo is the file position no matter
+// where the read started. Everything else keeps its raw block as Data
 // through NormalizePart, so a field this package does not name is still
 // stored and a type it has never met is counted as unknown instead of
 // dropped.
-func (b *builder) block(raw json.RawMessage, lineNo int) store.Part {
+//
+// The second result is false for an empty text block, which carries nothing
+// and is dropped by parts — a bare-string "" yields no parts either, and the
+// two shapes must read the same. A tool_result is always emitted here and
+// never classified: whether it is linked depends on calls later in the same
+// Read, so thread() reconciles once the pass is complete.
+func (b *builder) block(raw json.RawMessage, lineNo int) (store.Part, bool) {
 	var blk contentBlock
 	if err := json.Unmarshal(raw, &blk); err != nil {
-		return b.acc.NormalizePart("block", raw)
+		return b.acc.NormalizePart("block", raw), true
 	}
 	switch blk.Type {
 	case "text":
-		return store.Part{Type: importer.PartText, Data: textData(blk.Text)}
+		if blk.Text == "" {
+			return store.Part{}, false
+		}
+		return store.Part{Type: importer.PartText, Data: textData(blk.Text)}, true
 	case "tool_use":
 		id := blk.ID
 		if id == "" {
-			id = "cursor:" + strconv.Itoa(lineNo)
+			id = "cursor:" + strconv.Itoa(int(b.base)+lineNo)
 		}
 		if b.calls == nil {
 			b.calls = map[string]bool{}
 		}
 		b.calls[id] = true
-		return importer.NewToolCallPart(id, blk.Name, blk.Input)
+		return importer.NewToolCallPart(id, blk.Name, blk.Input), true
 	case "tool_result":
 		// UNOBSERVED SHAPE, held leniently: zero tool_results on the census
 		// machine, so every field name here is a guess at what Cursor
-		// writes. Each alias is tried in turn; a result that links to
-		// nothing is still emitted, counted as unlinked, because dropping
-		// it would lose transcript over a pairing this package cannot
-		// verify.
+		// writes. Each alias is tried in turn; linkage is reconciled in
+		// thread(), once every call in this Read has been seen — a result
+		// preceding its call in the same Read is linked, not orphaned.
 		id := firstNonEmpty(blk.ToolUseID, blk.CallID, blk.ID)
-		if id != "" && !b.calls[id] {
-			b.acc.Classify("tool_result:unlinked")
-		} else if id == "" {
-			b.acc.Classify("tool_result:unlinked")
-		}
-		return importer.NewToolResultPart(id, resultOutput(blk), blk.IsError || blk.IsErr)
+		return importer.NewToolResultPart(id, resultOutput(blk), blk.IsError || blk.IsErr), true
 	default:
-		return b.acc.NormalizePart(blk.Type, raw)
+		return b.acc.NormalizePart(blk.Type, raw), true
 	}
 }
 
@@ -260,6 +290,12 @@ func resultOutput(blk contentBlock) json.RawMessage {
 // id under "repo_id" and nothing else. Missing, unreadable, or id-less is no
 // event, not an error: the transcript is the session, the sidecar is a note.
 func (b *builder) repoEvent(env harness.Env) {
+	// A ref that is not shaped like a transcript has no sidecar beside it:
+	// without this check the join below degrades to repo.json and reads
+	// $HOME/repo.json, a file that has nothing to do with the session.
+	if slugOf(b.ref.Path) == "" {
+		return
+	}
 	// The sidecar sits beside agent-transcripts, not beside the session
 	// file: <slug>/repo.json, three directories up from <id>/<id>.jsonl.
 	rel := filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(b.ref.Path))), "repo.json")
@@ -300,6 +336,19 @@ func (b *builder) thread() store.Thread {
 		path, vcs = "cursor:"+slug, vcsNone
 		b.acc.Classify("worktree-fallback")
 	}
+	// A result preceding its call in the same Read is linked, not orphaned:
+	// linkage is reconciled here, once every call has been seen, rather than
+	// incrementally in block(). Each emitted tool_result whose id is empty
+	// or matches no call in this Read is still kept, counted as unlinked —
+	// dropping it would lose transcript over a pairing this package cannot
+	// verify.
+	for _, m := range b.messages {
+		for _, p := range m.Parts {
+			if p.Type == importer.PartToolResult && (p.ToolCallID == "" || !b.calls[p.ToolCallID]) {
+				b.acc.Classify("tool_result:unlinked")
+			}
+		}
+	}
 	th := store.Thread{
 		Worktree: store.Worktree{Path: path, VCS: vcs, Name: baseName(path)},
 		Session: store.Session{
@@ -319,9 +368,47 @@ func (b *builder) thread() store.Thread {
 		Messages: b.messages,
 	}
 	th.Turns = b.turns()
-	// Referenced for the build, and for the day a writer takes it; see Read.
-	_ = b.fileMTime
 	return th
+}
+
+// lineBase is the absolute line number this Read's first line sits after:
+// the count of newlines before the resume offset. The rescan conditions are
+// the same ones startOffset uses — a zero cursor, a file shorter than the
+// held Size, or an offset past the end — so a read that restarts at zero
+// numbers from zero too. Exact in both the mid-line-backup and the boundary
+// cases: the backup rewinds within the line the offset sits in, which holds
+// no newline between the line start and the offset, so the re-read first
+// line's absolute number is always count+1.
+func lineBase(f *os.File, held importer.JSONLCursor, size int64) int64 {
+	if held.Zero() || held.Size > size || held.Offset > size {
+		return 0
+	}
+	return countNewlines(f, held.Offset)
+}
+
+// countNewlines counts '\n' bytes in [0, end) with a chunked ReadAt loop on
+// the open descriptor: prefix-only, so cheap against a large transcript.
+func countNewlines(f *os.File, end int64) int64 {
+	const chunk = 32 << 10
+	buf := make([]byte, chunk)
+	var n, off int64
+	for off < end {
+		want := int64(chunk)
+		if end-off < want {
+			want = end - off
+		}
+		got, err := f.ReadAt(buf[:want], off)
+		for i := 0; i < got; i++ {
+			if buf[i] == '\n' {
+				n++
+			}
+		}
+		off += int64(got)
+		if err != nil || got == 0 {
+			break
+		}
+	}
+	return n
 }
 
 // turns splits the messages into turns. Cursor transcripts price nothing, so

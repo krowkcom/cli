@@ -440,6 +440,27 @@ func TestWorktreeComesFromTheSlugOnlyIfItExists(t *testing.T) {
 	}
 }
 
+// TestWorktreeOfDetectsGit pins the vcs half of the rule directly: a
+// directory holding a .git entry resolves git, one holding nothing resolves
+// none. The shared fixture stays .git-free on purpose — adding one there
+// would flip the existing vcsNone assertion and the golden.
+func TestWorktreeOfDetectsGit(t *testing.T) {
+	git := t.TempDir()
+	if err := os.Mkdir(filepath.Join(git, ".git"), 0o700); err != nil {
+		t.Fatalf("Mkdir .git: %v", err)
+	}
+	slug := strings.ReplaceAll(strings.TrimPrefix(git, "/"), "/", "-")
+	if path, vcs := worktreeOf(slug); path != git || vcs != vcsGit {
+		t.Fatalf("worktreeOf(%q) = (%q, %q), want (%q, git)", slug, path, vcs, git)
+	}
+
+	plain := t.TempDir()
+	pslug := strings.ReplaceAll(strings.TrimPrefix(plain, "/"), "/", "-")
+	if path, vcs := worktreeOf(pslug); path != plain || vcs != vcsNone {
+		t.Fatalf("worktreeOf(%q) = (%q, %q), want (%q, none)", pslug, path, vcs, plain)
+	}
+}
+
 func TestSessionNamesCursorAndBindsOnIt(t *testing.T) {
 	f := newFixture(t)
 	th, _, _ := f.read(t, refByID(t, discover(t, f), fixtureSession), nil)

@@ -162,11 +162,12 @@ func TestRealTranscriptsImport(t *testing.T) {
 		t.Logf("skipped line %d at offset %d: %s", s.Line, s.Offset, s.Reason)
 	}
 	// Events ride outside the line accounting — the repo sidecar is not a
-	// line — and so does worktree-fallback, which is classified once per
-	// thread rather than once per line. A delta test never runs here
-	// (every read above is full), but the principle is the same: both are
-	// asserted, not added.
-	lines := messages + classified - total.Classified["worktree-fallback"] + total.SkippedCount
+	// line — and so do worktree-fallback and tool_result:unlinked: the first
+	// is classified once per thread rather than once per line, the second
+	// against a line that ALSO became a message. A delta test never runs
+	// here (every read above is full), but the principle is the same: all
+	// three are asserted, not added.
+	lines := messages + classified - total.Classified["worktree-fallback"] - total.Classified["tool_result:unlinked"] + total.SkippedCount
 	if lines != total.Lines {
 		t.Fatalf("%d lines accounted for, %d read", lines, total.Lines)
 	}

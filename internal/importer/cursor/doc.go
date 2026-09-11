@@ -26,17 +26,24 @@
 // JSONL byte-offset cursor and never re-send. That is why this source,
 // unlike claude/opencode, honors the cursor: Read passes it to
 // importer.ReadJSONL and delta reads return only new lines. The tool_call_id
-// for an id-less tool_use is "cursor:<lineNo>", the ReadJSONL line number
-// within this Read — stable for full reads, and on delta reads only new
-// lines are numbered, which is exactly the append case. Pairing only ever
-// happens within one Read pass, so the renumbering of a resumed read cannot
-// break a link.
+// for an id-less tool_use is "cursor:<absolute line>": the count of newlines
+// before the resume offset plus the per-read line number, which is the
+// file's own line number no matter where the read started — stable for full
+// reads and delta reads alike, so a delta continuation never reuses an id an
+// earlier read already emitted. Pairing only ever happens within one Read
+// pass.
+//
+// A transcript rewritten shorter rescans from zero and re-imports its
+// messages as new rows: dedup is impossible without ids, which is inherent
+// to position-keyed NULL-id imports rather than a gap the cursor could
+// close. The rescan is still marked a full read, so the repo sidecar is
+// re-emitted rather than lost.
 //
 // # The transcript never names a time, a directory, or a model
 //
-// Thread carries no per-message time and the store stamps ingest time, so
-// there is nowhere to put the file mtime — but Read still stats the file, so
-// the value is in hand the day a writer learns to take it. User text opens
+// Thread carries no per-message time and the store stamps ingest time, which
+// coincides with the import — so the file mtime is deliberately not read: it
+// is noted as the no-better-source clock, not taken as a timestamp. User text opens
 // with <timestamp>...</timestamp> tags; they are left in the text, not
 // parsed. Session.Directory stays "" and Model stays "": the transcript
 // names neither. Provider is "cursor" throughout, the model-vendor fallback,
@@ -78,5 +85,7 @@
 // "isError"|"is_error"...}, with content a string, blocks, or raw. A result
 // whose id matches no call in this Read is still emitted, counted via
 // Classify as "tool_result:unlinked" — dropping it would lose transcript
-// over a pairing this package cannot verify.
+// over a pairing this package cannot verify. Linkage is reconciled after the
+// pass, once every call has been seen, so a result preceding its call in the
+// same Read still links.
 package cursor

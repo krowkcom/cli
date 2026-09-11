@@ -73,7 +73,7 @@ the versions are the `v*` tags a release is cut from. Entries land under
   parts in seq order with tool results labelled by their twin call's name
   (`unknown tool` when the call is missing) and thinking collapsed to one
   line unless `--thinking`. Costs are priced at display time from the
-  models.dev snapshot and footnote its date; an unpriced pair shows `—`,
+  embedded models.dev snapshot and footnote its date; an unpriced pair shows `—`,
   never 0. An untitled thread lists by the first 80 chars of its first
   user text, stored at import; threads imported before that fallback stay
   untitled until a re-import carries user text.

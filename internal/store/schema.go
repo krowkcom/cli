@@ -159,6 +159,8 @@ CREATE TABLE import_state (
 );
 
 CREATE INDEX idx_session_worktree_updated ON session(worktree_id, time_updated);
+CREATE INDEX idx_session_updated ON session(time_updated DESC);
+CREATE INDEX idx_turn_session ON turn(session_id);
 CREATE INDEX idx_session_parent ON session(parent_id);
 CREATE INDEX idx_binding_session ON session_binding(session_id);
 CREATE INDEX idx_message_turn ON message(turn_id);

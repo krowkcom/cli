@@ -2161,7 +2161,7 @@ func clip[T any](s []T, n int) []T {
 func onlyForSessionsImport(given map[string]bool, positionals []string) error {
 	isImport := len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "import"
 	isShow := len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "show"
-	isList := len(positionals) == 1 && len(positionals) > 0 && positionals[0] == "sessions"
+	isList := len(positionals) == 1 && positionals[0] == "sessions"
 	// Each flag names the command that owns it, so the refusal says where
 	// the flag does belong rather than only where it does not.
 	owner := map[string]string{

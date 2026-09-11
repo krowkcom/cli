@@ -194,8 +194,14 @@ func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, 
 	// Title fallback: a thread naming no title is listed by the first 80
 	// chars of its first user text, computed at import into session.title
 	// so the listing never reads message/part blobs to name a row.
+	// fromFallback marks a title the importer derived rather than read:
+	// findOrCreateSession must not let a derived fallback overwrite the
+	// title already stored, while an explicit rename still wins (see
+	// TestWriterIngestConvergesBinding).
+	fromFallback := false
 	if th.Session.Title == "" {
 		th.Session.Title = sessionTitleFallback(th.Messages)
+		fromFallback = true
 	}
 
 	tx, err := w.db.BeginTx(ctx, nil)
@@ -219,7 +225,7 @@ func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, 
 		res.Worktrees.Skipped++
 	}
 
-	sessionID, sessIns, bindIns, err := findOrCreateSession(ctx, tx, w.minter, now, worktreeID, th.Session, th.Binding)
+	sessionID, sessIns, bindIns, err := findOrCreateSession(ctx, tx, w.minter, now, worktreeID, th.Session, th.Binding, fromFallback)
 	if err != nil {
 		return Result{}, err
 	}
@@ -326,14 +332,25 @@ func upsertWorktree(ctx context.Context, tx *sql.Tx, m *Minter, now int64, wt Wo
 // refreshes its display fields, so two Threads naming the same
 // (provider, foreign_session_id) converge on one session row and one
 // binding row.
-func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, worktreeID string, s Session, b Binding) (string, bool, bool, error) {
+func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, worktreeID string, s Session, b Binding, fromFallback bool) (string, bool, bool, error) {
 	var sessionID string
 	err := tx.QueryRowContext(ctx,
 		`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
 		b.Provider, b.ForeignSessionID).Scan(&sessionID)
 	if err == nil {
 		title := s.Title
-		if title == "" {
+		if fromFallback {
+			// A derived fallback must never overwrite the title already
+			// on the row — same rule as the binding-race path's
+			// storedTitleOr. A stored untitled row still backfills from
+			// the re-import; an explicit rename (fromFallback=false)
+			// still wins below.
+			stored, terr := storedTitleOr(ctx, tx, sessionID, s.Title)
+			if terr != nil {
+				return "", false, false, terr
+			}
+			title = stored
+		} else if title == "" {
 			// Never wipe a stored title with an untitled re-import. A
 			// stored untitled row backfills here when the re-import
 			// carries user text; a row no re-import names stays untitled

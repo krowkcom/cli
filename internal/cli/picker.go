@@ -69,14 +69,20 @@ func pickWorkspace(title string, stored []api.WorkspaceKey) (string, error) {
 func pickSession(rows []store.SessionRow) (string, error) {
 	options := make([]huh.Option[string], 0, len(rows))
 	for _, r := range rows {
-		title := r.Title
+		title := cleanCell(r.Title)
 		if title == "" {
 			title = "(untitled)"
+		}
+		// Cap the title: picker labels are terminal rows built from
+		// caller-controlled transcript text, so overlong titles are cut
+		// on a rune boundary like the human table.
+		if r := []rune(title); len(r) > 60 {
+			title = string(r[:57]) + "..."
 		}
 		// Harness and model join without strays when one is missing; the
 		// recency plus short id tell apart the duplicate titles every
 		// agent eventually produces ("session title" × 40).
-		hm := strings.TrimSpace(strings.TrimSpace(r.Harness) + " " + strings.TrimSpace(r.Model))
+		hm := cleanCell(strings.TrimSpace(strings.TrimSpace(r.Harness) + " " + strings.TrimSpace(r.Model)))
 		short := r.ID
 		if len(short) > 8 {
 			short = short[:8]

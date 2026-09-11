@@ -25,7 +25,14 @@ import (
 // subquery. Joining both tables directly would fan out — a second binding
 // multiplies the turn COUNT/SUM and a second turn duplicates the binding
 // columns. sessionListQuery is a constant so the gate pins the exact text.
-const sessionListQuery = `SELECT s.id, s.title, s.model, s.provider, s.harness, s.directory, s.time_created, s.time_updated, w.path, b.harness, b.provider, b.foreign_session_id, COALESCE(t.n, 0), COALESCE(t.sum_in, 0), COALESCE(t.sum_out, 0), COALESCE(t.sum_total, 0), COALESCE(t.sum_cread, 0), COALESCE(t.sum_cwrite, 0), COALESCE(t.sum_reason, 0) FROM session s LEFT JOIN worktree w ON w.id = s.worktree_id LEFT JOIN (SELECT session_id, MIN(id) AS id FROM session_binding GROUP BY session_id) one ON one.session_id = s.id LEFT JOIN session_binding b ON b.id = one.id LEFT JOIN (SELECT session_id, COUNT(*) AS n, SUM(cost_input_tokens) AS sum_in, SUM(cost_output_tokens) AS sum_out, SUM(cost_total_tokens) AS sum_total, SUM(cost_cache_read_tokens) AS sum_cread, SUM(cost_cache_write_tokens) AS sum_cwrite, SUM(cost_reasoning_tokens) AS sum_reason FROM turn GROUP BY session_id) t ON t.session_id = s.id WHERE (? = '' OR COALESCE(b.harness, s.harness) = ?) AND (? = '' OR w.path = ?) ORDER BY s.time_updated DESC LIMIT ?`
+//
+// The page CTE selects the listed session ids first (filters, global
+// recency order, LIMIT), and the turn aggregate is restricted to those ids:
+// without the filter the subquery scans and aggregates the entire turn
+// table even for a LIMIT 50 page. The binding MIN(id) dedup still scans
+// the binding table; bindings are one row per import, so that scan stays
+// small while turns — one row per agent step — are the table that grows.
+const sessionListQuery = `WITH page AS (SELECT s.id AS pid FROM session s LEFT JOIN worktree w ON w.id = s.worktree_id LEFT JOIN (SELECT session_id, MIN(id) AS id FROM session_binding GROUP BY session_id) one ON one.session_id = s.id LEFT JOIN session_binding b ON b.id = one.id WHERE (? = '' OR COALESCE(b.harness, s.harness) = ?) AND (? = '' OR w.path = ?) ORDER BY s.time_updated DESC LIMIT ?) SELECT s.id, s.title, s.model, s.provider, s.harness, s.directory, s.time_created, s.time_updated, w.path, b.harness, b.provider, b.foreign_session_id, COALESCE(t.n, 0), COALESCE(t.sum_in, 0), COALESCE(t.sum_out, 0), COALESCE(t.sum_total, 0), COALESCE(t.sum_cread, 0), COALESCE(t.sum_cwrite, 0), COALESCE(t.sum_reason, 0) FROM session s JOIN page ON page.pid = s.id LEFT JOIN worktree w ON w.id = s.worktree_id LEFT JOIN (SELECT session_id, MIN(id) AS id FROM session_binding GROUP BY session_id) one ON one.session_id = s.id LEFT JOIN session_binding b ON b.id = one.id LEFT JOIN (SELECT session_id, COUNT(*) AS n, SUM(cost_input_tokens) AS sum_in, SUM(cost_output_tokens) AS sum_out, SUM(cost_total_tokens) AS sum_total, SUM(cost_cache_read_tokens) AS sum_cread, SUM(cost_cache_write_tokens) AS sum_cwrite, SUM(cost_reasoning_tokens) AS sum_reason FROM turn WHERE session_id IN (SELECT pid FROM page) GROUP BY session_id) t ON t.session_id = s.id ORDER BY s.time_updated DESC`
 
 // SessionRow is one listing row: display columns plus the turn aggregate
 // the priced cost is derived from at display time.
@@ -124,7 +131,7 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 	if len(ref) < 8 {
 		return "", fmt.Errorf("store: %q matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id", ref)
 	}
-	rows, err := db.Query(`SELECT id, title FROM session WHERE id LIKE ? ESCAPE '\' ORDER BY id`, escapeLikePrefix(ref)+"%")
+	rows, err := db.Query(`SELECT id, title FROM session WHERE id LIKE ? ESCAPE '\' ORDER BY id LIMIT 11`, escapeLikePrefix(ref)+"%")
 	if err != nil {
 		return "", fmt.Errorf("store: resolve session: %w", err)
 	}
@@ -147,8 +154,20 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 	case 1:
 		return ids[0], nil
 	default:
+		truncated := false
+		if len(ids) > 10 {
+			// The candidate query caps at 11: a full head of repeats
+			// (UUIDv7 ids share a time prefix) must not pour thousands
+			// of rows into one error string.
+			truncated = true
+			ids, titles = ids[:10], titles[:10]
+		}
 		var b strings.Builder
-		fmt.Fprintf(&b, "store: %q is ambiguous (%d sessions):", ref, len(ids))
+		if truncated {
+			fmt.Fprintf(&b, "store: %q is ambiguous (more than 10 sessions, showing first 10 — refine the prefix):", ref)
+		} else {
+			fmt.Fprintf(&b, "store: %q is ambiguous (%d sessions):", ref, len(ids))
+		}
 		for i := range ids {
 			title := titles[i]
 			if title == "" {
@@ -228,7 +247,7 @@ func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 		Scan(&r.ID, &r.Title, &r.Model, &r.Provider, &r.Harness, &r.Directory,
 			&r.TimeCreated, &r.TimeUpdated, &wpath, &bharness, &bprovider, &foreign)
 	if err == sql.ErrNoRows {
-		return d, fmt.Errorf("store: no session %q", sessionID)
+		return d, fmt.Errorf("store: no session %q: %w", sessionID, sql.ErrNoRows)
 	}
 	if err != nil {
 		return d, fmt.Errorf("store: load session: %w", err)
@@ -310,11 +329,6 @@ func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 	}
 	partsByMsg := map[string][]PartDetail{}
 	toolNames := map[string]string{}
-	type rawPart struct {
-		msgID string
-		part  PartDetail
-	}
-	var all []rawPart
 	for prows.Next() {
 		var msgID string
 		var p PartDetail
@@ -327,21 +341,20 @@ func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 		p.Signature = sig.String
 		p.ForeignID = pforeign.String
 		partsByMsg[msgID] = append(partsByMsg[msgID], p)
-		all = append(all, rawPart{msgID: msgID, part: p})
+		// Index the twin's name inline: the link pass below runs after
+		// every row is scanned, so a result still finds a call that
+		// comes later without keeping a second copy of every part.
+		if p.Type == "tool_call" && p.ToolCallID != "" {
+			if name := toolCallName(p.Data); name != "" {
+				if _, ok := toolNames[p.ToolCallID]; !ok {
+					toolNames[p.ToolCallID] = name
+				}
+			}
+		}
 	}
 	prows.Close()
 	if err := prows.Err(); err != nil {
 		return d, fmt.Errorf("store: load parts rows: %w", err)
-	}
-	// First pass over all parts: index every tool_call name.
-	for _, rp := range all {
-		if rp.part.Type == "tool_call" && rp.part.ToolCallID != "" {
-			if name := toolCallName(rp.part.Data); name != "" {
-				if _, ok := toolNames[rp.part.ToolCallID]; !ok {
-					toolNames[rp.part.ToolCallID] = name
-				}
-			}
-		}
 	}
 	// Second pass: link every tool_result to its twin's name.
 	for msgID, parts := range partsByMsg {

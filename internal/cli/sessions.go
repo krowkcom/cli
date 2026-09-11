@@ -2,12 +2,15 @@ package cli
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/krowkcom/cli/internal/api"
 	"github.com/krowkcom/cli/internal/output"
@@ -139,32 +142,34 @@ func humanSessionsList(rows []store.SessionRow, colour bool, now time.Time) stri
 	}
 	var tw, hw, mw int
 	for _, r := range rows {
-		title := r.Title
+		title := cleanCell(r.Title)
 		if title == "" {
 			title = "(untitled)"
 		}
-		tw = max(tw, len(title))
-		hw = max(hw, len(r.Harness))
-		mw = max(mw, len(r.Model))
+		tw = max(tw, utf8.RuneCountInString(title))
+		hw = max(hw, utf8.RuneCountInString(cleanCell(r.Harness)))
+		mw = max(mw, utf8.RuneCountInString(cleanCell(r.Model)))
 	}
 	if tw > 60 {
 		tw = 60
 	}
 	lines := make([]string, 0, len(rows))
 	for _, r := range rows {
-		title := r.Title
+		title := cleanCell(r.Title)
 		if title == "" {
 			title = "(untitled)"
 		}
 		if r := []rune(title); len(r) > 60 {
 			title = string(r[:57]) + "..."
 		}
+		harness := cleanCell(r.Harness)
+		model := cleanCell(r.Model)
 		cost := "—"
 		if priced, ok := priceRow(r); ok {
 			cost = formatCost(priced)
 		}
 		lines = append(lines, fmt.Sprintf("%-*s  %-*s  %-*s  %3d turns  %10s  %s",
-			tw, title, hw, r.Harness, mw, r.Model, r.TurnCount, cost,
+			tw, title, hw, harness, mw, model, r.TurnCount, cost,
 			relativeTime(r.TimeUpdated, now)))
 	}
 	_ = colour
@@ -240,7 +245,10 @@ func sessionsShow(w io.Writer, args []string, f flags, format output.Format, env
 	}
 	d, err := store.LoadSessionDetail(db, id)
 	if err != nil {
-		return api.Fail("no_session", sanitizeStoreErr(err, store.DBPath(store.Env(env))))
+		if errors.Is(err, sql.ErrNoRows) {
+			return api.Fail("no_session", sanitizeStoreErr(err, store.DBPath(store.Env(env))))
+		}
+		return api.Fail("store_unavailable", sanitizeStoreErr(err, store.DBPath(store.Env(env))))
 	}
 	if format != output.Human {
 		return emitSessionShow(w, f, d)
@@ -292,8 +300,6 @@ type sessionShowJSON struct {
 }
 
 func emitSessionShow(w io.Writer, f flags, d store.SessionDetail) error {
-	now := time.Now()
-	_ = now
 	msgs := make([]showMessageJSON, 0, len(d.Messages))
 	for _, m := range d.Messages {
 		parts := make([]showPartJSON, 0, len(m.Parts))
@@ -346,7 +352,7 @@ func emitSessionShow(w io.Writer, f flags, d store.SessionDetail) error {
 	if priced, ok := priceRow(d.Session); ok {
 		out.PricedCostUSD = &priced
 		out.CostDisplay = formatCost(priced)
-		out.PricedWith = fmt.Sprintf("priced at current models.dev rates (snapshot %s)", pricing.SnapshotDate)
+		out.PricedWith = fmt.Sprintf("priced from embedded models.dev snapshot %s", pricing.SnapshotDate)
 	}
 	if f.quiet {
 		return emit(w, encodeJSONValue(out), f)
@@ -364,14 +370,16 @@ func displayTitle(t string) string {
 	return t
 }
 
-// humanSessionShow renders turns, then messages with their parts.
+// humanSessionShow renders turns, then messages with their parts. Every
+// stored string printed here is caller-controlled transcript text, so each
+// passes through cleanCell before it reaches the terminal.
 func humanSessionShow(d store.SessionDetail, showThinking bool, colour bool, now time.Time) string {
 	var b strings.Builder
-	title := displayTitle(d.Session.Title)
+	title := displayTitle(cleanCell(d.Session.Title))
 	fmt.Fprintf(&b, "%s\n", title)
-	meta := d.Session.Harness
-	if d.Session.Model != "" {
-		meta += "  " + d.Session.Model
+	meta := cleanCell(d.Session.Harness)
+	if m := cleanCell(d.Session.Model); m != "" {
+		meta += "  " + m
 	}
 	if priced, ok := priceRow(d.Session); ok {
 		meta += "  " + formatCost(priced)
@@ -379,14 +387,14 @@ func humanSessionShow(d store.SessionDetail, showThinking bool, colour bool, now
 		meta += "  —"
 	}
 	meta += "  " + relativeTime(d.Session.TimeUpdated, now)
-	if d.Session.WorktreePath != "" {
-		meta += "\n" + d.Session.WorktreePath
+	if wp := cleanCell(d.Session.WorktreePath); wp != "" {
+		meta += "\n" + wp
 	}
 	b.WriteString(meta + "\n")
 	for _, t := range d.Turns {
 		fmt.Fprintf(&b, "\nturn %d", t.Seq)
-		if t.Status != "" {
-			fmt.Fprintf(&b, "  %s", t.Status)
+		if st := cleanCell(t.Status); st != "" {
+			fmt.Fprintf(&b, "  %s", st)
 		}
 		fmt.Fprintf(&b, "  %d tokens", t.Total)
 		if !t.USDNull {
@@ -395,7 +403,7 @@ func humanSessionShow(d store.SessionDetail, showThinking bool, colour bool, now
 		b.WriteString("\n")
 	}
 	for _, m := range d.Messages {
-		fmt.Fprintf(&b, "\n[%s]\n", m.Role)
+		fmt.Fprintf(&b, "\n[%s]\n", cleanCell(m.Role))
 		for _, p := range m.Parts {
 			b.WriteString(humanPart(p, showThinking) + "\n")
 		}
@@ -407,19 +415,16 @@ func humanSessionShow(d store.SessionDetail, showThinking bool, colour bool, now
 func humanPart(p store.PartDetail, showThinking bool) string {
 	switch p.Type {
 	case "text":
-		return partTextString(p.Data)
+		return cleanCell(partTextString(p.Data))
 	case "thinking":
 		text := partThinkingString(p.Data)
 		if showThinking {
-			return "thinking: " + text
+			return "thinking: " + cleanCell(text)
 		}
-		one := strings.Join(strings.Fields(text), " ")
-		if len(one) > 100 {
-			one = one[:97] + "..."
-		}
+		one := truncateOneLine(text, 100)
 		return "thinking: " + one + " (use --thinking for all)"
 	case "tool_call":
-		name := store.ToolNameOf(p.Data)
+		name := cleanCell(store.ToolNameOf(p.Data))
 		if name == "" {
 			name = "unknown tool"
 		}
@@ -429,7 +434,7 @@ func humanPart(p store.PartDetail, showThinking bool) string {
 		}
 		return "tool " + name
 	case "tool_result":
-		name := p.ToolName
+		name := cleanCell(p.ToolName)
 		if name == "" {
 			name = "unknown tool"
 		}
@@ -440,12 +445,17 @@ func humanPart(p store.PartDetail, showThinking bool) string {
 		return fmt.Sprintf("result (%s)", name)
 	default:
 		s := strings.Join(strings.Fields(p.Data), " ")
-		return p.Type + ": " + truncateOneLine(s, 200)
+		return cleanCell(p.Type) + ": " + truncateOneLine(s, 200)
 	}
 }
 
 func truncateOneLine(s string, n int) string {
-	s = strings.Join(strings.Fields(s), " ")
+	return truncateRunes(cleanCell(s), n)
+}
+
+// truncateRunes caps s at n runes, so a multi-byte character is never cut
+// in half. cleanCell has already folded whitespace to single spaces.
+func truncateRunes(s string, n int) string {
 	if r := []rune(s); len(r) > n {
 		if n < 3 {
 			return string(r[:n])
@@ -453,6 +463,51 @@ func truncateOneLine(s string, n int) string {
 		return string(r[:n-3]) + "..."
 	}
 	return s
+}
+
+// cleanCell makes caller-controlled transcript text safe for a terminal
+// row: whitespace folds to single spaces and the characters that would
+// move the cursor, recolour the row or reorder what is drawn after it are
+// dropped. Dropping ESC outright also neutralises ANSI sequences (only
+// their inert letters remain). Mirrors internal/output's oneLine, which
+// stays unexported — this is the CLI's copy for session display.
+func cleanCell(s string) string {
+	var b strings.Builder
+	space := false
+	for _, r := range strings.TrimSpace(s) {
+		switch {
+		case unicode.IsSpace(r):
+			space = true
+		case unicode.IsControl(r), reorderRune(r):
+			// Dropped outright rather than folded to a space: an escape
+			// sequence arrives as ESC plus ordinary letters, and spacing
+			// it out would leave the letters behind as text.
+		default:
+			if space && b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			space = false
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// reorderRune reports the characters that move or hide text while
+// occupying no space of their own: bidi overrides and isolates,
+// zero-width spaces, and the byte order mark. U+200D ZERO WIDTH JOINER
+// is kept: it holds multi-part emoji together.
+func reorderRune(r rune) bool {
+	switch {
+	case r == '\u200d':
+		return false
+	case r == '\ufeff',
+		r >= '\u200b' && r <= '\u200f',
+		r >= '\u202a' && r <= '\u202e',
+		r >= '\u2066' && r <= '\u2069':
+		return true
+	}
+	return false
 }
 
 func partTextString(data string) string {

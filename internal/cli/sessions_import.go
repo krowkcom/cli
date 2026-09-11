@@ -446,8 +446,12 @@ func (o *sourceOutcome) absorb(r importer.Result) {
 		// than an honest "and some more". The same goes for a key that
 		// arrives already spelled like the bucket.
 		_, known := o.SkippedByType[k]
+		named := len(o.SkippedByType)
+		if _, bucket := o.SkippedByType[skippedTypeOther]; bucket {
+			named-- // the bucket sits beside the named types, not among them
+		}
 		if len(k) > maxSkippedTypeLen || k == skippedTypeOther ||
-			(!known && len(o.SkippedByType) >= maxSkippedTypes) {
+			(!known && named >= maxSkippedTypes) {
 			k = skippedTypeOther
 		}
 		o.SkippedByType[k] += v

@@ -14,7 +14,7 @@ import (
 	"github.com/krowkcom/cli/internal/store"
 )
 
-// Read parses the whole session ref names and returns it as one Thread.
+// Read parses the whole session ref and returns it as one Thread.
 //
 // The cursor is type-checked and then deliberately not used to skip
 // anything; see the package doc for why a source whose turns are
@@ -39,6 +39,12 @@ func (s Source) Read(env harness.Env, ref importer.Ref, cursor importer.Cursor) 
 	rel := ref.Path
 	if rel == "" {
 		rel = dbRel
+	}
+	// The ref's path is a hint naming the one database this source
+	// reads, never an arbitrary file to open: anything but the known
+	// relative path is a caller's bug, refused rather than followed.
+	if rel != dbRel {
+		return store.Thread{}, held, importer.Result{}, fmt.Errorf("opencode: unexpected ref path %q", rel)
 	}
 	dbPath, err := importer.HomePath(env, rel)
 	if err != nil {
@@ -143,8 +149,9 @@ type messageMeta struct {
 
 // partMeta is the same idea for one message's parts.
 type partMeta struct {
-	id   string
-	size int64
+	id      string
+	size    int64
+	updated int64
 }
 
 // messageRawLimit caps the message.data blob materialised in one row.
@@ -209,7 +216,7 @@ func (b *builder) load(db *sql.DB) error {
 	err := db.QueryRow(`SELECT project_id, parent_id, directory, title, model FROM session WHERE id = ?`, id).
 		Scan(&s.projectID, &s.parentID, &s.directory, &s.title, &s.model)
 	if err == sql.ErrNoRows {
-		return fmt.Errorf("opencode: session %s not found", id)
+		return fmt.Errorf("session %s not found", id)
 	}
 	if err != nil {
 		return err
@@ -227,7 +234,7 @@ func (b *builder) load(db *sql.DB) error {
 	}
 	b.worktreePath, b.worktreeVCS = resolveWorktree(worktree.String, vcs.String, b.directory)
 
-	rows, err := db.Query(`SELECT id, time_created, time_updated, length(data)
+	rows, err := db.Query(`SELECT id, time_created, time_updated, length(CAST(data AS BLOB))
 	  FROM message WHERE session_id = ? ORDER BY time_created ASC, rowid ASC`, id)
 	if err != nil {
 		return err
@@ -251,19 +258,33 @@ func (b *builder) load(db *sql.DB) error {
 		return err
 	}
 	_ = rows.Close()
+	// One message row plus its part rows per iteration, not one JOIN:
+	// a session's parts only ever fit in memory one message at a time
+	// this way, and the handle holds a single connection, so the message
+	// rows are collected and closed above before any part row is read.
 	n := 0
 	for _, r := range metas {
 		n++
-		if r.updated > b.maxUpdated {
-			b.maxUpdated = r.updated
-		}
-		if err := b.messageByID(db, n, r); err != nil {
+		partMax, err := b.messageByID(db, n, r)
+		if err != nil {
 			// A message this build cannot use is a skip with a reason,
 			// not a failed read: stopping would pin the session to the
 			// messages before it on every attempt from then on. A huge
 			// row whose prefix does not even name a role lands here
-			// rather than under a guessed role.
+			// rather than under a guessed role. Skipped rows do not move
+			// the watermark, so the next read retries them instead of
+			// forgetting them.
 			b.acc.Skip(n, 0, err.Error())
+			continue
+		}
+		// The watermark is the largest timestamp successfully imported,
+		// over message and part rows alike: a part edited after its
+		// message must still move it.
+		if r.updated > b.maxUpdated {
+			b.maxUpdated = r.updated
+		}
+		if partMax > b.maxUpdated {
+			b.maxUpdated = partMax
 		}
 	}
 	return nil
@@ -274,48 +295,65 @@ func (b *builder) load(db *sql.DB) error {
 // prefix path string-scans role/model/provider (plus tokens/cost when
 // the prefix names them) and leaves RawJSON nil; a prefix with no role
 // is an error to the caller above, which counts it as skipped.
-func (b *builder) messageByID(db *sql.DB, n int, r messageMeta) error {
+//
+// The returned int64 is the largest part time_updated under the message,
+// folded into the watermark by the caller on success only.
+//
+// Every prefix scan is anchored to the top level of the blob (brace depth
+// 1): the first `"role"` in the raw bytes is not necessarily the message's
+// role when prose or nested objects name one, and a role flipped by a
+// nested match would file an assistant row as a prompt. Tokens are scoped
+// tighter still, to the `"tokens"` object substring, and cost to a
+// top-level `"cost"`; anything not cleanly parsed there stays zero with a
+// nil raw, which is honest about what was actually read.
+func (b *builder) messageByID(db *sql.DB, n int, r messageMeta) (int64, error) {
 	if r.size <= messageRawLimit {
 		var data string
 		if err := db.QueryRow(`SELECT data FROM message WHERE id = ?`, r.id).Scan(&data); err != nil {
-			return err
+			return 0, err
 		}
 		var d messageData
 		if err := json.Unmarshal([]byte(data), &d); err != nil {
-			return fmt.Errorf("opencode: message %s: %w", r.id, err)
+			return 0, fmt.Errorf("opencode: message %s: %w", r.id, err)
 		}
 		return b.addMessage(db, n, r.id, d.Role, d.ModelID, d.ProviderID, d.Tokens, d.Cost, rawJSON(data))
 	}
 	var prefix sql.NullString
 	if err := db.QueryRow(`SELECT substr(data,1,?) FROM message WHERE id = ?`, messagePrefixLen, r.id).Scan(&prefix); err != nil {
-		return err
+		return 0, err
 	}
-	role, ok := extractJSONString(prefix.String, "role")
+	head := prefix.String
+	role, ok := extractTopJSONString(head, "role")
 	if !ok || role == "" {
-		return fmt.Errorf("opencode: message %s has no role in its prefix", r.id)
+		return 0, fmt.Errorf("opencode: message %s has no role in its prefix", r.id)
 	}
-	modelID, _ := extractJSONString(prefix.String, "modelID")
-	providerID, _ := extractJSONString(prefix.String, "providerID")
+	modelID, _ := extractTopJSONString(head, "modelID")
+	providerID, _ := extractTopJSONString(head, "providerID")
 	// Tokens/cost ride on assistant rows and are absent on the huge
 	// user rows that motivated the cap; when the prefix names them
 	// (early fields, as in the regression fixture) they are kept so
-	// turn costing still sees the turn.
+	// turn costing still sees the turn. Scoped to the tokens object so
+	// a nested "input" in the tail cannot inflate a turn.
 	var tk tokenData
 	foundTokens := false
-	if v, ok := extractJSONInt(prefix.String, "input"); ok {
-		tk.Input, foundTokens = v, true
-	}
-	if v, ok := extractJSONInt(prefix.String, "output"); ok {
-		tk.Output, foundTokens = v, true
-	}
-	if v, ok := extractJSONInt(prefix.String, "reasoning"); ok {
-		tk.Reasoning, foundTokens = v, true
-	}
-	if v, ok := extractJSONInt(prefix.String, "read"); ok {
-		tk.Cache.Read, foundTokens = v, true
-	}
-	if v, ok := extractJSONInt(prefix.String, "write"); ok {
-		tk.Cache.Write, foundTokens = v, true
+	if tokObj, ok := extractTopObject(head, "tokens"); ok {
+		if v, ok := extractJSONInt(tokObj, "input"); ok {
+			tk.Input, foundTokens = v, true
+		}
+		if v, ok := extractJSONInt(tokObj, "output"); ok {
+			tk.Output, foundTokens = v, true
+		}
+		if v, ok := extractJSONInt(tokObj, "reasoning"); ok {
+			tk.Reasoning, foundTokens = v, true
+		}
+		if cacheObj, ok := extractObjectField(tokObj, "cache"); ok {
+			if v, ok := extractJSONInt(cacheObj, "read"); ok {
+				tk.Cache.Read, foundTokens = v, true
+			}
+			if v, ok := extractJSONInt(cacheObj, "write"); ok {
+				tk.Cache.Write, foundTokens = v, true
+			}
+		}
 	}
 	var tokensRaw json.RawMessage
 	var usage string
@@ -326,16 +364,17 @@ func (b *builder) messageByID(db *sql.DB, n int, r messageMeta) error {
 		}
 	}
 	var cost *float64
-	if v, ok := extractJSONFloat(prefix.String, "cost"); ok {
+	if v, ok := extractTopJSONFloat(head, "cost"); ok {
 		cost = &v
 	}
-	return b.addMessageRaw(db, n, r.id, role, modelID, providerID, tokensRaw, usage, tk, cost, nil)
+	partMax, err := b.addMessageRaw(db, n, r.id, role, modelID, providerID, tokensRaw, usage, tk, cost, nil)
+	return partMax, err
 }
 
 // addMessage assembles one message from decoded fields, keeping the raw
 // blob the caller materialised. It exists so the small-row path stays a
 // thin decode over the shared assembly in addMessageRaw.
-func (b *builder) addMessage(db *sql.DB, n int, msgID, role, modelID, providerID string, tokensRaw json.RawMessage, cost *float64, rawPtr *string) error {
+func (b *builder) addMessage(db *sql.DB, n int, msgID, role, modelID, providerID string, tokensRaw json.RawMessage, cost *float64, rawPtr *string) (int64, error) {
 	var tk tokenData
 	if len(tokensRaw) > 0 {
 		// A tokens blob that will not decode is not worth failing the
@@ -354,16 +393,23 @@ func (b *builder) addMessage(db *sql.DB, n int, msgID, role, modelID, providerID
 // addMessageRaw is the single assembly both row paths share: role check,
 // provider/model tracking, parts, turn candidate, line count. tokensRaw
 // feeds Usage, tk feeds turn costing, cost feeds dollar costing, rawPtr
-// is nil for huge rows whose blob was never materialised.
-func (b *builder) addMessageRaw(db *sql.DB, n int, msgID, role, modelID, providerID string, tokensRaw json.RawMessage, usage string, tk tokenData, cost *float64, rawPtr *string) error {
+// is nil for huge rows whose blob was never materialised. It returns the
+// largest part time_updated under the message for the watermark.
+func (b *builder) addMessageRaw(db *sql.DB, n int, msgID, role, modelID, providerID string, tokensRaw json.RawMessage, usage string, tk tokenData, cost *float64, rawPtr *string) (int64, error) {
 	var role2 store.Role
 	switch role {
 	case "user":
 		role2 = store.RoleUser
 	case "assistant":
 		role2 = store.RoleAssistant
+	case "system":
+		role2 = store.RoleSystem
 	default:
-		return fmt.Errorf("opencode: message %s has role %q", msgID, role)
+		// Live databases hold user and assistant only; anything else is
+		// skipped with its kind counted, so a new role shows up in the
+		// result instead of vanishing silently.
+		b.acc.Classify("role:" + role)
+		return 0, fmt.Errorf("opencode: message %s has role %q", msgID, role)
 	}
 
 	msg := store.Message{
@@ -386,9 +432,9 @@ func (b *builder) addMessageRaw(db *sql.DB, n int, msgID, role, modelID, provide
 		dollars = *cost
 	}
 
-	parts, err := b.parts(db, msgID)
+	parts, partMax, err := b.parts(db, msgID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	msg.Parts = parts
 
@@ -406,7 +452,7 @@ func (b *builder) addMessageRaw(db *sql.DB, n int, msgID, role, modelID, provide
 	// their part rows, which is the closest this source has to the JSONL
 	// reader's line.
 	b.acc.Lines += 1 + len(parts)
-	return nil
+	return partMax, nil
 }
 
 // extractJSONString scans hay for `"key" : "value"` without parsing it
@@ -456,6 +502,252 @@ func extractJSONString(hay, key string) (string, bool) {
 			sb.WriteByte(c)
 		}
 		return "", false
+	}
+	return "", false
+}
+
+// braceDepthAt is the object nesting depth at byte pos: the count of
+// unclosed '{' before it, ignoring braces inside double-quoted strings.
+// Top-level fields of the blob sit at depth 1; a `"role"` at any other
+// depth belongs to prose or a nested object, not to the message.
+func braceDepthAt(hay string, pos int) int {
+	depth := 0
+	inStr := false
+	escaped := false
+	for i := 0; i < pos && i < len(hay); i++ {
+		c := hay[i]
+		if inStr {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		if c == '"' {
+			inStr = true
+			continue
+		}
+		if c == '{' {
+			depth++
+		} else if c == '}' && depth > 0 {
+			depth--
+		}
+	}
+	return depth
+}
+
+// topKeyPos finds `"key"` at brace depth 1 followed by a colon, returning
+// the offset just past the colon. Occurrences at any other depth — prose
+// quoting a field name, a nested object — are skipped.
+func topKeyPos(hay, key string) (int, bool) {
+	needle := `"` + key + `"`
+	for off := 0; off < len(hay); {
+		i := strings.Index(hay[off:], needle)
+		if i < 0 {
+			return 0, false
+		}
+		start := off + i
+		if braceDepthAt(hay, start) != 1 {
+			off = start + len(needle)
+			continue
+		}
+		p := start + len(needle)
+		for p < len(hay) && (hay[p] == ' ' || hay[p] == '\t' || hay[p] == '\n' || hay[p] == '\r') {
+			p++
+		}
+		if p >= len(hay) || hay[p] != ':' {
+			off = start + len(needle)
+			continue
+		}
+		return p + 1, true
+	}
+	return 0, false
+}
+
+// extractTopJSONString is extractJSONString anchored to the top level of
+// the blob, so a nested "role" in prose cannot flip the message's role.
+func extractTopJSONString(hay, key string) (string, bool) {
+	p, ok := topKeyPos(hay, key)
+	if !ok {
+		return "", false
+	}
+	for p < len(hay) && (hay[p] == ' ' || hay[p] == '\t' || hay[p] == '\n' || hay[p] == '\r') {
+		p++
+	}
+	if p >= len(hay) || hay[p] != '"' {
+		return "", false
+	}
+	p++
+	var sb strings.Builder
+	escaped := false
+	for ; p < len(hay); p++ {
+		c := hay[p]
+		if escaped {
+			sb.WriteByte(c)
+			escaped = false
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			return sb.String(), true
+		}
+		sb.WriteByte(c)
+	}
+	return "", false
+}
+
+// extractTopJSONNumber is extractJSONNumber anchored to the top level,
+// so a nested number cannot pose as the message's own field.
+func extractTopJSONNumber(hay, key string) (string, bool) {
+	p, ok := topKeyPos(hay, key)
+	if !ok {
+		return "", false
+	}
+	for p < len(hay) && (hay[p] == ' ' || hay[p] == '\t' || hay[p] == '\n' || hay[p] == '\r') {
+		p++
+	}
+	start := p
+	for p < len(hay) && (hay[p] == '-' || hay[p] == '+' || hay[p] == '.' ||
+		(hay[p] >= '0' && hay[p] <= '9') || hay[p] == 'e' || hay[p] == 'E') {
+		p++
+	}
+	if p == start {
+		return "", false
+	}
+	return hay[start:p], true
+}
+
+// extractTopJSONFloat is extractTopJSONNumber parsed as a float.
+func extractTopJSONFloat(hay, key string) (float64, bool) {
+	lit, ok := extractTopJSONNumber(hay, key)
+	if !ok {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(lit, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// extractObjectField returns the balanced `{...}` object that is the value
+// of `"key"` at any depth, so a scoped scan (tokens, cache) stays inside
+// the object it names rather than matching a same-named field elsewhere.
+func extractObjectField(hay, key string) (string, bool) {
+	needle := `"` + key + `"`
+	for off := 0; off < len(hay); {
+		i := strings.Index(hay[off:], needle)
+		if i < 0 {
+			return "", false
+		}
+		start := off + i
+		p := start + len(needle)
+		for p < len(hay) && (hay[p] == ' ' || hay[p] == '\t' || hay[p] == '\n' || hay[p] == '\r') {
+			p++
+		}
+		if p >= len(hay) || hay[p] != ':' {
+			off = start + len(needle)
+			continue
+		}
+		p++
+		for p < len(hay) && (hay[p] == ' ' || hay[p] == '\t' || hay[p] == '\n' || hay[p] == '\r') {
+			p++
+		}
+		if p >= len(hay) || hay[p] != '{' {
+			off = start + len(needle)
+			continue
+		}
+		depth := 0
+		inStr := false
+		escaped := false
+		for q := p; q < len(hay); q++ {
+			c := hay[q]
+			if inStr {
+				if escaped {
+					escaped = false
+					continue
+				}
+				if c == '\\' {
+					escaped = true
+					continue
+				}
+				if c == '"' {
+					inStr = false
+				}
+				continue
+			}
+			if c == '"' {
+				inStr = true
+				continue
+			}
+			if c == '{' {
+				depth++
+			} else if c == '}' {
+				depth--
+				if depth == 0 {
+					return hay[p : q+1], true
+				}
+			}
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// extractTopObject is extractObjectField for a top-level key: the `"tokens"`
+// object of the message, not a nested namesake.
+func extractTopObject(hay, key string) (string, bool) {
+	p, ok := topKeyPos(hay, key)
+	if !ok {
+		return "", false
+	}
+	for p < len(hay) && (hay[p] == ' ' || hay[p] == '\t' || hay[p] == '\n' || hay[p] == '\r') {
+		p++
+	}
+	if p >= len(hay) || hay[p] != '{' {
+		return "", false
+	}
+	depth := 0
+	inStr := false
+	escaped := false
+	for q := p; q < len(hay); q++ {
+		c := hay[q]
+		if inStr {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		if c == '"' {
+			inStr = true
+			continue
+		}
+		if c == '{' {
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 {
+				return hay[p : q+1], true
+			}
+		}
 	}
 	return "", false
 }
@@ -522,42 +814,47 @@ func extractJSONFloat(hay, key string) (float64, bool) {
 }
 
 // parts reads one message's part rows in timeline order and maps each onto
-// canonical parts. One row is usually one part; a finished tool row is two
+// canonical parts, returning the largest part time_updated for the
+// watermark. One row is usually one part; a finished tool row is two
 // (see toolParts), which is why Lines above counts what came back rather
 // than what went out — the part-count test holds the difference against
 // the twin count. Two-phase like messages: lengths first (no data
 // column), then the full blob per small part or a short substr prefix
 // per oversized part, string-scanned in Go. No json_extract anywhere:
 // it parses the whole blob server-side and OOMs the wasm driver.
-func (b *builder) parts(db *sql.DB, msgID string) ([]store.Part, error) {
-	rows, err := db.Query(`SELECT id, length(data)
+func (b *builder) parts(db *sql.DB, msgID string) ([]store.Part, int64, error) {
+	rows, err := db.Query(`SELECT id, length(CAST(data AS BLOB)), time_updated
 	  FROM part WHERE message_id = ? ORDER BY time_created ASC, rowid ASC`, msgID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var metas []partMeta
 	for rows.Next() {
 		var m partMeta
-		if err := rows.Scan(&m.id, &m.size); err != nil {
+		if err := rows.Scan(&m.id, &m.size, &m.updated); err != nil {
 			_ = rows.Close()
-			return nil, err
+			return nil, 0, err
 		}
 		metas = append(metas, m)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return nil, err
+		return nil, 0, err
 	}
 	_ = rows.Close()
 	var parts []store.Part
+	var partMax int64
 	for _, m := range metas {
+		if m.updated > partMax {
+			partMax = m.updated
+		}
 		ps, err := b.partByID(db, m)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		parts = append(parts, ps...)
 	}
-	return parts, nil
+	return parts, partMax, nil
 }
 
 // partByID loads one part row: the full blob when it fits under
@@ -578,16 +875,16 @@ func (b *builder) partByID(db *sql.DB, m partMeta) ([]store.Part, error) {
 	if err := db.QueryRow(`SELECT substr(data,1,?) FROM part WHERE id = ?`, partPrefixLen, m.id).Scan(&prefix); err != nil {
 		return nil, err
 	}
-	typ, ok := extractJSONString(prefix.String, "type")
+	typ, ok := extractTopJSONString(prefix.String, "type")
 	if !ok || typ == "" {
 		return nil, fmt.Errorf("opencode: part %s has no type in its prefix", m.id)
 	}
-	tool, _ := extractJSONString(prefix.String, "tool")
-	callID, _ := extractJSONString(prefix.String, "callID")
-	text, _ := extractJSONString(prefix.String, "text")
-	snapshot, _ := extractJSONString(prefix.String, "snapshot")
+	tool, _ := extractTopJSONString(prefix.String, "tool")
+	callID, _ := extractTopJSONString(prefix.String, "callID")
+	text, _ := extractTopJSONString(prefix.String, "text")
+	snapshot, _ := extractTopJSONString(prefix.String, "snapshot")
 	var state sql.NullString
-	if status, ok := extractJSONString(prefix.String, "status"); ok {
+	if status, ok := extractTopJSONString(prefix.String, "status"); ok {
 		raw, _ := json.Marshal(toolState{Status: status})
 		state = sql.NullString{String: string(raw), Valid: true}
 	}
@@ -661,11 +958,15 @@ func (b *builder) partCapped(partID, typ, text, tool, callID string, state sql.N
 }
 
 // toolParts splits one tool row into its canonical pair. The call always
-// error — because a tool still running has returned nothing yet, and a
-// result with no output would be a row that claims work happened. The two
+// lands; the result only on a completed or error status — because a tool
+// still running has returned nothing yet, and a result with no output
+// would be a row that claims work happened. The two
 // share the row's call id (falling back to the part id when the row names
 // none), which is the only thing that pairs them, and both carry the part
-// id as ForeignID.
+// id as ForeignID. A status that is neither completed nor error twins
+// nothing, per the contract — but when it is some other terminal state
+// (not running, pending, or absent) it is classified under its own name
+// so the row is visible in the result instead of silently a lone call.
 func (b *builder) toolParts(partID string, d partData, raw json.RawMessage) []store.Part {
 	callID := firstNonEmpty(d.CallID, partID)
 	var input json.RawMessage
@@ -681,6 +982,10 @@ func (b *builder) toolParts(partID string, d partData, raw json.RawMessage) []st
 		result := importer.NewToolResultPart(callID, output, status == "error")
 		result.ForeignID = partID
 		parts = append(parts, result)
+		return parts
+	}
+	if status != "" && status != "running" && status != "pending" {
+		b.acc.Classify("tool:" + status)
 	}
 	return parts
 }
@@ -709,6 +1014,7 @@ func (b *builder) thread() store.Thread {
 			Provider:         importer.ProviderOpencode,
 			Harness:          Harness,
 			ForeignSessionID: b.parentID,
+			ResumeCmd:        resumeCmd(b.parentID),
 		}
 	}
 	th.Turns = b.turns()
@@ -722,7 +1028,9 @@ func (b *builder) thread() store.Thread {
 // only counted one message would understate the tool loops by an order of
 // magnitude. Token columns sum the message tokens; the dollar cost sums
 // message.data cost and lands in micros, rounded, because the transcript
-// prices in dollars and the store costs in micros. Status is "done" for
+// prices in dollars and the store costs in micros. CostUSDMicros stays nil
+// for a span where no message carried a cost — the column is NULL, never a
+// guessed zero. Status is "done" for
 // every turn: the transcript records no cancellation this reader could
 // tell from a finished turn, and guessing would be a guess.
 func (b *builder) turns() []store.Turn {
@@ -731,6 +1039,7 @@ func (b *builder) turns() []store.Turn {
 	for _, span := range spans {
 		t := store.Turn{Status: "done"}
 		var dollars float64
+		hasCostAny := false
 		for i := span.Start; i < span.End && i < len(b.tokens); i++ {
 			tk := b.tokens[i]
 			t.CostInput += tk.Input
@@ -739,10 +1048,17 @@ func (b *builder) turns() []store.Turn {
 			t.CostCacheRead += tk.Cache.Read
 			t.CostCacheWrite += tk.Cache.Write
 			t.CostTotal += tk.Input + tk.Output + tk.Reasoning + tk.Cache.Read + tk.Cache.Write
-			dollars += b.costs[i]
+			if i < len(b.hasCost) && b.hasCost[i] {
+				hasCostAny = true
+			}
+			if i < len(b.costs) {
+				dollars += b.costs[i]
+			}
 		}
-		micros := int64(math.Round(dollars * 1e6))
-		t.CostUSDMicros = &micros
+		if hasCostAny {
+			micros := int64(math.Round(dollars * 1e6))
+			t.CostUSDMicros = &micros
+		}
 		turns = append(turns, t)
 	}
 	return turns

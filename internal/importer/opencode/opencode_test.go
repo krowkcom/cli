@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -268,10 +269,37 @@ func firstDifference(golden, current string) string {
 // TestReadOnlyNoWal is the read-only acceptance: importing must leave the
 // database file byte-identical and create no sidecars, because opencode
 // holds the database open in WAL mode while it runs and a reader that
-// wrote would lock against the live agent.
+// wrote would lock against the live agent. The fixture is switched to WAL
+// with a writer held open across the reads, so this proves the point
+// against the mode opencode actually uses rather than a delete-mode file
+// nobody contends.
 func TestReadOnlyNoWal(t *testing.T) {
 	f := newFixture(t)
+
+	wal, err := sql.Open(store.DriverName, "file:"+f.dbFile)
+	if err != nil {
+		t.Fatalf("open writer db: %v", err)
+	}
+	defer func() { _ = wal.Close() }()
+	if _, err := wal.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+		t.Fatalf("journal_mode=WAL: %v", err)
+	}
+	// One real write so the -wal exists before the reads do: a WAL read
+	// maps shared memory next to it, and the assertion below is that the
+	// import adds nothing of its own, not that WAL files do not exist.
+	// The row is removed again so the fixture sessions read unchanged.
+	execFixture(t, wal, `INSERT INTO session (id, project_id, parent_id, directory, title, model, time_created, time_updated) VALUES ('ses_scratch', 'prj_1', NULL, 'x', 'scratch', NULL, 1, 1)`)
+	execFixture(t, wal, `DELETE FROM session WHERE id = 'ses_scratch'`)
+
 	before := hashFile(t, f.dbFile)
+	beforeWal := hashSidecar(t, f.dbFile+"-wal")
+	// The WAL switch above leaves -wal/-shm behind by design; what the
+	// import must not do is add anything of its own.
+	hadSidecar := map[string]bool{}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		_, err := os.Stat(f.dbFile + suffix)
+		hadSidecar[suffix] = !os.IsNotExist(err)
+	}
 
 	refs := discover(t, f)
 	for _, ref := range refs {
@@ -281,9 +309,17 @@ func TestReadOnlyNoWal(t *testing.T) {
 	if got := hashFile(t, f.dbFile); got != before {
 		t.Fatalf("database changed by import: %s -> %s", before, got)
 	}
+	// The -wal holds the writer's frames; a read-only import neither
+	// appends to it nor checkpoints it away. (-shm is shared memory by
+	// design and malleable on any WAL read, so only its presence is
+	// held, below.)
+	if got := hashSidecar(t, f.dbFile+"-wal"); got != beforeWal {
+		t.Fatalf("-wal changed by import: %s -> %s", beforeWal, got)
+	}
 	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
-		if _, err := os.Stat(f.dbFile + suffix); !os.IsNotExist(err) {
-			t.Fatalf("import created sidecar %s", f.dbFile+suffix)
+		_, err := os.Stat(f.dbFile + suffix)
+		if got, want := !os.IsNotExist(err), hadSidecar[suffix]; got != want {
+			t.Fatalf("import changed sidecar %s (present=%v, was=%v)", f.dbFile+suffix, got, want)
 		}
 	}
 }
@@ -291,6 +327,21 @@ func TestReadOnlyNoWal(t *testing.T) {
 func hashFile(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// hashSidecar hashes a sidecar that may not exist: absence hashes as
+// absence, so a file created mid-test still fails the comparison.
+func hashSidecar(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return "absent"
+	}
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -524,8 +575,14 @@ func turnCostsFromDB(t *testing.T, f fixture, sessionID string) []wantTurn {
 			m.cost = *d.Cost
 		}
 		// A turn opens at a user message carrying content. The source
-		// never stores a tool_result type of its own, so any part counts
-		// as a prompt part here.
+		// never stores a tool_result row of its own — results are derived
+		// twins on assistant messages, not rows — so any part counts as a
+		// prompt part here. That is deliberately coarser than the
+		// importer's hasPromptPart rule (which excludes tool_result-only
+		// user lines): the two agree on every row this source can hold,
+		// and the finer rule is pinned separately by
+		// TestSplitTurnsExcludesToolResultOnly below rather than by
+		// bending this oracle to a shape the database never takes.
 		m.startsTurn = d.Role == "user" && nparts > 0
 		msgs = append(msgs, m)
 	}
@@ -803,6 +860,265 @@ func TestHugeUserMessageKeepsIdentity(t *testing.T) {
 		if strings.Contains(s.Reason, "msg_huge_user") {
 			t.Fatalf("huge message was skipped: %q", s.Reason)
 		}
+	}
+}
+
+// openFixtureWriter opens the fixture database writable, closed at test
+// end. Tests that add rows use fresh session ids so the golden sessions
+// stay exactly as the checked-in SQL built them.
+func openFixtureWriter(t *testing.T, f fixture) *sql.DB {
+	t.Helper()
+	db, err := sql.Open(store.DriverName, "file:"+f.dbFile)
+	if err != nil {
+		t.Fatalf("open fixture db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+func execFixture(t *testing.T, db *sql.DB, stmt string, args ...any) {
+	t.Helper()
+	if _, err := db.Exec(stmt, args...); err != nil {
+		t.Fatalf("exec %s: %v", trunc(stmt), err)
+	}
+}
+
+// TestSplitTurnsExcludesToolResultOnly pins the finer half of the turn
+// rule the database oracle cannot see: a user line carrying nothing but
+// tool results is the protocol talking, not a prompt, and opens no turn.
+// Opencode never stores such a row (its results ride on assistant
+// messages), so the fixture cannot hold the shape and this unit test
+// stands in for it.
+func TestSplitTurnsExcludesToolResultOnly(t *testing.T) {
+	cands := []importer.TurnCandidate{
+		{Role: store.RoleUser, PartTypes: []string{importer.PartText}},
+		{Role: store.RoleAssistant, PartTypes: []string{importer.PartToolCall}},
+		{Role: store.RoleUser, PartTypes: []string{importer.PartToolResult}},
+	}
+	spans := importer.SplitTurns(cands)
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1: %+v", len(spans), spans)
+	}
+	if spans[0] != (importer.TurnSpan{Start: 0, End: 3}) {
+		t.Fatalf("span = %+v, want the whole session in one turn", spans[0])
+	}
+}
+
+// TestAnchoredPrefixExtraction holds the prefix scanners against nested
+// namesakes: the first `"role"` in the raw bytes is not necessarily the
+// message's role, and an unanchored scan would file the row under prose.
+func TestAnchoredPrefixExtraction(t *testing.T) {
+	hay := `{"nested":{"role":"user","input":99},"role":"assistant","modelID":"m"}`
+	if got, ok := extractTopJSONString(hay, "role"); !ok || got != "assistant" {
+		t.Fatalf("role = %q,%v, want assistant", got, ok)
+	}
+	hay2 := `{"role":"assistant","tokens":{"input":5},"cost":0.5}`
+	tok, ok := extractTopObject(hay2, "tokens")
+	if !ok {
+		t.Fatal("tokens object not found")
+	}
+	if got, ok := extractJSONInt(tok, "input"); !ok || got != 5 {
+		t.Fatalf("tokens input = %d,%v, want 5", got, ok)
+	}
+	if _, ok := extractTopJSONNumber(hay2, "input"); ok {
+		t.Fatal("top-level input matched from inside the tokens object")
+	}
+	if got, ok := extractTopJSONFloat(hay2, "cost"); !ok || got != 0.5 {
+		t.Fatalf("cost = %v,%v, want 0.5", got, ok)
+	}
+}
+
+// TestReadPinsRefPath refuses a ref naming anything but the known
+// database: the path is a hint, never an arbitrary file to open.
+func TestReadPinsRefPath(t *testing.T) {
+	f := newFixture(t)
+	held := importer.SQLiteCursor{TimeUpdated: 123}
+	ref := importer.Ref{Provider: importer.ProviderOpencode, ID: fixtureParent, Path: "/etc/passwd"}
+	_, back, _, err := Source{}.Read(f.env, ref, held)
+	if err == nil {
+		t.Fatal("Read opened an arbitrary ref path")
+	}
+	if back != importer.Cursor(held) {
+		t.Fatalf("cursor back = %+v, want the one held %+v", back, held)
+	}
+}
+
+// TestOpenReadOnlyEncodesSpecialChars proves the DSN cannot be escaped:
+// ?#& in a directory stay in the path component and mode=ro survives as
+// the query.
+func TestOpenReadOnlyEncodesSpecialChars(t *testing.T) {
+	raw := filepath.Join(t.TempDir(), "a?b#c&d", "opencode.db")
+	u := url.URL{Scheme: "file", Path: raw, RawQuery: "mode=ro"}
+	back, err := url.Parse(u.String())
+	if err != nil {
+		t.Fatalf("parse DSN: %v", err)
+	}
+	if back.Query().Get("mode") != "ro" {
+		t.Fatalf("DSN %q lost mode=ro", u.String())
+	}
+	if back.Path != raw {
+		t.Fatalf("path round-trip = %q, want %q", back.Path, raw)
+	}
+}
+
+// TestPartCappedKeepsRouting drives the oversized-part path: a part row
+// past the raw cap keeps its type and twin behaviour off a synthesized
+// payload instead of failing the message.
+func TestPartCappedKeepsRouting(t *testing.T) {
+	f := newFixture(t)
+	db := openFixtureWriter(t, f)
+	execFixture(t, db, `INSERT INTO session (id, project_id, parent_id, directory, title, model, time_created, time_updated) VALUES ('ses_cap', 'prj_1', NULL, ?, 'Cap session', NULL, 1757000002000, 1757000002001)`, f.worktree)
+	execFixture(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_cap', 'ses_cap', 1757000002000, 1757000002001, '{"role":"user"}')`)
+	big := strings.Repeat("y", partRawLimit+100)
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_cap_big', 'msg_cap', 'ses_cap', 1757000002000, 1757000002001, ?)`,
+		`{"type":"text","text":"`+big+`"}`)
+
+	th, _, res, err := Source{}.Read(f.env, importer.Ref{Provider: importer.ProviderOpencode, ID: "ses_cap", Path: dbRel}, nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(th.Messages) != 1 || len(th.Messages[0].Parts) != 1 {
+		t.Fatalf("got %d messages/%d parts, want 1/1", len(th.Messages), len(th.Messages[0].Parts))
+	}
+	p := th.Messages[0].Parts[0]
+	if p.Type != importer.PartText || p.ForeignID != "prt_cap_big" {
+		t.Fatalf("part = %+v, want the capped text part", p)
+	}
+	for _, s := range res.Skipped {
+		if strings.Contains(s.Reason, "msg_cap") {
+			t.Fatalf("capped message was skipped: %q", s.Reason)
+		}
+	}
+}
+
+// TestUnknownPartTypeCounted holds the unknown path: a part type this
+// build has never met lands as `unknown` and is counted, not dropped.
+func TestUnknownPartTypeCounted(t *testing.T) {
+	f := newFixture(t)
+	db := openFixtureWriter(t, f)
+	execFixture(t, db, `INSERT INTO session (id, project_id, parent_id, directory, title, model, time_created, time_updated) VALUES ('ses_unk', 'prj_1', NULL, ?, 'Unk session', NULL, 1757000002100, 1757000002101)`, f.worktree)
+	execFixture(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_unk', 'ses_unk', 1757000002100, 1757000002101, '{"role":"user"}')`)
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_unk', 'msg_unk', 'ses_unk', 1757000002100, 1757000002101, '{"type":"future-widget","frobnicate":true}')`)
+
+	th, _, res, err := Source{}.Read(f.env, importer.Ref{Provider: importer.ProviderOpencode, ID: "ses_unk", Path: dbRel}, nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if res.Unknown != 1 || res.UnknownTypes["future-widget"] != 1 {
+		t.Fatalf("Unknown = %d %v, want 1 future-widget", res.Unknown, res.UnknownTypes)
+	}
+	if got := th.Messages[0].Parts[0].Type; got != importer.PartUnknown {
+		t.Fatalf("part type = %q, want unknown", got)
+	}
+}
+
+// TestSessionModelFallback pins the session-level backstop: when no
+// assistant message names a model, the session row's model JSON answers.
+func TestSessionModelFallback(t *testing.T) {
+	f := newFixture(t)
+	db := openFixtureWriter(t, f)
+	execFixture(t, db, `INSERT INTO session (id, project_id, parent_id, directory, title, model, time_created, time_updated) VALUES ('ses_fb', 'prj_1', NULL, ?, 'Fallback session', '{"id":"fallback-model","providerID":"fallback-provider"}', 1757000002200, 1757000002201)`, f.worktree)
+	execFixture(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_fb_u', 'ses_fb', 1757000002200, 1757000002201, '{"role":"user"}')`)
+	execFixture(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_fb_a', 'ses_fb', 1757000002202, 1757000002203, '{"role":"assistant"}')`)
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_fb_u', 'msg_fb_u', 'ses_fb', 1757000002200, 1757000002201, '{"type":"text","text":"hi"}')`)
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_fb_a', 'msg_fb_a', 'ses_fb', 1757000002202, 1757000002203, '{"type":"text","text":"hello"}')`)
+
+	th, _, _, err := Source{}.Read(f.env, importer.Ref{Provider: importer.ProviderOpencode, ID: "ses_fb", Path: dbRel}, nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if th.Session.Model != "fallback-model" || th.Session.Provider != "fallback-provider" {
+		t.Fatalf("session = %+v, want the session row's model backstop", th.Session)
+	}
+	// And a span with no cost anywhere keeps a nil dollar cost rather
+	// than a guessed zero.
+	for i, turn := range th.Turns {
+		if turn.CostUSDMicros != nil {
+			t.Fatalf("turn %d micros = %d, want nil with no cost on any message", i, *turn.CostUSDMicros)
+		}
+	}
+}
+
+// TestMissingProjectFallsBackToDirectory pins the deleted-project path:
+// a session whose project row is gone reads off its own directory with
+// vcs none rather than failing.
+func TestMissingProjectFallsBackToDirectory(t *testing.T) {
+	f := newFixture(t)
+	db := openFixtureWriter(t, f)
+	execFixture(t, db, `INSERT INTO session (id, project_id, parent_id, directory, title, model, time_created, time_updated) VALUES ('ses_noproj', 'prj_gone', NULL, ?, 'Orphan session', NULL, 1757000002300, 1757000002301)`, f.worktree)
+	execFixture(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_np', 'ses_noproj', 1757000002300, 1757000002301, '{"role":"user"}')`)
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_np', 'msg_np', 'ses_noproj', 1757000002300, 1757000002301, '{"type":"text","text":"hi"}')`)
+
+	th, _, _, err := Source{}.Read(f.env, importer.Ref{Provider: importer.ProviderOpencode, ID: "ses_noproj", Path: dbRel}, nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if th.Worktree.Path != f.worktree || th.Worktree.VCS != vcsNone {
+		t.Fatalf("worktree = %+v, want the session directory with vcs none", th.Worktree)
+	}
+}
+
+// TestWatermarkFoldsPartsAndHoldsSkips pins both halves of the watermark
+// rule: a part edited after its message still moves it, and a skipped row
+// never does.
+func TestWatermarkFoldsPartsAndHoldsSkips(t *testing.T) {
+	f := newFixture(t)
+	db := openFixtureWriter(t, f)
+	execFixture(t, db, `INSERT INTO session (id, project_id, parent_id, directory, title, model, time_created, time_updated) VALUES ('ses_wm', 'prj_1', NULL, ?, 'Watermark session', NULL, 1757000002400, 1757000002401)`, f.worktree)
+	execFixture(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_wm1', 'ses_wm', 1757000002400, 1757000002401, '{"role":"user"}')`)
+	// The part is newer than its message: the watermark must follow the
+	// part, not the message row.
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_wm1', 'msg_wm1', 'ses_wm', 1757000002400, 1757000011401, '{"type":"text","text":"hi"}')`)
+	// A newer row this build cannot use: skipped, so the watermark must
+	// hold below it rather than sailing past.
+	execFixture(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_wm2', 'ses_wm', 1757000002500, 1757000020000, '{"role":"bogus"}')`)
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_wm2', 'msg_wm2', 'ses_wm', 1757000002500, 1757000020000, '{"type":"text","text":"unusable"}')`)
+
+	th, cur, res, err := Source{}.Read(f.env, importer.Ref{Provider: importer.ProviderOpencode, ID: "ses_wm", Path: dbRel}, nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got := mustSQLiteCursor(t, cur); got.TimeUpdated != 1757000011401 {
+		t.Fatalf("cursor = %d, want the part timestamp 1757000011401", got.TimeUpdated)
+	}
+	if len(th.Messages) != 1 {
+		t.Fatalf("got %d messages, want 1 with the bogus row skipped", len(th.Messages))
+	}
+	if res.SkippedCount != 1 {
+		t.Fatalf("SkippedCount = %d, want 1", res.SkippedCount)
+	}
+}
+
+// TestToolUnknownStatusClassified holds the compromise on tool statuses:
+// a status outside completed/error twins nothing, per the contract, but
+// is classified under its own name so the row stays visible.
+func TestToolUnknownStatusClassified(t *testing.T) {
+	f := newFixture(t)
+	db := openFixtureWriter(t, f)
+	execFixture(t, db, `INSERT INTO session (id, project_id, parent_id, directory, title, model, time_created, time_updated) VALUES ('ses_ts', 'prj_1', NULL, ?, 'Tool status session', NULL, 1757000002600, 1757000002601)`, f.worktree)
+	execFixture(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_ts', 'ses_ts', 1757000002600, 1757000002601, '{"role":"assistant"}')`)
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_ts', 'msg_ts', 'ses_ts', 1757000002600, 1757000002601, '{"type":"tool","tool":"bash","callID":"call_x","state":{"status":"timeout","input":{},"output":"late"}}')`)
+
+	th, _, res, err := Source{}.Read(f.env, importer.Ref{Provider: importer.ProviderOpencode, ID: "ses_ts", Path: dbRel}, nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	var calls, results int
+	for _, m := range th.Messages {
+		for _, p := range m.Parts {
+			if p.Type == importer.PartToolCall {
+				calls++
+			}
+			if p.Type == importer.PartToolResult {
+				results++
+			}
+		}
+	}
+	if calls != 1 || results != 0 {
+		t.Fatalf("got %d calls and %d results, want the lone call with no twin", calls, results)
+	}
+	if res.Classified["tool:timeout"] != 1 {
+		t.Fatalf("Classified = %v, want the timeout status counted", res.Classified)
 	}
 }
 

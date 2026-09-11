@@ -14,11 +14,13 @@ const (
 )
 
 // resolveWorktree is the worktree of a session: the project row's worktree
-// path, with its vcs, defaulting an empty vcs to none. A project row that
-// is missing entirely — a session whose project was deleted out from under
-// it — falls back to the session's own directory, which certainly exists
-// as a path and cannot collide with a checkout, the same bargain the
-// Claude reader's fallback makes.
+// path, with its vcs, defaulting an empty vcs to none. Only git is passed
+// through; anything else is none, because the store only knows checkouts
+// it can reason about and a novel vcs string would read as a promise. A
+// project row that is missing entirely — a session whose project was
+// deleted out from under it — falls back to the session's own directory,
+// which certainly exists as a path and cannot collide with a checkout,
+// the same bargain the Claude reader's fallback makes.
 func resolveWorktree(worktree, vcs, directory string) (path, outVCS string) {
 	if worktree == "" {
 		if directory == "" {
@@ -26,7 +28,8 @@ func resolveWorktree(worktree, vcs, directory string) (path, outVCS string) {
 		}
 		return filepath.Clean(directory), vcsNone
 	}
-	if vcs == "" {
+	worktree = filepath.Clean(worktree)
+	if vcs != vcsGit {
 		vcs = vcsNone
 	}
 	return worktree, vcs

@@ -10,7 +10,9 @@
 // # The database is opened read-only and stayed read-only
 //
 // The open is a single database/sql connection through the bundled driver
-// with DSN "file:<path>?mode=ro" and SetMaxOpenConns(1). Read-only is load
+// with a file: DSN carrying mode=ro and SetMaxOpenConns(1). The path rides
+// percent-encoded in the DSN's file component, so ?#& in a directory cannot
+// escape the path and override the read-only mode. Read-only is load
 // bearing, not polite: opencode holds the database open in WAL mode while
 // it runs, and anything but mode=ro risks creating -wal/-shm sidecars or
 // taking a lock against the running agent. No PRAGMA is ever issued —
@@ -38,13 +40,19 @@
 // # A turn is a costing unit, not a link
 //
 // Turns are split with importer.SplitTurns over one candidate per message.
-// Opencode user messages are always real prompts — there is no meta
-// furniture wearing the user role the way Claude's transcripts have — so
-// Meta is never set and the only thing that does not open a turn is a
-// tool_result-only message, which SplitTurns already excludes. Each turn's
+// Opencode user rows are always prompts: there is no Claude-style injected
+// furniture wearing the user role (attachments, reminders, hook output
+// filed as user lines), so Meta is never set and no user row is filtered.
+// The only thing that does not open a turn is a tool_result-only message,
+// which SplitTurns already excludes — and that shape does not occur in
+// this source anyway, because opencode keeps tool results on assistant
+// messages rather than sending them back under the user role. Huge summary
+// rows keep their prompt status too: a user row over the raw cap still
+// opens its turn with identity kept and raw dropped. Each turn's
 // token columns are summed over its span and its dollar cost is
 // round(sum(cost)*1e6) micros, because message.data prices in dollars and
-// the store costs in micros.
+// the store costs in micros; a span where no message carried a cost keeps
+// a nil dollar cost rather than a guessed zero.
 //
 // # Tool calls twin with their results
 //

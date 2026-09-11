@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
+	"strings"
 
 	// The read-only opens in this package go through database/sql, so the
 	// driver has to be registered somewhere this package reaches. store
@@ -73,6 +75,10 @@ func (s Source) Discover(env harness.Env) ([]importer.Ref, error) {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
 		}
+		// A machine whose database cannot be statted for permission
+		// reasons is an empty machine, not a failed import: the query
+		// path below swallows a permission error the same way, so a
+		// chmod in either direction reports the same answer.
 		if os.IsPermission(err) {
 			return nil, nil
 		}
@@ -80,6 +86,13 @@ func (s Source) Discover(env harness.Env) ([]importer.Ref, error) {
 	}
 	ids, err := listSessions(db)
 	if err != nil {
+		// The file was statted above and is gone now, or was replaced
+		// by something that is not this database: either way there is
+		// nothing to list, which is the empty-machine answer, not an
+		// error worth failing a whole import over.
+		if isOpenMissing(err) || os.IsPermission(err) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("opencode: list sessions: %w", err)
 	}
 	refs := make([]importer.Ref, 0, len(ids))
@@ -122,12 +135,30 @@ func listSessions(dbPath string) ([]string, error) {
 	return ids, nil
 }
 
+// isOpenMissing reports the errors a read-only open produces when the
+// database file vanished between the stat and the query, or was replaced
+// by a file that is not this database: the engine cannot open it, or the
+// session table is not there.
+func isOpenMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "unable to open") || strings.Contains(s, "no such table")
+}
+
 // openReadOnly opens one read-only handle to a SQLite file: mode=ro in the
 // DSN so the engine cannot write, and a single connection so there is only
 // ever one reader to reason about. No pragma is issued on the handle —
 // journal_mode especially stays whatever opencode left it as.
+//
+// The path rides in the DSN's file component, so it is percent-encoded
+// through net/url rather than concatenated: a directory carrying ?#& would
+// otherwise spill out of the path and override mode=ro (or worse), and an
+// encoded path keeps the query exactly "mode=ro".
 func openReadOnly(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open(store.DriverName, "file:"+dbPath+"?mode=ro")
+	u := url.URL{Scheme: "file", Path: dbPath, RawQuery: "mode=ro"}
+	db, err := sql.Open(store.DriverName, u.String())
 	if err != nil {
 		return nil, err
 	}

@@ -28,7 +28,7 @@
       "provider": "opencode",
       "harness": "opencode",
       "foreign_session_id": "ses_parent",
-      "resume_cmd": ""
+      "resume_cmd": "opencode run --session ses_parent"
     },
     "turns": [
       {

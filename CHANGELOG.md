@@ -339,6 +339,28 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `krowk doctor` will report a skill it did not write as installed either way,
   and say whether the next install will adopt it or leave it alone for good.
 
+### Fixed
+
+- The opencode importer, still unreleased, holds its review findings: the
+  database path rides percent-encoded in the read-only DSN, so `?#&` in a
+  directory can no longer escape the path and override `mode=ro`; `Read`
+  refuses a ref naming anything but the known database instead of opening
+  the hinted path. The watermark is the largest timestamp successfully
+  imported over message and part rows alike, and skipped rows no longer move
+  it, so a failed row is retried rather than forgotten. Oversized-row prefix
+  scans are anchored to the top level of the blob (tokens scoped to the
+  `tokens` object), so a nested field name in prose cannot flip a role or
+  inflate a turn; cap checks count bytes, not characters. A turn whose
+  messages carried no cost keeps a NULL dollar cost instead of a guessed
+  zero, a child session's parent binding carries its resume command, and
+  worktree `vcs` passes through only `git` (anything else is `none`) with
+  the path cleaned. A tool status outside `completed`/`error` still twins
+  nothing, but is now classified under its own name instead of vanishing
+  silently, as is a message role outside `user`/`assistant`/`system`. A
+  database that vanishes between listing and reading is an empty machine,
+  not an error, and a permission refusal reports the same empty answer
+  whether it lands on the stat or the query.
+
 ## [0.9.0] - 2026-09-06
 
 ### Added

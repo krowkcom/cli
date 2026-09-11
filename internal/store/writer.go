@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ingestBatchSize caps how many messages one Ingest transaction holds.
@@ -189,6 +191,13 @@ func (w *Writer) Ingest(ctx context.Context, th Thread) (Result, error) {
 func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, error) {
 	var res Result
 
+	// Title fallback: a thread naming no title is listed by the first 80
+	// chars of its first user text, computed at import into session.title
+	// so the listing never reads message/part blobs to name a row.
+	if th.Session.Title == "" {
+		th.Session.Title = sessionTitleFallback(th.Messages)
+	}
+
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
 		return res, fmt.Errorf("store: ingest begin: %w", err)
@@ -323,9 +332,16 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 		`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
 		b.Provider, b.ForeignSessionID).Scan(&sessionID)
 	if err == nil {
+		title := s.Title
+		if title == "" {
+			// Never wipe a stored title with an untitled re-import.
+			if terr := tx.QueryRowContext(ctx, `SELECT title FROM session WHERE id = ?`, sessionID).Scan(&title); terr != nil {
+				return "", false, false, fmt.Errorf("store: ingest read session title: %w", terr)
+			}
+		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE session SET worktree_id = ?, directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
-			worktreeID, s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, sessionID); err != nil {
+			worktreeID, s.Directory, title, s.Model, s.Provider, s.Harness, now, sessionID); err != nil {
 			return "", false, false, fmt.Errorf("store: ingest update session: %w", err)
 		}
 		return sessionID, false, false, nil
@@ -650,4 +666,44 @@ func insertOneMessage(ctx context.Context, tx *sql.Tx, m *Minter, now int64, ses
 		}
 	}
 	return len(msg.Parts), nil
+}
+
+// sessionTitleFallback names an untitled thread by the first 80 chars of
+// its first user text part. Whitespace is collapsed so a multiline prompt
+// lists as one line; overlong titles cut on a rune boundary.
+func sessionTitleFallback(msgs []Message) string {
+	for _, m := range msgs {
+		if m.Role != RoleUser {
+			continue
+		}
+		for _, p := range m.Parts {
+			if p.Type != "text" {
+				continue
+			}
+			text := partText(p.Data)
+			text = strings.Join(strings.Fields(text), " ")
+			if text == "" {
+				continue
+			}
+			if utf8.RuneCountInString(text) > 80 {
+				runes := []rune(text)
+				return string(runes[:80])
+			}
+			return text
+		}
+	}
+	return ""
+}
+
+// partText pulls {"text":...} out of a text part's data. Anything
+// unparseable is no title rather than an error: the fallback names a row,
+// it never fails an import.
+func partText(data string) string {
+	var v struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(data), &v); err != nil {
+		return ""
+	}
+	return v.Text
 }

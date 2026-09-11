@@ -1,0 +1,82 @@
+// Package cursor reads Cursor's agent transcripts off this machine and turns
+// them into the canonical store.Thread that internal/importer fixes.
+//
+// Layout: <home>/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl,
+// with a repo.json beside agent-transcripts holding {"id": "<uuid>"} — a repo
+// id only, not a path.
+//
+// # A line is a role or furniture
+//
+// Observed shapes are {"role":"user"|"assistant","message":{"content":[...]}},
+// with content blocks {"type":"text","text":...} and {"type":"tool_use",
+// "name":...,"input":{...}} — the tool_use blocks never carry an "id" field —
+// and {"type":"turn_ended","status":...} with no role at all. ZERO
+// tool_result blocks were observed on the census machine, so the tool_result
+// shape below is leniency over unobserved shapes, documented as such. Every
+// line lands in exactly one of three places — a message, Result.Classified,
+// or Result.Skipped — and a test asserts those three add up to the line
+// count, with the repo.json event held apart: it is not a line, so it is
+// asserted separately rather than folded into the sum.
+//
+// # Position-keyed dedup, because there are no ids
+//
+// Nothing in a Cursor transcript names a message: no uuid per line, no id on
+// tool_use blocks. So Message.ForeignID is always "" (stored NULL), and the
+// store appends such a message unconditionally — the caller must hold the
+// JSONL byte-offset cursor and never re-send. That is why this source,
+// unlike claude/opencode, honors the cursor: Read passes it to
+// importer.ReadJSONL and delta reads return only new lines. The tool_call_id
+// for an id-less tool_use is "cursor:<lineNo>", the ReadJSONL line number
+// within this Read — stable for full reads, and on delta reads only new
+// lines are numbered, which is exactly the append case. Pairing only ever
+// happens within one Read pass, so the renumbering of a resumed read cannot
+// break a link.
+//
+// # The transcript never names a time, a directory, or a model
+//
+// Thread carries no per-message time and the store stamps ingest time, so
+// there is nowhere to put the file mtime — but Read still stats the file, so
+// the value is in hand the day a writer learns to take it. User text opens
+// with <timestamp>...</timestamp> tags; they are left in the text, not
+// parsed. Session.Directory stays "" and Model stays "": the transcript
+// names neither. Provider is "cursor" throughout, the model-vendor fallback,
+// and Harness is "cursor". ResumeCmd is "" — resuming is unknown in v1.
+//
+// # The slug is not a path until the filesystem says so
+//
+// The slug decodes as "/" + strings.ReplaceAll(slug, "-", "/"), but that
+// transform is not invertible — a dash in a real directory is
+// indistinguishable from a separator — so the decoded path is used ONLY if
+// that directory exists on disk, and then walked up for a .git entry the way
+// the Claude reader does. Otherwise the worktree is "cursor:<slug>" with vcs
+// "none", counted via acc.Classify as "worktree-fallback". Name is
+// filepath.Base(path) — for the fallback that Base is the whole
+// "cursor:<slug>", which is fine: it names the slug rather than inventing a
+// directory.
+//
+// # repo.json is one event, on full reads only
+//
+// repo.json gives ONE session_event of type "cursor_repo" with data
+// {"repo_id": ...}. Missing or unreadable repo.json is no event, not an
+// error. The event is emitted only when the incoming cursor is zero: turns
+// and events are positional cumulative lists in the store, so re-emitting it
+// on every delta read would append a duplicate per import.
+//
+// # Delta turns are over the delta
+//
+// Turns are computed over just the lines this Read saw. An appended
+// assistant-only continuation therefore forms its own leading span, which the
+// store appends as a new turn. Accepted and documented: the alternative is
+// re-reading from the top on every import, which is what the cursor exists
+// to avoid, and the per-turn costs here are zero anyway — Cursor transcripts
+// price nothing.
+//
+// # tool_result is a guess held leniently
+//
+// With zero tool_results observed, both likely shapes are supported:
+// {"type":"tool_result","tool_use_id"|"callID"|"id":..., "content"|"output"...,
+// "isError"|"is_error"...}, with content a string, blocks, or raw. A result
+// whose id matches no call in this Read is still emitted, counted via
+// Classify as "tool_result:unlinked" — dropping it would lose transcript
+// over a pairing this package cannot verify.
+package cursor

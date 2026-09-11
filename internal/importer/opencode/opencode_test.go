@@ -486,8 +486,8 @@ func TestTurnCosts(t *testing.T) {
 			turn.CostCacheWrite != w.write {
 			t.Fatalf("turn %d tokens = %+v, want %+v", i, turn, w)
 		}
-		if sum := turn.CostInput + turn.CostOutput + turn.CostReasoning + turn.CostCacheRead + turn.CostCacheWrite; turn.CostTotal != sum {
-			t.Fatalf("turn %d total %d != %d, the sum of its classes", i, turn.CostTotal, sum)
+		if sum := turn.CostInput + turn.CostOutput + turn.CostCacheRead + turn.CostCacheWrite; turn.CostTotal != sum {
+			t.Fatalf("turn %d total %d != %d, the sum of its priced classes (reasoning excluded, as in the Claude reader)", i, turn.CostTotal, sum)
 		}
 		if turn.CostUSDMicros == nil {
 			t.Fatalf("turn %d carries no dollar cost", i)
@@ -1119,6 +1119,136 @@ func TestToolUnknownStatusClassified(t *testing.T) {
 	}
 	if res.Classified["tool:timeout"] != 1 {
 		t.Fatalf("Classified = %v, want the timeout status counted", res.Classified)
+	}
+}
+
+func TestResumeCmdRejectsUnsafeID(t *testing.T) {
+	if got := resumeCmd("ses_parent"); got != "opencode run --session ses_parent" {
+		t.Fatalf("resumeCmd = %q, want the session command", got)
+	}
+	// The id rides unquoted, so anything outside [A-Za-z0-9_-] omits
+	// it rather than risking injection.
+	for _, bad := range []string{"ses x", `ses"x`, "ses;rm -rf", "ses$(id)", "ses|less", "../ses"} {
+		if got := resumeCmd(bad); got != "opencode run" {
+			t.Fatalf("resumeCmd(%q) = %q, want the bare command", bad, got)
+		}
+	}
+	if got := resumeCmd(""); got != "" {
+		t.Fatalf("resumeCmd(\"\") = %q, want empty", got)
+	}
+	// Dashes join words rather than start flags here: the id is always
+	// the value after --session, never parsed as flags itself.
+	if got := resumeCmd("ses-abc_123"); got != "opencode run --session ses-abc_123" {
+		t.Fatalf("resumeCmd = %q, want the session command", got)
+	}
+}
+
+func TestResolveWorktreeRejectsRelative(t *testing.T) {
+	if got, vcs := resolveWorktree("relative/path", "git", "/abs/dir"); got != "/abs/dir" || vcs != vcsNone {
+		t.Fatalf("relative worktree = %q,%q, want the directory fallback with vcs none", got, vcs)
+	}
+	if got, vcs := resolveWorktree("relative/path", "git", ""); got != "" || vcs != vcsNone {
+		t.Fatalf("relative worktree with no directory = %q,%q, want empty none", got, vcs)
+	}
+	if got, vcs := resolveWorktree("/abs/wt", "git", "/abs/dir"); got != "/abs/wt" || vcs != vcsGit {
+		t.Fatalf("absolute worktree = %q,%q, want it passed through", got, vcs)
+	}
+}
+
+func TestDiscoverGarbageDatabaseIsEmptyMachine(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".local", "share", "opencode")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// A file that is not a database where the database should be: the
+	// machine reads as empty, not as a failed import.
+	if err := os.WriteFile(filepath.Join(dir, "opencode.db"), []byte("replaced-by-garbage"), 0o600); err != nil {
+		t.Fatalf("WriteFile garbage: %v", err)
+	}
+	env := func(k string) string {
+		if k == "HOME" {
+			return home
+		}
+		return ""
+	}
+	refs, err := Source{}.Discover(env)
+	if err != nil {
+		t.Fatalf("Discover of garbage db: %v", err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("Discover = %+v, want nothing for a garbage database", refs)
+	}
+}
+
+// TestPartCappedErrorStatusTwins drives the capped-part status through the
+// state object: status nests at depth 2, so a top-level scan never matches
+// it, and an error tool that lost its twin would read as still running.
+func TestPartCappedErrorStatusTwins(t *testing.T) {
+	f := newFixture(t)
+	db := openFixtureWriter(t, f)
+	execFixture(t, db, `INSERT INTO session (id, project_id, parent_id, directory, title, model, time_created, time_updated) VALUES ('ses_caperr', 'prj_1', NULL, ?, 'Cap error session', NULL, 1757000002700, 1757000002701)`, f.worktree)
+	execFixture(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_caperr', 'ses_caperr', 1757000002700, 1757000002701, '{"role":"assistant"}')`)
+	pad := strings.Repeat("z", partRawLimit+100)
+	// Hand-built so the discriminator and state ride first: a Go map
+	// would marshal keys alphabetically and bury "type" past the prefix.
+	data := `{"type":"tool","tool":"bash","callID":"call_big_err","state":{"status":"error","input":{"cmd":"x"},"output":"boom"},"pad":"` + pad + `"}`
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_caperr', 'msg_caperr', 'ses_caperr', 1757000002700, 1757000002701, ?)`, data)
+
+	th, _, _, err := Source{}.Read(f.env, importer.Ref{Provider: importer.ProviderOpencode, ID: "ses_caperr", Path: dbRel}, nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(th.Messages) != 1 || len(th.Messages[0].Parts) != 2 {
+		t.Fatalf("got %d messages with %d parts, want 1 message with the call+result twin",
+			len(th.Messages), len(th.Messages[0].Parts))
+	}
+	var result *store.Part
+	for i := range th.Messages[0].Parts {
+		if th.Messages[0].Parts[i].Type == importer.PartToolResult {
+			result = &th.Messages[0].Parts[i]
+		}
+	}
+	if result == nil {
+		t.Fatal("capped error tool has no tool_result twin")
+	}
+	var tr struct {
+		IsError bool `json:"is_error"`
+	}
+	if err := json.Unmarshal([]byte(result.Data), &tr); err != nil {
+		t.Fatalf("decode tool result data: %v", err)
+	}
+	if !tr.IsError {
+		t.Fatalf("tool_result data = %s, want is_error=true", result.Data)
+	}
+}
+
+// TestBadPartSkippedMessageKept holds the part-error rule: one unusable
+// part row is a skip with a reason, not a failed message — the good parts
+// on the same message still land.
+func TestBadPartSkippedMessageKept(t *testing.T) {
+	f := newFixture(t)
+	db := openFixtureWriter(t, f)
+	execFixture(t, db, `INSERT INTO session (id, project_id, parent_id, directory, title, model, time_created, time_updated) VALUES ('ses_badpart', 'prj_1', NULL, ?, 'Bad part session', NULL, 1757000002800, 1757000002801)`, f.worktree)
+	execFixture(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_bp', 'ses_badpart', 1757000002800, 1757000002801, '{"role":"user"}')`)
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_bp_good', 'msg_bp', 'ses_badpart', 1757000002800, 1757000002801, '{"type":"text","text":"kept"}')`)
+	// Oversized with no type in its prefix: partByID cannot route it.
+	big := strings.Repeat("q", partRawLimit+100)
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_bp_bad', 'msg_bp', 'ses_badpart', 1757000002800, 1757000002801, ?)`,
+		`{"blob":"`+big+`"}`)
+
+	th, _, res, err := Source{}.Read(f.env, importer.Ref{Provider: importer.ProviderOpencode, ID: "ses_badpart", Path: dbRel}, nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(th.Messages) != 1 {
+		t.Fatalf("got %d messages, want 1 with the bad part skipped", len(th.Messages))
+	}
+	if len(th.Messages[0].Parts) != 1 || th.Messages[0].Parts[0].ForeignID != "prt_bp_good" {
+		t.Fatalf("parts = %+v, want only the good text part", th.Messages[0].Parts)
+	}
+	if res.SkippedCount != 1 {
+		t.Fatalf("SkippedCount = %d, want 1 for the unroutable part", res.SkippedCount)
 	}
 }
 

@@ -22,7 +22,11 @@ const (
 // which certainly exists as a path and cannot collide with a checkout,
 // the same bargain the Claude reader's fallback makes.
 func resolveWorktree(worktree, vcs, directory string) (path, outVCS string) {
-	if worktree == "" {
+	// A non-empty worktree that is not absolute is rejected to the
+	// directory fallback: a relative path resolves against whatever the
+	// reader's cwd happens to be, which names a different checkout per
+	// caller rather than the session's one.
+	if worktree == "" || !filepath.IsAbs(worktree) {
 		if directory == "" {
 			return "", vcsNone
 		}

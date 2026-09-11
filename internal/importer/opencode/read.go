@@ -273,7 +273,8 @@ func (b *builder) load(db *sql.DB) error {
 			// row whose prefix does not even name a role lands here
 			// rather than under a guessed role. Skipped rows do not move
 			// the watermark, so the next read retries them instead of
-			// forgetting them.
+			// forgetting them. The offset is always 0: opencode has no
+			// byte offsets, the cursor is timestamp-based.
 			b.acc.Skip(n, 0, err.Error())
 			continue
 		}
@@ -336,7 +337,9 @@ func (b *builder) messageByID(db *sql.DB, n int, r messageMeta) (int64, error) {
 	// a nested "input" in the tail cannot inflate a turn.
 	var tk tokenData
 	foundTokens := false
-	if tokObj, ok := extractTopObject(head, "tokens"); ok {
+	tokObj := ""
+	if obj, ok := extractTopObject(head, "tokens"); ok {
+		tokObj = obj
 		if v, ok := extractJSONInt(tokObj, "input"); ok {
 			tk.Input, foundTokens = v, true
 		}
@@ -358,10 +361,11 @@ func (b *builder) messageByID(db *sql.DB, n int, r messageMeta) (int64, error) {
 	var tokensRaw json.RawMessage
 	var usage string
 	if foundTokens {
-		if raw, err := json.Marshal(tk); err == nil {
-			tokensRaw = raw
-			usage = storable(raw)
-		}
+		// The verbatim tokens object, not a remarshal of tk: tk
+		// zero-fills every class it did not find, so marshalling it
+		// would fabricate zeros for fields the prefix never named.
+		tokensRaw = json.RawMessage(tokObj)
+		usage = storable(tokensRaw)
 	}
 	var cost *float64
 	if v, ok := extractTopJSONFloat(head, "cost"); ok {
@@ -432,7 +436,7 @@ func (b *builder) addMessageRaw(db *sql.DB, n int, msgID, role, modelID, provide
 		dollars = *cost
 	}
 
-	parts, partMax, err := b.parts(db, msgID)
+	parts, partMax, err := b.parts(db, n, msgID)
 	if err != nil {
 		return 0, err
 	}
@@ -455,61 +459,12 @@ func (b *builder) addMessageRaw(db *sql.DB, n int, msgID, role, modelID, provide
 	return partMax, nil
 }
 
-// extractJSONString scans hay for `"key" : "value"` without parsing it
-// as JSON, so a 239MB blob's 2KB prefix yields identity fields while
-// the tail is never materialised. Whitespace around the colon is
-// allowed; escapes in the value are unquoted when possible.
-func extractJSONString(hay, key string) (string, bool) {
-	needle := `"` + key + `"`
-	for off := 0; off < len(hay); {
-		i := strings.Index(hay[off:], needle)
-		if i < 0 {
-			return "", false
-		}
-		p := off + i + len(needle)
-		for p < len(hay) && (hay[p] == ' ' || hay[p] == '\t' || hay[p] == '\n' || hay[p] == '\r') {
-			p++
-		}
-		if p >= len(hay) || hay[p] != ':' {
-			off = off + i + len(needle)
-			continue
-		}
-		p++
-		for p < len(hay) && (hay[p] == ' ' || hay[p] == '\t' || hay[p] == '\n' || hay[p] == '\r') {
-			p++
-		}
-		if p >= len(hay) || hay[p] != '"' {
-			off = off + i + len(needle)
-			continue
-		}
-		p++
-		var sb strings.Builder
-		escaped := false
-		for ; p < len(hay); p++ {
-			c := hay[p]
-			if escaped {
-				sb.WriteByte(c)
-				escaped = false
-				continue
-			}
-			if c == '\\' {
-				escaped = true
-				continue
-			}
-			if c == '"' {
-				return sb.String(), true
-			}
-			sb.WriteByte(c)
-		}
-		return "", false
-	}
-	return "", false
-}
-
 // braceDepthAt is the object nesting depth at byte pos: the count of
 // unclosed '{' before it, ignoring braces inside double-quoted strings.
 // Top-level fields of the blob sit at depth 1; a `"role"` at any other
-// depth belongs to prose or a nested object, not to the message.
+// depth belongs to prose or a nested object, not to the message. It scans
+// from the start per call, so topKeyPos over k candidates is O(n²) —
+// negligible for the ≤4KB prefixes it ever runs on, not worth an index.
 func braceDepthAt(hay string, pos int) int {
 	depth := 0
 	inStr := false
@@ -800,19 +755,6 @@ func extractJSONInt(hay, key string) (int64, bool) {
 	return v, true
 }
 
-// extractJSONFloat is extractJSONNumber parsed as a float.
-func extractJSONFloat(hay, key string) (float64, bool) {
-	lit, ok := extractJSONNumber(hay, key)
-	if !ok {
-		return 0, false
-	}
-	v, err := strconv.ParseFloat(lit, 64)
-	if err != nil {
-		return 0, false
-	}
-	return v, true
-}
-
 // parts reads one message's part rows in timeline order and maps each onto
 // canonical parts, returning the largest part time_updated for the
 // watermark. One row is usually one part; a finished tool row is two
@@ -822,7 +764,7 @@ func extractJSONFloat(hay, key string) (float64, bool) {
 // column), then the full blob per small part or a short substr prefix
 // per oversized part, string-scanned in Go. No json_extract anywhere:
 // it parses the whole blob server-side and OOMs the wasm driver.
-func (b *builder) parts(db *sql.DB, msgID string) ([]store.Part, int64, error) {
+func (b *builder) parts(db *sql.DB, n int, msgID string) ([]store.Part, int64, error) {
 	rows, err := db.Query(`SELECT id, length(CAST(data AS BLOB)), time_updated
 	  FROM part WHERE message_id = ? ORDER BY time_created ASC, rowid ASC`, msgID)
 	if err != nil {
@@ -845,12 +787,21 @@ func (b *builder) parts(db *sql.DB, msgID string) ([]store.Part, int64, error) {
 	var parts []store.Part
 	var partMax int64
 	for _, m := range metas {
-		if m.updated > partMax {
-			partMax = m.updated
-		}
 		ps, err := b.partByID(db, m)
 		if err != nil {
-			return nil, 0, err
+			// A part this build cannot use is a skip with a reason,
+			// not a failed message: discarding the whole message
+			// would drop good parts over one bad row. The offset is
+			// always 0 — opencode has no byte offsets, the cursor is
+			// timestamp-based — and the row still counts as consumed.
+			// Skipped parts do not move the watermark, so the next
+			// read retries them instead of forgetting them.
+			b.acc.Skip(n, 0, err.Error())
+			b.acc.Lines++
+			continue
+		}
+		if m.updated > partMax {
+			partMax = m.updated
 		}
 		parts = append(parts, ps...)
 	}
@@ -883,10 +834,15 @@ func (b *builder) partByID(db *sql.DB, m partMeta) ([]store.Part, error) {
 	callID, _ := extractTopJSONString(prefix.String, "callID")
 	text, _ := extractTopJSONString(prefix.String, "text")
 	snapshot, _ := extractTopJSONString(prefix.String, "snapshot")
+	// Status nests inside the state object (depth 2), so a top-level
+	// scan never matches it: extract the state object first, then scan
+	// status within it, where it sits at the top level.
 	var state sql.NullString
-	if status, ok := extractTopJSONString(prefix.String, "status"); ok {
-		raw, _ := json.Marshal(toolState{Status: status})
-		state = sql.NullString{String: string(raw), Valid: true}
+	if stateObj, ok := extractTopObject(prefix.String, "state"); ok {
+		if status, ok := extractTopJSONString(stateObj, "status"); ok {
+			raw, _ := json.Marshal(toolState{Status: status})
+			state = sql.NullString{String: string(raw), Valid: true}
+		}
 	}
 	return b.partCapped(m.id, typ, text, tool, callID, state, snapshot), nil
 }
@@ -1047,7 +1003,11 @@ func (b *builder) turns() []store.Turn {
 			t.CostReasoning += tk.Reasoning
 			t.CostCacheRead += tk.Cache.Read
 			t.CostCacheWrite += tk.Cache.Write
-			t.CostTotal += tk.Input + tk.Output + tk.Reasoning + tk.Cache.Read + tk.Cache.Write
+			// Total excludes reasoning, matching the Claude reader's addTo:
+			// Anthropic reports no total and the column is the sum of the
+			// four priced classes, while reasoning is tracked separately in
+			// CostReasoning.
+			t.CostTotal += tk.Input + tk.Output + tk.Cache.Read + tk.Cache.Write
 			if i < len(b.hasCost) && b.hasCost[i] {
 				hasCostAny = true
 			}
@@ -1109,10 +1069,17 @@ func withForeignID(p store.Part, foreignID string) store.Part {
 	return p
 }
 
-// resumeCmd is what a person types to get back into a session.
+// resumeCmd is what a person types to get back into a session. The id
+// rides unquoted, so it is allow-listed to [A-Za-z0-9_-]: anything else
+// (a space, a quote, a flag) omits the id rather than risking injection.
 func resumeCmd(sessionID string) string {
 	if sessionID == "" {
 		return ""
+	}
+	for _, c := range sessionID {
+		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return "opencode run"
+		}
 	}
 	return "opencode run --session " + sessionID
 }

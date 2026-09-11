@@ -144,7 +144,8 @@ func isOpenMissing(err error) bool {
 		return false
 	}
 	s := err.Error()
-	return strings.Contains(s, "unable to open") || strings.Contains(s, "no such table")
+	return strings.Contains(s, "unable to open") || strings.Contains(s, "no such table") ||
+		strings.Contains(s, "file is not a database") || strings.Contains(s, "not a database")
 }
 
 // openReadOnly opens one read-only handle to a SQLite file: mode=ro in the

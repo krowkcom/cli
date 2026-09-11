@@ -119,7 +119,7 @@
         "status": "done",
         "cost_input": 9121,
         "cost_output": 1660,
-        "cost_total": 53420,
+        "cost_total": 53397,
         "cost_cache_read": 42496,
         "cost_cache_write": 120,
         "cost_reasoning": 23,

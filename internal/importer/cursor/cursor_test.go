@@ -912,6 +912,56 @@ func TestEmptyTextBlockOpensNoTurn(t *testing.T) {
 	}
 }
 
+// TestNullElementIsUnknownNotEmpty: an explicit null inside a content
+// array is a block-shaped hole, not empty text — it is counted unknown
+// with its payload rather than vanishing like "".
+func TestNullElementIsUnknownNotEmpty(t *testing.T) {
+	env, ref, _ := adhocTranscript(t,
+		projectsDir+"/adhoc-null/agent-transcripts/adhoc-null-1/adhoc-null-1.jsonl", "adhoc-null-1",
+		[]string{
+			`{"role":"assistant","message":{"content":[null]}}`,
+		}, "")
+	th, _, res := adhocRead(t, env, ref, nil)
+
+	if len(th.Messages) != 1 || len(th.Messages[0].Parts) != 1 {
+		t.Fatalf("messages = %+v, want one message with one part", th.Messages)
+	}
+	if got := th.Messages[0].Parts[0]; got.Type != importer.PartUnknown {
+		t.Fatalf("null-element part type = %q, want unknown", got.Type)
+	}
+	if res.Unknown != 1 {
+		t.Fatalf("Unknown = %d %v, want the null element counted", res.Unknown, res.UnknownTypes)
+	}
+}
+
+// TestSnakeCaseCallIDLinks: the unobserved tool_result shape is held
+// leniently, which includes the snake-case call_id spelling alongside
+// tool_use_id and callID.
+func TestSnakeCaseCallIDLinks(t *testing.T) {
+	env, ref, _ := adhocTranscript(t,
+		projectsDir+"/adhoc-snake/agent-transcripts/adhoc-snake-1/adhoc-snake-1.jsonl", "adhoc-snake-1",
+		[]string{
+			`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}`,
+			`{"role":"assistant","message":{"content":[{"type":"tool_result","call_id":"cursor:1","output":"ok"}]}}`,
+		}, "")
+	th, _, res := adhocRead(t, env, ref, nil)
+
+	var resultID string
+	for _, m := range th.Messages {
+		for _, p := range m.Parts {
+			if p.Type == importer.PartToolResult {
+				resultID = p.ToolCallID
+			}
+		}
+	}
+	if resultID != "cursor:1" {
+		t.Fatalf("tool_result id = %q, want the snake-case link cursor:1", resultID)
+	}
+	if res.Classified["tool_result:unlinked"] != 0 {
+		t.Fatalf("Classified = %v, want no orphan", res.Classified)
+	}
+}
+
 // canonicalThread is the golden's shape. It exists rather than marshalling
 // store.Thread directly because store's structs have no json tags, so their
 // encoding would be Go field names and every rename would rewrite the

@@ -2,6 +2,7 @@ package cursor
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -115,9 +116,11 @@ func (s Source) Read(env harness.Env, ref importer.Ref, cursor importer.Cursor) 
 		// scan would build a partial turn list, and a caller that
 		// ingested it would store turns the transcript never held. The
 		// pass's counts stay with it — merging them would double-count
-		// every line in Result.Lines.
+		// every line in Result.Lines. Joined with the delta pass error,
+		// if any, so a double failure reports both rather than shadowing
+		// the transcript read behind the candidate scan.
 		if _, _, fberr := importer.ReadJSONL(f, importer.JSONLCursor{}, fb.line); fberr != nil {
-			return th, next, b.acc, fmt.Errorf("cursor: read %s: %w", ref.Path, fberr)
+			return th, next, b.acc, errors.Join(err, fmt.Errorf("cursor: read %s: %w", ref.Path, fberr))
 		}
 		if len(fb.candidates) > 0 {
 			th.Turns = turnsFrom(fb.candidates)
@@ -292,6 +295,12 @@ func (b *builder) parts(content json.RawMessage, lineNo int) []store.Part {
 // never classified: whether it is linked depends on calls later in the same
 // Read, so thread() reconciles once the pass is complete.
 func (b *builder) block(raw json.RawMessage, lineNo int) (store.Part, bool) {
+	// An explicit null element is a block-shaped hole, not empty text:
+	// without this it would unmarshal into a string as "" and vanish
+	// silently instead of being counted unknown with its payload.
+	if strings.TrimSpace(string(raw)) == "null" {
+		return b.acc.NormalizePart("block", raw), true
+	}
 	// A bare-string array element reads as text, the same textData shape
 	// as bare-string content: without this a ["plain string"] element
 	// would fall to NormalizePart("block") unknown.
@@ -308,10 +317,7 @@ func (b *builder) block(raw json.RawMessage, lineNo int) (store.Part, bool) {
 	}
 	switch blk.Type {
 	case "text":
-		if blk.Text == "" {
-			return store.Part{}, false
-		}
-		return store.Part{Type: importer.PartText, Data: textData(blk.Text)}, true
+		return b.textPart(raw, blk.Text)
 	case "tool_use":
 		id := blk.ID
 		if id == "" {
@@ -335,11 +341,31 @@ func (b *builder) block(raw json.RawMessage, lineNo int) (store.Part, bool) {
 		// writes. Each alias is tried in turn; linkage is reconciled in
 		// thread(), once every call in this Read has been seen — a result
 		// preceding its call in the same Read is linked, not orphaned.
-		id := firstNonEmpty(blk.ToolUseID, blk.CallID, blk.ID)
+		id := firstNonEmpty(blk.ToolUseID, blk.CallID, blk.CallIDS, blk.ID)
 		return importer.NewToolResultPart(id, resultOutput(blk), blk.IsError || blk.IsErr), true
 	default:
 		return b.acc.NormalizePart(blk.Type, raw), true
 	}
+}
+
+// textPart maps a text block onto its part. The text arrives raw because a
+// non-string text — unobserved, but cheap to allow — must not fail the whole
+// block: a string becomes the canonical text shape (empty dropped, like the
+// bare-string content shape), and anything else keeps its verbatim payload
+// under the text type rather than landing unknown.
+func (b *builder) textPart(raw, text json.RawMessage) (store.Part, bool) {
+	var s string
+	if err := json.Unmarshal(text, &s); err == nil {
+		if s == "" {
+			return store.Part{}, false
+		}
+		return store.Part{Type: importer.PartText, Data: textData(s)}, true
+	}
+	trimmed := strings.TrimSpace(string(text))
+	if len(trimmed) == 0 || trimmed == "null" {
+		return store.Part{}, false
+	}
+	return b.acc.NormalizePart(importer.PartText, raw), true
 }
 
 // resultOutput is the payload of a tool_result block: content, else output,
@@ -533,8 +559,8 @@ type envelope struct {
 
 // contentBlock is one entry of a message's content array.
 type contentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type string          `json:"type"`
+	Text json.RawMessage `json:"text"`
 	// tool_use fields. ID is read too, though no transcript observed
 	// carries it: the day one does, the block's own id should win over the
 	// synthesised one.
@@ -545,6 +571,7 @@ type contentBlock struct {
 	// guess at what Cursor writes.
 	ToolUseID string          `json:"tool_use_id"`
 	CallID    string          `json:"callID"`
+	CallIDS   string          `json:"call_id"`
 	Content   json.RawMessage `json:"content"`
 	Output    json.RawMessage `json:"output"`
 	IsError   bool            `json:"isError"`

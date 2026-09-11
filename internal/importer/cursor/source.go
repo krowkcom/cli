@@ -97,9 +97,12 @@ func (s Source) Discover(env harness.Env) ([]importer.Ref, error) {
 			id := sess.Name()
 			// The session file is named after its directory: <id>/<id>.jsonl.
 			// A directory without it is a session with nothing written yet,
-			// not a session — Discover names what Read can open.
+			// not a session — Discover names what Read can open. The leaf
+			// must be a regular file: Read opens through O_NOFOLLOW and
+			// refuses a symlinked leaf, so a symlink here would be a ref
+			// Read fails on.
 			name := id + ".jsonl"
-			info, err := os.Stat(filepath.Join(root, slug.Name(), transcriptsDir, id, name))
+			info, err := os.Lstat(filepath.Join(root, slug.Name(), transcriptsDir, id, name))
 			if err != nil || !info.Mode().IsRegular() {
 				continue
 			}

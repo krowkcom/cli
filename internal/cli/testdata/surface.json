@@ -580,8 +580,55 @@
       },
       {
         "name": "sessions",
-        "summary": "The local store of agent sessions",
+        "usage": "krowk sessions [--harness \u003cname\u003e] [--worktree \u003cpath\u003e] [--limit N] [--all]",
+        "summary": "List every agent thread on this machine, newest first",
+        "flags": [
+          {
+            "name": "harness",
+            "type": "string",
+            "default": "",
+            "usage": "Only sessions from this harness, e.g. claude"
+          },
+          {
+            "name": "worktree",
+            "type": "string",
+            "default": "",
+            "usage": "Only sessions in this worktree, by path"
+          },
+          {
+            "name": "limit",
+            "type": "int",
+            "default": "50",
+            "usage": "List at most this many sessions (default 50)"
+          },
+          {
+            "name": "all",
+            "type": "bool",
+            "default": "false",
+            "usage": "List every session, ignoring --limit"
+          }
+        ],
         "subcommands": [
+          {
+            "name": "show",
+            "usage": "krowk sessions show \u003cid\u003e [--thinking]",
+            "summary": "Read one session back, with its turns, messages and parts",
+            "args": [
+              {
+                "name": "id",
+                "summary": "The session id, an unambiguous id prefix of at least 8 chars, or a foreign session id",
+                "required": true
+              }
+            ],
+            "flags": [
+              {
+                "name": "thinking",
+                "type": "bool",
+                "default": "false",
+                "usage": "Show full thinking parts instead of one line each"
+              }
+            ]
+          },
           {
             "name": "import",
             "usage": "krowk sessions import --from \u003cprovider|all\u003e [--dry-run] [--limit N]",

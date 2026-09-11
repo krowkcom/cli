@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"fmt"
+
 	"github.com/charmbracelet/huh"
 
 	"github.com/krowkcom/cli/internal/api"
 	"github.com/krowkcom/cli/internal/output"
 	"github.com/krowkcom/cli/internal/runctx"
+	"github.com/krowkcom/cli/internal/store"
 )
 
 // interactive reports whether a command may put a question on the terminal
@@ -53,6 +56,32 @@ func pickWorkspace(title string, stored []api.WorkspaceKey) (string, error) {
 		// Esc or ctrl-c is a person saying "never mind", which is not a failure
 		// of anything — but it must not read as a selection either, so the
 		// command it interrupts reports it and does nothing.
+		return "", api.Fail("selection_cancelled", "nothing was selected and nothing was changed")
+	}
+	return choice, nil
+}
+
+// pickSession asks which session was meant, answering with its store id.
+// The options are the listed rows — this picker can only ever select among
+// sessions already in the store, which is what makes it safe to offer.
+func pickSession(rows []store.SessionRow) (string, error) {
+	options := make([]huh.Option[string], 0, len(rows))
+	for _, r := range rows {
+		title := r.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		label := fmt.Sprintf("%s  —  %s %s", title, r.Harness, r.Model)
+		options = append(options, huh.NewOption(label, r.ID))
+	}
+
+	var choice string
+	err := huh.NewSelect[string]().
+		Title("Pick a session").
+		Options(options...).
+		Value(&choice).
+		Run()
+	if err != nil {
 		return "", api.Fail("selection_cancelled", "nothing was selected and nothing was changed")
 	}
 	return choice, nil

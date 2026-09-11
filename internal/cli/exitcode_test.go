@@ -165,17 +165,25 @@ func TestExitCodesComeOutOfRun(t *testing.T) {
 
 // The table is a contract, so the codes it uses have to be the ones
 // documented. Anything outside the published range would be a number no
-// caller can read. exitUsage (1) is inside it: it is what a code absent from
-// the table falls through to, and an entry that names it is a decision
-// written down rather than a mapping left to the default.
+// caller can read.
+//
+// clientCodes may also say exitUsage (1): that is what a code absent from
+// the table falls through to, and an entry naming it is a decision written
+// down rather than a mapping left to the default. registryCodes may not —
+// every entry there classifies an answer that arrived over the wire, and 1
+// is "the command was wrong", which a round trip cannot have established.
 func TestExitCodesStayInRange(t *testing.T) {
 	for name, table := range map[string]map[string]int{
 		"clientCodes":   clientCodes,
 		"registryCodes": registryCodes,
 	} {
+		low, published := exitNotFound, "2-8"
+		if name == "clientCodes" {
+			low, published = exitUsage, "1-8"
+		}
 		for code, exit := range table {
-			if exit < exitUsage || exit > exitGone {
-				t.Errorf("%s[%q] = %d, outside the documented 1-8", name, code, exit)
+			if exit < low || exit > exitGone {
+				t.Errorf("%s[%q] = %d, outside the documented %s", name, code, exit, published)
 			}
 		}
 	}

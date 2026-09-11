@@ -264,16 +264,17 @@ func importStateRows(t *testing.T, env func(string) string) map[string]string {
 	return out
 }
 
-// A dry run discovers and counts, and writes nothing. The store is opened —
-// which is why the row counts are taken after a first dry run rather than
-// before one — and not a row lands in it.
+// A dry run discovers and counts, and writes nothing. The counts are taken
+// before it rather than after, because a dry run does not open the store —
+// see TestImportDryRunCreatesNoStore — and rowCounts opening it itself is
+// the one thing that must not be what creates the file under test.
 func TestImportDryRunWritesNothing(t *testing.T) {
 	h, home := importHarness(t)
 	seedClaude(t, home)
 	env := func(k string) string { return h.env[k] }
 
-	e := mustRun(t, h, "sessions", "import", "--from", "claude", "--dry-run", "--json")
 	before := rowCounts(t, env)
+	e := mustRun(t, h, "sessions", "import", "--from", "claude", "--dry-run", "--json")
 
 	if !e.Data.DryRun {
 		t.Error("the report does not say it was a dry run")
@@ -780,11 +781,13 @@ func TestImportDryRunWithNoHomeFailsClosed(t *testing.T) {
 	}
 }
 
-// Two real imports racing for the same store: one wins, the other is refused
-// by the lock. This is the test the in-process one above cannot be — it
-// takes the lock itself and then runs a command — and the thing it proves is
-// that whichever one loses says so in krowk's words and never SQLite's.
-func TestImportTwoConcurrentRunsOneWinsOneIsRefused(t *testing.T) {
+// Two real imports racing for the same store. The pair cannot be made to
+// overlap on demand — at GOMAXPROCS=1 the first can finish before the second
+// is scheduled — so what is asserted is what is true either way: both runs
+// end in one of the two answers this command has, at least one of them did
+// the import, and neither ever says "database is locked". The deterministic
+// half of the story is the test below, which holds the two runs open.
+func TestImportTwoConcurrentRunsEndInKnownStates(t *testing.T) {
 	h, home := importHarness(t)
 	seedClaude(t, home)
 
@@ -821,9 +824,88 @@ func TestImportTwoConcurrentRunsOneWinsOneIsRefused(t *testing.T) {
 			t.Errorf("a SQLite lock message reached the user:\n%s", r.out)
 		}
 	}
-	if won != 1 || refused != 1 {
-		t.Errorf("%d runs succeeded and %d were refused, want one of each:\n%s\n%s",
-			won, refused, results[0].out, results[1].out)
+	if won+refused != 2 || won < 1 {
+		t.Errorf("%d runs succeeded and %d were refused, want both accounted for and "+
+			"at least one import done:\n%s\n%s", won, refused, results[0].out, results[1].out)
+	}
+}
+
+// The deterministic one: a first import with enough to read that it is still
+// inside the lock, and a second one started while it is. The wait is on
+// krowk.db appearing, which is an ordering fact rather than a timing one —
+// the import creates the directory, takes the flock and only then opens the
+// store, so a store that exists is a lock that is held. Nothing here takes
+// the lock itself to find out, because a probe that succeeded would be the
+// thing that made the first import fail.
+func TestImportConcurrentSecondRunIsRefused(t *testing.T) {
+	h, home := importHarness(t)
+	seedClaude(t, home)
+	seedClaudeCopies(t, home, 400)
+	dbPath := store.DBPath(func(k string) string { return h.env[k] })
+
+	type result struct {
+		code int
+		out  string
+	}
+	first := make(chan result, 1)
+	go func() {
+		code, stdout, stderr := h.run("sessions", "import", "--from", "claude", "--json")
+		first <- result{code: code, out: stdout + stderr}
+	}()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(dbPath); err == nil {
+			break
+		}
+		select {
+		case r := <-first:
+			t.Fatalf("the first import finished before it opened the store: exit %d\n%s",
+				r.code, r.out)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first import never created the store")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	code, stdout, stderr := h.run("sessions", "import", "--from", "claude", "--json")
+	out := stdout + stderr
+	if code != 6 {
+		t.Errorf("a second import run inside the first exited %d, want 6\n%s", code, out)
+	}
+	if !strings.Contains(out, "import.lock") {
+		t.Errorf("the refusal does not name the lock file:\n%s", out)
+	}
+	if strings.Contains(strings.ToLower(out), "database is locked") {
+		t.Errorf("a SQLite lock message reached the user:\n%s", out)
+	}
+
+	if r := <-first; r.code != 0 {
+		t.Errorf("the first import exited %d\n%s", r.code, r.out)
+	}
+}
+
+// seedClaudeCopies multiplies the Claude fixture into n more sessions, each
+// with an id of its own inside and out, so an import has enough to read that
+// it is still working when the next thing happens. It is the same bytes n
+// times rather than a generator, because what is wanted here is duration and
+// not variety.
+func seedClaudeCopies(t *testing.T, home string, n int) {
+	t.Helper()
+	const original = "11111111-1111-4111-8111-111111111111"
+	dir := filepath.Join(home, ".claude", "projects", "-home-elvinas--buzz")
+	raw, err := os.ReadFile(filepath.Join(dir, original+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("%08d-1111-4111-8111-111111111111", i)
+		body := strings.ReplaceAll(string(raw), original, id)
+		if err := os.WriteFile(filepath.Join(dir, id+".jsonl"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -833,7 +915,7 @@ func TestImportTwoConcurrentRunsOneWinsOneIsRefused(t *testing.T) {
 func TestImportErrorsCarryATruncationCount(t *testing.T) {
 	var out sourceOutcome
 	for i := 0; i < maxReportedErrors+3; i++ {
-		out.fail(importer.Ref{Provider: "claude", ID: "ref"}, errors.New("boom"), "")
+		out.fail(importer.Ref{Provider: "claude", ID: "ref"}, errors.New("boom"))
 	}
 	if len(out.Errors) != maxReportedErrors {
 		t.Errorf("errors = %d, want the cap of %d", len(out.Errors), maxReportedErrors)
@@ -889,7 +971,7 @@ func TestImportBoundsSkippedByType(t *testing.T) {
 func TestImportBoundsErrorReasons(t *testing.T) {
 	var out sourceOutcome
 	out.fail(importer.Ref{Provider: "claude", ID: "ref"},
-		errors.New(strings.Repeat("e", 100000)), "")
+		errors.New(strings.Repeat("e", 100000)))
 
 	if len(out.Errors) != 1 {
 		t.Fatalf("errors = %v", out.Errors)
@@ -899,5 +981,33 @@ func TestImportBoundsErrorReasons(t *testing.T) {
 	}
 	if !strings.HasPrefix(out.Errors[0], "claude:ref: ") {
 		t.Errorf("the truncation ate the ref it names: %q", out.Errors[0])
+	}
+}
+
+// Only krowk's own store gets its lock message re-worded. opencode reads a
+// SQLite database of its own, so "database is locked" from a source is about
+// *that* file: re-wording it as krowk.db being busy would name the wrong
+// path and send somebody to close the wrong program.
+func TestImportRewordsOnlyTheKrowkStoresLockMessage(t *testing.T) {
+	const storePath = "/home/somebody/.local/share/krowk/krowk.db"
+	const fromSource = "opencode: read session: database is locked"
+	ref := importer.Ref{Provider: "opencode", ID: "ses_1"}
+
+	var out sourceOutcome
+	out.fail(ref, errors.New(fromSource))
+	if got := out.Errors[0]; !strings.Contains(got, fromSource) {
+		t.Errorf("a source's own words were re-worded: %q", got)
+	}
+	if strings.Contains(out.Errors[0], storePath) {
+		t.Errorf("a source failure was blamed on the krowk store: %q", out.Errors[0])
+	}
+
+	out = sourceOutcome{}
+	out.failStore(ref, errors.New("database is locked"), storePath)
+	if got := out.Errors[0]; !strings.Contains(got, storePath) || !strings.Contains(got, "busy") {
+		t.Errorf("a store failure was not re-worded: %q", got)
+	}
+	if strings.Contains(strings.ToLower(out.Errors[0]), "database is locked") {
+		t.Errorf("the SQLite message survived: %q", out.Errors[0])
 	}
 }

@@ -47,10 +47,16 @@ const maxReportedErrors = 10
 // that has gone wrong in a way the list of names does not help with, and
 // the count still does.
 const (
-	maxSkippedTypes    = 32
-	maxSkippedTypeLen  = 64
-	maxErrorReasonLen  = 512
-	skippedTypeOther   = "other"
+	maxSkippedTypes   = 32
+	maxSkippedTypeLen = 64
+	maxErrorReasonLen = 512
+	// skippedTypeOther is the bucket the overflow is summed under. The
+	// prefix is what makes it krowk's word rather than a name a transcript
+	// could also carry: a raw type is a JSON field value out of one agent's
+	// format and none of them contain a colon, so a plain `other` — which
+	// Claude or a later reader could legitimately emit — would merge a real
+	// count into the leftovers and nobody could tell which.
+	skippedTypeOther   = "krowk:other"
 	truncationEllipsis = "…"
 )
 
@@ -316,8 +322,10 @@ func runImportSource(ctx context.Context, db *sql.DB, storePath string, s import
 	refs, err := s.src.Discover(env)
 	if err != nil {
 		out.discoverFailed = true
+		// The source's own words: Discover never touches krowk's store,
+		// so nothing it says is krowk's to reword.
 		out.Errors = append(out.Errors,
-			truncateForReport("discover: "+sanitizeStoreErr(err, storePath), maxErrorReasonLen))
+			truncateForReport("discover: "+err.Error(), maxErrorReasonLen))
 		return out
 	}
 	// The limit is per source and it is a limit on refs, which is what
@@ -339,12 +347,12 @@ func runImportSource(ctx context.Context, db *sql.DB, storePath string, s import
 	for _, ref := range refs {
 		stored, err := store.ReadImportState(ctx, db, ref.Key())
 		if err != nil {
-			out.fail(ref, err, storePath)
+			out.failStore(ref, err, storePath)
 			continue
 		}
 		cur, err := s.decode(stored)
 		if err != nil {
-			out.fail(ref, err, storePath)
+			out.fail(ref, err)
 			continue
 		}
 		th, next, res, err := s.src.Read(env, ref, cur)
@@ -355,7 +363,7 @@ func runImportSource(ctx context.Context, db *sql.DB, storePath string, s import
 			// turn would be refreshed downward from it — so the honest
 			// thing is to leave the ref exactly as it was and try again
 			// next run.
-			out.fail(ref, err, storePath)
+			out.fail(ref, err)
 			continue
 		}
 		out.absorb(res)
@@ -364,7 +372,7 @@ func runImportSource(ctx context.Context, db *sql.DB, storePath string, s import
 		if next != nil {
 			encoded, err = next.Encode()
 			if err != nil {
-				out.fail(ref, err, storePath)
+				out.fail(ref, err)
 				continue
 			}
 		}
@@ -380,7 +388,7 @@ func runImportSource(ctx context.Context, db *sql.DB, storePath string, s import
 			// that nobody can vouch for. The ref still counts in
 			// files_failed, so a source that lost every one of them
 			// still fails the run.
-			out.fail(ref, err, storePath)
+			out.failStore(ref, err, storePath)
 			continue
 		}
 		out.count(ing)
@@ -400,14 +408,21 @@ func (o *sourceOutcome) count(r store.Result) {
 
 // absorb folds one Read's lossiness into the row, bounded in both
 // directions: the number of distinct types named, and the length of each
-// name. Once the map is full, further types are summed under `other` rather
-// than dropped — the point of the list is "what did this reader not
+// name. Once the map is full, further types are summed under `krowk:other`
+// rather than dropped — the point of the list is "what did this reader not
 // understand", and a count of unnamed leftovers still answers "is there
 // more of it".
 func (o *sourceOutcome) absorb(r importer.Result) {
 	for k, v := range r.UnknownTypes {
-		k = truncateForReport(k, maxSkippedTypeLen)
-		if _, known := o.SkippedByType[k]; !known && len(o.SkippedByType) >= maxSkippedTypes {
+		// A key too long to name goes to the bucket rather than being cut
+		// down to fit. A truncated name is a name that is not the type —
+		// two long types sharing a prefix would collide into one entry and
+		// report a count for a type that does not exist, which is worse
+		// than an honest "and some more". The same goes for a key that
+		// arrives already spelled like the bucket.
+		_, known := o.SkippedByType[k]
+		if len(k) > maxSkippedTypeLen || k == skippedTypeOther ||
+			(!known && len(o.SkippedByType) >= maxSkippedTypes) {
 			k = skippedTypeOther
 		}
 		o.SkippedByType[k] += v
@@ -430,15 +445,30 @@ func truncateForReport(s string, max int) string {
 }
 
 // fail records one ref that did not make it, with why, and keeps the list
-// bounded.
-func (o *sourceOutcome) fail(ref importer.Ref, err error, storePath string) {
+// bounded. The reason is the source's own words, verbatim: a reader has its
+// own database — opencode reads SQLite out of ~/.local/share/opencode — and
+// re-wording *its* lock message as krowk's store being busy would name the
+// wrong file and send somebody to close the wrong program. Only failures
+// that came out of the krowk store go through failStore.
+func (o *sourceOutcome) fail(ref importer.Ref, err error) {
+	o.record(ref.Key() + ": " + err.Error())
+}
+
+// failStore is fail for the errors that are krowk's own store answering:
+// the cursor read and the ingest. Those are the only two places a
+// "database is locked" can be about krowk.db, and so the only two whose
+// message is krowk's to rewrite.
+func (o *sourceOutcome) failStore(ref importer.Ref, err error, storePath string) {
+	o.record(ref.Key() + ": " + sanitizeStoreErr(err, storePath))
+}
+
+func (o *sourceOutcome) record(reason string) {
 	o.FilesFailed++
 	if len(o.Errors) >= maxReportedErrors {
 		o.ErrorsTruncated++
 		return
 	}
-	o.Errors = append(o.Errors,
-		truncateForReport(ref.Key()+": "+sanitizeStoreErr(err, storePath), maxErrorReasonLen))
+	o.Errors = append(o.Errors, truncateForReport(reason, maxErrorReasonLen))
 }
 
 // selectedSources resolves --from. An empty flag is a mistake rather than a

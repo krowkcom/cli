@@ -24,7 +24,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   than meeting the first inside SQLite and surfacing `database is locked`,
   which tells a caller nothing. A collision with something that is not a
   krowk import — anything else writing the database — is re-worded the
-  same way, naming the store and saying it is busy. A `--dry-run` takes no lock
+  same way, naming the store and saying it is busy — and only for
+  failures that came out of krowk's own store, since opencode reads a SQLite
+  database of its own and its lock message is about that file. A `--dry-run` takes no lock
   and does not open the store at all: discovery only needs the environment,
   so counting what would be imported no longer creates `krowk.db`. A single
   transcript that will not read is counted in `files_failed` and listed in
@@ -41,8 +43,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   offset and reads only what was appended. `*_inserted` is the number that
   means the same thing everywhere. `errors` stays capped at ten reasons,
   with `errors_truncated` counting the ones left out, each reason bounded to
-  512 bytes; `skipped_by_type` names at most 32 raw types, each at most 64
-  bytes, and sums the rest under `other`. All three are strings a transcript
+  512 bytes; `skipped_by_type` names at most 32 raw types and sums the rest —
+  along with any name over 64 bytes, which is summed rather than cut so two
+  long names cannot collide into one — under `krowk:other`, a bucket named
+  with a colon because no agent's raw type carries one. All three are strings a transcript
   supplied, and a report is not a place to pass those through at whatever
   length they arrived. The lock file itself is opened `O_NOFOLLOW` and
   refused if it is not a regular file, so a symlink or a fifo at that path

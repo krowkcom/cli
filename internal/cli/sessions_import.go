@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -50,6 +52,10 @@ const (
 	maxSkippedTypes   = 32
 	maxSkippedTypeLen = 64
 	maxErrorReasonLen = 512
+	// maxSkippedTypes is how many types `skipped_by_type` names; the
+	// `krowk:other` bucket sits beside them and is not one of them, so the
+	// map holds at most 33 entries.
+	//
 	// skippedTypeOther is the bucket the overflow is summed under. The
 	// prefix is what makes it krowk's word rather than a name a transcript
 	// could also carry: a raw type is a JSON field value out of one agent's
@@ -289,7 +295,7 @@ func sessionsImport(w io.Writer, format output.Format, f flags, env runctx.Env) 
 // this lock at all: two imports meeting inside the database would surface as
 // "database is locked", which tells a caller nothing about what to do.
 func importLockFailure(path string, err error) error {
-	if err == errImportLockHeld {
+	if errors.Is(err, errImportLockHeld) {
 		return api.Fail("import_locked", "another `krowk sessions import` is running on this store — "+
 			"wait for it to finish, or check "+path+" if you think it is not")
 	}
@@ -413,7 +419,26 @@ func (o *sourceOutcome) count(r store.Result) {
 // understand", and a count of unnamed leftovers still answers "is there
 // more of it".
 func (o *sourceOutcome) absorb(r importer.Result) {
-	for k, v := range r.UnknownTypes {
+	// Sorted, because a map range is ordered differently on every run and
+	// the cap makes that visible: which 32 types get named would otherwise
+	// be a coin toss, and two runs over the same unchanged machine would
+	// disagree about what was skipped. Alphabetical is not a better 32 than
+	// any other, but it is the same 32 every time.
+	//
+	// `krowk:other` is exempt from the cap, which is the choice made here:
+	// maxSkippedTypes is how many *named* types the list carries, and the
+	// bucket is one more entry beside them. The alternative — counting the
+	// bucket as one of the 32 — would mean the overflow displaces a real
+	// name, so a map that overflowed would name one fewer type than one
+	// that did not, for no reason a reader could see. The list is therefore
+	// at most 33 entries: 32 names and the leftovers.
+	names := make([]string, 0, len(r.UnknownTypes))
+	for k := range r.UnknownTypes {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		v := r.UnknownTypes[k]
 		// A key too long to name goes to the bucket rather than being cut
 		// down to fit. A truncated name is a name that is not the type —
 		// two long types sharing a prefix would collide into one entry and

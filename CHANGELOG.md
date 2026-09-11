@@ -46,7 +46,11 @@ the versions are the `v*` tags a release is cut from. Entries land under
   512 bytes; `skipped_by_type` names at most 32 raw types and sums the rest —
   along with any name over 64 bytes, which is summed rather than cut so two
   long names cannot collide into one — under `krowk:other`, a bucket named
-  with a colon because no agent's raw type carries one. All three are strings a transcript
+  with a colon because no agent's raw type carries one and which sits beside
+  the 32 rather than being one of them. The names are chosen in sorted order,
+  so two runs over the same machine name the same types. `--from` and
+  `--dry-run` are refused on every other command by name, rather than being
+  accepted and ignored by a shared flag set. All three are strings a transcript
   supplied, and a report is not a place to pass those through at whatever
   length they arrived. The lock file itself is opened `O_NOFOLLOW` and
   refused if it is not a regular file, so a symlink or a fifo at that path

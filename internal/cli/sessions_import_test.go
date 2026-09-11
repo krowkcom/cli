@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -830,13 +831,22 @@ func TestImportTwoConcurrentRunsEndInKnownStates(t *testing.T) {
 	}
 }
 
-// The deterministic one: a first import with enough to read that it is still
-// inside the lock, and a second one started while it is. The wait is on
-// krowk.db appearing, which is an ordering fact rather than a timing one —
-// the import creates the directory, takes the flock and only then opens the
-// store, so a store that exists is a lock that is held. Nothing here takes
-// the lock itself to find out, because a probe that succeeded would be the
-// thing that made the first import fail.
+// The overlapping one: a first import with four hundred transcripts to get
+// through, and a second one started while it is inside them.
+//
+// The two halves do different work. Waiting for krowk.db to appear is the
+// ordering half: the import mkdirs, takes the flock and only then opens the
+// store, so a store that exists is a lock that *was* taken — no sleep is
+// guessing at that. It does not prove the lock is still held a moment later,
+// and nothing short of reaching inside the first run could; that is what the
+// four hundred copies are for, widening the window from a few milliseconds
+// to half a second so the second run lands well inside it. If it ever
+// stopped landing inside, this test fails loudly rather than passing on a
+// technicality — the first run is checked for exit 0 at the end, so a race
+// lost shows up as a second run that was not refused.
+//
+// Nothing here takes the lock itself to find out, because a probe that
+// succeeded would be the thing that made the first import fail.
 func TestImportConcurrentSecondRunIsRefused(t *testing.T) {
 	h, home := importHarness(t)
 	seedClaude(t, home)
@@ -1009,5 +1019,77 @@ func TestImportRewordsOnlyTheKrowkStoresLockMessage(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(out.Errors[0]), "database is locked") {
 		t.Errorf("the SQLite message survived: %q", out.Errors[0])
+	}
+}
+
+// One flag set serves every command, so a flag that belongs to one of them
+// is accepted by all the rest and quietly does nothing. `--dry-run` is the
+// one where that is dangerous: read as a rehearsal, `krowk push` would
+// really upload. Every command that is not `sessions import` refuses both of
+// its flags by name instead.
+func TestSessionsImportFlagsAreRefusedElsewhere(t *testing.T) {
+	h, home := importHarness(t)
+	seedClaude(t, home)
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"push --dry-run", []string{"push", "--dry-run"}, "--dry-run"},
+		{"doctor --dry-run", []string{"doctor", "--dry-run"}, "--dry-run"},
+		{"uploads list --from", []string{"uploads", "list", "--from", "claude"}, "--from"},
+		{"sessions --dry-run", []string{"sessions", "--dry-run"}, "--dry-run"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, stdout, stderr := h.run(append(tc.args, "--json")...)
+			out := stdout + stderr
+			if code != 1 {
+				t.Errorf("exit = %d, want 1\n%s", code, out)
+			}
+			if !strings.Contains(out, tc.want) ||
+				!strings.Contains(out, "krowk sessions import") {
+				t.Errorf("the refusal does not say which command owns %s:\n%s", tc.want, out)
+			}
+			if !strings.Contains(out, "bad_flag") {
+				t.Errorf("the refusal carries no code:\n%s", out)
+			}
+		})
+	}
+
+	// And the command they belong to still takes them.
+	mustRun(t, h, "sessions", "import", "--from", "claude", "--dry-run", "--json")
+}
+
+// Which 32 types get named when the cap bites must not depend on a map's
+// iteration order: two runs over the same unchanged machine would otherwise
+// disagree about what was skipped.
+func TestImportSkippedByTypeIsTheSameEveryRun(t *testing.T) {
+	types := map[string]int{}
+	for i := 0; i < maxSkippedTypes*4; i++ {
+		types[fmt.Sprintf("type-%03d", i)] = 1
+	}
+
+	var want []string
+	for run := 0; run < 20; run++ {
+		out := sourceOutcome{providerReport: providerReport{SkippedByType: map[string]int{}}}
+		out.absorb(importer.Result{UnknownTypes: types})
+		got := make([]string, 0, len(out.SkippedByType))
+		for k := range out.SkippedByType {
+			got = append(got, k)
+		}
+		sort.Strings(got)
+		if want == nil {
+			want = got
+			continue
+		}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("run %d named a different set of types:\n%v\n%v", run, got, want)
+		}
+	}
+	// 32 names and the bucket beside them, which is not one of the names.
+	if len(want) != maxSkippedTypes+1 || want[0] != skippedTypeOther {
+		t.Errorf("named %d entries, want %d types plus %q: %v",
+			len(want), maxSkippedTypes, skippedTypeOther, want)
 	}
 }

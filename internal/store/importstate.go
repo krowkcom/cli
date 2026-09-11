@@ -53,12 +53,16 @@ func ReadImportState(ctx context.Context, db *sql.DB, key string) (string, error
 // A failed Ingest writes no cursor at all: the counts it managed are
 // returned, and the next run re-reads from the watermark it already had.
 func (w *Writer) IngestWithCursor(ctx context.Context, th Thread, key, cursor string) (Result, error) {
+	// Checked before the ingest, not after: a caller with no key is a
+	// caller bug, and doing the whole write first only to refuse means the
+	// rows land with no watermark — the one state this method exists to
+	// make impossible.
+	if key == "" {
+		return Result{}, fmt.Errorf("store: ingest with cursor needs an import_state key")
+	}
 	res, err := w.Ingest(ctx, th)
 	if err != nil {
 		return res, err
-	}
-	if key == "" {
-		return res, fmt.Errorf("store: ingest with cursor needs an import_state key")
 	}
 	if err := w.writeImportState(ctx, key, cursor); err != nil {
 		return res, err

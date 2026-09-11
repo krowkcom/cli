@@ -11,6 +11,30 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- The opencode importer, `internal/importer/opencode`, which reads opencode's
+  sessions out of the single SQLite database at
+  `~/.local/share/opencode/opencode.db` and produces the canonical
+  `store.Thread`. The thing it is careful about is the database staying
+  read-only: opencode holds it open in WAL mode while it runs, so every open
+  is one connection through `file:<path>?mode=ro` with no pragma ever issued,
+  and a test hashes the file before and after a `Discover` plus a `Read` and
+  fails on any change or any `-wal`/`-shm` sidecar. `Discover` returns one ref
+  per session row (sorted, keyed `opencode:<session_id>`) so each session
+  carries its own `SQLiteCursor` watermark; an absent database is an empty
+  list, not an error. `Read` re-reads the whole session every time and says
+  so, for the same reason the Claude reader does — turns are cumulative
+  positional lists costed over a span, and the store's `foreign_id` dedup
+  makes the re-read free — with the cursor as the largest message
+  `time_updated` seen. A finished tool row becomes the canonical twin on the
+  same message (`tool_call` plus `tool_result` sharing the call id, built by
+  the contract's constructors), while a tool still running stays a lone call;
+  `reasoning` lands as `thinking`, `step-start`/`step-finish` as `step`, and
+  anything unrecognised as counted `unknown` rather than dropped. Turn costs
+  sum the message token columns with dollars rounded once per turn into
+  micros, a child session binds its `parent_id` as `Thread.Parent`, and the
+  worktree comes from the project row's `worktree`/`vcs` rather than being
+  guessed. The fixture is checked in as SQL that builds a temp database,
+  never as a binary `.db`.
 - The Claude importer, `internal/importer/claude`, which reads Claude
   Code's JSONL transcripts out of `~/.claude/projects` and produces the
   canonical `store.Thread`. The thing it is careful about is not losing

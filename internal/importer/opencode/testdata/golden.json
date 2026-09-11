@@ -1,0 +1,289 @@
+[
+  {
+    "ref": {
+      "provider": "opencode",
+      "id": "ses_child",
+      "path": ".local/share/opencode/opencode.db",
+      "key": "opencode:ses_child"
+    },
+    "worktree": {
+      "Path": "{{WORKTREE}}",
+      "VCS": "git",
+      "Name": "repo"
+    },
+    "session": {
+      "directory": "{{WORKTREE}}",
+      "title": "Child session",
+      "model": "gpt-5.5",
+      "provider": "openai",
+      "harness": "opencode"
+    },
+    "binding": {
+      "provider": "opencode",
+      "harness": "opencode",
+      "foreign_session_id": "ses_child",
+      "resume_cmd": "opencode run --session ses_child"
+    },
+    "parent": {
+      "provider": "opencode",
+      "harness": "opencode",
+      "foreign_session_id": "ses_parent",
+      "resume_cmd": ""
+    },
+    "turns": [
+      {
+        "status": "done",
+        "cost_input": 10,
+        "cost_output": 5,
+        "cost_total": 15,
+        "cost_cache_read": 0,
+        "cost_cache_write": 0,
+        "cost_reasoning": 0,
+        "cost_usd_micros": 10
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "provider": "opencode",
+        "model": "",
+        "foreign_id": "msg_c_u1",
+        "usage": "",
+        "raw_json": "{\"role\":\"user\"}",
+        "parts": [
+          {
+            "type": "text",
+            "tool_call_id": "",
+            "signature": "",
+            "foreign_id": "prt_cu1_text",
+            "data": "{\"type\":\"text\",\"text\":\"child prompt\"}"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "foreign_id": "msg_c_a1",
+        "usage": "{\"input\":10,\"output\":5,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}",
+        "raw_json": "{\"role\":\"assistant\",\"modelID\":\"gpt-5.5\",\"providerID\":\"openai\",\"tokens\":{\"input\":10,\"output\":5,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}},\"cost\":0.00001,\"finish\":\"stop\"}",
+        "parts": [
+          {
+            "type": "text",
+            "tool_call_id": "",
+            "signature": "",
+            "foreign_id": "prt_ca1_text",
+            "data": "{\"type\":\"text\",\"text\":\"child answer\"}"
+          }
+        ]
+      }
+    ],
+    "cursor": 1757000001205,
+    "result": {
+      "lines": 4,
+      "unknown": 0,
+      "unknown_types": null,
+      "classified": null,
+      "skipped_count": 0,
+      "skipped_lines": []
+    }
+  },
+  {
+    "ref": {
+      "provider": "opencode",
+      "id": "ses_parent",
+      "path": ".local/share/opencode/opencode.db",
+      "key": "opencode:ses_parent"
+    },
+    "worktree": {
+      "Path": "{{WORKTREE}}",
+      "VCS": "git",
+      "Name": "repo"
+    },
+    "session": {
+      "directory": "{{WORKTREE}}",
+      "title": "Parent session",
+      "model": "gpt-5.5",
+      "provider": "openai",
+      "harness": "opencode"
+    },
+    "binding": {
+      "provider": "opencode",
+      "harness": "opencode",
+      "foreign_session_id": "ses_parent",
+      "resume_cmd": "opencode run --session ses_parent"
+    },
+    "parent": null,
+    "turns": [
+      {
+        "status": "done",
+        "cost_input": 9121,
+        "cost_output": 1660,
+        "cost_total": 53420,
+        "cost_cache_read": 42496,
+        "cost_cache_write": 120,
+        "cost_reasoning": 23,
+        "cost_usd_micros": 12345
+      },
+      {
+        "status": "done",
+        "cost_input": 100,
+        "cost_output": 50,
+        "cost_total": 150,
+        "cost_cache_read": 0,
+        "cost_cache_write": 0,
+        "cost_reasoning": 0,
+        "cost_usd_micros": 100
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "provider": "opencode",
+        "model": "",
+        "foreign_id": "msg_u1",
+        "usage": "",
+        "raw_json": "{\"role\":\"user\"}",
+        "parts": [
+          {
+            "type": "text",
+            "tool_call_id": "",
+            "signature": "",
+            "foreign_id": "prt_u1_text",
+            "data": "{\"type\":\"text\",\"text\":\"first prompt\"}"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "foreign_id": "msg_a1",
+        "usage": "{\"input\":9121,\"output\":1660,\"reasoning\":23,\"cache\":{\"read\":42496,\"write\":120}}",
+        "raw_json": "{\"role\":\"assistant\",\"modelID\":\"gpt-5.5\",\"providerID\":\"openai\",\"tokens\":{\"input\":9121,\"output\":1660,\"reasoning\":23,\"cache\":{\"read\":42496,\"write\":120}},\"cost\":0.012345,\"finish\":\"stop\"}",
+        "parts": [
+          {
+            "type": "text",
+            "tool_call_id": "",
+            "signature": "",
+            "foreign_id": "prt_a1_text",
+            "data": "{\"type\":\"text\",\"text\":\"Let me look at that.\"}"
+          },
+          {
+            "type": "thinking",
+            "tool_call_id": "",
+            "signature": "",
+            "foreign_id": "prt_a1_reason",
+            "data": "{\"type\":\"reasoning\",\"text\":\"Need to read the file first.\"}"
+          },
+          {
+            "type": "tool_call",
+            "tool_call_id": "call_1",
+            "signature": "",
+            "foreign_id": "prt_a1_tool1",
+            "data": "{\"name\":\"read\",\"input\":{\"file\":\"a.ts\"}}"
+          },
+          {
+            "type": "tool_result",
+            "tool_call_id": "call_1",
+            "signature": "",
+            "foreign_id": "prt_a1_tool1",
+            "data": "{\"output\":\"const x = 1\",\"is_error\":false}"
+          },
+          {
+            "type": "tool_call",
+            "tool_call_id": "call_2",
+            "signature": "",
+            "foreign_id": "prt_a1_tool2",
+            "data": "{\"name\":\"bash\",\"input\":{\"command\":\"exit 1\"}}"
+          },
+          {
+            "type": "tool_result",
+            "tool_call_id": "call_2",
+            "signature": "",
+            "foreign_id": "prt_a1_tool2",
+            "data": "{\"output\":\"boom\",\"is_error\":true}"
+          },
+          {
+            "type": "tool_call",
+            "tool_call_id": "call_3",
+            "signature": "",
+            "foreign_id": "prt_a1_tool3",
+            "data": "{\"name\":\"grep\",\"input\":{\"pattern\":\"foo\"}}"
+          },
+          {
+            "type": "file",
+            "tool_call_id": "",
+            "signature": "",
+            "foreign_id": "prt_a1_file",
+            "data": "{\"type\":\"file\",\"name\":\"notes.txt\",\"mime\":\"text/plain\"}"
+          },
+          {
+            "type": "patch",
+            "tool_call_id": "",
+            "signature": "",
+            "foreign_id": "prt_a1_patch",
+            "data": "{\"type\":\"patch\",\"diff\":\"--- a/a.ts\\n+++ b/a.ts\"}"
+          },
+          {
+            "type": "step",
+            "tool_call_id": "",
+            "signature": "",
+            "foreign_id": "prt_a1_step1",
+            "data": "{\"type\":\"step-start\",\"snapshot\":\"abc123\"}"
+          },
+          {
+            "type": "step",
+            "tool_call_id": "",
+            "signature": "",
+            "foreign_id": "prt_a1_step2",
+            "data": "{\"type\":\"step-finish\",\"reason\":\"stop\",\"snapshot\":\"def456\"}"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "provider": "opencode",
+        "model": "",
+        "foreign_id": "msg_u2",
+        "usage": "",
+        "raw_json": "{\"role\":\"user\"}",
+        "parts": [
+          {
+            "type": "text",
+            "tool_call_id": "",
+            "signature": "",
+            "foreign_id": "prt_u2_text",
+            "data": "{\"type\":\"text\",\"text\":\"second prompt\"}"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "foreign_id": "msg_a2",
+        "usage": "{\"input\":100,\"output\":50,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}",
+        "raw_json": "{\"role\":\"assistant\",\"modelID\":\"gpt-5.5\",\"providerID\":\"openai\",\"tokens\":{\"input\":100,\"output\":50,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}},\"cost\":0.0001,\"finish\":\"stop\"}",
+        "parts": [
+          {
+            "type": "text",
+            "tool_call_id": "",
+            "signature": "",
+            "foreign_id": "prt_a2_text",
+            "data": "{\"type\":\"text\",\"text\":\"Done.\"}"
+          }
+        ]
+      }
+    ],
+    "cursor": 1757000000405,
+    "result": {
+      "lines": 18,
+      "unknown": 0,
+      "unknown_types": null,
+      "classified": null,
+      "skipped_count": 0,
+      "skipped_lines": []
+    }
+  }
+]

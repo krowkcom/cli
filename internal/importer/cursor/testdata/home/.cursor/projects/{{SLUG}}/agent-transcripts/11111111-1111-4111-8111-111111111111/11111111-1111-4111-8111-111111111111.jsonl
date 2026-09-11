@@ -1,0 +1,7 @@
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Thursday, Sep 10, 2026, 7:41 AM (UTC+3)</timestamp>\n<user_query>\nfirst redacted prompt\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"first redacted reply"},{"type":"tool_use","name":"Read","input":{"path":"/redacted/file"}}]}}
+{"role":"assistant","message":{"content":[{"type":"tool_result","tool_use_id":"cursor:2","content":"redacted tool output"}]}}
+{"role":"assistant","message":{"content":[{"type":"tool_result","tool_use_id":"nothing-called-this","content":"orphan output"}]}}
+{"type":"turn_ended","status":"success"}
+this line is not json and is skipped with a reason
+{"role":"user","message":{"content":[{"type":"text","text":"second redacted prompt"}]}}

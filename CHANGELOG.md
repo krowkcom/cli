@@ -11,6 +11,29 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- `krowk sessions import --from <claude|cursor|opencode|all>`, which reads the
+  agent transcripts on this machine into the local store at
+  `~/.local/share/krowk/krowk.db`. `--dry-run` discovers and counts without
+  writing a row, and `--limit N` caps how many transcripts each source reads
+  (0, the default, is all). Each ref's watermark is written to `import_state`
+  with the rows it describes, so a second run inserts nothing: re-running the
+  command is the intended way to keep the store current, not a thing to be
+  careful about. One import at a time per store, enforced by an exclusive
+  `flock` on `import.lock` beside the database — a second one fails at once,
+  naming that file, with exit 6, rather than meeting the first inside SQLite
+  and surfacing `database is locked`, which tells a caller nothing. A single
+  transcript that will not read is counted in `files_failed` and listed in
+  `errors` while the rest of the import continues and the exit stays 0; a
+  source whose *discovery* fails, or which discovered transcripts and lost
+  every one of them, is a broken import rather than a lossy one, so the other
+  sources still run and the command exits 1 at the end. `--json` answers with
+  a row per source — files, sessions, messages, parts, `skipped_by_type`,
+  `skipped_lines` and `duration_ms` — and the human output is one line each. On
+  Windows it exits non-zero with `sessions is not supported on Windows in v1`
+  before it resolves a store path, so nothing is created on a machine the
+  command does not run on; with no home in the environment it fails closed on
+  `store.Open`'s own hint rather than writing a database into the working
+  directory.
 - The Cursor importer, `internal/importer/cursor`, which reads Cursor's
   agent transcripts out of `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`
   and produces the canonical `store.Thread`. The thing it is careful about

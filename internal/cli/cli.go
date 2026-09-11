@@ -125,6 +125,13 @@ LIST FLAGS
   --before <slug>        Start after this row — the ` + "`next`" + ` of the last page
   --run <slug|link>      On ` + "`uploads list`" + `, narrow it to what one run produced
 
+SESSIONS FLAGS
+  --from <source>        On ` + "`sessions import`" + `, whose transcripts to read:
+                         claude, cursor, opencode, or all. Required
+  --dry-run              Count what would be imported and write nothing
+  --limit <n>            On ` + "`sessions import`" + `, read at most this many
+                         transcripts per source (0, the default, is all)
+
 AUTH FLAGS
   --token <key>          Store this key rather than asking the browser — how CI
                          logs in, and it opens nothing
@@ -241,6 +248,12 @@ type flags struct {
 	help        bool
 	version     bool
 
+	// from, dryRun and limit are `sessions import`'s. --limit is shared
+	// with the listings, which read the same number as a page size: it is
+	// a maximum either way, so one flag says it.
+	from   string
+	dryRun bool
+
 	// filter is --jq once it has been compiled, and nil when there was none. It
 	// rides along here rather than through every command's signature because it
 	// applies to whatever a command renders and to nothing a command decides.
@@ -352,6 +365,8 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.BoolVar(&f.help, "h", false, "")
 	fs.BoolVar(&f.version, "version", false, "")
 	fs.BoolVar(&f.version, "v", false, "")
+	fs.StringVar(&f.from, "from", "", "")
+	fs.BoolVar(&f.dryRun, "dry-run", false, "")
 	return fs
 }
 
@@ -495,6 +510,8 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		err = configUnset(stdout, positionals[2:], f, format, colour)
 	case positionals[0] == "doctor":
 		err = doctor(stdout, format, f, env)
+	case len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "import":
+		err = sessionsImport(stdout, format, f, env)
 	case len(positionals) > 1 && positionals[0] == "pricing" && positionals[1] == "refresh":
 		err = pricingRefresh(stdout, format, f, env)
 	case positionals[0] == "upgrade":

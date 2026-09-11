@@ -67,6 +67,16 @@ var clientCodes = map[string]int{
 	"storage_unreachable":     exitUnreachable,
 	"storage_rejected_upload": exitUnreachable,
 
+	// Two ways the local session store can refuse to be written to. Both are
+	// storage not answering rather than the command being wrong, which is what
+	// exitUnreachable names — and both are worth retrying, which is the
+	// question the number exists to answer. `import_locked` in particular is a
+	// second `krowk sessions import` already running: the caller's command is
+	// fine, nothing has been learned about it, and the fix is to wait. Filing
+	// it under exitUsage would tell a script to stop rather than to come back.
+	"import_locked":     exitUnreachable,
+	"store_unavailable": exitUnreachable,
+
 	// An answer arrived, but not one this client can act on. That is the
 	// registry's side of the contract broken, which is what exitServer names.
 	"malformed_response": exitServer,

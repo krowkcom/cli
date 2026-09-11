@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/krowkcom/cli/internal/api"
+	"github.com/krowkcom/cli/internal/importer"
 	"github.com/krowkcom/cli/internal/runctx"
 )
 
@@ -359,6 +360,35 @@ func catalog() Catalog {
 			},
 			{Name: "doctor", Usage: "krowk doctor", Summary: "Check the local setup"},
 			{
+				Name:    "sessions",
+				Summary: "The local store of agent sessions",
+				Subcommands: []Command{
+					{
+						Name:    "import",
+						Usage:   "krowk sessions import --from <provider|all> [--dry-run] [--limit N]",
+						Summary: "Read agent transcripts on this machine into the local store",
+						Flags: []Flag{
+							// Required, and said so in the usage rather than
+							// by a Required field: flags do not have one, and
+							// inventing it for this single case would be a
+							// surface change for a sentence.
+							{Name: "from", Type: typeString,
+								Usage: "Which transcripts to read: " +
+									importer.ProviderClaude + ", " + importer.ProviderCursor + ", " +
+									importer.ProviderOpencode + ", or all. Required"},
+							{Name: "dry-run", Type: typeBool, Default: "false",
+								Usage: "Count what would be imported and write nothing"},
+							// The default is documented rather than
+							// registered, the same exception the listings
+							// take: the flag set carries 0 for both, and 0
+							// means "no limit" here.
+							{Name: "limit", Type: typeInt, Default: "0",
+								Usage: "Read at most this many transcripts per source (0 is all)"},
+						},
+					},
+				},
+			},
+			{
 				Name:    "pricing",
 				Summary: "Model price data",
 				Subcommands: []Command{
@@ -433,7 +463,7 @@ var sections = []section{
 		"auth login", "auth verify", "auth token",
 		"workspaces list", "workspaces use",
 		"config show", "config set", "config unset",
-		"doctor", "pricing refresh", "upgrade", "help",
+		"doctor", "sessions import", "pricing refresh", "upgrade", "help",
 	}},
 }
 

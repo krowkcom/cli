@@ -11,6 +11,55 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- `krowk sessions import --from <claude|cursor|opencode|all>`, which reads the
+  agent transcripts on this machine into the local store at
+  `~/.local/share/krowk/krowk.db`. `--dry-run` discovers and counts without
+  writing a row, and `--limit N` caps how many transcripts each source reads
+  (0, the default, is all). Each ref's watermark is written to `import_state`
+  with the rows it describes, so a second run inserts nothing: re-running the
+  command is the intended way to keep the store current, not a thing to be
+  careful about. One import at a time per store, enforced by an exclusive
+  `flock` on `import.lock` beside the database, taken before the store is
+  opened — a second one fails at once, naming that file, with exit 6, rather
+  than meeting the first inside SQLite and surfacing `database is locked`,
+  which tells a caller nothing. A collision with something that is not a
+  krowk import — anything else writing the database — is re-worded the
+  same way, naming the store and saying it is busy — and only for
+  failures that came out of krowk's own store, since opencode reads a SQLite
+  database of its own and its lock message is about that file. A `--dry-run` takes no lock
+  and does not open the store at all: discovery only needs the environment,
+  so counting what would be imported no longer creates `krowk.db`. A single
+  transcript that will not read is counted in `files_failed` and listed in
+  `errors` while the rest of the import continues and the exit stays 0; a
+  source whose *discovery* fails, or which discovered transcripts and lost
+  every one of them, is a broken import rather than a lossy one, so the other
+  sources still run and the command exits 1 at the end. `--json` answers with
+  a row per source — files, `sessions_seen`, `messages_seen`, `parts_seen`,
+  the matching `*_inserted` counts, `skipped_by_type`, `skipped_lines`,
+  `errors_truncated` and `duration_ms` — and the human output is one line
+  each. The `*_seen` numbers are what that run read, not what the store
+  holds, and they are not comparable across sources: claude and opencode
+  re-read a whole transcript every run while cursor resumes from its byte
+  offset and reads only what was appended. `*_inserted` is the number that
+  means the same thing everywhere. `errors` stays capped at ten reasons,
+  with `errors_truncated` counting the ones left out, each reason bounded to
+  512 bytes; `skipped_by_type` names at most 32 raw types and sums the rest —
+  along with any name over 64 bytes, which is summed rather than cut so two
+  long names cannot collide into one — under `krowk:other`, a bucket named
+  with a colon because no agent's raw type carries one and which sits beside
+  the 32 rather than being one of them. The names are chosen in sorted order,
+  so two runs over the same machine name the same types. `--from` and
+  `--dry-run` are refused on every other command by name, rather than being
+  accepted and ignored by a shared flag set. All three are strings a transcript
+  supplied, and a report is not a place to pass those through at whatever
+  length they arrived. The lock file itself is opened `O_NOFOLLOW` and
+  refused if it is not a regular file, so a symlink or a fifo at that path
+  is not something krowk locks and runs on. On
+  Windows it exits non-zero with `sessions is not supported on Windows in v1`
+  before it resolves a store path, so nothing is created on a machine the
+  command does not run on; with no home in the environment it fails closed on
+  `store.Open`'s own hint rather than writing a database into the working
+  directory.
 - The Cursor importer, `internal/importer/cursor`, which reads Cursor's
   agent transcripts out of `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`
   and produces the canonical `store.Thread`. The thing it is careful about

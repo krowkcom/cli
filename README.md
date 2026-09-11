@@ -59,6 +59,7 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 | `krowk config set workspace ws_9hj3kd8a` | Pin this repository to a workspace (`--global` for the machine) |
 | `krowk config show` / `unset <key>` | The effective configuration and which layer set it, or remove a value |
 | `krowk doctor` | Report version, connectivity, auth and detected run context |
+| `krowk sessions import --from all` | Read Claude, Cursor and opencode transcripts on this machine into the local store (`--dry-run`, `--limit N`) |
 | `krowk pricing refresh` | Refresh the models.dev price cache (conditional GET, silent on failure) |
 | `krowk upgrade` | Upgrade krowk to the latest release |
 

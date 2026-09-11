@@ -579,6 +579,37 @@
         "summary": "Check the local setup"
       },
       {
+        "name": "sessions",
+        "summary": "The local store of agent sessions",
+        "subcommands": [
+          {
+            "name": "import",
+            "usage": "krowk sessions import --from \u003cprovider|all\u003e [--dry-run] [--limit N]",
+            "summary": "Read agent transcripts on this machine into the local store",
+            "flags": [
+              {
+                "name": "from",
+                "type": "string",
+                "default": "",
+                "usage": "Which transcripts to read: claude, cursor, opencode, or all. Required"
+              },
+              {
+                "name": "dry-run",
+                "type": "bool",
+                "default": "false",
+                "usage": "Count what would be imported and write nothing"
+              },
+              {
+                "name": "limit",
+                "type": "int",
+                "default": "0",
+                "usage": "Read at most this many transcripts per source (0 is all)"
+              }
+            ]
+          }
+        ]
+      },
+      {
         "name": "pricing",
         "summary": "Model price data",
         "subcommands": [

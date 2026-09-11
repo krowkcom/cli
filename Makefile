@@ -3,7 +3,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
 LDFLAGS := -s -w -X github.com/krowkcom/cli/internal/cli.Version=$(VERSION)
 
-.PHONY: build test lint vet fmt check mock install clean dist release-check
+.PHONY: build test lint vet fmt check windows-build mock install clean dist release-check
 
 build: ## Build ./bin/krowk and ./bin/krowk-mcp
 	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/krowk ./cmd/krowk
@@ -21,7 +21,14 @@ fmt:
 lint: ## Requires golangci-lint; falls back to vet
 	@command -v golangci-lint >/dev/null && golangci-lint run || $(MAKE) vet
 
-check: vet test ## Everything CI runs
+# The Windows build is compile-only and on purpose: `sessions` refuses to run
+# there, but the package still has to compile, and the build-tagged halves of
+# the import lock are only ever checked by a cross build. A test run on Linux
+# never touches importlock_windows.go.
+windows-build:
+	GOOS=windows go build ./...
+
+check: vet windows-build test ## Everything CI runs
 
 mock: ## Local stand-in for api.krowk.com on :8787
 	go run ./internal/devregistry

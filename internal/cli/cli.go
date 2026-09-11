@@ -125,6 +125,13 @@ LIST FLAGS
   --before <slug>        Start after this row — the ` + "`next`" + ` of the last page
   --run <slug|link>      On ` + "`uploads list`" + `, narrow it to what one run produced
 
+SESSIONS FLAGS
+  --from <source>        On ` + "`sessions import`" + `, whose transcripts to read:
+                         claude, cursor, opencode, or all. Required
+  --dry-run              Count what would be imported and write nothing
+  --limit <n>            On ` + "`sessions import`" + `, read at most this many
+                         transcripts per source (0, the default, is all)
+
 AUTH FLAGS
   --token <key>          Store this key rather than asking the browser — how CI
                          logs in, and it opens nothing
@@ -241,6 +248,12 @@ type flags struct {
 	help        bool
 	version     bool
 
+	// from, dryRun and limit are `sessions import`'s. --limit is shared
+	// with the listings, which read the same number as a page size: it is
+	// a maximum either way, so one flag says it.
+	from   string
+	dryRun bool
+
 	// filter is --jq once it has been compiled, and nil when there was none. It
 	// rides along here rather than through every command's signature because it
 	// applies to whatever a command renders and to nothing a command decides.
@@ -352,6 +365,8 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.BoolVar(&f.help, "h", false, "")
 	fs.BoolVar(&f.version, "version", false, "")
 	fs.BoolVar(&f.version, "v", false, "")
+	fs.StringVar(&f.from, "from", "", "")
+	fs.BoolVar(&f.dryRun, "dry-run", false, "")
 	return fs
 }
 
@@ -368,7 +383,9 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	// `--jq "$FIELD"` with the variable unset is a flag that was given and is
 	// empty, and reading that as "no filter" would answer with everything.
 	jqGiven := false
+	given := map[string]bool{}
 	fs.Visit(func(fl *flag.Flag) {
+		given[fl.Name] = true
 		if fl.Name == "jq" {
 			jqGiven = true
 		}
@@ -453,6 +470,16 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		return 0
 	}
 
+	// One flag set serves every command, which is what lets flags follow
+	// positionals — and which means a flag belonging to one command is
+	// accepted, and ignored, by all the others. Ignored is the dangerous
+	// half: `krowk push shot.png --dry-run` reads as a rehearsal and
+	// uploads the file. So the flags that belong to one command are refused
+	// on every other one, by name, before anything runs.
+	if err := onlyForSessionsImport(given, positionals); err != nil {
+		return reportFiltered(stderr, err, format, f.quiet, colour, f.errTTY, f.filter)
+	}
+
 	var err error
 	switch {
 	case positionals[0] == "push":
@@ -495,6 +522,8 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		err = configUnset(stdout, positionals[2:], f, format, colour)
 	case positionals[0] == "doctor":
 		err = doctor(stdout, format, f, env)
+	case len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "import":
+		err = sessionsImport(stdout, format, f, env)
 	case len(positionals) > 1 && positionals[0] == "pricing" && positionals[1] == "refresh":
 		err = pricingRefresh(stdout, format, f, env)
 	case positionals[0] == "upgrade":
@@ -2099,4 +2128,22 @@ func clip[T any](s []T, n int) []T {
 		return s
 	}
 	return s[:n]
+}
+
+// onlyForSessionsImport refuses `sessions import`'s own flags anywhere else.
+// --limit is not in the list: the listings read the same number as a page
+// size, so it means a maximum on both and one flag says it. --dry-run and
+// --from mean nothing anywhere else, and a flag that means nothing is a flag
+// that was misunderstood by whoever typed it.
+func onlyForSessionsImport(given map[string]bool, positionals []string) error {
+	isImport := len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "import"
+	if isImport {
+		return nil
+	}
+	for _, name := range []string{"dry-run", "from"} {
+		if given[name] {
+			return api.Fail("bad_flag", "`--"+name+"` is only a flag of `krowk sessions import`")
+		}
+	}
+	return nil
 }

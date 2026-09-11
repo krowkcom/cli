@@ -528,6 +528,9 @@ func topKeyPos(hay, key string) (int, bool) {
 
 // extractTopJSONString is extractJSONString anchored to the top level of
 // the blob, so a nested "role" in prose cannot flip the message's role.
+// Escapes decode as JSON dictates: the quoted slice is unmarshalled whole,
+// so \n is a newline and \u00e9 is é, not the stripped letters an older
+// byte-copy returned.
 func extractTopJSONString(hay, key string) (string, bool) {
 	p, ok := topKeyPos(hay, key)
 	if !ok {
@@ -539,13 +542,12 @@ func extractTopJSONString(hay, key string) (string, bool) {
 	if p >= len(hay) || hay[p] != '"' {
 		return "", false
 	}
+	start := p
 	p++
-	var sb strings.Builder
 	escaped := false
 	for ; p < len(hay); p++ {
 		c := hay[p]
 		if escaped {
-			sb.WriteByte(c)
 			escaped = false
 			continue
 		}
@@ -554,9 +556,12 @@ func extractTopJSONString(hay, key string) (string, bool) {
 			continue
 		}
 		if c == '"' {
-			return sb.String(), true
+			var s string
+			if err := json.Unmarshal([]byte(hay[start:p+1]), &s); err != nil {
+				return "", false
+			}
+			return s, true
 		}
-		sb.WriteByte(c)
 	}
 	return "", false
 }
@@ -707,6 +712,101 @@ func extractTopObject(hay, key string) (string, bool) {
 	return "", false
 }
 
+// extractTopRawValue returns the raw JSON value of a top-level key: the
+// exact substring for a string (quoted), an object or array (balanced), or
+// a literal (number, true, false, null). A value cut off by the prefix cap
+// is absent, not partial — truncation reads as missing, which the caller
+// turns into null rather than half a JSON value — and a candidate that is
+// not valid JSON is refused the same way.
+func extractTopRawValue(hay, key string) (json.RawMessage, bool) {
+	p, ok := topKeyPos(hay, key)
+	if !ok {
+		return nil, false
+	}
+	for p < len(hay) && (hay[p] == ' ' || hay[p] == '\t' || hay[p] == '\n' || hay[p] == '\r') {
+		p++
+	}
+	if p >= len(hay) {
+		return nil, false
+	}
+	switch hay[p] {
+	case '"':
+		escaped := false
+		for q := p + 1; q < len(hay); q++ {
+			c := hay[q]
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				raw := json.RawMessage(hay[p : q+1])
+				if !json.Valid(raw) {
+					return nil, false
+				}
+				return raw, true
+			}
+		}
+		return nil, false
+	case '{', '[':
+		depth := 0
+		inStr := false
+		escaped := false
+		for q := p; q < len(hay); q++ {
+			c := hay[q]
+			if inStr {
+				if escaped {
+					escaped = false
+					continue
+				}
+				if c == '\\' {
+					escaped = true
+					continue
+				}
+				if c == '"' {
+					inStr = false
+				}
+				continue
+			}
+			if c == '"' {
+				inStr = true
+				continue
+			}
+			if c == '{' || c == '[' {
+				depth++
+			} else if c == '}' || c == ']' {
+				depth--
+				if depth == 0 {
+					raw := json.RawMessage(hay[p : q+1])
+					if !json.Valid(raw) {
+						return nil, false
+					}
+					return raw, true
+				}
+			}
+		}
+		return nil, false
+	default:
+		q := p
+		for q < len(hay) && (hay[q] == '-' || hay[q] == '+' || hay[q] == '.' ||
+			(hay[q] >= '0' && hay[q] <= '9') || hay[q] == 'e' || hay[q] == 'E' ||
+			(hay[q] >= 'a' && hay[q] <= 'z') || (hay[q] >= 'A' && hay[q] <= 'Z')) {
+			q++
+		}
+		if q == p {
+			return nil, false
+		}
+		raw := json.RawMessage(hay[p:q])
+		if !json.Valid(raw) {
+			return nil, false
+		}
+		return raw, true
+	}
+}
+
 // extractJSONNumber scans hay for `"key" : <number>` and returns the
 // raw literal, so ints and floats share one scanner.
 func extractJSONNumber(hay, key string) (string, bool) {
@@ -836,11 +936,22 @@ func (b *builder) partByID(db *sql.DB, m partMeta) ([]store.Part, error) {
 	snapshot, _ := extractTopJSONString(prefix.String, "snapshot")
 	// Status nests inside the state object (depth 2), so a top-level
 	// scan never matches it: extract the state object first, then scan
-	// status within it, where it sits at the top level.
+	// within it, where status/input/output sit at the top level. Input
+	// and output ride raw — arbitrary JSON the prefix may or may not
+	// still hold — so a twin with no scanned input carries null, never
+	// half a value cut off by the cap.
 	var state sql.NullString
 	if stateObj, ok := extractTopObject(prefix.String, "state"); ok {
-		if status, ok := extractTopJSONString(stateObj, "status"); ok {
-			raw, _ := json.Marshal(toolState{Status: status})
+		status, _ := extractTopJSONString(stateObj, "status")
+		var inRaw, outRaw json.RawMessage
+		if r, ok := extractTopRawValue(stateObj, "input"); ok {
+			inRaw = r
+		}
+		if r, ok := extractTopRawValue(stateObj, "output"); ok {
+			outRaw = r
+		}
+		if status != "" || inRaw != nil || outRaw != nil {
+			raw, _ := json.Marshal(toolState{Status: status, Input: inRaw, Output: outRaw})
 			state = sql.NullString{String: string(raw), Valid: true}
 		}
 	}
@@ -882,7 +993,10 @@ func (b *builder) part(partID, data string) []store.Part {
 // partCapped maps an oversized part row whose raw blob was never
 // materialised. Only the prefix-scanned fields are known, so the canonical
 // part carries a minimal synthesized payload rather than the verbatim
-// blob; routing and the tool call/result twin keep working.
+// blob; routing and the tool call/result twin keep working, with the
+// scanned input/output when the prefix still held them and null when it
+// did not. A capped tool is classified under its own name so the lossy
+// row stays visible in the result instead of passing as whole.
 func (b *builder) partCapped(partID, typ, text, tool, callID string, state sql.NullString, snapshot string) []store.Part {
 	var st *toolState
 	if state.Valid && state.String != "" {
@@ -895,6 +1009,7 @@ func (b *builder) partCapped(partID, typ, text, tool, callID string, state sql.N
 	min, _ := json.Marshal(map[string]string{"type": typ, "capped": "part data exceeded 5MB, see source database"})
 	raw := json.RawMessage(min)
 	if typ == "tool" {
+		b.acc.Classify("capped-tool")
 		return b.toolParts(partID, d, raw)
 	}
 	kind := typ

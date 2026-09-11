@@ -1195,7 +1195,7 @@ func TestPartCappedErrorStatusTwins(t *testing.T) {
 	data := `{"type":"tool","tool":"bash","callID":"call_big_err","state":{"status":"error","input":{"cmd":"x"},"output":"boom"},"pad":"` + pad + `"}`
 	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_caperr', 'msg_caperr', 'ses_caperr', 1757000002700, 1757000002701, ?)`, data)
 
-	th, _, _, err := Source{}.Read(f.env, importer.Ref{Provider: importer.ProviderOpencode, ID: "ses_caperr", Path: dbRel}, nil)
+	th, _, res, err := Source{}.Read(f.env, importer.Ref{Provider: importer.ProviderOpencode, ID: "ses_caperr", Path: dbRel}, nil)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
@@ -1203,9 +1203,12 @@ func TestPartCappedErrorStatusTwins(t *testing.T) {
 		t.Fatalf("got %d messages with %d parts, want 1 message with the call+result twin",
 			len(th.Messages), len(th.Messages[0].Parts))
 	}
-	var result *store.Part
+	var call, result *store.Part
 	for i := range th.Messages[0].Parts {
-		if th.Messages[0].Parts[i].Type == importer.PartToolResult {
+		switch th.Messages[0].Parts[i].Type {
+		case importer.PartToolCall:
+			call = &th.Messages[0].Parts[i]
+		case importer.PartToolResult:
 			result = &th.Messages[0].Parts[i]
 		}
 	}
@@ -1213,13 +1216,120 @@ func TestPartCappedErrorStatusTwins(t *testing.T) {
 		t.Fatal("capped error tool has no tool_result twin")
 	}
 	var tr struct {
-		IsError bool `json:"is_error"`
+		Output  json.RawMessage `json:"output"`
+		IsError bool            `json:"is_error"`
 	}
 	if err := json.Unmarshal([]byte(result.Data), &tr); err != nil {
 		t.Fatalf("decode tool result data: %v", err)
 	}
 	if !tr.IsError {
 		t.Fatalf("tool_result data = %s, want is_error=true", result.Data)
+	}
+	// The prefix still held the state, so the twins carry the scanned
+	// input/output rather than bare ids+status.
+	if call == nil {
+		t.Fatal("capped error tool has no tool_call twin")
+	}
+	var tc struct {
+		Name  string          `json:"name"`
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal([]byte(call.Data), &tc); err != nil {
+		t.Fatalf("decode tool call data: %v", err)
+	}
+	if tc.Name != "bash" || string(tc.Input) != `{"cmd":"x"}` {
+		t.Fatalf("tool_call data = %s, want the scanned bash input", call.Data)
+	}
+	if string(tr.Output) != `"boom"` {
+		t.Fatalf("tool_result data = %s, want the scanned output", result.Data)
+	}
+	if res.Classified["capped-tool"] != 1 {
+		t.Fatalf("Classified = %v, want the capped tool counted", res.Classified)
+	}
+}
+
+// TestExtractTopJSONStringUnescapes pins the prefix scanner's escape
+// decoding: a byte-copy that strips the backslash turns \n into n and
+// \u00e9 into u00e9, so the quoted slice is unmarshalled as JSON whole.
+func TestExtractTopJSONStringUnescapes(t *testing.T) {
+	hay := `{"type":"text","text":"line1\nline2 \"quoted\" caf\u00e9 back\\slash \/slash","pad":1}`
+	got, ok := extractTopJSONString(hay, "text")
+	if !ok {
+		t.Fatal("extractTopJSONString found no text")
+	}
+	want := "line1\nline2 \"quoted\" café back\\slash /slash"
+	if got != want {
+		t.Fatalf("text = %q, want %q", got, want)
+	}
+	// A nested namesake still loses to the top-level field, escapes or
+	// not: the anchor, not the decoding, decides which match wins.
+	nested := `{"type":"text","state":{"text":"decoy"},"text":"a\tb"}`
+	got, ok = extractTopJSONString(nested, "text")
+	if !ok || got != "a\tb" {
+		t.Fatalf("nested text = %q,%v, want %q,true", got, ok, "a\tb")
+	}
+	// A value cut off by the cap is absent, not half-decoded.
+	cut := `{"type":"text","text":"abc`
+	if _, ok := extractTopJSONString(cut, "text"); ok {
+		t.Fatal("extractTopJSONString decoded a truncated string")
+	}
+}
+
+// TestPartCappedKeepsEscapedToolInputOutput drives escaped characters
+// through the oversized-part path end to end: the input/output ride raw,
+// so \n, quotes and unicode survive the prefix scan verbatim into the
+// twins' Data.
+func TestPartCappedKeepsEscapedToolInputOutput(t *testing.T) {
+	f := newFixture(t)
+	db := openFixtureWriter(t, f)
+	execFixture(t, db, `INSERT INTO session (id, project_id, parent_id, directory, title, model, time_created, time_updated) VALUES ('ses_capesc', 'prj_1', NULL, ?, 'Cap escape session', NULL, 1757000002900, 1757000002901)`, f.worktree)
+	execFixture(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_capesc', 'ses_capesc', 1757000002900, 1757000002901, '{"role":"assistant"}')`)
+	inJSON, _ := json.Marshal(map[string]string{"cmd": "echo \"hi\"\ncaf\u00e9"})
+	outJSON, _ := json.Marshal("line1\nline2 \"quoted\"")
+	pad := strings.Repeat("z", partRawLimit+100)
+	// Hand-built so the discriminator and state ride first: a Go map
+	// would marshal keys alphabetically and bury "type" past the prefix.
+	data := `{"type":"tool","tool":"bash","callID":"call_big_esc","state":{"status":"completed","input":` + string(inJSON) + `,"output":` + string(outJSON) + `},"pad":"` + pad + `"}`
+	execFixture(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_capesc', 'msg_capesc', 'ses_capesc', 1757000002900, 1757000002901, ?)`, data)
+
+	th, _, res, err := Source{}.Read(f.env, importer.Ref{Provider: importer.ProviderOpencode, ID: "ses_capesc", Path: dbRel}, nil)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(th.Messages) != 1 || len(th.Messages[0].Parts) != 2 {
+		t.Fatalf("got %d messages with %d parts, want 1 message with the call+result twin",
+			len(th.Messages), len(th.Messages[0].Parts))
+	}
+	var callData, resultData string
+	for _, p := range th.Messages[0].Parts {
+		switch p.Type {
+		case importer.PartToolCall:
+			callData = p.Data
+		case importer.PartToolResult:
+			resultData = p.Data
+		}
+	}
+	var tc struct {
+		Name  string          `json:"name"`
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal([]byte(callData), &tc); err != nil {
+		t.Fatalf("decode tool call data: %v", err)
+	}
+	if string(tc.Input) != string(inJSON) {
+		t.Fatalf("tool_call input = %s, want %s", tc.Input, inJSON)
+	}
+	var tr struct {
+		Output json.RawMessage `json:"output"`
+	}
+	if err := json.Unmarshal([]byte(resultData), &tr); err != nil {
+		t.Fatalf("decode tool result data: %v", err)
+	}
+	if string(tr.Output) != string(outJSON) {
+		t.Fatalf("tool_result output = %s, want %s", tr.Output, outJSON)
+	}
+	if res.Classified["capped-tool"] != 1 {
+		t.Fatalf("Classified = %v, want the capped tool counted", res.Classified)
 	}
 }
 

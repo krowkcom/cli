@@ -16,9 +16,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   and produces the canonical `store.Thread`. The thing it is careful about
   is that Cursor lines carry `{role, message.content[]}` only — no message
   id, no timestamp, no session id, no `cwd`, no model — so the hard cases are
-  position-keyed dedup and a worktree with no `cwd`. Messages keep
-  `foreign_id` NULL and dedup on `(session_id, seq)` through the byte-offset
-  `JSONLCursor`, which `Read` honors (delta reads return only new lines),
+   position-keyed dedup and a worktree with no `cwd`. Messages keep
+   `foreign_id` NULL so the store appends them unconditionally — the
+   byte-offset `JSONLCursor`, which `Read` honors (delta reads return only
+   new lines) and the caller must hold and never re-send, is the only dedup —
   unlike the Claude and opencode readers that re-read whole sessions; a
   re-import with the stored cursor inserts nothing, and appending one line
   inserts exactly one message. The worktree decodes the slug

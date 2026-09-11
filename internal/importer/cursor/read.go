@@ -29,7 +29,10 @@ const eventRepo = "cursor_repo"
 // file would duplicate every message. A transcript rewritten shorter rescans
 // from zero (see startOffset) and re-imports every message as new rows:
 // dedup is impossible without ids, which is inherent to position-keyed
-// NULL-id imports rather than a gap the cursor could close. A cursor of the
+// NULL-id imports rather than a gap the cursor could close. A thread
+// returned with err != nil must not be ingested (the store contract); the
+// repo sidecar rides full reads, error partials included, so a caller that
+// ingests anyway still converges on the event. A cursor of the
 // wrong concrete kind is
 // refused with importer.ErrCursorType and handed straight back, because
 // nothing was read and a zero cursor would read as "start again". An open
@@ -130,7 +133,14 @@ func (b *builder) line(lineNo int, raw []byte) error {
 	if err := json.Unmarshal(raw, &l); err != nil {
 		return fmt.Errorf("cursor: unreadable line: %w", err)
 	}
-	role, ok := l.Role, l.Role == "user" || l.Role == "assistant"
+	role, ok := l.Role, false
+	// Any non-empty role the store admits becomes a message; only user
+	// opens turns (see SplitTurns), so system/tool/error lines ride along
+	// without moving the turn count.
+	switch store.Role(l.Role) {
+	case store.RoleUser, store.RoleAssistant, store.RoleSystem, store.RoleTool, store.RoleError:
+		role, ok = l.Role, true
+	}
 	if !ok {
 		// A line with no role is furniture if it names itself — turn_ended
 		// — and a skip otherwise. Classifying by the type string rather
@@ -246,7 +256,7 @@ func (b *builder) block(raw json.RawMessage, lineNo int) (store.Part, bool) {
 	case "tool_use":
 		id := blk.ID
 		if id == "" {
-			id = "cursor:" + strconv.Itoa(int(b.base)+lineNo)
+			id = "cursor:" + strconv.FormatInt(b.base+int64(lineNo), 10)
 		}
 		if b.calls == nil {
 			b.calls = map[string]bool{}
@@ -331,9 +341,15 @@ func (b *builder) thread() store.Thread {
 	if path == "" {
 		// The slug decoded to nothing on disk: file under the slug
 		// itself, counted, rather than inventing a directory or refusing
-		// the session. Base of "cursor:<slug>" is the whole thing, which
-		// names the slug — documented, not a guess at a path.
-		path, vcs = "cursor:"+slug, vcsNone
+		// the session. A ref with no .cursor shape has no slug at all, so
+		// it files under the session identity instead — unique per
+		// import_state key. Base of "cursor:<slug>" is the whole thing,
+		// which names the slug — documented, not a guess at a path.
+		name := slug
+		if name == "" {
+			name = b.ref.ID
+		}
+		path, vcs = "cursor:"+name, vcsNone
 		b.acc.Classify("worktree-fallback")
 	}
 	// A result preceding its call in the same Read is linked, not orphaned:
@@ -341,7 +357,8 @@ func (b *builder) thread() store.Thread {
 	// incrementally in block(). Each emitted tool_result whose id is empty
 	// or matches no call in this Read is still kept, counted as unlinked —
 	// dropping it would lose transcript over a pairing this package cannot
-	// verify.
+	// verify. Cross-read links classify unlinked by design: the pairing set
+	// is per-read, and real transcripts carry zero results.
 	for _, m := range b.messages {
 		for _, p := range m.Parts {
 			if p.Type == importer.PartToolResult && (p.ToolCallID == "" || !b.calls[p.ToolCallID]) {
@@ -378,7 +395,10 @@ func (b *builder) thread() store.Thread {
 // numbers from zero too. Exact in both the mid-line-backup and the boundary
 // cases: the backup rewinds within the line the offset sits in, which holds
 // no newline between the line start and the offset, so the re-read first
-// line's absolute number is always count+1.
+// line's absolute number is always count+1. Base is read at stat time and
+// constant for the whole pass, so a rewrite racing the read cannot break
+// within-pass call/result pairing — only absolute stability across that
+// already-broken read, which the rewrite itself voids.
 func lineBase(f *os.File, held importer.JSONLCursor, size int64) int64 {
 	if held.Zero() || held.Size > size || held.Offset > size {
 		return 0

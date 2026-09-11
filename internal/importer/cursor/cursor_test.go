@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -571,6 +572,236 @@ func appendLine(t *testing.T, path, line string) {
 	defer func() { _ = fh.Close() }()
 	if _, err := fh.WriteString(line); err != nil {
 		t.Fatalf("WriteString: %v", err)
+	}
+}
+
+// adhocTranscript materialises lines as one transcript under a throwaway
+// home and returns the env, ref and transcript path to read it through.
+//
+// It exists so the tests below do not touch the shared fixture: each builds
+// the smallest file its case needs. refPath is slash-joined under home —
+// the .cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl shape for
+// cases that need a sidecar, any other shape for the one that must not have
+// one. A non-empty repoID writes {"id": ...} to the repo.json beside
+// agent-transcripts, the same seat repoEvent reads.
+func adhocTranscript(t *testing.T, refPath, id string, lines []string, repoID string) (harness.Env, importer.Ref, string) {
+	t.Helper()
+	home := t.TempDir()
+	env := func(k string) string {
+		if k == "HOME" {
+			return home
+		}
+		return ""
+	}
+	full := filepath.Join(home, filepath.FromSlash(refPath))
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		t.Fatalf("MkdirAll %s: %v", filepath.Dir(full), err)
+	}
+	var sb strings.Builder
+	for _, l := range lines {
+		sb.WriteString(l)
+		sb.WriteString("\n")
+	}
+	if err := os.WriteFile(full, []byte(sb.String()), 0o600); err != nil {
+		t.Fatalf("WriteFile %s: %v", full, err)
+	}
+	if repoID != "" {
+		sidecar := filepath.Join(home, filepath.FromSlash(filepath.Dir(filepath.Dir(filepath.Dir(refPath)))), "repo.json")
+		if err := os.MkdirAll(filepath.Dir(sidecar), 0o700); err != nil {
+			t.Fatalf("MkdirAll %s: %v", filepath.Dir(sidecar), err)
+		}
+		data := `{"id": ` + strconv.Quote(repoID) + `}` + "\n"
+		if err := os.WriteFile(sidecar, []byte(data), 0o600); err != nil {
+			t.Fatalf("WriteFile %s: %v", sidecar, err)
+		}
+	}
+	return env, importer.Ref{Provider: importer.ProviderCursor, ID: id, Path: refPath}, full
+}
+
+func adhocRead(t *testing.T, env harness.Env, ref importer.Ref, cursor importer.Cursor) (store.Thread, importer.Cursor, importer.Result) {
+	t.Helper()
+	th, cur, res, err := Source{}.Read(env, ref, cursor)
+	if err != nil {
+		t.Fatalf("Read %s: %v", ref.ID, err)
+	}
+	return th, cur, res
+}
+
+// TestEmptySlugFilesUnderTheSessionID: a ref with no .cursor shape has no
+// slug to decode, so the session files under cursor:<id> — the session
+// identity, unique per import_state key — rather than the bare "cursor:" a
+// missing slug would otherwise build. Counted as the same fallback, and
+// with no sidecar beside it there is no repo event.
+func TestEmptySlugFilesUnderTheSessionID(t *testing.T) {
+	env, ref, _ := adhocTranscript(t, "odd/path.jsonl", "odd-session-9",
+		[]string{`{"role":"user","message":{"content":[{"type":"text","text":"hi"}]}}`}, "")
+	th, _, res := adhocRead(t, env, ref, nil)
+
+	if want := "cursor:odd-session-9"; th.Worktree.Path != want {
+		t.Fatalf("worktree path = %q, want %q", th.Worktree.Path, want)
+	}
+	if th.Worktree.VCS != vcsNone {
+		t.Fatalf("worktree vcs = %q, want %q", th.Worktree.VCS, vcsNone)
+	}
+	if res.Classified["worktree-fallback"] != 1 {
+		t.Fatalf("Classified = %v, want the fallback counted", res.Classified)
+	}
+	if len(th.Events) != 0 {
+		t.Fatalf("events = %+v, want none: no slug means no sidecar", th.Events)
+	}
+}
+
+// TestSystemRoleBecomesAMessageWithoutATurn: system/tool/error lines are
+// messages, not furniture — only empty-role lines classify-by-type or skip.
+// Only user opens turns, so the two system lines below share the one
+// leading span SplitTurns always opens rather than opening one each.
+func TestSystemRoleBecomesAMessageWithoutATurn(t *testing.T) {
+	env, ref, _ := adhocTranscript(t,
+		projectsDir+"/adhoc-sys/agent-transcripts/adhoc-sys-1/adhoc-sys-1.jsonl", "adhoc-sys-1",
+		[]string{
+			`{"role":"system","message":{"content":[{"type":"text","text":"first note"}]}}`,
+			`{"role":"system","message":{"content":[{"type":"text","text":"second note"}]}}`,
+		}, "")
+	th, _, _ := adhocRead(t, env, ref, nil)
+
+	if len(th.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(th.Messages))
+	}
+	for _, m := range th.Messages {
+		if m.Role != store.RoleSystem {
+			t.Fatalf("message role = %q, want system", m.Role)
+		}
+		if len(m.Parts) != 1 || m.Parts[0].Type != importer.PartText {
+			t.Fatalf("message parts = %+v, want one text part", m.Parts)
+		}
+	}
+	if len(th.Turns) != 1 {
+		t.Fatalf("turns = %d, want the one leading span", len(th.Turns))
+	}
+}
+
+// TestShorterRewriteRescansFromZero: a transcript rewritten shorter is a
+// rescan, not a delta — the returned thread holds the rewritten content
+// whole, and the repo sidecar is re-emitted because a rescan is a full read.
+func TestShorterRewriteRescansFromZero(t *testing.T) {
+	const repoID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	env, ref, path := adhocTranscript(t,
+		projectsDir+"/adhoc-rescan/agent-transcripts/adhoc-rescan-1/adhoc-rescan-1.jsonl", "adhoc-rescan-1",
+		[]string{
+			`{"role":"user","message":{"content":[{"type":"text","text":"first version one"}]}}`,
+			`{"role":"user","message":{"content":[{"type":"text","text":"first version two"}]}}`,
+		}, repoID)
+	_, held, _ := adhocRead(t, env, ref, nil)
+
+	rewritten := `{"role":"user","message":{"content":[{"type":"text","text":"v2"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(rewritten), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	th, _, res, err := Source{}.Read(env, ref, held)
+	if err != nil {
+		t.Fatalf("rescan Read: %v", err)
+	}
+	if len(th.Messages) != 1 {
+		t.Fatalf("messages = %d, want the 1 rewritten line whole, not a delta", len(th.Messages))
+	}
+	if len(th.Messages[0].Parts) != 1 || !strings.Contains(th.Messages[0].Parts[0].Data, "v2") {
+		t.Fatalf("message parts = %+v, want the rewritten content", th.Messages[0].Parts)
+	}
+	if res.Lines != 1 {
+		t.Fatalf("lines = %d, want 1", res.Lines)
+	}
+	if len(th.Events) != 1 || th.Events[0].Type != eventRepo {
+		t.Fatalf("events = %+v, want the re-emitted repo sidecar", th.Events)
+	}
+	if !strings.Contains(th.Events[0].Data, repoID) {
+		t.Fatalf("event data = %s, want the repo id %q", th.Events[0].Data, repoID)
+	}
+}
+
+// TestMidLineOffsetKeepsAbsoluteToolIDs: a cursor stranded mid-line backs
+// up and re-reads the whole line, and the re-read tool_use carries the same
+// absolute id the full read gave it — base is the newline count before the
+// resume offset, not a per-read number.
+func TestMidLineOffsetKeepsAbsoluteToolIDs(t *testing.T) {
+	env, ref, _ := adhocTranscript(t,
+		projectsDir+"/adhoc-mid/agent-transcripts/adhoc-mid-1/adhoc-mid-1.jsonl", "adhoc-mid-1",
+		[]string{
+			`{"role":"user","message":{"content":[{"type":"text","text":"prompt"}]}}`,
+			`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"/x"}}]}}`,
+		}, "")
+	full, cur, _ := adhocRead(t, env, ref, nil)
+
+	var want string
+	for _, m := range full.Messages {
+		for _, p := range m.Parts {
+			if p.Type == importer.PartToolCall {
+				want = p.ToolCallID
+			}
+		}
+	}
+	if want == "" {
+		t.Fatal("full read emitted no tool_call")
+	}
+
+	jc, ok := cur.(importer.JSONLCursor)
+	if !ok {
+		t.Fatalf("cursor = %T, want JSONLCursor", cur)
+	}
+	mid := jc.Offset - 5
+	if mid <= 0 {
+		t.Fatalf("cursor = %+v, too small to sit mid-line", jc)
+	}
+	reread, _, _, err := Source{}.Read(env, ref, importer.JSONLCursor{Offset: mid, Size: jc.Size})
+	if err != nil {
+		t.Fatalf("mid-line Read: %v", err)
+	}
+	var got string
+	for _, m := range reread.Messages {
+		for _, p := range m.Parts {
+			if p.Type == importer.PartToolCall {
+				got = p.ToolCallID
+			}
+		}
+	}
+	if got != want {
+		t.Fatalf("re-read tool_call id = %q, want the full-read id %q", got, want)
+	}
+}
+
+// TestDeltaResultWithoutCallIsUnlinked: pairing is per-read, so a delta
+// carrying only a result — its call went out with an earlier read — keeps
+// the message and counts tool_result:unlinked rather than dropping it.
+func TestDeltaResultWithoutCallIsUnlinked(t *testing.T) {
+	env, ref, path := adhocTranscript(t,
+		projectsDir+"/adhoc-unlinked/agent-transcripts/adhoc-unlinked-1/adhoc-unlinked-1.jsonl", "adhoc-unlinked-1",
+		[]string{
+			`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"/x"}}]}}`,
+		}, "")
+	_, held, _ := adhocRead(t, env, ref, nil)
+
+	appendLine(t, path,
+		`{"role":"assistant","message":{"content":[{"type":"tool_result","tool_use_id":"foreign-xyz","content":"late output"}]}}`+"\n")
+	delta, _, res, err := Source{}.Read(env, ref, held)
+	if err != nil {
+		t.Fatalf("delta Read: %v", err)
+	}
+	if len(delta.Messages) != 1 {
+		t.Fatalf("messages = %d, want the 1 appended result line", len(delta.Messages))
+	}
+	var sawResult bool
+	for _, p := range delta.Messages[0].Parts {
+		if p.Type == importer.PartToolResult {
+			sawResult = true
+			if p.ToolCallID != "foreign-xyz" {
+				t.Fatalf("tool_result call id = %q, want foreign-xyz", p.ToolCallID)
+			}
+		}
+	}
+	if !sawResult {
+		t.Fatalf("message parts = %+v, want a tool_result", delta.Messages[0].Parts)
+	}
+	if res.Classified["tool_result:unlinked"] != 1 {
+		t.Fatalf("Classified = %v, want the cross-read link counted unlinked", res.Classified)
 	}
 }
 

@@ -37,7 +37,11 @@
 // messages as new rows: dedup is impossible without ids, which is inherent
 // to position-keyed NULL-id imports rather than a gap the cursor could
 // close. The rescan is still marked a full read, so the repo sidecar is
-// re-emitted rather than lost.
+// re-emitted rather than lost. A rewrite that leaves the file the same
+// length or longer is invisible to the cursor — the documented bargain of
+// JSONLCursor — and for NULL-id imports that means a re-import silently
+// duplicates, where claude converges through foreign ids. Callers must not
+// trust a cursor across a rewrite.
 //
 // # The transcript never names a time, a directory, or a model
 //
@@ -67,7 +71,9 @@
 // {"repo_id": ...}. Missing or unreadable repo.json is no event, not an
 // error. The event is emitted only when the incoming cursor is zero: turns
 // and events are positional cumulative lists in the store, so re-emitting it
-// on every delta read would append a duplicate per import.
+// on every delta read would append a duplicate per import. A thread returned
+// with err != nil must not be ingested; the sidecar still rides full reads,
+// error partials included.
 //
 // # Delta turns are over the delta
 //
@@ -87,5 +93,6 @@
 // Classify as "tool_result:unlinked" — dropping it would lose transcript
 // over a pairing this package cannot verify. Linkage is reconciled after the
 // pass, once every call has been seen, so a result preceding its call in the
-// same Read still links.
+// same Read still links. Cross-read links classify unlinked by design: the
+// pairing set is per-read, and real transcripts carry zero results.
 package cursor

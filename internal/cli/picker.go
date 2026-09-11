@@ -2,6 +2,8 @@ package cli
 
 import (
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/charmbracelet/huh"
 
@@ -71,7 +73,19 @@ func pickSession(rows []store.SessionRow) (string, error) {
 		if title == "" {
 			title = "(untitled)"
 		}
-		label := fmt.Sprintf("%s  —  %s %s", title, r.Harness, r.Model)
+		// Harness and model join without strays when one is missing; the
+		// recency plus short id tell apart the duplicate titles every
+		// agent eventually produces ("session title" × 40).
+		hm := strings.TrimSpace(strings.TrimSpace(r.Harness) + " " + strings.TrimSpace(r.Model))
+		short := r.ID
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		label := title
+		if hm != "" {
+			label += "  —  " + hm
+		}
+		label += fmt.Sprintf("  ·  %s  ·  %s", relativeTime(r.TimeUpdated, time.Now()), short)
 		options = append(options, huh.NewOption(label, r.ID))
 	}
 

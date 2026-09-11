@@ -334,7 +334,10 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 	if err == nil {
 		title := s.Title
 		if title == "" {
-			// Never wipe a stored title with an untitled re-import.
+			// Never wipe a stored title with an untitled re-import. A
+			// stored untitled row backfills here when the re-import
+			// carries user text; a row no re-import names stays untitled
+			// — there is no migration rewriting stored titles.
 			if terr := tx.QueryRowContext(ctx, `SELECT title FROM session WHERE id = ?`, sessionID).Scan(&title); terr != nil {
 				return "", false, false, fmt.Errorf("store: ingest read session title: %w", terr)
 			}
@@ -372,9 +375,13 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 			if _, derr := tx.ExecContext(ctx, `DELETE FROM session WHERE id = ?`, sessionID); derr != nil {
 				return "", false, false, fmt.Errorf("store: ingest adopt session: %w", derr)
 			}
+			winnerTitle, uerr := storedTitleOr(ctx, tx, winner, s.Title)
+			if uerr != nil {
+				return "", false, false, uerr
+			}
 			if _, uerr := tx.ExecContext(ctx,
 				`UPDATE session SET worktree_id = ?, directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
-				worktreeID, s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, winner); uerr != nil {
+				worktreeID, s.Directory, winnerTitle, s.Model, s.Provider, s.Harness, now, winner); uerr != nil {
 				return "", false, false, fmt.Errorf("store: ingest update session: %w", uerr)
 			}
 			return winner, false, false, nil
@@ -382,6 +389,20 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 		return "", false, false, fmt.Errorf("store: ingest insert binding: %w", err)
 	}
 	return sessionID, true, true, nil
+}
+
+// storedTitleOr resolves the title the binding-race path writes: the
+// winner's stored title when it has one, else this attempt's fallback, so
+// an untitled loser never wipes the title the winner just stored.
+func storedTitleOr(ctx context.Context, tx *sql.Tx, sessionID, incoming string) (string, error) {
+	var stored string
+	if err := tx.QueryRowContext(ctx, `SELECT title FROM session WHERE id = ?`, sessionID).Scan(&stored); err != nil {
+		return "", fmt.Errorf("store: ingest read session title: %w", err)
+	}
+	if stored != "" {
+		return stored, nil
+	}
+	return incoming, nil
 }
 
 // linkParent points sessionID at the session its parent binding names, when

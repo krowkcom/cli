@@ -526,10 +526,12 @@ func Surface() Catalog {
 }
 
 // Leaves are the commands that can actually be run, each with the whole path a
-// caller types. A group is not one of them — unless it carries a Usage, which
-// is what marks it invocable: `krowk uploads` on its own is not a command,
-// while bare `krowk sessions` lists. The tests that hold the catalog to the
-// routing switch would otherwise be looking for a case that should not exist
+// caller types. A group is not one of them — except `sessions`, whose Usage
+// marks it invocable: `krowk uploads` on its own is not a command, while
+// bare `krowk sessions` lists. The exception names the group on purpose, so
+// a future Usage on another group cannot silently change the contract; that
+// group must opt in here. The tests that hold the catalog to the routing
+// switch would otherwise be looking for a case that should not exist
 // (or missing one that should).
 func (c Catalog) Leaves() []Command {
 	var leaves []Command
@@ -538,7 +540,7 @@ func (c Catalog) Leaves() []Command {
 			leaves = append(leaves, cmd)
 			continue
 		}
-		if cmd.Usage != "" {
+		if cmd.Name == "sessions" && cmd.Usage != "" {
 			leaves = append(leaves, Command{
 				Name: cmd.Name, Usage: cmd.Usage, Summary: cmd.Summary,
 				Args: cmd.Args, Flags: cmd.Flags,

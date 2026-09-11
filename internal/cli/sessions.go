@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -100,14 +102,9 @@ type sessionsListJSON struct {
 func sessionRowJSON(r store.SessionRow, now time.Time) sessionJSON {
 	var cost *float64
 	display := "—"
-	if rates, ok := pricing.Price(r.Provider, pricing.Normalize(r.Provider, r.Model)); ok {
-		v := rates.Cost(pricing.Tokens{
-			Input: r.SumInput, Output: r.SumOutput,
-			CacheRead: r.SumCacheRead, CacheWrite: r.SumCacheWrite,
-			Reasoning: r.SumReasoning,
-		})
-		cost = &v
-		display = formatCost(v)
+	if priced, ok := priceRow(r); ok {
+		cost = &priced
+		display = formatCost(priced)
 	}
 	return sessionJSON{
 		ID: r.ID, Title: r.Title, Harness: r.Harness, Model: r.Model,
@@ -159,8 +156,8 @@ func humanSessionsList(rows []store.SessionRow, colour bool, now time.Time) stri
 		if title == "" {
 			title = "(untitled)"
 		}
-		if len(title) > 60 {
-			title = title[:57] + "..."
+		if r := []rune(title); len(r) > 60 {
+			title = string(r[:57]) + "..."
 		}
 		cost := "—"
 		if priced, ok := priceRow(r); ok {
@@ -197,7 +194,7 @@ func formatCost(usd float64) string {
 func relativeTime(ms int64, now time.Time) string {
 	t := time.UnixMilli(ms)
 	if t.After(now) {
-		return "just now"
+		return "in the future"
 	}
 	d := now.Sub(t)
 	switch {
@@ -235,11 +232,11 @@ func sessionsShow(w io.Writer, args []string, f flags, format output.Format, env
 
 	id, err := store.ResolveSessionID(db, args[0])
 	if err != nil {
-		msg := err.Error()
-		if strings.Contains(msg, "ambiguous") {
-			return api.Fail("ambiguous_session", msg)
+		var amb *store.AmbiguousSessionError
+		if errors.As(err, &amb) {
+			return api.Fail("ambiguous_session", err.Error())
 		}
-		return api.Fail("no_session", msg)
+		return api.Fail("no_session", err.Error())
 	}
 	d, err := store.LoadSessionDetail(db, id)
 	if err != nil {
@@ -349,7 +346,7 @@ func emitSessionShow(w io.Writer, f flags, d store.SessionDetail) error {
 	if priced, ok := priceRow(d.Session); ok {
 		out.PricedCostUSD = &priced
 		out.CostDisplay = formatCost(priced)
-		out.PricedWith = "priced at current models.dev rates"
+		out.PricedWith = fmt.Sprintf("priced at current models.dev rates (snapshot %s)", pricing.SnapshotDate)
 	}
 	if f.quiet {
 		return emit(w, encodeJSONValue(out), f)
@@ -393,7 +390,7 @@ func humanSessionShow(d store.SessionDetail, showThinking bool, colour bool, now
 		}
 		fmt.Fprintf(&b, "  %d tokens", t.Total)
 		if !t.USDNull {
-			fmt.Fprintf(&b, "  $%.6f", float64(t.USDMicros)/1e6)
+			fmt.Fprintf(&b, "  %s", formatCost(float64(t.USDMicros)/1e6))
 		}
 		b.WriteString("\n")
 	}
@@ -449,8 +446,11 @@ func humanPart(p store.PartDetail, showThinking bool) string {
 
 func truncateOneLine(s string, n int) string {
 	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > n {
-		return s[:n-3] + "..."
+	if r := []rune(s); len(r) > n {
+		if n < 3 {
+			return string(r[:n])
+		}
+		return string(r[:n-3]) + "..."
 	}
 	return s
 }
@@ -510,9 +510,12 @@ func partOutputString(data string) string {
 // encodeJSONValue renders indented JSON without HTML escaping, like every
 // other krowk answer.
 func encodeJSONValue(v any) string {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
 		return fmt.Sprintf(`{"ok":false,"error":{"error":"encode_failed","detail":%q}}`, err.Error())
 	}
-	return string(b)
+	return strings.TrimRight(buf.String(), "\n")
 }

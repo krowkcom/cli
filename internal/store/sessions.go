@@ -8,6 +8,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -17,7 +18,14 @@ import (
 // no blob column (message.raw_json, message.usage, part.data) and no part
 // table at all — a 10k-session listing stays instant because it never
 // reads a message or part row.
-const sessionListQuery = `SELECT s.id, s.title, s.model, s.provider, s.harness, s.directory, s.time_created, s.time_updated, w.path, b.harness, b.provider, b.foreign_session_id, COUNT(t.id), COALESCE(SUM(t.cost_input_tokens), 0), COALESCE(SUM(t.cost_output_tokens), 0), COALESCE(SUM(t.cost_total_tokens), 0), COALESCE(SUM(t.cost_cache_read_tokens), 0), COALESCE(SUM(t.cost_cache_write_tokens), 0), COALESCE(SUM(t.cost_reasoning_tokens), 0) FROM session s LEFT JOIN worktree w ON w.id = s.worktree_id LEFT JOIN session_binding b ON b.session_id = s.id LEFT JOIN turn t ON t.session_id = s.id WHERE (? = '' OR COALESCE(b.harness, s.harness) = ?) AND (? = '' OR w.path = ?) GROUP BY s.id ORDER BY s.time_updated DESC LIMIT ?`
+//
+// The binding and turn joins each yield at most one row per session: the
+// binding through the earliest-minted row (binding ids are UUIDv7, so id
+// order is creation order) and the turns through a pre-aggregated
+// subquery. Joining both tables directly would fan out — a second binding
+// multiplies the turn COUNT/SUM and a second turn duplicates the binding
+// columns. sessionListQuery is a constant so the gate pins the exact text.
+const sessionListQuery = `SELECT s.id, s.title, s.model, s.provider, s.harness, s.directory, s.time_created, s.time_updated, w.path, b.harness, b.provider, b.foreign_session_id, COALESCE(t.n, 0), COALESCE(t.sum_in, 0), COALESCE(t.sum_out, 0), COALESCE(t.sum_total, 0), COALESCE(t.sum_cread, 0), COALESCE(t.sum_cwrite, 0), COALESCE(t.sum_reason, 0) FROM session s LEFT JOIN worktree w ON w.id = s.worktree_id LEFT JOIN (SELECT session_id, MIN(id) AS id FROM session_binding GROUP BY session_id) one ON one.session_id = s.id LEFT JOIN session_binding b ON b.id = one.id LEFT JOIN (SELECT session_id, COUNT(*) AS n, SUM(cost_input_tokens) AS sum_in, SUM(cost_output_tokens) AS sum_out, SUM(cost_total_tokens) AS sum_total, SUM(cost_cache_read_tokens) AS sum_cread, SUM(cost_cache_write_tokens) AS sum_cwrite, SUM(cost_reasoning_tokens) AS sum_reason FROM turn GROUP BY session_id) t ON t.session_id = s.id WHERE (? = '' OR COALESCE(b.harness, s.harness) = ?) AND (? = '' OR w.path = ?) ORDER BY s.time_updated DESC LIMIT ?`
 
 // SessionRow is one listing row: display columns plus the turn aggregate
 // the priced cost is derived from at display time.
@@ -85,6 +93,17 @@ func ListSessions(db *sql.DB, harness, worktree string, limit int) ([]SessionRow
 	return out, nil
 }
 
+// AmbiguousSessionError is what ResolveSessionID returns when a prefix
+// matches more than one session. Callers match it with errors.As to pick
+// the ambiguous_session code — never by substring on the message.
+type AmbiguousSessionError struct {
+	Ref string
+	IDs []string
+	msg string
+}
+
+func (e *AmbiguousSessionError) Error() string { return e.msg }
+
 // ResolveSessionID maps what a person typed to a store session id: a full
 // id, an unambiguous id prefix of at least 8 chars, or a foreign_session_id
 // via the binding. An ambiguous prefix fails naming every candidate.
@@ -105,7 +124,7 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 	if len(ref) < 8 {
 		return "", fmt.Errorf("store: %q matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id", ref)
 	}
-	rows, err := db.Query(`SELECT id, title FROM session WHERE id LIKE ? || '%' ORDER BY id`, ref)
+	rows, err := db.Query(`SELECT id, title FROM session WHERE id LIKE ? ESCAPE '\' ORDER BY id`, escapeLikePrefix(ref)+"%")
 	if err != nil {
 		return "", fmt.Errorf("store: resolve session: %w", err)
 	}
@@ -137,8 +156,18 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 			}
 			fmt.Fprintf(&b, "\n  %s  %s", ids[i], title)
 		}
-		return "", fmt.Errorf("%s", b.String())
+		return "", &AmbiguousSessionError{Ref: ref, IDs: ids, msg: b.String()}
 	}
+}
+
+// escapeLikePrefix quotes the LIKE wildcards in a typed id prefix: % and _
+// match any run under LIKE, and the ESCAPE '\' clause needs backslashes
+// doubled. Without this a prefix of "%" lists every session.
+func escapeLikePrefix(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
 }
 
 // TurnDetail, MessageDetail and PartDetail are what show hydrates: turns,
@@ -195,7 +224,7 @@ func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 	var d SessionDetail
 	var r SessionRow
 	var wpath, bharness, bprovider, foreign sql.NullString
-	err := db.QueryRow(`SELECT s.id, s.title, s.model, s.provider, s.harness, s.directory, s.time_created, s.time_updated, w.path, b.harness, b.provider, b.foreign_session_id FROM session s LEFT JOIN worktree w ON w.id = s.worktree_id LEFT JOIN session_binding b ON b.session_id = s.id WHERE s.id = ?`, sessionID).
+	err := db.QueryRow(`SELECT s.id, s.title, s.model, s.provider, s.harness, s.directory, s.time_created, s.time_updated, w.path, (SELECT b.harness FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1), (SELECT b.provider FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1), (SELECT b.foreign_session_id FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1) FROM session s LEFT JOIN worktree w ON w.id = s.worktree_id WHERE s.id = ?`, sessionID).
 		Scan(&r.ID, &r.Title, &r.Model, &r.Provider, &r.Harness, &r.Directory,
 			&r.TimeCreated, &r.TimeUpdated, &wpath, &bharness, &bprovider, &foreign)
 	if err == sql.ErrNoRows {
@@ -271,46 +300,53 @@ func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 		return d, fmt.Errorf("store: load messages rows: %w", err)
 	}
 
-	// Tool names keyed by call id, so tool_result parts print their twin's name.
+	// Parts load in one session-scoped query (part carries session_id for
+	// exactly this), then distribute to their messages in seq order. The
+	// tool-name pass runs over every part before any tool_result links, so
+	// a result links to its call regardless of which message comes first.
+	prows, err := db.Query(`SELECT message_id, seq, type, tool_call_id, signature, data, foreign_id FROM part WHERE session_id = ? ORDER BY message_id, seq`, sessionID)
+	if err != nil {
+		return d, fmt.Errorf("store: load parts: %w", err)
+	}
+	partsByMsg := map[string][]PartDetail{}
 	toolNames := map[string]string{}
-	for _, mk := range msgs {
-		prows, err := db.Query(`SELECT seq, type, tool_call_id, signature, data, foreign_id FROM part WHERE message_id = ? ORDER BY seq`, mk.id)
-		if err != nil {
-			return d, fmt.Errorf("store: load parts: %w", err)
+	type rawPart struct {
+		msgID string
+		part  PartDetail
+	}
+	var all []rawPart
+	for prows.Next() {
+		var msgID string
+		var p PartDetail
+		var tcid, sig, pforeign sql.NullString
+		if err := prows.Scan(&msgID, &p.Seq, &p.Type, &tcid, &sig, &p.Data, &pforeign); err != nil {
+			prows.Close()
+			return d, fmt.Errorf("store: scan part: %w", err)
 		}
-		var parts []PartDetail
-		for prows.Next() {
-			var p PartDetail
-			var tcid, sig, pforeign sql.NullString
-			if err := prows.Scan(&p.Seq, &p.Type, &tcid, &sig, &p.Data, &pforeign); err != nil {
-				prows.Close()
-				return d, fmt.Errorf("store: scan part: %w", err)
-			}
-			p.ToolCallID = tcid.String
-			p.Signature = sig.String
-			p.ForeignID = pforeign.String
-			parts = append(parts, p)
-		}
-		prows.Close()
-		if err := prows.Err(); err != nil {
-			return d, fmt.Errorf("store: load parts rows: %w", err)
-		}
-		for _, p := range parts {
-			if p.Type == "tool_call" && p.ToolCallID != "" {
-				if name := toolCallName(p.Data); name != "" {
-					if _, ok := toolNames[p.ToolCallID]; !ok {
-						toolNames[p.ToolCallID] = name
-					}
+		p.ToolCallID = tcid.String
+		p.Signature = sig.String
+		p.ForeignID = pforeign.String
+		partsByMsg[msgID] = append(partsByMsg[msgID], p)
+		all = append(all, rawPart{msgID: msgID, part: p})
+	}
+	prows.Close()
+	if err := prows.Err(); err != nil {
+		return d, fmt.Errorf("store: load parts rows: %w", err)
+	}
+	// First pass over all parts: index every tool_call name.
+	for _, rp := range all {
+		if rp.part.Type == "tool_call" && rp.part.ToolCallID != "" {
+			if name := toolCallName(rp.part.Data); name != "" {
+				if _, ok := toolNames[rp.part.ToolCallID]; !ok {
+					toolNames[rp.part.ToolCallID] = name
 				}
 			}
 		}
-		mk.msg.Parts = parts
-		// append now; link pass below fills ToolName/Linked.
-		d.Messages = append(d.Messages, mk.msg)
 	}
-	for mi := range d.Messages {
-		for pi := range d.Messages[mi].Parts {
-			p := &d.Messages[mi].Parts[pi]
+	// Second pass: link every tool_result to its twin's name.
+	for msgID, parts := range partsByMsg {
+		for i := range parts {
+			p := &parts[i]
 			if p.Type != "tool_result" {
 				continue
 			}
@@ -320,46 +356,27 @@ func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 				p.ToolName, p.Linked = "unknown tool", false
 			}
 		}
+		partsByMsg[msgID] = parts
+	}
+	for _, mk := range msgs {
+		mk.msg.Parts = partsByMsg[mk.id]
+		d.Messages = append(d.Messages, mk.msg)
 	}
 	return d, nil
 }
 
-// toolCallName pulls {"name":...} out of a tool_call part's data without a
-// full schema: show only needs the name to label the twin result.
+// toolCallName reads the top-level {"name":...} of a tool_call part's
+// data with a real JSON decode: a substring scan mistakes a nested
+// input.name for the call name and mis-decodes escapes.
 //
 // ToolNameOf is the exported half, for the CLI's human and JSON rendering.
 func ToolNameOf(data string) string { return toolCallName(data) }
 func toolCallName(data string) string {
-	start := strings.Index(data, `"name"`)
-	if start < 0 {
+	var v struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(data), &v); err != nil {
 		return ""
 	}
-	rest := data[start+len(`"name"`):]
-	colon := strings.Index(rest, ":")
-	if colon < 0 {
-		return ""
-	}
-	rest = strings.TrimSpace(rest[colon+1:])
-	if !strings.HasPrefix(rest, `"`) {
-		return ""
-	}
-	rest = rest[1:]
-	var b strings.Builder
-	escaped := false
-	for _, r := range rest {
-		if escaped {
-			b.WriteRune(r)
-			escaped = false
-			continue
-		}
-		if r == '\\' {
-			escaped = true
-			continue
-		}
-		if r == '"' {
-			return b.String()
-		}
-		b.WriteRune(r)
-	}
-	return ""
+	return v.Name
 }

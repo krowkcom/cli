@@ -12,7 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"unicode"
+
+	"github.com/krowkcom/cli/internal/termclean"
 )
 
 // sessionListQuery lists sessions newest-first from columns only: session,
@@ -60,17 +61,27 @@ type SessionRow struct {
 	SumReasoning     int64
 }
 
+// DefaultSessionPageSize is the listing page when the caller passes limit 0
+// (the shared flag set's unset value). The CLI's --limit defaults to this
+// in help text and passes 0 through; the store applies the default in this
+// one place so every caller agrees.
+const DefaultSessionPageSize = 50
+
 // ListSessions runs sessionListQuery: harness and worktree are exact-match
-// filters (empty means no filter), limit <= 0 means no cap — callers pass
-// -1 for --all, and 0 is treated the same (never "zero rows"): it is the
-// unset value the shared flag set carries, so a caller that forgot to
-// default still lists rather than answering empty. Pass a positive page or
-// -1. Rows come newest-first.
+// filters (empty means no filter). limit is a page size with one contract:
+// -1 means no cap (--all), 0 means the default page (DefaultSessionPageSize),
+// a positive n lists at most n rows. Any other negative is a caller bug and
+// fails. Rows come newest-first.
 func ListSessions(db *sql.DB, harness, worktree string, limit int) ([]SessionRow, error) {
 	q := sessionListQuery
 	lim := limit
-	if lim <= 0 {
-		lim = -1
+	switch {
+	case lim == 0:
+		lim = DefaultSessionPageSize
+	case lim == -1:
+	case lim > 0:
+	default:
+		return nil, fmt.Errorf("store: list sessions: bad limit %d (want -1 for all, 0 for the default page, or a positive page)", limit)
 	}
 	rows, err := db.Query(q, harness, harness, worktree, worktree, lim)
 	if err != nil {
@@ -185,7 +196,7 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 			fmt.Fprintf(&b, "store: %q is ambiguous (%d sessions):", ref, len(ids))
 		}
 		for i := range ids {
-			title := sanitizeCell(titles[i])
+			title := termclean.Cell(titles[i])
 			if title == "" {
 				title = "(untitled)"
 			}
@@ -195,45 +206,9 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 	}
 }
 
-// sanitizeCell makes caller-controlled transcript text safe for a terminal
-// row: whitespace folds to single spaces and control / bidi / zero-width
-// runes are dropped. Local copy of the CLI cleanCell logic — store cannot
-// import the CLI package without a cycle.
+// sanitizeCell is the store's name for the shared terminal scrubber.
 func sanitizeCell(s string) string {
-	var b strings.Builder
-	space := false
-	for _, r := range strings.TrimSpace(s) {
-		switch {
-		case unicode.IsSpace(r):
-			space = true
-		case unicode.IsControl(r), reorderRune(r):
-			// Dropped outright: an escape sequence arrives as ESC plus
-			// ordinary letters, spacing it would leave letters as text.
-		default:
-			if space && b.Len() > 0 {
-				b.WriteByte(' ')
-			}
-			space = false
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-// reorderRune reports characters that move or hide text while occupying no
-// space: bidi overrides/isolates, zero-width spaces, BOM. ZWJ is kept to
-// hold multi-part emoji together.
-func reorderRune(r rune) bool {
-	switch {
-	case r == '\u200d':
-		return false
-	case r == '\ufeff',
-		r >= '\u200b' && r <= '\u200f',
-		r >= '\u202a' && r <= '\u202e',
-		r >= '\u2066' && r <= '\u2069':
-		return true
-	}
-	return false
+	return termclean.Cell(s)
 }
 
 // escapeLikePrefix quotes the LIKE wildcards in a typed id prefix: % and _

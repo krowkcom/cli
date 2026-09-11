@@ -9,7 +9,6 @@ import (
 	"io"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/krowkcom/cli/internal/api"
@@ -17,11 +16,13 @@ import (
 	"github.com/krowkcom/cli/internal/pricing"
 	"github.com/krowkcom/cli/internal/runctx"
 	"github.com/krowkcom/cli/internal/store"
+	"github.com/krowkcom/cli/internal/termclean"
 )
 
 // defaultSessionLimit is the listing page when --limit is unset and --all
-// is not passed. It matches the registry listings' page size.
-const defaultSessionLimit = 50
+// is not passed. It aliases the store's default page so the picker gate and
+// the query agree in one place.
+const defaultSessionLimit = store.DefaultSessionPageSize
 
 // sessionsList lists every thread on this machine from columns only: title,
 // harness, model, turn count, priced cost and recency. Message/part blobs
@@ -40,9 +41,9 @@ func sessionsList(w io.Writer, f flags, format output.Format, env runctx.Env, co
 	}
 	if all {
 		limit = -1
-	} else if limit == 0 {
-		limit = defaultSessionLimit
 	}
+	// limit 0 is the flag set's unset value; store.ListSessions applies the
+	// default page (store.DefaultSessionPageSize) in that one place.
 	db, err := store.Open(store.Env(env))
 	if err != nil {
 		return api.Fail("store_unavailable", sanitizeStoreErr(err, store.DBPath(store.Env(env))))
@@ -56,7 +57,10 @@ func sessionsList(w io.Writer, f flags, format output.Format, env runctx.Env, co
 	if format != output.Human {
 		return emitSessionsList(w, format, f, rows)
 	}
-	if interactive(f, format, env, isTTY) && len(rows) > 0 {
+	// The picker builds one huh option per row: an unbounded --all page (or
+	// any page past the default) would hang the TTY building options, so the
+	// picker only fires on a paged list and the full page prints as a table.
+	if interactive(f, format, env, isTTY) && !all && len(rows) > 0 && len(rows) <= defaultSessionLimit {
 		id, err := pickSession(rows)
 		if err != nil {
 			return err
@@ -257,7 +261,7 @@ func sessionsShow(w io.Writer, args []string, f flags, format output.Format, env
 			return api.Fail("ambiguous_session", err.Error())
 		}
 		if errors.Is(err, sql.ErrNoRows) {
-			return api.Fail("no_session", noSessionDetail(err))
+			return api.Fail("no_session", noSessionDetail(args[0]))
 		}
 		return api.Fail("store_unavailable", sanitizeStoreErr(err, store.DBPath(store.Env(env))))
 	}
@@ -275,13 +279,15 @@ func sessionsShow(w io.Writer, args []string, f flags, format output.Format, env
 	return nil
 }
 
-// noSessionDetail keeps the store's miss hint ("matches no session — pass
-// a full id …") while dropping the driver suffix ResolveSessionID wraps
-// underneath (": sql: no rows in result set"), which is a driver fact, not
-// a fact about the session the person typed.
-func noSessionDetail(err error) string {
-	const suffix = ": sql: no rows in result set"
-	return strings.TrimSuffix(err.Error(), suffix)
+// noSessionDetail builds the miss message from the typed ref alone, without
+// wrapping (and then stripping) the driver text ResolveSessionID carries
+// underneath.
+func noSessionDetail(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "pass the session: `krowk sessions show <id>`"
+	}
+	return fmt.Sprintf("%q matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id", ref)
 }
 
 type showPartJSON struct {
@@ -417,7 +423,8 @@ func humanSessionShow(d store.SessionDetail, showThinking bool, colour bool, now
 	meta += "  " + relativeTime(d.Session.TimeUpdated, now)
 	if wp := cleanCell(d.Session.WorktreePath); wp != "" {
 		meta += "\n" + wp
-	} else if dir := cleanCell(d.Session.Directory); dir != "" {
+	}
+	if dir := cleanCell(d.Session.Directory); dir != "" {
 		meta += "\n" + dir
 	}
 	b.WriteString(meta + "\n")
@@ -495,49 +502,9 @@ func truncateRunes(s string, n int) string {
 	return s
 }
 
-// cleanCell makes caller-controlled transcript text safe for a terminal
-// row: whitespace folds to single spaces and the characters that would
-// move the cursor, recolour the row or reorder what is drawn after it are
-// dropped. Dropping ESC outright also neutralises ANSI sequences (only
-// their inert letters remain). Mirrors internal/output's oneLine, which
-// stays unexported — this is the CLI's copy for session display.
+// cleanCell is the CLI's name for the shared terminal scrubber.
 func cleanCell(s string) string {
-	var b strings.Builder
-	space := false
-	for _, r := range strings.TrimSpace(s) {
-		switch {
-		case unicode.IsSpace(r):
-			space = true
-		case unicode.IsControl(r), reorderRune(r):
-			// Dropped outright rather than folded to a space: an escape
-			// sequence arrives as ESC plus ordinary letters, and spacing
-			// it out would leave the letters behind as text.
-		default:
-			if space && b.Len() > 0 {
-				b.WriteByte(' ')
-			}
-			space = false
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-// reorderRune reports the characters that move or hide text while
-// occupying no space of their own: bidi overrides and isolates,
-// zero-width spaces, and the byte order mark. U+200D ZERO WIDTH JOINER
-// is kept: it holds multi-part emoji together.
-func reorderRune(r rune) bool {
-	switch {
-	case r == '\u200d':
-		return false
-	case r == '\ufeff',
-		r >= '\u200b' && r <= '\u200f',
-		r >= '\u202a' && r <= '\u202e',
-		r >= '\u2066' && r <= '\u2069':
-		return true
-	}
-	return false
+	return termclean.Cell(s)
 }
 
 func partTextString(data string) string {

@@ -492,7 +492,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	// half: `krowk push shot.png --dry-run` reads as a rehearsal and
 	// uploads the file. So the flags that belong to one command are refused
 	// on every other one, by name, before anything runs.
-	if err := onlyForSessionsImport(given, positionals); err != nil {
+	if err := rejectMisplacedSessionsFlags(given, positionals); err != nil {
 		return reportFiltered(stderr, err, format, f.quiet, colour, f.errTTY, f.filter)
 	}
 
@@ -2150,7 +2150,7 @@ func clip[T any](s []T, n int) []T {
 	return s[:n]
 }
 
-// onlyForSessionsImport refuses each sessions flag anywhere it does not
+// rejectMisplacedSessionsFlags refuses each sessions flag anywhere it does not
 // belong. --limit is not in the owner list: the listings read the same
 // number as a page size and the import as a transcript cap, so it means a
 // maximum on all of them and one flag says it. `sessions show` reads one
@@ -2160,7 +2160,7 @@ func clip[T any](s []T, n int) []T {
 // nothing outside the bare `sessions` list; --thinking means nothing
 // outside `sessions show`. A flag that means nothing where it was typed is
 // a flag that was misunderstood by whoever typed it.
-func onlyForSessionsImport(given map[string]bool, positionals []string) error {
+func rejectMisplacedSessionsFlags(given map[string]bool, positionals []string) error {
 	isImport := len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "import"
 	isShow := len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "show"
 	isList := len(positionals) == 1 && positionals[0] == "sessions"

@@ -44,11 +44,19 @@ type Source interface {
 	//
 	// The returned Cursor is the last safe watermark and is non-nil even
 	// when err is non-nil: a read that failed halfway still knows how far
-	// it got safely, and a caller that stored nothing would re-import the
-	// prefix on every attempt. The one exception is a rejected cursor —
+	// it got safely. The one exception is a rejected cursor —
 	// ErrCursorType below — where Read hands back the cursor it was given,
 	// untouched, because it never read anything and has nothing of its own
 	// to say.
+	//
+	// `krowk sessions import`, the only caller, stores none of those
+	// cursors: a failed Read returns no usable Thread, and a watermark
+	// moved past rows that were never ingested is a gap in the store that
+	// no later run would ever fill. Advancing the cursor without the rows
+	// is the one failure that is silent and permanent, and re-reading a
+	// prefix is only work. Sources still return the watermark because it
+	// is honest and a future caller may have somewhere to put it; nothing
+	// today does.
 	//
 	// A Source must return ErrCursorType when cursor is not the concrete
 	// kind it takes. Silently falling back to a full rescan would be the

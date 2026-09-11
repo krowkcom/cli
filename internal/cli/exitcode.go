@@ -77,6 +77,14 @@ var clientCodes = map[string]int{
 	"import_locked":     exitUnreachable,
 	"store_unavailable": exitUnreachable,
 
+	// The two ways `krowk sessions import` refuses that are not storage:
+	// the machine is Windows, or the run finished having lost everything it
+	// tried to read. Both are exitUsage — the default this table would have
+	// fallen through to — written down so the mapping is a decision rather
+	// than an omission.
+	"unsupported_os": exitUsage,
+	"import_failed":  exitUsage,
+
 	// An answer arrived, but not one this client can act on. That is the
 	// registry's side of the contract broken, which is what exitServer names.
 	"malformed_response": exitServer,

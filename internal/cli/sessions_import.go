@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -31,6 +33,26 @@ const fromAll = "all"
 // response carrying ten thousand near-identical sentences is not a better
 // answer than ten and a count.
 const maxReportedErrors = 10
+
+// The report is built from strings a transcript supplied — a raw `type`
+// field, a reason carrying a path — and a report is not a place to pass
+// those through at whatever length they arrived. A machine with a corrupt
+// or hostile transcript directory can otherwise make one JSON answer
+// arbitrarily large, and a terminal unreadable, without anything having
+// gone wrong that krowk would call an error.
+//
+// maxSkippedTypes is how many distinct raw types `skipped_by_type` names
+// before the rest are summed under skippedTypeOther. Thirty-two is well
+// past the handful any real reader produces: a source generating more than
+// that has gone wrong in a way the list of names does not help with, and
+// the count still does.
+const (
+	maxSkippedTypes    = 32
+	maxSkippedTypeLen  = 64
+	maxErrorReasonLen  = 512
+	skippedTypeOther   = "other"
+	truncationEllipsis = "…"
+)
 
 // unsupportedOSMessage is what Windows gets, verbatim. It is a constant
 // because it is checked as an exact string: the message is the whole answer
@@ -70,18 +92,28 @@ func importSources() []importSource {
 }
 
 // providerReport is what one source did, in rows rather than in prose. The
-// inserted counts sit beside the totals rather than replacing them because
-// the two answer different questions: "how much of my history is in the
-// store" is the total, and "did this run do anything" is what was inserted.
+// inserted counts sit beside the seen counts rather than replacing them
+// because the two answer different questions: "how much did this run read"
+// is the seen count, and "did this run change anything" is what was
+// inserted.
 type providerReport struct {
 	Provider string `json:"provider"`
 	// Files is how many refs were read, which for every reader here is one
 	// per session file or session row.
-	Files    int `json:"files"`
-	Sessions int `json:"sessions"`
-	Messages int `json:"messages"`
-	Parts    int `json:"parts"`
+	Files int `json:"files"`
+	// SessionsSeen, MessagesSeen and PartsSeen are what this run read, not
+	// what the store contains. They are named `*_seen` because they are not
+	// comparable across sources: claude and opencode re-read a whole
+	// transcript every run, while cursor resumes from its byte offset and
+	// so reads only what was appended since last time. Summing them is a
+	// measure of this run's work, never of the store's contents — that
+	// question is answered by the store.
+	SessionsSeen int `json:"sessions_seen"`
+	MessagesSeen int `json:"messages_seen"`
+	PartsSeen    int `json:"parts_seen"`
 
+	// The *Inserted counts are rows this run actually added, which is the
+	// one number that means the same thing whichever source produced it.
 	SessionsInserted int `json:"sessions_inserted"`
 	MessagesInserted int `json:"messages_inserted"`
 	PartsInserted    int `json:"parts_inserted"`
@@ -102,6 +134,12 @@ type providerReport struct {
 	// Errors is the first maxReportedErrors of those, plus a Discover
 	// failure if there was one.
 	Errors []string `json:"errors,omitempty"`
+	// ErrorsTruncated is how many reasons were dropped to keep Errors
+	// bounded. Without it a caller reading ten errors beside a
+	// files_failed of four hundred has to work out for itself that the
+	// list is not the whole story, and a human line showing ten reasons
+	// looks like ten problems.
+	ErrorsTruncated int `json:"errors_truncated"`
 
 	DurationMS int64 `json:"duration_ms"`
 }
@@ -167,29 +205,53 @@ func sessionsImport(w io.Writer, format output.Format, f flags, env runctx.Env) 
 			"use 0 for no limit")
 	}
 
-	// Open before locking, so a store that cannot be opened at all reports
-	// its own hint — a relative or missing HOME is store.ErrNoHome with the
-	// sentence that says what to set — rather than a failure to create a
-	// lock file in a directory that was never going to exist.
-	db, err := store.Open(store.Env(env))
-	if err != nil {
-		return api.Fail("store_unavailable", err.Error())
+	// A store path is resolved before anything is created, because an
+	// environment that names no home has no answer here at all — not even
+	// for a dry run, which would otherwise be the one shape of this command
+	// that quietly did not care where the store was. store.Open is asked
+	// for the sentence rather than it being written twice: the hint that
+	// says which variable to set belongs to the package that needs it set.
+	storePath := store.DBPath(store.Env(env))
+	if storePath == "" {
+		_, err := store.Open(store.Env(env))
+		if err == nil {
+			err = store.ErrNoHome
+		}
+		return api.Fail("store_unavailable", sanitizeStoreErr(err, storePath))
 	}
-	defer db.Close()
 
-	lockPath := importLockPath(store.DBPath(store.Env(env)))
-	release, err := lockImport(lockPath)
-	if err != nil {
-		return importLockFailure(lockPath, err)
+	var db *sql.DB
+	if !f.dryRun {
+		// The lock is taken before store.Open, not after: opening is
+		// itself a write — the file is created, the schema is stamped,
+		// pragmas are set — so an open racing another import is exactly
+		// the SQLite-level collision this lock exists to keep away from
+		// the caller. Creating the directory first is what store.Open
+		// would have done anyway, with the same mode, so the lock file
+		// has somewhere to live.
+		if err := os.MkdirAll(filepath.Dir(storePath), 0o700); err != nil {
+			return api.Fail("store_unavailable", err.Error())
+		}
+		lockPath := importLockPath(storePath)
+		release, err := lockImport(lockPath)
+		if err != nil {
+			return importLockFailure(lockPath, err)
+		}
+		defer release.Close()
+
+		db, err = store.Open(store.Env(env))
+		if err != nil {
+			return api.Fail("store_unavailable", sanitizeStoreErr(err, storePath))
+		}
+		defer db.Close()
 	}
-	defer release.Close()
 
 	ctx := context.Background()
 	started := time.Now()
-	report := importReport{DryRun: f.dryRun, Store: store.DBPath(store.Env(env))}
+	report := importReport{DryRun: f.dryRun, Store: storePath}
 	var broken []string
 	for _, s := range sources {
-		row := runImportSource(ctx, db, s, harnessenv.Env(env), f)
+		row := runImportSource(ctx, db, storePath, s, harnessenv.Env(env), f)
 		if row.discoverFailed {
 			broken = append(broken, row.Provider+" could not be listed")
 		} else if row.Files > 0 && row.FilesFailed == row.Files {
@@ -243,7 +305,7 @@ type sourceOutcome struct {
 // that is actually returned. With an unnamed return the defer runs after the
 // copy and every duration reports 0, which is a lie that looks like a fast
 // machine.
-func runImportSource(ctx context.Context, db *sql.DB, s importSource, env harnessenv.Env, f flags) (out sourceOutcome) {
+func runImportSource(ctx context.Context, db *sql.DB, storePath string, s importSource, env harnessenv.Env, f flags) (out sourceOutcome) {
 	started := time.Now()
 	out = sourceOutcome{providerReport: providerReport{
 		Provider:      s.src.Name(),
@@ -254,7 +316,8 @@ func runImportSource(ctx context.Context, db *sql.DB, s importSource, env harnes
 	refs, err := s.src.Discover(env)
 	if err != nil {
 		out.discoverFailed = true
-		out.Errors = append(out.Errors, "discover: "+err.Error())
+		out.Errors = append(out.Errors,
+			truncateForReport("discover: "+sanitizeStoreErr(err, storePath), maxErrorReasonLen))
 		return out
 	}
 	// The limit is per source and it is a limit on refs, which is what
@@ -276,12 +339,12 @@ func runImportSource(ctx context.Context, db *sql.DB, s importSource, env harnes
 	for _, ref := range refs {
 		stored, err := store.ReadImportState(ctx, db, ref.Key())
 		if err != nil {
-			out.fail(ref, err)
+			out.fail(ref, err, storePath)
 			continue
 		}
 		cur, err := s.decode(stored)
 		if err != nil {
-			out.fail(ref, err)
+			out.fail(ref, err, storePath)
 			continue
 		}
 		th, next, res, err := s.src.Read(env, ref, cur)
@@ -292,7 +355,7 @@ func runImportSource(ctx context.Context, db *sql.DB, s importSource, env harnes
 			// turn would be refreshed downward from it — so the honest
 			// thing is to leave the ref exactly as it was and try again
 			// next run.
-			out.fail(ref, err)
+			out.fail(ref, err, storePath)
 			continue
 		}
 		out.absorb(res)
@@ -301,45 +364,81 @@ func runImportSource(ctx context.Context, db *sql.DB, s importSource, env harnes
 		if next != nil {
 			encoded, err = next.Encode()
 			if err != nil {
-				out.fail(ref, err)
+				out.fail(ref, err, storePath)
 				continue
 			}
 		}
 		ing, err := writer.IngestWithCursor(ctx, th, ref.Key(), encoded)
-		out.count(ing)
 		if err != nil {
-			out.fail(ref, err)
+			// Counted only on success, which is the simpler of the two
+			// ways to stop a half-written ref from being reported as
+			// both stored and failed. A failed ingest may have inserted
+			// something before it gave up, so this can undercount by
+			// whatever that partial write left behind — an undercount of
+			// a ref that is also listed in `errors` is the honest half
+			// of the trade, where counting it would claim rows landed
+			// that nobody can vouch for. The ref still counts in
+			// files_failed, so a source that lost every one of them
+			// still fails the run.
+			out.fail(ref, err, storePath)
+			continue
 		}
+		out.count(ing)
 	}
 	return out
 }
 
-// count folds one Ingest's counts into the row.
+// count folds one successful Ingest's counts into the row.
 func (o *sourceOutcome) count(r store.Result) {
-	o.Sessions += r.Sessions.Inserted + r.Sessions.Skipped
-	o.Messages += r.Messages.Inserted + r.Messages.Skipped
-	o.Parts += r.Parts.Inserted + r.Parts.Skipped
+	o.SessionsSeen += r.Sessions.Inserted + r.Sessions.Skipped
+	o.MessagesSeen += r.Messages.Inserted + r.Messages.Skipped
+	o.PartsSeen += r.Parts.Inserted + r.Parts.Skipped
 	o.SessionsInserted += r.Sessions.Inserted
 	o.MessagesInserted += r.Messages.Inserted
 	o.PartsInserted += r.Parts.Inserted
 }
 
-// absorb folds one Read's lossiness into the row.
+// absorb folds one Read's lossiness into the row, bounded in both
+// directions: the number of distinct types named, and the length of each
+// name. Once the map is full, further types are summed under `other` rather
+// than dropped — the point of the list is "what did this reader not
+// understand", and a count of unnamed leftovers still answers "is there
+// more of it".
 func (o *sourceOutcome) absorb(r importer.Result) {
 	for k, v := range r.UnknownTypes {
+		k = truncateForReport(k, maxSkippedTypeLen)
+		if _, known := o.SkippedByType[k]; !known && len(o.SkippedByType) >= maxSkippedTypes {
+			k = skippedTypeOther
+		}
 		o.SkippedByType[k] += v
 	}
 	o.SkippedLines += r.SkippedCount
 }
 
+// truncateForReport bounds a string that came from a transcript before it
+// lands in the report. The cut is made valid UTF-8 again rather than left
+// as it fell: slicing bytes can land inside a rune, and these strings go to
+// a terminal and through a JSON encoder. It is importer.truncateReason's
+// rule, applied at the other end of the pipe — unexported there, and one
+// six-line function is a smaller thing to have twice than an export whose
+// only caller is in another package.
+func truncateForReport(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max-len(truncationEllipsis)], "") + truncationEllipsis
+}
+
 // fail records one ref that did not make it, with why, and keeps the list
 // bounded.
-func (o *sourceOutcome) fail(ref importer.Ref, err error) {
+func (o *sourceOutcome) fail(ref importer.Ref, err error, storePath string) {
 	o.FilesFailed++
 	if len(o.Errors) >= maxReportedErrors {
+		o.ErrorsTruncated++
 		return
 	}
-	o.Errors = append(o.Errors, ref.Key()+": "+err.Error())
+	o.Errors = append(o.Errors,
+		truncateForReport(ref.Key()+": "+sanitizeStoreErr(err, storePath), maxErrorReasonLen))
 }
 
 // selectedSources resolves --from. An empty flag is a mistake rather than a
@@ -355,7 +454,7 @@ func selectedSources(from string) ([]importSource, error) {
 
 	switch from {
 	case "":
-		return nil, api.Fail("parameter_missing",
+		return nil, api.Fail("bad_flag",
 			"`krowk sessions import` needs --from <"+choices+"> — it says which agent's transcripts to read")
 	case fromAll:
 		return all, nil
@@ -387,6 +486,9 @@ func emitImportReport(w io.Writer, format output.Format, f flags, report importR
 		for _, e := range p.Errors {
 			fmt.Fprintf(w, "  ! %s\n", e)
 		}
+		if p.ErrorsTruncated > 0 {
+			fmt.Fprintf(w, "  ! ... and %d more not shown\n", p.ErrorsTruncated)
+		}
 	}
 	return nil
 }
@@ -398,8 +500,10 @@ func humanProviderLine(p providerReport, dryRun bool) string {
 		return fmt.Sprintf("%-9s %d files found (dry run, nothing written)  %dms",
 			p.Provider, p.Files, p.DurationMS)
 	}
-	line := fmt.Sprintf("%-9s %d files  %d sessions  %d messages  %d parts  %dms",
-		p.Provider, p.Files, p.Sessions, p.Messages, p.Parts, p.DurationMS)
+	line := fmt.Sprintf("%-9s %d files  %d sessions read  %d messages read  %d parts read  "+
+		"%d messages new  %dms",
+		p.Provider, p.Files, p.SessionsSeen, p.MessagesSeen, p.PartsSeen,
+		p.MessagesInserted, p.DurationMS)
 	if p.FilesFailed > 0 {
 		line += fmt.Sprintf("  (%d failed)", p.FilesFailed)
 	}
@@ -409,16 +513,21 @@ func humanProviderLine(p providerReport, dryRun bool) string {
 // importSummary is the one sentence the envelope carries, which is the
 // totals across every source.
 func importSummary(report importReport) string {
-	var files, sessions, messages int
+	var files, sessions, messages, inserted int
 	for _, p := range report.Providers {
 		files += p.Files
-		sessions += p.Sessions
-		messages += p.Messages
+		sessions += p.SessionsSeen
+		messages += p.MessagesSeen
+		inserted += p.MessagesInserted
 	}
 	if report.DryRun {
 		return fmt.Sprintf("%d files found, nothing written", files)
 	}
-	return fmt.Sprintf("%d files, %d sessions, %d messages", files, sessions, messages)
+	// "read" rather than a bare count, because that is what these numbers
+	// are: a source resuming from a cursor reads only what was appended,
+	// so the total is this run's work and not the store's contents.
+	return fmt.Sprintf("%d files, %d sessions read, %d messages read, %d messages new",
+		files, sessions, messages, inserted)
 }
 
 // encodeImport renders JSON the way every other krowk answer is rendered:
@@ -430,4 +539,37 @@ func encodeImport(v any) string {
 		return fmt.Sprintf(`{"ok":false,"error":{"error":"encode_failed","detail":%q}}`, err.Error())
 	}
 	return string(b)
+}
+
+// sanitizeStoreErr is what a store failure says to a person. SQLite's own
+// "database is locked" is the one message this command must never hand back
+// unexplained: it names a condition with no action attached, and the whole
+// reason `import.lock` exists is that a caller who sees it has learned
+// nothing. The lock closes the window between two krowk imports; another
+// process entirely — a `krowk sessions` reader, an editor with the file
+// open, a second machine on a synced directory — can still collide, and the
+// message for that says who is at fault and what to do about it.
+//
+// It matches on the text rather than on the driver's error codes because
+// only internal/store imports the SQLite driver, by policy: reaching into
+// it from here to compare against sqlite3.BUSY would make internal/cli the
+// second package that has to be changed when the driver is. The strings are
+// SQLite's, they are stable, and a miss costs a less helpful sentence
+// rather than a wrong one.
+// The store path is a parameter rather than the single-argument helper the
+// review asked for, because the sentence names the file and nothing at the
+// per-ref call site knows it otherwise; the alternative was a package-level
+// variable holding the path, which is worse than one more argument.
+func sanitizeStoreErr(err error, storePath string) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	lower := strings.ToLower(msg)
+	if strings.Contains(lower, "database is locked") ||
+		strings.Contains(lower, "database table is locked") ||
+		strings.Contains(lower, "database is busy") {
+		return "the store at " + storePath + " is busy — another process is writing to it"
+	}
+	return msg
 }

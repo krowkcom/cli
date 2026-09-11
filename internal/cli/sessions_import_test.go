@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,9 +41,9 @@ type importEnvelope struct {
 		Providers  []struct {
 			Provider         string         `json:"provider"`
 			Files            int            `json:"files"`
-			Sessions         int            `json:"sessions"`
-			Messages         int            `json:"messages"`
-			Parts            int            `json:"parts"`
+			SessionsSeen     int            `json:"sessions_seen"`
+			MessagesSeen     int            `json:"messages_seen"`
+			PartsSeen        int            `json:"parts_seen"`
 			SessionsInserted int            `json:"sessions_inserted"`
 			MessagesInserted int            `json:"messages_inserted"`
 			PartsInserted    int            `json:"parts_inserted"`
@@ -48,6 +51,7 @@ type importEnvelope struct {
 			SkippedLines     int            `json:"skipped_lines"`
 			FilesFailed      int            `json:"files_failed"`
 			Errors           []string       `json:"errors"`
+			ErrorsTruncated  int            `json:"errors_truncated"`
 			DurationMS       int64          `json:"duration_ms"`
 		} `json:"providers"`
 	} `json:"data"`
@@ -278,7 +282,7 @@ func TestImportDryRunWritesNothing(t *testing.T) {
 	if row.Files == 0 {
 		t.Fatalf("a dry run on a seeded home discovered nothing: %+v", row)
 	}
-	if row.Messages != 0 || row.Sessions != 0 {
+	if row.MessagesSeen != 0 || row.SessionsSeen != 0 {
 		t.Errorf("a dry run reported rows it did not write: %+v", row)
 	}
 
@@ -318,12 +322,12 @@ func TestImportFromAllMatchesTheGoldens(t *testing.T) {
 		if row.Files != files {
 			t.Errorf("%s files = %d, want %d (the golden's refs)", provider, row.Files, files)
 		}
-		if row.Sessions != files {
-			t.Errorf("%s sessions = %d, want %d", provider, row.Sessions, files)
+		if row.SessionsSeen != files {
+			t.Errorf("%s sessions = %d, want %d", provider, row.SessionsSeen, files)
 		}
-		if row.Messages != messages {
+		if row.MessagesSeen != messages {
 			t.Errorf("%s messages = %d, want %d (the golden's messages)",
-				provider, row.Messages, messages)
+				provider, row.MessagesSeen, messages)
 		}
 		if row.MessagesInserted != messages {
 			t.Errorf("%s inserted %d messages on a first import, want %d",
@@ -391,10 +395,13 @@ func TestImportRefusesWhileAnotherHoldsTheLock(t *testing.T) {
 	seedClaude(t, home)
 	env := func(k string) string { return h.env[k] }
 
-	// A dry run first, so the store directory the lock lives in exists.
-	mustRun(t, h, "sessions", "import", "--from", "claude", "--dry-run", "--json")
-
+	// The store directory has to exist for the lock to be taken in it. A
+	// dry run no longer creates it — that is the point of a dry run — so
+	// the test makes it the same way the import would.
 	path := importLockPath(store.DBPath(store.Env(env)))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	held, err := lockImport(path)
 	if err != nil {
 		t.Fatalf("take the lock: %v", err)
@@ -614,7 +621,7 @@ func (slowSource) Read(harnessenv.Env, importer.Ref, importer.Cursor) (store.Thr
 // which reports every source as instant however long it took.
 func TestImportReportsHowLongASourceTook(t *testing.T) {
 	const delay = 20 * time.Millisecond
-	out := runImportSource(context.Background(), nil,
+	out := runImportSource(context.Background(), nil, "",
 		importSource{src: slowSource{delay: delay}, decode: func(string) (importer.Cursor, error) {
 			return nil, nil
 		}},
@@ -676,9 +683,9 @@ func TestImportSurvivesOneUnreadableTranscript(t *testing.T) {
 	if len(row.Errors) != 1 {
 		t.Errorf("errors = %v, want the one file's reason", row.Errors)
 	}
-	if row.Sessions != row.Files-1 {
-		t.Errorf("sessions = %d of %d files, want everything but the bad one",
-			row.Sessions, row.Files)
+	if row.SessionsSeen != row.Files-1 {
+		t.Errorf("sessions_seen = %d of %d files, want everything but the bad one",
+			row.SessionsSeen, row.Files)
 	}
 }
 
@@ -706,5 +713,191 @@ func requireNotRoot(t *testing.T) {
 	t.Helper()
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: chmod 000 is still readable")
+	}
+}
+
+// A SQLite lock message is not an answer: it names a condition with no
+// action attached. Whatever shape it arrives in, what reaches the caller
+// says which file is busy and who is at fault.
+func TestSanitizeStoreErrHidesTheSQLiteLockMessage(t *testing.T) {
+	const path = "/home/somebody/.local/share/krowk/krowk.db"
+	for _, raw := range []string{
+		"database is locked",
+		"sqlite3: database is locked",
+		"store: ingest: database table is locked",
+		"DATABASE IS LOCKED",
+	} {
+		got := sanitizeStoreErr(errors.New(raw), path)
+		if strings.Contains(strings.ToLower(got), "database is locked") ||
+			strings.Contains(strings.ToLower(got), "database table is locked") {
+			t.Errorf("sanitizeStoreErr(%q) still says it: %q", raw, got)
+		}
+		if !strings.Contains(got, path) || !strings.Contains(got, "busy") {
+			t.Errorf("sanitizeStoreErr(%q) = %q, want the store named and called busy", raw, got)
+		}
+	}
+	// Everything else is passed through untouched: the sanitiser exists for
+	// one message, not to re-word every store failure.
+	if got := sanitizeStoreErr(errors.New("no such table: session"), path); got != "no such table: session" {
+		t.Errorf("an unrelated failure was re-worded: %q", got)
+	}
+}
+
+// A dry run writes nothing at all, which includes the store itself: it takes
+// no lock and does not open the database, because discovery only reads the
+// environment. A command that promises to write nothing and leaves a
+// krowk.db behind has broken the promise on the first word.
+func TestImportDryRunCreatesNoStore(t *testing.T) {
+	h, home := importHarness(t)
+	seedClaude(t, home)
+	env := func(k string) string { return h.env[k] }
+
+	e := mustRun(t, h, "sessions", "import", "--from", "claude", "--dry-run", "--json")
+	if row := e.Data.Providers[e.provider(t, "claude")]; row.Files == 0 {
+		t.Fatalf("a dry run on a seeded home discovered nothing: %+v", row)
+	}
+	if _, err := os.Stat(store.DBPath(store.Env(env))); !os.IsNotExist(err) {
+		t.Errorf("a dry run created the store at %s (stat: %v)",
+			store.DBPath(store.Env(env)), err)
+	}
+}
+
+// And a dry run with no home fails closed on the same hint a real import
+// does, rather than being the one shape of this command that does not care
+// where the store would have been.
+func TestImportDryRunWithNoHomeFailsClosed(t *testing.T) {
+	h, _ := importHarness(t)
+	h.env["HOME"] = ""
+	h.env["XDG_DATA_HOME"] = ""
+
+	code, stdout, stderr := h.run("sessions", "import", "--from", "all", "--dry-run", "--json")
+	out := stdout + stderr
+	if code == 0 {
+		t.Fatalf("a homeless dry run succeeded:\n%s", out)
+	}
+	if !strings.Contains(out, "set HOME") {
+		t.Errorf("the refusal is not store.Open's hint:\n%s", out)
+	}
+}
+
+// Two real imports racing for the same store: one wins, the other is refused
+// by the lock. This is the test the in-process one above cannot be — it
+// takes the lock itself and then runs a command — and the thing it proves is
+// that whichever one loses says so in krowk's words and never SQLite's.
+func TestImportTwoConcurrentRunsOneWinsOneIsRefused(t *testing.T) {
+	h, home := importHarness(t)
+	seedClaude(t, home)
+
+	type result struct {
+		code int
+		out  string
+	}
+	results := make([]result, 2)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			code, stdout, stderr := h.run("sessions", "import", "--from", "claude", "--json")
+			results[i] = result{code: code, out: stdout + stderr}
+		}(i)
+	}
+	wg.Wait()
+
+	won, refused := 0, 0
+	for _, r := range results {
+		switch r.code {
+		case 0:
+			won++
+		case 6:
+			refused++
+			if !strings.Contains(r.out, "import.lock") {
+				t.Errorf("the refusal does not name the lock file:\n%s", r.out)
+			}
+		default:
+			t.Errorf("exit = %d, want 0 or 6:\n%s", r.code, r.out)
+		}
+		if strings.Contains(strings.ToLower(r.out), "database is locked") {
+			t.Errorf("a SQLite lock message reached the user:\n%s", r.out)
+		}
+	}
+	if won != 1 || refused != 1 {
+		t.Errorf("%d runs succeeded and %d were refused, want one of each:\n%s\n%s",
+			won, refused, results[0].out, results[1].out)
+	}
+}
+
+// The errors list is capped, and the count of what the cap dropped is
+// reported beside it: ten reasons next to four hundred failures without one
+// reads like ten problems.
+func TestImportErrorsCarryATruncationCount(t *testing.T) {
+	var out sourceOutcome
+	for i := 0; i < maxReportedErrors+3; i++ {
+		out.fail(importer.Ref{Provider: "claude", ID: "ref"}, errors.New("boom"), "")
+	}
+	if len(out.Errors) != maxReportedErrors {
+		t.Errorf("errors = %d, want the cap of %d", len(out.Errors), maxReportedErrors)
+	}
+	if out.ErrorsTruncated != 3 {
+		t.Errorf("errors_truncated = %d, want 3", out.ErrorsTruncated)
+	}
+	if out.FilesFailed != maxReportedErrors+3 {
+		t.Errorf("files_failed = %d, want every failure counted", out.FilesFailed)
+	}
+}
+
+// The keys of `skipped_by_type` are raw `type` fields out of a transcript,
+// so neither their number nor their length is krowk's to trust. Past the cap
+// the count keeps accruing under `other`, because "is there more of it" is
+// the question the list is read for and dropping the tail answers it wrong.
+func TestImportBoundsSkippedByType(t *testing.T) {
+	out := sourceOutcome{providerReport: providerReport{SkippedByType: map[string]int{}}}
+
+	long := strings.Repeat("t", 5000)
+	types := map[string]int{long: 2}
+	for i := 0; i < maxSkippedTypes*3; i++ {
+		types[fmt.Sprintf("type-%03d", i)] = 1
+	}
+	total := 0
+	for _, v := range types {
+		total += v
+	}
+	out.absorb(importer.Result{UnknownTypes: types})
+
+	if len(out.SkippedByType) > maxSkippedTypes+1 {
+		t.Errorf("skipped_by_type names %d types, want at most %d plus %q",
+			len(out.SkippedByType), maxSkippedTypes, skippedTypeOther)
+	}
+	counted := 0
+	for k, v := range out.SkippedByType {
+		if len(k) > maxSkippedTypeLen {
+			t.Errorf("key of %d bytes survived: %q", len(k), k)
+		}
+		counted += v
+	}
+	if counted != total {
+		t.Errorf("counted %d skipped parts, want %d — the cap dropped some", counted, total)
+	}
+	if out.SkippedByType[skippedTypeOther] == 0 {
+		t.Errorf("nothing landed in %q despite %d types: %v",
+			skippedTypeOther, len(types), out.SkippedByType)
+	}
+}
+
+// An error reason carries a path and a source's own words, and a report is
+// not the place to pass either through at whatever length it arrived.
+func TestImportBoundsErrorReasons(t *testing.T) {
+	var out sourceOutcome
+	out.fail(importer.Ref{Provider: "claude", ID: "ref"},
+		errors.New(strings.Repeat("e", 100000)), "")
+
+	if len(out.Errors) != 1 {
+		t.Fatalf("errors = %v", out.Errors)
+	}
+	if n := len(out.Errors[0]); n > maxErrorReasonLen {
+		t.Errorf("the reason is %d bytes, want at most %d", n, maxErrorReasonLen)
+	}
+	if !strings.HasPrefix(out.Errors[0], "claude:ref: ") {
+		t.Errorf("the truncation ate the ref it names: %q", out.Errors[0])
 	}
 }

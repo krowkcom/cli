@@ -393,7 +393,7 @@ func emitSessionShow(w io.Writer, f flags, d store.SessionDetail) error {
 	}
 	return emit(w, encodeJSONValue(output.Envelope{
 		OK: true, Data: out,
-		Summary: fmt.Sprintf("%s — %d turns, %d messages", displayTitle(d.Session.Title), len(turns), len(msgs)),
+		Summary: fmt.Sprintf("%s — %d turns, %d messages", displayTitle(cleanCell(d.Session.Title)), len(turns), len(msgs)),
 	}), f)
 }
 
@@ -456,7 +456,7 @@ func humanPart(p store.PartDetail, showThinking bool) string {
 	case "thinking":
 		text := partThinkingString(p.Data)
 		if showThinking {
-			return "thinking: " + cleanCell(text)
+			return "thinking: " + cleanLines(text)
 		}
 		one := truncateOneLine(text, 100)
 		return "thinking: " + one + " (use --thinking for all)"
@@ -507,6 +507,17 @@ func cleanCell(s string) string {
 	return termclean.Cell(s)
 }
 
+// cleanLines scrubs caller-controlled text that keeps its line breaks
+// (the --thinking path): each line passes through Cell, so ESC/bidi die
+// but newlines survive.
+func cleanLines(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = termclean.Cell(l)
+	}
+	return strings.Join(lines, "\n")
+}
+
 func partTextString(data string) string {
 	var v struct {
 		Text string `json:"text"`
@@ -542,7 +553,7 @@ func partInputString(data string) string {
 	if err := json.Unmarshal(v.Input, &s); err == nil {
 		return s
 	}
-	return truncateOneLine(string(v.Input), 200)
+	return string(v.Input)
 }
 
 func partOutputString(data string) string {
@@ -556,7 +567,7 @@ func partOutputString(data string) string {
 	if err := json.Unmarshal(v.Output, &s); err == nil {
 		return s
 	}
-	return truncateOneLine(string(v.Output), 300)
+	return string(v.Output)
 }
 
 // encodeJSONValue renders indented JSON without HTML escaping, like every

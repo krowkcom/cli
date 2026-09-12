@@ -330,6 +330,45 @@ func TestSessionsShowThinking(t *testing.T) {
 	}
 }
 
+// TestSessionsShowThinkingMultiline pins the --thinking scrub: line breaks
+// survive (one thinking block stays multi-line) while ESC sequences die.
+func TestSessionsShowThinkingMultiline(t *testing.T) {
+	h, _ := importHarness(t)
+	env := func(k string) string { return h.env[k] }
+	db, err := store.Open(store.Env(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := store.NewWriter(db, nil)
+	_, err = w.Ingest(context.Background(), store.Thread{
+		Worktree: store.Worktree{Path: "/wt-tm"},
+		Session:  store.Session{Title: "multiline thinker"},
+		Binding:  store.Binding{Provider: "anthropic", Harness: "claude", ForeignSessionID: "ses-think-multi"},
+		Messages: []store.Message{
+			{Role: store.RoleAssistant, Parts: []store.Part{{Type: "thinking", Data: "{\"thinking\":\"first line\\u001b[31m\\nsecond line\"}"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id string
+	if err := db.QueryRow(`SELECT session_id FROM session_binding WHERE foreign_session_id = 'ses-think-multi'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	code, full, stderr := h.runOnStreams(false, false, "sessions", "show", id, "--format", "human", "--thinking")
+	if code != 0 {
+		t.Fatalf("show --thinking exited %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(full, "first line[31m\nsecond line") {
+		t.Errorf("--thinking folded newlines:\n%s", full)
+	}
+	if strings.Contains(full, "\x1b") {
+		t.Errorf("--thinking leaked an escape:\n%q", full)
+	}
+}
+
 // Id resolution through the CLI: unique prefix works, ambiguous errors
 // naming both, foreign_session_id resolves via the binding.
 func TestSessionsShowResolution(t *testing.T) {

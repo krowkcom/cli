@@ -7,11 +7,13 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/krowkcom/cli/internal/termclean"
 )
@@ -146,16 +148,51 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 	} else {
 		return id, nil
 	}
-	// A foreign session id resolves via the binding (Claude sessionId).
-	var viaBinding string
-	if err := db.QueryRow(`SELECT session_id FROM session_binding WHERE foreign_session_id = ?`, ref).Scan(&viaBinding); err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			return "", fmt.Errorf("store: resolve session: %w", err)
-		}
-	} else {
-		return viaBinding, nil
+	// A foreign session id resolves via the binding. The unique key is
+	// (provider, foreign_session_id), so the same foreign id can exist
+	// under two providers — pick nothing silently and fail naming both.
+	brows, err := db.Query(`SELECT session_id, provider FROM session_binding WHERE foreign_session_id = ? ORDER BY provider, session_id`, ref)
+	if err != nil {
+		return "", fmt.Errorf("store: resolve session: %w", err)
 	}
-	if len(ref) < 8 {
+	var bIDs, bProviders []string
+	for brows.Next() {
+		var sid, prov string
+		if err := brows.Scan(&sid, &prov); err != nil {
+			brows.Close()
+			return "", fmt.Errorf("store: scan session binding: %w", err)
+		}
+		bIDs = append(bIDs, sid)
+		bProviders = append(bProviders, prov)
+	}
+	brows.Close()
+	if err := brows.Err(); err != nil {
+		return "", fmt.Errorf("store: resolve session rows: %w", err)
+	}
+	switch len(bIDs) {
+	case 0:
+	case 1:
+		return bIDs[0], nil
+	default:
+		seen := map[string]bool{}
+		var uniq []string
+		for _, sid := range bIDs {
+			if !seen[sid] {
+				seen[sid] = true
+				uniq = append(uniq, sid)
+			}
+		}
+		if len(uniq) == 1 {
+			return uniq[0], nil
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "store: %q is ambiguous (%d sessions):", ref, len(uniq))
+		for i, sid := range uniq {
+			fmt.Fprintf(&b, "\n  %s  %s", sid, bProviders[i])
+		}
+		return "", &AmbiguousSessionError{Ref: ref, IDs: uniq, msg: b.String()}
+	}
+	if utf8.RuneCountInString(ref) < 8 {
 		return "", fmt.Errorf("store: %q matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id: %w", ref, sql.ErrNoRows)
 	}
 	rows, err := db.Query(`SELECT id, title FROM session WHERE id LIKE ? ESCAPE '\' ORDER BY id LIMIT 11`, escapeLikePrefix(ref)+"%")
@@ -270,12 +307,21 @@ type SessionDetail struct {
 
 // LoadSessionDetail hydrates one session: header columns via the listing
 // shape (no blobs), then turns, messages and parts in seq order. Part rows
-// are read here — show is where parts are hydrated.
+// are read here — show is where parts are hydrated. All four reads run in
+// one deferred read transaction so a concurrent import cannot slip a new
+// turn between the header and the parts.
 func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 	var d SessionDetail
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return d, fmt.Errorf("store: load session: %w", err)
+	}
+	// Rollback is a no-op after a successful commit.
+	defer tx.Rollback()
 	var r SessionRow
 	var wpath, bharness, bprovider, foreign sql.NullString
-	err := db.QueryRow(`SELECT s.id, s.title, s.model, s.provider, s.harness, s.directory, s.time_created, s.time_updated, w.path, (SELECT b.harness FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1), (SELECT b.provider FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1), (SELECT b.foreign_session_id FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1) FROM session s LEFT JOIN worktree w ON w.id = s.worktree_id WHERE s.id = ?`, sessionID).
+	err = tx.QueryRow(`SELECT s.id, s.title, s.model, s.provider, s.harness, s.directory, s.time_created, s.time_updated, w.path, (SELECT b.harness FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1), (SELECT b.provider FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1), (SELECT b.foreign_session_id FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1) FROM session s LEFT JOIN worktree w ON w.id = s.worktree_id WHERE s.id = ?`, sessionID).
 		Scan(&r.ID, &r.Title, &r.Model, &r.Provider, &r.Harness, &r.Directory,
 			&r.TimeCreated, &r.TimeUpdated, &wpath, &bharness, &bprovider, &foreign)
 	if err == sql.ErrNoRows {
@@ -293,7 +339,7 @@ func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 	}
 	d.Session = r
 
-	trows, err := db.Query(`SELECT seq, status, cost_input_tokens, cost_output_tokens, cost_total_tokens, cost_cache_read_tokens, cost_cache_write_tokens, cost_reasoning_tokens, cost_usd_micros, time_created, time_updated FROM turn WHERE session_id = ? ORDER BY seq`, sessionID)
+	trows, err := tx.Query(`SELECT seq, status, cost_input_tokens, cost_output_tokens, cost_total_tokens, cost_cache_read_tokens, cost_cache_write_tokens, cost_reasoning_tokens, cost_usd_micros, time_created, time_updated FROM turn WHERE session_id = ? ORDER BY seq`, sessionID)
 	if err != nil {
 		return d, fmt.Errorf("store: load turns: %w", err)
 	}
@@ -326,7 +372,7 @@ func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 		d.Session.SumReasoning += t.Reasoning
 	}
 
-	mrows, err := db.Query(`SELECT id, seq, role, provider, model, foreign_id, time_created FROM message WHERE session_id = ? ORDER BY seq`, sessionID)
+	mrows, err := tx.Query(`SELECT id, seq, role, provider, model, foreign_id, time_created FROM message WHERE session_id = ? ORDER BY seq`, sessionID)
 	if err != nil {
 		return d, fmt.Errorf("store: load messages: %w", err)
 	}
@@ -355,7 +401,7 @@ func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 	// exactly this), then distribute to their messages in seq order. The
 	// tool-name pass runs over every part before any tool_result links, so
 	// a result links to its call regardless of which message comes first.
-	prows, err := db.Query(`SELECT message_id, seq, type, tool_call_id, signature, data, foreign_id FROM part WHERE session_id = ? ORDER BY message_id, seq`, sessionID)
+	prows, err := tx.Query(`SELECT message_id, seq, type, tool_call_id, signature, data, foreign_id FROM part WHERE session_id = ? ORDER BY message_id, seq`, sessionID)
 	if err != nil {
 		return d, fmt.Errorf("store: load parts: %w", err)
 	}
@@ -406,6 +452,9 @@ func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 	for _, mk := range msgs {
 		mk.msg.Parts = partsByMsg[mk.id]
 		d.Messages = append(d.Messages, mk.msg)
+	}
+	if err := tx.Commit(); err != nil {
+		return d, fmt.Errorf("store: load session: %w", err)
 	}
 	return d, nil
 }

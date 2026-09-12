@@ -404,6 +404,95 @@ func TestResolvePrefixWildcards(t *testing.T) {
 	}
 }
 
+// TestResolveShortMultibyteRef pins the rune-count gate: 3 CJK chars are
+// 9 bytes but only 3 runes, so they are a short ref — not a prefix query.
+func TestResolveShortMultibyteRef(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(map[string]string{"HOME": home})
+	db, err := Open(env)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := ResolveSessionID(db, "日本語"); err == nil {
+		t.Fatalf("3-rune ref resolved, want a short-ref error")
+	} else if !strings.Contains(err.Error(), "at least 8 chars") {
+		t.Errorf("3-rune ref error = %q, want the short-ref message", err.Error())
+	}
+}
+
+// TestResolveForeignCollision pins the cross-provider case: the unique key
+// is (provider, foreign_session_id), so the same foreign id under two
+// providers must fail naming both — never silently pick one.
+func TestResolveForeignCollision(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(map[string]string{"HOME": home})
+	db, err := Open(env)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	wID := NewID()
+	if _, err := db.Exec(`INSERT INTO worktree (id, path, time_created, time_updated) VALUES (?, '/collide', 1, 2)`, wID); err != nil {
+		t.Fatal(err)
+	}
+	idA, idB := NewID(), NewID()
+	for _, id := range []string{idA, idB} {
+		if _, err := db.Exec(`INSERT INTO session (id, worktree_id, directory, title, time_created, time_updated) VALUES (?, ?, '/r', ?, 1, 2)`, id, wID, "t-"+id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO session_binding (id, session_id, provider, harness, foreign_session_id, time_created, time_updated) VALUES (?, ?, 'anthropic', 'claude', 'shared-foreign', 1, 2)`, NewID(), idA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO session_binding (id, session_id, provider, harness, foreign_session_id, time_created, time_updated) VALUES (?, ?, 'opencode', 'opencode', 'shared-foreign', 1, 2)`, NewID(), idB); err != nil {
+		t.Fatal(err)
+	}
+	_, err = ResolveSessionID(db, "shared-foreign")
+	if err == nil {
+		t.Fatalf("shared foreign id resolved, want an ambiguous error")
+	}
+	var amb *AmbiguousSessionError
+	if !errors.As(err, &amb) {
+		t.Fatalf("shared foreign id error is %T, want *AmbiguousSessionError", err)
+	}
+	if !strings.Contains(err.Error(), idA) || !strings.Contains(err.Error(), idB) {
+		t.Errorf("ambiguous error names neither candidate: %q", err.Error())
+	}
+}
+
+// TestResolveForeignSameSession: two bindings for one session under one
+// foreign id (e.g. re-import) still resolve to that session.
+func TestResolveForeignSameSession(t *testing.T) {
+	home := t.TempDir()
+	env := testEnv(map[string]string{"HOME": home})
+	db, err := Open(env)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	wID := NewID()
+	if _, err := db.Exec(`INSERT INTO worktree (id, path, time_created, time_updated) VALUES (?, '/same', 1, 2)`, wID); err != nil {
+		t.Fatal(err)
+	}
+	sID := NewID()
+	if _, err := db.Exec(`INSERT INTO session (id, worktree_id, directory, title, time_created, time_updated) VALUES (?, ?, '/r', 'same', 1, 2)`, sID, wID); err != nil {
+		t.Fatal(err)
+	}
+	// Two providers pointing one foreign id at one session: not ambiguous.
+	for _, prov := range []string{"anthropic", "opencode"} {
+		if _, err := db.Exec(`INSERT INTO session_binding (id, session_id, provider, harness, foreign_session_id, time_created, time_updated) VALUES (?, ?, ?, 'h', 'same-foreign', 1, 2)`, NewID(), sID, prov); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := ResolveSessionID(db, "same-foreign"); err != nil || got != sID {
+		t.Errorf("shared foreign id on one session = %q, %v; want %q", got, err, sID)
+	}
+}
+
 // TestSessionListMultiBindingNoFanout pins the listing aggregate: a second
 // binding row must neither multiply the turn COUNT/SUM nor duplicate the
 // session, and the displayed binding is the earliest-minted one.

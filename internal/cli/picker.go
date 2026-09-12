@@ -76,13 +76,18 @@ func pickSession(rows []store.SessionRow) (string, error) {
 		// Cap the title: picker labels are terminal rows built from
 		// caller-controlled transcript text, so overlong titles are cut
 		// on a rune boundary like the human table.
-		if r := []rune(title); len(r) > 60 {
-			title = string(r[:57]) + "..."
+		if r := []rune(title); len(r) > 48 {
+			title = string(r[:45]) + "..."
 		}
 		// Harness and model join without strays when one is missing; the
 		// recency plus short id tell apart the duplicate titles every
-		// agent eventually produces ("session title" × 40).
+		// agent eventually produces ("session title" × 40). The pair is
+		// capped as one unit and the recency is fixed-width so short ids
+		// align vertically down the menu.
 		hm := cleanCell(strings.TrimSpace(strings.TrimSpace(r.Harness) + " " + strings.TrimSpace(r.Model)))
+		if r := []rune(hm); len(r) > 32 {
+			hm = string(r[:29]) + "..."
+		}
 		short := r.ID
 		if rs := []rune(short); len(rs) > 8 {
 			short = string(rs[:8])
@@ -91,7 +96,7 @@ func pickSession(rows []store.SessionRow) (string, error) {
 		if hm != "" {
 			label += "  —  " + hm
 		}
-		label += fmt.Sprintf("  ·  %s  ·  %s", relativeTime(r.TimeUpdated, time.Now()), short)
+		label += fmt.Sprintf("  ·  %-9s  ·  %s", relativeTime(r.TimeUpdated, time.Now()), short)
 		options = append(options, huh.NewOption(label, r.ID))
 	}
 

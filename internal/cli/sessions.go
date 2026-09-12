@@ -139,11 +139,15 @@ func emitSessionsList(w io.Writer, format output.Format, f flags, rows []store.S
 }
 
 // humanSessionsList is the non-TTY table (and the TTY fallback when no
-// picker applies): title, harness, model, turns, cost, recency.
+// picker applies): short id, title, harness, model, turns, cost, recency.
+// Colour is gated on the colour flag so piped output stays byte-stable.
 func humanSessionsList(rows []store.SessionRow, colour bool, now time.Time) string {
 	if len(rows) == 0 {
 		return "no sessions — run `krowk sessions import --from all`"
 	}
+	const maxTitleWidth = 60
+	const maxHarnessWidth = 24
+	const maxModelWidth = 32
 	var tw, hw, mw int
 	for _, r := range rows {
 		title := cleanCell(r.Title)
@@ -154,42 +158,80 @@ func humanSessionsList(rows []store.SessionRow, colour bool, now time.Time) stri
 		hw = max(hw, utf8.RuneCountInString(cleanCell(r.Harness)))
 		mw = max(mw, utf8.RuneCountInString(cleanCell(r.Model)))
 	}
-	if tw > 60 {
-		tw = 60
-	}
-	if hw > 60 {
-		hw = 60
-	}
-	if mw > 60 {
-		mw = 60
-	}
-	lines := make([]string, 0, len(rows))
+	tw = min(max(tw, utf8.RuneCountInString("TITLE")), maxTitleWidth)
+	hw = min(max(hw, utf8.RuneCountInString("HARNESS")), maxHarnessWidth)
+	mw = min(max(mw, utf8.RuneCountInString("MODEL")), maxModelWidth)
+	lines := make([]string, 0, len(rows)+1)
+	lines = append(lines, strings.Join([]string{
+		sessionPadRight(colour, "1;2", "ID", 8),
+		sessionPadRight(colour, "1;2", "TITLE", tw),
+		sessionPadRight(colour, "1;2", "HARNESS", hw),
+		sessionPadRight(colour, "1;2", "MODEL", mw),
+		sessionPadLeft(colour, "1;2", "TURNS", 9),
+		sessionPadLeft(colour, "1;2", "COST", 10),
+		sessionPaint(colour, "1;2", "UPDATED"),
+	}, "  "))
 	for _, r := range rows {
 		title := cleanCell(r.Title)
 		if title == "" {
 			title = "(untitled)"
 		}
-		if r := []rune(title); len(r) > 60 {
-			title = string(r[:57]) + "..."
+		title = truncateRunes(title, maxTitleWidth)
+		harness := truncateRunes(cleanCell(r.Harness), maxHarnessWidth)
+		model := truncateRunes(cleanCell(r.Model), maxModelWidth)
+		short := r.ID
+		if rs := []rune(short); len(rs) > 8 {
+			short = string(rs[:8])
 		}
-		harness := cleanCell(r.Harness)
-		if r := []rune(harness); len(r) > 60 {
-			harness = string(r[:57]) + "..."
-		}
-		model := cleanCell(r.Model)
-		if r := []rune(model); len(r) > 60 {
-			model = string(r[:57]) + "..."
-		}
+		turns := fmt.Sprintf("%3d", r.TurnCount) + " " + sessionPaint(colour, "2", "turns")
 		cost := "—"
+		costCode := "2"
 		if priced, ok := priceRow(r); ok {
 			cost = formatCost(priced)
+			costCode = "32"
 		}
-		lines = append(lines, fmt.Sprintf("%-*s  %-*s  %-*s  %3d turns  %10s  %s",
-			tw, title, hw, harness, mw, model, r.TurnCount, cost,
-			relativeTime(r.TimeUpdated, now)))
+		lines = append(lines, strings.Join([]string{
+			sessionPadRight(false, "", short, 8),
+			sessionPadRight(colour, "1", title, tw),
+			sessionPadRight(colour, "2", harness, hw),
+			sessionPadRight(colour, "2", model, mw),
+			turns,
+			sessionPadLeft(colour, costCode, cost, 10),
+			sessionPaint(colour, "2", relativeTime(r.TimeUpdated, now)),
+		}, "  "))
 	}
-	_ = colour
 	return strings.Join(lines, "\n")
+}
+
+// sessionPaint mirrors the output package's paint idiom: ANSI-wrap s in
+// code only when colour is on, so colour=false stays byte-stable plain
+// text for tests and pipes.
+func sessionPaint(colour bool, code, s string) string {
+	if !colour {
+		return s
+	}
+	return "\x1b[" + code + "m" + s + "\x1b[0m"
+}
+
+// sessionPadRight styles s then pads to w visible runes. Padding is
+// computed from the raw rune count, so the ANSI codes never break column
+// alignment.
+func sessionPadRight(colour bool, code, s string, w int) string {
+	styled := sessionPaint(colour, code, s)
+	if pad := w - utf8.RuneCountInString(s); pad > 0 {
+		styled += strings.Repeat(" ", pad)
+	}
+	return styled
+}
+
+// sessionPadLeft is the right-aligned twin of sessionPadRight, for the
+// numeric COST column and its header.
+func sessionPadLeft(colour bool, code, s string, w int) string {
+	styled := sessionPaint(colour, code, s)
+	if pad := w - utf8.RuneCountInString(s); pad > 0 {
+		return strings.Repeat(" ", pad) + styled
+	}
+	return styled
 }
 
 func priceRow(r store.SessionRow) (float64, bool) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/krowkcom/cli/internal/store"
 )
@@ -167,7 +168,7 @@ func TestSessionsListFilters(t *testing.T) {
 
 func TestSessionsListHumanTable(t *testing.T) {
 	h, _ := importHarness(t)
-	seedSessionsHarness(t, h)
+	alphaID, betaID := seedSessionsHarness(t, h)
 
 	code, stdout, stderr := h.runOnStreams(false, false, "sessions", "--format", "human")
 	if code != 0 {
@@ -178,6 +179,39 @@ func TestSessionsListHumanTable(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "turns") {
 		t.Errorf("human table has no turn counts:\n%s", stdout)
+	}
+	for _, want := range []string{"ID", "TITLE", "HARNESS", "MODEL", "TURNS", "COST", "UPDATED"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("human table misses header %q:\n%s", want, stdout)
+		}
+	}
+	if !strings.Contains(stdout, alphaID[:8]) || !strings.Contains(stdout, betaID[:8]) {
+		t.Errorf("human table misses a short id:\n%s", stdout)
+	}
+}
+
+// TestSessionsListHumanColour pins the colour gate: colour=false is plain
+// text (pipes/tests), colour=true wraps cells in ANSI codes.
+func TestSessionsListHumanColour(t *testing.T) {
+	now := time.Now()
+	rows := []store.SessionRow{{
+		ID: "0196colourtest00000001", Title: "Coloured", Harness: "claude",
+		Model: "claude-fable-5-1", Provider: "anthropic", TurnCount: 2,
+		SumInput: 1000, SumOutput: 500,
+		TimeUpdated: now.Add(-time.Hour).UnixMilli(),
+	}}
+	plain := humanSessionsList(rows, false, now)
+	if strings.Contains(plain, "\x1b[") {
+		t.Errorf("colour=false leaked an escape:\n%q", plain)
+	}
+	if !strings.Contains(plain, "Coloured") || !strings.Contains(plain, "0196colo") {
+		t.Errorf("plain table misses title or short id:\n%s", plain)
+	}
+	coloured := humanSessionsList(rows, true, now)
+	for _, want := range []string{"\x1b[1m", "\x1b[2m", "\x1b[32m", "\x1b[1;2m"} {
+		if !strings.Contains(coloured, want) {
+			t.Errorf("colour=true misses %q:\n%q", want, coloured)
+		}
 	}
 }
 

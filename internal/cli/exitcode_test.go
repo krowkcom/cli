@@ -52,6 +52,8 @@ func TestExitCodeFor(t *testing.T) {
 		// Not found, both spellings.
 		{"no such artifact", registryErr(404, "not_found"), 2},
 		{"no such endpoint", registryErr(404, "no_such_endpoint"), 2},
+		{"no such session", api.Fail("no_session", ""), 2},
+		{"ambiguous session", api.Fail("ambiguous_session", ""), 1},
 
 		// Auth.
 		{"key rejected", registryErr(401, "unauthorized"), 3},

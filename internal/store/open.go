@@ -111,7 +111,10 @@ func dsn(path string) string {
 // unmodified — refused by a read-only pre-check before the read-write open,
 // and the read-write handle itself carries no persistent pragma until the
 // re-check accepts, so not even a swapped-in file gets its header flipped
-// first. No silent repair, no in-place ALTER path in v1.
+// first. No silent repair, no in-place ALTER path in v1. The gate checks
+// tables, never indexes: a v1 file created before a later index landed is
+// still accepted and answers correctly, just on a slower plan, until a
+// rebuild recreates the file with every index.
 // The returned handle is pinged, so a path that cannot hold a database fails
 // here rather than on first use.
 func Open(env Env) (*sql.DB, error) {

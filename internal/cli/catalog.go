@@ -360,9 +360,34 @@ func catalog() Catalog {
 			},
 			{Name: "doctor", Usage: "krowk doctor", Summary: "Check the local setup"},
 			{
-				Name:    "sessions",
-				Summary: "The local store of agent sessions",
+				Name: "sessions",
+				// The group is invocable: bare `krowk sessions` lists every
+				// thread on the machine, and `show` reads one back. Usage set
+				// is what marks it so — see Leaves.
+				Usage:   "krowk sessions [--harness <name>] [--worktree <path>] [--limit N] [--all]",
+				Summary: "List every agent thread on this machine, newest first",
+				Flags: []Flag{
+					{Name: "harness", Type: typeString,
+						Usage: "Only sessions from this harness, e.g. claude"},
+					{Name: "worktree", Type: typeString,
+						Usage: "Only sessions in this worktree, by path"},
+					{Name: "limit", Type: typeInt, Default: "50",
+						Usage: "List at most this many sessions (default 50)"},
+					{Name: "all", Type: typeBool, Default: "false",
+						Usage: "List every session, ignoring --limit"},
+				},
 				Subcommands: []Command{
+					{
+						Name:    "show",
+						Usage:   "krowk sessions show <id> [--thinking]",
+						Summary: "Read one session back, with its turns, messages and parts",
+						Args: []Arg{{Name: "id", Required: true,
+							Summary: "The session id, an unambiguous id prefix of at least 8 chars, or a foreign session id"}},
+						Flags: []Flag{
+							{Name: "thinking", Type: typeBool, Default: "false",
+								Usage: "Show full thinking parts instead of one line each"},
+						},
+					},
 					{
 						Name:    "import",
 						Usage:   "krowk sessions import --from <provider|all> [--dry-run] [--limit N]",
@@ -459,11 +484,12 @@ var sections = []section{
 	{"PUSH & PASTE", []string{"push", "uploads create"}},
 	{"RUNS", []string{"runs start", "runs finish", "runs show", "runs list"}},
 	{"UPLOADS", []string{"uploads list", "uploads show", "uploads attach", "uploads delete", "claim"}},
+	{"SESSIONS", []string{"sessions", "sessions show", "sessions import"}},
 	{"ACCOUNT & SYSTEM", []string{
 		"auth login", "auth verify", "auth token",
 		"workspaces list", "workspaces use",
 		"config show", "config set", "config unset",
-		"doctor", "sessions import", "pricing refresh", "upgrade", "help",
+		"doctor", "pricing refresh", "upgrade", "help",
 	}},
 }
 
@@ -500,15 +526,25 @@ func Surface() Catalog {
 }
 
 // Leaves are the commands that can actually be run, each with the whole path a
-// caller types. A group is not one of them: `krowk uploads` on its own is not a
-// command, and the tests that hold the catalog to the routing switch would
-// otherwise be looking for a case that should not exist.
+// caller types. A group is not one of them — except `sessions`, whose Usage
+// marks it invocable: `krowk uploads` on its own is not a command, while
+// bare `krowk sessions` lists. The exception names the group on purpose, so
+// a future Usage on another group cannot silently change the contract; that
+// group must opt in here. The tests that hold the catalog to the routing
+// switch would otherwise be looking for a case that should not exist
+// (or missing one that should).
 func (c Catalog) Leaves() []Command {
 	var leaves []Command
 	for _, cmd := range c.Commands {
 		if len(cmd.Subcommands) == 0 {
 			leaves = append(leaves, cmd)
 			continue
+		}
+		if cmd.Name == "sessions" && cmd.Usage != "" {
+			leaves = append(leaves, Command{
+				Name: cmd.Name, Usage: cmd.Usage, Summary: cmd.Summary,
+				Args: cmd.Args, Flags: cmd.Flags,
+			})
 		}
 		for _, sub := range cmd.Subcommands {
 			sub.Name = cmd.Name + " " + sub.Name

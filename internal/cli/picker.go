@@ -84,8 +84,8 @@ func pickSession(rows []store.SessionRow) (string, error) {
 		// agent eventually produces ("session title" × 40).
 		hm := cleanCell(strings.TrimSpace(strings.TrimSpace(r.Harness) + " " + strings.TrimSpace(r.Model)))
 		short := r.ID
-		if len(short) > 8 {
-			short = short[:8]
+		if rs := []rune(short); len(rs) > 8 {
+			short = string(rs[:8])
 		}
 		label := title
 		if hm != "" {

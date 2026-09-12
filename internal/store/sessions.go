@@ -174,11 +174,11 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 	case 1:
 		return bIDs[0], nil
 	default:
-		seen := map[string]bool{}
+		seen := map[string]string{}
 		var uniq []string
-		for _, sid := range bIDs {
-			if !seen[sid] {
-				seen[sid] = true
+		for i, sid := range bIDs {
+			if _, ok := seen[sid]; !ok {
+				seen[sid] = bProviders[i]
 				uniq = append(uniq, sid)
 			}
 		}
@@ -187,8 +187,8 @@ func ResolveSessionID(db *sql.DB, ref string) (string, error) {
 		}
 		var b strings.Builder
 		fmt.Fprintf(&b, "store: %q is ambiguous (%d sessions):", ref, len(uniq))
-		for i, sid := range uniq {
-			fmt.Fprintf(&b, "\n  %s  %s", sid, bProviders[i])
+		for _, sid := range uniq {
+			fmt.Fprintf(&b, "\n  %s  %s", sid, seen[sid])
 		}
 		return "", &AmbiguousSessionError{Ref: ref, IDs: uniq, msg: b.String()}
 	}
@@ -324,7 +324,7 @@ func LoadSessionDetail(db *sql.DB, sessionID string) (SessionDetail, error) {
 	err = tx.QueryRow(`SELECT s.id, s.title, s.model, s.provider, s.harness, s.directory, s.time_created, s.time_updated, w.path, (SELECT b.harness FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1), (SELECT b.provider FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1), (SELECT b.foreign_session_id FROM session_binding b WHERE b.session_id = s.id ORDER BY b.id LIMIT 1) FROM session s LEFT JOIN worktree w ON w.id = s.worktree_id WHERE s.id = ?`, sessionID).
 		Scan(&r.ID, &r.Title, &r.Model, &r.Provider, &r.Harness, &r.Directory,
 			&r.TimeCreated, &r.TimeUpdated, &wpath, &bharness, &bprovider, &foreign)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return d, fmt.Errorf("store: no session %q: %w", sessionID, sql.ErrNoRows)
 	}
 	if err != nil {

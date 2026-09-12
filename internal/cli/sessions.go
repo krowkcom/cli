@@ -179,7 +179,7 @@ func humanSessionsList(rows []store.SessionRow, colour bool, now time.Time) stri
 		title = truncateRunes(title, maxTitleWidth)
 		harness := truncateRunes(cleanCell(r.Harness), maxHarnessWidth)
 		model := truncateRunes(cleanCell(r.Model), maxModelWidth)
-		short := r.ID
+		short := cleanCell(r.ID)
 		if rs := []rune(short); len(rs) > 8 {
 			short = string(rs[:8])
 		}
@@ -207,7 +207,7 @@ func humanSessionsList(rows []store.SessionRow, colour bool, now time.Time) stri
 // code only when colour is on, so colour=false stays byte-stable plain
 // text for tests and pipes.
 func sessionPaint(colour bool, code, s string) string {
-	if !colour {
+	if !colour || s == "" {
 		return s
 	}
 	return "\x1b[" + code + "m" + s + "\x1b[0m"

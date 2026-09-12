@@ -88,7 +88,7 @@ func pickSession(rows []store.SessionRow) (string, error) {
 		if r := []rune(hm); len(r) > 32 {
 			hm = string(r[:29]) + "..."
 		}
-		short := r.ID
+		short := cleanCell(r.ID)
 		if rs := []rune(short); len(rs) > 8 {
 			short = string(rs[:8])
 		}
@@ -96,7 +96,7 @@ func pickSession(rows []store.SessionRow) (string, error) {
 		if hm != "" {
 			label += "  —  " + hm
 		}
-		label += fmt.Sprintf("  ·  %-9s  ·  %s", relativeTime(r.TimeUpdated, time.Now()), short)
+		label += fmt.Sprintf("  ·  %-13s  ·  %s", relativeTime(r.TimeUpdated, time.Now()), short)
 		options = append(options, huh.NewOption(label, r.ID))
 	}
 

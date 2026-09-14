@@ -139,68 +139,85 @@ func emitSessionsList(w io.Writer, format output.Format, f flags, rows []store.S
 }
 
 // humanSessionsList is the non-TTY table (and the TTY fallback when no
-// picker applies): short id, title, harness, model, turns, cost, recency.
+// picker applies): title, source, turns, cost, recency, short id.
 // Colour is gated on the colour flag so piped output stays byte-stable.
 func humanSessionsList(rows []store.SessionRow, colour bool, now time.Time) string {
 	if len(rows) == 0 {
 		return "no sessions — run `krowk sessions import --from all`"
 	}
 	const maxTitleWidth = 60
-	const maxHarnessWidth = 24
-	const maxModelWidth = 32
-	var tw, hw, mw int
-	for _, r := range rows {
+	const maxSourceWidth = 40
+	var tw, sw int
+	sources := make([]string, len(rows))
+	for i, r := range rows {
 		title := cleanCell(r.Title)
 		if title == "" {
 			title = "(untitled)"
 		}
 		tw = max(tw, utf8.RuneCountInString(title))
-		hw = max(hw, utf8.RuneCountInString(cleanCell(r.Harness)))
-		mw = max(mw, utf8.RuneCountInString(cleanCell(r.Model)))
+		sources[i] = truncateRunes(sessionSource(r), maxSourceWidth)
+		sw = max(sw, utf8.RuneCountInString(sources[i]))
 	}
-	tw = min(max(tw, utf8.RuneCountInString("TITLE")), maxTitleWidth)
-	hw = min(max(hw, utf8.RuneCountInString("HARNESS")), maxHarnessWidth)
-	mw = min(max(mw, utf8.RuneCountInString("MODEL")), maxModelWidth)
+	tw = min(max(tw, utf8.RuneCountInString("Title")), maxTitleWidth)
+	sw = min(max(sw, utf8.RuneCountInString("Source")), maxSourceWidth)
 	lines := make([]string, 0, len(rows)+1)
 	lines = append(lines, strings.Join([]string{
-		sessionPadRight(colour, "1;2", "ID", 8),
-		sessionPadRight(colour, "1;2", "TITLE", tw),
-		sessionPadRight(colour, "1;2", "HARNESS", hw),
-		sessionPadRight(colour, "1;2", "MODEL", mw),
-		sessionPadLeft(colour, "1;2", "TURNS", 9),
-		sessionPadLeft(colour, "1;2", "COST", 10),
-		sessionPaint(colour, "1;2", "UPDATED"),
+		sessionPadRight(colour, "2", "Title", tw),
+		sessionPadRight(colour, "2", "Source", sw),
+		sessionPadLeft(colour, "2", "Turns", 9),
+		sessionPadLeft(colour, "2", "Cost", 10),
+		sessionPaint(colour, "2", "Updated"),
 	}, "  "))
-	for _, r := range rows {
+	for i, r := range rows {
 		title := cleanCell(r.Title)
 		if title == "" {
 			title = "(untitled)"
 		}
 		title = truncateRunes(title, maxTitleWidth)
-		harness := truncateRunes(cleanCell(r.Harness), maxHarnessWidth)
-		model := truncateRunes(cleanCell(r.Model), maxModelWidth)
 		short := cleanCell(r.ID)
 		if rs := []rune(short); len(rs) > 8 {
 			short = string(rs[:8])
 		}
-		turns := fmt.Sprintf("%3d", r.TurnCount) + " " + sessionPaint(colour, "2", "turns")
+		turnWord := "turns"
+		if r.TurnCount == 1 {
+			turnWord = "turn"
+		}
+		turns := fmt.Sprintf("%3d", r.TurnCount) + " " + sessionPaint(colour, "2", turnWord)
 		cost := "—"
 		costCode := "2"
 		if priced, ok := priceRow(r); ok {
-			cost = formatCost(priced)
+			cost = humanCost(priced)
 			costCode = "32"
+			if priced == 0 {
+				costCode = "2"
+			}
 		}
 		lines = append(lines, strings.Join([]string{
-			sessionPadRight(false, "", short, 8),
 			sessionPadRight(colour, "1", title, tw),
-			sessionPadRight(colour, "2", harness, hw),
-			sessionPadRight(colour, "2", model, mw),
+			sessionPadRight(colour, "2", sources[i], sw),
 			turns,
 			sessionPadLeft(colour, costCode, cost, 10),
 			sessionPaint(colour, "2", relativeTime(r.TimeUpdated, now)),
+			sessionPaint(colour, "2", "#"+short),
 		}, "  "))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// sessionSource merges harness and model into one `harness · model` cell:
+// model-only when harness is empty, harness-only when model is empty,
+// empty when both are. Callers truncate the result to the column cap.
+func sessionSource(r store.SessionRow) string {
+	harness := cleanCell(r.Harness)
+	model := cleanCell(r.Model)
+	switch {
+	case harness != "" && model != "":
+		return harness + " · " + model
+	case harness != "":
+		return harness
+	default:
+		return model
+	}
 }
 
 // sessionPaint mirrors the output package's paint idiom: ANSI-wrap s in
@@ -253,6 +270,20 @@ func formatCost(usd float64) string {
 	return fmt.Sprintf("$%.2f", usd)
 }
 
+// humanCost renders a priced total for the human table only: exact 0 is
+// free, dust below a cent collapses to <$0.01, the rest keeps $%.2f.
+// Unknown costs never reach here — the caller keeps "—".
+func humanCost(usd float64) string {
+	switch {
+	case usd == 0:
+		return "free"
+	case usd < 0.01:
+		return "<$0.01"
+	default:
+		return fmt.Sprintf("$%.2f", usd)
+	}
+}
+
 // relativeTime turns epoch millis into "5m ago" beside the listing.
 func relativeTime(ms int64, now time.Time) string {
 	t := time.UnixMilli(ms)
@@ -267,6 +298,8 @@ func relativeTime(ms int64, now time.Time) string {
 		return fmt.Sprintf("%dm ago", int(d.Minutes()))
 	case d < 24*time.Hour:
 		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	case d < 48*time.Hour:
+		return "yesterday"
 	case d < 30*24*time.Hour:
 		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 	case d < 365*24*time.Hour:

@@ -177,16 +177,21 @@ func TestSessionsListHumanTable(t *testing.T) {
 	if !strings.Contains(stdout, "Alpha thread") || !strings.Contains(stdout, "beta prompt here") {
 		t.Errorf("human table misses a title:\n%s", stdout)
 	}
-	if !strings.Contains(stdout, "turns") {
-		t.Errorf("human table has no turn counts:\n%s", stdout)
+	if !strings.Contains(stdout, "1 turn") {
+		t.Errorf("human table has no singular turn count:\n%s", stdout)
 	}
-	for _, want := range []string{"ID", "TITLE", "HARNESS", "MODEL", "TURNS", "COST", "UPDATED"} {
+	for _, want := range []string{"Title", "Source", "Turns", "Cost", "Updated"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("human table misses header %q:\n%s", want, stdout)
 		}
 	}
-	if !strings.Contains(stdout, alphaID[:8]) || !strings.Contains(stdout, betaID[:8]) {
-		t.Errorf("human table misses a short id:\n%s", stdout)
+	for _, gone := range []string{"TITLE", "HARNESS", "MODEL", "TURNS", "COST", "UPDATED"} {
+		if strings.Contains(stdout, gone) {
+			t.Errorf("human table still has shouty header %q:\n%s", gone, stdout)
+		}
+	}
+	if !strings.Contains(stdout, "#"+alphaID[:8]) || !strings.Contains(stdout, "#"+betaID[:8]) {
+		t.Errorf("human table misses a #-prefixed short id:\n%s", stdout)
 	}
 }
 
@@ -204,14 +209,38 @@ func TestSessionsListHumanColour(t *testing.T) {
 	if strings.Contains(plain, "\x1b[") {
 		t.Errorf("colour=false leaked an escape:\n%q", plain)
 	}
-	if !strings.Contains(plain, "Coloured") || !strings.Contains(plain, "0196colo") {
-		t.Errorf("plain table misses title or short id:\n%s", plain)
+	if !strings.Contains(plain, "Coloured") || !strings.Contains(plain, "#0196colo") {
+		t.Errorf("plain table misses title or #-prefixed short id:\n%s", plain)
 	}
 	coloured := humanSessionsList(rows, true, now)
-	for _, want := range []string{"\x1b[1m", "\x1b[2m", "\x1b[32m", "\x1b[1;2m"} {
+	for _, want := range []string{"\x1b[1m", "\x1b[2m", "\x1b[32m"} {
 		if !strings.Contains(coloured, want) {
 			t.Errorf("colour=true misses %q:\n%q", want, coloured)
 		}
+	}
+	if strings.Contains(coloured, "\x1b[1;2m") {
+		t.Errorf("header still uses bold+dim:\n%q", coloured)
+	}
+	// Human cost tiers: exact 0 is free, dust collapses below a cent.
+	if got := humanCost(0); got != "free" {
+		t.Errorf("humanCost(0) = %q, want free", got)
+	}
+	if got := humanCost(0.005); got != "<$0.01" {
+		t.Errorf("humanCost(0.005) = %q, want <$0.01", got)
+	}
+	if got := humanCost(1.234); got != "$1.23" {
+		t.Errorf("humanCost(1.234) = %q, want $1.23", got)
+	}
+	free := humanSessionsList([]store.SessionRow{{
+		ID: "0196freetest00000001", Title: "Freebie", Harness: "claude",
+		Model: "claude-fable-5-1", Provider: "anthropic",
+		TimeUpdated: now.Add(-time.Hour).UnixMilli(),
+	}}, true, now)
+	if !strings.Contains(free, "\x1b[2mfree\x1b[0m") {
+		t.Errorf("free cost is not dimmed:\n%q", free)
+	}
+	if got := relativeTime(now.Add(-30*time.Hour).UnixMilli(), now); got != "yesterday" {
+		t.Errorf("relativeTime(-30h) = %q, want yesterday", got)
 	}
 }
 

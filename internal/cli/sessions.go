@@ -192,13 +192,17 @@ func humanSessionsList(rows []store.SessionRow, colour bool, now time.Time) stri
 				costCode = "2"
 			}
 		}
+		id := ""
+		if short != "" {
+			id = sessionPaint(colour, "2", "#"+short)
+		}
 		lines = append(lines, strings.Join([]string{
 			sessionPadRight(colour, "1", title, tw),
 			sessionPadRight(colour, "2", sources[i], sw),
 			turns,
 			sessionPadLeft(colour, costCode, cost, 10),
 			sessionPaint(colour, "2", relativeTime(r.TimeUpdated, now)),
-			sessionPaint(colour, "2", "#"+short),
+			id,
 		}, "  "))
 	}
 	return strings.Join(lines, "\n")
@@ -277,7 +281,7 @@ func humanCost(usd float64) string {
 	switch {
 	case usd == 0:
 		return "free"
-	case usd < 0.01:
+	case usd > 0 && usd < 0.01:
 		return "<$0.01"
 	default:
 		return fmt.Sprintf("$%.2f", usd)

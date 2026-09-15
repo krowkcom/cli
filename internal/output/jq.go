@@ -17,6 +17,7 @@ import (
 	"github.com/itchyny/gojq"
 
 	"github.com/krowkcom/cli/internal/api"
+	"github.com/krowkcom/cli/internal/termclean"
 )
 
 // --jq filters a result inside krowk, with the jq engine compiled in.
@@ -306,7 +307,7 @@ func terminalSafeJSON(encoded string) string {
 	var b strings.Builder
 	b.Grow(len(encoded))
 	for _, r := range encoded {
-		if unicode.IsControl(r) || reordering(r) {
+		if unicode.IsControl(r) || termclean.Reordering(r) {
 			fmt.Fprintf(&b, `\u%04x`, r)
 			continue
 		}
@@ -321,7 +322,7 @@ func terminalSafeJSON(encoded string) string {
 // among them, since one filter result is one line.
 func unprintable(s string) bool {
 	for _, r := range s {
-		if unicode.IsControl(r) || reordering(r) {
+		if unicode.IsControl(r) || termclean.Reordering(r) {
 			return true
 		}
 	}

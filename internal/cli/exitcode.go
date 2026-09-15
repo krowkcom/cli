@@ -85,6 +85,14 @@ var clientCodes = map[string]int{
 	"unsupported_os": exitUsage,
 	"import_failed":  exitUsage,
 
+	// A `sessions show` ref that matches nothing is the local analogue of
+	// the registry's 404: what was named is not there. exitNotFound so a
+	// script checks the id rather than its own command. An ambiguous ref
+	// is the opposite news — the command needs refining — so it stays
+	// exitUsage explicitly rather than by fall-through.
+	"no_session":        exitNotFound,
+	"ambiguous_session": exitUsage,
+
 	// An answer arrived, but not one this client can act on. That is the
 	// registry's side of the contract broken, which is what exitServer names.
 	"malformed_response": exitServer,

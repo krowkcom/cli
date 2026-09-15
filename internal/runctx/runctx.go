@@ -149,7 +149,7 @@ func validateLinkLine(where, field, value string, max int) error {
 // overrides and isolates, the zero-width spaces and the byte order mark.
 //
 // The renderer already folds these out of anything it draws
-// (output.reordering, output.oneLine). This is the writer's side of the same
+// (termclean.Cell). This is the writer's side of the same
 // rule, and it refuses rather than folds: a title krowk quietly rewrote is not
 // what the caller said, and the record is stored verbatim and read for years.
 // U+200D ZERO WIDTH JOINER is kept for the same reason the renderer keeps it —

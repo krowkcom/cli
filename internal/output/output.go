@@ -12,9 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/krowkcom/cli/internal/api"
+	"github.com/krowkcom/cli/internal/termclean"
 )
 
 // Format is the shape of a rendered result.
@@ -1451,54 +1451,20 @@ const maxLabelRunes = 72
 
 // oneLine folds every run of whitespace to a single space and drops the control
 // characters that would otherwise move the cursor or recolour the row.
+// Single implementation lives in internal/termclean; this stays as the
+// output package's name for it.
 func oneLine(s string) string {
-	var b strings.Builder
-	space := false
-	for _, r := range strings.TrimSpace(s) {
-		switch {
-		case unicode.IsSpace(r):
-			space = true
-		case unicode.IsControl(r), reordering(r):
-			// Dropped outright rather than folded to a space: an escape sequence
-			// arrives as ESC plus ordinary letters, and spacing it out would leave
-			// the letters behind as text.
-		default:
-			if space && b.Len() > 0 {
-				b.WriteByte(' ')
-			}
-			space = false
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
+	return termclean.Cell(s)
 }
 
 // reordering reports the characters that move or hide text while occupying no
 // space of their own: the bidi overrides and isolates, the zero-width spaces,
 // and the byte order mark.
 //
-// A right-to-left override in a title reverses everything drawn after it, which
-// is the same "a label must not repaint the row" problem as an escape sequence
-// reached a different way — and unicode.IsControl does not cover it, since these
-// are format characters rather than control ones.
-//
-// U+200D ZERO WIDTH JOINER is deliberately kept: it is what holds a multi-part
-// emoji together, so dropping it would break one glyph into several.
-//
-// Spelled as code points rather than literals, since written literally they
-// would be invisible here too — in the one function whose job is knowing they
-// exist.
+// Single implementation lives in internal/termclean; this stays as the
+// output package's name for it. See termclean.Reordering for the rationale.
 func reordering(r rune) bool {
-	switch {
-	case r == '\u200d': // ZERO WIDTH JOINER
-		return false
-	case r == '\ufeff', // BYTE ORDER MARK
-		r >= '\u200b' && r <= '\u200f', // zero-width spaces, LRM, RLM
-		r >= '\u202a' && r <= '\u202e', // bidi embeddings and overrides
-		r >= '\u2066' && r <= '\u2069': // bidi isolates
-		return true
-	}
-	return false
+	return termclean.Reordering(r)
 }
 
 // clipLabel truncates on runes rather than bytes, so a multi-byte character is

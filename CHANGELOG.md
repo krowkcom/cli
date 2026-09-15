@@ -59,7 +59,27 @@ the versions are the `v*` tags a release is cut from. Entries land under
   before it resolves a store path, so nothing is created on a machine the
   command does not run on; with no home in the environment it fails closed on
   `store.Open`'s own hint rather than writing a database into the working
-  directory.
+   directory.
+- `krowk sessions` and `krowk sessions show <id>`, which read the imported
+  threads back. Bare `krowk sessions` lists every thread newest-first from
+  session columns only — title, harness, model, turn count, priced cost and
+  recency — with `--harness`, `--worktree`, `--limit N` (default 50) and
+  `--all`, and never touches message or part blobs, so the default page
+  stays instant on a 10k-session store. On a terminal it offers a picker
+  that prints `krowk sessions show <id>`; piped, `--json`, `--quiet` or in
+  CI the table (or envelope) is the answer and no picker appears. `show`
+  takes a full id, an unambiguous id prefix of at least 8 chars, or a
+  foreign session id via the binding, then renders turns, messages and
+  parts in seq order with tool results labelled by their twin call's name
+  (`unknown tool` when the call is missing) and thinking collapsed to one
+  line unless `--thinking`. Costs are priced at display time from the
+  embedded models.dev snapshot and footnote its date; an unpriced pair shows `—`,
+  never 0. An untitled thread lists by the first 80 chars of its first
+  user text, stored at import; threads imported before that fallback stay
+  untitled until a re-import carries user text. The listing indexes apply
+  to fresh stores only: a `krowk.db` created before an index landed is
+  still accepted and answers correctly, just on a slower plan, until
+  `krowk sessions rebuild` recreates it — there is no backfill in v1.
 - The Cursor importer, `internal/importer/cursor`, which reads Cursor's
   agent transcripts out of `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`
   and produces the canonical `store.Thread`. The thing it is careful about

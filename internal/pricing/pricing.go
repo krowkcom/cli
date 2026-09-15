@@ -27,8 +27,8 @@
 // the models.dev id for its provider before calling Price (see Normalize);
 // an unknown pair answers ok=false and the caller renders "—", never 0.
 //
-// Rates are current, never historical: sessions show footnotes "priced at
-// current models.dev rates (snapshot YYYY-MM-DD)" from SnapshotDate.
+// Rates are current, never historical: sessions show footnotes "priced from
+// embedded models.dev snapshot YYYY-MM-DD" from SnapshotDate.
 package pricing
 
 //go:generate go run ./generate -date 2026-09-10

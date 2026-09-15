@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ingestBatchSize caps how many messages one Ingest transaction holds.
@@ -189,6 +191,20 @@ func (w *Writer) Ingest(ctx context.Context, th Thread) (Result, error) {
 func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, error) {
 	var res Result
 
+	// Title fallback: a thread naming no title is listed by the first 80
+	// chars of its first user text, computed at import into session.title
+	// so the listing never reads message/part blobs to name a row.
+	// fromFallback marks a title the importer derived rather than read:
+	// findOrCreateSession must not let a derived fallback overwrite the
+	// title already stored, while an explicit rename still wins (see
+	// TestWriterIngestConvergesBinding).
+	fromFallback := false
+	th.Session.Title = strings.TrimSpace(th.Session.Title)
+	if th.Session.Title == "" {
+		th.Session.Title = sessionTitleFallback(th.Messages)
+		fromFallback = true
+	}
+
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
 		return res, fmt.Errorf("store: ingest begin: %w", err)
@@ -210,7 +226,7 @@ func (w *Writer) ingestOnce(ctx context.Context, th Thread, now int64) (Result, 
 		res.Worktrees.Skipped++
 	}
 
-	sessionID, sessIns, bindIns, err := findOrCreateSession(ctx, tx, w.minter, now, worktreeID, th.Session, th.Binding)
+	sessionID, sessIns, bindIns, err := findOrCreateSession(ctx, tx, w.minter, now, worktreeID, th.Session, th.Binding, fromFallback)
 	if err != nil {
 		return Result{}, err
 	}
@@ -317,15 +333,42 @@ func upsertWorktree(ctx context.Context, tx *sql.Tx, m *Minter, now int64, wt Wo
 // refreshes its display fields, so two Threads naming the same
 // (provider, foreign_session_id) converge on one session row and one
 // binding row.
-func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, worktreeID string, s Session, b Binding) (string, bool, bool, error) {
+func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, worktreeID string, s Session, b Binding, fromFallback bool) (string, bool, bool, error) {
+	s.Title = strings.TrimSpace(s.Title)
 	var sessionID string
 	err := tx.QueryRowContext(ctx,
 		`SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?`,
 		b.Provider, b.ForeignSessionID).Scan(&sessionID)
 	if err == nil {
+		title := strings.TrimSpace(s.Title)
+		if fromFallback {
+			// A derived fallback must never overwrite the title already
+			// on the row — same rule as the binding-race path's
+			// storedTitleOr. A stored untitled row still backfills from
+			// the re-import; an explicit rename (fromFallback=false)
+			// still wins below.
+			stored, terr := storedTitleOr(ctx, tx, sessionID, s.Title, true)
+			if terr != nil {
+				return "", false, false, terr
+			}
+			title = stored
+		} else if title == "" {
+			// Never wipe a stored title with an untitled re-import. A
+			// stored untitled row backfills here when the re-import
+			// carries user text; a row no re-import names stays untitled
+			// — there is no migration rewriting stored titles.
+			// TrimSpace above is what reaches this branch: fromFallback
+			// is false exactly when the importer read a title, so a
+			// truly empty one cannot arrive here — but a whitespace-only
+			// one can, and storing spaces would be a wipe by another
+			// name. It backfills from the row instead.
+			if terr := tx.QueryRowContext(ctx, `SELECT title FROM session WHERE id = ?`, sessionID).Scan(&title); terr != nil {
+				return "", false, false, fmt.Errorf("store: ingest read session title: %w", terr)
+			}
+		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE session SET worktree_id = ?, directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
-			worktreeID, s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, sessionID); err != nil {
+			worktreeID, s.Directory, title, s.Model, s.Provider, s.Harness, now, sessionID); err != nil {
 			return "", false, false, fmt.Errorf("store: ingest update session: %w", err)
 		}
 		return sessionID, false, false, nil
@@ -356,9 +399,13 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 			if _, derr := tx.ExecContext(ctx, `DELETE FROM session WHERE id = ?`, sessionID); derr != nil {
 				return "", false, false, fmt.Errorf("store: ingest adopt session: %w", derr)
 			}
+			winnerTitle, uerr := storedTitleOr(ctx, tx, winner, s.Title, fromFallback)
+			if uerr != nil {
+				return "", false, false, uerr
+			}
 			if _, uerr := tx.ExecContext(ctx,
 				`UPDATE session SET worktree_id = ?, directory = ?, title = ?, model = ?, provider = ?, harness = ?, time_updated = ? WHERE id = ?`,
-				worktreeID, s.Directory, s.Title, s.Model, s.Provider, s.Harness, now, winner); uerr != nil {
+				worktreeID, s.Directory, winnerTitle, s.Model, s.Provider, s.Harness, now, winner); uerr != nil {
 				return "", false, false, fmt.Errorf("store: ingest update session: %w", uerr)
 			}
 			return winner, false, false, nil
@@ -366,6 +413,25 @@ func findOrCreateSession(ctx context.Context, tx *sql.Tx, m *Minter, now int64, 
 		return "", false, false, fmt.Errorf("store: ingest insert binding: %w", err)
 	}
 	return sessionID, true, true, nil
+}
+
+// storedTitleOr resolves the title the binding-race path writes. A stored
+// title survives a derived fallback or an empty incoming — an untitled
+// loser never wipes the title the winner just stored — while an explicit
+// rename (fromFallback=false with a non-empty incoming) wins, so a rename
+// racing an import is not silently dropped.
+func storedTitleOr(ctx context.Context, tx *sql.Tx, sessionID, incoming string, fromFallback bool) (string, error) {
+	var stored string
+	if err := tx.QueryRowContext(ctx, `SELECT title FROM session WHERE id = ?`, sessionID).Scan(&stored); err != nil {
+		return "", fmt.Errorf("store: ingest read session title: %w", err)
+	}
+	if !fromFallback && strings.TrimSpace(incoming) != "" {
+		return strings.TrimSpace(incoming), nil
+	}
+	if stored != "" {
+		return stored, nil
+	}
+	return incoming, nil
 }
 
 // linkParent points sessionID at the session its parent binding names, when
@@ -650,4 +716,44 @@ func insertOneMessage(ctx context.Context, tx *sql.Tx, m *Minter, now int64, ses
 		}
 	}
 	return len(msg.Parts), nil
+}
+
+// sessionTitleFallback names an untitled thread by the first 80 chars of
+// its first user text part. Whitespace is collapsed so a multiline prompt
+// lists as one line; overlong titles cut on a rune boundary.
+func sessionTitleFallback(msgs []Message) string {
+	for _, m := range msgs {
+		if m.Role != RoleUser {
+			continue
+		}
+		for _, p := range m.Parts {
+			if p.Type != "text" {
+				continue
+			}
+			text := partText(p.Data)
+			text = strings.Join(strings.Fields(text), " ")
+			if text == "" {
+				continue
+			}
+			if utf8.RuneCountInString(text) > 80 {
+				runes := []rune(text)
+				return string(runes[:80])
+			}
+			return text
+		}
+	}
+	return ""
+}
+
+// partText pulls {"text":...} out of a text part's data. Anything
+// unparseable is no title rather than an error: the fallback names a row,
+// it never fails an import.
+func partText(data string) string {
+	var v struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(data), &v); err != nil {
+		return ""
+	}
+	return v.Text
 }

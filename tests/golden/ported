@@ -9,3 +9,5 @@ unknown-command
 unknown-flag
 config
 config-errors
+jq-surface
+config-no-home

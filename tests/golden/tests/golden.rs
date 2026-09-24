@@ -218,7 +218,7 @@ fn contract_difference(want: &str, got: &str) -> Option<String> {
         if w.head != g.head {
             return Some(format!("step `{}` ran as `{}`", w.head, g.head));
         }
-        let data = w.head.contains("--jq") || w.head.contains("--format url") || w.head.starts_with("@ls ");
+        let data = ["--jq", "--format url", "--format markdown"].iter().any(|d| w.head.contains(d)) || w.head.starts_with("@ls ");
         let names = |s: &Step| s.sections.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
         let find = |s: &Step, n: &str| s.sections.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
         for name in ["exit", "stdout", "stderr", "tty", "body"] {
@@ -228,13 +228,7 @@ fn contract_difference(want: &str, got: &str) -> Option<String> {
                 (Some(_), None) | (None, Some(_)) if name == "tty" => continue,
                 (Some(_), None) | (None, Some(_)) => Some(format!("{name}: {:?} recorded, {:?} got", names(w), names(g))),
                 (Some(a), Some(b)) if name == "exit" => (a != b).then(|| format!("exit {a} recorded, {b} got")),
-                (Some(a), Some(b)) => match (json_stream(a), json_stream(b)) {
-                    (Some(x), Some(y)) => (x != y).then(|| {
-                        format!("{name} JSON differs:\n  want {}\n  got  {}", serde_json::to_string(&x).unwrap(), serde_json::to_string(&y).unwrap())
-                    }),
-                    _ if name == "tty" || !data => None,
-                    _ => (a != b).then(|| format!("{name} differs:\n{}", first_difference(a, b))),
-                },
+                (Some(a), Some(b)) => section_difference(name, a, b, data),
             };
             if let Some(why) = why {
                 return Some(format!("at `{}`: {why}", w.head));
@@ -242,6 +236,26 @@ fn contract_difference(want: &str, got: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// One section of one step, judged by what the oracle recorded: recorded JSON
+/// must come back as JSON with the same value; recorded text is compared
+/// exactly where it is data and only for presence where it is prose. The
+/// recorded side decides — a port that answers a JSON step with prose, or
+/// with JSON and a trailing line, has broken the contract.
+fn section_difference(name: &str, want: &str, got: &str, data: bool) -> Option<String> {
+    let recorded = json_stream(want).filter(|docs| !docs.is_empty() && name != "tty");
+    match (recorded, json_stream(got)) {
+        (Some(x), Some(y)) if x == y => None,
+        (Some(x), Some(y)) => Some(format!(
+            "{name} JSON differs:\n  want {}\n  got  {}",
+            serde_json::to_string(&x).unwrap(),
+            serde_json::to_string(&y).unwrap()
+        )),
+        (Some(_), None) => Some(format!("{name} was JSON and is not:\n{}", first_difference(want, got))),
+        (None, _) if name == "tty" || !data => None,
+        (None, _) => (want != got).then(|| format!("{name} differs:\n{}", first_difference(want, got))),
+    }
 }
 
 /// Every JSON document in a section, canonical: prose fields dropped,
@@ -256,7 +270,7 @@ fn json_stream(text: &str) -> Option<Vec<serde_json::Value>> {
 
 /// The fields a port may word its own way. Their presence is kept — a
 /// breadcrumb must still carry a description — and only the words dropped.
-const PROSE: &[&str] = &["fix", "message", "detail", "summary", "description", "usage", "instructions", "text", "hint", "reason", "warning"];
+const PROSE: &[&str] = &["fix", "message", "detail", "summary", "description", "usage", "instructions"];
 
 fn canonical(v: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
@@ -743,4 +757,31 @@ fn normalize(text: &str, scratch: &Path, registry: Option<&str>, bins: &Bins) ->
             .into_owned();
     }
     text
+}
+
+#[cfg(test)]
+mod contract {
+    use super::*;
+
+    fn step(stdout: &str) -> String {
+        format!("$ krowk push a.txt\nstdout:\n{stdout}exit: 0\n\n")
+    }
+
+    #[test]
+    fn recorded_json_must_come_back_as_the_same_json() {
+        let want = step("{\n  \"ok\": true,\n  \"summary\": \"one\"\n}\n");
+        assert!(contract_difference(&want, &step("{\"summary\": \"other words\", \"ok\": true}\n")).is_none());
+        assert!(contract_difference(&want, &step("all good, nothing to see\n")).is_some());
+        assert!(contract_difference(&want, &step("{\"ok\": true}\ntrailing\n")).is_some());
+        assert!(contract_difference(&want, &step("{\"ok\": false, \"summary\": \"one\"}\n")).is_some());
+    }
+
+    #[test]
+    fn recorded_prose_is_held_for_presence_and_data_exactly() {
+        let prose = step("✓ Uploaded a.txt\n");
+        assert!(contract_difference(&prose, &step("Uploaded, in other words\n")).is_none());
+        let data = "$ krowk push a.txt --format url\nstdout:\nhttp://x/a\nexit: 0\n\n";
+        assert!(contract_difference(data, &data.replace("http://x/a", "http://x/b")).is_some());
+        assert!(contract_difference(&prose, &prose.replace("exit: 0", "exit: 1")).is_some());
+    }
 }

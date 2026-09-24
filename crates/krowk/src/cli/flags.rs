@@ -101,6 +101,36 @@ fn lookup<'a>(known: &'a [Flag], name: &str) -> Option<&'a Flag> {
     known.iter().find(|f| f.name == name || f.aliases.contains(&name))
 }
 
+/// An integer the way Go's flag package reads one: an optional sign, then
+/// decimal, `0x` hex, `0o` or a leading `0` octal, or `0b` binary, with `_`
+/// between digits.
+fn parse_int(v: &str) -> Option<i64> {
+    let (negative, digits) = match v.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, v.strip_prefix('+').unwrap_or(v)),
+    };
+    let lower = digits.to_ascii_lowercase();
+    let (radix, body) = if let Some(b) = lower.strip_prefix("0x") {
+        (16, b)
+    } else if let Some(b) = lower.strip_prefix("0o") {
+        (8, b)
+    } else if let Some(b) = lower.strip_prefix("0b") {
+        (2, b)
+    } else if lower.len() > 1 && lower.starts_with('0') {
+        (8, &lower[1..])
+    } else {
+        (10, lower.as_str())
+    };
+    // Go's rule: `_` separates digits or follows a base prefix, never doubles
+    // and never ends the number.
+    let prefixed = body.len() != lower.len();
+    if body.is_empty() || body.ends_with('_') || body.contains("__") || (!prefixed && body.starts_with('_')) {
+        return None;
+    }
+    let n = i64::from_str_radix(&body.replace('_', ""), radix).ok()?;
+    Some(if negative { -n } else { n })
+}
+
 fn parse_bool(name: &str, v: &str) -> Result<bool, String> {
     match v {
         "1" | "t" | "T" | "true" | "TRUE" | "True" => Ok(true),
@@ -117,7 +147,7 @@ impl Flags {
             "run" => text(&mut self.run),
             "before" => text(&mut self.before),
             "limit" => {
-                self.limit = v.parse().map_err(|_| format!("invalid value {v:?} for flag -limit: parse error"))?;
+                self.limit = parse_int(v).ok_or_else(|| format!("invalid value {v:?} for flag -limit: parse error"))?;
             }
             "pull-request" => text(&mut self.pull_request),
             "link" => self.links.push(Link { url: v.into(), ..Link::default() }),
@@ -210,6 +240,13 @@ mod tests {
         assert_eq!((f.links[0].rel.as_str(), f.links[1].title.as_str()), ("fixes", "B"));
         assert!(run("push a --link-title orphan").2.is_err());
         assert!(run("push a --link https://a --link-rel x --link-rel y").2.is_err());
+    }
+
+    #[test]
+    fn limits_read_the_way_go_reads_an_int() {
+        for (v, want) in [("10", Some(10)), ("-3", Some(-3)), ("0x10", Some(16)), ("010", Some(8)), ("0o17", Some(15)), ("0b101", Some(5)), ("0x_1_0", Some(16)), ("1_0", Some(10)), ("1__0", None), ("10_", None), ("_1", None), ("", None), ("x", None), ("0x", None)] {
+            assert_eq!(parse_int(v), want, "{v}");
+        }
     }
 
     #[test]

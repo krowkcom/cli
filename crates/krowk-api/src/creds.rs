@@ -64,21 +64,20 @@ pub const TOKEN_SOURCE_ENV: &str = "KROWK_TOKEN";
 pub const TOKEN_SOURCE_FILE: &str = "credentials file";
 pub const TOKEN_SOURCE_NONE: &str = "none";
 
-/// $XDG_CONFIG_HOME/krowk/credentials.json, else ~/.config/krowk/, else a
-/// relative .krowk/ when there is no home at all.
+/// $XDG_CONFIG_HOME/krowk/credentials.json, else ~/.config/krowk/.
 pub fn credentials_path() -> PathBuf {
-    config_dir().join("krowk").join("credentials.json")
+    config_dir().join("credentials.json")
 }
 
-/// $XDG_CONFIG_HOME, else ~/.config — or `.krowk` beside the caller when
-/// there is no home, which is what the Go build fell back to.
-pub(crate) fn config_dir() -> PathBuf {
+/// krowk's config directory: $XDG_CONFIG_HOME/krowk, else ~/.config/krowk —
+/// or `.krowk` beside the caller when there is no home at all.
+pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
+        return PathBuf::from(dir).join("krowk");
     }
     match home_dir() {
-        Some(home) => home.join(".config"),
-        None => PathBuf::from(".krowk").join(".."),
+        Some(home) => home.join(".config").join("krowk"),
+        None => PathBuf::from(".krowk"),
     }
 }
 

@@ -65,7 +65,7 @@ fn read_file(path: &Path) -> Result<Option<String>, String> {
 
 /// $XDG_CONFIG_HOME/krowk/config.json, else ~/.config/krowk/config.json.
 pub fn global_path() -> PathBuf {
-    krowk_api::creds::credentials_path().with_file_name("config.json")
+    krowk_api::creds::config_dir().join("config.json")
 }
 
 /// <git-root>/.krowk/config.json, when `dir` is inside a checkout. The root is

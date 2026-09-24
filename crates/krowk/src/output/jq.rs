@@ -47,11 +47,62 @@ pub fn is_filter_failure(err: &Error) -> bool {
 
 type Compiled = jaq_core::compile::Filter<jaq_core::Native<data::JustLut<Val>>>;
 
+/// What jq has and jaq does not, defined the way jq defines it, plus `env`
+/// answering `{}`.
+const COMPAT_DEFS: &str = r#"
+def env: {};
+def tostream: path(def r: (.[]?|r), .; r) as $p | getpath($p) | reduce path(.[]?) as $q ([$p, .]; [$p+$q]);
+def __krowk_csv: if type != "array" then error("\(type) (\(tojson)) cannot be csv-formatted, only an array can be")
+  else map(if type == "string" then "\"" + gsub("\""; "\"\"") + "\""
+    elif type == "null" then "" elif type == "array" or type == "object" then error("\(type) (\(tojson)) is not valid in a csv row")
+    else tojson end) | join(",") end;
+def __krowk_tsv: if type != "array" then error("\(type) (\(tojson)) cannot be tsv-formatted, only an array can be")
+  else map(if type == "string" then gsub("\\\\"; "\\\\") | gsub("\t"; "\\t") | gsub("\n"; "\\n") | gsub("\r"; "\\r")
+    elif type == "null" then "" elif type == "array" or type == "object" then error("\(type) (\(tojson)) is not valid in a tsv row")
+    else tojson end) | join("\t") end;
+"#;
+
+/// `@csv` and `@tsv` spelled as the definitions above, outside string
+/// literals: jaq parses a format it does not know as an error, so the
+/// expression is rewritten before it is loaded.
+fn with_formats(expr: &str) -> String {
+    let (mut out, mut chars, mut in_string) = (String::new(), expr.chars().peekable(), false);
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            match c {
+                '\\' => out.extend(chars.next()),
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+        }
+        if c == '@' {
+            let word: String = std::iter::from_fn(|| chars.next_if(|c| c.is_ascii_alphanumeric())).collect();
+            match word.as_str() {
+                "csv" => out.push_str("__krowk_csv"),
+                "tsv" => out.push_str("__krowk_tsv"),
+                other => {
+                    out.push('@');
+                    out.push_str(other);
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Loads and compiles `expr` with jq's standard library, `env` answering `{}`,
 /// and hands the result to `f`. The error is a sentence about where it gave up.
 fn with_filter<T>(expr: &str, f: impl FnOnce(&Compiled) -> T) -> Result<T, String> {
     let arena = Arena::default();
-    let env_def = jaq_core::load::parse("def env: {};", |p| p.defs()).unwrap_or_default();
+    let expr = &with_formats(expr);
+    let env_def = jaq_core::load::parse(COMPAT_DEFS, |p| p.defs()).unwrap_or_default();
     let defs = jaq_core::defs().chain(jaq_std::defs()).chain(jaq_json::defs()).chain(env_def);
     let funs = jaq_core::funs().chain(jaq_std::funs()).chain(jaq_json::funs()).filter(|(name, _, _)| *name != "env");
     let modules = Loader::new(defs).load(&arena, File { code: expr, path: () }).map_err(|errs| {
@@ -111,7 +162,13 @@ impl Filter {
 }
 
 fn run(expr: &str, rendered: &str, tty: bool) -> Result<(String, usize), Error> {
-    let input = jaq_json::read::parse_single(rendered.as_bytes())
+    // Keys sorted before the filter sees them, as they are for gojq, which
+    // holds a decoded object as a map: `.[]`, `to_entries` and `paths` then
+    // walk them in the order the Go build did.
+    let sorted: serde_json::Value = serde_json::from_str(rendered)
+        .map(|v| sort_keys(&v))
+        .map_err(|e| fail("jq_failed", format!("--jq had no JSON result to filter: {e}")))?;
+    let input = jaq_json::read::parse_single(sorted.to_string().as_bytes())
         .map_err(|e| fail("jq_failed", format!("--jq had no JSON result to filter: {e}")))?;
     with_filter(expr, |filter| {
         let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new([Val::obj(Default::default())]));
@@ -141,7 +198,8 @@ fn run(expr: &str, rendered: &str, tty: bool) -> Result<(String, usize), Error> 
                     if tty { terminal_safe_string(&s) } else { s.into_owned() }
                 }
                 other => {
-                    let encoded = other.to_string();
+                    let mut encoded = String::new();
+                    encode(other, &mut encoded);
                     if tty { terminal_safe_json(&encoded) } else { encoded }
                 }
             };
@@ -151,6 +209,62 @@ fn run(expr: &str, rendered: &str, tty: bool) -> Result<(String, usize), Error> 
         Ok((out, said))
     })
     .map_err(|why| fail("bad_jq", format!("--jq: {why}")))?
+}
+
+fn sort_keys(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            serde_json::Value::Object(keys.into_iter().map(|k| (k.clone(), sort_keys(&map[k]))).collect())
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(items.iter().map(sort_keys).collect()),
+        other => other.clone(),
+    }
+}
+
+/// A result as JSON: keys sorted, as gojq writes them, and a number JSON cannot
+/// spell written as the nearest one it can — NaN as null, an infinity as the
+/// largest finite double — so what comes out always parses.
+fn encode(v: &Val, out: &mut String) {
+    match v {
+        Val::Num(jaq_json::Num::Float(f)) if f.is_nan() => out.push_str("null"),
+        Val::Num(jaq_json::Num::Float(f)) if f.is_infinite() => {
+            out.push_str(if *f > 0.0 { "1.7976931348623157e+308" } else { "-1.7976931348623157e+308" })
+        }
+        Val::Arr(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                encode(item, out);
+            }
+            out.push(']');
+        }
+        Val::Obj(map) => {
+            let mut entries: Vec<(String, &Val)> = map.iter().map(|(k, v)| (key_text(k), v)).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push('{');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::Value::String(k.clone()).to_string());
+                out.push(':');
+                encode(v, out);
+            }
+            out.push('}');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+fn key_text(k: &Val) -> String {
+    match k {
+        Val::TStr(s) | Val::BStr(s) => String::from_utf8_lossy(s).into_owned(),
+        other => other.to_string(),
+    }
 }
 
 /// The two secrets krowk mints, redacted to their prefix, and the message
@@ -215,6 +329,17 @@ mod tests {
         assert_eq!((serde_json::from_str::<serde_json::Value>(&out).unwrap()["byte_size"].as_i64(), said), (Some(5), 1));
         assert_eq!(filter(".data.artifacts[] | select(.byte_size > 100)").write(doc, false).unwrap(), (String::new(), 0));
         assert_eq!(filter(".missing").write(doc, false).unwrap(), ("null\n".into(), 0));
+    }
+
+    #[test]
+    fn what_jq_has_and_jaq_does_not_answers_as_jq_does() {
+        assert_eq!(filter(r#"[1,"a,b",null,"q\"t"] | @csv"#).write("null", false).unwrap().0, "1,\"a,b\",,\"q\"\"t\"\n");
+        assert_eq!(filter(r#"["a\tb",2] | @tsv"#).write("null", false).unwrap().0, "a\\tb\t2\n");
+        assert_eq!(filter(r#""@csv stays text""#).write("null", false).unwrap().0, "@csv stays text\n");
+        assert_eq!(filter("[.[] | tostream]").write("[[1]]", false).unwrap().0, "[[[0],1],[[0]]]\n");
+        assert_eq!(filter("[nan, infinite, -infinite]").write("null", false).unwrap().0, "[null,1.7976931348623157e+308,-1.7976931348623157e+308]\n");
+        assert_eq!(filter("to_entries[0].key").write(r#"{"b":1,"a":2}"#, false).unwrap().0, "a\n");
+        assert_eq!(filter("{z: 1, a: 2}").write("null", false).unwrap().0, "{\"a\":2,\"z\":1}\n");
     }
 
     #[test]

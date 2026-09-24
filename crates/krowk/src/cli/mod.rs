@@ -147,7 +147,7 @@ fn dispatch(ctx: &mut Ctx, p: &[String]) -> Result<(), Error> {
         ["config", "unset", ..] => workspace::config_unset(ctx, rest(2)),
         ["workspaces"] | ["workspaces", "list", ..] => workspace::workspaces_list(ctx),
         ["workspaces", "use", ..] => workspace::workspaces_use(ctx, rest(2)),
-        _ if catalog::catalog(VERSION).leaves().iter().any(|l| p.join(" ").starts_with(&l.name)) => Err(fail(
+        _ if catalog::catalog(VERSION).leaves().iter().any(|l| p.starts_with(&l.name.split(' ').map(String::from).collect::<Vec<_>>())) => Err(fail(
             "not_ported",
             format!("`{}` is not in the Rust build yet — the Go build still ships it", clip(p, 2).join(" ")),
         )),

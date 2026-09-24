@@ -136,6 +136,8 @@ SESSIONS FLAGS
   --dry-run              Count what would be imported and write nothing
   --limit <n>            On ` + "`sessions import`" + `, read at most this many
                          transcripts per source (0, the default, is all)
+  --yes                  On ` + "`sessions rebuild`" + `, delete krowk.db without asking —
+                         required when nobody is at a terminal to confirm
 
 AUTH FLAGS
   --token <key>          Store this key rather than asking the browser — how CI
@@ -258,6 +260,10 @@ type flags struct {
 	// a maximum either way, so one flag says it.
 	from   string
 	dryRun bool
+
+	// yes is `sessions rebuild`'s: the confirmation that deleting krowk.db
+	// was meant, for a caller with no terminal to be asked on.
+	yes bool
 
 	// harness, worktree and all are `sessions` (the list)'s; thinking is
 	// `sessions show`'s. --limit is shared with the other listings.
@@ -383,6 +389,7 @@ func newFlagSet(f *flags) *flag.FlagSet {
 	fs.StringVar(&f.worktree, "worktree", "", "")
 	fs.BoolVar(&f.all, "all", false, "")
 	fs.BoolVar(&f.thinking, "thinking", false, "")
+	fs.BoolVar(&f.yes, "yes", false, "")
 	return fs
 }
 
@@ -544,6 +551,8 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 		err = sessionsShow(stdout, positionals[2:], f, format, env, colour)
 	case len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "import":
 		err = sessionsImport(stdout, format, f, env)
+	case len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "rebuild":
+		err = sessionsRebuild(stdout, format, f, env, isTTY)
 	case len(positionals) > 1 && positionals[0] == "pricing" && positionals[1] == "refresh":
 		err = pricingRefresh(stdout, format, f, env)
 	case positionals[0] == "upgrade":
@@ -2158,12 +2167,15 @@ func clip[T any](s []T, n int) []T {
 // name below rather than silently ignored. --dry-run and --from mean
 // nothing outside `sessions import`; --harness, --worktree and --all mean
 // nothing outside the bare `sessions` list; --thinking means nothing
-// outside `sessions show`. A flag that means nothing where it was typed is
-// a flag that was misunderstood by whoever typed it.
+// outside `sessions show`; --yes means nothing outside `sessions rebuild`,
+// which always imports every source and so takes no --limit either. A flag
+// that means nothing where it was typed is a flag that was misunderstood by
+// whoever typed it.
 func rejectMisplacedSessionsFlags(given map[string]bool, positionals []string) error {
 	isImport := len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "import"
 	isShow := len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "show"
 	isList := len(positionals) == 1 && positionals[0] == "sessions"
+	isRebuild := len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "rebuild"
 	// Each flag names the command that owns it, so the refusal says where
 	// the flag does belong rather than only where it does not.
 	owner := map[string]string{
@@ -2173,6 +2185,7 @@ func rejectMisplacedSessionsFlags(given map[string]bool, positionals []string) e
 		"worktree": "`krowk sessions`",
 		"all":      "`krowk sessions`",
 		"thinking": "`krowk sessions show`",
+		"yes":      "`krowk sessions rebuild`",
 	}
 	allowed := map[string]bool{}
 	switch {
@@ -2182,14 +2195,19 @@ func rejectMisplacedSessionsFlags(given map[string]bool, positionals []string) e
 		allowed = map[string]bool{"thinking": true}
 	case isList:
 		allowed = map[string]bool{"harness": true, "worktree": true, "all": true}
+	case isRebuild:
+		allowed = map[string]bool{"yes": true}
 	}
-	for _, name := range []string{"dry-run", "from", "harness", "worktree", "all", "thinking"} {
+	for _, name := range []string{"dry-run", "from", "harness", "worktree", "all", "thinking", "yes"} {
 		if given[name] && !allowed[name] {
 			return api.Fail("bad_flag", "`--"+name+"` is only a flag of "+owner[name])
 		}
 	}
 	if isShow && given["limit"] {
 		return api.Fail("bad_flag", "`--limit` is only a flag of `krowk sessions` and `krowk sessions import` — `krowk sessions show` reads one session")
+	}
+	if isRebuild && given["limit"] {
+		return api.Fail("bad_flag", "`--limit` is only a flag of `krowk sessions` and `krowk sessions import` — `krowk sessions rebuild` re-imports everything")
 	}
 	return nil
 }

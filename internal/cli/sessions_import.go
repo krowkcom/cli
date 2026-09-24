@@ -162,6 +162,10 @@ type importReport struct {
 	Store      string           `json:"store"`
 	Providers  []providerReport `json:"providers"`
 	DurationMS int64            `json:"duration_ms"`
+	// Removed is the files `sessions rebuild` deleted before importing —
+	// `[]` when there were none — and absent from a plain import's report,
+	// which is what the pointer tells apart.
+	Removed *[]string `json:"removed,omitempty"`
 }
 
 // sessionsImport reads every transcript the named sources can see and writes
@@ -257,10 +261,17 @@ func sessionsImport(w io.Writer, format output.Format, f flags, env runctx.Env) 
 		}
 		defer db.Close()
 	}
+	return importInto(w, format, f, env, db, storePath, sources, nil)
+}
 
+// importInto is the import itself, from an open store (nil on a dry run) to
+// the report and the exit it decides. Split out of sessionsImport so
+// `sessions rebuild` runs exactly this path over the fresh file rather than a
+// copy of it; removed is what rebuild deleted first, and nil for an import.
+func importInto(w io.Writer, format output.Format, f flags, env runctx.Env, db *sql.DB, storePath string, sources []importSource, removed *[]string) error {
 	ctx := context.Background()
 	started := time.Now()
-	report := importReport{DryRun: f.dryRun, Store: storePath}
+	report := importReport{DryRun: f.dryRun, Store: storePath, Removed: removed}
 	var broken []string
 	for _, s := range sources {
 		row := runImportSource(ctx, db, storePath, s, harnessenv.Env(env), f)
@@ -296,7 +307,7 @@ func sessionsImport(w io.Writer, format output.Format, f flags, env runctx.Env) 
 // "database is locked", which tells a caller nothing about what to do.
 func importLockFailure(path string, err error) error {
 	if errors.Is(err, errImportLockHeld) {
-		return api.Fail("import_locked", "another `krowk sessions import` is running on this store — "+
+		return api.Fail("import_locked", "another `krowk sessions import` or `rebuild` is running on this store — "+
 			"wait for it to finish, or check "+path+" if you think it is not")
 	}
 	return api.Fail("import_locked", "the import lock at "+path+" could not be taken: "+err.Error())
@@ -540,6 +551,11 @@ func emitImportReport(w io.Writer, format output.Format, f flags, report importR
 			Summary: importSummary(report),
 		}), f)
 	}
+	if report.Removed != nil {
+		for _, path := range *report.Removed {
+			fmt.Fprintf(w, "removed   %s\n", path)
+		}
+	}
 	for _, p := range report.Providers {
 		fmt.Fprintln(w, humanProviderLine(p, report.DryRun))
 		for _, e := range p.Errors {
@@ -585,8 +601,12 @@ func importSummary(report importReport) string {
 	// "read" rather than a bare count, because that is what these numbers
 	// are: a source resuming from a cursor reads only what was appended,
 	// so the total is this run's work and not the store's contents.
-	return fmt.Sprintf("%d files, %d sessions read, %d messages read, %d messages new",
+	summary := fmt.Sprintf("%d files, %d sessions read, %d messages read, %d messages new",
 		files, sessions, messages, inserted)
+	if report.Removed != nil {
+		summary = fmt.Sprintf("removed %d files, then %s", len(*report.Removed), summary)
+	}
+	return summary
 }
 
 // encodeImport renders JSON the way every other krowk answer is rendered:

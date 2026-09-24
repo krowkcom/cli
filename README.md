@@ -62,6 +62,7 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 | `krowk sessions` | List every agent thread on this machine, newest first (`--harness`, `--worktree`, `--limit N`, `--all`) — picks from a list on a terminal |
 | `krowk sessions show <id>` | Read one session back, with its turns, messages and parts (`--thinking`) |
 | `krowk sessions import --from all` | Read Claude, Cursor and opencode transcripts on this machine into the local store (`--dry-run`, `--limit N`) |
+| `krowk sessions rebuild` | Delete the local store and re-import every transcript — the fix when the store's schema version does not match (`--yes` off a terminal) |
 | `krowk pricing refresh` | Refresh the models.dev price cache (conditional GET, silent on failure) |
 | `krowk upgrade` | Upgrade krowk to the latest release |
 

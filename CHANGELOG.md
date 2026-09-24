@@ -11,6 +11,17 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- `krowk sessions rebuild`, the recovery the schema gate's hint has been
+  naming: it takes the import lock, deletes `krowk.db`, `krowk.db-wal` and
+  `krowk.db-shm` — nothing else in the directory — and re-imports every
+  source, as `sessions import --from all` would. It never opens the old file
+  first, so it works exactly where `Open` refuses a version it does not know.
+  It asks once, naming the path, only on a terminal with human output (stdin
+  and stdout both a TTY, not `--json`/`--quiet`, not CI); anywhere else it
+  refuses with `confirmation_required` and deletes nothing unless `--yes` is
+  passed. The question is asked before the lock is taken. A held
+  `import.lock` refuses it with exit 6, like a second import. The report is
+  import's per-provider envelope plus `removed`, the paths it deleted.
 - `krowk sessions import --from <claude|cursor|opencode|all>`, which reads the
   agent transcripts on this machine into the local store at
   `~/.local/share/krowk/krowk.db`. `--dry-run` discovers and counts without

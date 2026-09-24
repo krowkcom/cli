@@ -189,7 +189,7 @@ func TestHumanHelpIsStillHumanOnATerminal(t *testing.T) {
 		// The commands, under the headings that group them, rather than a flat
 		// column of usage lines.
 		"PUSH & PASTE",
-		"  push             Upload files, get a link for each",
+		"  push              Upload files, get a link for each",
 		"UPLOAD FLAGS",
 		"GLOBAL FLAGS",
 		"ENVIRONMENT",

@@ -85,6 +85,13 @@ var clientCodes = map[string]int{
 	"unsupported_os": exitUsage,
 	"import_failed":  exitUsage,
 
+	// `krowk sessions rebuild` deletes the store only on a clear yes. No
+	// --yes with nobody at a terminal to ask, and a person answering no (or
+	// Esc), are both the command not having been confirmed — nothing was
+	// touched, and the fix is the caller's — so both are exitUsage.
+	"confirmation_required": exitUsage,
+	"selection_cancelled":   exitUsage,
+
 	// A `sessions show` ref that matches nothing is the local analogue of
 	// the registry's 404: what was named is not there. exitNotFound so a
 	// script checks the id rather than its own command. An ambiguous ref

@@ -1,0 +1,8 @@
+{
+  "ok": false,
+  "error": {
+    "error": "no_file",
+    "fix": "pass at least one path: `krowk push screenshot.png`",
+    "retryable": false
+  }
+}

@@ -1,0 +1,26 @@
+# The Rust port of krowk, growing beside the Go build until it replaces it.
+# Go under cmd/ and internal/ is still what ships; tests/golden is what decides
+# when that stops being true — the same cases, run against both binaries.
+#
+# Crates split where a dependency has to stop, not by layer: the default
+# `krowk` build is the agent-container one and never links sqlite, so it stays
+# small and has nothing to fail on; `--features sessions` adds the store.
+[workspace]
+resolver = "3"
+members = ["crates/*", "tests/golden"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+license-file = "LICENSE"
+publish = false
+
+# Size is a requirement here, not a nicety: this binary is fetched into
+# someone else's container at the end of their task.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -7,5 +7,6 @@
 # `make dist` work on a clean checkout too. Neither is needed for `make check`.
 [tools]
 go = "1.26.5"
+rust = "1.97"
 goreleaser = "2"
 node = "22"

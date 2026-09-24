@@ -1,0 +1,17 @@
+[package]
+name = "krowk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# The device-side half: krowk.db, import, sync. Off by default so the agent
+# build links none of it.
+sessions = ["dep:krowk-store"]
+
+[dependencies]
+krowk-api = { path = "../krowk-api" }
+krowk-store = { path = "../krowk-store", optional = true }

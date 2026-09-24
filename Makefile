@@ -3,7 +3,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
 LDFLAGS := -s -w -X github.com/krowkcom/cli/internal/cli.Version=$(VERSION)
 
-.PHONY: build test lint vet fmt check windows-build mock install clean dist release-check
+.PHONY: build test lint vet fmt check windows-build mock install clean dist release-check rust golden golden-rust golden-update
 
 build: ## Build ./bin/krowk and ./bin/krowk-mcp
 	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/krowk ./cmd/krowk
@@ -51,3 +51,17 @@ dist: ## The whole release, locally: every binary, the archives, the npm package
 
 clean:
 	rm -rf bin dist
+
+# The Rust port (Cargo.toml). Go above is still what ships; these targets are
+# how the port proves it can take over.
+rust: ## Build the Rust krowk into target/release
+	cargo build --release -p krowk
+
+golden: build ## Hold the Go build to tests/golden/cases
+	cargo test -p krowk-golden
+
+golden-rust: rust ## Hold the Rust build to the same cases
+	KROWK_BIN=target/release/krowk cargo test -p krowk-golden
+
+golden-update: build ## Re-record the cases from the Go build
+	GOLDEN_UPDATE=1 cargo test -p krowk-golden

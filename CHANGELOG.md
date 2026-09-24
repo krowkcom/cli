@@ -9,521 +9,87 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-24
+
+krowk is written in Rust now, and it can read your agents' sessions back.
+
 ### Changed
 
-- **krowk is written in Rust now.** Same commands, flags, JSON, error codes
-  and exit codes: every golden case recorded from the Go build passed against
-  the Rust one before the Go build was removed, and a `krowk.db` either build
-  wrote opens in the other. What you notice is the size and the speed —
-  `krowk` is 4–5 MB depending on the platform (was ~14 MB) and `krowk-mcp`
-  about 2 MB (was ~7 MB), and on 707 real sessions `sessions import` takes
-  ~10 s where it took ~14 s and `sessions` lists in 12 ms where it took 23 ms. Linux builds are static
-  (musl), for containers with any libc or none.
-- The repository is **`krowkcom/krowk`** (was `krowkcom/cli`); the old URLs
-  redirect, so an installed binary keeps upgrading. From source it is
-  `cargo install --locked --git https://github.com/krowkcom/krowk --features sessions krowk`
+- **krowk is written in Rust.** The commands, flags, JSON, error codes and
+  exit codes are the ones 0.9.0 had: every recorded case of the Go build
+  passed against the Rust one before the Go build was removed. What you
+  notice is the size and the speed. `krowk` is 4–5 MB depending on the
+  platform (was ~14 MB) and `krowk-mcp` about 2 MB (was ~7 MB). On 707 real
+  sessions, `sessions import` takes ~10 s where the Go build took ~14 s, and
+  `sessions` lists in 12 ms where it took 23 ms.
+- Linux builds are static (musl), so they run in a container with any libc
+  or none. macOS and Windows builds are native, as before.
+- **The repository is `krowkcom/krowk`** (was `krowkcom/cli`). The old URLs
+  redirect, so an installed krowk keeps upgrading, `install.sh` keeps working
+  from its old address, and `uses: krowkcom/cli@v0` still resolves. Point new
+  workflows at `uses: krowkcom/krowk@v0`.
+- From source it is `cargo install --locked --git https://github.com/krowkcom/krowk --features sessions krowk`
   rather than `go install`.
-- Where the two builds differ, it is prose, not contract: human-readable
-  wording, key order and number spelling in `fix`/`detail` lines; `doctor`'s
-  `runtime` reads `rust <os>/<arch>`. A Claude prompt holding bytes that are
-  not UTF-8 now imports as text (with U+FFFD) rather than as an opaque block
-  with no title.
+- The GitHub Action installs the release of the repository it was taken
+  from, so a fork's action installs the fork's releases.
+- Where the two builds differ, it is wording rather than contract:
+  human-readable text, key order and escaping in JSON (`<` is written as
+  `<`, not `\u003c`), and `doctor`'s `runtime` reads `rust <os>/<arch>`.
 
 ### Added
 
-- `krowk sessions sync`, the incremental import meant to run on a schedule.
-  It takes the same `import.lock` as import and walks every source, but
-  leaves a ref unread when its stored cursor says nothing moved: a Claude or
-  Cursor transcript the same size as when its byte-offset cursor was taken,
-  or an opencode session with no message or part `time_updated` past its
-  watermark. A file that grew is read, and one that shrank is re-read from 0:
-  for Claude the store's foreign-id dedup keeps that from inserting
-  duplicates, while Cursor messages carry no foreign id, so a shrunk Cursor
-  transcript re-imports its messages, as import already does. A transcript
-  with no `import_state` row yet is new and always read. A file sync skips is
-  never re-read, so what a newer reader would extract from it lands only on
-  `import` or `rebuild`. There is
-  no `--since`: the cursor is the only watermark. It is also the one sessions
-  command that uses the network: it refreshes the models.dev price cache when
-  the last answer is over 24 hours old, within 3 seconds, and a failure is a
-  warning in `pricing` rather than a failed sync. `--no-network` skips it.
-  The report is import's per-provider envelope plus `files_unchanged` per
-  provider and `pricing.status` (`no_network`, `fresh`, `refreshed`,
-  `unchanged` or `failed`, with a `warning`). Claude and opencode still
-  re-read a changed transcript whole, because turns are cumulative.
-- `krowk sessions rebuild`, the recovery the schema gate's hint has been
-  naming: it takes the import lock, deletes `krowk.db`, `krowk.db-wal` and
-  `krowk.db-shm` — nothing else in the directory — and re-imports every
-  source, as `sessions import --from all` would. It never opens the old file
-  first, so it works exactly where `Open` refuses a version it does not know.
-  It asks once, naming the path, only on a terminal with human output (stdin
-  and stdout both a TTY, not `--json`/`--quiet`, not CI); anywhere else it
-  refuses with `confirmation_required` and deletes nothing unless `--yes` is
-  passed. The question is asked before the lock is taken. A held
-  `import.lock` refuses it with exit 6, like a second import. The report is
-  import's per-provider envelope plus `removed`, the paths it deleted.
-- `krowk sessions import --from <claude|cursor|opencode|all>`, which reads the
-  agent transcripts on this machine into the local store at
-  `~/.local/share/krowk/krowk.db`. `--dry-run` discovers and counts without
-  writing a row, and `--limit N` caps how many transcripts each source reads
-  (0, the default, is all). Each ref's watermark is written to `import_state`
-  with the rows it describes, so a second run inserts nothing: re-running the
-  command is the intended way to keep the store current, not a thing to be
-  careful about. One import at a time per store, enforced by an exclusive
-  `flock` on `import.lock` beside the database, taken before the store is
-  opened — a second one fails at once, naming that file, with exit 6, rather
-  than meeting the first inside SQLite and surfacing `database is locked`,
-  which tells a caller nothing. A collision with something that is not a
-  krowk import — anything else writing the database — is re-worded the
-  same way, naming the store and saying it is busy — and only for
-  failures that came out of krowk's own store, since opencode reads a SQLite
-  database of its own and its lock message is about that file. A `--dry-run` takes no lock
-  and does not open the store at all: discovery only needs the environment,
-  so counting what would be imported no longer creates `krowk.db`. A single
-  transcript that will not read is counted in `files_failed` and listed in
-  `errors` while the rest of the import continues and the exit stays 0; a
-  source whose *discovery* fails, or which discovered transcripts and lost
-  every one of them, is a broken import rather than a lossy one, so the other
-  sources still run and the command exits 1 at the end. `--json` answers with
-  a row per source — files, `sessions_seen`, `messages_seen`, `parts_seen`,
-  the matching `*_inserted` counts, `skipped_by_type`, `skipped_lines`,
-  `errors_truncated` and `duration_ms` — and the human output is one line
-  each. The `*_seen` numbers are what that run read, not what the store
-  holds, and they are not comparable across sources: claude and opencode
-  re-read a whole transcript every run while cursor resumes from its byte
-  offset and reads only what was appended. `*_inserted` is the number that
-  means the same thing everywhere. `errors` stays capped at ten reasons,
-  with `errors_truncated` counting the ones left out, each reason bounded to
-  512 bytes; `skipped_by_type` names at most 32 raw types and sums the rest —
-  along with any name over 64 bytes, which is summed rather than cut so two
-  long names cannot collide into one — under `krowk:other`, a bucket named
-  with a colon because no agent's raw type carries one and which sits beside
-  the 32 rather than being one of them. The names are chosen in sorted order,
-  so two runs over the same machine name the same types. `--from` and
-  `--dry-run` are refused on every other command by name, rather than being
-  accepted and ignored by a shared flag set. All three are strings a transcript
-  supplied, and a report is not a place to pass those through at whatever
-  length they arrived. The lock file itself is opened `O_NOFOLLOW` and
-  refused if it is not a regular file, so a symlink or a fifo at that path
-  is not something krowk locks and runs on. On
-  Windows it exits non-zero with `sessions is not supported on Windows in v1`
-  before it resolves a store path, so nothing is created on a machine the
-  command does not run on; with no home in the environment it fails closed on
-  `store.Open`'s own hint rather than writing a database into the working
-   directory.
-- `krowk sessions` and `krowk sessions show <id>`, which read the imported
-  threads back. Bare `krowk sessions` lists every thread newest-first from
-  session columns only — title, harness, model, turn count, priced cost and
-  recency — with `--harness`, `--worktree`, `--limit N` (default 50) and
-  `--all`, and never touches message or part blobs, so the default page
-  stays instant on a 10k-session store. On a terminal it offers a picker
-  that prints `krowk sessions show <id>`; piped, `--json`, `--quiet` or in
-  CI the table (or envelope) is the answer and no picker appears. `show`
-  takes a full id, an unambiguous id prefix of at least 8 chars, or a
-  foreign session id via the binding, then renders turns, messages and
-  parts in seq order with tool results labelled by their twin call's name
-  (`unknown tool` when the call is missing) and thinking collapsed to one
-  line unless `--thinking`. Costs are priced at display time from the
-  embedded models.dev snapshot and footnote its date; an unpriced pair shows `—`,
-  never 0. An untitled thread lists by the first 80 chars of its first
-  user text, stored at import; threads imported before that fallback stay
-  untitled until a re-import carries user text. The listing indexes apply
-  to fresh stores only: a `krowk.db` created before an index landed is
-  still accepted and answers correctly, just on a slower plan, until
-  `krowk sessions rebuild` recreates it — there is no backfill in v1.
-- The Cursor importer, `internal/importer/cursor`, which reads Cursor's
-  agent transcripts out of `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`
-  and produces the canonical `store.Thread`. The thing it is careful about
-  is that Cursor lines carry `{role, message.content[]}` only — no message
-  id, no timestamp, no session id, no `cwd`, no model — so the hard cases are
-   position-keyed dedup and a worktree with no `cwd`. Messages keep
-   `foreign_id` NULL so the store appends them unconditionally — the
-   byte-offset `JSONLCursor`, which `Read` honors (delta reads return only
-   new lines) and the caller must hold and never re-send, is the only dedup —
-     unlike the Claude and opencode readers that re-read whole sessions; a
-  re-import with the stored cursor inserts nothing, and appending one line
-  inserts exactly one message and extends the cumulative turn list by one
-  (turns are always cumulative over the whole file, messages stay delta). The worktree decodes the slug
-  (`home-elvinas-Repositories-krowk-cli` → `/home/elvinas/Repositories/krowk-cli`)
-  only when that directory exists on disk, walking up for `.git` as the
-  Claude reader does; otherwise the session files under `cursor:<slug>` with
-  `vcs` of `none` and a counted `worktree-fallback`. `repo.json` beside
-  `agent-transcripts` contributes one `cursor_repo` session event carrying
-  the repo id, never a path. `text` blocks land as `text`, `tool_use` as
-   `tool_call` (with `cursor:<line>` as the call id when the block names
-   none, which is every block observed — a second id-less `tool_use` on the
-   same line takes `cursor:<line>:<k>`), `tool_result` as `tool_result`, and
-  `turn_ended` lines are classified furniture; embedded `<timestamp>` tags
-  stay in the user text, unparsed. The binding stays on `cursor` with an
-  empty resume command (unknown in v1). The fixture is redacted, with a
-  golden regenerated by `-update`.
-- The opencode importer, `internal/importer/opencode`, which reads opencode's
-  sessions out of the single SQLite database at
-  `~/.local/share/opencode/opencode.db` and produces the canonical
-  `store.Thread`. The thing it is careful about is the database staying
-  read-only: opencode holds it open in WAL mode while it runs, so every open
-  is one connection through `file:<path>?mode=ro` with no pragma ever issued,
-  and a test hashes the file before and after a `Discover` plus a `Read` and
-  fails on any change or any `-wal`/`-shm` sidecar. `Discover` returns one ref
-  per session row (sorted, keyed `opencode:<session_id>`) so each session
-  carries its own `SQLiteCursor` watermark; an absent database is an empty
-  list, not an error. `Read` re-reads the whole session every time and says
-  so, for the same reason the Claude reader does — turns are cumulative
-  positional lists costed over a span, and the store's `foreign_id` dedup
-  makes the re-read free — with the cursor as the largest message
-  `time_updated` seen. A finished tool row becomes the canonical twin on the
-  same message (`tool_call` plus `tool_result` sharing the call id, built by
-  the contract's constructors), while a tool still running stays a lone call;
-  `reasoning` lands as `thinking`, `step-start`/`step-finish` as `step`, and
-  anything unrecognised as counted `unknown` rather than dropped. Turn costs
-  sum the message token columns with dollars rounded once per turn into
-  micros, a child session binds its `parent_id` as `Thread.Parent`, and the
-  worktree comes from the project row's `worktree`/`vcs` rather than being
-  guessed. The fixture is checked in as SQL that builds a temp database,
-  never as a binary `.db`.
-- The Claude importer, `internal/importer/claude`, which reads Claude
-  Code's JSONL transcripts out of `~/.claude/projects` and produces the
-  canonical `store.Thread`. The thing it is careful about is not losing
-  anything: on a real machine a third of the lines are `attachment` and
-  another slice is `mode`, `last-prompt`, `queue-operation`, `atis-latch`,
-  `pr-link`, `permission-mode`, `cost-state`, `file-history-snapshot`,
-  `file-history-delta`, `ai-title`, `frame-link`, `continued-in` and
-  `agent-name`, so a reader that matched `user` and `assistant` would drop
-  most of the file and report a clean import. Every line lands in exactly
-  one of four places — a message, a session event, `Result.Classified` or
-  `Result.Skipped` — including a line type this build has never met, which
-  is classified under its own name rather than ignored, and a test adds the
-  four up against the fixture's line count. An `attachment` becomes a
-  `session_event` only when it carries a hook event; the rest are context
-  Claude injected, and importing them as user messages would put words in a
-  person's mouth and double the turn count. The worktree comes from the
-  line's `cwd` and never from the directory slug, because
-  `-home-elvinas--buzz` is not invertible: the checkout is the git toplevel
-  found by walking up from `cwd`, and a session run outside version control
-  gets its own directory with `vcs` of `none`. A subagent transcript under
-  `<session>/subagents/agent-*.jsonl` becomes a session of its own, bound
-  on its agent id and pointed at the conversation that dispatched it, and
-  `Discover` returns a parent immediately before its children so a caller
-  ingesting in order never leaves the link unset. `session.provider` is
-  `anthropic` and `session.harness` is `claude`, while the binding stays on
-  `claude` because that half of the key is already persisted. `Read` reads
-  from the top of the file every time and says so: turns are cumulative
-  positional lists whose costs are summed over a whole span, so a read
-  resumed from the middle could neither number them nor cost them, and the
-  store's `foreign_id` dedup makes the re-read free — and the store now
-  refreshes the last stored turn, so a session imported while it was still
-  being used converges on its real costs rather than keeping the partial
-  ones. A message line missing its `uuid` gets a synthesised foreign id so
-  it dedups like any other, and a `user` line whose content is null
-  produces no parts and so opens no turn. A user-role line that no person
-  typed does not open one either: an agent reporting back to the
-  conversation that dispatched it arrives with the user role and real prose
-  in it, so a line whose `origin.kind` is anything but `human`, whose
-  `promptSource` is `system`, or whose text opens with
-  `<local-command-stdout>`, `<bash-stdout>`, `<task-notification>` or
-  `<system-reminder>` is treated as meta — which is worth a fifth of the
-  turn count on a machine that dispatches subagents, and the same factor on
-  every per-turn cost. `promptSource: "sdk"` and `<command-name>` are
-  deliberately not on that list: both are a person, reached through
-  something other than the terminal. Turns carry no `turn_id` link
-  back to their messages, because the contract carries none: a turn is the
-  costing unit and nothing else yet.
-- `store.Thread.Parent`, a binding naming the session a session was spawned
-  from. On ingest it is resolved through `session_binding` and written to
-  `session.parent_id`, but only when the parent is already in the store and
-  only when the column is still NULL — a child imported before its parent
-  keeps a NULL and a later ingest of the same child fills it in, and a
-  parent already recorded is never silently repointed.
-
-- The importer contract, so three importers cannot become three exporters:
-  `internal/importer` fixes the vocabulary the Claude, cursor and opencode
-  readers all have to speak. A `Source` is `Name`, `Discover` and `Read`,
-  producing a `store.Thread` plus the watermark to resume from; the
-  watermark is a byte offset into a named file (`JSONLCursor{offset, size}`)
-  or a row update time (`SQLiteCursor{time_updated}`), serialised as JSON
-  into `import_state.cursor` under `"<provider>:<ref>"`, never a
-  modification time — a transcript that got shorter is a rescan, not an
-  append, and the watermark says plainly that it assumes an append-only
-  file and leans on the store's `foreign_id` dedup for the rest. The
-  `part.type` set is closed here at `text`, `thinking`,
-  `tool_call`, `tool_result`, `image`, `file`, `patch`, `step` and
-  `unknown`, with `tool_call` and `tool_result` data shapes fixed and paired
-  by `tool_call_id`, and a block this build does not recognise landing as
-  `unknown` carrying its raw payload and counted rather than dropped.
-  Reading a transcript goes through `OpenHome`, which resolves under the
-  home directory, refuses a path that leaves it, refuses a symlink whose
-  target is outside it — including one whose target does not exist yet,
-  which would otherwise be approved on the strength of a file nobody has
-  created — and refuses a file over 64 MiB or anything that is not a
-  regular file. That is the same "home is trusted, a checkout is not" rule
-  `internal/harness` applies to configs, and "a checkout" means outside
-  home: a symlink into a repository that itself lives under home is
-  followed, because home is trusted in full and a path is untrusted for
-  where it is rather than for what happens to be checked out there.
-  `ReadJSONL` resumes from a cursor, restarts from the top when the file
-  has been rewritten shorter, rewinds to the last complete line when an
-  offset landed mid-line, and leaves a half-flushed trailing line for the
-  next read. A line it cannot use — unparseable, past the 16 MiB line cap,
-  or rejected by the source reading it — is counted in
-  `Result.SkippedCount` and the read carries on, because stopping would pin
-  the cursor to that line and one bad line would cost the rest of the file
-  on every attempt from then on. The first hundred of those lines are also
-  described individually in `Result.Skipped`, with the line number and byte
-  offset; the count stays exact past that, so a file that is nothing but
-  junk is reported as a number rather than accumulating a record per line
-  until the importer runs out of memory. Only three things stop a read: an I/O
-  error, an unterminated final line that is already past the line cap, and
-  a source explicitly returning `ErrAbortFile` for a failure that was not
-  the line's fault. The turn rule is one shared function: a turn opens at a
-  user message that a person actually sent, so hook output, attachments and
-  `tool_result`-only user lines no longer report ten turns where somebody
-  asked one question.
-  `Discover` returns `ErrUnsupportedOS` on Windows rather than reporting an
-  empty machine, and a `Source` handed a cursor of the wrong kind returns
-  `ErrCursorType` rather than silently rescanning from the top. Nothing is
-  user-visible yet; no command imports anything.
-
-- The canonical thread model plus the store `Writer`: `internal/store` now
-  defines the one shape every importer produces — a `Thread` carrying its
-  `Worktree`, `Session` display fields, `Binding` identity and the
-  transcript in order (`Turn`, `Message` with `Part`s, `Event`) — with
-  `provider`/`harness`/`type` as open strings and `role` as the closed
-  `user|assistant|system|tool|error` enum the schema CHECK pins.
-  `Writer.Ingest` writes a thread idempotently: the worktree is upserted by
-  path, the session is found by `(provider, foreign_session_id)` (two
-  threads naming one key converge on one session and one binding, even in a
-  lost create race), messages carrying a known `foreign_id` are skipped
-  with their parts and the rest appended with `seq` after the current max,
-  while turns and events are cumulative positional lists (position `i` is
-  `seq` `i`, so a re-sent prefix is skipped — except for the last stored
-  turn, whose status and costs are refreshed from the re-sent list,
-  because an importer that read a live transcript caught that turn in
-  flight and the fraction of its cost it saw would otherwise stand
-  forever; every earlier turn is settled, since a turn closes only when
-  the next one opens), and a session found by its binding has its
-  `worktree_id` re-pointed as well as its display fields refreshed, so a
-  session first filed under a placeholder directory moves once a later
-  import works out where it really ran. Message batches commit 500
-  per transaction, so a concurrent push waits on `busy_timeout` instead of
-  meeting a lock held for a whole import. Every minted id passes
-  `ValidateID`, every `time_*` comes from the injected clock, and the
-  `Writer` never reads the environment. Nothing is user-visible yet; no
-  command writes these tables.
-
-- Model prices from models.dev: a new `internal/pricing` package answers
-  per-(provider, model) USD-per-1M-token rates from an embedded snapshot
-  (796 bytes, regenerated by `go generate ./internal/pricing` from the
-  committed fixture, never the live network) with a
-  `$XDG_CACHE_HOME/krowk/models.json` cache winning when present and
-  parseable. `krowk pricing refresh` refreshes that cache with a conditional
-  GET (5 s timeout, silent and non-fatal on failure); the lookup itself never
-  touches the network, keys (provider, model) so provider-specific prices
-  stay apart, and derives display-time costs with reasoning tokens falling
-  back to the output rate when a model publishes none. Nothing prices
-  anything yet — sessions list/show will footnote the snapshot date.
-
-- The session store now carries a 10k-message cold-open budget: `internal/store`
-  builds ten thousand messages (each with a blob part) in a temp database and
-  fails the gate if a cold `Open` on that fixture exceeds 50ms (500ms under
-  `-short`, where loaded CI runners flake on tight wall-clock asserts). The
-  same test pins the listing-shape probe — `SELECT COUNT(*) FROM message` —
-  and fails if it ever names `raw_json` or touches the `part` table, so later
-  listings cannot drag blobs by accident. Fixture setup sits outside the
-  measured window. Nothing is user-visible yet; no command reads these rows.
-
-- `krowk doctor` now reports the local session store's health as a `store`
-  StatusCheck, sibling to the harness checks: the `krowk.db` path, the schema
-  version and the steady-state pragmas (WAL, NORMAL, foreign keys). It passes
-  on a fresh open and fails with an `internal/store` hint — never a reinstall
-  — when HOME is missing, the file is unreadable, or the migration is stale.
-
-- The v1 session-store schema: `001_init.sql` now defines the eight tables
-  the plan promised — `worktree`, `session`, `session_binding`,
-  `session_event`, `turn`, `message`, `part` and `import_state` — instead of
-  a comment. Every `id` is a `TEXT PRIMARY KEY` holding a uuidv7 minted by
-  `internal/store` (now spelled `store.ParseID` at the boundary, as an alias
-  of `ValidateID`, so the two can never disagree). `seq` is the only
-  ordering key; dedup is a unique index, never a derived id: a second import
-  of the same Claude session converges on one row through
-  `UNIQUE(provider, foreign_session_id)`, and a re-imported message through
-  the partial `UNIQUE(session_id, foreign_id) WHERE foreign_id IS NOT NULL`,
-  which lets NULLs repeat. Foreign keys run `ON DELETE CASCADE` from
-  `session` down, so deleting a session takes its bindings, events, turns,
-  messages and parts with it but never its worktree. Every `time_*` column
-  is `INTEGER` milliseconds; `role` is a closed `CHECK`
-  (`user|assistant|system|tool|error`) while `provider`, `harness` and `type`
-  stay open strings. The gate tests name every table and every unique index,
-  assert every own `*_id` column carries a cascading FK with a leading index
-  (`foreign_session_id`, `foreign_id` and `tool_call_id` hold other systems'
-  ids and must carry none), and pin the deliberate absences: no
-  `turn_attempt`, `attachment`, `model_cache`, `convention` or `migrations`
-  table, and no unique gate on one assistant message per turn. Nothing is
-  user-visible yet; no command writes these tables.
-
-- A new `internal/store` package begins the local session store — the
-  `krowk.db` SQLite file that will hold the sessions, messages and parts krowk
-  syncs. This change ships only the two decisions every row in it depends on:
-  how a row is named, and how a time is written. Nothing is user-visible yet,
-  and no command touches it.
-
-  Ids are UUIDv7 in canonical lowercase hyphenated form, with no type prefix.
-  The registry's primary keys are already uuidv7, so an id of the same shape
-  lands in a native `uuid` column on sync instead of in text, and the two
-  halves index and compare the same way. The prefix was dropped on purpose:
-  the `foreign_id` columns beside ours hold ids that already carry one —
-  opencode mints `ses_`/`msg_`/`prt_`, Anthropic mints `msg_…` — and a krowk
-  prefix sitting next to those would read as though it meant the same kind of
-  thing. They are minted from the standard library, no dependency added, with
-  a 12-bit per-millisecond counter in `rand_a` (RFC 9562 §6.2) so that ids
-  issued inside one millisecond by one process still sort in the order they
-  were issued — across processes the order is millisecond-granular — and a
-  clock that steps backwards cannot hand out an id that sorts before one
-  already given away. That keeps a recent-first listing a plain `ORDER BY` on
-  the primary key; the order of messages inside a session will be a `seq`
-  column, not the id. The timestamp inside an id is monotonic rather than a
-  clock reading — when a millisecond's counter fills, or the clock steps back,
-  it advances past the last value used, so it can run ahead of the real time.
-  It orders rows; the time columns record when things happened. `ValidateID`
-  refuses at the store boundary anything this package would not have minted, so
-  a v4 uuid from a Claude transcript, an opencode `ses_…` or a registry slug
-  cannot enter as one of our own ids.
-
-  Every time column in the store is milliseconds since the Unix epoch, UTC, as
-  an int64 — not seconds, not nanoseconds, not a string — and the clock is
-  injected, so a test freezes the id timestamps and the time columns together.
-
-- The session store now has its SQLite driver: `github.com/ncruces/go-sqlite3`,
-  the cgo-free build of unmodified SQLite (Wasm through wazero), wired in as
-  the `database/sql` driver `internal/store` alone imports. It was picked
-  because the release binary must stay static with no toolchain, which rules
-  out cgo; of the pure-Go drivers this is the lighter one. No optional
-  extensions are enabled until a product asks for one. Nothing is user-visible
-  yet, and no command opens the database; that arrives with `store.Open`.
-
-- `store.Open` opens the session store: one global file at
-  `$XDG_DATA_HOME/krowk/krowk.db` (a relative `XDG_DATA_HOME` is ignored, as
-  the basedir spec says), otherwise `~/.local/share/krowk/krowk.db`. Global on
-  purpose — a cwd-based path would split the store per repo. The environment
-  is injected, and a missing or relative home means Open fails with a hint
-  instead of inventing a path at `/` or the working directory. The parent
-  directory is created when missing and the database file is created `0600`
-  before SQLite touches it — a file or sidecar (`-wal`, `-shm`) an earlier
-  run left world-readable is tightened back to `0600` on open, so the store
-  itself stays private to the user. (Side files SQLite creates after `Open`
-  returns follow the process umask; the write path owns those.) Every connection the pool
-  opens carries the same pragmas via the DSN: `journal_mode=WAL` so readers
-  never block the writer, `synchronous=NORMAL` (safe under WAL — a power cut
-  can lose the last moments, never corrupt the file), `foreign_keys=1` because
-  SQLite ships with them off and every schema here assumes them on, and a 10s
-  `busy_timeout` so a briefly locked database waits instead of failing.
-  Nothing is user-visible yet; no command opens the database.
-
-- `store.Open` now versions the session store: the first open of a fresh
-  `krowk.db` applies `001_init.sql` in one transaction and stamps
-  `PRAGMA user_version = 1`; a reopen runs no DDL. A file at any other
-  version, at version 0 with tables `Open` never wrote, or at version 1
-  with a table missing — or a file that is not a database at all — fails
-  to open with a hint to run `krowk sessions rebuild` (delete the file and
-  re-import): there is no silent repair and no in-place migration path in
-  v1, because every row is still re-derivable from transcripts on disk. A
-  refused file is left byte-identical, mode bits included: the version
-  check runs read-only before the read-write open, the opened file is
-  pinned by device-and-inode identity before it is tightened, and the
-  read-write handle itself carries no persistent pragma until the re-check
-  accepts. The steady handle re-verifies check-only and never
-  re-initialises a regressed file.
-  Two first-launch opens racing each other converge instead of erroring —
-  the loser adopts the winner's schema. The store directory is tightened
-  to `0700` like the database file. There is still no `migrations` table;
-  it arrives with the first state the source files do not hold. Nothing is
-  user-visible yet; no command opens the database.
-
-- A harness registry (`internal/harness`) that detects which coding agents are
-  installed and asks each one whether krowk is actually wired into it. Claude
-  Code is the first: detected by a `~/.claude/` directory or a `claude` binary,
-  then checked for the krowk MCP server in every scope it can be registered in
-  — user or local scope in `~/.claude.json`, project scope in a checked-in
-  `.mcp.json` — and for the krowk skill. `CLAUDE_CONFIG_DIR` is honoured, as
-  the installer already does. Nothing surfaces this yet; `krowk doctor` and
-  `krowk setup` will, and they will agree because they will be reading the
-  same checks.
-
-- The installer no longer overwrites a Claude Code skill directory it did not
-  write. `scripts/install.sh` now leaves two files beside the skill it
-  installs — `.managed-by-krowk-cli`, which says krowk manages the directory,
-  and `.installed-version`, which says with what — and writes only where that
-  marker says it wrote before: it creates a directory that is not there,
-  adopts an empty one, refreshes one carrying a marker it wrote, and otherwise
-  says why and leaves the directory exactly as it found it. A directory that
-  cannot be listed is left alone too, as is one belonging to another user (on
-  Unix, where there is a uid to compare).
-  If you have your own `~/.claude/skills/krowk/`, move it aside and re-run to
-  have krowk manage it.
-
-  Upgrading from an earlier krowk needs nothing: a skill directory holding
-  nothing but the `SKILL.md` a previous installer wrote is adopted and marked
-  on the next run, since that is the only file that installer wrote and the
-  one it overwrote anyway. Nothing is written through a symlink any more, in
-  either the skill directory's own name or a managed file's — a symlinked
-  `~/.claude` or `~/.claude/skills` still resolves, as it should — and a file
-  is never truncated in
-  place: both halves of krowk write every managed file to a sibling temporary
-  file and rename it into place, so a reader sees the old file or the whole
-  new one, and a second hard link to somebody's file keeps its contents.
-
-  `internal/harness` carries the same gate for Go — `ClaimDir`,
-  `WriteManagedFile`, `StampVersion`, `InstalledVersion`, `DirOwned`,
-  `IsManagedCopy` — where
-  every read is bounded and, on Unix, goes through an `O_NOFOLLOW`,
-  non-blocking open, so a symlink, a FIFO or an oversized file in a managed
-  name is refused rather than followed, waited on or half-read. Windows is
-  weaker and says so in the code: the marker is read by checking the path and
-  then opening it, with a small window in between, and there is no ownership
-  check at all — closing either needs the Win32 API. No
-  command calls any of it yet: it is what `krowk setup` will go through, so
-  that one rule decides every write krowk makes into your home directory.
-  `krowk doctor` will report a skill it did not write as installed either way,
-  and say whether the next install will adopt it or leave it alone for good.
+- **`krowk sessions`**: your agents' transcripts, on this machine, in one
+  local store at `~/.local/share/krowk/krowk.db`. The files are private to
+  you (0700/0600), and nothing leaves the machine.
+  - `krowk sessions import --from <claude|cursor|opencode|all>` reads Claude
+    Code, Cursor and opencode transcripts into the store. Running it again
+    inserts nothing new, so re-running is how you keep the store current.
+    `--dry-run` counts without writing, and `--limit N` caps how many
+    transcripts each source reads.
+  - `krowk sessions sync` is the version for a schedule. It reads only the
+    transcripts that changed since the last run, and refreshes the model
+    prices once a day (`--no-network` skips that).
+  - `krowk sessions` lists every session newest-first, with title, agent,
+    model, turns, cost and recency; `--harness`, `--worktree`, `--limit`
+    and `--all` narrow it. On a terminal it opens a picker.
+  - `krowk sessions show <id>` reads one session back — turns, messages,
+    tool calls with their results — from a full id, an 8-character prefix,
+    or the agent's own session id. `--thinking` shows thinking in full.
+  - `krowk sessions rebuild` deletes the store and re-imports everything:
+    the fix when a store is from a version krowk no longer reads. It asks
+    first on a terminal, and needs `--yes` anywhere else.
+  - One import runs at a time per store; a second one says so at once
+    (exit 6) rather than waiting or colliding.
+  - Costs are priced from an embedded models.dev snapshot, and
+    `krowk pricing refresh` fetches the current prices. A model krowk has
+    no price for shows `—`, never 0.
+  - `sessions` is not supported on Windows yet, and says so.
+- `krowk doctor` reports the session store's health: its path, schema
+  version and journal mode, with the command to run when it is not
+  healthy.
+- The installer no longer overwrites a Claude Code skill directory it did
+  not write. It marks the directory it installs (`.managed-by-krowk-cli`,
+  `.installed-version`) and refreshes only a directory carrying its mark,
+  or an empty one; anything else it leaves alone and says why. A skill
+  directory from an earlier installer, holding only its `SKILL.md`, is
+  adopted on the next run. If you keep your own `~/.claude/skills/krowk/`,
+  move it aside and re-run to have krowk manage it.
 
 ### Fixed
 
-- A git remote with credentials in it — `https://x-access-token:<token>@github.com/...`,
-  which is how CI checkouts clone — no longer reaches the run metadata. Its URL
-  went into `vcs.repository.url.full` verbatim, and run metadata is public on
-  every card; the user and password are now dropped. A token already pushed this
+- **A git remote with credentials in it no longer reaches the run
+  metadata.** A CI checkout clones from
+  `https://x-access-token:<token>@github.com/...`, and that URL went into
+  `vcs.repository.url.full` verbatim — and run metadata is public on every
+  card. The user and password are now dropped. A token already pushed this
   way is on the cards it was pushed with: rotate it.
 - The content type a push declares no longer depends on the machine. It came
-  from the host's `mime.types`, so the same file declared from macOS and from
-  Linux could differ. krowk now carries its own table of the extensions agents
-  produce — images, video, audio, fonts, text and source files, documents,
-  archives — each answering what macOS answered, except that `.md` and `.markdown` are `text/markdown` (they
-  were `application/octet-stream` on macOS) and a `.webm` without a video
-  track is `audio/webm` (it was `video/webm` on macOS). An extension outside
-  the table is `application/octet-stream` on every machine: on Linux that
-  includes types the distribution knew, like `.diff`, `.yaml` and `.py`, and on
-  macOS the rarer ones Apache's list names, like `.kml` or `.dmg`.
-- `krowk sessions rebuild` with nobody at a terminal suggested running
-  `krowk sessions rebuild` — the command that had just refused. It now
-  suggests `krowk sessions rebuild --yes`.
-- The opencode importer, still unreleased, holds its review findings: the
-  database path rides percent-encoded in the read-only DSN, so `?#&` in a
-  directory can no longer escape the path and override `mode=ro`; `Read`
-  refuses a ref naming anything but the known database instead of opening
-  the hinted path. The watermark is the largest timestamp successfully
-  imported over message and part rows alike, and skipped rows no longer move
-  it, so a failed row is retried rather than forgotten. Oversized-row prefix
-  scans are anchored to the top level of the blob (tokens scoped to the
-  `tokens` object), so a nested field name in prose cannot flip a role or
-  inflate a turn; cap checks count bytes, not characters. A turn whose
-  messages carried no cost keeps a NULL dollar cost instead of a guessed
-  zero, a child session's parent binding carries its resume command, and
-  worktree `vcs` passes through only `git` (anything else is `none`) with
-  the path cleaned. A tool status outside `completed`/`error` still twins
-  nothing, but is now classified under its own name instead of vanishing
-  silently, as is a message role outside `user`/`assistant`/`system`. A
-  database that vanishes between listing and reading is an empty machine,
-  not an error, and a permission refusal reports the same empty answer
-  whether it lands on the stat or the query.
+  from the host's `mime.types`, so the same file could be declared
+  differently from macOS and from Linux. krowk now carries its own table of
+  the extensions agents produce. `.md` and `.markdown` are `text/markdown`,
+  and a `.webm` without a video track is `audio/webm`; an extension outside
+  the table is `application/octet-stream` everywhere.
+- The installer's log names the repository it downloads from.
 
 ## [0.9.0] - 2026-09-06
 
@@ -885,7 +451,8 @@ was released on GitHub but never published to npm.
   credentials travel, and a refusal is written to stderr and into the JSON
   envelope.
 
-[Unreleased]: https://github.com/krowkcom/krowk/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/krowkcom/krowk/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/krowkcom/krowk/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/krowkcom/cli/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/krowkcom/cli/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/krowkcom/cli/compare/v0.8.0...v0.8.1

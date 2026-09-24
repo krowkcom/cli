@@ -497,6 +497,8 @@ fn run_on_tty(bin: &Path, args: &[String], work: &Path, env: &[(String, String)]
     use std::os::fd::FromRawFd;
     let (mut master, mut slave) = (0, 0);
     let mut size = libc::winsize { ws_row: 40, ws_col: 120, ws_xpixel: 0, ws_ypixel: 0 };
+    // macOS declares the winsize mutable and Linux const; `&mut` fits both.
+    #[allow(clippy::unnecessary_mut_passed)]
     let ok = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) };
     assert_eq!(ok, 0, "openpty failed");
     let (master, slave) = unsafe { (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave)) };

@@ -31,3 +31,7 @@ flate2 = "1"
 tar = { version = "0.4", default-features = false }
 sha2 = "0.11"
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+
+[target.'cfg(unix)'.dependencies]
+# Open flags and errnos per target: their values differ by architecture.
+libc = "0.2"

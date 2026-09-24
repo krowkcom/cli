@@ -902,7 +902,7 @@ fn lock_file(path: &Path) -> Result<std::fs::File, Option<String>> {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(if cfg!(target_os = "macos") { 0x0100 } else { 0o400000 })
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|e| Some(format!("open {}: {e}", path.display())))?;
     let meta = f.metadata().map_err(|e| Some(format!("stat {}: {e}", path.display())))?;

@@ -305,6 +305,9 @@ fn find_or_create_session(
     b: &Binding,
     from_fallback: bool,
 ) -> Result<(String, bool), StoreError> {
+    // Trimmed after the fallback is cut, as Go does: a prompt whose 80th
+    // character is a space stores 79.
+    let s = &Session { title: s.title.trim().to_string(), ..s.clone() };
     let found: Option<String> = tx
         .query_row(
             "SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?",

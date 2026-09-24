@@ -192,7 +192,7 @@ impl<'a> Builder<'a> {
     /// else is skipped.
     fn line(&mut self, line_no: usize, raw: &[u8]) -> Result<(), LineError> {
         let bad = |why: &str| LineError::Skip(format!("cursor: unreadable line: {why}"));
-        let v: Value = serde_json::from_slice(raw).map_err(|e| bad(&e.to_string()))?;
+        let v: Value = crate::decode_line(raw).map_err(|e| bad(&e.to_string()))?;
         // Go decodes a literal null into the zero struct.
         let empty = Map::new();
         let obj = match &v {

@@ -366,8 +366,9 @@ struct Builder {
 impl Builder {
     /// A bad line is a skip; nothing here aborts the file.
     fn line(&mut self, line_no: usize, raw: &[u8]) -> Result<(), LineError> {
-        // Lossy, as Go decodes invalid UTF-8; raw_json is then withheld.
-        let v: Value = serde_json::from_str(&String::from_utf8_lossy(raw))
+        // As Go decodes it (invalid UTF-8, lone surrogates); raw_json is
+        // withheld for a line that is not valid UTF-8.
+        let v: Value = crate::decode_line(raw)
             .map_err(|e| LineError::Skip(format!("claude: unreadable line: {e}")))?;
         let l: Line = serde_json::from_value(v)
             .map_err(|e| LineError::Skip(format!("claude: unreadable line: {e}")))?;

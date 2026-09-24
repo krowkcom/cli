@@ -406,7 +406,7 @@ impl<'a> Builder<'a> {
                 db.query_row("SELECT data FROM message WHERE id = ?1", [&m.id], |row| bytes(row, 0)).map_err(|e| e.to_string())?;
             let text = String::from_utf8_lossy(&data);
             let bad = |e: String| format!("opencode: message {}: {e}", m.id);
-            let v: Value = serde_json::from_str(&text).map_err(|e| bad(e.to_string()))?;
+            let v: Value = crate::decode_line(text.as_bytes()).map_err(|e| bad(e.to_string()))?;
             object(&v).map_err(bad)?;
             let tokens = v.get("tokens");
             let cost = match v.get("cost") {
@@ -585,7 +585,7 @@ impl<'a> Builder<'a> {
     /// One part row onto one or two canonical parts, the raw payload kept.
     fn part(&mut self, id: &str, data: &[u8]) -> Vec<Part> {
         let text = String::from_utf8_lossy(data);
-        let value = serde_json::from_str::<Value>(&text).ok();
+        let value = crate::decode_line(text.as_bytes()).ok();
         // A payload that is not UTF-8 JSON is kept as a string rather than
         // stored as bytes no reader could decode.
         let usable = value.clone().filter(|_| std::str::from_utf8(data).is_ok());

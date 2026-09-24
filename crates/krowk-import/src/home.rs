@@ -139,21 +139,21 @@ pub fn read_home(env: Env, rel: &str, max_bytes: u64) -> Result<Vec<u8>, ImportE
 }
 
 // O_NOFOLLOW so a final symlink is not followed; O_NONBLOCK so a FIFO put
-// where a transcript belongs cannot hang the import.
-#[cfg(target_os = "macos")]
+// where a transcript belongs cannot hang the import. From libc, because the
+// values differ by architecture: O_NOFOLLOW is 0o400000 on x86_64 Linux but
+// 0o100000 on aarch64, where 0o400000 is O_LARGEFILE.
+#[cfg(unix)]
 fn libc_flags() -> i32 {
-    0x0100 | 0x0004
+    libc::O_NOFOLLOW | libc::O_NONBLOCK
 }
-#[cfg(target_os = "linux")]
-fn libc_flags() -> i32 {
-    0o400000 | 0o4000
-}
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn libc_flags() -> i32 {
-    0
-}
-const ELOOP: i32 = if cfg!(target_os = "macos") { 62 } else { 40 };
-const ENXIO: i32 = 6;
+#[cfg(unix)]
+const ELOOP: i32 = libc::ELOOP;
+#[cfg(unix)]
+const ENXIO: i32 = libc::ENXIO;
+#[cfg(not(unix))]
+const ELOOP: i32 = -1;
+#[cfg(not(unix))]
+const ENXIO: i32 = -1;
 
 #[cfg(test)]
 mod tests {

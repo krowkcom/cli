@@ -56,9 +56,7 @@ pub fn read_jsonl(
             continue;
         }
         res.lines += 1;
-        // Validity as Go judges it: invalid UTF-8 inside a string is not a
-        // syntax error, it is replaced, so such a line still imports.
-        if serde_json::from_str::<serde::de::IgnoredAny>(&String::from_utf8_lossy(payload)).is_err() {
+        if decode_line(payload).is_err() {
             res.skip(line_no, line_start, "invalid json");
             continue;
         }
@@ -69,6 +67,52 @@ pub fn read_jsonl(
         }
     }
     Ok((at(offset), res))
+}
+
+/// A line decoded the way Go's encoding/json decodes it: invalid UTF-8 and
+/// unpaired surrogate escapes become U+FFFD rather than failing the line.
+/// Claude Code cuts long tool output by UTF-16 length, so half an emoji —
+/// a lone `\ud83d` — is ordinary, and must not cost the whole message.
+pub fn decode_line(raw: &[u8]) -> Result<serde_json::Value, serde_json::Error> {
+    if let Ok(s) = std::str::from_utf8(raw)
+        && !s.contains("\\u")
+    {
+        return serde_json::from_str(s);
+    }
+    serde_json::from_str(&replace_lone_surrogates(&String::from_utf8_lossy(raw)))
+}
+
+fn replace_lone_surrogates(s: &str) -> String {
+    let hex = |at: usize| s.get(at..at + 4).and_then(|h| u16::from_str_radix(h, 16).ok());
+    let (mut out, mut i) = (String::with_capacity(s.len()), 0);
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            let c = s[i..].chars().next().expect("in bounds");
+            out.push(c);
+            i += c.len_utf8();
+            continue;
+        }
+        // An escape: copy it whole, so `\\u` is never read as `\u`.
+        if bytes.get(i + 1) == Some(&b'u')
+            && let Some(cp) = hex(i + 2)
+            && (0xD800..=0xDFFF).contains(&cp)
+        {
+            let low = (cp < 0xDC00 && s.get(i + 6..i + 8) == Some("\\u")).then(|| hex(i + 8)).flatten();
+            if low.is_some_and(|l| (0xDC00..=0xDFFF).contains(&l)) {
+                out.push_str(&s[i..i + 12]);
+                i += 12;
+            } else {
+                out.push_str("\\ufffd");
+                i += 6;
+            }
+            continue;
+        }
+        let next = s[i + 1..].chars().next().map_or(0, char::len_utf8);
+        out.push_str(&s[i..i + 1 + next]);
+        i += 1 + next;
+    }
+    out
 }
 
 /// Reads one line into `out`, keeping at most MAX_LINE_BYTES of it; returns
@@ -189,5 +233,15 @@ mod tests {
         let (_, res) = read_jsonl(&mut f, JsonlCursor { offset: 5, size: cur.size + 100 }, |_, _| Ok(())).unwrap();
         assert_eq!(res.lines, 4, "a file smaller than the cursor recorded is read from the start");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn lone_surrogates_and_bad_utf8_decode_as_go_does() {
+        assert_eq!(decode_line(br#"{"t":"a\ud83d"}"#).unwrap()["t"], "a\u{fffd}");
+        assert_eq!(decode_line(br#"{"t":"\udc00b"}"#).unwrap()["t"], "\u{fffd}b");
+        assert_eq!(decode_line(br#"{"t":"\ud83d\ude00"}"#).unwrap()["t"], "😀", "a real pair is kept");
+        assert_eq!(decode_line(br#"{"t":"\\ud83d"}"#).unwrap()["t"], "\\ud83d", "an escaped backslash is not an escape");
+        assert_eq!(decode_line(b"{\"t\":\"a\xffb\"}").unwrap()["t"], "a\u{fffd}b");
+        assert!(decode_line(b"{\"t\":").is_err());
     }
 }

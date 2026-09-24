@@ -289,7 +289,7 @@ download_binaries() {
   archive="krowk_${version}_${platform}.${ext}"
   base_url=$(release_base_url "$version")
 
-  step "Downloading krowk ${version} for ${platform//_/ }"
+  step "Downloading krowk ${version} for ${platform//_/ }, from ${REPO}"
   if ! curl_run -fsSL "${base_url}/${archive}" -o "${tmp_dir}/${archive}"; then
     why=$(curl_reason)
     error "Could not download ${base_url}/${archive}${why:+ (${why})}. Check that ${version} is a released version: https://github.com/${REPO}/releases"

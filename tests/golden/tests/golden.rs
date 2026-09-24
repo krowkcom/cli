@@ -238,12 +238,17 @@ fn contract_difference(want: &str, got: &str) -> Option<String> {
     None
 }
 
-/// One section of one step, judged by what the oracle recorded: recorded JSON
-/// must come back as JSON with the same value; recorded text is compared
-/// exactly where it is data and only for presence where it is prose. The
+/// One section of one step, judged by what the oracle recorded: a data step's
+/// stdout exactly; otherwise recorded JSON must come back as JSON with the
+/// same value, and recorded prose only has to be there. The
 /// recorded side decides — a port that answers a JSON step with prose, or
 /// with JSON and a trailing line, has broken the contract.
 fn section_difference(name: &str, want: &str, got: &str, data: bool) -> Option<String> {
+    // A data step's spelling is the contract — a shell reads `5`, not `5.0` —
+    // so it is compared as text even where it parses as JSON.
+    if data && name == "stdout" {
+        return (want != got).then(|| format!("{name} differs:\n{}", first_difference(want, got)));
+    }
     let recorded = json_stream(want).filter(|docs| !docs.is_empty() && name != "tty");
     match (recorded, json_stream(got)) {
         (Some(x), Some(y)) if x == y => None,

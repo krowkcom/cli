@@ -124,3 +124,23 @@ stderr:
 }
 exit: 1
 
+$ krowk help --jq '(.commands | length) / 2'
+stdout:
+6
+exit: 0
+
+$ krowk help --jq '[10/2, 5*1.0, 1e17, 0.5, 1e21, 1e-7]'
+stdout:
+[5,5,100000000000000000,0.5,1e+21,1e-7]
+exit: 0
+
+$ krowk help --jq '"\([.commands[0].name, 1] | @csv)"'
+stdout:
+"push",1
+exit: 0
+
+$ krowk help --jq '.commands[0] | @csv "row: \([.name, .usage])"'
+stdout:
+row: "push","krowk push <file...> [flags]"
+exit: 0
+

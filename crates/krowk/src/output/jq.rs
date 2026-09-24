@@ -62,39 +62,110 @@ def __krowk_tsv: if type != "array" then error("\(type) (\(tojson)) cannot be ts
     else tojson end) | join("\t") end;
 "#;
 
-/// `@csv` and `@tsv` spelled as the definitions above, outside string
-/// literals: jaq parses a format it does not know as an error, so the
-/// expression is rewritten before it is loaded.
+/// `@csv` and `@tsv` spelled as the definitions above: jaq parses a format
+/// it does not know as an error, so the expression is rewritten before it is
+/// loaded. Code inside a string's `\(…)` is code and is rewritten too, and the
+/// format-string form `@csv "row: \(.x)"` pipes each interpolation through the
+/// format, as jq does.
 fn with_formats(expr: &str) -> String {
-    let (mut out, mut chars, mut in_string) = (String::new(), expr.chars().peekable(), false);
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            match c {
-                '\\' => out.extend(chars.next()),
-                '"' => in_string = false,
-                _ => {}
+    let chars: Vec<char> = expr.chars().collect();
+    let mut out = String::new();
+    rewrite_code(&chars, &mut 0, &mut out, false);
+    out
+}
+
+fn format_def(word: &str) -> Option<&'static str> {
+    match word {
+        "csv" => Some("__krowk_csv"),
+        "tsv" => Some("__krowk_tsv"),
+        _ => None,
+    }
+}
+
+/// Copies code from `chars[*i..]` into `out`, rewriting formats. Inside an
+/// interpolation (`nested`) it stops at the `)` that closes it.
+fn rewrite_code(chars: &[char], i: &mut usize, out: &mut String, nested: bool) {
+    let mut depth = 0usize;
+    while *i < chars.len() {
+        let c = chars[*i];
+        match c {
+            '"' => {
+                *i += 1;
+                rewrite_string(chars, i, out, None);
+                continue;
             }
-            continue;
-        }
-        if c == '"' {
-            in_string = true;
-        }
-        if c == '@' {
-            let word: String = std::iter::from_fn(|| chars.next_if(|c| c.is_ascii_alphanumeric())).collect();
-            match word.as_str() {
-                "csv" => out.push_str("__krowk_csv"),
-                "tsv" => out.push_str("__krowk_tsv"),
-                other => {
-                    out.push('@');
-                    out.push_str(other);
+            '(' => depth += 1,
+            ')' if nested && depth == 0 => return,
+            ')' => depth = depth.saturating_sub(1),
+            '@' => {
+                let start = *i + 1;
+                let mut end = start;
+                while end < chars.len() && chars[end].is_ascii_alphanumeric() {
+                    end += 1;
+                }
+                let word: String = chars[start..end].iter().collect();
+                if let Some(def) = format_def(&word) {
+                    // `@csv "…"` is the format-string form: the format applies
+                    // to what each interpolation yields, not to the string.
+                    let mut next = end;
+                    while next < chars.len() && chars[next].is_whitespace() {
+                        next += 1;
+                    }
+                    *i = end;
+                    if next < chars.len() && chars[next] == '"' {
+                        *i = next + 1;
+                        rewrite_string(chars, i, out, Some(def));
+                    } else {
+                        out.push_str(def);
+                    }
+                    continue;
                 }
             }
-            continue;
+            _ => {}
         }
         out.push(c);
+        *i += 1;
     }
-    out
+}
+
+/// Copies a string literal, from just after its opening quote through its
+/// closing one. Interpolated code is rewritten, and under a format-string
+/// piped through the format.
+fn rewrite_string(chars: &[char], i: &mut usize, out: &mut String, format: Option<&str>) {
+    out.push('"');
+    while *i < chars.len() {
+        let c = chars[*i];
+        *i += 1;
+        match c {
+            '\\' if chars.get(*i) == Some(&'(') => {
+                *i += 1;
+                out.push_str("\\(");
+                if format.is_some() {
+                    out.push('(');
+                }
+                rewrite_code(chars, i, out, true);
+                if let Some(def) = format {
+                    out.push_str(&format!(")|{def}"));
+                }
+                if *i < chars.len() {
+                    out.push(')');
+                    *i += 1;
+                }
+            }
+            '\\' => {
+                out.push(c);
+                if let Some(&escaped) = chars.get(*i) {
+                    out.push(escaped);
+                    *i += 1;
+                }
+            }
+            '"' => {
+                out.push('"');
+                return;
+            }
+            c => out.push(c),
+        }
+    }
 }
 
 /// Loads and compiles `expr` with jq's standard library, `env` answering `{}`,
@@ -232,6 +303,13 @@ fn encode(v: &Val, out: &mut String) {
         Val::Num(jaq_json::Num::Float(f)) if f.is_infinite() => {
             out.push_str(if *f > 0.0 { "1.7976931348623157e+308" } else { "-1.7976931348623157e+308" })
         }
+        Val::Num(jaq_json::Num::Float(f)) => out.push_str(&go_float(*f)),
+        // A literal jaq keeps as its digits, gojq holds as a float64.
+        Val::Num(jaq_json::Num::Dec(d)) => match d.parse::<f64>() {
+            Ok(f) if f.is_finite() => out.push_str(&go_float(f)),
+            Ok(f) => encode(&Val::Num(jaq_json::Num::Float(f)), out),
+            Err(_) => out.push_str(d),
+        },
         Val::Arr(items) => {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
@@ -258,6 +336,22 @@ fn encode(v: &Val, out: &mut String) {
         }
         other => out.push_str(&other.to_string()),
     }
+}
+
+/// A float the way Go's encoder writes one, which is what a shell reading
+/// `$(krowk … --jq 'length/2')` gets: no `.0` on an integral value, positional
+/// digits below 1e21, and `1e+21`-style exponents outside that range.
+fn go_float(f: f64) -> String {
+    let abs = f.abs();
+    if abs != 0.0 && !(1e-6..1e21).contains(&abs) {
+        let s = format!("{f:e}");
+        let (mantissa, exp) = s.split_once('e').unwrap_or((&s, "0"));
+        return match exp.strip_prefix('-') {
+            Some(neg) => format!("{mantissa}e-{neg}"),
+            None => format!("{mantissa}e+{exp:0>2}"),
+        };
+    }
+    format!("{f}")
 }
 
 fn key_text(k: &Val) -> String {
@@ -336,6 +430,10 @@ mod tests {
         assert_eq!(filter(r#"[1,"a,b",null,"q\"t"] | @csv"#).write("null", false).unwrap().0, "1,\"a,b\",,\"q\"\"t\"\n");
         assert_eq!(filter(r#"["a\tb",2] | @tsv"#).write("null", false).unwrap().0, "a\\tb\t2\n");
         assert_eq!(filter(r#""@csv stays text""#).write("null", false).unwrap().0, "@csv stays text\n");
+        assert_eq!(filter(r#""\([1,"a"]|@csv)""#).write("null", false).unwrap().0, "1,\"a\"\n");
+        assert_eq!(filter(r#"@csv "row: \(.)""#).write(r#"[1,"a"]"#, false).unwrap().0, "row: 1,\"a\"\n");
+        assert_eq!(filter("[10/2, 5*1.0, 1e17, 0.5, 1e21, 1e-7]").write("null", false).unwrap().0, "[5,5,100000000000000000,0.5,1e+21,1e-7]\n");
+        assert_eq!(filter("10/2").write("null", false).unwrap().0, "5\n");
         assert_eq!(filter("[.[] | tostream]").write("[[1]]", false).unwrap().0, "[[[0],1],[[0]]]\n");
         assert_eq!(filter("[nan, infinite, -infinite]").write("null", false).unwrap().0, "[null,1.7976931348623157e+308,-1.7976931348623157e+308]\n");
         assert_eq!(filter("to_entries[0].key").write(r#"{"b":1,"a":2}"#, false).unwrap().0, "a\n");

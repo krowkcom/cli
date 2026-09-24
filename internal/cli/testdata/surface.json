@@ -653,6 +653,19 @@
                 "usage": "Read at most this many transcripts per source (0 is all)"
               }
             ]
+          },
+          {
+            "name": "rebuild",
+            "usage": "krowk sessions rebuild [--yes]",
+            "summary": "Delete the local store and re-import every transcript",
+            "flags": [
+              {
+                "name": "yes",
+                "type": "bool",
+                "default": "false",
+                "usage": "Delete without asking — required when nobody is at a terminal to confirm"
+              }
+            ]
           }
         ]
       },

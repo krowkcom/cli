@@ -411,6 +411,15 @@ func catalog() Catalog {
 								Usage: "Read at most this many transcripts per source (0 is all)"},
 						},
 					},
+					{
+						Name:    "rebuild",
+						Usage:   "krowk sessions rebuild [--yes]",
+						Summary: "Delete the local store and re-import every transcript",
+						Flags: []Flag{
+							{Name: "yes", Type: typeBool, Default: "false",
+								Usage: "Delete without asking — required when nobody is at a terminal to confirm"},
+						},
+					},
 				},
 			},
 			{
@@ -484,7 +493,7 @@ var sections = []section{
 	{"PUSH & PASTE", []string{"push", "uploads create"}},
 	{"RUNS", []string{"runs start", "runs finish", "runs show", "runs list"}},
 	{"UPLOADS", []string{"uploads list", "uploads show", "uploads attach", "uploads delete", "claim"}},
-	{"SESSIONS", []string{"sessions", "sessions show", "sessions import"}},
+	{"SESSIONS", []string{"sessions", "sessions show", "sessions import", "sessions rebuild"}},
 	{"ACCOUNT & SYSTEM", []string{
 		"auth login", "auth verify", "auth token",
 		"workspaces list", "workspaces use",

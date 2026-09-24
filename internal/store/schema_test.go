@@ -432,7 +432,13 @@ func TestSchemaGateConcurrentFirstOpen(t *testing.T) {
 			t.Errorf("goroutine %d: %v", i, err)
 		}
 	}
-	db, err := openSQL("file:" + path + "?mode=ro&immutable=1")
+	// Read-only, but not immutable. An immutable handle opened straight after
+	// eight writers close read the file as version 0 in about one run in four
+	// — the schema still in WAL frames it did not see — and the accept then
+	// tried to create it on a read-only handle. Open's own inspect handle is
+	// immutable too, but a read-write re-check stands behind it; this final
+	// accept has none, so it reads the way any later reader would.
+	db, err := openSQL("file:" + path + "?mode=ro")
 	if err != nil {
 		t.Fatalf("inspect: %v", err)
 	}

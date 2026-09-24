@@ -33,8 +33,8 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      # setup-go needs this to save its build cache; without it every run
-      # ends in "cache write denied: token has no writable scopes".
+      # rust-cache needs this to save its cache; without it every run ends in
+      # "cache write denied: token has no writable scopes".
       actions: write
     steps:
       - name: Checkout repository
@@ -43,11 +43,12 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache: true
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.97 --profile minimal --component clippy
+          rustup default 1.97
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Run opencode review
         uses: anomalyco/opencode/github@latest
@@ -62,32 +63,33 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
 
-            Review this pull request. This is a Go CLI. Be pragmatic and terse — a senior Go
-            reviewer who already knows the codebase, not a checklist. Lead with the biggest
-            problem. Concrete fixes with `file:line`, not formal critique.
+            Review this pull request. This is a Rust CLI (a cargo workspace under crates/).
+            Be pragmatic and terse — a senior Rust reviewer who already knows the codebase, not
+            a checklist. Lead with the biggest problem. Concrete fixes with `file:line`, not
+            formal critique.
 
             Read the diff first (`gh pr diff`), then read the surrounding files for anything
             you are unsure about. Do not review code the PR did not touch.
 
             What actually matters here:
             - **Correctness over style.** Wrong behaviour, bad edge cases, broken contracts.
-            - **Errors are values.** Wrapped with context (`fmt.Errorf("...: %w", err)`), never
-              swallowed, never `_ =` on something that can fail meaningfully.
-            - **Concurrency.** Data races, goroutine leaks, unbuffered channels that can block
-              forever, `context.Context` that is accepted but never honoured.
-            - **Resource lifetime.** Missing `defer Close()`, files/conns/tickers left open,
-              `defer` inside a loop.
-            - **Nil and bounds.** Nil map writes, nil pointer derefs on error paths, slice
-              aliasing after `append`.
+            - **Errors carry the next action.** Failures become a krowk error with a `fix`
+              line naming what to do; never `unwrap()`/`expect()` on something a user's input or
+              disk can make fail, never `let _ =` on a failure that matters.
+            - **Resource lifetime.** Files, sockets, locks and temp files released on every path,
+              including the error ones.
+            - **Panics and bounds.** Slicing on byte offsets that may split a char, integer
+              casts that truncate, indexing that can go out of range.
             - **The CLI surface is a contract.** Flag names, exit codes, stdout vs stderr,
               output format. Breaking changes must be called out explicitly.
-            - **Tests.** New behaviour needs a test. Table-driven where it fits. Say so when a
+            - **Size and speed are requirements.** A new dependency must say what it buys; the
+              release binary is size-tuned (`opt-level = "s"`).
+            - **Tests.** New behaviour needs a test. Say so when a
               tricky path is untested — name the path.
             - **Abstractions must earn their place.** Interface with one implementation, wrapper
               with one caller, package with one function: inline it.
 
-            Skip formatting, import order, and naming-only preferences — gofmt and the linters
-            cover those. Do not suggest comments for self-evident code.
+            Skip formatting, import order, and naming-only preferences — clippy covers those. Do not suggest comments for self-evident code.
 
             Output format:
 

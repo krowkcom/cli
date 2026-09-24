@@ -3,7 +3,7 @@
   "name": "io.github.krowkcom/krowk",
   "description": "Publish agent output — screenshots, recordings, logs, reports — to a permanent link that unfurls as a card in GitHub, Slack, Basecamp and Linear.",
   "repository": {
-    "url": "https://github.com/krowkcom/cli",
+    "url": "https://github.com/krowkcom/krowk",
     "source": "github"
   },
   "version": "0.9.0",

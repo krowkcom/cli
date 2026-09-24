@@ -1,0 +1,15 @@
+[package]
+name = "krowk-golden"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+# Test-only: none of this reaches a shipped binary, so the size rule that
+# governs crates/ does not apply here.
+[dev-dependencies]
+libc = "0.2"
+regex = "1"
+serde_json = "1"
+shlex = "2"

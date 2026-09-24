@@ -1,0 +1,29 @@
+# krowk: the CLI, its MCP server, the session store and importers, and the
+# stand-in registry the tests run against. tests/golden holds the binaries to
+# their recorded transcripts.
+#
+# Crates split where a dependency has to stop, not by layer: the default
+# `krowk` build is the agent-container one and never links sqlite, so it stays
+# small and has nothing to fail on; `--features sessions` adds the store.
+[workspace]
+resolver = "3"
+members = ["crates/*", "tests/golden"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+license-file = "LICENSE"
+publish = false
+
+# Size is a requirement here, not a nicety: this binary is fetched into
+# someone else's container at the end of their task. "s" rather than "z":
+# measured on 707 real sessions, "s" imports ~28% faster than "z" (10.0 s
+# against 13.5 s) and as fast as "3", for 0.7 MB more; "3" costs 1.9 MB
+# beyond "s" and buys nothing measurable.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

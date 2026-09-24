@@ -1,0 +1,47 @@
+name: CI
+
+# The gate every pull request passes, whatever branch it targets.
+#
+# Every platform CI can run natively, because the golden cases are exactly the
+# kind of test a platform difference breaks: temp paths, file modes, what the
+# machine's own tables say.
+on:
+  pull_request:
+  push:
+    branches: [main, rust-rewrite]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # `git describe` stamps the version the golden cases mask; a shallow
+          # clone without tags still describes, just less precisely.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # rustup is on every hosted runner; the toolchain is pinned to the
+      # workspace's rust-version rather than whatever the image carries.
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.97 --profile minimal --component clippy
+          rustup default 1.97
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The opencode fixture is built from SQL at case time.
+      - name: Ensure sqlite3
+        if: runner.os == 'Linux'
+        run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
+
+      - name: Lint, unit tests and golden cases
+        run: make check

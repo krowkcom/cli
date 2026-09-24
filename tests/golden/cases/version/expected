@@ -1,0 +1,17 @@
+$ krowk --version
+stdout:
+0.0.0-golden
+exit: 0
+
+$ krowk version
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "unknown_command",
+    "fix": "`version` is not a krowk command — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+

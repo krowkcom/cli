@@ -1,0 +1,36 @@
+$ krowk push a.txt --jq '.data.artifacts[0] | error'
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "jq_failed",
+    "fix": "--jq: <jq error>. The command itself succeeded — this is the reading of its result failing, so running it again repeats whatever it did",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk auth token --jq .
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "jq_unsupported",
+    "fix": "`auth token` prints no JSON, so there is nothing for --jq to read — drop the flag, or ask a command that answers with a record",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk auth verify --jq '.data | tonumber'
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "jq_failed",
+    "fix": "--jq: <jq error>. The command itself succeeded — this is the reading of its result failing, so running it again repeats whatever it did",
+    "retryable": false
+  }
+}
+exit: 1
+

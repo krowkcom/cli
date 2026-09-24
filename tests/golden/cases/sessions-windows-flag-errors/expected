@@ -1,0 +1,47 @@
+$ krowk sessions --limit 0
+stdout:
+{
+  "ok": true,
+  "data": {
+    "sessions": []
+  },
+  "summary": "0 sessions"
+}
+exit: 0
+
+$ krowk sessions --limit -1
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "--limit is a maximum, so it cannot be negative",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk sessions show a b
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "`krowk sessions show` takes one session id, got extra b",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk sessions rebuild extra
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "confirmation_required",
+    "fix": "rebuilding deletes <scratch>/home/.local/share/krowk/krowk.db and re-imports every transcript — run `krowk sessions rebuild --yes` to confirm when nobody is at a terminal to ask",
+    "retryable": false
+  }
+}
+exit: 1
+

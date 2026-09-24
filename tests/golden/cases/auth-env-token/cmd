@@ -1,0 +1,4 @@
+@registry
+@env KROWK_TOKEN=krowk_sk_env
+krowk auth verify --format human
+krowk auth token --format human

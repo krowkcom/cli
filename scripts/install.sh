@@ -28,7 +28,9 @@
 
 set -euo pipefail
 
-REPO="krowkcom/cli"
+# KROWK_REPO is how the GitHub Action names the repository it was taken from;
+# anyone else gets the canonical one.
+REPO="${KROWK_REPO:-krowkcom/krowk}"
 BIN_DIR="${KROWK_BIN_DIR:-}"
 VERSION="${KROWK_VERSION:-}"
 BASE_URL_OVERRIDE="${KROWK_INSTALL_BASE_URL:-}"
@@ -113,20 +115,20 @@ detect_platform() {
     darwin) os="darwin" ;;
     linux) os="linux" ;;
     mingw*|msys*|cygwin*) os="windows" ;;
-    *) error "krowk has no build for $os. Linux, macOS and Windows are what the release carries; from source: go install github.com/${REPO}/cmd/krowk@latest" ;;
+    *) error "krowk has no build for $os. Linux, macOS and Windows are what the release carries; from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk" ;;
   esac
 
   arch=$(uname -m)
   case "$arch" in
     x86_64|amd64) arch="amd64" ;;
     aarch64|arm64) arch="arm64" ;;
-    *) error "krowk has no build for $arch. amd64 and arm64 are what the release carries; from source: go install github.com/${REPO}/cmd/krowk@latest" ;;
+    *) error "krowk has no build for $arch. amd64 and arm64 are what the release carries; from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk" ;;
   esac
 
   # Windows ARM is deliberately not built. Say so, rather than offering a
   # download that was never uploaded.
   if [[ "$os" == "windows" && "$arch" == "arm64" ]]; then
-    error "No Windows ARM build is published. Install inside WSL2, or build from source: go install github.com/${REPO}/cmd/krowk@latest"
+    error "No Windows ARM build is published. Install inside WSL2, or build from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk"
   fi
 
   echo "${os}_${arch}"
@@ -233,7 +235,7 @@ latest_version() {
 
   local why
   why=$(curl_reason)
-  error "Could not find the latest release of ${REPO}. ${why:+curl said: ${why}. }Name one with KROWK_VERSION, or install from source: go install github.com/${REPO}/cmd/krowk@latest"
+  error "Could not find the latest release of ${REPO}. ${why:+curl said: ${why}. }Name one with KROWK_VERSION, or install from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk"
 }
 
 release_base_url() {
@@ -287,7 +289,7 @@ download_binaries() {
   archive="krowk_${version}_${platform}.${ext}"
   base_url=$(release_base_url "$version")
 
-  step "Downloading krowk ${version} for ${platform//_/ }"
+  step "Downloading krowk ${version} for ${platform//_/ }, from ${REPO}"
   if ! curl_run -fsSL "${base_url}/${archive}" -o "${tmp_dir}/${archive}"; then
     why=$(curl_reason)
     error "Could not download ${base_url}/${archive}${why:+ (${why})}. Check that ${version} is a released version: https://github.com/${REPO}/releases"
@@ -398,10 +400,8 @@ skills_dir() {
 }
 
 # The ownership marker and the version stamp krowk writes beside every skill it
-# manages. They are the same two filenames, with the same marker sentence, that
-# internal/harness/managed.go writes — a directory claimed here and one claimed
-# by the binary have to be the same directory, or an upgrade would refuse to
-# refresh what this script installed.
+# manages. This script is their only writer: an upgrade re-runs it, and a
+# directory it claimed once is one it recognises and refreshes after.
 MANAGED_MARKER=".managed-by-krowk-cli"
 INSTALLED_VERSION_FILE=".installed-version"
 MANAGED_MARKER_CONTENT="This directory is managed by krowk. Manual edits will be overwritten on upgrade."
@@ -470,14 +470,13 @@ write_managed_file() {
   fi
 }
 
-# claim_skill_dir is the gate every skill write goes through, and the shell half
-# of internal/harness/managed.go's ClaimDir: it creates a missing directory,
+# claim_skill_dir is the gate every skill write goes through: it creates a missing directory,
 # adopts an empty one, accepts one that already carries krowk's marker, and
 # refuses anything else. A populated directory without the marker is somebody's
 # own skill, and an installer that overwrote it would destroy work nobody asked
 # it to touch — so it says why and leaves it exactly as it found it.
 #
-# It also adopts one shape the Go gate deliberately refuses: a directory holding
+# It also adopts one shape a stricter gate would refuse: a directory holding
 # nothing but a regular SKILL.md, which is the only file a pre-marker krowk
 # installer ever wrote and the one it overwrote on every single run. Adopting it
 # now therefore takes nothing from anybody, while anything else in the directory

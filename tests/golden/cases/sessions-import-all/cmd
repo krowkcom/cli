@@ -1,0 +1,10 @@
+@fixture harnesses
+krowk sessions import --from all --dry-run
+krowk sessions
+krowk sessions import --from all
+krowk sessions
+krowk sessions --format human
+krowk sessions --all
+krowk sessions --limit 1
+krowk sessions import --from all
+@ls {home}/.local/share/krowk

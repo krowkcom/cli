@@ -12,10 +12,10 @@
     "agent"
   ],
   "homepage": "https://krowk.com",
-  "bugs": "https://github.com/krowkcom/cli/issues",
+  "bugs": "https://github.com/krowkcom/krowk/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/krowkcom/cli.git",
+    "url": "git+https://github.com/krowkcom/krowk.git",
     "directory": "npm/mcp"
   },
   "license": "MIT",

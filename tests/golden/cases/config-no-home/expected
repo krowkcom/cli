@@ -1,0 +1,88 @@
+$ krowk config show
+stdout:
+{
+  "ok": true,
+  "data": {
+    "global_path": ".krowk/config.json",
+    "repo_path": "<scratch>/work/.krowk/config.json"
+  },
+  "summary": "no configuration set — uploads use the stored default key",
+  "breadcrumbs": [
+    {
+      "action": "set the workspace",
+      "cmd": "krowk config set workspace <workspace>",
+      "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
+    }
+  ]
+}
+exit: 0
+
+$ krowk config set workspace ws_x --global
+stdout:
+{
+  "ok": true,
+  "data": {
+    "key": "workspace",
+    "value": "ws_x",
+    "path": ".krowk/config.json"
+  },
+  "summary": "workspace = ws_x in .krowk/config.json",
+  "breadcrumbs": [
+    {
+      "action": "check the effective configuration",
+      "cmd": "krowk config show",
+      "description": "reports what actually resolves here, which layer wins, and why"
+    }
+  ]
+}
+exit: 0
+
+@ls {work}
+.git/
+.krowk/
+.krowk/config.json 644
+
+$ krowk config show
+stdout:
+{
+  "ok": true,
+  "data": {
+    "workspace": "ws_x",
+    "sources": {
+      "workspace": "repo config"
+    },
+    "global_path": ".krowk/config.json",
+    "repo_path": "<scratch>/work/.krowk/config.json"
+  },
+  "summary": "workspace ws_x — repo config",
+  "breadcrumbs": [
+    {
+      "action": "set the workspace",
+      "cmd": "krowk config set workspace <workspace>",
+      "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
+    }
+  ]
+}
+exit: 0
+
+$ krowk workspaces
+stdout:
+{
+  "ok": true,
+  "data": {
+    "stored": [],
+    "resolved": "ws_x",
+    "source": "repo config",
+    "key_missing": true
+  },
+  "summary": "ws_x resolves here (repo config) but holds no key — every upload fails until `krowk auth login`",
+  "breadcrumbs": [
+    {
+      "action": "log in",
+      "cmd": "krowk auth login",
+      "description": "approving it in the browser stores a key, and uploads stop expiring — `--token krowk_sk_...` stores one directly instead"
+    }
+  ]
+}
+exit: 0
+

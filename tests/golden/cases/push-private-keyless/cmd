@@ -1,0 +1,3 @@
+@registry
+@file a.txt hello
+krowk push a.txt --private

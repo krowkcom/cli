@@ -1,0 +1,4 @@
+krowk sessions --limit 0
+krowk sessions --limit -1
+krowk sessions show a b
+krowk sessions rebuild extra

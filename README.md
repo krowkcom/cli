@@ -4,8 +4,7 @@
 
 Permalinks for agent output. Push a screenshot, get a URL that unfurls in GitHub, Slack, Basecamp and Linear — with the run metadata attached.
 
-<a href="https://github.com/krowkcom/cli/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/krowkcom/cli?color=1a1a19"></a>
-<a href="https://pkg.go.dev/github.com/krowkcom/cli"><img alt="Go Reference" src="https://pkg.go.dev/badge/github.com/krowkcom/cli.svg"></a>
+<a href="https://github.com/krowkcom/krowk/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/krowkcom/krowk?color=1a1a19"></a>
 <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-1a1a19"></a>
 
 ---
@@ -35,7 +34,7 @@ krowk push screenshot.png \
 curl -fsSL https://krowk.com/install | bash
 
 # Go
-go install github.com/krowkcom/cli/cmd/krowk@latest
+cargo install --locked --git https://github.com/krowkcom/krowk --features sessions krowk
 
 # npm
 npx @krowk/cli push screenshot.png
@@ -121,7 +120,7 @@ Without a destination, ordinary human output ends with the block anyway, so the 
 The repository doubles as an action, so CI can push what a test run produced and put the links where a reviewer will see them:
 
 ```yaml
-- uses: krowkcom/cli@v0 # or a release tag, e.g. @v0.8.0, to freeze the binary too
+- uses: krowkcom/krowk@v0 # or a release tag, e.g. @v0.8.0, to freeze the binary too
   id: krowk
   with:
     files: |
@@ -188,12 +187,13 @@ Credentials from `krowk auth login` live in `~/.config/krowk/credentials.json` (
 ## Development
 
 ```bash
-make check          # go vet + go test ./...
-make build          # → bin/krowk and bin/krowk-mcp
+make check          # clippy, the unit tests and every golden case
+make build          # → target/release/krowk (with sessions) and krowk-mcp
 make mock           # a local stand-in registry — then run any command with --dev
+make golden-update  # re-record tests/golden/cases after an intended output change
 ```
 
-The repository ships the registry it develops against as an internal command (`go run ./internal/devregistry`), so trying krowk out needs neither the network nor a key. It is not part of any released binary.
+Rust (a cargo workspace under `crates/`). The repository ships the registry it develops against as a crate of its own (`crates/krowk-devregistry`, run by `make mock`), so trying krowk out needs neither the network nor a key. It is not part of any released binary.
 
 ## Who uses Krowk?
 

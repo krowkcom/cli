@@ -1,0 +1,150 @@
+$ krowk sessions import --from claude
+stdout:
+{
+  "ok": true,
+  "data": {
+    "dry_run": false,
+    "store": "<scratch>/home/.local/share/krowk/krowk.db",
+    "providers": [
+      {
+        "provider": "claude",
+        "files": 4,
+        "sessions_seen": 4,
+        "messages_seen": 20,
+        "parts_seen": 24,
+        "sessions_inserted": 4,
+        "messages_inserted": 20,
+        "parts_inserted": 24,
+        "skipped_by_type": {
+          "server_tool_use": 1
+        },
+        "skipped_lines": 2,
+        "files_failed": 0,
+        "files_unchanged": 0,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      }
+    ],
+    "duration_ms": <n>
+  },
+  "summary": "4 files, 4 sessions read, 20 messages read, 20 messages new"
+}
+exit: 0
+
+$ krowk sessions import --from cursor
+stdout:
+{
+  "ok": true,
+  "data": {
+    "dry_run": false,
+    "store": "<scratch>/home/.local/share/krowk/krowk.db",
+    "providers": [
+      {
+        "provider": "cursor",
+        "files": 2,
+        "sessions_seen": 2,
+        "messages_seen": 6,
+        "parts_seen": 7,
+        "sessions_inserted": 2,
+        "messages_inserted": 6,
+        "parts_inserted": 7,
+        "skipped_by_type": {},
+        "skipped_lines": 1,
+        "files_failed": 0,
+        "files_unchanged": 0,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      }
+    ],
+    "duration_ms": <n>
+  },
+  "summary": "2 files, 2 sessions read, 6 messages read, 6 messages new"
+}
+exit: 0
+
+$ krowk sessions import --from opencode
+stdout:
+{
+  "ok": true,
+  "data": {
+    "dry_run": false,
+    "store": "<scratch>/home/.local/share/krowk/krowk.db",
+    "providers": [
+      {
+        "provider": "opencode",
+        "files": 2,
+        "sessions_seen": 2,
+        "messages_seen": 6,
+        "parts_seen": 16,
+        "sessions_inserted": 2,
+        "messages_inserted": 6,
+        "parts_inserted": 16,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 0,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      }
+    ],
+    "duration_ms": <n>
+  },
+  "summary": "2 files, 2 sessions read, 6 messages read, 6 messages new"
+}
+exit: 0
+
+$ krowk sessions import --from nope
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "--from nope is not a source krowk can read — one of claude|cursor|opencode|all",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk sessions import
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "`krowk sessions import` needs --from <claude|cursor|opencode|all> — it says which agent's transcripts to read",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk sessions import --from claude --limit 1
+stdout:
+{
+  "ok": true,
+  "data": {
+    "dry_run": false,
+    "store": "<scratch>/home/.local/share/krowk/krowk.db",
+    "providers": [
+      {
+        "provider": "claude",
+        "files": 1,
+        "sessions_seen": 1,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 0,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      }
+    ],
+    "duration_ms": <n>
+  },
+  "summary": "1 files, 1 sessions read, 0 messages read, 0 messages new"
+}
+exit: 0
+

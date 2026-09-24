@@ -1,0 +1,2 @@
+@registry
+krowk auth login --token nope

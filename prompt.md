@@ -15,7 +15,7 @@ curl -fsSL https://krowk.com/install | bash
 If `curl | bash` is not permitted in this environment, use one of:
 
 ```bash
-go install github.com/krowkcom/cli/cmd/krowk@latest
+cargo install --locked --git https://github.com/krowkcom/krowk --features sessions krowk
 # or, without installing:
 npx @krowk/cli push <file>
 ```
@@ -30,7 +30,7 @@ Make sure the skills directory exists, then re-run the installer (it writes the 
 
 ```bash
 mkdir -p ~/.claude/skills/krowk
-curl -fsSL https://raw.githubusercontent.com/krowkcom/cli/main/skills/krowk/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/krowkcom/krowk/main/skills/krowk/SKILL.md \
   -o ~/.claude/skills/krowk/SKILL.md
 ```
 
@@ -41,7 +41,7 @@ If `CLAUDE_CONFIG_DIR` is set, use `$CLAUDE_CONFIG_DIR/skills/krowk/SKILL.md` in
 Copy the same `SKILL.md` into your agent's skills directory, keeping the `krowk/SKILL.md` layout:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/krowkcom/cli/main/skills/krowk/SKILL.md
+curl -fsSL https://raw.githubusercontent.com/krowkcom/krowk/main/skills/krowk/SKILL.md
 ```
 
 ### Agents without skill support

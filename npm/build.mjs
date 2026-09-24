@@ -6,7 +6,7 @@
 // `@krowk/cli` and `@krowk/mcp` — which depend on all five as optionalDependencies
 // and use whichever npm decided applies. That is the esbuild pattern.
 //
-// The bytes are the release's bytes, read out of dist/, not a second `go build`
+// The bytes are the release's bytes, read out of dist/, not a second `cargo build`
 // that could differ from what the checksums cover.
 //
 //   node npm/build.mjs [--dist dist] [--out dist/npm]
@@ -156,7 +156,7 @@ for (const platform of PLATFORMS) {
         version,
         description: "krowk CLI + MCP binaries for " + platform.os + " " + platform.cpu + ".",
         homepage: "https://krowk.com",
-        repository: { type: "git", url: "git+https://github.com/krowkcom/cli.git" },
+        repository: { type: "git", url: "git+https://github.com/krowkcom/krowk.git" },
         license: "MIT",
         os: [platform.os],
         cpu: [platform.cpu],

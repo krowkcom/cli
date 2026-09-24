@@ -1,0 +1,109 @@
+$ krowk workspaces
+stdout:
+{
+  "ok": true,
+  "data": {
+    "stored": []
+  },
+  "summary": "no keys stored — uploads are anonymous",
+  "breadcrumbs": [
+    {
+      "action": "log in",
+      "cmd": "krowk auth login",
+      "description": "approving it in the browser stores a key, and uploads stop expiring — `--token krowk_sk_...` stores one directly instead"
+    }
+  ]
+}
+exit: 0
+
+$ krowk workspaces list
+stdout:
+{
+  "ok": true,
+  "data": {
+    "stored": []
+  },
+  "summary": "no keys stored — uploads are anonymous",
+  "breadcrumbs": [
+    {
+      "action": "log in",
+      "cmd": "krowk auth login",
+      "description": "approving it in the browser stores a key, and uploads stop expiring — `--token krowk_sk_...` stores one directly instead"
+    }
+  ]
+}
+exit: 0
+
+$ krowk auth login --token krowk_sk_test
+stdout:
+{
+  "ok": true,
+  "data": {
+    "path": "<scratch>/home/.config/krowk/credentials.json",
+    "confirmed": true,
+    "key_id": "<key_1>",
+    "workspace": "<ws_1>"
+  },
+  "summary": "<key_1> stored, uploads land in <ws_1>",
+  "breadcrumbs": [
+    {
+      "action": "push",
+      "cmd": "krowk push <file>",
+      "description": "the key is stored and accepted, so nothing else is needed before uploading; <file> is the path to upload"
+    }
+  ]
+}
+exit: 0
+
+$ krowk workspaces
+stdout:
+{
+  "ok": true,
+  "data": {
+    "stored": [
+      {
+        "name": "<ws_1>",
+        "key_id": "<key_1>",
+        "workspace": "<ws_1>",
+        "workspace_name": "Local workspace",
+        "default": true
+      }
+    ],
+    "resolved": "<ws_1>",
+    "source": "stored default"
+  },
+  "summary": "uploads from here land in <ws_1> (stored default) — 1 key(s) stored",
+  "breadcrumbs": [
+    {
+      "action": "switch the default",
+      "cmd": "krowk workspaces use <workspace>",
+      "description": "repoints the machine-wide default at another stored key — <workspace> is a name from this list"
+    },
+    {
+      "action": "pin this repository",
+      "cmd": "krowk config set workspace <workspace>",
+      "description": "writes .krowk/config.json at the repository root, so every command run inside it uses that workspace's key whoever runs it — <workspace> is a name from this list"
+    }
+  ]
+}
+exit: 0
+
+$ krowk workspaces use nope
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "unknown_workspace",
+    "fix": "no stored key named nope — stored: <ws_1>",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk workspaces --format human
+stdout:
+stored keys
+  Local workspace — <ws_1> <key_1>  (default)
+uploads from here land in <ws_1> — stored default
+exit: 0
+

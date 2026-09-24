@@ -479,5 +479,5 @@ gains a class can only move *out* of 1.
 
 ## Learn More
 
-- CLI repo, wire contract and the MCP server: https://github.com/krowkcom/cli
+- CLI repo, wire contract and the MCP server: https://github.com/krowkcom/krowk
 - The surface as data, always current: `krowk help --json`

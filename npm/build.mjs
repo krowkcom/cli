@@ -156,7 +156,7 @@ for (const platform of PLATFORMS) {
         version,
         description: "krowk CLI + MCP binaries for " + platform.os + " " + platform.cpu + ".",
         homepage: "https://krowk.com",
-        repository: { type: "git", url: "git+https://github.com/krowkcom/cli.git" },
+        repository: { type: "git", url: "git+https://github.com/krowkcom/krowk.git" },
         license: "MIT",
         os: [platform.os],
         cpu: [platform.cpu],

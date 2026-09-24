@@ -1,4 +1,4 @@
-# action.yml — the GitHub Action face of the CLI: `uses: krowkcom/cli@v0`,
+# action.yml — the GitHub Action face of the CLI: `uses: krowkcom/krowk@v0`,
 # or a release tag where a workflow wants the version frozen.
 #
 # It is a composite of two bash steps, install then push, because that is all

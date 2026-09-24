@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-REPO="krowkcom/cli"
+REPO="krowkcom/krowk"
 BIN_DIR="${KROWK_BIN_DIR:-}"
 VERSION="${KROWK_VERSION:-}"
 BASE_URL_OVERRIDE="${KROWK_INSTALL_BASE_URL:-}"
@@ -113,20 +113,20 @@ detect_platform() {
     darwin) os="darwin" ;;
     linux) os="linux" ;;
     mingw*|msys*|cygwin*) os="windows" ;;
-    *) error "krowk has no build for $os. Linux, macOS and Windows are what the release carries; from source: go install github.com/${REPO}/cmd/krowk@latest" ;;
+    *) error "krowk has no build for $os. Linux, macOS and Windows are what the release carries; from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk" ;;
   esac
 
   arch=$(uname -m)
   case "$arch" in
     x86_64|amd64) arch="amd64" ;;
     aarch64|arm64) arch="arm64" ;;
-    *) error "krowk has no build for $arch. amd64 and arm64 are what the release carries; from source: go install github.com/${REPO}/cmd/krowk@latest" ;;
+    *) error "krowk has no build for $arch. amd64 and arm64 are what the release carries; from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk" ;;
   esac
 
   # Windows ARM is deliberately not built. Say so, rather than offering a
   # download that was never uploaded.
   if [[ "$os" == "windows" && "$arch" == "arm64" ]]; then
-    error "No Windows ARM build is published. Install inside WSL2, or build from source: go install github.com/${REPO}/cmd/krowk@latest"
+    error "No Windows ARM build is published. Install inside WSL2, or build from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk"
   fi
 
   echo "${os}_${arch}"
@@ -233,7 +233,7 @@ latest_version() {
 
   local why
   why=$(curl_reason)
-  error "Could not find the latest release of ${REPO}. ${why:+curl said: ${why}. }Name one with KROWK_VERSION, or install from source: go install github.com/${REPO}/cmd/krowk@latest"
+  error "Could not find the latest release of ${REPO}. ${why:+curl said: ${why}. }Name one with KROWK_VERSION, or install from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk"
 }
 
 release_base_url() {

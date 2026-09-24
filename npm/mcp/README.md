@@ -35,8 +35,8 @@ a proxy, under `npm ci --ignore-scripts`, and off a private mirror.
 If Node is not already in the picture, point the client at the binary instead:
 
 ```bash
-go install github.com/krowkcom/cli/cmd/krowk-mcp@latest
-# or grab an archive from https://github.com/krowkcom/cli/releases/latest
+cargo install --locked --git https://github.com/krowkcom/krowk krowk --bin krowk-mcp
+# or grab an archive from https://github.com/krowkcom/krowk/releases/latest
 ```
 
 ```json
@@ -45,6 +45,6 @@ go install github.com/krowkcom/cli/cmd/krowk-mcp@latest
 
 ## Documentation
 
-Tools, arguments, and the errors they return: <https://github.com/krowkcom/cli>.
+Tools, arguments, and the errors they return: <https://github.com/krowkcom/krowk>.
 
 MIT.

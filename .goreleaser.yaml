@@ -100,11 +100,11 @@ release:
     npx @krowk/cli push screenshot.png
 
     # Direct download — no runtime, no package manager
-    curl -sSfL https://github.com/krowkcom/cli/releases/download/{{ .Tag }}/krowk_{{ .Version }}_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz \
+    curl -sSfL https://github.com/krowkcom/krowk/releases/download/{{ .Tag }}/krowk_{{ .Version }}_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz \
       | tar -xz -C /usr/local/bin krowk krowk-mcp
 
     # From source
-    cargo install --locked --git https://github.com/krowkcom/cli --tag {{ .Tag }} --features sessions krowk
+    cargo install --locked --git https://github.com/krowkcom/krowk --tag {{ .Tag }} --features sessions krowk
     ```
 
     `checksums.txt` covers every archive on this release.

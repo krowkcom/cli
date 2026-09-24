@@ -92,7 +92,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: node npm/publish.mjs
 
-      # The moving major tag, so `uses: krowkcom/cli@v0` follows the 0.x line
+      # The moving major tag, so `uses: krowkcom/krowk@v0` follows the 0.x line
       # instead of freezing a workflow on one patch release. It moves last, once
       # the release exists and npm carries the packages: a tag pointing at bytes
       # nobody can download yet is worse than a tag that lags by a minute.

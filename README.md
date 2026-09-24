@@ -4,8 +4,8 @@
 
 Permalinks for agent output. Push a screenshot, get a URL that unfurls in GitHub, Slack, Basecamp and Linear — with the run metadata attached.
 
-<a href="https://github.com/krowkcom/cli/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/krowkcom/cli?color=1a1a19"></a>
-<a href="https://pkg.go.dev/github.com/krowkcom/cli"><img alt="Go Reference" src="https://pkg.go.dev/badge/github.com/krowkcom/cli.svg"></a>
+<a href="https://github.com/krowkcom/krowk/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/krowkcom/krowk?color=1a1a19"></a>
+<a href="https://pkg.go.dev/github.com/krowkcom/krowk"><img alt="Go Reference" src="https://pkg.go.dev/badge/github.com/krowkcom/krowk.svg"></a>
 <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-1a1a19"></a>
 
 ---
@@ -35,7 +35,7 @@ krowk push screenshot.png \
 curl -fsSL https://krowk.com/install | bash
 
 # Go
-go install github.com/krowkcom/cli/cmd/krowk@latest
+cargo install --locked --git https://github.com/krowkcom/krowk --features sessions krowk
 
 # npm
 npx @krowk/cli push screenshot.png
@@ -121,7 +121,7 @@ Without a destination, ordinary human output ends with the block anyway, so the 
 The repository doubles as an action, so CI can push what a test run produced and put the links where a reviewer will see them:
 
 ```yaml
-- uses: krowkcom/cli@v0 # or a release tag, e.g. @v0.8.0, to freeze the binary too
+- uses: krowkcom/krowk@v0 # or a release tag, e.g. @v0.8.0, to freeze the binary too
   id: krowk
   with:
     files: |

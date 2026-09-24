@@ -35,7 +35,7 @@
 //!                               person at a shell would; ESC and CR print as \e and \r
 //!
 //! Every command runs with an empty environment apart from PATH, HOME, TMPDIR,
-//! KROWK_NO_UPDATE_CHECK and KROWK_TEST_NOW_MS (the store's clock, frozen at
+//! TZ=UTC, KROWK_NO_UPDATE_CHECK and KROWK_TEST_NOW_MS (the store's clock, frozen at
 //! 2026-01-01), with KROWK_API_URL on a port nothing listens on
 //! and every proxy variable pointing there too, so nothing on the machine — a
 //! key, a krowk.db, a harness transcript — leaks in, and no case reaches the
@@ -190,6 +190,8 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
         // The store's clock, frozen so every time column — and every listing
         // ordered by one — is the same on each run and in both builds.
         ("KROWK_TEST_NOW_MS".into(), "1767225600000".into()),
+        // "expires tomorrow" counts midnights in the local zone.
+        ("TZ".into(), "UTC".into()),
     ];
     let mut registry: Option<(Registry, String)> = None;
     let mut stdin: Option<Vec<u8>> = None;

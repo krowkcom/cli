@@ -45,7 +45,9 @@ clean:
 # against, at the path they look for it. Built by no release.
 bin/devregistry:
 	cargo build --release -p krowk-devregistry --bin devregistry
-	mkdir -p bin && cp target/release/devregistry bin/devregistry
+	# rm first: on macOS a rebuilt binary copied over the old one keeps the old
+	# inode's code signature, and the kernel kills it on launch.
+	mkdir -p bin && rm -f bin/devregistry && cp target/release/devregistry bin/devregistry
 
 # The cases compare the version like any other output, so the build they run is
 # stamped with one no release will ever carry.

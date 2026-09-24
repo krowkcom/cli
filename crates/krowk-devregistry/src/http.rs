@@ -112,11 +112,14 @@ pub fn unescape(s: &str, query: bool) -> Option<String> {
     Some(String::from_utf8_lossy(&out).into_owned())
 }
 
-/// Whether Go's server would have parsed this request-target at all: no
-/// control bytes anywhere, and every escape in the path well formed.
+/// Whether Go's server would have parsed this request-target at all: origin
+/// form (`/…`) or absolute form (`scheme://…`), no control bytes anywhere, and
+/// every escape in the path well formed. `GET None` or `GET *` is a 400 there,
+/// not a redirect to `/None`.
 pub fn parseable(path: &str, query: &str) -> bool {
     let clean = |s: &str| !s.bytes().any(|c| c < 0x20 || c == 0x7f);
-    clean(path) && clean(query) && unescape(path, false).is_some()
+    let form = path.starts_with('/') || path.contains("://");
+    form && clean(path) && clean(query) && unescape(path, false).is_some()
 }
 
 /// Go's `path.Clean`.
@@ -192,6 +195,14 @@ pub fn redirect(method: &str, path: &str, query: &str) -> Resp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_target_that_is_neither_origin_nor_absolute_form_does_not_parse() {
+        assert!(parseable("/v1/key", ""));
+        assert!(parseable("http://localhost/v1/key", ""));
+        assert!(!parseable("None", ""));
+        assert!(!parseable("*", ""));
+    }
 
     #[test]
     fn paths_clean_the_way_go_cleans_them() {

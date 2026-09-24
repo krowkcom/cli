@@ -799,6 +799,7 @@ name = "krowk-api"
 version = "0.0.0"
 dependencies = [
  "jiff",
+ "krowk-devregistry",
  "serde",
  "serde_json",
  "sha2",

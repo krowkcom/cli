@@ -28,7 +28,9 @@
 
 set -euo pipefail
 
-REPO="krowkcom/krowk"
+# KROWK_REPO is how the GitHub Action names the repository it was taken from;
+# anyone else gets the canonical one.
+REPO="${KROWK_REPO:-krowkcom/krowk}"
 BIN_DIR="${KROWK_BIN_DIR:-}"
 VERSION="${KROWK_VERSION:-}"
 BASE_URL_OVERRIDE="${KROWK_INSTALL_BASE_URL:-}"

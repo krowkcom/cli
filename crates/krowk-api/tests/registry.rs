@@ -1,36 +1,20 @@
 //! The client against the stand-in registry, end to end. The stand-in makes
 //! the refusals the real registry makes — bytes that never arrived, a length
 //! or digest that is not what was declared — so a client that passes here is
-//! exercising the real sequence. `make golden` builds bin/devregistry.
+//! exercising the real sequence. The stand-in runs in-process, so nothing
+//! has to be built first.
 
 use krowk_api::spec::{inspect, Spec};
 use krowk_api::Client;
-use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 
-struct Registry(Child, String);
-
-impl Drop for Registry {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+/// The stand-in, served in-process on a port of its own; dropping it stops it.
+struct Registry(#[allow(dead_code)] krowk_devregistry::Running, String);
 
 fn registry() -> Registry {
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bin/devregistry");
-    assert!(bin.exists(), "no stand-in registry at {} — run `make bin/devregistry`", bin.display());
-    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let mut child = Command::new(bin)
-        .args(["--addr", &format!("127.0.0.1:{port}")])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
-    Registry(child, format!("http://127.0.0.1:{port}/v1"))
+    let running = krowk_devregistry::start(TcpListener::bind("127.0.0.1:0").unwrap(), krowk_devregistry::Config::default()).unwrap();
+    let url = format!("{}/v1", running.url());
+    Registry(running, url)
 }
 
 fn file(name: &str, body: &str) -> Spec {

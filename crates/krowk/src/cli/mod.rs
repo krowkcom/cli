@@ -189,8 +189,11 @@ fn dispatch(ctx: &mut Ctx, p: &[String]) -> Result<(), Error> {
         #[cfg(feature = "sessions")]
         ["pricing", "refresh", ..] => sessions::pricing_refresh(ctx),
         _ if catalog::catalog(VERSION).leaves().iter().any(|l| p.starts_with(&l.name.split(' ').map(String::from).collect::<Vec<_>>())) => Err(fail(
-            "not_ported",
-            format!("`{}` is not in the Rust build yet — the Go build still ships it", clip(p, 2).join(" ")),
+            "not_in_build",
+            format!(
+                "`{}` is not in this build — it is the agent build, without `sessions`; install a release, or build with `--features sessions`",
+                clip(p, 2).join(" ")
+            ),
         )),
         _ => Err(fail("unknown_command", format!("`{}` is not a krowk command — run `krowk --help`", clip(p, 2).join(" ")))),
     }

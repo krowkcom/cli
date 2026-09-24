@@ -55,12 +55,7 @@ jobs:
       - name: Golden cases against the Go build
         run: make golden
 
-      - name: Rust lint and unit tests
+      - name: Rust lint, unit tests and golden cases (contract mode)
         run: |
           rustup component add clippy
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo clippy --workspace --all-targets --features krowk/sessions -- -D warnings
-          cargo test --workspace --exclude krowk-golden --features krowk/sessions
-
-      - name: Golden cases against the Rust build (contract mode)
-        run: make golden-rust
+          make rust-check

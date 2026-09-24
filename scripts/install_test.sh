@@ -79,15 +79,36 @@ grep -q 'name_template: checksums.txt' .goreleaser.yaml \
 pass "the archive and checksum names still match what the installer builds"
 
 # The other half of that agreement is the platform table. install.sh writes it
-# out as case arms and .goreleaser.yaml as goos/goarch lists, and a table kept
-# in two places drifts: a platform added to the release that the installer will
-# not name 404s, and a platform the installer names that the release never
-# built 404s the same way, with the same wrong-looking error. So the lists are
-# read out of the config and diffed against the arms.
-yaml_goos=$(sed -n 's/^ *goos: *\[\(.*\)\].*/\1/p' .goreleaser.yaml | tr -d ' ' | tr ',' '\n' | sort -u)
-yaml_goarch=$(sed -n 's/^ *goarch: *\[\(.*\)\].*/\1/p' .goreleaser.yaml | tr -d ' ' | tr ',' '\n' | sort -u)
-[[ -n "$yaml_goos" && -n "$yaml_goarch" ]] \
-  || fail "no goos/goarch lists found in .goreleaser.yaml, so this check is reading nothing"
+# out as case arms and .goreleaser.yaml as Rust target triples, and a table
+# kept in two places drifts: a platform added to the release that the installer
+# will not name 404s, and a platform the installer names that the release never
+# built 404s the same way, with the same wrong-looking error. So the triples
+# are read out of the config, spelled the way the archives are named, and
+# diffed against the arms.
+goos_goarch_of() {
+  local arch os
+  case "$1" in
+    x86_64-*) arch=amd64 ;;
+    aarch64-*) arch=arm64 ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *-linux-*) os=linux ;;
+    *-apple-darwin) os=darwin ;;
+    *-windows-*) os=windows ;;
+    *) return 1 ;;
+  esac
+  echo "${os}_${arch}"
+}
+yaml_built=""
+for triple in $(sed -n 's/^ *- *\([a-z0-9_]*-[a-z0-9_-]*\) *$/\1/p' .goreleaser.yaml | grep -E -- '-(linux|apple|pc)-' | sort -u); do
+  pair=$(goos_goarch_of "$triple") || fail ".goreleaser.yaml builds $triple, which this test cannot spell as an archive name; add it to goos_goarch_of"
+  yaml_built+="$pair"$'\n'
+done
+yaml_built=$(printf '%s' "$yaml_built" | sort -u)
+[[ -n "$yaml_built" ]] || fail "no target triples found in .goreleaser.yaml, so this check is reading nothing"
+yaml_goos=$(cut -d_ -f1 <<<"$yaml_built" | sort -u)
+yaml_goarch=$(cut -d_ -f2 <<<"$yaml_built" | sort -u)
 
 # What the case arms in detect_platform can answer with, as opposed to what they
 # accept: `mingw*|msys*|cygwin*) os="windows"` is three spellings of one goos.
@@ -114,15 +135,10 @@ for name in MANAGED_MARKER INSTALLED_VERSION_FILE; do
 done
 pass "the marker sentence and the two filenames agree with internal/harness/managed.go"
 
-# The ignore list is the third piece: a combination the config refuses to build
-# must be one the installer refuses to offer, and every combination it does
-# build must be one detect_platform can name.
-yaml_ignored=$(awk '
-  $1 == "ignore:" { in_ignore = 1; next }
-  in_ignore && $1 == "-" && $2 == "goos:" { os = $3; next }
-  in_ignore && $1 == "goarch:" { print os "_" $2; next }
-  in_ignore && /^ *[a-z_]+:/ { in_ignore = 0 }
-' .goreleaser.yaml | sort -u)
+# The combinations the release does not build are the third piece: one the
+# config does not build must be one the installer refuses to offer, and every
+# one it does build must be one detect_platform can name.
+yaml_ignored=$(for o in $yaml_goos; do for a in $yaml_goarch; do grep -qx "${o}_${a}" <<<"$yaml_built" || echo "${o}_${a}"; done; done | sort -u)
 
 # detect_platform reads uname, so uname is what this stands in for. The stub is
 # only live while FAKE_UNAME_* are set, and the installer itself runs in its own

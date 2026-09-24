@@ -8,42 +8,50 @@ version: 2
 project_name: krowk
 
 builds:
+  # Rust, cross-compiled with cargo-zigbuild: zig is the C compiler and linker
+  # for the C inside the build (the bundled SQLite and ring), so one macOS
+  # runner builds every platform. macOS because the darwin builds link
+  # Security.framework, which only the macOS SDK carries.
   - id: krowk
+    builder: rust
     binary: krowk
-    main: ./cmd/krowk
-    # Static, because the binary lands in containers we did not build and must
-    # not need a libc that matches ours.
-    env:
-      - CGO_ENABLED=0
+    # The workspace root, where cargo writes target/; the package is picked
+    # by flag.
+    dir: .
+    # The device build: the one people install on the machine their agents
+    # run on, so `sessions` is in it.
     flags:
-      - -trimpath
-    # The same stamp the Makefile applies, so `krowk --version` says the same
-    # thing whether it came from a release or from a checkout.
-    ldflags:
-      - -s -w -X github.com/krowkcom/cli/internal/cli.Version={{ .Version }}
-    goos: [linux, darwin, windows]
-    goarch: [amd64, arm64]
-    ignore:
+      - --release
+      - --package=krowk
+      - --bin=krowk
+      - --features=sessions
+    # Linux is musl and static, because the binary lands in containers we did
+    # not build and must not need a libc that matches ours.
+    targets: &targets
+      - x86_64-unknown-linux-musl
+      - aarch64-unknown-linux-musl
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
       # Nobody is running an agent container on Windows ARM yet. Add it when
       # somebody asks.
-      - goos: windows
-        goarch: arm64
+      - x86_64-pc-windows-gnu
+    # The same stamp the Makefile applies, so `krowk --version` says the same
+    # thing whether it came from a release or from a checkout.
+    env:
+      - KROWK_VERSION={{ .Version }}
     mod_timestamp: "{{ .CommitTimestamp }}"
 
   - id: krowk-mcp
+    builder: rust
     binary: krowk-mcp
-    main: ./cmd/krowk-mcp
-    env:
-      - CGO_ENABLED=0
+    dir: .
     flags:
-      - -trimpath
-    ldflags:
-      - -s -w -X github.com/krowkcom/cli/internal/cli.Version={{ .Version }}
-    goos: [linux, darwin, windows]
-    goarch: [amd64, arm64]
-    ignore:
-      - goos: windows
-        goarch: arm64
+      - --release
+      - --package=krowk
+      - --bin=krowk-mcp
+    targets: *targets
+    env:
+      - KROWK_VERSION={{ .Version }}
     mod_timestamp: "{{ .CommitTimestamp }}"
 
 archives:
@@ -96,7 +104,7 @@ release:
       | tar -xz -C /usr/local/bin krowk krowk-mcp
 
     # From source
-    go install github.com/krowkcom/cli/cmd/krowk@{{ .Tag }}
+    cargo install --locked --git https://github.com/krowkcom/cli --tag {{ .Tag }} --features sessions krowk
     ```
 
     `checksums.txt` covers every archive on this release.

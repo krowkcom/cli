@@ -3,7 +3,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
 LDFLAGS := -s -w -X github.com/krowkcom/cli/internal/cli.Version=$(VERSION)
 
-.PHONY: build test lint vet fmt check windows-build mock install clean dist release-check rust golden golden-rust golden-update
+.PHONY: build test lint vet fmt check windows-build mock install clean dist release-check rust rust-check golden golden-rust golden-update
 
 build: ## Build ./bin/krowk and ./bin/krowk-mcp
 	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/krowk ./cmd/krowk
@@ -45,8 +45,8 @@ release-check: ## Validate .goreleaser.yaml, the npm launchers and the installer
 	# which a plain `go test` run has no business requiring.
 	scripts/install_test.sh
 
-dist: ## The whole release, locally: every binary, the archives, the npm packages
-	goreleaser release --snapshot --clean --skip=publish
+dist: ## The whole release, locally: every binary, the archives, the npm packages (needs zig + cargo-zigbuild, on macOS)
+	goreleaser release --snapshot --clean --skip=publish --parallelism 1
 	node npm/build.mjs
 
 clean:
@@ -76,6 +76,12 @@ FORCE:
 
 golden: bin/golden bin/devregistry ## Hold the Go build to tests/golden/cases
 	cargo test -p krowk-golden
+
+rust-check: bin/devregistry ## The Rust gate: clippy on both builds, unit tests, golden cases
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets --features krowk/sessions -- -D warnings
+	cargo test --workspace --exclude krowk-golden --features krowk/sessions
+	$(MAKE) golden-rust
 
 golden-rust: bin/devregistry ## Hold the Rust build to the same cases
 	KROWK_VERSION=$(GOLDEN_VERSION) cargo build --release -p krowk --features sessions

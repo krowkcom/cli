@@ -4,6 +4,9 @@ name: Release
 # builds both binaries for five platforms, opens the GitHub Release with the
 # archives and checksums on it, and publishes the seven npm packages.
 #
+# macOS, because the darwin builds link Security.framework and only the macOS
+# SDK carries it; zig cross-compiles the Linux and Windows builds from there.
+#
 # Three components, deliberately: the moving major tag this workflow pushes at
 # the end is also `v*`, and a release run for `v0` would ask GoReleaser to cut
 # a release of version "0" and npm to publish it.
@@ -16,7 +19,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     permissions:
       # GoReleaser creates the release and uploads the archives to it.
       contents: write
@@ -32,16 +35,33 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Go only for the stand-in registry the golden cases run against.
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.97 --profile minimal --component clippy \
+            --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-pc-windows-gnu
+          rustup default 1.97
+
+      - name: Set up zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.4
+
       # The same gate as a pull request. A tag that cannot pass it should not
       # become bytes anyone downloads.
       - name: Check
-        run: make check
+        run: make rust-check
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -54,7 +74,9 @@ jobs:
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean
+          # One build at a time: two cargo-zigbuild runs for the same target
+          # race to create the same linker wrapper.
+          args: release --clean --parallelism 1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -1,0 +1,53 @@
+$ krowk doctor --dev
+stdout:
+{
+  "api": "http://localhost:8787/v1",
+  "api_status": "unreachable — network_unreachable — <transport error>",
+  "authenticated": false,
+  "config": "global <scratch>/home/.config/krowk/config.json (absent)",
+  "context": {},
+  "credentials": "<scratch>/home/.config/krowk/credentials.json",
+  "key": "none — uploads will be anonymous",
+  "registry": "local",
+  "runs_available": false,
+  "runtime": "<runtime>",
+  "store": {
+    "name": "store",
+    "status": "pass",
+    "message": "healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"
+  },
+  "token_source": "none",
+  "version": "0.0.0-golden",
+  "workspace": "none — uploads will be anonymous"
+}
+exit: 0
+
+$ krowk doctor
+stdout:
+{
+  "api": "http://localhost:8787/v1",
+  "api_status": "unreachable — network_unreachable — <transport error>",
+  "authenticated": false,
+  "config": "global <scratch>/home/.config/krowk/config.json (absent)",
+  "context": {},
+  "credentials": "<scratch>/home/.config/krowk/credentials.json",
+  "key": "none — uploads will be anonymous",
+  "registry": "local",
+  "runs_available": false,
+  "runtime": "<runtime>",
+  "store": {
+    "name": "store",
+    "status": "pass",
+    "message": "healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"
+  },
+  "token_source": "none",
+  "version": "0.0.0-golden",
+  "workspace": "none — uploads will be anonymous"
+}
+exit: 0
+
+$ krowk doctor --jq .api
+stdout:
+https://api.krowk.com/v1
+exit: 0
+

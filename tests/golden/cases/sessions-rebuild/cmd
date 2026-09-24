@@ -1,0 +1,5 @@
+@fixture harnesses
+krowk sessions import --from all --quiet
+krowk sessions rebuild
+krowk sessions rebuild --yes
+krowk sessions --quiet

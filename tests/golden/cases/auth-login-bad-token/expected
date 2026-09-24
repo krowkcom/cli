@@ -1,0 +1,21 @@
+$ krowk auth login --token nope
+stdout:
+{
+  "ok": true,
+  "data": {
+    "path": "<scratch>/home/.config/krowk/credentials.json",
+    "confirmed": true,
+    "key_id": "<key_1>",
+    "workspace": "<ws_1>"
+  },
+  "summary": "<key_1> stored, uploads land in <ws_1>",
+  "breadcrumbs": [
+    {
+      "action": "push",
+      "cmd": "krowk push \u003cfile\u003e",
+      "description": "the key is stored and accepted, so nothing else is needed before uploading; \u003cfile\u003e is the path to upload"
+    }
+  ]
+}
+exit: 0
+

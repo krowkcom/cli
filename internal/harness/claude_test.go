@@ -377,8 +377,15 @@ func TestAMatchedCommandIsStrippedOfWhatItShouldNotPrint(t *testing.T) {
 	if strings.ContainsRune(check.Message, '\x1b') {
 		t.Fatalf("message %q carries an escape sequence", check.Message)
 	}
-	if len([]rune(check.Message)) > 200 {
-		t.Fatalf("message is %d runes long, want the command truncated", len([]rune(check.Message)))
+	// Only the quoted command is truncated; the path before it is the temp
+	// directory's, whose length is the machine's business.
+	_, quoted, ok := strings.Cut(check.Message, " (")
+	if !ok || !strings.HasSuffix(quoted, ")") {
+		t.Fatalf("message %q does not quote the command in parentheses", check.Message)
+	}
+	quoted = strings.TrimSuffix(quoted, ")")
+	if n := len([]rune(quoted)); n > 81 {
+		t.Fatalf("quoted command is %d runes long, want it truncated to 80 and an ellipsis: %q", n, quoted)
 	}
 }
 

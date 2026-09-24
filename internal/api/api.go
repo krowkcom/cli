@@ -41,7 +41,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -683,11 +682,9 @@ func ContentType(path string) string {
 // always video/*, never audio/*; without one — audio-only or an unreadable
 // head — the extension answer stands.
 func contentTypeFor(path string, head []byte) string {
-	t := mime.TypeByExtension(filepath.Ext(path))
-	if t == "" {
+	t, ok := contentTypes[strings.ToLower(filepath.Ext(path))]
+	if !ok {
 		t = "application/octet-stream"
-	} else if i := strings.IndexByte(t, ';'); i >= 0 {
-		t = strings.TrimSpace(t[:i])
 	}
 	if len(head) > 0 && isMatroskaExt(path) && hasMatroskaVideoTrack(head) {
 		// The subtype is kept: audio/webm becomes video/webm, so the answer
@@ -703,6 +700,71 @@ func contentTypeFor(path string, head []byte) string {
 		}
 	}
 	return t
+}
+
+// contentTypes is the whole extension table, fixed here rather than read from
+// the machine. The standard library's mime package merges in whatever
+// mime.types the host carries — Apache's on macOS, the distribution's on Linux —
+// so the same file declared from two laptops could be two different artifacts,
+// and a type is signed into the upload URL and kept on the record.
+//
+// Every entry is what Go answered on macOS when the table was fixed, so a push
+// from a Mac declares what it always did for these extensions — the ones an
+// agent plausibly produces, not the thousand in Apache's list — with two
+// deliberate exceptions:
+//
+//   - .md and .markdown are text/markdown. macOS had no answer (octet-stream)
+//     and Linux distributions do; markdown is the report agents write most.
+//   - .webm is audio/webm. Only a Matroska head with a video track makes it
+//     video (contentTypeFor), so an audio-only recording stays audio.
+//
+// Anything absent is application/octet-stream; the card page falls back to the
+// filename for those.
+var contentTypes = map[string]string{
+	// images
+	".apng": "image/apng", ".avif": "image/avif", ".bmp": "image/bmp",
+	".gif": "image/gif", ".ico": "image/x-icon", ".jpeg": "image/jpeg",
+	".jpg": "image/jpeg", ".png": "image/png", ".svg": "image/svg+xml",
+	".tif": "image/tiff", ".tiff": "image/tiff", ".webp": "image/webp",
+	// fonts
+	".eot": "application/vnd.ms-fontobject", ".otf": "font/otf", ".ttf": "font/ttf",
+	".woff": "font/woff", ".woff2": "font/woff2",
+	// video
+	".3gp": "video/3gpp", ".avi": "video/x-msvideo", ".flv": "video/x-flv",
+	".m4v": "video/x-m4v", ".mkv": "video/x-matroska", ".wmv": "video/x-ms-wmv",
+	".mov": "video/quicktime", ".mp4": "video/mp4", ".mpeg": "video/mpeg",
+	".ogv": "video/ogg", ".ts": "video/mp2t", ".webm": "audio/webm",
+	// audio
+	".aac": "audio/x-aac", ".flac": "audio/x-flac", ".m4a": "audio/mp4a-latm",
+	".mp3": "audio/mpeg", ".oga": "audio/ogg", ".ogg": "audio/ogg",
+	".opus": "audio/ogg", ".wav": "audio/x-wav", ".aif": "audio/x-aiff",
+	".aiff": "audio/x-aiff", ".m3u": "audio/x-mpegurl", ".mid": "audio/midi",
+	".midi": "audio/midi", ".wma": "audio/x-ms-wma",
+	// text
+	".css": "text/css", ".csv": "text/csv", ".htm": "text/html",
+	".html": "text/html", ".ics": "text/calendar", ".log": "text/plain",
+	".markdown": "text/markdown", ".md": "text/markdown", ".mjs": "text/javascript",
+	".text": "text/plain", ".tsv": "text/tab-separated-values", ".txt": "text/plain",
+	".c": "text/x-c", ".conf": "text/plain", ".cpp": "text/x-c", ".h": "text/x-c",
+	".java": "text/x-java-source", ".vcf": "text/x-vcard", ".vtt": "text/vtt",
+	// application
+	".js": "application/javascript", ".json": "application/json",
+	".pdf": "application/pdf", ".rs": "application/rls-services+xml",
+	".rtf": "application/rtf", ".sh": "application/x-sh", ".sql": "application/x-sql",
+	".srt":  "application/x-subrip",
+	".wasm": "application/wasm", ".xhtml": "application/xhtml+xml", ".xml": "application/xml",
+	// documents
+	".doc": "application/msword", ".epub": "application/epub+zip",
+	".odt": "application/vnd.oasis.opendocument.text", ".ppt": "application/vnd.ms-powerpoint",
+	".xls":  "application/vnd.ms-excel",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	// archives
+	".7z": "application/x-7z-compressed", ".bz2": "application/x-bzip2",
+	".gz": "application/gzip", ".tar": "application/x-tar", ".xz": "application/x-xz",
+	".zip": "application/zip", ".jar": "application/java-archive",
+	".rar": "application/x-rar-compressed",
 }
 
 // matroskaHeadLimit is how much of the file the video-track sniff reads.

@@ -406,7 +406,7 @@ func (m *Metadata) reconcileRepo() {
 // known, rather than guessing a path that 404s.
 func RepoURL(env Env, remote string) string {
 	if strings.HasPrefix(remote, "http://") || strings.HasPrefix(remote, "https://") {
-		return strings.TrimSuffix(strings.TrimRight(remote, "/"), ".git")
+		return strings.TrimSuffix(strings.TrimRight(withoutUserinfo(remote), "/"), ".git")
 	}
 	slug := Slug(remote)
 	if slug == "" {
@@ -420,6 +420,23 @@ func RepoURL(env Env, remote string) string {
 		return ""
 	}
 	return strings.TrimRight(server, "/") + "/" + slug
+}
+
+// withoutUserinfo drops the user and password from an http(s) remote. CI
+// checkouts clone as https://x-access-token:<token>@github.com/..., and the
+// URL this feeds is run metadata — public, permanent, on every card. Cut by
+// hand rather than through url.Parse so a remote that does not parse still
+// loses everything before the last @ in its authority.
+func withoutUserinfo(remote string) string {
+	scheme, rest, _ := strings.Cut(remote, "://")
+	authority, path, hasPath := strings.Cut(rest, "/")
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		authority = authority[at+1:]
+	}
+	if !hasPath {
+		return scheme + "://" + authority
+	}
+	return scheme + "://" + authority + "/" + path
 }
 
 // DetectSession finds the agent run this upload belongs to, so --session is a

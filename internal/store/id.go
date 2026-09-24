@@ -4,8 +4,10 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -48,7 +50,29 @@ func NewMinter(clock Clock) *Minter {
 
 // defaultMinter serves the package-level NewID and NowMS, which is what
 // everything outside a test uses.
-var defaultMinter = NewMinter(nil)
+var defaultMinter = NewMinter(envClock())
+
+// envClock starts the default minter at KROWK_TEST_NOW_MS when it is set, and
+// is nil (time.Now) otherwise. It exists for the black-box golden cases in
+// tests/golden, which hold this build and the Rust port to the same output:
+// every time column is written from this clock, and a listing ordered by one
+// is only reproducible when two rows written a millisecond apart in one run
+// cannot land a millisecond apart the other way in the next.
+//
+// It advances a millisecond per read rather than standing still. A clock that
+// never moves ties every row, and a listing ordered by time then falls back to
+// SQLite's tie order — oldest first, the reverse of what a person sees. Moving
+// forward keeps "written later" meaning "newer", which is the behavior under
+// test. Not a user setting — nothing documents it outside the harness.
+func envClock() Clock {
+	ms, err := strconv.ParseInt(os.Getenv("KROWK_TEST_NOW_MS"), 10, 64)
+	if err != nil {
+		return nil
+	}
+	var next atomic.Int64
+	next.Store(ms)
+	return func() time.Time { return time.UnixMilli(next.Add(1) - 1) }
+}
 
 // NewID mints an id from the default minter.
 func NewID() string { return defaultMinter.NewID() }

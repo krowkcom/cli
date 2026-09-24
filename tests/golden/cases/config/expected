@@ -1,0 +1,223 @@
+$ krowk config show
+stdout:
+{
+  "ok": true,
+  "data": {
+    "global_path": "<scratch>/home/.config/krowk/config.json",
+    "repo_path": "<scratch>/work/.krowk/config.json"
+  },
+  "summary": "no configuration set — uploads use the stored default key",
+  "breadcrumbs": [
+    {
+      "action": "set the workspace",
+      "cmd": "krowk config set workspace \u003cworkspace\u003e",
+      "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
+    }
+  ]
+}
+exit: 0
+
+$ krowk config set workspace ws_local
+stdout:
+{
+  "ok": true,
+  "data": {
+    "key": "workspace",
+    "value": "ws_local",
+    "path": "<scratch>/work/.krowk/config.json"
+  },
+  "summary": "workspace = ws_local in <scratch>/work/.krowk/config.json",
+  "breadcrumbs": [
+    {
+      "action": "check the effective configuration",
+      "cmd": "krowk config show",
+      "description": "reports what actually resolves here, which layer wins, and why"
+    }
+  ]
+}
+exit: 0
+
+$ krowk config show
+stdout:
+{
+  "ok": true,
+  "data": {
+    "workspace": "ws_local",
+    "sources": {
+      "workspace": "repo config"
+    },
+    "global_path": "<scratch>/home/.config/krowk/config.json",
+    "repo_path": "<scratch>/work/.krowk/config.json"
+  },
+  "summary": "workspace ws_local — repo config",
+  "breadcrumbs": [
+    {
+      "action": "set the workspace",
+      "cmd": "krowk config set workspace \u003cworkspace\u003e",
+      "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
+    }
+  ]
+}
+exit: 0
+
+@ls {work}
+.git/
+.krowk/
+.krowk/config.json 644
+
+@cat {work}/.krowk/config.json
+{
+  "workspace": "ws_local"
+}
+
+$ krowk config set workspace ws_global --global
+stdout:
+{
+  "ok": true,
+  "data": {
+    "key": "workspace",
+    "value": "ws_global",
+    "path": "<scratch>/home/.config/krowk/config.json"
+  },
+  "summary": "workspace = ws_global in <scratch>/home/.config/krowk/config.json",
+  "breadcrumbs": [
+    {
+      "action": "check the effective configuration",
+      "cmd": "krowk config show",
+      "description": "reports what actually resolves here, which layer wins, and why"
+    }
+  ]
+}
+exit: 0
+
+$ krowk config show
+stdout:
+{
+  "ok": true,
+  "data": {
+    "workspace": "ws_local",
+    "sources": {
+      "workspace": "repo config"
+    },
+    "global_path": "<scratch>/home/.config/krowk/config.json",
+    "repo_path": "<scratch>/work/.krowk/config.json"
+  },
+  "summary": "workspace ws_local — repo config",
+  "breadcrumbs": [
+    {
+      "action": "set the workspace",
+      "cmd": "krowk config set workspace \u003cworkspace\u003e",
+      "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
+    }
+  ]
+}
+exit: 0
+
+@ls {home}
+.config/
+.config/krowk/
+.config/krowk/config.json 644
+
+$ krowk config unset workspace
+stdout:
+{
+  "ok": true,
+  "data": {
+    "key": "workspace",
+    "path": "<scratch>/work/.krowk/config.json"
+  },
+  "summary": "workspace removed from <scratch>/work/.krowk/config.json",
+  "breadcrumbs": [
+    {
+      "action": "check the effective configuration",
+      "cmd": "krowk config show",
+      "description": "reports what actually resolves here, which layer wins, and why"
+    }
+  ]
+}
+exit: 0
+
+$ krowk config show
+stdout:
+{
+  "ok": true,
+  "data": {
+    "workspace": "ws_global",
+    "sources": {
+      "workspace": "global config"
+    },
+    "global_path": "<scratch>/home/.config/krowk/config.json",
+    "repo_path": "<scratch>/work/.krowk/config.json"
+  },
+  "summary": "workspace ws_global — global config",
+  "breadcrumbs": [
+    {
+      "action": "set the workspace",
+      "cmd": "krowk config set workspace \u003cworkspace\u003e",
+      "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
+    }
+  ]
+}
+exit: 0
+
+$ krowk config unset workspace --global
+stdout:
+{
+  "ok": true,
+  "data": {
+    "key": "workspace",
+    "path": "<scratch>/home/.config/krowk/config.json"
+  },
+  "summary": "workspace removed from <scratch>/home/.config/krowk/config.json",
+  "breadcrumbs": [
+    {
+      "action": "check the effective configuration",
+      "cmd": "krowk config show",
+      "description": "reports what actually resolves here, which layer wins, and why"
+    }
+  ]
+}
+exit: 0
+
+$ krowk config show --format human
+stdout:
+nothing set — uploads use the stored default key
+  global    <scratch>/home/.config/krowk/config.json
+  repo      <scratch>/work/.krowk/config.json
+exit: 0
+
+$ krowk config set bogus_key 1
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "unknown_config_key",
+    "fix": "unknown config key \"bogus_key\", valid keys: workspace",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk config show
+stdout:
+{
+  "ok": true,
+  "data": {
+    "workspace": "ws_env",
+    "sources": {
+      "workspace": "KROWK_WORKSPACE"
+    },
+    "global_path": "<scratch>/home/.config/krowk/config.json",
+    "repo_path": "<scratch>/work/.krowk/config.json"
+  },
+  "summary": "workspace ws_env — KROWK_WORKSPACE",
+  "breadcrumbs": [
+    {
+      "action": "set the workspace",
+      "cmd": "krowk config set workspace \u003cworkspace\u003e",
+      "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
+    }
+  ]
+}
+exit: 0
+

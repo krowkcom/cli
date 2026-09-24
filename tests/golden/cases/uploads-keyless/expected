@@ -1,0 +1,79 @@
+$ krowk uploads create a.txt --quiet
+stdout:
+{
+  "artifacts": [
+    {
+      "slug": "<art_1>",
+      "state": "ready",
+      "filename": "a.txt",
+      "content_type": "text/plain",
+      "byte_size": 5,
+      "checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_1>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_1>/a.txt",
+      "markdown": "[a.txt](http://<registry>/a/<art_1>)",
+      "paste": {
+        "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_1>) · expires <date>",
+        "url": "http://<registry>/a/<art_1>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_1>"
+    }
+  ]
+}
+exit: 0
+
+$ krowk uploads list
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "unauthorized",
+    "fix": "this endpoint needs an API key — run `krowk auth login --token krowk_sk_...`, or set KROWK_TOKEN",
+    "message": "Provide a valid API key as `Authorization: Bearer krowk_sk_...`.",
+    "retryable": false,
+    "status": 401
+  }
+}
+exit: 3
+
+$ krowk uploads show <art_2>
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "not_found",
+    "fix": "no such artifact or run in this workspace — check the slug, and that the key matches the workspace it was uploaded to",
+    "message": "No such record.",
+    "retryable": false,
+    "status": 404
+  }
+}
+exit: 2
+
+$ krowk uploads delete <art_2>
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "missing_claim",
+    "fix": "taking down an anonymous upload needs the claim token it came back with: `krowk uploads delete <art_2> krowk_claim_...` — with an API key, the key is authority enough",
+    "retryable": false
+  }
+}
+exit: 3
+

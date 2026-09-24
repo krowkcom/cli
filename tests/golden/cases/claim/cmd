@@ -1,0 +1,26 @@
+# An anonymous upload is claimed into a workspace by its token, once; into a
+# run when one is named; and a keyless delete is also by token.
+@registry
+@file a.txt hello
+krowk push a.txt
+@let ART .data.artifacts[0].slug
+@let TOKEN .data.artifacts[0].claim_token
+krowk push a.txt
+@let ART2 .data.artifacts[0].slug
+@let TOKEN2 .data.artifacts[0].claim_token
+krowk push a.txt
+@let ART3 .data.artifacts[0].slug
+@let TOKEN3 .data.artifacts[0].claim_token
+krowk claim {ART} {TOKEN}
+@env KROWK_TOKEN=krowk_sk_test
+krowk claim {ART} {TOKEN}
+krowk claim {ART} {TOKEN}
+krowk claim {ART} krowk_claim_0000000000000000000000000000000000000000000000000000000000000000
+krowk runs start --title claimed
+@let RUN .data.slug
+krowk claim {ART2} {TOKEN2} --run {RUN}
+@tty krowk claim {ART2} {TOKEN2}
+@unenv KROWK_TOKEN
+krowk uploads delete {ART3} krowk_claim_0000000000000000000000000000000000000000000000000000000000000000
+krowk uploads delete {ART3} {TOKEN3}
+krowk uploads delete {ART3} {TOKEN3}

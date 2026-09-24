@@ -10,8 +10,28 @@ publish.workspace = true
 default = []
 # The device-side half: krowk.db, import, sync. Off by default so the agent
 # build links none of it.
-sessions = ["dep:krowk-store"]
+sessions = ["dep:krowk-store", "dep:krowk-import"]
 
 [dependencies]
 krowk-api = { path = "../krowk-api" }
 krowk-store = { path = "../krowk-store", optional = true }
+krowk-import = { path = "../krowk-import", optional = true }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: a record read back keeps the key order it arrived in.
+serde_json = { version = "1", features = ["preserve_order"] }
+regex-lite = "0.1"
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+jaq-core = "3"
+jaq-std = "3"
+jaq-json = "2"
+# The two pickers (workspace, session) a person at a terminal may be asked.
+inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
+# `krowk upgrade` unpacks the release archive it downloads.
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+sha2 = "0.11"
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+
+[target.'cfg(unix)'.dependencies]
+# Open flags and errnos per target: their values differ by architecture.
+libc = "0.2"

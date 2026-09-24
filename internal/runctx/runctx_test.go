@@ -83,6 +83,10 @@ func TestRepoURL(t *testing.T) {
 		// A non-GitHub ssh remote gets no URL rather than a guessed one that 404s.
 		"git@gitlab.com:acme/storefront.git": "",
 		"":                                   "",
+		// Credentials in a remote never reach the metadata: it is public.
+		"https://x-access-token:ghs_secret@github.com/acme/storefront.git": "https://github.com/acme/storefront",
+		"https://user@git.acme.dev/acme/storefront":                        "https://git.acme.dev/acme/storefront",
+		"https://a:b@c@github.com":                                         "https://github.com",
 	} {
 		if got := RepoURL(env(nil), in); got != want {
 			t.Errorf("RepoURL(%q) = %q, want %q", in, got, want)

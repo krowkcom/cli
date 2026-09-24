@@ -1,0 +1,3 @@
+@registry
+@env KROWK_TOKEN=krowk_sk_test
+krowk doctor

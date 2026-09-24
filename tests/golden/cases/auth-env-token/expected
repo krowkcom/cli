@@ -1,0 +1,12 @@
+$ krowk auth verify --format human
+stdout:
+✓ key valid  <key_1>
+  workspace   Local workspace (<ws_1>)
+  name        local
+exit: 0
+
+$ krowk auth token --format human
+stdout:
+krowk_sk_env
+exit: 0
+

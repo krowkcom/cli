@@ -1,0 +1,60 @@
+$ krowk bogus
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "unknown_command",
+    "fix": "`bogus` is not a krowk command — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk uploads bogus
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "unknown_command",
+    "fix": "`uploads bogus` is not a krowk command — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk runs
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "unknown_command",
+    "fix": "`runs` is not a krowk command — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk auth
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "unknown_command",
+    "fix": "`auth` is not a krowk command — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk config
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "unknown_command",
+    "fix": "`config` is not a krowk command — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+

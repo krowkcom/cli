@@ -1,0 +1,102 @@
+$ krowk auth token
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "not_authenticated",
+    "fix": "run `krowk auth login --token krowk_sk_...`, or upload anonymously",
+    "retryable": false
+  }
+}
+exit: 3
+
+$ krowk auth verify
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "not_authenticated",
+    "fix": "no key to verify — run `krowk auth login --token krowk_sk_...`, or upload anonymously",
+    "retryable": false
+  }
+}
+exit: 3
+
+$ krowk auth login --token krowk_sk_test
+stdout:
+{
+  "ok": true,
+  "data": {
+    "path": "<scratch>/home/.config/krowk/credentials.json",
+    "confirmed": true,
+    "key_id": "<key_1>",
+    "workspace": "<ws_1>"
+  },
+  "summary": "<key_1> stored, uploads land in <ws_1>",
+  "breadcrumbs": [
+    {
+      "action": "push",
+      "cmd": "krowk push \u003cfile\u003e",
+      "description": "the key is stored and accepted, so nothing else is needed before uploading; \u003cfile\u003e is the path to upload"
+    }
+  ]
+}
+exit: 0
+
+$ krowk auth token
+stdout:
+krowk_sk_test
+exit: 0
+
+$ krowk auth verify
+stdout:
+{
+  "ok": true,
+  "data": {
+    "key_id": "<key_1>",
+    "name": "local",
+    "workspace": "<ws_1>",
+    "workspace_name": "Local workspace"
+  },
+  "summary": "<key_1> in <ws_1>",
+  "breadcrumbs": [
+    {
+      "action": "push",
+      "cmd": "krowk push \u003cfile\u003e",
+      "description": "the key works, so an upload with it lands in that workspace and does not expire; \u003cfile\u003e is the path to upload"
+    }
+  ]
+}
+exit: 0
+
+@ls {home}
+.config/
+.config/krowk/
+.config/krowk/credentials.json 600
+
+$ krowk auth token
+stdout:
+krowk_sk_other
+exit: 0
+
+$ krowk auth verify
+stdout:
+{
+  "ok": true,
+  "data": {
+    "key_id": "<key_2>",
+    "name": "local",
+    "workspace": "<ws_2>",
+    "workspace_name": "Local workspace"
+  },
+  "summary": "<key_2> in <ws_2>",
+  "breadcrumbs": [
+    {
+      "action": "push",
+      "cmd": "krowk push \u003cfile\u003e",
+      "description": "the key works, so an upload with it lands in that workspace and does not expire; \u003cfile\u003e is the path to upload"
+    }
+  ]
+}
+exit: 0
+

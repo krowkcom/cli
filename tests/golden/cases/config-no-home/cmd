@@ -1,0 +1,8 @@
+# With no HOME the config directory is .krowk beside the caller.
+@unenv HOME
+@sh mkdir -p .git
+krowk config show
+krowk config set workspace ws_x --global
+@ls {work}
+krowk config show
+krowk workspaces

@@ -1,0 +1,421 @@
+$ krowk push --help
+stdout:
+{
+  "name": "push",
+  "usage": "krowk push <file...> [flags]",
+  "summary": "Upload files, get a link for each",
+  "args": [
+    {
+      "name": "file",
+      "summary": "Path to upload",
+      "required": true,
+      "repeated": true
+    }
+  ],
+  "flags": [
+    {
+      "name": "run",
+      "type": "string",
+      "default": "",
+      "usage": "Attach to an existing run instead of opening one. Its slug, or a link carrying it"
+    },
+    {
+      "name": "caption",
+      "type": "string",
+      "default": "",
+      "usage": "What this file shows, recorded on the artifact as `krowk.caption`. Repeat to caption several files, in the order they are given",
+      "repeatable": true
+    },
+    {
+      "name": "destination",
+      "type": "string",
+      "default": "",
+      "usage": "Print what this tool wants pasted into it, e.g. github or slack. A tool krowk has not been told about gets the markdown block"
+    },
+    {
+      "name": "private",
+      "type": "bool",
+      "default": "false",
+      "usage": "Upload where only this workspace can read it. The image still embeds — the byte URL is the capability — but the card opens only for a signed-in member and unfurls nowhere. Needs an API key"
+    },
+    {
+      "name": "pull-request",
+      "type": "string",
+      "default": "",
+      "usage": "Pull request the work belongs to"
+    },
+    {
+      "name": "link",
+      "type": "string",
+      "default": "",
+      "usage": "Link this work is about — the issue, the spec, the discussion. An absolute http(s) URL, repeatable up to 20, recorded on the run as `krowk.links`",
+      "repeatable": true
+    },
+    {
+      "name": "link-title",
+      "type": "string",
+      "default": "",
+      "usage": "What to call the --link before it, instead of its URL. One line",
+      "repeatable": true
+    },
+    {
+      "name": "link-rel",
+      "type": "string",
+      "default": "",
+      "usage": "What the --link before it is: tracks, fixes, spec, discussion, source, supersedes — or a word of your own",
+      "repeatable": true
+    },
+    {
+      "name": "reference",
+      "type": "string",
+      "default": "",
+      "usage": "Related identifier that is not a URL, e.g. a ticket key — repeat for more than one. A URL is a --link",
+      "repeatable": true
+    },
+    {
+      "name": "session",
+      "type": "string",
+      "default": "",
+      "usage": "Agent session ID"
+    },
+    {
+      "name": "title",
+      "type": "string",
+      "default": "",
+      "usage": "Title for the work this push belongs to, recorded on the run. What a pasted link says is the artifact's --caption"
+    },
+    {
+      "name": "repo",
+      "type": "string",
+      "default": "",
+      "usage": "Override the detected repository"
+    },
+    {
+      "name": "commit",
+      "type": "string",
+      "default": "",
+      "usage": "Override the detected commit"
+    },
+    {
+      "name": "agent",
+      "type": "string",
+      "default": "",
+      "usage": "Override the detected agent"
+    },
+    {
+      "name": "metadata",
+      "type": "string",
+      "default": "",
+      "usage": "Extra key=value metadata — your value wins over a detected one. Public",
+      "repeatable": true
+    }
+  ]
+}
+exit: 0
+
+$ krowk runs start --help
+stdout:
+{
+  "name": "runs start",
+  "usage": "krowk runs start [flags]",
+  "summary": "Open a run to group uploads under",
+  "flags": [
+    {
+      "name": "pull-request",
+      "type": "string",
+      "default": "",
+      "usage": "Pull request the work belongs to"
+    },
+    {
+      "name": "link",
+      "type": "string",
+      "default": "",
+      "usage": "Link this work is about — the issue, the spec, the discussion. An absolute http(s) URL, repeatable up to 20, recorded on the run as `krowk.links`",
+      "repeatable": true
+    },
+    {
+      "name": "link-title",
+      "type": "string",
+      "default": "",
+      "usage": "What to call the --link before it, instead of its URL. One line",
+      "repeatable": true
+    },
+    {
+      "name": "link-rel",
+      "type": "string",
+      "default": "",
+      "usage": "What the --link before it is: tracks, fixes, spec, discussion, source, supersedes — or a word of your own",
+      "repeatable": true
+    },
+    {
+      "name": "reference",
+      "type": "string",
+      "default": "",
+      "usage": "Related identifier that is not a URL, e.g. a ticket key — repeat for more than one. A URL is a --link",
+      "repeatable": true
+    },
+    {
+      "name": "session",
+      "type": "string",
+      "default": "",
+      "usage": "Agent session ID"
+    },
+    {
+      "name": "title",
+      "type": "string",
+      "default": "",
+      "usage": "Title for the work this push belongs to, recorded on the run. What a pasted link says is the artifact's --caption"
+    },
+    {
+      "name": "repo",
+      "type": "string",
+      "default": "",
+      "usage": "Override the detected repository"
+    },
+    {
+      "name": "commit",
+      "type": "string",
+      "default": "",
+      "usage": "Override the detected commit"
+    },
+    {
+      "name": "agent",
+      "type": "string",
+      "default": "",
+      "usage": "Override the detected agent"
+    },
+    {
+      "name": "metadata",
+      "type": "string",
+      "default": "",
+      "usage": "Extra key=value metadata — your value wins over a detected one. Public",
+      "repeatable": true
+    }
+  ]
+}
+exit: 0
+
+$ krowk sessions import --help
+stdout:
+{
+  "name": "sessions import",
+  "usage": "krowk sessions import --from <provider|all> [--dry-run] [--limit N]",
+  "summary": "Read agent transcripts on this machine into the local store",
+  "flags": [
+    {
+      "name": "from",
+      "type": "string",
+      "default": "",
+      "usage": "Which transcripts to read: claude, cursor, opencode, or all. Required"
+    },
+    {
+      "name": "dry-run",
+      "type": "bool",
+      "default": "false",
+      "usage": "Count what would be imported and write nothing"
+    },
+    {
+      "name": "limit",
+      "type": "int",
+      "default": "0",
+      "usage": "Read at most this many transcripts per source (0 is all)"
+    }
+  ]
+}
+exit: 0
+
+$ krowk uploads --help
+stdout:
+{
+  "name": "uploads",
+  "summary": "Work with uploads",
+  "subcommands": [
+    {
+      "name": "create",
+      "usage": "krowk uploads create <file...> [flags]",
+      "summary": "The same thing, spelled out",
+      "args": [
+        {
+          "name": "file",
+          "summary": "Path to upload",
+          "required": true,
+          "repeated": true
+        }
+      ],
+      "flags": [
+        {
+          "name": "run",
+          "type": "string",
+          "default": "",
+          "usage": "Attach to an existing run instead of opening one. Its slug, or a link carrying it"
+        },
+        {
+          "name": "caption",
+          "type": "string",
+          "default": "",
+          "usage": "What this file shows, recorded on the artifact as `krowk.caption`. Repeat to caption several files, in the order they are given",
+          "repeatable": true
+        },
+        {
+          "name": "destination",
+          "type": "string",
+          "default": "",
+          "usage": "Print what this tool wants pasted into it, e.g. github or slack. A tool krowk has not been told about gets the markdown block"
+        },
+        {
+          "name": "private",
+          "type": "bool",
+          "default": "false",
+          "usage": "Upload where only this workspace can read it. The image still embeds — the byte URL is the capability — but the card opens only for a signed-in member and unfurls nowhere. Needs an API key"
+        },
+        {
+          "name": "pull-request",
+          "type": "string",
+          "default": "",
+          "usage": "Pull request the work belongs to"
+        },
+        {
+          "name": "link",
+          "type": "string",
+          "default": "",
+          "usage": "Link this work is about — the issue, the spec, the discussion. An absolute http(s) URL, repeatable up to 20, recorded on the run as `krowk.links`",
+          "repeatable": true
+        },
+        {
+          "name": "link-title",
+          "type": "string",
+          "default": "",
+          "usage": "What to call the --link before it, instead of its URL. One line",
+          "repeatable": true
+        },
+        {
+          "name": "link-rel",
+          "type": "string",
+          "default": "",
+          "usage": "What the --link before it is: tracks, fixes, spec, discussion, source, supersedes — or a word of your own",
+          "repeatable": true
+        },
+        {
+          "name": "reference",
+          "type": "string",
+          "default": "",
+          "usage": "Related identifier that is not a URL, e.g. a ticket key — repeat for more than one. A URL is a --link",
+          "repeatable": true
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "default": "",
+          "usage": "Agent session ID"
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "default": "",
+          "usage": "Title for the work this push belongs to, recorded on the run. What a pasted link says is the artifact's --caption"
+        },
+        {
+          "name": "repo",
+          "type": "string",
+          "default": "",
+          "usage": "Override the detected repository"
+        },
+        {
+          "name": "commit",
+          "type": "string",
+          "default": "",
+          "usage": "Override the detected commit"
+        },
+        {
+          "name": "agent",
+          "type": "string",
+          "default": "",
+          "usage": "Override the detected agent"
+        },
+        {
+          "name": "metadata",
+          "type": "string",
+          "default": "",
+          "usage": "Extra key=value metadata — your value wins over a detected one. Public",
+          "repeatable": true
+        }
+      ]
+    },
+    {
+      "name": "list",
+      "usage": "krowk uploads list [flags]",
+      "summary": "List uploads, newest first — a run's, or the workspace's",
+      "flags": [
+        {
+          "name": "limit",
+          "type": "int",
+          "default": "50",
+          "usage": "Rows per page (1–100)"
+        },
+        {
+          "name": "before",
+          "type": "string",
+          "default": "",
+          "usage": "Start after this row — the `next` of the last page"
+        },
+        {
+          "name": "run",
+          "type": "string",
+          "default": "",
+          "usage": "Narrow it to what one run produced. Its slug, or a link carrying it"
+        }
+      ]
+    },
+    {
+      "name": "show",
+      "usage": "krowk uploads show <artifact>",
+      "summary": "Read one artifact back",
+      "args": [
+        {
+          "name": "artifact",
+          "summary": "The artifact slug, or a link carrying it — the card page or the CDN URL",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "attach",
+      "usage": "krowk uploads attach <art> --run <run>",
+      "summary": "Put an upload under a run afterwards",
+      "args": [
+        {
+          "name": "artifact",
+          "summary": "The artifact slug, or a link carrying it — the card page or the CDN URL",
+          "required": true
+        }
+      ],
+      "flags": [
+        {
+          "name": "run",
+          "type": "string",
+          "default": "",
+          "usage": "The run to put it under — required, and it must be one this workspace holds. Its slug, or a link carrying it"
+        }
+      ]
+    },
+    {
+      "name": "delete",
+      "usage": "krowk uploads delete <art> [token]",
+      "summary": "Take an upload down — immediate, cannot be undone",
+      "args": [
+        {
+          "name": "artifact",
+          "summary": "The artifact slug, or a link carrying it — the card page or the CDN URL",
+          "required": true
+        },
+        {
+          "name": "claim-token",
+          "summary": "The claim token an anonymous upload came back with, when there is no key to authorise the takedown",
+          "required": false
+        }
+      ]
+    }
+  ]
+}
+exit: 0
+

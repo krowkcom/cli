@@ -39,8 +39,11 @@ func sessionsRebuild(w io.Writer, format output.Format, f flags, env runctx.Env,
 	}
 	prompt := !f.yes && stdinIsTerminal() && interactive(f, format, env, isTTY)
 	if !f.yes && !prompt {
-		return api.Fail("confirmation_required", "`krowk sessions rebuild` deletes "+storePath+
-			" and re-imports every transcript — pass --yes to confirm when nobody is at a terminal to ask")
+		// The command to run is the only backticked span, because the human
+		// renderer offers the first one as "try:" — and the bare command is the
+		// one that just refused.
+		return api.Fail("confirmation_required", "rebuilding deletes "+storePath+
+			" and re-imports every transcript — run `krowk sessions rebuild --yes` to confirm when nobody is at a terminal to ask")
 	}
 
 	// Asked before the lock is taken, so a question left on screen does not

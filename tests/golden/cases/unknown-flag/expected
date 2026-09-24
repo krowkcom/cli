@@ -1,0 +1,36 @@
+$ krowk push --nope a.txt
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "flag provided but not defined: -nope — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk --nope
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "flag provided but not defined: -nope — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk sessions --limit notanumber
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "invalid value \"notanumber\" for flag -limit: parse error — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+

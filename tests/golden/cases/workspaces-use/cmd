@@ -1,0 +1,25 @@
+# Two stored keys; the default moves with `use`, and --workspace and
+# KROWK_WORKSPACE pick one per command.
+@registry
+krowk auth login --token krowk_sk_first
+@let WS1 .data.workspace
+krowk auth login --token krowk_sk_second
+@let WS2 .data.workspace
+krowk workspaces
+krowk workspaces use {WS1}
+krowk workspaces
+@cat {home}/.config/krowk/credentials.json
+krowk auth verify
+krowk auth verify --workspace {WS2}
+@env KROWK_WORKSPACE={WS2}
+krowk auth verify
+krowk auth verify --workspace {WS1}
+krowk auth verify --workspace ws_unknown000000000000000
+@unenv KROWK_WORKSPACE
+@sh mkdir -p .git
+krowk config set workspace {WS2}
+krowk auth verify
+@file a.txt hello
+krowk push a.txt --jq '.data.artifacts[0].file_url'
+krowk workspaces --format human
+@tty krowk workspaces

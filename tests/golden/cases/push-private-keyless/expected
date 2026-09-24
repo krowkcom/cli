@@ -1,0 +1,12 @@
+$ krowk push a.txt --private
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "private_needs_key",
+    "fix": "a private upload needs an API key: a keyless upload lands in the shared anonymous workspace, which nobody is a member of, so there is nothing for it to be private to — run `krowk auth login`, or push it public",
+    "retryable": false
+  }
+}
+exit: 4
+

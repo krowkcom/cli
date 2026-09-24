@@ -1,0 +1,597 @@
+$ krowk push f.png f.jpg f.gif f.webp f.svg f.html f.md f.txt f.json f.log f.diff f.patch f.csv f.pdf f.mp4 f.webm f.mov f.zip f.unknownext --quiet
+stdout:
+{
+  "artifacts": [
+    {
+      "slug": "<art_1>",
+      "state": "ready",
+      "filename": "f.png",
+      "content_type": "image/png",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_1>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_1>/f.png",
+      "markdown": "[![f.png](http://<registry>/_storage/weur/<ws_1>/<art_1>/f.png)](http://<registry>/a/<art_1>)",
+      "paste": {
+        "markdown": "[![f.png](http://<registry>/_storage/weur/<ws_1>/<art_1>/f.png)](http://<registry>/a/<art_1>)\nf.png · [View preview ↗](http://<registry>/a/<art_1>) · expires <date>",
+        "url": "http://<registry>/a/<art_1>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_1>"
+    },
+    {
+      "slug": "<art_2>",
+      "state": "ready",
+      "filename": "f.jpg",
+      "content_type": "image/jpeg",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_2>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_2>/f.jpg",
+      "markdown": "[![f.jpg](http://<registry>/_storage/weur/<ws_1>/<art_2>/f.jpg)](http://<registry>/a/<art_2>)",
+      "paste": {
+        "markdown": "[![f.jpg](http://<registry>/_storage/weur/<ws_1>/<art_2>/f.jpg)](http://<registry>/a/<art_2>)\nf.jpg · [View preview ↗](http://<registry>/a/<art_2>) · expires <date>",
+        "url": "http://<registry>/a/<art_2>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_2>"
+    },
+    {
+      "slug": "<art_3>",
+      "state": "ready",
+      "filename": "f.gif",
+      "content_type": "image/gif",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_3>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_3>/f.gif",
+      "markdown": "[![f.gif](http://<registry>/_storage/weur/<ws_1>/<art_3>/f.gif)](http://<registry>/a/<art_3>)",
+      "paste": {
+        "markdown": "[![f.gif](http://<registry>/_storage/weur/<ws_1>/<art_3>/f.gif)](http://<registry>/a/<art_3>)\nf.gif · [View preview ↗](http://<registry>/a/<art_3>) · expires <date>",
+        "url": "http://<registry>/a/<art_3>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_3>"
+    },
+    {
+      "slug": "<art_4>",
+      "state": "ready",
+      "filename": "f.webp",
+      "content_type": "image/webp",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_4>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_4>/f.webp",
+      "markdown": "[![f.webp](http://<registry>/_storage/weur/<ws_1>/<art_4>/f.webp)](http://<registry>/a/<art_4>)",
+      "paste": {
+        "markdown": "[![f.webp](http://<registry>/_storage/weur/<ws_1>/<art_4>/f.webp)](http://<registry>/a/<art_4>)\nf.webp · [View preview ↗](http://<registry>/a/<art_4>) · expires <date>",
+        "url": "http://<registry>/a/<art_4>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_4>"
+    },
+    {
+      "slug": "<art_5>",
+      "state": "ready",
+      "filename": "f.svg",
+      "content_type": "image/svg+xml",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_5>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_5>/f.svg",
+      "markdown": "[![f.svg](http://<registry>/_storage/weur/<ws_1>/<art_5>/f.svg)](http://<registry>/a/<art_5>)",
+      "paste": {
+        "markdown": "[![f.svg](http://<registry>/_storage/weur/<ws_1>/<art_5>/f.svg)](http://<registry>/a/<art_5>)\nf.svg · [View preview ↗](http://<registry>/a/<art_5>) · expires <date>",
+        "url": "http://<registry>/a/<art_5>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_5>"
+    },
+    {
+      "slug": "<art_6>",
+      "state": "ready",
+      "filename": "f.html",
+      "content_type": "text/html",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_6>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_6>/f.html",
+      "markdown": "[f.html](http://<registry>/a/<art_6>)",
+      "paste": {
+        "markdown": "**f.html** · [View preview ↗](http://<registry>/a/<art_6>) · expires <date>",
+        "url": "http://<registry>/a/<art_6>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_6>"
+    },
+    {
+      "slug": "<art_7>",
+      "state": "ready",
+      "filename": "f.md",
+      "content_type": "text/markdown",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_7>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_7>/f.md",
+      "markdown": "[f.md](http://<registry>/a/<art_7>)",
+      "paste": {
+        "markdown": "**f.md** · [View preview ↗](http://<registry>/a/<art_7>) · expires <date>",
+        "url": "http://<registry>/a/<art_7>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_7>"
+    },
+    {
+      "slug": "<art_8>",
+      "state": "ready",
+      "filename": "f.txt",
+      "content_type": "text/plain",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_8>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_8>/f.txt",
+      "markdown": "[f.txt](http://<registry>/a/<art_8>)",
+      "paste": {
+        "markdown": "**f.txt** · [View preview ↗](http://<registry>/a/<art_8>) · expires <date>",
+        "url": "http://<registry>/a/<art_8>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_8>"
+    },
+    {
+      "slug": "<art_9>",
+      "state": "ready",
+      "filename": "f.json",
+      "content_type": "application/json",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_9>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_9>/f.json",
+      "markdown": "[f.json](http://<registry>/a/<art_9>)",
+      "paste": {
+        "markdown": "**f.json** · [View preview ↗](http://<registry>/a/<art_9>) · expires <date>",
+        "url": "http://<registry>/a/<art_9>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_9>"
+    },
+    {
+      "slug": "<art_10>",
+      "state": "ready",
+      "filename": "f.log",
+      "content_type": "text/plain",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_10>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_10>/f.log",
+      "markdown": "[f.log](http://<registry>/a/<art_10>)",
+      "paste": {
+        "markdown": "**f.log** · [View preview ↗](http://<registry>/a/<art_10>) · expires <date>",
+        "url": "http://<registry>/a/<art_10>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_10>"
+    },
+    {
+      "slug": "<art_11>",
+      "state": "ready",
+      "filename": "f.diff",
+      "content_type": "application/octet-stream",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_11>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_11>/f.diff",
+      "markdown": "[f.diff](http://<registry>/a/<art_11>)",
+      "paste": {
+        "markdown": "**f.diff** · [View preview ↗](http://<registry>/a/<art_11>) · expires <date>",
+        "url": "http://<registry>/a/<art_11>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_11>"
+    },
+    {
+      "slug": "<art_12>",
+      "state": "ready",
+      "filename": "f.patch",
+      "content_type": "application/octet-stream",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_12>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_12>/f.patch",
+      "markdown": "[f.patch](http://<registry>/a/<art_12>)",
+      "paste": {
+        "markdown": "**f.patch** · [View preview ↗](http://<registry>/a/<art_12>) · expires <date>",
+        "url": "http://<registry>/a/<art_12>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_12>"
+    },
+    {
+      "slug": "<art_13>",
+      "state": "ready",
+      "filename": "f.csv",
+      "content_type": "text/csv",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_13>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_13>/f.csv",
+      "markdown": "[f.csv](http://<registry>/a/<art_13>)",
+      "paste": {
+        "markdown": "**f.csv** · [View preview ↗](http://<registry>/a/<art_13>) · expires <date>",
+        "url": "http://<registry>/a/<art_13>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_13>"
+    },
+    {
+      "slug": "<art_14>",
+      "state": "ready",
+      "filename": "f.pdf",
+      "content_type": "application/pdf",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_14>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_14>/f.pdf",
+      "markdown": "[f.pdf](http://<registry>/a/<art_14>)",
+      "paste": {
+        "markdown": "**f.pdf** · [View preview ↗](http://<registry>/a/<art_14>) · expires <date>",
+        "url": "http://<registry>/a/<art_14>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_14>"
+    },
+    {
+      "slug": "<art_15>",
+      "state": "ready",
+      "filename": "f.mp4",
+      "content_type": "video/mp4",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_15>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_15>/f.mp4",
+      "markdown": "[f.mp4](http://<registry>/a/<art_15>)",
+      "paste": {
+        "markdown": "**f.mp4** · [View preview ↗](http://<registry>/a/<art_15>) · expires <date>",
+        "url": "http://<registry>/a/<art_15>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_15>"
+    },
+    {
+      "slug": "<art_16>",
+      "state": "ready",
+      "filename": "f.webm",
+      "content_type": "audio/webm",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_16>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_16>/f.webm",
+      "markdown": "[f.webm](http://<registry>/a/<art_16>)",
+      "paste": {
+        "markdown": "**f.webm** · [View preview ↗](http://<registry>/a/<art_16>) · expires <date>",
+        "url": "http://<registry>/a/<art_16>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_16>"
+    },
+    {
+      "slug": "<art_17>",
+      "state": "ready",
+      "filename": "f.mov",
+      "content_type": "video/quicktime",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_17>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_17>/f.mov",
+      "markdown": "[f.mov](http://<registry>/a/<art_17>)",
+      "paste": {
+        "markdown": "**f.mov** · [View preview ↗](http://<registry>/a/<art_17>) · expires <date>",
+        "url": "http://<registry>/a/<art_17>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_17>"
+    },
+    {
+      "slug": "<art_18>",
+      "state": "ready",
+      "filename": "f.zip",
+      "content_type": "application/zip",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_18>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_18>/f.zip",
+      "markdown": "[f.zip](http://<registry>/a/<art_18>)",
+      "paste": {
+        "markdown": "**f.zip** · [View preview ↗](http://<registry>/a/<art_18>) · expires <date>",
+        "url": "http://<registry>/a/<art_18>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_18>"
+    },
+    {
+      "slug": "<art_19>",
+      "state": "ready",
+      "filename": "f.unknownext",
+      "content_type": "application/octet-stream",
+      "byte_size": 1,
+      "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+      "region": "weur",
+      "visibility": "public",
+      "url": "http://<registry>/a/<art_19>",
+      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_19>/f.unknownext",
+      "markdown": "[f.unknownext](http://<registry>/a/<art_19>)",
+      "paste": {
+        "markdown": "**f.unknownext** · [View preview ↗](http://<registry>/a/<art_19>) · expires <date>",
+        "url": "http://<registry>/a/<art_19>",
+        "destinations": {
+          "_default": "markdown",
+          "asana": "url",
+          "basecamp": "url",
+          "github": "markdown",
+          "gitlab": "markdown",
+          "linear": "markdown",
+          "notion": "markdown",
+          "slack": "url"
+        }
+      },
+      "expires_at": "<time>",
+      "created_at": "<time>",
+      "metadata": null,
+      "claim_token": "<claim_19>"
+    }
+  ]
+}
+exit: 0
+

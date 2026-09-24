@@ -1,0 +1,106 @@
+$ krowk sessions
+stdout:
+{
+  "ok": true,
+  "data": {
+    "sessions": []
+  },
+  "summary": "0 sessions"
+}
+exit: 0
+
+$ krowk sessions --format human
+stdout:
+no sessions — run `krowk sessions import --from all`
+[no newline at end]
+exit: 0
+
+$ krowk sessions show nope
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "no_session",
+    "fix": "\"nope\" matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id",
+    "retryable": false
+  }
+}
+exit: 2
+
+$ krowk sessions sync --no-network
+stdout:
+{
+  "ok": true,
+  "data": {
+    "dry_run": false,
+    "store": "<scratch>/home/.local/share/krowk/krowk.db",
+    "providers": [
+      {
+        "provider": "claude",
+        "files": 0,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 0,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      },
+      {
+        "provider": "cursor",
+        "files": 0,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 0,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      },
+      {
+        "provider": "opencode",
+        "files": 0,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 0,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      }
+    ],
+    "duration_ms": <n>,
+    "pricing": {
+      "status": "no_network"
+    }
+  },
+  "summary": "0 files, 0 sessions read, 0 messages read, 0 messages new"
+}
+exit: 0
+
+$ krowk sessions
+stdout:
+{
+  "ok": true,
+  "data": {
+    "sessions": []
+  },
+  "summary": "0 sessions"
+}
+exit: 0
+

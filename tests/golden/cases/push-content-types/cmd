@@ -1,0 +1,22 @@
+@registry
+@file f.png x
+@file f.jpg x
+@file f.gif x
+@file f.webp x
+@file f.svg x
+@file f.html x
+@file f.md x
+@file f.txt x
+@file f.json x
+@file f.log x
+@file f.diff x
+@file f.patch x
+@file f.csv x
+@file f.pdf x
+@file f.mp4 x
+@file f.webm x
+@file f.mov x
+@file f.zip x
+@file f.unknownext x
+
+krowk push f.png f.jpg f.gif f.webp f.svg f.html f.md f.txt f.json f.log f.diff f.patch f.csv f.pdf f.mp4 f.webm f.mov f.zip f.unknownext --quiet

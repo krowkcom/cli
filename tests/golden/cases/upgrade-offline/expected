@@ -1,0 +1,12 @@
+$ krowk upgrade
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "not_upgradable",
+    "fix": "this build came from source (version 0.0.0-golden) — upgrade with `git pull \u0026\u0026 make install`, or `go install github.com/krowkcom/cli/cmd/...@latest`",
+    "retryable": false
+  }
+}
+exit: 1
+

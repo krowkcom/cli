@@ -28,7 +28,32 @@ use std::time::Duration;
 use ureq::http::Uri;
 
 const MAX_ATTEMPTS: u32 = 3;
+
 const MAX_BODY: u64 = 1 << 20;
+
+/// The proxy Go's ProxyFromEnvironment would pick: HTTPS_PROXY for an https
+/// registry, HTTP_PROXY for an http one, ALL_PROXY ignored, NO_PROXY honoured,
+/// and loopback never proxied. ureq's own reading takes whichever variable is
+/// set first for every scheme, which would route https through an http-only
+/// proxy a CI job configured.
+fn proxy_for(base_url: &str) -> Option<ureq::Proxy> {
+    let var = |names: &[&str]| names.iter().find_map(|n| std::env::var(n).ok().filter(|v| !v.trim().is_empty()));
+    let raw = if base_url.starts_with("https://") { var(&["HTTPS_PROXY", "https_proxy"]) } else { var(&["HTTP_PROXY", "http_proxy"]) }?;
+    let raw = if raw.contains("://") { raw } else { format!("http://{raw}") };
+    let parsed = ureq::Proxy::new(&raw).ok()?;
+    let no_proxy = var(&["NO_PROXY", "no_proxy"]).unwrap_or_default();
+    let mut b = ureq::Proxy::builder(parsed.protocol())
+        .host(parsed.host())
+        .port(parsed.port())
+        .no_proxy(&format!("localhost,127.0.0.1,::1{}{no_proxy}", if no_proxy.is_empty() { "" } else { "," }));
+    if let Some(user) = parsed.username() {
+        b = b.username(user);
+    }
+    if let Some(password) = parsed.password() {
+        b = b.password(password);
+    }
+    b.build().ok()
+}
 
 /// One CLI invocation's client. It holds no state between calls.
 pub struct Client {
@@ -43,7 +68,7 @@ impl Client {
     /// A client against `base_url` (the public registry when empty).
     pub fn new(base_url: &str, token: &str) -> Client {
         let base_url = if base_url.is_empty() { crate::DEFAULT_BASE_URL } else { base_url }.trim_end_matches('/').to_string();
-        let proxy = ureq::Proxy::try_from_env();
+        let proxy = proxy_for(&base_url);
         let guard = Guard { base: base_url.clone(), proxy: proxy.as_ref().map(|p| (p.host().to_string(), p.port())) };
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -133,7 +158,7 @@ impl Client {
     /// Idempotency-Key so a retry after a lost response is the same declare.
     pub fn prepare_artifact(&self, spec: &Spec) -> Result<Artifact, Error> {
         let body = json!({ "artifact": spec });
-        Ok(self.call("POST", "/artifacts", Some(body), MAX_ATTEMPTS, Some(idempotency_key()))?.0)
+        Ok(self.call("POST", "/artifacts", Some(body), MAX_ATTEMPTS, Some(idempotency_key()?))?.0)
     }
 
     /// Mints the upload again over the same slug. A keyless caller's authority
@@ -190,16 +215,17 @@ impl Client {
     /// both, the registry reads the key and looks in the wrong workspace.
     pub fn take_down_artifact(&self, slug: &str, claim_token: &str) -> Result<(), Error> {
         let path = format!("/artifacts/{}", slug_path(slug));
-        if claim_token.is_empty() {
-            return self.call::<Value>("DELETE", &path, None, MAX_ATTEMPTS, None).map(|_| ());
-        }
-        self.keyless().call::<Value>("DELETE", &path, Some(json!({ "claim_token": claim_token })), MAX_ATTEMPTS, None).map(|_| ())
+        // Nothing comes back but a 204, so any success is one: a proxy that
+        // answers a DELETE with a text body has not undone the takedown.
+        let (client, body) = if claim_token.is_empty() { (None, None) } else { (Some(self.keyless()), Some(json!({ "claim_token": claim_token }))) };
+        let client = client.as_ref().unwrap_or(self);
+        client.request_raw("DELETE", &format!("{}{path}", client.base_url), body, MAX_ATTEMPTS, None).map(|_| ())
     }
 
     /// Opens a run, under an Idempotency-Key so a retry is the same run.
     pub fn create_run(&self, metadata: &Value) -> Result<Run, Error> {
         let body = json!({ "run": { "metadata": metadata } });
-        Ok(self.call("POST", "/runs", Some(body), MAX_ATTEMPTS, Some(idempotency_key()))?.0)
+        Ok(self.call("POST", "/runs", Some(body), MAX_ATTEMPTS, Some(idempotency_key()?))?.0)
     }
 
     pub fn finish_run(&self, slug: &str) -> Result<Run, Error> {
@@ -239,18 +265,23 @@ impl Client {
         attempts: u32,
         idempotency: Option<String>,
     ) -> Result<(T, u16), Error> {
+        let (status, bytes) = self.request_raw(method, url, body, attempts, idempotency)?;
+        let value = if bytes.iter().all(u8::is_ascii_whitespace) {
+            // A 204 carries nothing, which reads as an empty record.
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_slice(&bytes).map_err(|_| malformed_success(status))?
+        };
+        serde_json::from_value(value).map(|v| (v, status)).map_err(|_| malformed_success(status))
+    }
+
+    /// The status and body of a success, retried; the body not read as anything.
+    fn request_raw(&self, method: &str, url: &str, body: Option<Value>, attempts: u32, idempotency: Option<String>) -> Result<(u16, Vec<u8>), Error> {
         let payload = body.map(|b| serde_json::to_vec(&b).expect("request body serializes"));
         let mut last = None;
         for attempt in 1..=attempts {
             match self.once(method, url, payload.as_deref(), idempotency.as_deref()) {
-                Ok((status, bytes)) => {
-                    let value = if bytes.iter().all(u8::is_ascii_whitespace) { Value::Null } else {
-                        serde_json::from_slice(&bytes).map_err(|_| malformed_success(status))?
-                    };
-                    // A 204 carries nothing, which reads as an empty record.
-                    let value = if value.is_null() { Value::Object(Map::new()) } else { value };
-                    return serde_json::from_value(value).map(|v| (v, status)).map_err(|_| malformed_success(status));
-                }
+                Ok(success) => return Ok(success),
                 Err(e) => {
                     if !e.retryable() || attempt == attempts {
                         return Err(e);
@@ -452,7 +483,11 @@ impl Client {
         let mut req = ureq::http::Request::builder().method("PUT").uri(endpoint);
         for (k, v) in upload.and_then(|u| u.headers.as_ref()).into_iter().flatten() {
             // Content-Length is signed too, and comes off the body's own size.
-            if !k.eq_ignore_ascii_case("content-length") {
+            // The hop-by-hop and routing headers are the transport's, never a
+            // response body's: a registry-chosen Host picks which site answers
+            // at the address the resolver checked, and Transfer-Encoding beside
+            // a Content-Length is how a request is smuggled.
+            if !transport_header(k) {
                 req = req.header(k.as_str(), v.as_str());
             }
         }
@@ -523,6 +558,12 @@ impl Client {
     fn is_local(&self) -> bool {
         parse(&self.base_url).is_some_and(|b| is_loopback(&b.host))
     }
+}
+
+fn transport_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(name.as_str(), "content-length" | "host" | "transfer-encoding" | "connection" | "te" | "upgrade" | "keep-alive" | "trailer")
+        || name.starts_with("proxy-")
 }
 
 fn header(res: &ureq::http::Response<ureq::Body>, name: &str) -> String {
@@ -659,7 +700,12 @@ pub fn retry_after(v: &str) -> Option<Duration> {
     if let Ok(secs) = v.parse::<i64>() {
         return (secs > 0).then(|| Duration::from_secs(secs as u64).min(MAX));
     }
-    let at = jiff::fmt::rfc2822::parse(v).ok()?.timestamp();
+    // HTTP allows three date spellings: IMF-fixdate, RFC 850 and asctime.
+    let at = jiff::fmt::rfc2822::parse(v)
+        .map(|z| z.timestamp())
+        .or_else(|_| jiff::fmt::strtime::parse("%A, %d-%b-%y %H:%M:%S GMT", v).and_then(|t| t.to_datetime()).and_then(|d| d.to_zoned(jiff::tz::TimeZone::UTC)).map(|z| z.timestamp()))
+        .or_else(|_| jiff::fmt::strtime::parse("%a %b %e %H:%M:%S %Y", v).and_then(|t| t.to_datetime()).and_then(|d| d.to_zoned(jiff::tz::TimeZone::UTC)).map(|z| z.timestamp()))
+        .ok()?;
     let wait = at.duration_since(jiff::Timestamp::now());
     (wait.is_positive()).then(|| Duration::try_from(wait).unwrap_or(MAX).min(MAX))
 }
@@ -689,19 +735,15 @@ fn clip(s: &str, n: usize) -> String {
 /// 128 random bits shaped as a v4 UUID. Unguessable, not merely unique: on a
 /// keyless push it is the only thing a retry presents to prove it made the
 /// original call.
-fn idempotency_key() -> String {
+fn idempotency_key() -> Result<String, Error> {
     let mut b = [0u8; 16];
-    getrandom(&mut b);
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).map_err(|_| {
+        fail("no_idempotency_key", "this machine's random source is unreadable, so a retry could not be named safely")
+    })?;
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
-}
-
-/// The operating system's random source.
-fn getrandom(buf: &mut [u8]) {
-    use std::io::Read as _;
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)).expect("the OS random source is readable");
+    Ok(format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32]))
 }
 
 /// A slug as one URL path segment: `#`, `?` and `/` in what a caller typed
@@ -757,16 +799,34 @@ fn on_origin(base: &Url, u: &Url) -> bool {
     (u.scheme == base.scheme && u.port == base.port) || (base.scheme == "http" && u.scheme == "https" && u.port == 443)
 }
 
+/// A Location resolved against the URL it came back on, per RFC 3986: an
+/// absolute URL as it is, `//host/x` on the same scheme, `/x` on the same
+/// origin, `?q` on the same path, and `x` beside the current path.
 fn resolve_location(from: &str, location: &str) -> Option<String> {
     if location.is_empty() {
         return None;
     }
-    if location.contains("://") {
+    let is_absolute = location.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) && !scheme.contains('/')
+    }) && location.split(['/', '?', '#']).next().is_some_and(|first| first.contains(':'));
+    if is_absolute {
         return Some(location.to_string());
     }
     let u = parse(from)?;
+    if let Some(rest) = location.strip_prefix("//") {
+        return Some(format!("{}://{rest}", u.scheme));
+    }
     let origin = format!("{}://{}", u.scheme, u.authority);
-    Some(if location.starts_with('/') { format!("{origin}{location}") } else { format!("{origin}/{location}") })
+    let path = from.split_once("://").map(|(_, r)| r).and_then(|r| r.find('/').map(|i| &r[i..])).unwrap_or("/");
+    let path = path.split(['?', '#']).next().unwrap_or("/");
+    Some(if location.starts_with('/') {
+        format!("{origin}{location}")
+    } else if location.starts_with('?') {
+        format!("{origin}{path}{location}")
+    } else {
+        let dir = &path[..path.rfind('/').map_or(0, |i| i + 1)];
+        format!("{origin}{}{location}", if dir.is_empty() { "/" } else { dir })
+    })
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -836,10 +896,15 @@ impl Guard {
             return Ok(());
         }
         let host = uri.host().unwrap_or_default().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
-        if base.as_ref().is_some_and(|b| b.host == host) {
+        // The registry's own host, on its own port — or 443 for the https
+        // upgrade of an http base. Any other port on that host is somewhere else.
+        if base.as_ref().is_some_and(|b| b.host == host && (addr.port() == b.port || (b.scheme == "http" && addr.port() == 443))) {
             return Ok(());
         }
-        if self.proxy.as_ref().is_some_and(|(h, _)| h.eq_ignore_ascii_case(&host)) {
+        // The proxy, on its own port. ureq resolves the proxy's URI only when it
+        // is dialling the proxy; a request NO_PROXY sent direct resolves its
+        // target, and naming the proxy's host on another port earns nothing.
+        if self.proxy.as_ref().is_some_and(|(h, p)| h.eq_ignore_ascii_case(&host) && addr.port() == *p) {
             return Ok(());
         }
         Err(fail("untrusted_endpoint", format!("refusing to connect to {addr}, which is inside this machine or its network")))
@@ -918,8 +983,212 @@ mod tests {
 
     #[test]
     fn idempotency_keys_are_v4_uuids_and_differ() {
-        let (a, b) = (idempotency_key(), idempotency_key());
+        let (a, b) = (idempotency_key().unwrap(), idempotency_key().unwrap());
         assert_ne!(a, b);
         assert_eq!((a.len(), &a[14..15]), (36, "4"));
+    }
+}
+
+#[cfg(test)]
+mod boundary {
+    //! The boundary held against a real socket: a tiny HTTP server answering
+    //! scripted responses and recording what arrived.
+    use super::*;
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// Answers each connection with the next scripted response (the last
+    /// repeats), recording each request's head and body.
+    fn server(responses: Vec<String>) -> (u16, Log) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log: Log = Arc::default();
+        let seen = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut head, mut length) = (String::new(), 0usize);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                    head.push_str(&line);
+                }
+                let mut body = vec![0; length];
+                let _ = std::io::Read::read_exact(&mut reader, &mut body);
+                seen.lock().unwrap().push(format!("{head}\n{}", String::from_utf8_lossy(&body)));
+                let response = &responses[i.min(responses.len() - 1)];
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (port, log)
+    }
+
+    fn respond(status: &str, headers: &str, body: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}", body.len())
+    }
+
+    fn quiet(mut c: Client) -> Client {
+        c.sleep = |_| {};
+        c
+    }
+
+    fn guard(base: &str, proxy: Option<(&str, u16)>) -> Guard {
+        Guard { base: base.into(), proxy: proxy.map(|(h, p)| (h.into(), p)) }
+    }
+
+    fn uri(s: &str) -> Uri {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn the_api_host_is_exempt_on_its_own_port_and_the_https_upgrade_only() {
+        let g = guard("https://api.example.com/v1", None);
+        assert!(g.permit(&uri("https://api.example.com/x"), "10.0.0.1:443".parse().unwrap()).is_ok());
+        assert!(g.permit(&uri("https://api.example.com:6379/x"), "10.0.0.1:6379".parse().unwrap()).is_err());
+        let plain = guard("http://registry.internal/v1", None);
+        assert!(plain.permit(&uri("http://registry.internal/x"), "10.0.0.1:80".parse().unwrap()).is_ok());
+        assert!(plain.permit(&uri("https://registry.internal/x"), "10.0.0.1:443".parse().unwrap()).is_ok());
+        assert!(plain.permit(&uri("http://registry.internal:8080/x"), "10.0.0.1:8080".parse().unwrap()).is_err());
+        assert!(g.permit(&uri("https://cdn.example.com/x"), "1.1.1.1:443".parse().unwrap()).is_ok());
+        assert!(g.permit(&uri("https://cdn.example.com/x"), "169.254.169.254:443".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn the_proxy_is_exempt_on_its_own_port_only() {
+        let g = guard("https://api.krowk.com/v1", Some(("proxy.corp", 3128)));
+        assert!(g.permit(&uri("http://proxy.corp:3128"), "10.0.0.2:3128".parse().unwrap()).is_ok());
+        assert!(g.permit(&uri("http://proxy.corp:9999/secret"), "10.0.0.2:9999".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_public_registry_never_dials_loopback_however_it_is_spelled() {
+        let (port, _) = server(vec![respond("200 OK", "", "{}")]);
+        let c = quiet(Client::new("https://api.krowk.com/v1", ""));
+        for target in [format!("http://127.0.0.1:{port}/"), format!("http://[::1]:{port}/"), format!("http://localhost:{port}/")] {
+            let e = c.request_url::<Value>("GET", &target, None, 1, None).unwrap_err();
+            assert_eq!(e.code(), "untrusted_endpoint", "{target}");
+        }
+    }
+
+    #[test]
+    fn redirects_stay_on_the_api_origin_and_same_port() {
+        let (other, _) = server(vec![respond("200 OK", "", "{}")]);
+        let (port, log) = server(vec![
+            respond("302 Found", "Location: /v1/moved\r\n", ""),
+            respond("200 OK", "", "{}"),
+            respond("302 Found", &format!("Location: http://127.0.0.1:{other}/x\r\n"), ""),
+            respond("302 Found", "Location: http://evil.example/x\r\n", ""),
+        ]);
+        let c = quiet(Client::new(&format!("http://127.0.0.1:{port}/v1"), ""));
+        assert!(c.request_url::<Value>("GET", &format!("http://127.0.0.1:{port}/v1/x"), None, 1, None).is_ok());
+        assert!(log.lock().unwrap()[1].starts_with("GET /v1/moved "));
+        assert_eq!(c.request_url::<Value>("GET", &format!("http://127.0.0.1:{port}/v1/x"), None, 1, None).unwrap_err().code(), "unexpected_redirect");
+        assert_eq!(c.request_url::<Value>("GET", &format!("http://127.0.0.1:{port}/v1/x"), None, 1, None).unwrap_err().code(), "untrusted_redirect");
+    }
+
+    fn prepared(storage: u16, path: &str, headers: &[(&str, &str)]) -> Artifact {
+        Artifact {
+            slug: "art_x".into(),
+            upload: Some(Upload {
+                method: "POST".into(),
+                url: format!("http://127.0.0.1:{storage}{path}"),
+                headers: Some(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+                expires_at: String::new(),
+            }),
+            ..Artifact::default()
+        }
+    }
+
+    fn spec() -> Spec {
+        let path = std::env::temp_dir().join(format!("krowk-boundary-{}", std::process::id()));
+        std::fs::write(&path, "hello").unwrap();
+        Spec { path: path.display().to_string(), byte_size: 5, ..Spec::default() }
+    }
+
+    #[test]
+    fn an_upload_is_a_put_never_redirected_and_carries_no_transport_headers_from_the_registry() {
+        let (storage, log) = server(vec![respond("200 OK", "", ""), respond("307 Temporary Redirect", "Location: http://127.0.0.1:1/x\r\n", "")]);
+        let (api, _) = server(vec![respond("200 OK", "", "{}")]);
+        let c = quiet(Client::new(&format!("http://127.0.0.1:{api}/v1"), ""));
+        let mut a = prepared(storage, "/put", &[("Host", "evil.example"), ("Transfer-Encoding", "chunked"), ("x-amz-meta-k", "v")]);
+        c.put_bytes(&mut a, &spec()).unwrap();
+        let first = log.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(first.starts_with("put /put "), "{first}");
+        assert!(!first.contains("evil.example") && !first.contains("transfer-encoding") && first.contains("x-amz-meta-k: v"), "{first}");
+        assert_eq!(c.put_bytes(&mut a, &spec()).unwrap_err().code(), "upload_redirected");
+    }
+
+    #[test]
+    fn a_refused_signature_is_presigned_again_over_the_same_slug() {
+        let (storage, log) = server(vec![respond("403 Forbidden", "", "<Error/>"), respond("200 OK", "", "")]);
+        let fresh = format!(r#"{{"slug":"art_x","upload":{{"method":"PUT","url":"http://127.0.0.1:{storage}/second","headers":{{}}}}}}"#);
+        let (api, api_log) = server(vec![respond("200 OK", "", &fresh)]);
+        let c = quiet(Client::new(&format!("http://127.0.0.1:{api}/v1"), ""));
+        let mut a = prepared(storage, "/first", &[]);
+        c.put_bytes(&mut a, &spec()).unwrap();
+        let log = log.lock().unwrap();
+        assert!(log[0].starts_with("PUT /first ") && log[1].starts_with("PUT /second "));
+        assert!(api_log.lock().unwrap()[0].starts_with("POST /v1/artifacts/art_x/upload "));
+    }
+
+    #[test]
+    fn one_idempotency_key_per_call_carried_by_every_attempt() {
+        let run = r#"{"slug":"run_x","status":"open"}"#;
+        let (api, log) = server(vec![respond("503 Service Unavailable", "", ""), respond("503 Service Unavailable", "", ""), respond("201 Created", "", run)]);
+        let c = quiet(Client::new(&format!("http://127.0.0.1:{api}/v1"), "krowk_sk_test"));
+        c.create_run(&json!({})).unwrap();
+        c.create_run(&json!({})).unwrap();
+        let keys: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.lines().find(|l| l.to_ascii_lowercase().starts_with("idempotency-key:")).unwrap().to_string())
+            .collect();
+        assert_eq!(keys.len(), 4);
+        assert!(keys[0] == keys[1] && keys[1] == keys[2] && keys[2] != keys[3], "{keys:?}");
+    }
+
+    #[test]
+    fn a_claim_token_is_sent_instead_of_the_key_never_beside_it() {
+        let (api, log) = server(vec![respond("204 No Content", "", ""), respond("200 OK", "", "not json")]);
+        let c = quiet(Client::new(&format!("http://127.0.0.1:{api}/v1"), "krowk_sk_test"));
+        c.take_down_artifact("art_x", "krowk_claim_y").unwrap();
+        c.take_down_artifact("art_x", "").unwrap();
+        let log = log.lock().unwrap();
+        assert!(!log[0].to_ascii_lowercase().contains("authorization:") && log[0].contains("krowk_claim_y"));
+        assert!(log[1].to_ascii_lowercase().contains("authorization: bearer krowk_sk_test"));
+    }
+
+    #[test]
+    fn retry_after_reads_every_http_date_spelling_and_locations_resolve_per_rfc_3986() {
+        let later = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(30);
+        let utc = later.to_zoned(jiff::tz::TimeZone::UTC);
+        for spelled in [
+            utc.strftime("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+            utc.strftime("%A, %d-%b-%y %H:%M:%S GMT").to_string(),
+            utc.strftime("%a %b %e %H:%M:%S %Y").to_string(),
+        ] {
+            assert!(retry_after(&spelled).is_some_and(|d| d > Duration::from_secs(20)), "{spelled}");
+        }
+        let from = "https://api.krowk.com/v1/runs/x?y=1";
+        for (location, want) in [
+            ("https://other/x", "https://other/x"),
+            ("//host/x", "https://host/x"),
+            ("/v2/z", "https://api.krowk.com/v2/z"),
+            ("z", "https://api.krowk.com/v1/runs/z"),
+            ("?q=1", "https://api.krowk.com/v1/runs/x?q=1"),
+            ("/r?to=https://x", "https://api.krowk.com/r?to=https://x"),
+        ] {
+            assert_eq!(resolve_location(from, location).as_deref(), Some(want), "{location}");
+        }
     }
 }

@@ -2,6 +2,7 @@
 //! credentials a call is made with. The contract is owned by krowk-canon and
 //! served by krowk-registry; this is one of its three implementations.
 
+pub mod client;
 pub mod creds;
 pub mod error;
 pub mod slug;
@@ -9,6 +10,7 @@ pub mod spec;
 mod tempfile;
 pub mod types;
 
+pub use client::Client;
 pub use error::{fail, private_needs_key, Error};
 pub use types::*;
 

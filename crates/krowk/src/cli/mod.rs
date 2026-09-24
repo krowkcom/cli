@@ -8,6 +8,8 @@ mod doctor;
 pub mod exit;
 pub mod flags;
 pub mod help;
+#[cfg(feature = "sessions")]
+mod sessions;
 mod upgrade;
 mod workspace;
 
@@ -174,6 +176,18 @@ fn dispatch(ctx: &mut Ctx, p: &[String]) -> Result<(), Error> {
         ["config", "unset", ..] => workspace::config_unset(ctx, rest(2)),
         ["workspaces"] | ["workspaces", "list", ..] => workspace::workspaces_list(ctx),
         ["workspaces", "use", ..] => workspace::workspaces_use(ctx, rest(2)),
+        #[cfg(feature = "sessions")]
+        ["sessions"] => sessions::list(ctx),
+        #[cfg(feature = "sessions")]
+        ["sessions", "show", ..] => sessions::show(ctx, rest(2)),
+        #[cfg(feature = "sessions")]
+        ["sessions", "import", ..] => sessions::import(ctx),
+        #[cfg(feature = "sessions")]
+        ["sessions", "rebuild", ..] => sessions::rebuild(ctx),
+        #[cfg(feature = "sessions")]
+        ["sessions", "sync", ..] => sessions::sync(ctx),
+        #[cfg(feature = "sessions")]
+        ["pricing", "refresh", ..] => sessions::pricing_refresh(ctx),
         _ if catalog::catalog(VERSION).leaves().iter().any(|l| p.starts_with(&l.name.split(' ').map(String::from).collect::<Vec<_>>())) => Err(fail(
             "not_ported",
             format!("`{}` is not in the Rust build yet — the Go build still ships it", clip(p, 2).join(" ")),

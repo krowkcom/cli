@@ -1,0 +1,986 @@
+//! `krowk sessions` and `krowk pricing refresh`: the device-side commands,
+//! reading and writing krowk.db on this machine. Nothing here touches the
+//! registry; `sessions sync` is the one command allowed network, and only to
+//! refresh prices.
+
+use super::{interactive, Ctx};
+use crate::output::{self, Envelope, Format};
+use crate::pricing;
+use crate::termclean;
+use krowk_api::{fail, Error};
+use krowk_import::{Ref, Source};
+use krowk_store::{Connection, SessionDetail, SessionRow, StoreError};
+use serde::Serialize;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+
+const DEFAULT_SESSION_LIMIT: usize = 50;
+const MAX_REPORTED_ERRORS: usize = 10;
+const MAX_SKIPPED_TYPES: usize = 32;
+const MAX_SKIPPED_TYPE_LEN: usize = 64;
+const MAX_ERROR_REASON_LEN: usize = 512;
+const SKIPPED_TYPE_OTHER: &str = "krowk:other";
+const UNSUPPORTED_OS: &str = "sessions is not supported on Windows in v1";
+const PRICING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn check_os() -> Result<(), Error> {
+    krowk_import::check_os().map_err(|_| fail("unsupported_os", UNSUPPORTED_OS))
+}
+
+/// What a store failure says to a person. SQLite's "database is locked"
+/// names no action, so it is replaced by who is at fault.
+fn sanitize_store_err(msg: &str, store_path: &str) -> String {
+    let lower = msg.to_lowercase();
+    if lower.contains("database is locked") || lower.contains("database table is locked") || lower.contains("database is busy") {
+        return format!("the store at {store_path} is busy — another process is writing to it");
+    }
+    msg.to_string()
+}
+
+fn store_fail(e: &StoreError, store_path: &str) -> Error {
+    fail("store_unavailable", sanitize_store_err(e.message(), store_path))
+}
+
+fn db_path_string(ctx: &Ctx) -> String {
+    krowk_store::db_path(ctx.io.env).map(|p| p.display().to_string()).unwrap_or_default()
+}
+
+fn open_store(ctx: &Ctx) -> Result<Connection, Error> {
+    krowk_store::open(ctx.io.env).map_err(|e| store_fail(&e, &db_path_string(ctx)))
+}
+
+/// Where krowk.db lives, or store.open's own sentence for an environment
+/// that names no home.
+fn resolve_store_path(ctx: &Ctx) -> Result<String, Error> {
+    let path = db_path_string(ctx);
+    if !path.is_empty() {
+        return Ok(path);
+    }
+    match krowk_store::open(ctx.io.env) {
+        Err(e) => Err(store_fail(&e, "")),
+        Ok(_) => Err(fail("store_unavailable", "store: no home directory in environment")),
+    }
+}
+
+// ---- list -------------------------------------------------------------------
+
+pub fn list(ctx: &mut Ctx) -> Result<(), Error> {
+    check_os()?;
+    if ctx.f.limit < 0 {
+        return Err(fail("bad_flag", "--limit is a maximum, so it cannot be negative"));
+    }
+    let limit = if ctx.f.all { -1 } else { ctx.f.limit };
+    let conn = open_store(ctx)?;
+    let rows = krowk_store::list_sessions(&conn, &ctx.f.harness, &ctx.f.worktree, limit).map_err(|e| store_fail(&e, &db_path_string(ctx)))?;
+    let now = now_ms();
+    if ctx.format != Format::Human {
+        let sessions: Vec<Value> = rows.iter().map(|r| session_row_json(ctx, r, now)).collect();
+        let data = json!({ "sessions": sessions });
+        return emit_data(ctx, data, format!("{} sessions", rows.len()));
+    }
+    // One option per row: an unbounded page would hang the terminal building
+    // them, so the picker only fires on a paged list.
+    if interactive(ctx) && !ctx.f.all && !rows.is_empty() && rows.len() <= DEFAULT_SESSION_LIMIT {
+        let id = pick_session(&rows, now)?;
+        let _ = writeln!(ctx.io.stdout, "krowk sessions show {id}");
+        return Ok(());
+    }
+    let table = human_sessions_list(ctx, &rows, ctx.colour, now);
+    let _ = write!(ctx.io.stdout, "{table}");
+    if !rows.is_empty() {
+        let _ = writeln!(ctx.io.stdout);
+    }
+    Ok(())
+}
+
+fn emit_data(ctx: &mut Ctx, data: Value, summary: String) -> Result<(), Error> {
+    let rendered = if ctx.f.quiet {
+        output::encode(&data)
+    } else {
+        output::encode(&Envelope { ok: true, data: Some(data), summary, ..Envelope::default() })
+    };
+    ctx.emit(&rendered)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+fn price_row(ctx: &Ctx, r: &SessionRow) -> Option<f64> {
+    let rates = pricing::price(ctx.io.env, &r.provider, &r.model)?;
+    Some(rates.cost(pricing::Tokens {
+        input: r.sum_input,
+        output: r.sum_output,
+        cache_read: r.sum_cache_read,
+        cache_write: r.sum_cache_write,
+        reasoning: r.sum_reasoning,
+    }))
+}
+
+fn session_row_json(ctx: &Ctx, r: &SessionRow, now: i64) -> Value {
+    let cost = price_row(ctx, r);
+    let mut v = json!({
+        "id": r.id,
+        "title": r.title,
+        "harness": r.harness,
+        "model": r.model,
+        "provider": r.provider,
+        "turns": r.turn_count,
+        "cost_usd": cost,
+        "cost_display": cost.map_or("—".to_string(), format_cost),
+        "time_updated_ms": r.time_updated,
+        "time_updated_relative": relative_time(r.time_updated, now),
+        "worktree": r.worktree_path,
+    });
+    if !r.foreign_session_id.is_empty() {
+        v["foreign_session_id"] = json!(r.foreign_session_id);
+    }
+    if !r.directory.is_empty() {
+        v["directory"] = json!(r.directory);
+    }
+    v
+}
+
+fn format_cost(usd: f64) -> String {
+    if usd < 0.01 { format!("${usd:.4}") } else { format!("${usd:.2}") }
+}
+
+/// The human table's cost: exact 0 is free, dust collapses to <$0.01.
+fn human_cost(usd: f64) -> String {
+    if usd == 0.0 {
+        "free".into()
+    } else if usd > 0.0 && usd < 0.01 {
+        "<$0.01".into()
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
+fn relative_time(ms: i64, now: i64) -> String {
+    if ms > now {
+        return "in the future".into();
+    }
+    let secs = (now - ms) / 1000;
+    let (m, h, d) = (60, 3600, 86400);
+    match secs {
+        s if s < m => "just now".into(),
+        s if s < h => format!("{}m ago", s / m),
+        s if s < 24 * h => format!("{}h ago", s / h),
+        s if s < 48 * h => "yesterday".into(),
+        s if s < 30 * d => format!("{}d ago", s / d),
+        s if s < 365 * d => format!("{}mo ago", s / (30 * d)),
+        s => format!("{}y ago", s / (365 * d)),
+    }
+}
+
+fn cell(s: &str) -> String {
+    termclean::cell(s)
+}
+
+/// Caps s at n chars, so a multi-byte character is never cut in half.
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    if n < 3 {
+        return s.chars().take(n).collect();
+    }
+    s.chars().take(n - 3).collect::<String>() + "..."
+}
+
+fn width(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn paint(colour: bool, code: &str, s: &str) -> String {
+    if !colour || s.is_empty() { s.to_string() } else { format!("\x1b[{code}m{s}\x1b[0m") }
+}
+
+fn pad_right(colour: bool, code: &str, s: &str, w: usize) -> String {
+    paint(colour, code, s) + &" ".repeat(w.saturating_sub(width(s)))
+}
+
+fn pad_left(colour: bool, code: &str, s: &str, w: usize) -> String {
+    " ".repeat(w.saturating_sub(width(s))) + &paint(colour, code, s)
+}
+
+fn display_title(t: &str) -> String {
+    if t.is_empty() { "(untitled)".into() } else { t.to_string() }
+}
+
+fn session_source(r: &SessionRow) -> String {
+    let (harness, model) = (cell(&r.harness), cell(&r.model));
+    match (harness.is_empty(), model.is_empty()) {
+        (false, false) => format!("{harness} · {model}"),
+        (false, true) => harness,
+        _ => model,
+    }
+}
+
+fn short_id(id: &str) -> String {
+    cell(id).chars().take(8).collect()
+}
+
+fn human_sessions_list(ctx: &Ctx, rows: &[SessionRow], colour: bool, now: i64) -> String {
+    if rows.is_empty() {
+        return "no sessions — run `krowk sessions import --from all`".into();
+    }
+    const MAX_TITLE: usize = 60;
+    const MAX_SOURCE: usize = 40;
+    let titles: Vec<String> = rows.iter().map(|r| display_title(&cell(&r.title))).collect();
+    let sources: Vec<String> = rows.iter().map(|r| truncate_chars(&session_source(r), MAX_SOURCE)).collect();
+    let tw = titles.iter().map(|t| width(t)).max().unwrap_or(0).max(width("Title")).min(MAX_TITLE);
+    let sw = sources.iter().map(|s| width(s)).max().unwrap_or(0).max(width("Source")).min(MAX_SOURCE);
+    let mut lines = vec![[
+        pad_right(colour, "2", "Title", tw),
+        pad_right(colour, "2", "Source", sw),
+        pad_left(colour, "2", "Turns", 9),
+        pad_left(colour, "2", "Cost", 10),
+        paint(colour, "2", "Updated"),
+    ]
+    .join("  ")];
+    for (i, r) in rows.iter().enumerate() {
+        let title = truncate_chars(&titles[i], MAX_TITLE);
+        let turns = format!("{:3} {}", r.turn_count, paint(colour, "2", if r.turn_count == 1 { "turn" } else { "turns" }));
+        let (cost, code) = match price_row(ctx, r) {
+            Some(p) => (human_cost(p), if p == 0.0 { "2" } else { "32" }),
+            None => ("—".into(), "2"),
+        };
+        let short = short_id(&r.id);
+        let id = if short.is_empty() { String::new() } else { paint(colour, "2", &format!("#{short}")) };
+        lines.push(
+            [
+                pad_right(colour, "1", &title, tw),
+                pad_right(colour, "2", &sources[i], sw),
+                turns,
+                pad_left(colour, code, &cost, 10),
+                paint(colour, "2", &relative_time(r.time_updated, now)),
+                id,
+            ]
+            .join("  "),
+        );
+    }
+    lines.join("\n")
+}
+
+/// The picker offers only rows already in the store, which is what makes it
+/// safe to offer.
+fn pick_session(rows: &[SessionRow], now: i64) -> Result<String, Error> {
+    let labels: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let title = display_title(&cell(&r.title));
+            let title = if width(&title) > 48 { title.chars().take(45).collect::<String>() + "..." } else { title };
+            let hm = cell(format!("{} {}", r.harness.trim(), r.model.trim()).trim());
+            let hm = if width(&hm) > 32 { hm.chars().take(29).collect::<String>() + "..." } else { hm };
+            let mut label = title;
+            if !hm.is_empty() {
+                label += &format!("  —  {hm}");
+            }
+            label + &format!("  ·  {:<13}  ·  {}", relative_time(r.time_updated, now), short_id(&r.id))
+        })
+        .collect();
+    let picked = inquire::Select::new("Pick a session", labels.clone())
+        .raw_prompt()
+        .map_err(|_| fail("selection_cancelled", "nothing was selected and nothing was changed"))?;
+    let _ = labels;
+    Ok(rows[picked.index].id.clone())
+}
+
+// ---- show -------------------------------------------------------------------
+
+pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
+    check_os()?;
+    let Some(reference) = args.first().filter(|a| !a.trim().is_empty()) else {
+        return Err(fail("no_session", "pass the session: `krowk sessions show <id>`"));
+    };
+    if args.len() > 1 {
+        return Err(fail("bad_flag", format!("`krowk sessions show` takes one session id, got extra {}", args[1..].join(" "))));
+    }
+    let conn = open_store(ctx)?;
+    let id = match krowk_store::resolve_session_id(&conn, reference) {
+        Ok(id) => id,
+        Err(StoreError::Ambiguous { message, .. }) => return Err(fail("ambiguous_session", message)),
+        Err(StoreError::NotFound(_)) => {
+            return Err(fail(
+                "no_session",
+                format!("{:?} matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id", reference.trim()),
+            ));
+        }
+        Err(e) => return Err(store_fail(&e, &db_path_string(ctx))),
+    };
+    let d = match krowk_store::load_session_detail(&conn, &id) {
+        Ok(d) => d,
+        Err(StoreError::NotFound(_)) => return Err(fail("no_session", format!("no session {id:?}"))),
+        Err(e) => return Err(store_fail(&e, &db_path_string(ctx))),
+    };
+    if ctx.format != Format::Human {
+        let (data, summary) = session_show_json(ctx, &d);
+        return emit_data(ctx, data, summary);
+    }
+    let text = human_session_show(ctx, &d, ctx.f.thinking, now_ms());
+    let _ = write!(ctx.io.stdout, "{text}");
+    Ok(())
+}
+
+fn session_show_json(ctx: &Ctx, d: &SessionDetail) -> (Value, String) {
+    let messages: Vec<Value> = d
+        .messages
+        .iter()
+        .map(|m| {
+            let parts: Vec<Value> = m
+                .parts
+                .iter()
+                .map(|p| {
+                    let data = serde_json::from_str::<Value>(&p.data).unwrap_or_else(|_| Value::String(p.data.clone()));
+                    let mut v = serde_json::Map::new();
+                    v.insert("seq".into(), json!(p.seq));
+                    v.insert("type".into(), json!(p.kind));
+                    if !p.tool_call_id.is_empty() {
+                        v.insert("tool_call_id".into(), json!(p.tool_call_id));
+                    }
+                    if p.kind == "tool_call" {
+                        let name = krowk_store::tool_name_of(&p.data);
+                        if !name.is_empty() {
+                            v.insert("tool_name".into(), json!(name));
+                        }
+                    }
+                    if p.kind == "tool_result" {
+                        if !p.tool_name.is_empty() {
+                            v.insert("tool_name".into(), json!(p.tool_name));
+                        }
+                        v.insert("linked".into(), json!(p.linked));
+                    }
+                    v.insert("data".into(), data);
+                    Value::Object(v)
+                })
+                .collect();
+            let mut v = serde_json::Map::new();
+            v.insert("seq".into(), json!(m.seq));
+            v.insert("role".into(), json!(m.role));
+            if !m.provider.is_empty() {
+                v.insert("provider".into(), json!(m.provider));
+            }
+            if !m.model.is_empty() {
+                v.insert("model".into(), json!(m.model));
+            }
+            v.insert("parts".into(), Value::Array(parts));
+            Value::Object(v)
+        })
+        .collect();
+    let turns: Vec<Value> = d
+        .turns
+        .iter()
+        .map(|t| {
+            let mut v = serde_json::Map::new();
+            v.insert("seq".into(), json!(t.seq));
+            if !t.status.is_empty() {
+                v.insert("status".into(), json!(t.status));
+            }
+            v.insert("input_tokens".into(), json!(t.input));
+            v.insert("output_tokens".into(), json!(t.output));
+            v.insert("total_tokens".into(), json!(t.total));
+            match t.usd_micros {
+                Some(usd) => v.insert("cost_usd_micros".into(), json!(usd)),
+                None => v.insert("cost_unknown".into(), json!(true)),
+            };
+            Value::Object(v)
+        })
+        .collect();
+    let s = &d.session;
+    let mut out = serde_json::Map::new();
+    for (k, v) in [("id", &s.id), ("title", &s.title), ("harness", &s.harness), ("model", &s.model), ("provider", &s.provider), ("worktree", &s.worktree_path)] {
+        out.insert(k.into(), json!(v));
+    }
+    if !s.directory.is_empty() {
+        out.insert("directory".into(), json!(s.directory));
+    }
+    if !s.foreign_session_id.is_empty() {
+        out.insert("foreign_session_id".into(), json!(s.foreign_session_id));
+    }
+    let summary = format!("{} — {} turns, {} messages", display_title(&cell(&s.title)), turns.len(), messages.len());
+    out.insert("turns".into(), Value::Array(turns));
+    out.insert("messages".into(), Value::Array(messages));
+    match price_row(ctx, s) {
+        Some(priced) => {
+            out.insert("priced_cost_usd".into(), json!(priced));
+            out.insert("cost_display".into(), json!(format_cost(priced)));
+            out.insert("priced_with".into(), json!(format!("priced from embedded models.dev snapshot {}", pricing::SNAPSHOT_DATE)));
+        }
+        None => {
+            out.insert("cost_display".into(), json!("—"));
+        }
+    }
+    (Value::Object(out), summary)
+}
+
+/// Every stored string printed here is transcript text, so each goes
+/// through the terminal scrubber before it reaches the screen.
+fn human_session_show(ctx: &Ctx, d: &SessionDetail, show_thinking: bool, now: i64) -> String {
+    let s = &d.session;
+    let mut b = format!("{}\n", display_title(&cell(&s.title)));
+    let mut meta = cell(&s.harness);
+    let model = cell(&s.model);
+    if !model.is_empty() {
+        meta += &format!("  {model}");
+    }
+    meta += &match price_row(ctx, s) {
+        Some(p) => format!("  {}", format_cost(p)),
+        None => "  —".into(),
+    };
+    meta += &format!("  {}", relative_time(s.time_updated, now));
+    for extra in [cell(&s.worktree_path), cell(&s.directory)] {
+        if !extra.is_empty() {
+            meta += &format!("\n{extra}");
+        }
+    }
+    b += &meta;
+    b += "\n";
+    for t in &d.turns {
+        b += &format!("\nturn {}", t.seq);
+        let st = cell(&t.status);
+        if !st.is_empty() {
+            b += &format!("  {st}");
+        }
+        b += &format!("  {} tokens", t.total);
+        if let Some(usd) = t.usd_micros {
+            b += &format!("  {}", format_cost(usd as f64 / 1e6));
+        }
+        b += "\n";
+    }
+    for m in &d.messages {
+        b += &format!("\n[{}]\n", cell(&m.role));
+        for p in &m.parts {
+            b += &human_part(p, show_thinking);
+            b += "\n";
+        }
+    }
+    b.trim_end_matches('\n').to_string() + "\n"
+}
+
+fn one_line(s: &str, n: usize) -> String {
+    truncate_chars(&cell(s), n)
+}
+
+fn fields(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn human_part(p: &krowk_store::PartDetail, show_thinking: bool) -> String {
+    let parsed = serde_json::from_str::<Value>(&p.data).ok();
+    let str_field = |k: &str| parsed.as_ref().and_then(|v| v.get(k)).and_then(Value::as_str).unwrap_or_default().to_string();
+    // A field as text: a JSON string unquoted, anything else as its JSON.
+    let raw_field = |k: &str| match parsed.as_ref().and_then(|v| v.get(k)) {
+        None => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+    };
+    match p.kind.as_str() {
+        "text" => cell(&if parsed.is_some() { str_field("text") } else { fields(&p.data) }),
+        "thinking" => {
+            let text = if parsed.is_none() {
+                fields(&p.data)
+            } else {
+                let t = str_field("thinking");
+                if t.is_empty() { str_field("text") } else { t }
+            };
+            if show_thinking {
+                format!("thinking: {}", text.split('\n').map(termclean::cell).collect::<Vec<_>>().join("\n"))
+            } else {
+                format!("thinking: {} (use --thinking for all)", one_line(&text, 100))
+            }
+        }
+        "tool_call" => {
+            let name = cell(&krowk_store::tool_name_of(&p.data));
+            let name = if name.is_empty() { "unknown tool".to_string() } else { name };
+            let input = raw_field("input");
+            if input.is_empty() { format!("tool {name}") } else { format!("tool {name}: {}", one_line(&input, 200)) }
+        }
+        "tool_result" => {
+            let name = cell(&p.tool_name);
+            let name = if name.is_empty() { "unknown tool".to_string() } else { name };
+            let out = raw_field("output");
+            if out.is_empty() { format!("result ({name})") } else { format!("result ({name}): {}", one_line(&out, 300)) }
+        }
+        _ => format!("{}: {}", cell(&p.kind), one_line(&fields(&p.data), 200)),
+    }
+}
+
+// ---- import / rebuild / sync ------------------------------------------------
+
+#[derive(Debug, Default, Serialize)]
+struct ProviderReport {
+    provider: String,
+    files: usize,
+    sessions_seen: usize,
+    messages_seen: usize,
+    parts_seen: usize,
+    sessions_inserted: usize,
+    messages_inserted: usize,
+    parts_inserted: usize,
+    skipped_by_type: BTreeMap<String, usize>,
+    skipped_lines: usize,
+    files_failed: usize,
+    files_unchanged: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<String>,
+    errors_truncated: usize,
+    duration_ms: u128,
+    #[serde(skip)]
+    discover_failed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncPricing {
+    status: &'static str,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    warning: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ImportReport {
+    dry_run: bool,
+    store: String,
+    providers: Vec<ProviderReport>,
+    duration_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pricing: Option<SyncPricing>,
+}
+
+impl ProviderReport {
+    fn record(&mut self, reason: String) {
+        self.files_failed += 1;
+        if self.errors.len() >= MAX_REPORTED_ERRORS {
+            self.errors_truncated += 1;
+            return;
+        }
+        self.errors.push(truncate_for_report(&reason, MAX_ERROR_REASON_LEN));
+    }
+
+    fn count(&mut self, r: &krowk_store::IngestResult) {
+        self.sessions_seen += r.sessions.inserted + r.sessions.skipped;
+        self.messages_seen += r.messages.inserted + r.messages.skipped;
+        self.parts_seen += r.parts.inserted + r.parts.skipped;
+        self.sessions_inserted += r.sessions.inserted;
+        self.messages_inserted += r.messages.inserted;
+        self.parts_inserted += r.parts.inserted;
+    }
+
+    /// Folds one read's lossiness in, bounded: at most 32 named types (in
+    /// sorted order, so the same 32 every run), each name at most 64 bytes;
+    /// the rest summed under `krowk:other`, which sits beside them.
+    fn absorb(&mut self, r: &krowk_import::ReadResult) {
+        for (k, v) in &r.unknown_types {
+            let known = self.skipped_by_type.contains_key(k);
+            let named = self.skipped_by_type.len() - usize::from(self.skipped_by_type.contains_key(SKIPPED_TYPE_OTHER));
+            let key = if k.len() > MAX_SKIPPED_TYPE_LEN || k == SKIPPED_TYPE_OTHER || (!known && named >= MAX_SKIPPED_TYPES) {
+                SKIPPED_TYPE_OTHER
+            } else {
+                k.as_str()
+            };
+            *self.skipped_by_type.entry(key.to_string()).or_default() += v;
+        }
+        self.skipped_lines += r.skipped_count;
+    }
+}
+
+fn truncate_for_report(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut cut = max - '…'.len_utf8();
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &s[..cut])
+}
+
+fn selected_sources(from: &str) -> Result<Vec<Box<dyn Source>>, Error> {
+    let all = krowk_import::sources();
+    let names: Vec<&str> = all.iter().map(|s| s.name()).collect();
+    let choices = format!("{}|all", names.join("|"));
+    match from {
+        "" => Err(fail("bad_flag", format!("`krowk sessions import` needs --from <{choices}> — it says which agent's transcripts to read"))),
+        "all" => Ok(all),
+        _ => all
+            .into_iter()
+            .find(|s| s.name() == from)
+            .map(|s| vec![s])
+            .ok_or_else(|| fail("bad_flag", format!("--from {from} is not a source krowk can read — one of {choices}"))),
+    }
+}
+
+pub fn import(ctx: &mut Ctx) -> Result<(), Error> {
+    // Before anything touches a path: the store would otherwise be created
+    // on a machine about to be told the command does not run there.
+    check_os()?;
+    let sources = selected_sources(&ctx.f.from)?;
+    if ctx.f.limit < 0 {
+        return Err(fail("bad_flag", "--limit is a maximum, so it cannot be negative — use 0 for no limit"));
+    }
+    let store_path = resolve_store_path(ctx)?;
+    if ctx.f.dry_run {
+        return import_into(ctx, None, &store_path, &sources, false, ImportReport::default());
+    }
+    // Taken before open: opening is itself a write.
+    let _lock = lock_store(&store_path)?;
+    let conn = open_store(ctx)?;
+    import_into(ctx, Some(&conn), &store_path, &sources, false, ImportReport::default())
+}
+
+pub fn rebuild(ctx: &mut Ctx) -> Result<(), Error> {
+    check_os()?;
+    let store_path = resolve_store_path(ctx)?;
+    let prompt = !ctx.f.yes && std::io::IsTerminal::is_terminal(&std::io::stdin()) && interactive(ctx);
+    if !ctx.f.yes && !prompt {
+        return Err(fail(
+            "confirmation_required",
+            format!(
+                "rebuilding deletes {store_path} and re-imports every transcript — run `krowk sessions rebuild --yes` to confirm when nobody is at a terminal to ask"
+            ),
+        ));
+    }
+    // Asked before the lock, so a question left on screen holds off no import.
+    if prompt {
+        let ok = inquire::Confirm::new(&format!("Delete {store_path} and re-import every transcript?")).with_default(false).prompt();
+        if !matches!(ok, Ok(true)) {
+            return Err(fail("selection_cancelled", "nothing was deleted"));
+        }
+    }
+    let _lock = lock_store(&store_path)?;
+    // Exactly the database and its WAL sidecars: import.lock is held right
+    // now, and anything else in the directory is not krowk's to remove.
+    let mut removed = Vec::new();
+    for path in [store_path.clone(), format!("{store_path}-wal"), format!("{store_path}-shm")] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(fail("store_unavailable", format!("remove {path}: {e}"))),
+        }
+    }
+    let conn = open_store(ctx)?;
+    let sources = krowk_import::sources();
+    import_into(ctx, Some(&conn), &store_path, &sources, false, ImportReport { removed: Some(removed), ..ImportReport::default() })
+}
+
+pub fn sync(ctx: &mut Ctx) -> Result<(), Error> {
+    check_os()?;
+    let store_path = resolve_store_path(ctx)?;
+    let _lock = lock_store(&store_path)?;
+    let conn = open_store(ctx)?;
+    // Inside the lock, so "is a sync running" has one answer; bounded by the
+    // refresh's own timeout.
+    let p = sync_prices(ctx.io.env, ctx.f.no_network);
+    if !p.warning.is_empty() && ctx.format == Format::Human {
+        let _ = writeln!(ctx.io.stderr, "! {}", p.warning);
+    }
+    let sources = krowk_import::sources();
+    import_into(ctx, Some(&conn), &store_path, &sources, true, ImportReport { pricing: Some(p), ..ImportReport::default() })
+}
+
+/// Refreshes the models.dev cache when it is due, judged by the sidecar's
+/// mtime: a 304 rewrites only the sidecar, and "when did krowk last ask" is
+/// the question.
+fn sync_prices(env: &dyn Fn(&str) -> String, no_network: bool) -> SyncPricing {
+    let failed = |w: String| SyncPricing { status: "failed", warning: w };
+    if no_network {
+        return SyncPricing { status: "no_network", warning: String::new() };
+    }
+    let Some(cache) = pricing::cache_path(env) else {
+        return failed("prices were not refreshed: no cache directory in the environment".into());
+    };
+    let meta = pricing::meta_path(&cache);
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let before = mtime(&meta);
+    if before.is_some_and(|t| t.elapsed().is_ok_and(|age| age < PRICING_MAX_AGE)) {
+        return SyncPricing { status: "fresh", warning: String::new() };
+    }
+    match pricing::refresh_within(env, "", Duration::from_secs(3)) {
+        Err(e) => failed(format!("prices were not refreshed: {e}")),
+        Ok(true) => SyncPricing { status: "refreshed", warning: String::new() },
+        Ok(false) if mtime(&meta).is_some_and(|now| before.is_none_or(|b| now > b)) => SyncPricing { status: "unchanged", warning: String::new() },
+        Ok(false) => failed(
+            "prices were not refreshed: models.dev could not be reached or did not answer with a price file — the cache or the snapshot still prices everything".into(),
+        ),
+    }
+}
+
+/// The import itself, shared by import, rebuild and sync; `report` carries
+/// what they did first. One unreadable file is counted and the run goes on;
+/// a source that could not be listed, or lost every file, fails the run
+/// after every source has had its turn.
+fn import_into(ctx: &mut Ctx, conn: Option<&Connection>, store_path: &str, sources: &[Box<dyn Source>], skip_unchanged: bool, mut report: ImportReport) -> Result<(), Error> {
+    let started = Instant::now();
+    report.dry_run = conn.is_none();
+    report.store = store_path.to_string();
+    let mut broken = Vec::new();
+    for s in sources {
+        let row = run_source(ctx, conn, store_path, s.as_ref(), skip_unchanged);
+        if row.discover_failed {
+            broken.push(format!("{} could not be listed", row.provider));
+        } else if row.files > 0 && row.files_failed == row.files {
+            broken.push(format!("{} lost every one of its {} transcripts", row.provider, row.files));
+        }
+        report.providers.push(row);
+    }
+    report.duration_ms = started.elapsed().as_millis();
+    emit_import_report(ctx, &report)?;
+    if !broken.is_empty() {
+        return Err(fail("import_failed", format!("{} — the reasons are in `errors` in the report above", broken.join("; "))));
+    }
+    Ok(())
+}
+
+fn run_source(ctx: &Ctx, conn: Option<&Connection>, store_path: &str, s: &dyn Source, skip_unchanged: bool) -> ProviderReport {
+    let started = Instant::now();
+    let env = ctx.io.env;
+    let mut out = ProviderReport { provider: s.name().to_string(), ..ProviderReport::default() };
+    let finish = |mut out: ProviderReport| {
+        out.duration_ms = started.elapsed().as_millis();
+        out
+    };
+    let mut refs: Vec<Ref> = match s.discover(env) {
+        Ok(refs) => refs,
+        Err(e) => {
+            out.discover_failed = true;
+            out.errors.push(truncate_for_report(&format!("discover: {e}"), MAX_ERROR_REASON_LEN));
+            return finish(out);
+        }
+    };
+    // Per source, and on refs: one session file or one session row.
+    if ctx.f.limit > 0 {
+        refs.truncate(ctx.f.limit as usize);
+    }
+    out.files = refs.len();
+    let Some(conn) = conn else {
+        return finish(out);
+    };
+    let writer = krowk_store::Writer::new(conn);
+    for r in &refs {
+        let key = r.key();
+        let stored = match krowk_store::read_import_state(conn, &key) {
+            Ok(c) => c,
+            Err(e) => {
+                out.record(format!("{key}: {}", sanitize_store_err(e.message(), store_path)));
+                continue;
+            }
+        };
+        // A skipped ref is never re-read, so sync does not backfill what a
+        // reader upgrade would now extract; import and rebuild do.
+        if skip_unchanged && !stored.is_empty() && s.unchanged(env, r, &stored) {
+            out.files_unchanged += 1;
+            continue;
+        }
+        // A failed read is not ingested and writes no cursor: its turn list
+        // may be truncated, and the next run retries from the same watermark.
+        let (thread, next, res) = match s.read(env, r, &stored) {
+            Ok(read) => read,
+            Err(e) => {
+                out.record(format!("{key}: {e}"));
+                continue;
+            }
+        };
+        out.absorb(&res);
+        match writer.ingest_with_cursor(&thread, &key, &next) {
+            Ok(ing) => out.count(&ing),
+            Err(e) => out.record(format!("{key}: {}", sanitize_store_err(e.message(), store_path))),
+        }
+    }
+    finish(out)
+}
+
+fn emit_import_report(ctx: &mut Ctx, report: &ImportReport) -> Result<(), Error> {
+    if ctx.format != Format::Human {
+        let data = serde_json::to_value(report).expect("report serializes");
+        return emit_data(ctx, data, import_summary(report));
+    }
+    let mut out = String::new();
+    for path in report.removed.iter().flatten() {
+        out += &format!("removed   {path}\n");
+    }
+    if let Some(p) = &report.pricing {
+        out += &format!("pricing   {}\n", p.status);
+    }
+    for p in &report.providers {
+        out += &human_provider_line(p, report.dry_run);
+        out += "\n";
+        for e in &p.errors {
+            out += &format!("  ! {e}\n");
+        }
+        if p.errors_truncated > 0 {
+            out += &format!("  ! ... and {} more not shown\n", p.errors_truncated);
+        }
+    }
+    let _ = write!(ctx.io.stdout, "{out}");
+    Ok(())
+}
+
+fn human_provider_line(p: &ProviderReport, dry_run: bool) -> String {
+    if dry_run {
+        return format!("{:<9} {} files found (dry run, nothing written)  {}ms", p.provider, p.files, p.duration_ms);
+    }
+    let mut line = format!(
+        "{:<9} {} files  {} sessions read  {} messages read  {} parts read  {} messages new  {}ms",
+        p.provider, p.files, p.sessions_seen, p.messages_seen, p.parts_seen, p.messages_inserted, p.duration_ms
+    );
+    if p.files_unchanged > 0 {
+        line += &format!("  ({} unchanged)", p.files_unchanged);
+    }
+    if p.files_failed > 0 {
+        line += &format!("  ({} failed)", p.files_failed);
+    }
+    line
+}
+
+fn import_summary(r: &ImportReport) -> String {
+    let files: usize = r.providers.iter().map(|p| p.files).sum();
+    if r.dry_run {
+        return format!("{files} files found, nothing written");
+    }
+    let sessions: usize = r.providers.iter().map(|p| p.sessions_seen).sum();
+    let messages: usize = r.providers.iter().map(|p| p.messages_seen).sum();
+    let inserted: usize = r.providers.iter().map(|p| p.messages_inserted).sum();
+    let summary = format!("{files} files, {sessions} sessions read, {messages} messages read, {inserted} messages new");
+    match &r.removed {
+        Some(removed) => format!("removed {} files, then {summary}", removed.len()),
+        None => summary,
+    }
+}
+
+// ---- the import lock --------------------------------------------------------
+
+/// import.lock beside krowk.db, flock'd exclusively and never waited on: a
+/// second import is a mistake to report, not a queue to join. The kernel
+/// drops the lock however the process dies, so a killed import leaves a
+/// stale file and no stale lock. Dropping the returned file releases it.
+fn lock_store(store_path: &str) -> Result<std::fs::File, Error> {
+    let dir = Path::new(store_path).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode_private()
+        .create(&dir)
+        .map_err(|e| fail("store_unavailable", e.to_string()))?;
+    let path = dir.join("import.lock");
+    lock_file(&path).map_err(|held| match held {
+        None => fail(
+            "import_locked",
+            format!(
+                "another `krowk sessions import` or `rebuild` is running on this store — wait for it to finish, or check {} if you think it is not",
+                path.display()
+            ),
+        ),
+        Some(why) => fail("import_locked", format!("the import lock at {} could not be taken: {why}", path.display())),
+    })
+}
+
+trait PrivateDir {
+    fn mode_private(&mut self) -> &mut Self;
+}
+
+impl PrivateDir for std::fs::DirBuilder {
+    fn mode_private(&mut self) -> &mut Self {
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(self, 0o700);
+        self
+    }
+}
+
+/// Err(None) is somebody else holding it; Err(Some(why)) is a file that
+/// could not be opened, or is not a lock krowk will take.
+#[cfg(unix)]
+fn lock_file(path: &Path) -> Result<std::fs::File, Option<String>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW and the regular-file check: a symlink or a fifo standing at
+    // the path is not the thing being serialised.
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(if cfg!(target_os = "macos") { 0x0100 } else { 0o400000 })
+        .open(path)
+        .map_err(|e| Some(format!("open {}: {e}", path.display())))?;
+    let meta = f.metadata().map_err(|e| Some(format!("stat {}: {e}", path.display())))?;
+    if !meta.is_file() {
+        return Err(Some(format!("{} is not a regular file, so it is not a lock krowk will take", path.display())));
+    }
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(_) => Err(None),
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_file(path: &Path) -> Result<std::fs::File, Option<String>> {
+    Err(Some(format!("{}: locking is not supported here", path.display())))
+}
+
+// ---- pricing refresh --------------------------------------------------------
+
+pub fn pricing_refresh(ctx: &mut Ctx) -> Result<(), Error> {
+    let refreshed = pricing::refresh(ctx.io.env, "").map_err(|e| fail("pricing_failed", e))?;
+    let path = pricing::cache_path(ctx.io.env).unwrap_or_default();
+    if ctx.format != Format::Human {
+        let report = json!({
+            "meta_path": pricing::meta_path(&path).display().to_string(),
+            "path": path.display().to_string(),
+            "refreshed": refreshed,
+            "snapshot_date": pricing::SNAPSHOT_DATE,
+            "source": pricing::MODELS_URL,
+        });
+        return ctx.emit(&output::encode(&report));
+    }
+    if refreshed {
+        let _ = writeln!(ctx.io.stdout, "prices refreshed from {}", pricing::MODELS_URL);
+    } else {
+        let _ = writeln!(ctx.io.stdout, "prices unchanged (snapshot {})", pricing::SNAPSHOT_DATE);
+    }
+    let _ = writeln!(ctx.io.stdout, "cache: {}", path.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skipped_types_are_capped_and_the_overflow_is_summed() {
+        let mut row = ProviderReport::default();
+        let mut res = krowk_import::ReadResult::default();
+        for i in 0..40 {
+            res.unknown_types.insert(format!("t{i:02}"), 1);
+        }
+        res.unknown_types.insert("x".repeat(65), 2);
+        row.absorb(&res);
+        assert_eq!(row.skipped_by_type.len(), 33);
+        assert_eq!(row.skipped_by_type[SKIPPED_TYPE_OTHER], 8 + 2);
+    }
+
+    #[test]
+    fn a_second_lock_on_the_same_store_is_refused_as_held() {
+        let dir = std::env::temp_dir().join(format!("krowk-lock-{}", std::process::id()));
+        let store = dir.join("krowk.db").display().to_string();
+        let first = lock_store(&store).unwrap();
+        let second = lock_store(&store).unwrap_err();
+        assert_eq!(second.code(), "import_locked");
+        assert!(second.fix().starts_with("another"));
+        drop(first);
+        assert!(lock_store(&store).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn relative_time_and_costs_read_as_go_wrote_them() {
+        let now = 1_000_000_000_000;
+        assert_eq!(relative_time(now - 90_000, now), "1m ago");
+        assert_eq!(relative_time(now - 36 * 3_600_000, now), "yesterday");
+        assert_eq!(relative_time(now + 1, now), "in the future");
+        assert_eq!((format_cost(0.005), human_cost(0.005), human_cost(0.0)), ("$0.0050".into(), "<$0.01".into(), "free".into()));
+        assert_eq!(truncate_chars("ąčęėįšųū", 5), "ąč...");
+    }
+}

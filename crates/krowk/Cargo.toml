@@ -10,11 +10,12 @@ publish.workspace = true
 default = []
 # The device-side half: krowk.db, import, sync. Off by default so the agent
 # build links none of it.
-sessions = ["dep:krowk-store"]
+sessions = ["dep:krowk-store", "dep:krowk-import"]
 
 [dependencies]
 krowk-api = { path = "../krowk-api" }
 krowk-store = { path = "../krowk-store", optional = true }
+krowk-import = { path = "../krowk-import", optional = true }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: a record read back keeps the key order it arrived in.
 serde_json = { version = "1", features = ["preserve_order"] }

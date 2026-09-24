@@ -6,5 +6,7 @@ pub mod cli;
 pub mod config;
 pub mod mcp;
 pub mod output;
+#[cfg(feature = "sessions")]
+pub mod pricing;
 pub mod runctx;
 pub mod termclean;

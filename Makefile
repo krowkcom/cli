@@ -56,7 +56,7 @@ clean:
 # golden cases are recorded from; these targets are how the port proves it can
 # take over.
 rust: ## Build the Rust krowk into target/release
-	cargo build --release -p krowk
+	cargo build --release -p krowk --features sessions
 
 bin/devregistry: $(shell find internal/devregistry internal/registry -name '*.go')
 	go build -trimpath -o bin/devregistry ./internal/devregistry
@@ -78,7 +78,7 @@ golden: bin/golden bin/devregistry ## Hold the Go build to tests/golden/cases
 	cargo test -p krowk-golden
 
 golden-rust: bin/devregistry ## Hold the Rust build to the same cases
-	KROWK_VERSION=$(GOLDEN_VERSION) cargo build --release -p krowk
+	KROWK_VERSION=$(GOLDEN_VERSION) cargo build --release -p krowk --features sessions
 	GOLDEN_MODE=contract KROWK_BIN=target/release/krowk KROWK_MCP_BIN=target/release/krowk-mcp cargo test -p krowk-golden
 
 golden-update: bin/golden bin/devregistry ## Re-record the cases from the Go build

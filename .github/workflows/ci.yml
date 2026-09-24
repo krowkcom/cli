@@ -59,7 +59,8 @@ jobs:
         run: |
           rustup component add clippy
           cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace --exclude krowk-golden
+          cargo clippy --workspace --all-targets --features krowk/sessions -- -D warnings
+          cargo test --workspace --exclude krowk-golden --features krowk/sessions
 
       - name: Golden cases against the Rust build (contract mode)
         run: make golden-rust

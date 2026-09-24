@@ -1,0 +1,271 @@
+
+$ krowk sessions sync --no-network
+stdout:
+{
+  "ok": true,
+  "data": {
+    "dry_run": false,
+    "store": "<scratch>/home/.local/share/krowk/krowk.db",
+    "providers": [
+      {
+        "provider": "claude",
+        "files": 4,
+        "sessions_seen": 4,
+        "messages_seen": 20,
+        "parts_seen": 24,
+        "sessions_inserted": 4,
+        "messages_inserted": 20,
+        "parts_inserted": 24,
+        "skipped_by_type": {
+          "server_tool_use": 1
+        },
+        "skipped_lines": 2,
+        "files_failed": 0,
+        "files_unchanged": 0,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      },
+      {
+        "provider": "cursor",
+        "files": 2,
+        "sessions_seen": 2,
+        "messages_seen": 6,
+        "parts_seen": 7,
+        "sessions_inserted": 2,
+        "messages_inserted": 6,
+        "parts_inserted": 7,
+        "skipped_by_type": {},
+        "skipped_lines": 1,
+        "files_failed": 0,
+        "files_unchanged": 0,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      },
+      {
+        "provider": "opencode",
+        "files": 2,
+        "sessions_seen": 2,
+        "messages_seen": 6,
+        "parts_seen": 16,
+        "sessions_inserted": 2,
+        "messages_inserted": 6,
+        "parts_inserted": 16,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 0,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      }
+    ],
+    "duration_ms": <n>,
+    "pricing": {
+      "status": "no_network"
+    }
+  },
+  "summary": "8 files, 8 sessions read, 32 messages read, 32 messages new"
+}
+exit: 0
+
+$ krowk sessions sync --no-network
+stdout:
+{
+  "ok": true,
+  "data": {
+    "dry_run": false,
+    "store": "<scratch>/home/.local/share/krowk/krowk.db",
+    "providers": [
+      {
+        "provider": "claude",
+        "files": 4,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 4,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      },
+      {
+        "provider": "cursor",
+        "files": 2,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 2,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      },
+      {
+        "provider": "opencode",
+        "files": 2,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 2,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      }
+    ],
+    "duration_ms": <n>,
+    "pricing": {
+      "status": "no_network"
+    }
+  },
+  "summary": "8 files, 0 sessions read, 0 messages read, 0 messages new"
+}
+exit: 0
+
+
+$ krowk sessions sync --no-network
+stdout:
+{
+  "ok": true,
+  "data": {
+    "dry_run": false,
+    "store": "<scratch>/home/.local/share/krowk/krowk.db",
+    "providers": [
+      {
+        "provider": "claude",
+        "files": 4,
+        "sessions_seen": 1,
+        "messages_seen": 15,
+        "parts_seen": 19,
+        "sessions_inserted": 0,
+        "messages_inserted": 1,
+        "parts_inserted": 1,
+        "skipped_by_type": {
+          "server_tool_use": 1
+        },
+        "skipped_lines": 2,
+        "files_failed": 0,
+        "files_unchanged": 3,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      },
+      {
+        "provider": "cursor",
+        "files": 2,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 2,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      },
+      {
+        "provider": "opencode",
+        "files": 2,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 2,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      }
+    ],
+    "duration_ms": <n>,
+    "pricing": {
+      "status": "no_network"
+    }
+  },
+  "summary": "8 files, 1 sessions read, 15 messages read, 1 messages new"
+}
+exit: 0
+
+$ krowk sessions sync
+stdout:
+{
+  "ok": true,
+  "data": {
+    "dry_run": false,
+    "store": "<scratch>/home/.local/share/krowk/krowk.db",
+    "providers": [
+      {
+        "provider": "claude",
+        "files": 4,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 4,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      },
+      {
+        "provider": "cursor",
+        "files": 2,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 2,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      },
+      {
+        "provider": "opencode",
+        "files": 2,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 2,
+        "errors_truncated": 0,
+        "duration_ms": <n>
+      }
+    ],
+    "duration_ms": <n>,
+    "pricing": {
+      "status": "failed",
+      "warning": "prices were not refreshed: models.dev could not be reached or did not answer with a price file — the cache or the snapshot still prices everything"
+    }
+  },
+  "summary": "8 files, 0 sessions read, 0 messages read, 0 messages new"
+}
+exit: 0
+

@@ -1,0 +1,63 @@
+
+
+
+$ krowk push missing.txt
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "file_unreadable",
+    "fix": "cannot read `missing.txt` — paths resolve from the current directory",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk push empty.txt
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "empty_file",
+    "fix": "`empty.txt` is empty — there is nothing to upload",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk push dir
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "file_unreadable",
+    "fix": "cannot read `dir` — paths resolve from the current directory",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk push
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "no_file",
+    "fix": "pass at least one path: `krowk push screenshot.png`",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk push a b --run
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "flag needs an argument: -run — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+

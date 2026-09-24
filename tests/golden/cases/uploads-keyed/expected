@@ -1,0 +1,292 @@
+
+
+
+
+$ krowk uploads create a.txt b.txt
+stdout:
+{
+  "ok": true,
+  "data": {
+    "artifacts": [
+      {
+        "slug": "<art_1>",
+        "state": "ready",
+        "filename": "a.txt",
+        "content_type": "text/plain",
+        "byte_size": 5,
+        "checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "region": "weur",
+        "run": {
+          "slug": "<run_1>",
+          "metadata": {
+            "krowk.client": "krowk-cli/<version>"
+          },
+          "created_at": "<time>"
+        },
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_1>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_1>/a.txt",
+        "markdown": "[a.txt](http://<registry>/a/<art_1>)",
+        "paste": {
+          "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_1>)",
+          "url": "http://<registry>/a/<art_1>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "created_at": "<time>",
+        "metadata": {
+          "krowk.client": "krowk-cli/<version>"
+        }
+      },
+      {
+        "slug": "<art_2>",
+        "state": "ready",
+        "filename": "b.txt",
+        "content_type": "text/plain",
+        "byte_size": 5,
+        "checksum": "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7",
+        "region": "weur",
+        "run": {
+          "slug": "<run_1>",
+          "metadata": {
+            "krowk.client": "krowk-cli/<version>"
+          },
+          "created_at": "<time>"
+        },
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_2>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_2>/b.txt",
+        "markdown": "[b.txt](http://<registry>/a/<art_2>)",
+        "paste": {
+          "markdown": "**b.txt** · [View preview ↗](http://<registry>/a/<art_2>)",
+          "url": "http://<registry>/a/<art_2>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "created_at": "<time>",
+        "metadata": {
+          "krowk.client": "krowk-cli/<version>"
+        }
+      }
+    ],
+    "run": {
+      "slug": "<run_1>",
+      "status": "finished",
+      "started_at": "<time>",
+      "finished_at": "<time>",
+      "metadata": {
+        "krowk.client": "krowk-cli/<version>"
+      }
+    }
+  },
+  "paste": {
+    "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_1>)\n\n**b.txt** · [View preview ↗](http://<registry>/a/<art_2>)",
+    "url": "http://<registry>/a/<art_1>\nhttp://<registry>/a/<art_2>",
+    "destinations": {
+      "_default": "markdown",
+      "asana": "url",
+      "basecamp": "url",
+      "github": "markdown",
+      "gitlab": "markdown",
+      "linear": "markdown",
+      "notion": "markdown",
+      "slack": "url"
+    }
+  },
+  "summary": "2 artifacts, 10 B, run <run_1>",
+  "breadcrumbs": [
+    {
+      "action": "share",
+      "cmd": "http://<registry>/a/<art_1>",
+      "description": "hand this link on — it is public and needs no key to read"
+    },
+    {
+      "action": "share",
+      "cmd": "http://<registry>/a/<art_2>",
+      "description": "hand this link on — it is public and needs no key to read"
+    }
+  ]
+}
+exit: 0
+
+$ krowk uploads list
+stdout:
+{
+  "ok": true,
+  "data": {
+    "artifacts": [
+      {
+        "slug": "<art_2>",
+        "state": "ready",
+        "filename": "b.txt",
+        "content_type": "text/plain",
+        "byte_size": 5,
+        "checksum": "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7",
+        "region": "weur",
+        "run": {
+          "slug": "<run_1>",
+          "metadata": {
+            "krowk.client": "krowk-cli/<version>"
+          },
+          "created_at": "<time>"
+        },
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_2>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_2>/b.txt",
+        "markdown": "[b.txt](http://<registry>/a/<art_2>)",
+        "paste": {
+          "markdown": "**b.txt** · [View preview ↗](http://<registry>/a/<art_2>)",
+          "url": "http://<registry>/a/<art_2>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "created_at": "<time>",
+        "metadata": {
+          "krowk.client": "krowk-cli/<version>"
+        }
+      },
+      {
+        "slug": "<art_1>",
+        "state": "ready",
+        "filename": "a.txt",
+        "content_type": "text/plain",
+        "byte_size": 5,
+        "checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "region": "weur",
+        "run": {
+          "slug": "<run_1>",
+          "metadata": {
+            "krowk.client": "krowk-cli/<version>"
+          },
+          "created_at": "<time>"
+        },
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_1>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_1>/a.txt",
+        "markdown": "[a.txt](http://<registry>/a/<art_1>)",
+        "paste": {
+          "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_1>)",
+          "url": "http://<registry>/a/<art_1>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "created_at": "<time>",
+        "metadata": {
+          "krowk.client": "krowk-cli/<version>"
+        }
+      }
+    ]
+  },
+  "summary": "2 artifacts"
+}
+exit: 0
+
+$ krowk uploads list --limit 1
+stdout:
+{
+  "ok": true,
+  "data": {
+    "artifacts": [
+      {
+        "slug": "<art_2>",
+        "state": "ready",
+        "filename": "b.txt",
+        "content_type": "text/plain",
+        "byte_size": 5,
+        "checksum": "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7",
+        "region": "weur",
+        "run": {
+          "slug": "<run_1>",
+          "metadata": {
+            "krowk.client": "krowk-cli/<version>"
+          },
+          "created_at": "<time>"
+        },
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_2>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_2>/b.txt",
+        "markdown": "[b.txt](http://<registry>/a/<art_2>)",
+        "paste": {
+          "markdown": "**b.txt** · [View preview ↗](http://<registry>/a/<art_2>)",
+          "url": "http://<registry>/a/<art_2>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "created_at": "<time>",
+        "metadata": {
+          "krowk.client": "krowk-cli/<version>"
+        }
+      }
+    ],
+    "next": "<art_2>"
+  },
+  "summary": "1 artifact",
+  "breadcrumbs": [
+    {
+      "action": "next page",
+      "cmd": "krowk uploads list --limit 1 --before <art_2>",
+      "description": "this page came back full, so any older rows are behind that cursor"
+    }
+  ]
+}
+exit: 0
+
+$ krowk uploads list --format human
+stdout:
+b.txt  5 B  http://<registry>/a/<art_2>
+a.txt  5 B  http://<registry>/a/<art_1>
+exit: 0
+
+$ krowk uploads list --format markdown
+stdout:
+**b.txt** · [View preview ↗](http://<registry>/a/<art_2>)
+
+**a.txt** · [View preview ↗](http://<registry>/a/<art_1>)
+exit: 0
+
+$ krowk uploads list --format url
+stdout:
+http://<registry>/a/<art_2>
+http://<registry>/a/<art_1>
+exit: 0
+

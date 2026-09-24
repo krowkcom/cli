@@ -1,0 +1,26 @@
+
+
+$ krowk doctor
+stdout:
+{
+  "api": "http://<registry>/v1",
+  "api_status": "reachable (krowk-registry, v1)",
+  "authenticated": true,
+  "config": "global <scratch>/home/.config/krowk/config.json (absent)",
+  "context": {},
+  "credentials": "<scratch>/home/.config/krowk/credentials.json",
+  "key": "<key_1> (<ws_1>) local",
+  "registry": "custom (KROWK_API_URL)",
+  "runs_available": true,
+  "runtime": "<runtime>",
+  "store": {
+    "name": "store",
+    "status": "pass",
+    "message": "healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"
+  },
+  "token_source": "KROWK_TOKEN",
+  "version": "<version>",
+  "workspace": "unknown — not recorded at login; `krowk auth verify` asks the registry"
+}
+exit: 0
+

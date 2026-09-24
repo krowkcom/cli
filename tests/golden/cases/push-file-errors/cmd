@@ -1,0 +1,8 @@
+@registry
+@file empty.txt 
+@sh mkdir dir
+krowk push missing.txt
+krowk push empty.txt
+krowk push dir
+krowk push
+krowk push a b --run

@@ -1,8 +1,0 @@
-{
-  "ok": false,
-  "error": {
-    "error": "unknown_command",
-    "fix": "`bogus` is not a krowk command — run `krowk --help`",
-    "retryable": false
-  }
-}

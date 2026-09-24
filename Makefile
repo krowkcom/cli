@@ -52,16 +52,20 @@ dist: ## The whole release, locally: every binary, the archives, the npm package
 clean:
 	rm -rf bin dist
 
-# The Rust port (Cargo.toml). Go above is still what ships; these targets are
-# how the port proves it can take over.
+# The Rust port (Cargo.toml). Go above is frozen and serves as the oracle the
+# golden cases are recorded from; these targets are how the port proves it can
+# take over.
 rust: ## Build the Rust krowk into target/release
 	cargo build --release -p krowk
 
-golden: build ## Hold the Go build to tests/golden/cases
+bin/devregistry: $(shell find internal/devregistry internal/registry -name '*.go')
+	go build -trimpath -o bin/devregistry ./internal/devregistry
+
+golden: build bin/devregistry ## Hold the Go build to tests/golden/cases
 	cargo test -p krowk-golden
 
-golden-rust: rust ## Hold the Rust build to the same cases
-	KROWK_BIN=target/release/krowk cargo test -p krowk-golden
+golden-rust: rust bin/devregistry ## Hold the Rust build to the same cases
+	KROWK_BIN=target/release/krowk KROWK_MCP_BIN=target/release/krowk-mcp cargo test -p krowk-golden
 
-golden-update: build ## Re-record the cases from the Go build
+golden-update: build bin/devregistry ## Re-record the cases from the Go build
 	GOLDEN_UPDATE=1 cargo test -p krowk-golden

@@ -1,0 +1,162 @@
+
+
+$ krowk runs start --title "first" --pull-request https://github.com/o/r/pull/2 --session sess --repo o/r --commit deadbeef --agent claude
+stdout:
+{
+  "ok": true,
+  "data": {
+    "slug": "<run_1>",
+    "status": "open",
+    "started_at": "<time>",
+    "metadata": {
+      "vcs.repository.name": "o/r",
+      "vcs.ref.head.revision": "deadbeef",
+      "krowk.harness": "claude",
+      "krowk.client": "krowk-cli/<version>",
+      "vcs.change.id": "2",
+      "vcs.change.title": "first",
+      "krowk.change.url": "https://github.com/o/r/pull/2",
+      "krowk.session": "sess"
+    }
+  },
+  "summary": "run <run_1> is open",
+  "breadcrumbs": [
+    {
+      "action": "attach uploads",
+      "cmd": "krowk push \u003cfile\u003e --run <run_1>",
+      "description": "every push naming this run is grouped under it and inherits the metadata recorded on it; \u003cfile\u003e is the path to upload"
+    },
+    {
+      "action": "close",
+      "cmd": "krowk runs finish <run_1>",
+      "description": "marks the run finished; a run stays open until something says so"
+    }
+  ]
+}
+exit: 0
+
+$ krowk runs start
+stdout:
+{
+  "ok": true,
+  "data": {
+    "slug": "<run_2>",
+    "status": "open",
+    "started_at": "<time>",
+    "metadata": {
+      "krowk.client": "krowk-cli/<version>"
+    }
+  },
+  "summary": "run <run_2> is open",
+  "breadcrumbs": [
+    {
+      "action": "attach uploads",
+      "cmd": "krowk push \u003cfile\u003e --run <run_2>",
+      "description": "every push naming this run is grouped under it and inherits the metadata recorded on it; \u003cfile\u003e is the path to upload"
+    },
+    {
+      "action": "close",
+      "cmd": "krowk runs finish <run_2>",
+      "description": "marks the run finished; a run stays open until something says so"
+    }
+  ]
+}
+exit: 0
+
+$ krowk runs list
+stdout:
+{
+  "ok": true,
+  "data": {
+    "runs": [
+      {
+        "slug": "<run_2>",
+        "status": "open",
+        "started_at": "<time>",
+        "metadata": {
+          "krowk.client": "krowk-cli/<version>"
+        }
+      },
+      {
+        "slug": "<run_1>",
+        "status": "open",
+        "started_at": "<time>",
+        "metadata": {
+          "vcs.repository.name": "o/r",
+          "vcs.ref.head.revision": "deadbeef",
+          "krowk.harness": "claude",
+          "krowk.client": "krowk-cli/<version>",
+          "vcs.change.id": "2",
+          "vcs.change.title": "first",
+          "krowk.change.url": "https://github.com/o/r/pull/2",
+          "krowk.session": "sess"
+        }
+      }
+    ]
+  },
+  "summary": "2 runs"
+}
+exit: 0
+
+$ krowk runs list --limit 1
+stdout:
+{
+  "ok": true,
+  "data": {
+    "runs": [
+      {
+        "slug": "<run_2>",
+        "status": "open",
+        "started_at": "<time>",
+        "metadata": {
+          "krowk.client": "krowk-cli/<version>"
+        }
+      }
+    ],
+    "next": "<run_2>"
+  },
+  "summary": "1 run",
+  "breadcrumbs": [
+    {
+      "action": "next page",
+      "cmd": "krowk runs list --limit 1 --before <run_2>",
+      "description": "this page came back full, so any older rows are behind that cursor"
+    }
+  ]
+}
+exit: 0
+
+$ krowk runs list --format human
+stdout:
+<run_2>  open
+<run_1>  open  first
+exit: 0
+
+$ krowk runs show <run_3>
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "not_found",
+    "fix": "no such artifact or run in this workspace — check the slug, and that the key matches the workspace it was uploaded to",
+    "message": "No such record.",
+    "retryable": false,
+    "status": 404
+  }
+}
+exit: 2
+
+$ krowk runs finish <run_3>
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "not_found",
+    "fix": "no such artifact or run in this workspace — check the slug, and that the key matches the workspace it was uploaded to",
+    "message": "No such record.",
+    "retryable": false,
+    "status": 404
+  }
+}
+exit: 2
+

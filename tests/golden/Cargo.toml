@@ -6,4 +6,8 @@ rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
 
-[dependencies]
+# Test-only: none of this reaches a shipped binary, so the size rule that
+# governs crates/ does not apply here.
+[dev-dependencies]
+regex = "1"
+shlex = "2"

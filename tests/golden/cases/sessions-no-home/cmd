@@ -1,0 +1,3 @@
+@unenv HOME
+krowk sessions
+krowk sessions import --from all

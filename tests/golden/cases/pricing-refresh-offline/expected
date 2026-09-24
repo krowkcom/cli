@@ -1,0 +1,35 @@
+$ krowk pricing refresh
+stdout:
+{
+  "meta_path": "<scratch>/home/.cache/krowk/models.meta.json",
+  "path": "<scratch>/home/.cache/krowk/models.json",
+  "refreshed": false,
+  "snapshot_date": "2026-09-10",
+  "source": "https://models.dev/api.json"
+}
+exit: 0
+
+$ krowk pricing
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "unknown_command",
+    "fix": "`pricing` is not a krowk command — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk pricing bogus
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "unknown_command",
+    "fix": "`pricing bogus` is not a krowk command — run `krowk --help`",
+    "retryable": false
+  }
+}
+exit: 1
+

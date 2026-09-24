@@ -1,0 +1,385 @@
+
+
+
+$ krowk push a.txt
+stdout:
+{
+  "ok": true,
+  "data": {
+    "artifacts": [
+      {
+        "slug": "<art_1>",
+        "state": "ready",
+        "filename": "a.txt",
+        "content_type": "text/plain",
+        "byte_size": 5,
+        "checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "region": "weur",
+        "run": {
+          "slug": "<run_1>",
+          "metadata": {
+            "krowk.client": "krowk-cli/<version>"
+          },
+          "created_at": "<time>"
+        },
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_1>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_1>/a.txt",
+        "markdown": "[a.txt](http://<registry>/a/<art_1>)",
+        "paste": {
+          "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_1>)",
+          "url": "http://<registry>/a/<art_1>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "created_at": "<time>",
+        "metadata": {
+          "krowk.client": "krowk-cli/<version>"
+        }
+      }
+    ],
+    "run": {
+      "slug": "<run_1>",
+      "status": "finished",
+      "started_at": "<time>",
+      "finished_at": "<time>",
+      "metadata": {
+        "krowk.client": "krowk-cli/<version>"
+      }
+    }
+  },
+  "paste": {
+    "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_1>)",
+    "url": "http://<registry>/a/<art_1>",
+    "destinations": {
+      "_default": "markdown",
+      "asana": "url",
+      "basecamp": "url",
+      "github": "markdown",
+      "gitlab": "markdown",
+      "linear": "markdown",
+      "notion": "markdown",
+      "slack": "url"
+    }
+  },
+  "summary": "1 artifact, 5 B, run <run_1>",
+  "breadcrumbs": [
+    {
+      "action": "share",
+      "cmd": "http://<registry>/a/<art_1>",
+      "description": "hand this link on — it is public and needs no key to read"
+    }
+  ]
+}
+exit: 0
+
+$ krowk push a.txt --private
+stdout:
+{
+  "ok": true,
+  "data": {
+    "artifacts": [
+      {
+        "slug": "<art_2>",
+        "state": "ready",
+        "filename": "a.txt",
+        "content_type": "text/plain",
+        "byte_size": 5,
+        "checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "region": "weur",
+        "run": {
+          "slug": "<run_2>",
+          "metadata": {
+            "krowk.client": "krowk-cli/<version>"
+          },
+          "created_at": "<time>"
+        },
+        "visibility": "private",
+        "url": "http://<registry>/a/<art_2>",
+        "file_url": "http://<registry>/_storage/weur/<secret>/a.txt",
+        "markdown": "[a.txt](http://<registry>/a/<art_2>)",
+        "paste": {
+          "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_2>)",
+          "url": "http://<registry>/a/<art_2>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "created_at": "<time>",
+        "metadata": {
+          "krowk.client": "krowk-cli/<version>"
+        }
+      }
+    ],
+    "run": {
+      "slug": "<run_2>",
+      "status": "finished",
+      "started_at": "<time>",
+      "finished_at": "<time>",
+      "metadata": {
+        "krowk.client": "krowk-cli/<version>"
+      }
+    }
+  },
+  "paste": {
+    "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_2>)",
+    "url": "http://<registry>/a/<art_2>",
+    "destinations": {
+      "_default": "markdown",
+      "asana": "url",
+      "basecamp": "url",
+      "github": "markdown",
+      "gitlab": "markdown",
+      "linear": "markdown",
+      "notion": "markdown",
+      "slack": "url"
+    }
+  },
+  "summary": "1 artifact, 5 B, run <run_2>",
+  "breadcrumbs": [
+    {
+      "action": "share",
+      "cmd": "http://<registry>/a/<art_2>",
+      "description": "hand this link to a workspace member — it opens the card after they sign in to the app, and reads as not found to everyone else. The image embeds anywhere: its byte URL is the capability, so paste the markdown form outside the workspace only when the picture itself is meant to be seen"
+    }
+  ]
+}
+exit: 0
+
+$ krowk push a.txt --title "the work" --pull-request https://github.com/o/r/pull/1 --session s1 --repo o/r --commit abc123 --agent claude --reference https://example.com/x
+stdout:
+{
+  "ok": true,
+  "data": {
+    "artifacts": [
+      {
+        "slug": "<art_3>",
+        "state": "ready",
+        "filename": "a.txt",
+        "content_type": "text/plain",
+        "byte_size": 5,
+        "checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "region": "weur",
+        "run": {
+          "slug": "<run_3>",
+          "metadata": {
+            "vcs.repository.name": "o/r",
+            "vcs.ref.head.revision": "abc123",
+            "krowk.harness": "claude",
+            "krowk.client": "krowk-cli/<version>",
+            "vcs.change.id": "1",
+            "vcs.change.title": "the work",
+            "krowk.change.url": "https://github.com/o/r/pull/1",
+            "krowk.session": "s1",
+            "krowk.references": [
+              "https://example.com/x"
+            ]
+          },
+          "created_at": "<time>"
+        },
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_3>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_3>/a.txt",
+        "markdown": "[a.txt](http://<registry>/a/<art_3>)",
+        "paste": {
+          "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_3>)",
+          "url": "http://<registry>/a/<art_3>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "created_at": "<time>",
+        "metadata": {
+          "vcs.repository.name": "o/r",
+          "vcs.ref.head.revision": "abc123",
+          "krowk.harness": "claude",
+          "krowk.client": "krowk-cli/<version>"
+        }
+      }
+    ],
+    "run": {
+      "slug": "<run_3>",
+      "status": "finished",
+      "started_at": "<time>",
+      "finished_at": "<time>",
+      "metadata": {
+        "vcs.repository.name": "o/r",
+        "vcs.ref.head.revision": "abc123",
+        "krowk.harness": "claude",
+        "krowk.client": "krowk-cli/<version>",
+        "vcs.change.id": "1",
+        "vcs.change.title": "the work",
+        "krowk.change.url": "https://github.com/o/r/pull/1",
+        "krowk.session": "s1",
+        "krowk.references": [
+          "https://example.com/x"
+        ]
+      }
+    },
+    "title": "the work"
+  },
+  "paste": {
+    "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_3>)",
+    "url": "http://<registry>/a/<art_3>",
+    "destinations": {
+      "_default": "markdown",
+      "asana": "url",
+      "basecamp": "url",
+      "github": "markdown",
+      "gitlab": "markdown",
+      "linear": "markdown",
+      "notion": "markdown",
+      "slack": "url"
+    }
+  },
+  "summary": "1 artifact, 5 B, run <run_3>",
+  "breadcrumbs": [
+    {
+      "action": "share",
+      "cmd": "http://<registry>/a/<art_3>",
+      "description": "hand this link on — it is public and needs no key to read"
+    }
+  ]
+}
+exit: 0
+
+$ krowk push a.txt --metadata '{"test":"login"}'
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "--metadata takes key=value, like --metadata krowk.caption=\"before the fix\"",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk push a.txt --metadata notjson
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "--metadata takes key=value, like --metadata krowk.caption=\"before the fix\"",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk push a.txt --link https://example.com --link-title Example --link-rel docs
+stdout:
+{
+  "ok": true,
+  "data": {
+    "artifacts": [
+      {
+        "slug": "<art_4>",
+        "state": "ready",
+        "filename": "a.txt",
+        "content_type": "text/plain",
+        "byte_size": 5,
+        "checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "region": "weur",
+        "run": {
+          "slug": "<run_4>",
+          "metadata": {
+            "krowk.client": "krowk-cli/<version>",
+            "krowk.links": [
+              {
+                "url": "https://example.com",
+                "title": "Example",
+                "rel": "docs"
+              }
+            ]
+          },
+          "created_at": "<time>"
+        },
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_4>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_4>/a.txt",
+        "markdown": "[a.txt](http://<registry>/a/<art_4>)",
+        "paste": {
+          "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_4>)",
+          "url": "http://<registry>/a/<art_4>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "created_at": "<time>",
+        "metadata": {
+          "krowk.client": "krowk-cli/<version>"
+        }
+      }
+    ],
+    "run": {
+      "slug": "<run_4>",
+      "status": "finished",
+      "started_at": "<time>",
+      "finished_at": "<time>",
+      "metadata": {
+        "krowk.client": "krowk-cli/<version>",
+        "krowk.links": [
+          {
+            "url": "https://example.com",
+            "title": "Example",
+            "rel": "docs"
+          }
+        ]
+      }
+    }
+  },
+  "paste": {
+    "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_4>)",
+    "url": "http://<registry>/a/<art_4>",
+    "destinations": {
+      "_default": "markdown",
+      "asana": "url",
+      "basecamp": "url",
+      "github": "markdown",
+      "gitlab": "markdown",
+      "linear": "markdown",
+      "notion": "markdown",
+      "slack": "url"
+    }
+  },
+  "summary": "1 artifact, 5 B, run <run_4>",
+  "breadcrumbs": [
+    {
+      "action": "share",
+      "cmd": "http://<registry>/a/<art_4>",
+      "description": "hand this link on — it is public and needs no key to read"
+    }
+  ]
+}
+exit: 0
+

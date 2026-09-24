@@ -1,0 +1,168 @@
+
+
+
+
+$ krowk push a.txt b.md c.json
+stdout:
+{
+  "ok": true,
+  "data": {
+    "artifacts": [
+      {
+        "slug": "<art_1>",
+        "state": "ready",
+        "filename": "a.txt",
+        "content_type": "text/plain",
+        "byte_size": 5,
+        "checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "region": "weur",
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_1>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_1>/a.txt",
+        "markdown": "[a.txt](http://<registry>/a/<art_1>)",
+        "paste": {
+          "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_1>) · expires <date>",
+          "url": "http://<registry>/a/<art_1>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "expires_at": "<time>",
+        "created_at": "<time>",
+        "metadata": null,
+        "claim_token": "<claim_1>"
+      },
+      {
+        "slug": "<art_2>",
+        "state": "ready",
+        "filename": "b.md",
+        "content_type": "application/octet-stream",
+        "byte_size": 8,
+        "checksum": "497c96e612373c14de69c0cbd79e8c6b870cc73ae6da4037f1a1e0c58bcc9315",
+        "region": "weur",
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_2>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_2>/b.md",
+        "markdown": "[b.md](http://<registry>/a/<art_2>)",
+        "paste": {
+          "markdown": "**b.md** · [View preview ↗](http://<registry>/a/<art_2>) · expires <date>",
+          "url": "http://<registry>/a/<art_2>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "expires_at": "<time>",
+        "created_at": "<time>",
+        "metadata": null,
+        "claim_token": "<claim_2>"
+      },
+      {
+        "slug": "<art_3>",
+        "state": "ready",
+        "filename": "c.json",
+        "content_type": "application/json",
+        "byte_size": 2,
+        "checksum": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "region": "weur",
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_3>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_3>/c.json",
+        "markdown": "[c.json](http://<registry>/a/<art_3>)",
+        "paste": {
+          "markdown": "**c.json** · [View preview ↗](http://<registry>/a/<art_3>) · expires <date>",
+          "url": "http://<registry>/a/<art_3>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "expires_at": "<time>",
+        "created_at": "<time>",
+        "metadata": null,
+        "claim_token": "<claim_3>"
+      }
+    ]
+  },
+  "paste": {
+    "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_1>) · expires <date>\n\n**b.md** · [View preview ↗](http://<registry>/a/<art_2>) · expires <date>\n\n**c.json** · [View preview ↗](http://<registry>/a/<art_3>) · expires <date>",
+    "url": "http://<registry>/a/<art_1>\nhttp://<registry>/a/<art_2>\nhttp://<registry>/a/<art_3>",
+    "destinations": {
+      "_default": "markdown",
+      "asana": "url",
+      "basecamp": "url",
+      "github": "markdown",
+      "gitlab": "markdown",
+      "linear": "markdown",
+      "notion": "markdown",
+      "slack": "url"
+    }
+  },
+  "summary": "3 artifacts, 15 B",
+  "breadcrumbs": [
+    {
+      "action": "keep past expiry",
+      "cmd": "krowk claim <art_1> <claim_1>",
+      "description": "this upload is anonymous and expires within the day; claiming it with a key moves it into that key's workspace — a Pro workspace keeps it, a free one gives it another 24 hours. The token is shown once and spent once"
+    },
+    {
+      "action": "keep past expiry",
+      "cmd": "krowk claim <art_2> <claim_2>",
+      "description": "this upload is anonymous and expires within the day; claiming it with a key moves it into that key's workspace — a Pro workspace keeps it, a free one gives it another 24 hours. The token is shown once and spent once"
+    },
+    {
+      "action": "keep past expiry",
+      "cmd": "krowk claim <art_3> <claim_3>",
+      "description": "this upload is anonymous and expires within the day; claiming it with a key moves it into that key's workspace — a Pro workspace keeps it, a free one gives it another 24 hours. The token is shown once and spent once"
+    },
+    {
+      "action": "share",
+      "cmd": "http://<registry>/a/<art_1>",
+      "description": "hand this link on — it is public and needs no key to read"
+    },
+    {
+      "action": "share",
+      "cmd": "http://<registry>/a/<art_2>",
+      "description": "hand this link on — it is public and needs no key to read"
+    },
+    {
+      "action": "share",
+      "cmd": "http://<registry>/a/<art_3>",
+      "description": "hand this link on — it is public and needs no key to read"
+    }
+  ]
+}
+exit: 0
+
+$ krowk push a.txt b.md --format markdown
+stdout:
+**a.txt** · [View preview ↗](http://<registry>/a/<art_4>) · expires <date>
+
+**b.md** · [View preview ↗](http://<registry>/a/<art_5>) · expires <date>
+exit: 0
+
+$ krowk push a.txt b.md --format url
+stdout:
+http://<registry>/a/<art_6>
+http://<registry>/a/<art_7>
+exit: 0
+

@@ -1,0 +1,5 @@
+krowk sessions
+krowk sessions --format human
+krowk sessions show nope
+krowk sessions sync --no-network
+krowk sessions

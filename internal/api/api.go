@@ -41,7 +41,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -683,11 +682,9 @@ func ContentType(path string) string {
 // always video/*, never audio/*; without one — audio-only or an unreadable
 // head — the extension answer stands.
 func contentTypeFor(path string, head []byte) string {
-	t := mime.TypeByExtension(filepath.Ext(path))
-	if t == "" {
+	t, ok := contentTypes[strings.ToLower(filepath.Ext(path))]
+	if !ok {
 		t = "application/octet-stream"
-	} else if i := strings.IndexByte(t, ';'); i >= 0 {
-		t = strings.TrimSpace(t[:i])
 	}
 	if len(head) > 0 && isMatroskaExt(path) && hasMatroskaVideoTrack(head) {
 		// The subtype is kept: audio/webm becomes video/webm, so the answer
@@ -703,6 +700,44 @@ func contentTypeFor(path string, head []byte) string {
 		}
 	}
 	return t
+}
+
+// contentTypes is the whole extension table, fixed here rather than read from
+// the machine. The standard library's mime package merges in whatever
+// mime.types the host carries — Apache's on macOS, the distribution's on Linux —
+// so the same file declared from two laptops could be two different artifacts,
+// and a type is signed into the upload URL and kept on the record. Anything
+// absent is application/octet-stream; the card page falls back to the filename
+// for those. .webm is audio here on purpose: only a Matroska head with a video
+// track makes it video (contentTypeFor), so an audio-only recording stays audio.
+var contentTypes = map[string]string{
+	// images
+	".apng": "image/apng", ".avif": "image/avif", ".bmp": "image/bmp",
+	".gif": "image/gif", ".heic": "image/heic", ".ico": "image/x-icon",
+	".jpeg": "image/jpeg", ".jpg": "image/jpeg", ".png": "image/png",
+	".svg": "image/svg+xml", ".tif": "image/tiff", ".tiff": "image/tiff",
+	".webp": "image/webp",
+	// video and audio
+	".avi": "video/x-msvideo", ".m4v": "video/x-m4v", ".mkv": "video/x-matroska",
+	".mov": "video/quicktime", ".mp4": "video/mp4", ".mpeg": "video/mpeg",
+	".ogv": "video/ogg", ".webm": "audio/webm",
+	".aac": "audio/aac", ".flac": "audio/flac", ".m4a": "audio/mp4",
+	".mp3": "audio/mpeg", ".oga": "audio/ogg", ".ogg": "audio/ogg",
+	".opus": "audio/ogg", ".wav": "audio/wav",
+	// text
+	".css": "text/css", ".csv": "text/csv", ".htm": "text/html",
+	".html": "text/html", ".ics": "text/calendar", ".js": "text/javascript",
+	".log": "text/plain", ".mjs": "text/javascript", ".text": "text/plain",
+	".tsv": "text/tab-separated-values", ".txt": "text/plain", ".xml": "text/xml",
+	// documents and data
+	".json": "application/json", ".pdf": "application/pdf",
+	".wasm": "application/wasm", ".xhtml": "application/xhtml+xml",
+	".doc": "application/msword", ".rtf": "application/rtf",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	// archives
+	".gz": "application/gzip", ".tar": "application/x-tar", ".zip": "application/zip",
 }
 
 // matroskaHeadLimit is how much of the file the video-track sniff reads.

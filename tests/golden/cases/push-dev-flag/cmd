@@ -1,0 +1,3 @@
+@file a.txt hello
+@unenv KROWK_API_URL
+krowk config show --dev

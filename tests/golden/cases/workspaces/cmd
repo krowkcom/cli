@@ -1,0 +1,7 @@
+@registry
+krowk workspaces
+krowk workspaces list
+krowk auth login --token krowk_sk_test
+krowk workspaces
+krowk workspaces use nope
+krowk workspaces --format human

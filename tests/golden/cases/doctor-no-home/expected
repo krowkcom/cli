@@ -1,0 +1,26 @@
+
+$ krowk doctor
+stdout:
+{
+  "api": "http://127.0.0.1:9/v1",
+  "api_status": "unreachable — network_unreachable — <transport error>",
+  "authenticated": false,
+  "config": "global .krowk/config.json (absent)",
+  "context": {},
+  "credentials": ".krowk/credentials.json",
+  "key": "none — uploads will be anonymous",
+  "registry": "custom (KROWK_API_URL)",
+  "runs_available": false,
+  "runtime": "<runtime>",
+  "store": {
+    "name": "store",
+    "status": "fail",
+    "message": "no home directory in environment, so krowk.db has nowhere to live",
+    "hint": "set HOME (or XDG_DATA_HOME to an absolute path) so krowk.db has a place to live (internal/store)"
+  },
+  "token_source": "none",
+  "version": "<version>",
+  "workspace": "none — uploads will be anonymous"
+}
+exit: 0
+

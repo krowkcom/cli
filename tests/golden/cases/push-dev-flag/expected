@@ -1,0 +1,20 @@
+
+
+$ krowk config show --dev
+stdout:
+{
+  "ok": true,
+  "data": {
+    "global_path": "<scratch>/home/.config/krowk/config.json"
+  },
+  "summary": "no configuration set — uploads use the stored default key",
+  "breadcrumbs": [
+    {
+      "action": "set the workspace",
+      "cmd": "krowk config set workspace \u003cworkspace\u003e",
+      "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
+    }
+  ]
+}
+exit: 0
+

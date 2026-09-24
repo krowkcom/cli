@@ -17,9 +17,12 @@ license-file = "LICENSE"
 publish = false
 
 # Size is a requirement here, not a nicety: this binary is fetched into
-# someone else's container at the end of their task.
+# someone else's container at the end of their task. "s" rather than "z":
+# measured on 707 real sessions, "s" imports ~28% faster than "z" (10.0 s
+# against 13.5 s) and as fast as "3", for 0.7 MB more; "3" costs 1.9 MB
+# beyond "s" and buys nothing measurable.
 [profile.release]
-opt-level = "z"
+opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"

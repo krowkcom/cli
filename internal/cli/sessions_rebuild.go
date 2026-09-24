@@ -94,7 +94,7 @@ func sessionsRebuild(w io.Writer, format output.Format, f flags, env runctx.Env,
 		return api.Fail("store_unavailable", sanitizeStoreErr(err, storePath))
 	}
 	defer db.Close()
-	return importInto(w, format, f, env, db, storePath, importSources(), &removed)
+	return importInto(w, format, f, env, db, storePath, importSources(), importReport{Removed: &removed})
 }
 
 // stdinIsTerminal is whether a confirmation has anyone to read it. stdout

@@ -88,6 +88,11 @@ type importSource struct {
 	// this source takes. An empty string decodes to the zero cursor, which
 	// every reader reads as "from the start".
 	decode func(string) (importer.Cursor, error)
+	// unchanged is `sessions sync`'s: whether the ref has moved past the
+	// stored cursor at all, asked before Read so an untouched transcript
+	// costs a stat or one query rather than a parse. nil, as import leaves
+	// it, reads every ref.
+	unchanged func(env harnessenv.Env, ref importer.Ref, cur importer.Cursor) bool
 }
 
 // importSources is every reader krowk has, in the order they run. Claude
@@ -143,6 +148,10 @@ type providerReport struct {
 	// FilesFailed is refs whose Read returned an error and which were
 	// therefore not ingested at all.
 	FilesFailed int `json:"files_failed"`
+	// FilesUnchanged is refs `sessions sync` left unread because their
+	// cursor said nothing had moved. Always 0 on import, which reads every
+	// ref.
+	FilesUnchanged int `json:"files_unchanged"`
 	// Errors is the first maxReportedErrors of those, plus a Discover
 	// failure if there was one.
 	Errors []string `json:"errors,omitempty"`
@@ -166,6 +175,9 @@ type importReport struct {
 	// `[]` when there were none — and absent from a plain import's report,
 	// which is what the pointer tells apart.
 	Removed *[]string `json:"removed,omitempty"`
+	// Pricing is what `sessions sync` did about the price cache, and absent
+	// everywhere else: sync is the one sessions command allowed network.
+	Pricing *syncPricing `json:"pricing,omitempty"`
 }
 
 // sessionsImport reads every transcript the named sources can see and writes
@@ -261,17 +273,18 @@ func sessionsImport(w io.Writer, format output.Format, f flags, env runctx.Env) 
 		}
 		defer db.Close()
 	}
-	return importInto(w, format, f, env, db, storePath, sources, nil)
+	return importInto(w, format, f, env, db, storePath, sources, importReport{})
 }
 
 // importInto is the import itself, from an open store (nil on a dry run) to
 // the report and the exit it decides. Split out of sessionsImport so
-// `sessions rebuild` runs exactly this path over the fresh file rather than a
-// copy of it; removed is what rebuild deleted first, and nil for an import.
-func importInto(w io.Writer, format output.Format, f flags, env runctx.Env, db *sql.DB, storePath string, sources []importSource, removed *[]string) error {
+// `sessions rebuild` and `sessions sync` run exactly this path rather than a
+// copy of it; report carries what they did first — rebuild's removed, sync's
+// pricing — and is empty for an import.
+func importInto(w io.Writer, format output.Format, f flags, env runctx.Env, db *sql.DB, storePath string, sources []importSource, report importReport) error {
 	ctx := context.Background()
 	started := time.Now()
-	report := importReport{DryRun: f.dryRun, Store: storePath, Removed: removed}
+	report.DryRun, report.Store = f.dryRun, storePath
 	var broken []string
 	for _, s := range sources {
 		row := runImportSource(ctx, db, storePath, s, harnessenv.Env(env), f)
@@ -370,6 +383,10 @@ func runImportSource(ctx context.Context, db *sql.DB, storePath string, s import
 		cur, err := s.decode(stored)
 		if err != nil {
 			out.fail(ref, err)
+			continue
+		}
+		if stored != "" && s.unchanged != nil && s.unchanged(env, ref, cur) {
+			out.FilesUnchanged++
 			continue
 		}
 		th, next, res, err := s.src.Read(env, ref, cur)
@@ -556,6 +573,12 @@ func emitImportReport(w io.Writer, format output.Format, f flags, report importR
 			fmt.Fprintf(w, "removed   %s\n", path)
 		}
 	}
+	if report.Pricing != nil {
+		fmt.Fprintf(w, "pricing   %s\n", report.Pricing.Status)
+		if report.Pricing.Warning != "" {
+			fmt.Fprintf(w, "  ! %s\n", report.Pricing.Warning)
+		}
+	}
 	for _, p := range report.Providers {
 		fmt.Fprintln(w, humanProviderLine(p, report.DryRun))
 		for _, e := range p.Errors {
@@ -579,6 +602,9 @@ func humanProviderLine(p providerReport, dryRun bool) string {
 		"%d messages new  %dms",
 		p.Provider, p.Files, p.SessionsSeen, p.MessagesSeen, p.PartsSeen,
 		p.MessagesInserted, p.DurationMS)
+	if p.FilesUnchanged > 0 {
+		line += fmt.Sprintf("  (%d unchanged)", p.FilesUnchanged)
+	}
 	if p.FilesFailed > 0 {
 		line += fmt.Sprintf("  (%d failed)", p.FilesFailed)
 	}

@@ -666,6 +666,19 @@
                 "usage": "Delete without asking — required when nobody is at a terminal to confirm"
               }
             ]
+          },
+          {
+            "name": "sync",
+            "usage": "krowk sessions sync [--no-network]",
+            "summary": "Import only what changed since the last import, and refresh prices",
+            "flags": [
+              {
+                "name": "no-network",
+                "type": "bool",
+                "default": "false",
+                "usage": "Skip the models.dev price refresh"
+              }
+            ]
           }
         ]
       },

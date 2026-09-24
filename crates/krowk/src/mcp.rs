@@ -325,8 +325,10 @@ struct PushArgs {
     private: bool,
 }
 
+/// Strict where the top level is lenient, as Go's checkLinkFields is: a
+/// misspelled `title` here would land an unlabelled link in public metadata.
 #[derive(Deserialize, Default, Clone)]
-#[serde(default)]
+#[serde(deny_unknown_fields, default)]
 struct LinkArg {
     url: String,
     title: String,
@@ -742,5 +744,13 @@ mod tests {
         let lines: Vec<Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines[0]["error"]["code"], -32602);
         assert_eq!(lines[1]["result"], json!({}), "a last line without its newline is still answered");
+    }
+
+    #[test]
+    fn push_ignores_extra_arguments_but_refuses_extra_link_fields() {
+        assert!(arguments::<PushArgs>(&json!({"files": ["a.txt"], "bogus": 1}), "").is_ok());
+        let err = arguments::<PushArgs>(&json!({"files": ["a.txt"], "links": [{"url": "https://x.example", "label": "Issue"}]}), "").err().unwrap();
+        assert_eq!(err.code(), "bad_arguments");
+        assert!(err.fix().contains("unknown field `label`"), "{}", err.fix());
     }
 }

@@ -88,6 +88,28 @@ jobs:
           got=$(/tmp/pin/krowk-bin/krowk --version)
           [ "$got" = "0.7.0" ] || { echo "::error::installed $got, want the pinned 0.7.0" >&2; exit 1; }
 
+      # A remote `uses: owner/repo@ref`: the runner fetches the whole
+      # repository as the action, crates/ and all, and names it in
+      # GITHUB_ACTION_REPOSITORY. The release must come from there, never from
+      # the consumer's repository — here, a made-up acme/webapp.
+      - name: A remote action installs from its own repository
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          action="$(mktemp -d)"
+          git archive HEAD | tar -x -C "$action"
+          ruby -ryaml -e 'puts YAML.load_file("action.yml")["runs"]["steps"][0]["run"]' > /tmp/remote_step.sh
+          export GITHUB_ACTION_PATH="$action" GITHUB_ACTION_REF=v0.7.0 KROWK_SKIP_SKILL=1
+          export GITHUB_ACTION_REPOSITORY="$GITHUB_REPOSITORY" GITHUB_REPOSITORY=acme/webapp
+          export RUNNER_TEMP=/tmp/remote GITHUB_PATH=/tmp/remote_path
+          mkdir -p /tmp/remote && : > /tmp/remote_path
+          out=$(bash /tmp/remote_step.sh 2>&1) || { echo "$out"; exit 1; }
+          grep -q "from ${GITHUB_ACTION_REPOSITORY}\$" <<<"$(grep Downloading <<<"$out")" || {
+            echo "::error::a remote action did not install from ${GITHUB_ACTION_REPOSITORY}:" >&2
+            grep Downloading <<<"$out" >&2
+            exit 1
+          }
+
       # The moving major tag has no release of its own, so it installs the
       # latest — and the guard in the step refuses to hand a workflow that
       # asked for 0.x a binary from another major line.

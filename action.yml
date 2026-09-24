@@ -86,17 +86,21 @@ runs:
             v[0-9]*.[0-9]*.[0-9]*) export KROWK_VERSION="${GITHUB_ACTION_REF#v}" ;;
           esac
         fi
-        # Whose releases to install. A checkout of this project itself (`uses: ./`
-        # here, or the extracted-step tests) installs its own repository's, so
-        # it works on either side of a rename and in a fork. Anyone else gets
-        # the repository the action was taken from, or the canonical one when
-        # the runner names none — never the calling workflow's repository,
-        # which has no krowk releases.
+        # Whose releases to install. A remote `uses: owner/repo@ref` names its
+        # repository in GITHUB_ACTION_REPOSITORY, and that is the answer — never
+        # the calling workflow's repository, which has no krowk releases. The
+        # runner fetches the whole repository for it, so the checkout test below
+        # would pass there too, which is why it comes second. `uses: ./` and a
+        # `run:` step name no action repository: a checkout of this project
+        # installs its own repository's releases (either side of a rename, or a
+        # fork), and anything else — a vendored copy — the canonical ones.
         if [ -z "${KROWK_REPO:-}" ]; then
-          if [ -d "${GITHUB_ACTION_PATH:?}/crates/krowk" ]; then
+          if [ -n "${GITHUB_ACTION_REPOSITORY:-}" ]; then
+            KROWK_REPO="$GITHUB_ACTION_REPOSITORY"
+          elif [ -d "${GITHUB_ACTION_PATH:?}/crates/krowk" ]; then
             KROWK_REPO="${GITHUB_REPOSITORY:-krowkcom/krowk}"
           else
-            KROWK_REPO="${GITHUB_ACTION_REPOSITORY:-krowkcom/krowk}"
+            KROWK_REPO="krowkcom/krowk"
           fi
         fi
         export KROWK_REPO

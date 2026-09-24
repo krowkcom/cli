@@ -1,10 +1,14 @@
 //! The krowk command line. `run` is the whole entry point, taking its streams
 //! and environment as arguments so tests never touch the process.
 
+mod agent;
+mod auth;
 pub mod catalog;
+mod doctor;
 pub mod exit;
 pub mod flags;
 pub mod help;
+mod upgrade;
 mod workspace;
 
 use crate::output::{self, jq, Format};
@@ -129,7 +133,14 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         reject_misplaced_sessions_flags(&ctx.f, &positionals).and_then(|()| dispatch(&mut ctx, &positionals))
     };
     match result {
-        Ok(()) => exit::OK,
+        Ok(()) => {
+            // The nudge comes after the command's own output, and only when it
+            // worked: a failure has the floor. `upgrade` just answered it.
+            if positionals.first().is_some_and(|p| p != "upgrade") {
+                upgrade::maybe_notify(&mut ctx);
+            }
+            exit::OK
+        }
         Err(e) => {
             let (quiet, colour, err_tty) = (ctx.f.quiet, ctx.colour, ctx.io.err_tty);
             let filter = ctx.filter.take();
@@ -142,6 +153,22 @@ fn dispatch(ctx: &mut Ctx, p: &[String]) -> Result<(), Error> {
     let words: Vec<&str> = p.iter().map(String::as_str).collect();
     let rest = |n: usize| &p[n.min(p.len())..];
     match words.as_slice() {
+        ["push", ..] => agent::upload(ctx, rest(1)),
+        ["uploads", "create", ..] => agent::upload(ctx, rest(2)),
+        ["uploads", "list", ..] => agent::uploads_list(ctx),
+        ["uploads", "show", ..] => agent::uploads_show(ctx, rest(2)),
+        ["uploads", "attach", ..] => agent::uploads_attach(ctx, rest(2)),
+        ["uploads", "delete", ..] => agent::uploads_delete(ctx, rest(2)),
+        ["runs", "start", ..] => agent::runs_start(ctx),
+        ["runs", "list", ..] => agent::runs_list(ctx),
+        ["runs", "show", ..] => agent::runs_show(ctx, rest(2)),
+        ["runs", "finish", ..] => agent::runs_finish(ctx, rest(2)),
+        ["claim", ..] => agent::claim(ctx, rest(1)),
+        ["auth", "login", ..] => auth::login(ctx, rest(2)),
+        ["auth", "token", ..] => auth::token(ctx),
+        ["auth", "verify", ..] => auth::verify(ctx),
+        ["upgrade", ..] => upgrade::upgrade(ctx),
+        ["doctor", ..] => doctor::doctor(ctx),
         ["config", "show", ..] => workspace::config_show(ctx),
         ["config", "set", ..] => workspace::config_set(ctx, rest(2)),
         ["config", "unset", ..] => workspace::config_unset(ctx, rest(2)),

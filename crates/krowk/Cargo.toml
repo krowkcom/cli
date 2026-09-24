@@ -25,3 +25,8 @@ jaq-std = "3"
 jaq-json = "2"
 # The two pickers (workspace, session) a person at a terminal may be asked.
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
+# `krowk upgrade` unpacks the release archive it downloads.
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+sha2 = "0.11"
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }

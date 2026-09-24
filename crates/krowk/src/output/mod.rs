@@ -3,6 +3,7 @@
 
 pub mod fix;
 pub mod jq;
+pub mod spinner;
 pub mod workspace;
 
 use krowk_api::{fail, Artifact, Error, Key, Page, Run, RunPage};

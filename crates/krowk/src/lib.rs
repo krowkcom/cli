@@ -4,6 +4,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod mcp;
 pub mod output;
 pub mod runctx;
 pub mod termclean;

@@ -1,40 +1,28 @@
 # The leading v comes off, because GoReleaser drops it and npm will not take it.
 # A checkout and a release should not disagree about what version this is.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
-LDFLAGS := -s -w -X github.com/krowkcom/cli/internal/cli.Version=$(VERSION)
 
-.PHONY: build test lint vet fmt check windows-build mock install clean dist release-check rust golden golden-rust golden-update
+.PHONY: build test lint check install mock clean dist release-check golden golden-update bin/devregistry
 
-build: ## Build ./bin/krowk and ./bin/krowk-mcp
-	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/krowk ./cmd/krowk
-	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/krowk-mcp ./cmd/krowk-mcp
+build: ## Build target/release/krowk (with sessions) and krowk-mcp
+	KROWK_VERSION=$(VERSION) cargo build --release -p krowk --features sessions
 
-test:
-	go test ./...
+test: ## The unit and integration tests
+	cargo test --workspace --exclude krowk-golden --features krowk/sessions
 
-vet:
-	go vet ./...
+# Both builds: the agent build (no sessions) is the one a container compiles
+# from source, and a cfg that only one of them sees is a lint only one catches.
+lint:
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets --features krowk/sessions -- -D warnings
 
-fmt:
-	gofmt -l -w .
+check: lint test golden ## Everything CI runs
 
-lint: ## Requires golangci-lint; falls back to vet
-	@command -v golangci-lint >/dev/null && golangci-lint run || $(MAKE) vet
-
-# The Windows build is compile-only and on purpose: `sessions` refuses to run
-# there, but the package still has to compile, and the build-tagged halves of
-# the import lock are only ever checked by a cross build. A test run on Linux
-# never touches importlock_windows.go.
-windows-build:
-	GOOS=windows go build ./...
-
-check: vet windows-build test ## Everything CI runs
+install: ## Install krowk and krowk-mcp into ~/.cargo/bin
+	KROWK_VERSION=$(VERSION) cargo install --locked --path crates/krowk --features sessions
 
 mock: ## Local stand-in for api.krowk.com on :8787
-	go run ./internal/devregistry
-
-install:
-	go install -trimpath -ldflags "$(LDFLAGS)" ./cmd/krowk ./cmd/krowk-mcp
+	cargo run --release -p krowk-devregistry --bin devregistry
 
 release-check: ## Validate .goreleaser.yaml, the npm launchers and the installer, offline
 	goreleaser check
@@ -42,44 +30,33 @@ release-check: ## Validate .goreleaser.yaml, the npm launchers and the installer
 	node --check npm/mcp/bin/krowk-mcp.js
 	# The installer downloads what this file produces, so it belongs to the
 	# release pipeline rather than to `check`: it needs goreleaser and python3,
-	# which a plain `go test` run has no business requiring.
+	# which a plain test run has no business requiring.
 	scripts/install_test.sh
 
-dist: ## The whole release, locally: every binary, the archives, the npm packages
-	goreleaser release --snapshot --clean --skip=publish
+dist: ## The whole release, locally: every binary, the archives, the npm packages (needs zig + cargo-zigbuild, on macOS)
+	goreleaser release --snapshot --clean --skip=publish --parallelism 1
 	node npm/build.mjs
 
 clean:
 	rm -rf bin dist
+	cargo clean
 
-# The Rust port (Cargo.toml). Go above is frozen and serves as the oracle the
-# golden cases are recorded from; these targets are how the port proves it can
-# take over.
-rust: ## Build the Rust krowk into target/release
-	cargo build --release -p krowk --features sessions
+# The stand-in registry the golden cases and the integration tests run
+# against, at the path they look for it. Built by no release.
+bin/devregistry:
+	cargo build --release -p krowk-devregistry --bin devregistry
+	# rm first: on macOS a rebuilt binary copied over the old one keeps the old
+	# inode's code signature, and the kernel kills it on launch.
+	mkdir -p bin && rm -f bin/devregistry && cp target/release/devregistry bin/devregistry
 
-bin/devregistry: $(shell find internal/devregistry internal/registry -name '*.go')
-	go build -trimpath -o bin/devregistry ./internal/devregistry
-
-# The cases compare the version like any other output, so the oracle is built
-# stamped with one no release will ever carry — into bin/golden/, so a golden
-# run leaves the developer's own bin/krowk as it was.
+# The cases compare the version like any other output, so the build they run is
+# stamped with one no release will ever carry.
 GOLDEN_VERSION := 0.0.0-golden
-GOLDEN_LDFLAGS := -s -w -X github.com/krowkcom/cli/internal/cli.Version=$(GOLDEN_VERSION)
 
-bin/golden: FORCE
-	go build -trimpath -ldflags "$(GOLDEN_LDFLAGS)" -o bin/golden/krowk ./cmd/krowk
-	go build -trimpath -ldflags "$(GOLDEN_LDFLAGS)" -o bin/golden/krowk-mcp ./cmd/krowk-mcp
-
-.PHONY: FORCE
-FORCE:
-
-golden: bin/golden bin/devregistry ## Hold the Go build to tests/golden/cases
+golden: bin/devregistry ## Hold the build to tests/golden/cases
+	KROWK_VERSION=$(GOLDEN_VERSION) cargo build --release -p krowk --features sessions
 	cargo test -p krowk-golden
 
-golden-rust: bin/devregistry ## Hold the Rust build to the same cases
+golden-update: bin/devregistry ## Re-record tests/golden/cases after an intended output change
 	KROWK_VERSION=$(GOLDEN_VERSION) cargo build --release -p krowk --features sessions
-	GOLDEN_MODE=contract KROWK_BIN=target/release/krowk KROWK_MCP_BIN=target/release/krowk-mcp cargo test -p krowk-golden
-
-golden-update: bin/golden bin/devregistry ## Re-record the cases from the Go build
 	GOLDEN_UPDATE=1 cargo test -p krowk-golden

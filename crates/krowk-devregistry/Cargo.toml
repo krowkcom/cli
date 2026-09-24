@@ -1,0 +1,24 @@
+# The stand-in for api.krowk.com that the golden cases and the client's own
+# tests run against. Test infrastructure: built by no release, never shipped.
+[package]
+name = "krowk-devregistry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+
+[lib]
+name = "krowk_devregistry"
+
+[[bin]]
+name = "devregistry"
+path = "src/main.rs"
+
+[dependencies]
+jiff = { version = "0.2", default-features = false, features = ["std"] }
+sha2 = "0.11"
+tiny_http = "0.12"
+
+[dev-dependencies]
+serde_json = "1"

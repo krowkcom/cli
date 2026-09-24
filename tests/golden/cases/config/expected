@@ -10,7 +10,7 @@ stdout:
   "breadcrumbs": [
     {
       "action": "set the workspace",
-      "cmd": "krowk config set workspace \u003cworkspace\u003e",
+      "cmd": "krowk config set workspace <workspace>",
       "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
     }
   ]
@@ -53,7 +53,7 @@ stdout:
   "breadcrumbs": [
     {
       "action": "set the workspace",
-      "cmd": "krowk config set workspace \u003cworkspace\u003e",
+      "cmd": "krowk config set workspace <workspace>",
       "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
     }
   ]
@@ -106,7 +106,7 @@ stdout:
   "breadcrumbs": [
     {
       "action": "set the workspace",
-      "cmd": "krowk config set workspace \u003cworkspace\u003e",
+      "cmd": "krowk config set workspace <workspace>",
       "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
     }
   ]
@@ -153,7 +153,7 @@ stdout:
   "breadcrumbs": [
     {
       "action": "set the workspace",
-      "cmd": "krowk config set workspace \u003cworkspace\u003e",
+      "cmd": "krowk config set workspace <workspace>",
       "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
     }
   ]
@@ -214,7 +214,7 @@ stdout:
   "breadcrumbs": [
     {
       "action": "set the workspace",
-      "cmd": "krowk config set workspace \u003cworkspace\u003e",
+      "cmd": "krowk config set workspace <workspace>",
       "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
     }
   ]

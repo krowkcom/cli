@@ -21,8 +21,8 @@ stdout:
   "breadcrumbs": [
     {
       "action": "attach uploads",
-      "cmd": "krowk push \u003cfile\u003e --run <run_1>",
-      "description": "every push naming this run is grouped under it and inherits the metadata recorded on it; \u003cfile\u003e is the path to upload"
+      "cmd": "krowk push <file> --run <run_1>",
+      "description": "every push naming this run is grouped under it and inherits the metadata recorded on it; <file> is the path to upload"
     },
     {
       "action": "close",
@@ -49,8 +49,8 @@ stdout:
   "breadcrumbs": [
     {
       "action": "attach uploads",
-      "cmd": "krowk push \u003cfile\u003e --run <run_2>",
-      "description": "every push naming this run is grouped under it and inherits the metadata recorded on it; \u003cfile\u003e is the path to upload"
+      "cmd": "krowk push <file> --run <run_2>",
+      "description": "every push naming this run is grouped under it and inherits the metadata recorded on it; <file> is the path to upload"
     },
     {
       "action": "close",

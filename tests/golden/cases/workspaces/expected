@@ -48,8 +48,8 @@ stdout:
   "breadcrumbs": [
     {
       "action": "push",
-      "cmd": "krowk push \u003cfile\u003e",
-      "description": "the key is stored and accepted, so nothing else is needed before uploading; \u003cfile\u003e is the path to upload"
+      "cmd": "krowk push <file>",
+      "description": "the key is stored and accepted, so nothing else is needed before uploading; <file> is the path to upload"
     }
   ]
 }
@@ -76,13 +76,13 @@ stdout:
   "breadcrumbs": [
     {
       "action": "switch the default",
-      "cmd": "krowk workspaces use \u003cworkspace\u003e",
-      "description": "repoints the machine-wide default at another stored key — \u003cworkspace\u003e is a name from this list"
+      "cmd": "krowk workspaces use <workspace>",
+      "description": "repoints the machine-wide default at another stored key — <workspace> is a name from this list"
     },
     {
       "action": "pin this repository",
-      "cmd": "krowk config set workspace \u003cworkspace\u003e",
-      "description": "writes .krowk/config.json at the repository root, so every command run inside it uses that workspace's key whoever runs it — \u003cworkspace\u003e is a name from this list"
+      "cmd": "krowk config set workspace <workspace>",
+      "description": "writes .krowk/config.json at the repository root, so every command run inside it uses that workspace's key whoever runs it — <workspace> is a name from this list"
     }
   ]
 }

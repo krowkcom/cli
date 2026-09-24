@@ -9,6 +9,26 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Changed
+
+- **krowk is written in Rust now.** Same commands, flags, JSON, error codes
+  and exit codes: every golden case recorded from the Go build passed against
+  the Rust one before the Go build was removed, and a `krowk.db` either build
+  wrote opens in the other. What you notice is the size and the speed —
+  `krowk` is 4–5 MB depending on the platform (was ~14 MB) and `krowk-mcp`
+  about 2 MB (was ~7 MB), and on 707 real sessions `sessions import` takes
+  ~10 s where it took ~14 s and `sessions` lists in 12 ms where it took 23 ms. Linux builds are static
+  (musl), for containers with any libc or none.
+- The repository is **`krowkcom/krowk`** (was `krowkcom/cli`); the old URLs
+  redirect, so an installed binary keeps upgrading. From source it is
+  `cargo install --locked --git https://github.com/krowkcom/krowk --features sessions krowk`
+  rather than `go install`.
+- Where the two builds differ, it is prose, not contract: human-readable
+  wording, key order and number spelling in `fix`/`detail` lines; `doctor`'s
+  `runtime` reads `rust <os>/<arch>`. A Claude prompt holding bytes that are
+  not UTF-8 now imports as text (with U+FFFD) rather than as an opaque block
+  with no title.
+
 ### Added
 
 - `krowk sessions sync`, the incremental import meant to run on a schedule.
@@ -865,7 +885,7 @@ was released on GitHub but never published to npm.
   credentials travel, and a refusal is written to stderr and into the JSON
   envelope.
 
-[Unreleased]: https://github.com/krowkcom/cli/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/krowkcom/krowk/compare/v0.9.0...HEAD
 [0.9.0]: https://github.com/krowkcom/cli/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/krowkcom/cli/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/krowkcom/cli/compare/v0.8.0...v0.8.1

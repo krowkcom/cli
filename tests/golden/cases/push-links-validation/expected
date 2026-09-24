@@ -29,7 +29,7 @@ stderr:
   "ok": false,
   "error": {
     "error": "bad_flag",
-    "fix": "invalid value \"orphan\" for flag -link-title: --link-title describes the --link before it, and none was given yet: write --link \u003curl\u003e --link-title \"orphan\" — run `krowk --help`",
+    "fix": "invalid value \"orphan\" for flag -link-title: --link-title describes the --link before it, and none was given yet: write --link <url> --link-title \"orphan\" — run `krowk --help`",
     "retryable": false
   }
 }

@@ -230,7 +230,10 @@ fn check_schema_content(path: &Path, version: i64, tables: &[String]) -> Result<
 /// The existing file, read without a lock, without WAL recovery and without
 /// flipping its journal mode — so one about to be refused stays byte-identical.
 fn check_schema_file(path: &Path) -> Result<(), StoreError> {
-    let uri = format!("file:{}?mode=ro&immutable=1", path.display());
+    // Escaped, because SQLite reads a URI: an unescaped `?` in a directory
+    // name would start the parameters, and `#` would cut the path short.
+    let escaped = path.display().to_string().replace('%', "%25").replace('?', "%3f").replace('#', "%23");
+    let uri = format!("file:{escaped}?mode=ro&immutable=1");
     let inspected = Connection::open_with_flags(&uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)
         .and_then(|c| read_version_and_tables(&c));
     match inspected {
@@ -283,7 +286,7 @@ pub fn check(env: Env) -> StatusCheck {
         return status(
             "fail",
             "no home directory in environment, so krowk.db has nowhere to live".into(),
-            "set HOME (or XDG_DATA_HOME to an absolute path) so krowk.db has a place to live (internal/store)".into(),
+            "set HOME (or XDG_DATA_HOME to an absolute path) so krowk.db has a place to live".into(),
         );
     };
     match open(env) {
@@ -291,12 +294,12 @@ pub fn check(env: Env) -> StatusCheck {
         Err(StoreError::SchemaMismatch(m)) => status(
             "fail",
             m,
-            format!("run `krowk sessions rebuild` (delete {} and re-import) (internal/store)", path.display()),
+            format!("run `krowk sessions rebuild` (delete {} and re-import)", path.display()),
         ),
         Err(e) => {
             let msg = e.message().to_string();
             let msg = if msg.contains(&path.display().to_string()) { msg } else { format!("{}: {msg}", path.display()) };
-            status("fail", msg, format!("inspect {} (internal/store)", path.display()))
+            status("fail", msg, format!("inspect {}", path.display()))
         }
     }
 }
@@ -332,6 +335,17 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::Home;
     use super::*;
+
+    #[test]
+    fn a_home_whose_path_reads_as_a_uri_still_reopens_its_store() {
+        let home = Home::new("uri?mode=rw#frag%41");
+        let env = home.env();
+        drop(open(&env).unwrap());
+        // The second open inspects the existing file through a file: URI.
+        let conn = open(&env).expect("reopen through the escaped URI");
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
 
     #[test]
     fn a_fresh_store_is_v1_private_and_reopens() {

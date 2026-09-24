@@ -33,13 +33,13 @@ If Node is not already in the picture, skip it. The binary is the primary
 channel:
 
 ```bash
-go install github.com/krowkcom/cli/cmd/krowk@latest
-# or grab an archive from https://github.com/krowkcom/cli/releases/latest
+cargo install --locked --git https://github.com/krowkcom/krowk --features sessions krowk
+# or grab an archive from https://github.com/krowkcom/krowk/releases/latest
 ```
 
 ## Documentation
 
 Commands, flags, output formats, MCP, and what the CLI refuses to upload and
-why: <https://github.com/krowkcom/cli>.
+why: <https://github.com/krowkcom/krowk>.
 
 MIT.

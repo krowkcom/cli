@@ -12,8 +12,8 @@ stdout:
   "breadcrumbs": [
     {
       "action": "push",
-      "cmd": "krowk push \u003cfile\u003e",
-      "description": "the key is stored and accepted, so nothing else is needed before uploading; \u003cfile\u003e is the path to upload"
+      "cmd": "krowk push <file>",
+      "description": "the key is stored and accepted, so nothing else is needed before uploading; <file> is the path to upload"
     }
   ]
 }
@@ -88,24 +88,24 @@ exit: 0
 $ krowk doctor
 stdout:
 {
+  "version": "0.0.0-golden",
+  "runtime": "<runtime>",
   "api": "http://<registry>/v1",
+  "registry": "custom (KROWK_API_URL)",
   "api_status": "reachable (krowk-registry, v1)",
   "authenticated": false,
-  "config": "global <scratch>/home/cfg/krowk/config.json, repo <scratch>/work/.krowk/config.json (absent)",
-  "context": {},
-  "credentials": "<scratch>/home/cfg/krowk/credentials.json",
+  "token_source": "none",
   "key": "none — uploads will be anonymous",
-  "registry": "custom (KROWK_API_URL)",
+  "workspace": "ws_x (global config) — but no key is stored for it, so every command here fails",
   "runs_available": false,
-  "runtime": "<runtime>",
+  "credentials": "<scratch>/home/cfg/krowk/credentials.json",
+  "config": "global <scratch>/home/cfg/krowk/config.json, repo <scratch>/work/.krowk/config.json (absent)",
   "store": {
     "name": "store",
     "status": "pass",
     "message": "healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"
   },
-  "token_source": "none",
-  "version": "0.0.0-golden",
-  "workspace": "ws_x (global config) — but no key is stored for it, so every command here fails"
+  "context": {}
 }
 exit: 0
 

@@ -524,7 +524,7 @@ mod tests {
     const MISSING_SLUG: &str = "missing-dir-xyz";
     const FIXTURE_LINES: usize = 7;
     const FIXTURE_MESSAGES: usize = 5;
-    const TESTDATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../internal/importer/cursor/testdata");
+    const TESTDATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/cursor");
 
     /// A temporary directory, removed on drop. Its name holds no dash, so a
     /// slug built from it decodes back exactly.

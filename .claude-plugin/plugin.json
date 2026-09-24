@@ -8,7 +8,7 @@
     "url": "https://krowk.com"
   },
   "homepage": "https://krowk.com",
-  "repository": "https://github.com/krowkcom/cli",
+  "repository": "https://github.com/krowkcom/krowk",
   "license": "MIT",
   "keywords": [
     "screenshot",

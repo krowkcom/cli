@@ -11,8 +11,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const RELEASE_API: &str = "https://api.github.com/repos/krowkcom/cli/releases/latest";
-const RELEASE_DOWNLOAD: &str = "https://github.com/krowkcom/cli/releases/download";
+const RELEASE_API: &str = "https://api.github.com/repos/krowkcom/krowk/releases/latest";
+const RELEASE_DOWNLOAD: &str = "https://github.com/krowkcom/krowk/releases/download";
 
 /// A release version: three numbers. `dev`, `0.9.0-12-gabc` and the golden
 /// stamp are source builds, and nothing here touches a build git owns.
@@ -65,7 +65,7 @@ pub(crate) fn upgrade(ctx: &mut Ctx) -> Result<(), Error> {
     if !is_release(VERSION) {
         return Err(fail(
             "not_upgradable",
-            format!("this build came from source (version {VERSION}) — upgrade with `git pull && make install`, or build it with `cargo install --path crates/krowk`"),
+            format!("this build came from source (version {VERSION}) — upgrade with `git pull && make install`, or `cargo install --locked --git https://github.com/krowkcom/krowk --features sessions krowk`"),
         ));
     }
     let latest = latest_version(Duration::from_secs(10))?;

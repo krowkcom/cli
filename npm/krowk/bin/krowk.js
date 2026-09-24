@@ -42,9 +42,9 @@ function locate() {
       "no prebuilt binary for " + host + ".",
       "",
       "Built for: " + Object.keys(PACKAGES).sort().join(", ") + ".",
-      "Everywhere else, build it yourself — the CLI is pure Go:",
+      "Everywhere else, build it yourself with Rust (rustup.rs):",
       "",
-      "  go install github.com/krowkcom/cli/cmd/krowk@latest",
+      "  cargo install --locked --git https://github.com/krowkcom/krowk --features sessions krowk",
     ]);
   }
 
@@ -63,7 +63,7 @@ function locate() {
       "",
       "Or take the binary straight from the release, no Node involved:",
       "",
-      "  https://github.com/krowkcom/cli/releases/latest",
+      "  https://github.com/krowkcom/krowk/releases/latest",
     ]);
   }
 

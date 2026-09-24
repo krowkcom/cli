@@ -35,3 +35,7 @@ ureq = { version = "3", default-features = false, features = ["rustls", "platfor
 [target.'cfg(unix)'.dependencies]
 # Open flags and errnos per target: their values differ by architecture.
 libc = "0.2"
+
+[dev-dependencies]
+# The stand-in registry, served in-process for the wire-shape pin.
+krowk-devregistry = { path = "../krowk-devregistry" }

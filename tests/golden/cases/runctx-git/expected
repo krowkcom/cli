@@ -45,29 +45,29 @@ exit: 0
 $ krowk doctor
 stdout:
 {
+  "version": "0.0.0-golden",
+  "runtime": "<runtime>",
   "api": "http://<registry>/v1",
+  "registry": "custom (KROWK_API_URL)",
   "api_status": "reachable (krowk-registry, v1)",
   "authenticated": true,
-  "config": "global <scratch>/home/.config/krowk/config.json (absent), repo <scratch>/work/.krowk/config.json (absent)",
-  "context": {
-    "vcs.repository.name": "krowkcom/golden",
-    "vcs.repository.url.full": "https://github.com/krowkcom/golden",
-    "vcs.ref.head.revision": "16417386662110097498ce23a16d532b93b44963",
-    "krowk.vcs.dirty": true
-  },
-  "credentials": "<scratch>/home/.config/krowk/credentials.json",
+  "token_source": "KROWK_TOKEN",
   "key": "<key_1> (<ws_1>) local",
-  "registry": "custom (KROWK_API_URL)",
+  "workspace": "unknown — not recorded at login; `krowk auth verify` asks the registry",
   "runs_available": true,
-  "runtime": "<runtime>",
+  "credentials": "<scratch>/home/.config/krowk/credentials.json",
+  "config": "global <scratch>/home/.config/krowk/config.json (absent), repo <scratch>/work/.krowk/config.json (absent)",
   "store": {
     "name": "store",
     "status": "pass",
     "message": "healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"
   },
-  "token_source": "KROWK_TOKEN",
-  "version": "0.0.0-golden",
-  "workspace": "unknown — not recorded at login; `krowk auth verify` asks the registry"
+  "context": {
+    "vcs.repository.name": "krowkcom/golden",
+    "vcs.repository.url.full": "https://github.com/krowkcom/golden",
+    "vcs.ref.head.revision": "16417386662110097498ce23a16d532b93b44963",
+    "krowk.vcs.dirty": true
+  }
 }
 exit: 0
 

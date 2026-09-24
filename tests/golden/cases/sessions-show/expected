@@ -246,7 +246,7 @@ stderr:
   "ok": false,
   "error": {
     "error": "no_session",
-    "fix": "pass the session: `krowk sessions show \u003cid\u003e`",
+    "fix": "pass the session: `krowk sessions show <id>`",
     "retryable": false
   }
 }

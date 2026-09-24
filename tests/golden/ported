@@ -1,0 +1,11 @@
+# The cases the Rust port is held to under `make golden-rust`, one per line.
+# A case goes in when its command is ported, and never comes out.
+help
+help-commands
+help-subcommand-flag
+version
+no-args
+unknown-command
+unknown-flag
+config
+config-errors

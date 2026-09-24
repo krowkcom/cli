@@ -79,7 +79,7 @@ golden: bin/golden bin/devregistry ## Hold the Go build to tests/golden/cases
 
 golden-rust: bin/devregistry ## Hold the Rust build to the same cases
 	KROWK_VERSION=$(GOLDEN_VERSION) cargo build --release -p krowk
-	KROWK_BIN=target/release/krowk KROWK_MCP_BIN=target/release/krowk-mcp cargo test -p krowk-golden
+	GOLDEN_MODE=contract KROWK_BIN=target/release/krowk KROWK_MCP_BIN=target/release/krowk-mcp cargo test -p krowk-golden
 
 golden-update: bin/golden bin/devregistry ## Re-record the cases from the Go build
 	GOLDEN_UPDATE=1 cargo test -p krowk-golden

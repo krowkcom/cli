@@ -68,11 +68,6 @@ runs:
       shell: bash
       env:
         KROWK_VERSION: ${{ inputs.version }}
-        # The repository this action was taken from, so its releases are the
-        # ones installed: the right answer for a fork, and for this repository
-        # before and after a rename. `uses: ./` names no action repository, so
-        # the workflow's own repository stands in.
-        KROWK_REPO: ${{ github.action_repository || github.repository }}
         # The runner already has its skills; installing one here would write
         # into a throwaway home directory anyway.
         KROWK_SKIP_SKILL: "1"
@@ -91,6 +86,20 @@ runs:
             v[0-9]*.[0-9]*.[0-9]*) export KROWK_VERSION="${GITHUB_ACTION_REF#v}" ;;
           esac
         fi
+        # Whose releases to install. A checkout of this project itself (`uses: ./`
+        # here, or the extracted-step tests) installs its own repository's, so
+        # it works on either side of a rename and in a fork. Anyone else gets
+        # the repository the action was taken from, or the canonical one when
+        # the runner names none — never the calling workflow's repository,
+        # which has no krowk releases.
+        if [ -z "${KROWK_REPO:-}" ]; then
+          if [ -d "${GITHUB_ACTION_PATH:?}/crates/krowk" ]; then
+            KROWK_REPO="${GITHUB_REPOSITORY:-krowkcom/krowk}"
+          else
+            KROWK_REPO="${GITHUB_ACTION_REPOSITORY:-krowkcom/krowk}"
+          fi
+        fi
+        export KROWK_REPO
         export KROWK_BIN_DIR="$RUNNER_TEMP/krowk-bin"
         mkdir -p "$KROWK_BIN_DIR"
         # Already on PATH before the installer runs, so its setup_path leaves

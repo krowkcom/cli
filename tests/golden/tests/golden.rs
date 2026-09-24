@@ -31,6 +31,8 @@
 //!     @sh command               run /bin/sh -c in work/ for setup; not recorded ({case} expands too)
 //!     krowk args...             run the binary; shell-style quoting
 //!     krowk-mcp args...         run $KROWK_MCP_BIN, default bin/krowk-mcp
+//!     @tty krowk args...        run with stdout and stderr on one pseudo-terminal, as a
+//!                               person at a shell would; ESC and CR print as \e and \r
 //!
 //! Every command runs with an empty environment apart from PATH, HOME, TMPDIR,
 //! KROWK_NO_UPDATE_CHECK and KROWK_TEST_NOW_MS (the store's clock, frozen at
@@ -258,6 +260,13 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
                     .unwrap();
                 assert!(result.status.success(), "{}: @sh {rest} failed:\n{}", case.display(), String::from_utf8_lossy(&result.stderr));
             }
+            "@tty" => {
+                let (word, rest) = rest.split_once(' ').unwrap_or((rest, ""));
+                assert_eq!(word, "krowk", "{}: @tty runs krowk only", case.display());
+                let args: Vec<String> = shlex::split(rest).expect("unbalanced quotes").iter().map(|a| expand(a)).collect();
+                let (screen, code) = run_on_tty(bins.krowk, &args, &work, &env, case, line);
+                out.push_str(&format!("$ {line}\ntty:\n{}exit: {code}\n", ensure_newline(&visible(&screen))));
+            }
             "krowk" | "krowk-mcp" => {
                 let args: Vec<String> = shlex::split(rest).expect("unbalanced quotes").iter().map(|a| expand(a)).collect();
                 let mut child = Command::new(if word == "krowk" { bins.krowk } else { bins.mcp })
@@ -304,6 +313,55 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
     drop(registry);
     let _ = fs::remove_dir_all(&scratch);
     normalize(&out, &scratch, url.as_deref(), bins)
+}
+
+/// Runs the binary with stdout and stderr on one pseudo-terminal and returns
+/// everything drawn on it. A pty rather than a pipe is the only way to see
+/// what a person sees: colour, the human format by default, the spinner.
+#[cfg(unix)]
+fn run_on_tty(bin: &Path, args: &[String], work: &Path, env: &[(String, String)], case: &Path, line: &str) -> (String, String) {
+    use std::os::fd::FromRawFd;
+    let (mut master, mut slave) = (0, 0);
+    let mut size = libc::winsize { ws_row: 40, ws_col: 120, ws_xpixel: 0, ws_ypixel: 0 };
+    let ok = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) };
+    assert_eq!(ok, 0, "openpty failed");
+    let (master, slave) = unsafe { (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave)) };
+    let mut child = Command::new(bin)
+        .args(args)
+        .current_dir(work)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave)
+        .spawn()
+        .unwrap();
+    // The child holds the only slave handles now, so the master reads to
+    // EOF (EIO on Linux) exactly when the child exits.
+    let reader = std::thread::spawn(move || {
+        let (mut master, mut screen) = (master, Vec::new());
+        let _ = std::io::Read::read_to_end(&mut master, &mut screen);
+        screen
+    });
+    let (pid, deadline) = (child.id(), std::time::Instant::now() + std::time::Duration::from_secs(20));
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            panic!("{}: `{line}` still running after 20s", case.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let screen = String::from_utf8_lossy(&reader.join().unwrap()).into_owned();
+    (screen, status.code().map_or("signal".into(), |c| c.to_string()))
+}
+
+// A terminal turns \n into \r\n on the way out, which says nothing about the
+// binary; what does is every other control character, spelled out.
+fn visible(screen: &str) -> String {
+    screen.replace("\r\n", "\n").replace('\x1b', "\\e").replace('\r', "\\r")
 }
 
 fn set(env: &mut Vec<(String, String)>, key: &str, value: &str) {
@@ -411,6 +469,8 @@ static PLAIN: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
         // the error code beside it is the behavior, the detail is not.
         (r#"(Get|Post|Put|Patch|Delete|Head) \\?"http[^"\\]*\\?": [^"\n]*"#, "<transport error>"),
         (r"\b\d+(\.\d+)?ms\b", "<n>ms"),
+        // How many spinner frames draw is how long the command took.
+        (r"(\\r\\e\[K)?([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] [^\\\n]*(\\r\\e\[K)?)+", "<spinner>"),
     ]
     .into_iter()
     .map(|(re, to)| (Regex::new(re).unwrap(), to))
@@ -432,6 +492,18 @@ fn normalize(text: &str, scratch: &Path, registry: Option<&str>, bins: &Bins) ->
     for (re, to) in PLAIN.iter() {
         text = re.replace_all(&text, *to).into_owned();
     }
+    // What a jq library says about a failed expression is its own wording; the
+    // error code and krowk's sentence around it are the behavior. A message
+    // carrying a credential is left alone, so a leak still shows as a diff.
+    static JQ: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"--jq: ((?:[^"\\]|\\.)*?)(\. The command itself succeeded|")"#).unwrap());
+    text = JQ
+        .replace_all(&text, |c: &Captures| {
+            let secret = c[1].contains("krowk_sk_") || c[1].contains("krowk_claim_");
+            let unsupported = c[1].starts_with("halt and halt_error");
+            if secret || unsupported { c[0].to_string() } else { format!("--jq: <jq error>{}", &c[2]) }
+        })
+        .into_owned();
     // Epoch milliseconds are masked only near the clock: a fixture's own
     // timestamps are behavior and stay, the moment a command ran is not.
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;

@@ -1,0 +1,89 @@
+
+$ @tty krowk sessions
+tty:
+no sessions — run `krowk sessions import --from all`
+[no newline at end]
+exit: 0
+
+$ krowk sessions import --from all --quiet
+stdout:
+{
+  "dry_run": false,
+  "store": "<scratch>/home/.local/share/krowk/krowk.db",
+  "providers": [
+    {
+      "provider": "claude",
+      "files": 4,
+      "sessions_seen": 4,
+      "messages_seen": 20,
+      "parts_seen": 24,
+      "sessions_inserted": 4,
+      "messages_inserted": 20,
+      "parts_inserted": 24,
+      "skipped_by_type": {
+        "server_tool_use": 1
+      },
+      "skipped_lines": 2,
+      "files_failed": 0,
+      "files_unchanged": 0,
+      "errors_truncated": 0,
+      "duration_ms": <n>
+    },
+    {
+      "provider": "cursor",
+      "files": 2,
+      "sessions_seen": 2,
+      "messages_seen": 6,
+      "parts_seen": 7,
+      "sessions_inserted": 2,
+      "messages_inserted": 6,
+      "parts_inserted": 7,
+      "skipped_by_type": {},
+      "skipped_lines": 1,
+      "files_failed": 0,
+      "files_unchanged": 0,
+      "errors_truncated": 0,
+      "duration_ms": <n>
+    },
+    {
+      "provider": "opencode",
+      "files": 2,
+      "sessions_seen": 2,
+      "messages_seen": 6,
+      "parts_seen": 16,
+      "sessions_inserted": 2,
+      "messages_inserted": 6,
+      "parts_inserted": 16,
+      "skipped_by_type": {},
+      "skipped_lines": 0,
+      "files_failed": 0,
+      "files_unchanged": 0,
+      "errors_truncated": 0,
+      "duration_ms": <n>
+    }
+  ],
+  "duration_ms": <n>
+}
+exit: 0
+
+$ @tty krowk sessions
+tty:
+\e[31m✗\e[0m Nothing was selected and nothing was changed.
+\e[2m  (selection_cancelled)\e[0m
+exit: 1
+
+$ @tty krowk sessions show <uuid_1>
+tty:
+\e[31m✗\e[0m Store: "<uuid_1>" is ambiguous (2 sessions):
+  <uuid_2>  claude
+  <uuid_3>  cursor.
+\e[2m  (ambiguous_session)\e[0m
+exit: 1
+
+$ @tty krowk sessions rebuild
+tty:
+\e[31m✗\e[0m `krowk sessions rebuild` deletes <scratch>/home/.local/share/krowk/krowk.db and re-imports every transcript.
+\e[2m  (confirmation_required)\e[0m
+\e[2m  try:\e[0m  krowk sessions rebuild
+exit: 1
+

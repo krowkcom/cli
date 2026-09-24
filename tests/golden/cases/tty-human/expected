@@ -1,0 +1,136 @@
+
+
+
+$ @tty krowk push a.txt
+tty:
+\r\e[K\e[2m<spinner>\e[0m\r\e[K\e[32m✓\e[0m Uploaded a.txt → http://<registry>/a/<art_1>
+\e[2m  5 B · expires tomorrow\e[0m
+\e[2m  keep it:\e[0m  krowk claim <art_1> <claim_1>
+
+\e[2m  paste this:\e[0m
+**a.txt** · [View preview ↗](http://<registry>/a/<art_1>) · expires <date>
+exit: 0
+
+$ @tty krowk push a.txt shot.png
+tty:
+\r\e[K\e[2m<spinner>\e[0m\r\e[K\e[32m✓\e[0m Uploaded 2 files
+  a.txt     http://<registry>/a/<art_2>
+  shot.png  http://<registry>/a/<art_3>
+\e[2m  18 B · expires tomorrow\e[0m
+\e[2m  keep it:\e[0m  krowk claim <art_2> <claim_2>
+\e[2m  keep it:\e[0m  krowk claim <art_3> <claim_3>
+
+\e[2m  paste this:\e[0m
+**a.txt** · [View preview ↗](http://<registry>/a/<art_2>) · expires <date>
+
+[![shot.png](http://<registry>/_storage/weur/<ws_1>/<art_3>/shot.png)](http://<registry>/a/<art_3>)
+shot.png · [View preview ↗](http://<registry>/a/<art_3>) · expires <date>
+exit: 0
+
+$ @tty krowk push a.txt --json
+tty:
+{
+  "ok": true,
+  "data": {
+    "artifacts": [
+      {
+        "slug": "<art_4>",
+        "state": "ready",
+        "filename": "a.txt",
+        "content_type": "text/plain",
+        "byte_size": 5,
+        "checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "region": "weur",
+        "visibility": "public",
+        "url": "http://<registry>/a/<art_4>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_4>/a.txt",
+        "markdown": "[a.txt](http://<registry>/a/<art_4>)",
+        "paste": {
+          "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_4>) · expires <date>",
+          "url": "http://<registry>/a/<art_4>",
+          "destinations": {
+            "_default": "markdown",
+            "asana": "url",
+            "basecamp": "url",
+            "github": "markdown",
+            "gitlab": "markdown",
+            "linear": "markdown",
+            "notion": "markdown",
+            "slack": "url"
+          }
+        },
+        "expires_at": "<time>",
+        "created_at": "<time>",
+        "metadata": null,
+        "claim_token": "<claim_4>"
+      }
+    ]
+  },
+  "paste": {
+    "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_4>) · expires <date>",
+    "url": "http://<registry>/a/<art_4>",
+    "destinations": {
+      "_default": "markdown",
+      "asana": "url",
+      "basecamp": "url",
+      "github": "markdown",
+      "gitlab": "markdown",
+      "linear": "markdown",
+      "notion": "markdown",
+      "slack": "url"
+    }
+  },
+  "summary": "1 artifact, 5 B",
+  "breadcrumbs": [
+    {
+      "action": "keep past expiry",
+      "cmd": "krowk claim <art_4> <claim_4>",
+      "description": "this upload is anonymous and expires within the day; claiming it with a key moves it into that key's workspace — a Pro workspace keeps it, a free one gives it another 24 hours. The token is shown once and spent once"
+    },
+    {
+      "action": "share",
+      "cmd": "http://<registry>/a/<art_4>",
+      "description": "hand this link on — it is public and needs no key to read"
+    }
+  ]
+}
+exit: 0
+
+$ @tty krowk push missing.txt
+tty:
+\e[31m✗\e[0m Cannot read `missing.txt`.
+\e[2m  (file_unreadable)\e[0m
+\e[2m  Paths resolve from the current directory.\e[0m
+exit: 1
+
+$ @tty krowk bogus
+tty:
+\e[31m✗\e[0m `bogus` is not a krowk command.
+\e[2m  (unknown_command)\e[0m
+\e[2m  try:\e[0m  krowk --help
+exit: 1
+
+$ @tty krowk doctor
+tty:
+version         <version>
+runtime         <runtime>
+api             http://<registry>/v1
+registry        custom (KROWK_API_URL)
+api_status      reachable (krowk-registry, v1)
+authenticated   false
+token_source    none
+key             none — uploads will be anonymous
+workspace       none — uploads will be anonymous
+runs_available  false
+credentials     <scratch>/home/.config/krowk/credentials.json
+config          global <scratch>/home/.config/krowk/config.json (absent)
+store           {"name":"store","status":"pass","message":"healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"}
+context         {}
+exit: 0
+
+$ @tty krowk config show
+tty:
+\e[2mnothing set — uploads use the stored default key\e[0m
+  global    <scratch>/home/.config/krowk/config.json
+exit: 0
+

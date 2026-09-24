@@ -1,0 +1,126 @@
+
+
+$ krowk push a.txt --jq .ok
+stdout:
+true
+exit: 0
+
+$ krowk push a.txt --jq '.data.artifacts[0].filename'
+stdout:
+a.txt
+exit: 0
+
+$ krowk push a.txt --jq '.data.artifacts[0] | {filename, byte_size}'
+stdout:
+{"byte_size":5,"filename":"a.txt"}
+exit: 0
+
+$ krowk push a.txt --jq '.data.artifacts[] | select(.byte_size > 100)'
+exit: 0
+
+$ krowk push a.txt --jq '.data.artifacts[0].byte_size * 2'
+stdout:
+10
+exit: 0
+
+$ krowk push a.txt --jq '.data.artifacts | length'
+stdout:
+1
+exit: 0
+
+$ krowk push a.txt --jq 'env'
+stdout:
+{}
+exit: 0
+
+$ krowk push a.txt --jq '$ENV.HOME'
+stdout:
+null
+exit: 0
+
+$ krowk push a.txt --jq '.data.artifacts[0].filename | tonumber'
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "jq_failed",
+    "fix": "--jq: <jq error>. The command itself succeeded — this is the reading of its result failing, so running it again repeats whatever it did",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk push a.txt --jq 'halt_error'
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "jq_failed",
+    "fix": "--jq: halt and halt_error are not honoured — in jq they choose the process's exit code, and krowk's exit codes are what happened to the artifact. The command itself succeeded — this is the reading of its result failing, so running it again repeats whatever it did",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk push a.txt --jq '.[[['
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_jq",
+    "fix": "--jq: <jq error>",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk push a.txt --jq ''
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_jq",
+    "fix": "a blank --jq is not an expression — pass one, e.g. --jq '.data.artifacts[].slug'",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk push a.txt --jq .ok --format human
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "--jq reads the JSON, so it cannot be combined with --format human — drop one of the two",
+    "retryable": false
+  }
+}
+exit: 1
+
+$ krowk push a.txt --jq .ok --quiet
+stdout:
+null
+exit: 0
+
+$ krowk bogus --jq .ok
+stderr:
+false
+exit: 1
+
+$ @tty krowk push a.txt --jq '.data.artifacts[0].filename'
+tty:
+a.txt
+exit: 0
+
+
+$ krowk push a.txt --jq '"\u001b[31mred"'
+stdout:
+[31mred
+exit: 0
+
+$ @tty krowk push a.txt --jq '"\u001b[31mred"'
+tty:
+\x1b[31mred
+exit: 0
+

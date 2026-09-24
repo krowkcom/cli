@@ -244,10 +244,15 @@ fn contract_difference(want: &str, got: &str) -> Option<String> {
 /// recorded side decides — a port that answers a JSON step with prose, or
 /// with JSON and a trailing line, has broken the contract.
 fn section_difference(name: &str, want: &str, got: &str, data: bool) -> Option<String> {
-    // A data step's spelling is the contract — a shell reads `5`, not `5.0` —
-    // so it is compared as text even where it parses as JSON.
+    // A data step's spelling is the contract — a shell reads `5`, not `5.0`.
+    // Where it is JSON the prose inside may still be worded differently, so it
+    // is compared by value with prose masked, plus every number as written.
     if data && name == "stdout" {
-        return (want != got).then(|| format!("{name} differs:\n{}", first_difference(want, got)));
+        return match (json_stream(want).filter(|d| !d.is_empty()), json_stream(got)) {
+            (Some(x), Some(y)) if x == y && numbers(want) == numbers(got) => None,
+            (Some(_), Some(_)) => Some(format!("{name} JSON differs:\n{}", first_difference(want, got))),
+            _ => (want != got).then(|| format!("{name} differs:\n{}", first_difference(want, got))),
+        };
     }
     let recorded = json_stream(want).filter(|docs| !docs.is_empty() && name != "tty");
     match (recorded, json_stream(got)) {
@@ -261,6 +266,35 @@ fn section_difference(name: &str, want: &str, got: &str, data: bool) -> Option<S
         (None, _) if name == "tty" || !data => None,
         (None, _) => (want != got).then(|| format!("{name} differs:\n{}", first_difference(want, got))),
     }
+}
+
+/// Every number literal outside a string, as written: `5` and `5.0` are one
+/// value and two spellings, and a shell reading them sees the difference.
+fn numbers(text: &str) -> Vec<String> {
+    let (mut out, mut current, mut in_string, mut escaped) = (Vec::new(), String::new(), false, false);
+    for c in text.chars() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        if c.is_ascii_digit() || (matches!(c, '-' | '+' | '.' | 'e' | 'E') && !current.is_empty()) || (c == '-' && current.is_empty()) {
+            current.push(c);
+            continue;
+        }
+        if !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+        }
+        in_string = c == '"';
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 /// Every JSON document in a section, canonical: prose fields dropped,
@@ -779,6 +813,15 @@ mod contract {
         assert!(contract_difference(&want, &step("all good, nothing to see\n")).is_some());
         assert!(contract_difference(&want, &step("{\"ok\": true}\ntrailing\n")).is_some());
         assert!(contract_difference(&want, &step("{\"ok\": false, \"summary\": \"one\"}\n")).is_some());
+    }
+
+    #[test]
+    fn data_json_keeps_its_number_spelling_but_not_its_prose() {
+        let data = |out: &str| format!("$ krowk help --jq .\nstdout:\n{out}\nexit: 0\n\n");
+        let want = data(r#"{"n":5,"summary":"one"}"#);
+        assert!(contract_difference(&want, &data(r#"{"summary":"other","n":5}"#)).is_none());
+        assert!(contract_difference(&want, &data(r#"{"n":5.0,"summary":"one"}"#)).is_some());
+        assert_eq!(numbers(r#"[1, "2", -3.5e+2, "a\"4"]"#), ["1", "-3.5e+2"]);
     }
 
     #[test]

@@ -1,4 +1,3 @@
-
 $ krowk auth token
 stderr:
 {
@@ -74,7 +73,6 @@ exit: 0
 .config/
 .config/krowk/
 .config/krowk/credentials.json 600
-
 
 $ krowk auth token
 stdout:

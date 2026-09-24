@@ -61,11 +61,18 @@ rust: ## Build the Rust krowk into target/release
 bin/devregistry: $(shell find internal/devregistry internal/registry -name '*.go')
 	go build -trimpath -o bin/devregistry ./internal/devregistry
 
-golden: build bin/devregistry ## Hold the Go build to tests/golden/cases
+# The cases compare the version like any other output, so both builds are
+# stamped with one that no release will ever carry.
+GOLDEN_VERSION := 0.0.0-golden
+
+golden: bin/devregistry ## Hold the Go build to tests/golden/cases
+	$(MAKE) build VERSION=$(GOLDEN_VERSION)
 	cargo test -p krowk-golden
 
-golden-rust: rust bin/devregistry ## Hold the Rust build to the same cases
+golden-rust: bin/devregistry ## Hold the Rust build to the same cases
+	KROWK_VERSION=$(GOLDEN_VERSION) cargo build --release -p krowk
 	KROWK_BIN=target/release/krowk KROWK_MCP_BIN=target/release/krowk-mcp cargo test -p krowk-golden
 
-golden-update: build bin/devregistry ## Re-record the cases from the Go build
+golden-update: bin/devregistry ## Re-record the cases from the Go build
+	$(MAKE) build VERSION=$(GOLDEN_VERSION)
 	GOLDEN_UPDATE=1 cargo test -p krowk-golden

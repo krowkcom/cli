@@ -1,6 +1,3 @@
-
-
-
 $ @tty krowk push a.txt
 tty:
 \r\e[K\e[2m<spinner>\e[0m\r\e[K\e[32m✓\e[0m Uploaded a.txt → http://<registry>/a/<art_1>
@@ -112,7 +109,7 @@ exit: 1
 
 $ @tty krowk doctor
 tty:
-version         <version>
+version         0.0.0-golden
 runtime         <runtime>
 api             http://<registry>/v1
 registry        custom (KROWK_API_URL)

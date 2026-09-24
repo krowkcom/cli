@@ -1,3 +1,7 @@
-@file a.txt hello
+# --dev and KROWK_DEV point at the local registry at localhost:8787.
 @unenv KROWK_API_URL
-krowk config show --dev
+krowk doctor --dev
+@env KROWK_DEV=1
+krowk doctor
+@env KROWK_DEV=off
+krowk doctor --jq .api

@@ -31,20 +31,24 @@
 //!     @sh command               run /bin/sh -c in work/ for setup; not recorded ({case} expands too)
 //!     krowk args...             run the binary; shell-style quoting
 //!     krowk-mcp args...         run $KROWK_MCP_BIN, default bin/krowk-mcp
+//!     @let NAME .path[0].to     capture a value from the previous command's stdout (JSON,
+//!                               before masking); {NAME} expands in every later line
 //!     @tty krowk args...        run with stdout and stderr on one pseudo-terminal, as a
 //!                               person at a shell would; ESC and CR print as \e and \r
 //!
 //! Every command runs with an empty environment apart from PATH, HOME, TMPDIR,
-//! TZ=UTC, KROWK_NO_UPDATE_CHECK and KROWK_TEST_NOW_MS (the store's clock, frozen at
-//! 2026-01-01), with KROWK_API_URL on a port nothing listens on
+//! TZ=UTC, KROWK_NO_UPDATE_CHECK and KROWK_TEST_NOW_MS (the store's clock,
+//! starting at 2026-01-01 and advancing a millisecond per read), with KROWK_API_URL on a port nothing listens on
 //! and every proxy variable pointing there too, so nothing on the machine — a
 //! key, a krowk.db, a harness transcript — leaks in, and no case reaches the
 //! network (models.dev, GitHub) by accident.
 //!
 //! What is random or clock-bound is masked before comparing: slugs, tokens,
-//! uuids, timestamps, dates, the registry port and the temp paths. Values that
-//! repeat keep their identity (`<art_1>` twice is the same artifact), so a
-//! case still proves that one command's output feeds the next.
+//! uuids, timestamps, expiry dates, the registry port and the temp paths.
+//! Values that repeat keep their identity (`<art_1>` twice is the same
+//! artifact), so a case still proves that one command's output feeds the next.
+//! The binary's version is not masked: `make golden*` stamps both builds
+//! 0.0.0-golden, so a version-dependent path is compared like any other.
 //!
 //! `GOLDEN_UPDATE=1` rewrites `expected` instead of checking it, and
 //! `GOLDEN_CASE=substr` runs only the matching cases.
@@ -57,6 +61,9 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::LazyLock;
+
+/// Where the store's test clock starts: 2026-01-01T00:00:00Z.
+const STORE_EPOCH_MS: i64 = 1_767_225_600_000;
 
 fn workspace_path(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
@@ -74,10 +81,6 @@ fn golden() {
     let krowk = bin_from("KROWK_BIN", "bin/krowk");
     let mcp = bin_from("KROWK_MCP_BIN", "bin/krowk-mcp");
     let registry = bin_from("KROWK_REGISTRY_BIN", "bin/devregistry");
-    // The build stamps its version from `git describe`, so it differs by
-    // commit and by build; masked wherever it appears.
-    let version = Command::new(&krowk).arg("--version").env_clear().output().unwrap().stdout;
-    let version = String::from_utf8_lossy(&version).split_whitespace().last().unwrap_or_default().to_string();
     let update = std::env::var_os("GOLDEN_UPDATE").is_some();
     let only = std::env::var("GOLDEN_CASE").unwrap_or_default();
 
@@ -91,7 +94,7 @@ fn golden() {
     for case in cases.iter().filter(|c| c.to_string_lossy().contains(&only)) {
         ran += 1;
         let name = case.file_name().unwrap().to_string_lossy().into_owned();
-        let got = run_case(case, ran, &Bins { krowk: &krowk, version: &version, mcp: &mcp, registry: &registry });
+        let got = run_case(case, ran, &Bins { krowk: &krowk, mcp: &mcp, registry: &registry });
         let path = case.join("expected");
         if update {
             fs::write(&path, &got).unwrap();
@@ -151,7 +154,6 @@ fn start_registry(bin: &Path) -> (Registry, String) {
 
 struct Bins<'a> {
     krowk: &'a Path,
-    version: &'a str,
     mcp: &'a Path,
     registry: &'a Path,
 }
@@ -189,18 +191,21 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
         ("NO_PROXY".into(), "127.0.0.1,localhost".into()),
         // The store's clock, frozen so every time column — and every listing
         // ordered by one — is the same on each run and in both builds.
-        ("KROWK_TEST_NOW_MS".into(), "1767225600000".into()),
+        ("KROWK_TEST_NOW_MS".into(), STORE_EPOCH_MS.to_string()),
         // "expires tomorrow" counts midnights in the local zone.
         ("TZ".into(), "UTC".into()),
     ];
     let mut registry: Option<(Registry, String)> = None;
     let mut stdin: Option<Vec<u8>> = None;
     let mut out = String::new();
+    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut last_stdout = String::new();
 
     let script = fs::read_to_string(case.join("cmd")).unwrap();
     for line in script.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let url = registry.as_ref().map(|r| r.1.clone()).unwrap_or_default();
         let expand = |s: &str| {
+            let s = vars.iter().fold(s.to_string(), |s, (k, v)| s.replace(&format!("{{{k}}}"), v));
             s.replace("{home}", &home.display().to_string())
                 .replace("{work}", &work.display().to_string())
                 .replace("{registry}", &url)
@@ -218,6 +223,13 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
                 set(&mut env, k, &expand(v));
             }
             "@unenv" => env.retain(|(k, _)| k != rest),
+            "@let" => {
+                let (name, path) = rest.split_once(' ').expect("@let NAME .path");
+                let json: serde_json::Value = serde_json::from_str(&last_stdout)
+                    .unwrap_or_else(|e| panic!("{}: @let {rest}: previous stdout is not JSON: {e}", case.display()));
+                let value = json_path(&json, path).unwrap_or_else(|| panic!("{}: @let {rest}: no value at {path}", case.display()));
+                vars.push((name.to_string(), value));
+            }
             "@file" => {
                 let (path, content) = rest.split_once(' ').unwrap_or((rest, ""));
                 let path = work.join(path);
@@ -228,12 +240,12 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
             "@cat" => {
                 let path = PathBuf::from(expand(rest));
                 let body = fs::read(&path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|e| format!("<{e}>"));
-                out.push_str(&format!("@cat {rest}\n{}", ensure_newline(&body)));
+                out.push_str(&format!("@cat {rest}\n{}\n", ensure_newline(&body)));
             }
             "@ls" => {
                 let mut entries = Vec::new();
                 list_tree(&PathBuf::from(expand(rest)), Path::new(""), &mut entries);
-                out.push_str(&format!("@ls {rest}\n{}", entries.iter().map(|e| e.clone() + "\n").collect::<String>()));
+                out.push_str(&format!("@ls {rest}\n{}\n", entries.iter().map(|e| e.clone() + "\n").collect::<String>()));
             }
             "@fixture" => {
                 let dir = case.parent().unwrap().parent().unwrap().join("fixtures").join(rest);
@@ -267,7 +279,7 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
                 assert_eq!(word, "krowk", "{}: @tty runs krowk only", case.display());
                 let args: Vec<String> = shlex::split(rest).expect("unbalanced quotes").iter().map(|a| expand(a)).collect();
                 let (screen, code) = run_on_tty(bins.krowk, &args, &work, &env, case, line);
-                out.push_str(&format!("$ {line}\ntty:\n{}exit: {code}\n", ensure_newline(&visible(&screen))));
+                out.push_str(&format!("$ {line}\ntty:\n{}exit: {code}\n\n", ensure_newline(&visible(&screen))));
             }
             "krowk" | "krowk-mcp" => {
                 let args: Vec<String> = shlex::split(rest).expect("unbalanced quotes").iter().map(|a| expand(a)).collect();
@@ -281,8 +293,11 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
                     .stderr(Stdio::piped())
                     .spawn()
                     .unwrap();
+                // Fed from its own thread, so a child that writes more than a
+                // pipe holds before reading its input cannot deadlock the case.
                 if let Some(bytes) = stdin.take() {
-                    child.stdin.take().unwrap().write_all(&bytes).unwrap();
+                    let mut pipe = child.stdin.take().unwrap();
+                    std::thread::spawn(move || pipe.write_all(&bytes));
                 }
                 // A command that waits on something no case provides — a
                 // browser approval, a network that is not there — must fail
@@ -304,11 +319,11 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
                 if !result.stderr.is_empty() {
                     out.push_str(&format!("stderr:\n{}", ensure_newline(&String::from_utf8_lossy(&result.stderr))));
                 }
-                out.push_str(&format!("exit: {}\n", result.status.code().map_or("signal".into(), |c| c.to_string())));
+                out.push_str(&format!("exit: {}\n\n", result.status.code().map_or("signal".into(), |c| c.to_string())));
+                last_stdout = String::from_utf8_lossy(&result.stdout).into_owned();
             }
             other => panic!("{}: unknown directive {other:?}", case.display()),
         }
-        out.push('\n');
     }
 
     let url = registry.as_ref().map(|r| r.1.clone());
@@ -364,6 +379,22 @@ fn run_on_tty(bin: &Path, args: &[String], work: &Path, env: &[(String, String)]
 // binary; what does is every other control character, spelled out.
 fn visible(screen: &str) -> String {
     screen.replace("\r\n", "\n").replace('\x1b', "\\e").replace('\r', "\\r")
+}
+
+/// `.data.artifacts[0].slug`: object keys and array indices, nothing more.
+/// A string is its contents, anything else its JSON.
+fn json_path(value: &serde_json::Value, path: &str) -> Option<String> {
+    let mut at = value;
+    for part in path.trim_start_matches('.').split('.').filter(|p| !p.is_empty()) {
+        let (key, indices) = part.split_once('[').map_or((part, ""), |(k, i)| (k, i));
+        if !key.is_empty() {
+            at = at.get(key)?;
+        }
+        for index in indices.split('[').filter(|i| !i.is_empty()) {
+            at = at.get(index.trim_end_matches(']').parse::<usize>().ok()?)?;
+        }
+    }
+    Some(at.as_str().map_or_else(|| at.to_string(), str::to_string))
 }
 
 fn set(env: &mut Vec<(String, String)>, key: &str, value: &str) {
@@ -455,9 +486,10 @@ static NUMBERED: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
 
 static PLAIN: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
     [
-        (r#""version": ?"[^"]*""#, r#""version": "<version>""#),
         (r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})", "<time>"),
-        (r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}(, \d{4})?\b", "<date>"),
+        // Only the dates krowk computes from the clock: a date inside a
+        // transcript is fixture input and stays.
+        (r"\bexpires (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}(, \d{4})?\b", "expires <date>"),
         (r"\b\d+ ?(s|m|h|d|w|mo|y|seconds?|minutes?|hours?|days?|weeks?|months?|years?) ago\b", "<ago>"),
         // A private artifact's byte key is region then a bare 24-character
         // secret, with no prefix for the numbered masks to key on.
@@ -470,7 +502,6 @@ static PLAIN: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
         // A transport failure's wording is the HTTP library's, not krowk's:
         // the error code beside it is the behavior, the detail is not.
         (r#"(Get|Post|Put|Patch|Delete|Head) \\?"http[^"\\]*\\?": [^"\n]*"#, "<transport error>"),
-        (r"\b\d+(\.\d+)?ms\b", "<n>ms"),
         // How many spinner frames draw is how long the command took.
         (r"(\\r\\e\[K)?([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] [^\\\n]*(\\r\\e\[K)?)+", "<spinner>"),
     ]
@@ -483,9 +514,6 @@ fn normalize(text: &str, scratch: &Path, registry: Option<&str>, bins: &Bins) ->
     let mut text = text.replace(&scratch.display().to_string(), "<scratch>");
     for (bin, name) in [(bins.mcp, "<krowk-mcp>"), (bins.krowk, "<krowk>")] {
         text = text.replace(&bin.display().to_string(), name);
-    }
-    if !bins.version.is_empty() {
-        text = text.replace(bins.version, "<version>");
     }
     if let Some(url) = registry {
         let port = url.rsplit(':').next().unwrap();
@@ -506,14 +534,15 @@ fn normalize(text: &str, scratch: &Path, registry: Option<&str>, bins: &Bins) ->
             if secret || unsupported { c[0].to_string() } else { format!("--jq: <jq error>{}", &c[2]) }
         })
         .into_owned();
-    // Epoch milliseconds are masked only near the clock: a fixture's own
-    // timestamps are behavior and stay, the moment a command ran is not.
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    // The store's clock starts at STORE_EPOCH_MS and moves a millisecond per
+    // read, so what it wrote depends on how often a build reads it; the order
+    // of rows it stamped is behavior, the exact values are not. A fixture's own
+    // timestamps fall outside the window and stay.
     static MILLIS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{13}\b").unwrap());
     text = MILLIS
         .replace_all(&text, |c: &Captures| {
             let ms: i64 = c[0].parse().unwrap();
-            if (ms - now).abs() < 2 * 86_400_000 { "<now_ms>".to_string() } else { c[0].to_string() }
+            if (STORE_EPOCH_MS..STORE_EPOCH_MS + 86_400_000).contains(&ms) { "<store_ms>".to_string() } else { c[0].to_string() }
         })
         .into_owned();
     for (re, kind) in NUMBERED.iter() {

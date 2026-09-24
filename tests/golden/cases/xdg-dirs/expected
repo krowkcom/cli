@@ -1,8 +1,3 @@
-
-
-
-
-
 $ krowk auth login --token krowk_sk_test
 stdout:
 {
@@ -83,7 +78,6 @@ krowk/
 krowk/import.lock 600
 krowk/krowk.db 600
 
-
 $ krowk sessions --quiet
 stdout:
 {
@@ -110,7 +104,7 @@ stdout:
     "message": "healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"
   },
   "token_source": "none",
-  "version": "<version>",
+  "version": "0.0.0-golden",
   "workspace": "ws_x (global config) — but no key is stored for it, so every command here fails"
 }
 exit: 0

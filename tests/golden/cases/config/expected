@@ -1,4 +1,3 @@
-
 $ krowk config show
 stdout:
 {
@@ -198,7 +197,6 @@ stderr:
   }
 }
 exit: 1
-
 
 $ krowk config show
 stdout:

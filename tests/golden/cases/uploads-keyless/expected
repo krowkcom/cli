@@ -1,5 +1,3 @@
-
-
 $ krowk uploads create a.txt --quiet
 stdout:
 {

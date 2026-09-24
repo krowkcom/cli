@@ -1,4 +1,3 @@
-
 $ krowk sessions import --from all --quiet
 stdout:
 {
@@ -68,50 +67,6 @@ stdout:
     "sessions": [
       {
         "id": "<uuid_1>",
-        "title": "Redacted unused session",
-        "harness": "claude",
-        "model": "",
-        "provider": "anthropic",
-        "turns": 0,
-        "cost_usd": null,
-        "cost_display": "—",
-        "time_updated_ms": 1767225600000,
-        "time_updated_relative": "<ago>",
-        "worktree": "<scratch>/home/.claude/projects/-home-elvinas",
-        "foreign_session_id": "<uuid_2>"
-      },
-      {
-        "id": "<uuid_3>",
-        "title": "Redacted session title",
-        "harness": "claude",
-        "model": "claude-opus-5-20260401",
-        "provider": "anthropic",
-        "turns": 4,
-        "cost_usd": null,
-        "cost_display": "—",
-        "time_updated_ms": 1767225600000,
-        "time_updated_relative": "<ago>",
-        "worktree": "<scratch>/work",
-        "foreign_session_id": "<uuid_4>",
-        "directory": "<scratch>/work/claude"
-      },
-      {
-        "id": "<uuid_5>",
-        "title": "redacted subagent task",
-        "harness": "claude",
-        "model": "claude-opus-5-20260401",
-        "provider": "anthropic",
-        "turns": 1,
-        "cost_usd": null,
-        "cost_display": "—",
-        "time_updated_ms": 1767225600000,
-        "time_updated_relative": "<ago>",
-        "worktree": "<scratch>/work",
-        "foreign_session_id": "a0123456789abcdef",
-        "directory": "<scratch>/work/claude"
-      },
-      {
-        "id": "<uuid_6>",
         "title": "redacted prompt outside a checkout",
         "harness": "claude",
         "model": "claude-opus-5-20260401",
@@ -119,11 +74,55 @@ stdout:
         "turns": 1,
         "cost_usd": null,
         "cost_display": "—",
-        "time_updated_ms": 1767225600000,
+        "time_updated_ms": <store_ms>,
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/home/plain",
-        "foreign_session_id": "<uuid_7>",
+        "foreign_session_id": "<uuid_2>",
         "directory": "<scratch>/home/plain"
+      },
+      {
+        "id": "<uuid_3>",
+        "title": "redacted subagent task",
+        "harness": "claude",
+        "model": "claude-opus-5-20260401",
+        "provider": "anthropic",
+        "turns": 1,
+        "cost_usd": null,
+        "cost_display": "—",
+        "time_updated_ms": <store_ms>,
+        "time_updated_relative": "<ago>",
+        "worktree": "<scratch>/work",
+        "foreign_session_id": "a0123456789abcdef",
+        "directory": "<scratch>/work/claude"
+      },
+      {
+        "id": "<uuid_4>",
+        "title": "Redacted session title",
+        "harness": "claude",
+        "model": "claude-opus-5-20260401",
+        "provider": "anthropic",
+        "turns": 4,
+        "cost_usd": null,
+        "cost_display": "—",
+        "time_updated_ms": <store_ms>,
+        "time_updated_relative": "<ago>",
+        "worktree": "<scratch>/work",
+        "foreign_session_id": "<uuid_5>",
+        "directory": "<scratch>/work/claude"
+      },
+      {
+        "id": "<uuid_6>",
+        "title": "Redacted unused session",
+        "harness": "claude",
+        "model": "",
+        "provider": "anthropic",
+        "turns": 0,
+        "cost_usd": null,
+        "cost_display": "—",
+        "time_updated_ms": <store_ms>,
+        "time_updated_relative": "<ago>",
+        "worktree": "<scratch>/home/.claude/projects/-home-elvinas",
+        "foreign_session_id": "<uuid_7>"
       }
     ]
   },
@@ -139,31 +138,31 @@ stdout:
     "sessions": [
       {
         "id": "<uuid_8>",
-        "title": "<timestamp>Friday, <date>, 9:00 AM (UTC+3)</timestamp> <user_query> redact",
-        "harness": "cursor",
-        "model": "",
-        "provider": "cursor",
-        "turns": 1,
-        "cost_usd": null,
-        "cost_display": "—",
-        "time_updated_ms": 1767225600000,
-        "time_updated_relative": "<ago>",
-        "worktree": "cursor:missing-dir-xyz",
-        "foreign_session_id": "<uuid_7>"
-      },
-      {
-        "id": "<uuid_9>",
-        "title": "<timestamp>Thursday, <date>, 7:41 AM (UTC+3)</timestamp> <user_query> firs",
+        "title": "<timestamp>Thursday, Sep 10, 2026, 7:41 AM (UTC+3)</timestamp> <user_query> firs",
         "harness": "cursor",
         "model": "",
         "provider": "cursor",
         "turns": 2,
         "cost_usd": null,
         "cost_display": "—",
-        "time_updated_ms": 1767225600000,
+        "time_updated_ms": <store_ms>,
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work",
-        "foreign_session_id": "<uuid_4>"
+        "foreign_session_id": "<uuid_5>"
+      },
+      {
+        "id": "<uuid_9>",
+        "title": "<timestamp>Friday, Sep 11, 2026, 9:00 AM (UTC+3)</timestamp> <user_query> redact",
+        "harness": "cursor",
+        "model": "",
+        "provider": "cursor",
+        "turns": 1,
+        "cost_usd": null,
+        "cost_display": "—",
+        "time_updated_ms": <store_ms>,
+        "time_updated_relative": "<ago>",
+        "worktree": "cursor:missing-dir-xyz",
+        "foreign_session_id": "<uuid_2>"
       }
     ]
   },
@@ -179,21 +178,6 @@ stdout:
     "sessions": [
       {
         "id": "<uuid_10>",
-        "title": "Child session",
-        "harness": "opencode",
-        "model": "gpt-5.5",
-        "provider": "openai",
-        "turns": 1,
-        "cost_usd": null,
-        "cost_display": "—",
-        "time_updated_ms": 1767225600000,
-        "time_updated_relative": "<ago>",
-        "worktree": "<scratch>/work/oc",
-        "foreign_session_id": "ses_child",
-        "directory": "<scratch>/work/oc"
-      },
-      {
-        "id": "<uuid_11>",
         "title": "Parent session",
         "harness": "opencode",
         "model": "gpt-5.5",
@@ -201,10 +185,25 @@ stdout:
         "turns": 2,
         "cost_usd": null,
         "cost_display": "—",
-        "time_updated_ms": 1767225600000,
+        "time_updated_ms": <store_ms>,
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work/oc",
         "foreign_session_id": "ses_parent",
+        "directory": "<scratch>/work/oc"
+      },
+      {
+        "id": "<uuid_11>",
+        "title": "Child session",
+        "harness": "opencode",
+        "model": "gpt-5.5",
+        "provider": "openai",
+        "turns": 1,
+        "cost_usd": null,
+        "cost_display": "—",
+        "time_updated_ms": <store_ms>,
+        "time_updated_relative": "<ago>",
+        "worktree": "<scratch>/work/oc",
+        "foreign_session_id": "ses_child",
         "directory": "<scratch>/work/oc"
       }
     ]
@@ -231,22 +230,21 @@ stdout:
   "data": {
     "sessions": [
       {
-        "id": "<uuid_3>",
-        "title": "Redacted session title",
-        "harness": "claude",
-        "model": "claude-opus-5-20260401",
-        "provider": "anthropic",
-        "turns": 4,
+        "id": "<uuid_8>",
+        "title": "<timestamp>Thursday, Sep 10, 2026, 7:41 AM (UTC+3)</timestamp> <user_query> firs",
+        "harness": "cursor",
+        "model": "",
+        "provider": "cursor",
+        "turns": 2,
         "cost_usd": null,
         "cost_display": "—",
-        "time_updated_ms": 1767225600000,
+        "time_updated_ms": <store_ms>,
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work",
-        "foreign_session_id": "<uuid_4>",
-        "directory": "<scratch>/work/claude"
+        "foreign_session_id": "<uuid_5>"
       },
       {
-        "id": "<uuid_5>",
+        "id": "<uuid_3>",
         "title": "redacted subagent task",
         "harness": "claude",
         "model": "claude-opus-5-20260401",
@@ -254,25 +252,26 @@ stdout:
         "turns": 1,
         "cost_usd": null,
         "cost_display": "—",
-        "time_updated_ms": 1767225600000,
+        "time_updated_ms": <store_ms>,
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work",
         "foreign_session_id": "a0123456789abcdef",
         "directory": "<scratch>/work/claude"
       },
       {
-        "id": "<uuid_9>",
-        "title": "<timestamp>Thursday, <date>, 7:41 AM (UTC+3)</timestamp> <user_query> firs",
-        "harness": "cursor",
-        "model": "",
-        "provider": "cursor",
-        "turns": 2,
+        "id": "<uuid_4>",
+        "title": "Redacted session title",
+        "harness": "claude",
+        "model": "claude-opus-5-20260401",
+        "provider": "anthropic",
+        "turns": 4,
         "cost_usd": null,
         "cost_display": "—",
-        "time_updated_ms": 1767225600000,
+        "time_updated_ms": <store_ms>,
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work",
-        "foreign_session_id": "<uuid_4>"
+        "foreign_session_id": "<uuid_5>",
+        "directory": "<scratch>/work/claude"
       }
     ]
   },

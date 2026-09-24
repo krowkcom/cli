@@ -1,7 +1,3 @@
-
-
-
-
 $ krowk push a.txt b.md c.json
 stdout:
 {
@@ -43,7 +39,7 @@ stdout:
         "slug": "<art_2>",
         "state": "ready",
         "filename": "b.md",
-        "content_type": "application/octet-stream",
+        "content_type": "text/markdown",
         "byte_size": 8,
         "checksum": "497c96e612373c14de69c0cbd79e8c6b870cc73ae6da4037f1a1e0c58bcc9315",
         "region": "weur",

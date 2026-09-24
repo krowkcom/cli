@@ -1,5 +1,3 @@
-
-
 $ krowk runs start --title "first" --pull-request https://github.com/o/r/pull/2 --session sess --repo o/r --commit deadbeef --agent claude
 stdout:
 {
@@ -12,7 +10,7 @@ stdout:
       "vcs.repository.name": "o/r",
       "vcs.ref.head.revision": "deadbeef",
       "krowk.harness": "claude",
-      "krowk.client": "krowk-cli/<version>",
+      "krowk.client": "krowk-cli/0.0.0-golden",
       "vcs.change.id": "2",
       "vcs.change.title": "first",
       "krowk.change.url": "https://github.com/o/r/pull/2",
@@ -44,7 +42,7 @@ stdout:
     "status": "open",
     "started_at": "<time>",
     "metadata": {
-      "krowk.client": "krowk-cli/<version>"
+      "krowk.client": "krowk-cli/0.0.0-golden"
     }
   },
   "summary": "run <run_2> is open",
@@ -74,7 +72,7 @@ stdout:
         "status": "open",
         "started_at": "<time>",
         "metadata": {
-          "krowk.client": "krowk-cli/<version>"
+          "krowk.client": "krowk-cli/0.0.0-golden"
         }
       },
       {
@@ -85,7 +83,7 @@ stdout:
           "vcs.repository.name": "o/r",
           "vcs.ref.head.revision": "deadbeef",
           "krowk.harness": "claude",
-          "krowk.client": "krowk-cli/<version>",
+          "krowk.client": "krowk-cli/0.0.0-golden",
           "vcs.change.id": "2",
           "vcs.change.title": "first",
           "krowk.change.url": "https://github.com/o/r/pull/2",
@@ -109,7 +107,7 @@ stdout:
         "status": "open",
         "started_at": "<time>",
         "metadata": {
-          "krowk.client": "krowk-cli/<version>"
+          "krowk.client": "krowk-cli/0.0.0-golden"
         }
       }
     ],

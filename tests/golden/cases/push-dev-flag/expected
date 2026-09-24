@@ -1,20 +1,53 @@
-
-
-$ krowk config show --dev
+$ krowk doctor --dev
 stdout:
 {
-  "ok": true,
-  "data": {
-    "global_path": "<scratch>/home/.config/krowk/config.json"
+  "api": "http://localhost:8787/v1",
+  "api_status": "unreachable — network_unreachable — <transport error>",
+  "authenticated": false,
+  "config": "global <scratch>/home/.config/krowk/config.json (absent)",
+  "context": {},
+  "credentials": "<scratch>/home/.config/krowk/credentials.json",
+  "key": "none — uploads will be anonymous",
+  "registry": "local",
+  "runs_available": false,
+  "runtime": "<runtime>",
+  "store": {
+    "name": "store",
+    "status": "pass",
+    "message": "healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"
   },
-  "summary": "no configuration set — uploads use the stored default key",
-  "breadcrumbs": [
-    {
-      "action": "set the workspace",
-      "cmd": "krowk config set workspace \u003cworkspace\u003e",
-      "description": "pins which workspace commands in this repository use — --global sets the machine-wide fallback instead"
-    }
-  ]
+  "token_source": "none",
+  "version": "0.0.0-golden",
+  "workspace": "none — uploads will be anonymous"
 }
+exit: 0
+
+$ krowk doctor
+stdout:
+{
+  "api": "http://localhost:8787/v1",
+  "api_status": "unreachable — network_unreachable — <transport error>",
+  "authenticated": false,
+  "config": "global <scratch>/home/.config/krowk/config.json (absent)",
+  "context": {},
+  "credentials": "<scratch>/home/.config/krowk/credentials.json",
+  "key": "none — uploads will be anonymous",
+  "registry": "local",
+  "runs_available": false,
+  "runtime": "<runtime>",
+  "store": {
+    "name": "store",
+    "status": "pass",
+    "message": "healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"
+  },
+  "token_source": "none",
+  "version": "0.0.0-golden",
+  "workspace": "none — uploads will be anonymous"
+}
+exit: 0
+
+$ krowk doctor --jq .api
+stdout:
+https://api.krowk.com/v1
 exit: 0
 

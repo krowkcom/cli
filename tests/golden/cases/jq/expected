@@ -1,5 +1,3 @@
-
-
 $ krowk push a.txt --jq .ok
 stdout:
 true
@@ -112,7 +110,6 @@ $ @tty krowk push a.txt --jq '.data.artifacts[0].filename'
 tty:
 a.txt
 exit: 0
-
 
 $ krowk push a.txt --jq '"\u001b[31mred"'
 stdout:

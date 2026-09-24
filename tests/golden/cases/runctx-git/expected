@@ -1,52 +1,36 @@
-
-
-
-
-
-
-
-
-
-
-
-
 $ krowk push a.txt --jq '.data.artifacts[0].metadata'
 stdout:
-{"krowk.client":"krowk-cli/<version>","krowk.vcs.dirty":false,"vcs.ref.head.name":"feature/golden","vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"krowkcom/golden","vcs.repository.url.full":"https://github.com/krowkcom/golden"}
+{"krowk.client":"krowk-cli/0.0.0-golden","krowk.vcs.dirty":false,"vcs.ref.head.name":"feature/golden","vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"krowkcom/golden","vcs.repository.url.full":"https://github.com/krowkcom/golden"}
 exit: 0
 
 $ krowk push a.txt --jq '.data.run.metadata'
 stdout:
-{"krowk.client":"krowk-cli/<version>","krowk.vcs.dirty":false,"vcs.ref.head.name":"feature/golden","vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"krowkcom/golden","vcs.repository.url.full":"https://github.com/krowkcom/golden"}
+{"krowk.client":"krowk-cli/0.0.0-golden","krowk.vcs.dirty":false,"vcs.ref.head.name":"feature/golden","vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"krowkcom/golden","vcs.repository.url.full":"https://github.com/krowkcom/golden"}
 exit: 0
-
 
 $ krowk push a.txt --jq '.data.artifacts[0].metadata'
 stdout:
-{"krowk.client":"krowk-cli/<version>","krowk.vcs.dirty":true,"vcs.ref.head.name":"feature/golden","vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"krowkcom/golden","vcs.repository.url.full":"https://github.com/krowkcom/golden"}
+{"krowk.client":"krowk-cli/0.0.0-golden","krowk.vcs.dirty":true,"vcs.ref.head.name":"feature/golden","vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"krowkcom/golden","vcs.repository.url.full":"https://github.com/krowkcom/golden"}
 exit: 0
-
 
 $ krowk push a.txt --jq '.data.artifacts[0].metadata'
 stdout:
-{"krowk.client":"krowk-cli/<version>","krowk.vcs.dirty":true,"vcs.ref.head.name":"feature/golden","vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"sub/proj","vcs.repository.url.full":"https://gitlab.example.com/group/sub/proj"}
+{"krowk.client":"krowk-cli/0.0.0-golden","krowk.vcs.dirty":true,"vcs.ref.head.name":"feature/golden","vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"sub/proj","vcs.repository.url.full":"https://gitlab.example.com/group/sub/proj"}
 exit: 0
-
 
 $ krowk push a.txt --jq '.data.artifacts[0].metadata'
 stdout:
-{"krowk.client":"krowk-cli/<version>","krowk.vcs.dirty":true,"vcs.ref.head.name":"feature/golden","vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"krowkcom/golden","vcs.repository.url.full":"https://github.com/krowkcom/golden"}
+{"krowk.client":"krowk-cli/0.0.0-golden","krowk.vcs.dirty":true,"vcs.ref.head.name":"feature/golden","vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"krowkcom/golden","vcs.repository.url.full":"https://github.com/krowkcom/golden"}
 exit: 0
-
 
 $ krowk push a.txt --jq '.data.artifacts[0].metadata'
 stdout:
-{"krowk.client":"krowk-cli/<version>","krowk.vcs.dirty":true,"vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"krowkcom/golden","vcs.repository.url.full":"https://github.com/krowkcom/golden"}
+{"krowk.client":"krowk-cli/0.0.0-golden","krowk.vcs.dirty":true,"vcs.ref.head.revision":"16417386662110097498ce23a16d532b93b44963","vcs.repository.name":"krowkcom/golden","vcs.repository.url.full":"https://github.com/krowkcom/golden"}
 exit: 0
 
 $ krowk push a.txt --repo o/override --commit abc --agent codex --jq '.data.artifacts[0].metadata'
 stdout:
-{"krowk.client":"krowk-cli/<version>","krowk.harness":"codex","krowk.vcs.dirty":true,"vcs.ref.head.revision":"abc","vcs.repository.name":"o/override"}
+{"krowk.client":"krowk-cli/0.0.0-golden","krowk.harness":"codex","krowk.vcs.dirty":true,"vcs.ref.head.revision":"abc","vcs.repository.name":"o/override"}
 exit: 0
 
 $ @tty krowk push a.txt
@@ -82,7 +66,7 @@ stdout:
     "message": "healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"
   },
   "token_source": "KROWK_TOKEN",
-  "version": "<version>",
+  "version": "0.0.0-golden",
   "workspace": "unknown — not recorded at login; `krowk auth verify` asks the registry"
 }
 exit: 0

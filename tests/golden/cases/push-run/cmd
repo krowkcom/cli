@@ -1,5 +1,0 @@
-@registry
-@env KROWK_TOKEN=krowk_sk_test
-@file a.txt hello
-krowk runs start --title "a run" --quiet
-krowk push a.txt --run run_doesnotexist000000000000

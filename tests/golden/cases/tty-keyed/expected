@@ -1,6 +1,3 @@
-
-
-
 $ @tty krowk push a.txt --title "a run"
 tty:
 \r\e[K\e[2m<spinner>\e[0m\r\e[K\e[2m<spinner>\e[0m\r\e[K\e[32m✓\e[0m Uploaded a.txt → http://<registry>/a/<art_1>

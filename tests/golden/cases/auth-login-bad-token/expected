@@ -1,4 +1,3 @@
-
 $ krowk auth login --token nope
 stdout:
 {

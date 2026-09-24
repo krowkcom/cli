@@ -1,6 +1,3 @@
-
-
-
 $ krowk push a.txt --jq '.data.artifacts[0] | error'
 stderr:
 {

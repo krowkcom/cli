@@ -1,6 +1,3 @@
-
-
-
 $ krowk push missing.txt
 stderr:
 {

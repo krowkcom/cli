@@ -467,6 +467,19 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Fixed
 
+- A git remote with credentials in it — `https://x-access-token:<token>@github.com/...`,
+  which is how CI checkouts clone — no longer reaches the run metadata. Its URL
+  went into `vcs.repository.url.full` verbatim, and run metadata is public on
+  every card; the user and password are now dropped. A token already pushed this
+  way is on the cards it was pushed with: rotate it.
+- The content type a push declares no longer depends on the machine. It came
+  from the host's `mime.types`, so the same file declared from macOS and from
+  Linux could differ. krowk now carries its own table, which answers what
+  macOS answered, except that `.md` and `.markdown` are `text/markdown` (they
+  were `application/octet-stream` on macOS) and a `.webm` without a video
+  track is `audio/webm` (it was `video/webm` on macOS). On Linux, types the
+  distribution's table knew and krowk's does not — `.diff`, `.yaml`, `.py`
+  and the like — are now `application/octet-stream`.
 - The opencode importer, still unreleased, holds its review findings: the
   database path rides percent-encoded in the read-only DSN, so `?#&` in a
   directory can no longer escape the path and override `mode=ro`; `Read`

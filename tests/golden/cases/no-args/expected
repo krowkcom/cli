@@ -2,7 +2,7 @@ $ krowk
 stdout:
 {
   "name": "krowk",
-  "version": "<version>",
+  "version": "0.0.0-golden",
   "summary": "permalinks for agent output",
   "commands": [
     {

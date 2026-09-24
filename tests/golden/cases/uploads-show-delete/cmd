@@ -1,5 +1,0 @@
-@registry
-@env KROWK_TOKEN=krowk_sk_test
-@file a.txt hello
-krowk push a.txt --format url
-krowk uploads list --format url

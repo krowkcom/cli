@@ -11,4 +11,5 @@ publish.workspace = true
 [dev-dependencies]
 libc = "0.2"
 regex = "1"
+serde_json = "1"
 shlex = "2"

@@ -1,23 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 $ krowk push f.png f.jpg f.gif f.webp f.svg f.html f.md f.txt f.json f.log f.diff f.patch f.csv f.pdf f.mp4 f.webm f.mov f.zip f.unknownext --quiet
 stdout:
 {
@@ -212,7 +192,7 @@ stdout:
       "slug": "<art_7>",
       "state": "ready",
       "filename": "f.md",
-      "content_type": "application/octet-stream",
+      "content_type": "text/markdown",
       "byte_size": 1,
       "checksum": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
       "region": "weur",

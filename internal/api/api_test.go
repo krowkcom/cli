@@ -914,3 +914,30 @@ func TestWebmWithVideoTrackIsDeclaredVideo(t *testing.T) {
 		t.Errorf("upper-extension video .webm = %q, want video/webm", spec.ContentType)
 	}
 }
+
+// The declared type comes from krowk's own table, never the host's mime.types,
+// so one file declares the same from any machine. Pinned per extension: a
+// change here changes what users upload, and should read as one.
+func TestContentTypeIsTheTableNotTheHost(t *testing.T) {
+	for name, want := range map[string]string{
+		"shot.png":    "image/png",
+		"SHOT.PNG":    "image/png",
+		"report.md":   "text/markdown",
+		"notes.txt":   "text/plain",
+		"build.log":   "text/plain",
+		"page.html":   "text/html",
+		"data.json":   "application/json",
+		"app.js":      "application/javascript",
+		"feed.xml":    "application/xml",
+		"clip.mp4":    "video/mp4",
+		"voice.webm":  "audio/webm",
+		"voice.wav":   "audio/x-wav",
+		"change.diff": "application/octet-stream",
+		"Makefile":    "application/octet-stream",
+		"archive.zip": "application/zip",
+	} {
+		if got := ContentType(name); got != want {
+			t.Errorf("ContentType(%q) = %q, want %q", name, got, want)
+		}
+	}
+}

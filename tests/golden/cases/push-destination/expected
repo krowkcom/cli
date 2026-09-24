@@ -1,5 +1,3 @@
-
-
 $ krowk push a.png --destination github
 stdout:
 [![a.png](http://<registry>/_storage/weur/<ws_1>/<art_1>/a.png)](http://<registry>/a/<art_1>)

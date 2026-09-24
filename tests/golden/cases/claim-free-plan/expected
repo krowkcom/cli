@@ -1,4 +1,4 @@
-$ krowk push a.txt --format json
+$ krowk push a.txt
 stdout:
 {
   "ok": true,
@@ -67,14 +67,14 @@ stdout:
 }
 exit: 0
 
-$ krowk push a.txt --json
+$ krowk claim {ART} {TOKEN}
 stdout:
 {
   "ok": true,
   "data": {
     "artifacts": [
       {
-        "slug": "<art_2>",
+        "slug": "<art_1>",
         "state": "ready",
         "filename": "a.txt",
         "content_type": "text/plain",
@@ -82,12 +82,12 @@ stdout:
         "checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
         "region": "weur",
         "visibility": "public",
-        "url": "http://<registry>/a/<art_2>",
-        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_2>/a.txt",
-        "markdown": "[a.txt](http://<registry>/a/<art_2>)",
+        "url": "http://<registry>/a/<art_1>",
+        "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_1>/a.txt",
+        "markdown": "[a.txt](http://<registry>/a/<art_1>)",
         "paste": {
-          "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_2>) · expires <date>",
-          "url": "http://<registry>/a/<art_2>",
+          "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_1>) · expires <date>",
+          "url": "http://<registry>/a/<art_1>",
           "destinations": {
             "_default": "markdown",
             "asana": "url",
@@ -101,14 +101,13 @@ stdout:
         },
         "expires_at": "<time>",
         "created_at": "<time>",
-        "metadata": null,
-        "claim_token": "<claim_2>"
+        "metadata": null
       }
     ]
   },
   "paste": {
-    "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_2>) · expires <date>",
-    "url": "http://<registry>/a/<art_2>",
+    "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_1>) · expires <date>",
+    "url": "http://<registry>/a/<art_1>",
     "destinations": {
       "_default": "markdown",
       "asana": "url",
@@ -123,87 +122,16 @@ stdout:
   "summary": "1 artifact, 5 B",
   "breadcrumbs": [
     {
-      "action": "keep past expiry",
-      "cmd": "krowk claim <art_2> <claim_2>",
-      "description": "this upload is anonymous and expires within the day; claiming it with a key moves it into that key's workspace — a Pro workspace keeps it, a free one gives it another 24 hours. The token is shown once and spent once"
+      "action": "share",
+      "cmd": "http://<registry>/a/<art_1>",
+      "description": "hand this link on — it is public and needs no key to read"
     },
     {
-      "action": "share",
-      "cmd": "http://<registry>/a/<art_2>",
-      "description": "hand this link on — it is public and needs no key to read"
+      "action": "group under a run",
+      "cmd": "krowk uploads attach <art_1> --run \u003crun\u003e",
+      "description": "a claimed upload belongs to a workspace but to no run, and a run is where the pull request, commit and session are recorded — `krowk runs start` opens one, and its slug goes in place of \u003crun\u003e"
     }
   ]
 }
 exit: 0
-
-$ krowk push a.txt --quiet
-stdout:
-{
-  "artifacts": [
-    {
-      "slug": "<art_3>",
-      "state": "ready",
-      "filename": "a.txt",
-      "content_type": "text/plain",
-      "byte_size": 5,
-      "checksum": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
-      "region": "weur",
-      "visibility": "public",
-      "url": "http://<registry>/a/<art_3>",
-      "file_url": "http://<registry>/_storage/weur/<ws_1>/<art_3>/a.txt",
-      "markdown": "[a.txt](http://<registry>/a/<art_3>)",
-      "paste": {
-        "markdown": "**a.txt** · [View preview ↗](http://<registry>/a/<art_3>) · expires <date>",
-        "url": "http://<registry>/a/<art_3>",
-        "destinations": {
-          "_default": "markdown",
-          "asana": "url",
-          "basecamp": "url",
-          "github": "markdown",
-          "gitlab": "markdown",
-          "linear": "markdown",
-          "notion": "markdown",
-          "slack": "url"
-        }
-      },
-      "expires_at": "<time>",
-      "created_at": "<time>",
-      "metadata": null,
-      "claim_token": "<claim_3>"
-    }
-  ]
-}
-exit: 0
-
-$ krowk push a.txt --format human
-stdout:
-✓ Uploaded a.txt → http://<registry>/a/<art_4>
-  5 B · expires tomorrow
-  keep it:  krowk claim <art_4> <claim_4>
-
-  paste this:
-**a.txt** · [View preview ↗](http://<registry>/a/<art_4>) · expires <date>
-exit: 0
-
-$ krowk push a.txt --format markdown
-stdout:
-**a.txt** · [View preview ↗](http://<registry>/a/<art_5>) · expires <date>
-exit: 0
-
-$ krowk push a.txt --format url
-stdout:
-http://<registry>/a/<art_6>
-exit: 0
-
-$ krowk push a.txt --format yaml
-stderr:
-{
-  "ok": false,
-  "error": {
-    "error": "bad_format",
-    "fix": "unknown --format yaml (expected human, json, markdown or url)",
-    "retryable": false
-  }
-}
-exit: 1
 

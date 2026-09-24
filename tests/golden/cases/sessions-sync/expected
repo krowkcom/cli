@@ -1,4 +1,3 @@
-
 $ krowk sessions sync --no-network
 stdout:
 {
@@ -132,7 +131,6 @@ stdout:
   "summary": "8 files, 0 sessions read, 0 messages read, 0 messages new"
 }
 exit: 0
-
 
 $ krowk sessions sync --no-network
 stdout:

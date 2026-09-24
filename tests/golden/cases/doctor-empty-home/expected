@@ -17,14 +17,14 @@ stdout:
     "message": "healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"
   },
   "token_source": "none",
-  "version": "<version>",
+  "version": "0.0.0-golden",
   "workspace": "none — uploads will be anonymous"
 }
 exit: 0
 
 $ krowk doctor --format human
 stdout:
-version         <version>
+version         0.0.0-golden
 runtime         <runtime>
 api             http://127.0.0.1:9/v1
 registry        custom (KROWK_API_URL)

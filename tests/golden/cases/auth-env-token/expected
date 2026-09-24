@@ -1,5 +1,3 @@
-
-
 $ krowk auth verify --format human
 stdout:
 ✓ key valid  <key_1>

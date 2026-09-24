@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/charmbracelet/huh"
+	"github.com/mattn/go-isatty"
 
 	"github.com/krowkcom/cli/internal/api"
 	"github.com/krowkcom/cli/internal/output"
@@ -47,6 +48,19 @@ func sessionsRebuild(w io.Writer, format output.Format, f flags, env runctx.Env,
 			" and re-imports every transcript — pass --yes to confirm when nobody is at a terminal to ask")
 	}
 
+	// Asked before the lock is taken, so a question left on screen does not
+	// hold off every import on the machine while it waits.
+	if prompt {
+		ok := false
+		err := huh.NewConfirm().
+			Title("Delete " + storePath + " and re-import every transcript?").
+			Value(&ok).
+			Run()
+		if err != nil || !ok {
+			return api.Fail("selection_cancelled", "nothing was deleted")
+		}
+	}
+
 	// The same lock import takes, for the same reason: an import writing
 	// into the file while it is deleted would lose its rows, or land them in
 	// a file that is about to be unlinked.
@@ -59,17 +73,6 @@ func sessionsRebuild(w io.Writer, format output.Format, f flags, env runctx.Env,
 		return importLockFailure(lockPath, err)
 	}
 	defer release.Close()
-
-	if prompt {
-		ok := false
-		err := huh.NewConfirm().
-			Title("Delete " + storePath + " and re-import every transcript?").
-			Value(&ok).
-			Run()
-		if err != nil || !ok {
-			return api.Fail("selection_cancelled", "nothing was deleted")
-		}
-	}
 
 	// Exactly the database and its two WAL-mode sidecars, and nothing else
 	// in the directory: import.lock is held right now, and anything else
@@ -96,8 +99,9 @@ func sessionsRebuild(w io.Writer, format output.Format, f flags, env runctx.Env,
 
 // stdinIsTerminal is whether a confirmation has anyone to read it. stdout
 // being a terminal is not enough: `yes | krowk sessions rebuild` has a
-// terminal on stdout and nobody answering on stdin.
+// terminal on stdout and nobody answering on stdin. isatty rather than
+// ModeCharDevice, because /dev/null is a character device too and
+// `</dev/null` is exactly the caller with nobody to answer.
 func stdinIsTerminal() bool {
-	fi, err := os.Stdin.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+	return isatty.IsTerminal(os.Stdin.Fd())
 }

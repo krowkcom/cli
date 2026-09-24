@@ -307,7 +307,7 @@ func importInto(w io.Writer, format output.Format, f flags, env runctx.Env, db *
 // "database is locked", which tells a caller nothing about what to do.
 func importLockFailure(path string, err error) error {
 	if errors.Is(err, errImportLockHeld) {
-		return api.Fail("import_locked", "another `krowk sessions import` is running on this store — "+
+		return api.Fail("import_locked", "another `krowk sessions import` or `rebuild` is running on this store — "+
 			"wait for it to finish, or check "+path+" if you think it is not")
 	}
 	return api.Fail("import_locked", "the import lock at "+path+" could not be taken: "+err.Error())

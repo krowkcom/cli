@@ -54,6 +54,8 @@ func TestExitCodeFor(t *testing.T) {
 		{"no such endpoint", registryErr(404, "no_such_endpoint"), 2},
 		{"no such session", api.Fail("no_session", ""), 2},
 		{"ambiguous session", api.Fail("ambiguous_session", ""), 1},
+		{"rebuild not confirmed", api.Fail("confirmation_required", ""), 1},
+		{"rebuild declined", api.Fail("selection_cancelled", ""), 1},
 
 		// Auth.
 		{"key rejected", registryErr(401, "unauthorized"), 3},

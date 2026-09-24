@@ -202,3 +202,52 @@ func TestRebuildFlagsAreRefusedElsewhere(t *testing.T) {
 		}
 	}
 }
+
+// A plain import's report has no `removed` key at all; a rebuild on a
+// machine with no store yet has one, and it is empty rather than absent.
+func TestRemovedIsRebuildsAloneAndEmptyWhenNothingWasThere(t *testing.T) {
+	h, home := importHarness(t)
+	seedClaude(t, home)
+
+	code, stdout, stderr := h.run("sessions", "import", "--from", "all", "--json")
+	if code != 0 {
+		t.Fatalf("import exited %d\n%s%s", code, stdout, stderr)
+	}
+	var raw struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw.Data["removed"]; ok {
+		t.Errorf("a plain import's report carries removed:\n%s", stdout)
+	}
+
+	fresh, freshHome := importHarness(t)
+	seedClaude(t, freshHome)
+	code, stdout, stderr = fresh.run("sessions", "rebuild", "--yes", "--json")
+	if code != 0 {
+		t.Fatalf("rebuild exited %d\n%s%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, `"removed": []`) {
+		t.Errorf("rebuild with no store did not report \"removed\": []:\n%s", stdout)
+	}
+	if removed := removedPaths(t, stdout); len(removed) != 0 {
+		t.Errorf("removed = %v on a machine with no store", removed)
+	}
+}
+
+// /dev/null is a character device, and still nobody to answer a question.
+func TestStdinFromDevNullIsNotATerminal(t *testing.T) {
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	saved := os.Stdin
+	os.Stdin = null
+	defer func() { os.Stdin = saved }()
+	if stdinIsTerminal() {
+		t.Error("stdin from /dev/null reads as a terminal")
+	}
+}

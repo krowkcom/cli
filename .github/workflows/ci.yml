@@ -54,3 +54,12 @@ jobs:
 
       - name: Golden cases against the Go build
         run: make golden
+
+      - name: Rust lint and unit tests
+        run: |
+          rustup component add clippy
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --exclude krowk-golden
+
+      - name: Golden cases against the Rust build (contract mode)
+        run: make golden-rust

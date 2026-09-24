@@ -39,10 +39,8 @@ pub fn load(dir: &str, env: &dyn Fn(&str) -> String, flag_workspace: &str) -> Re
     if let Some(v) = read_file(&global_path())? {
         apply(&mut c, v, SOURCE_GLOBAL);
     }
-    if let Some(path) = repo_path(dir) {
-        if let Some(v) = read_file(&path)? {
-            apply(&mut c, v, SOURCE_REPO);
-        }
+    if let Some(v) = repo_path(dir).map(|p| read_file(&p)).transpose()?.flatten() {
+        apply(&mut c, v, SOURCE_REPO);
     }
     apply(&mut c, env("KROWK_WORKSPACE"), SOURCE_ENV);
     apply(&mut c, flag_workspace.to_string(), SOURCE_FLAG);

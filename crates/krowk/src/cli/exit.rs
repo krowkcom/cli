@@ -50,10 +50,8 @@ pub fn code_for(err: &Error) -> i32 {
     if let Some(exit) = client(&code) {
         return exit;
     }
-    if err.status != 0 {
-        if let Some(exit) = registry(&code) {
-            return exit;
-        }
+    if let Some(exit) = registry(&code).filter(|_| err.status != 0) {
+        return exit;
     }
     match err.status {
         0 => USAGE,

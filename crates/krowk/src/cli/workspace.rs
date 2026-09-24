@@ -22,11 +22,9 @@ pub(crate) fn workspaces_list(ctx: &mut Ctx) -> Result<(), Error> {
     let (ws, source) = resolve_workspace(ctx)?;
     let stored = creds::stored_workspaces();
     let mut view = Workspaces { resolved: ws.clone(), source, shadowed: !ctx.env("KROWK_TOKEN").is_empty(), ..Workspaces::default() };
-    if ws.is_empty() {
-        if let Some(k) = stored.iter().find(|k| k.default) {
-            view.resolved = k.name.clone();
-            view.source = "stored default".into();
-        }
+    if let Some(k) = stored.iter().find(|k| k.default).filter(|_| ws.is_empty()) {
+        view.resolved = k.name.clone();
+        view.source = "stored default".into();
     }
     if !view.resolved.is_empty() && !view.shadowed && creds::resolve_token(ctx.io.env, &ws).is_err() {
         view.key_missing = true;

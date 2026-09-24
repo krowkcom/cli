@@ -81,8 +81,8 @@ exit: 1
 
 $ @tty krowk sessions rebuild
 tty:
-\e[31m✗\e[0m `krowk sessions rebuild` deletes <scratch>/home/.local/share/krowk/krowk.db and re-imports every transcript.
+\e[31m✗\e[0m Rebuilding deletes <scratch>/home/.local/share/krowk/krowk.db and re-imports every transcript.
 \e[2m  (confirmation_required)\e[0m
-\e[2m  try:\e[0m  krowk sessions rebuild
+\e[2m  try:\e[0m  krowk sessions rebuild --yes
 exit: 1
 

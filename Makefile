@@ -61,18 +61,25 @@ rust: ## Build the Rust krowk into target/release
 bin/devregistry: $(shell find internal/devregistry internal/registry -name '*.go')
 	go build -trimpath -o bin/devregistry ./internal/devregistry
 
-# The cases compare the version like any other output, so both builds are
-# stamped with one that no release will ever carry.
+# The cases compare the version like any other output, so the oracle is built
+# stamped with one no release will ever carry — into bin/golden/, so a golden
+# run leaves the developer's own bin/krowk as it was.
 GOLDEN_VERSION := 0.0.0-golden
+GOLDEN_LDFLAGS := -s -w -X github.com/krowkcom/cli/internal/cli.Version=$(GOLDEN_VERSION)
 
-golden: bin/devregistry ## Hold the Go build to tests/golden/cases
-	$(MAKE) build VERSION=$(GOLDEN_VERSION)
+bin/golden: FORCE
+	go build -trimpath -ldflags "$(GOLDEN_LDFLAGS)" -o bin/golden/krowk ./cmd/krowk
+	go build -trimpath -ldflags "$(GOLDEN_LDFLAGS)" -o bin/golden/krowk-mcp ./cmd/krowk-mcp
+
+.PHONY: FORCE
+FORCE:
+
+golden: bin/golden bin/devregistry ## Hold the Go build to tests/golden/cases
 	cargo test -p krowk-golden
 
 golden-rust: bin/devregistry ## Hold the Rust build to the same cases
 	KROWK_VERSION=$(GOLDEN_VERSION) cargo build --release -p krowk
 	KROWK_BIN=target/release/krowk KROWK_MCP_BIN=target/release/krowk-mcp cargo test -p krowk-golden
 
-golden-update: bin/devregistry ## Re-record the cases from the Go build
-	$(MAKE) build VERSION=$(GOLDEN_VERSION)
+golden-update: bin/golden bin/devregistry ## Re-record the cases from the Go build
 	GOLDEN_UPDATE=1 cargo test -p krowk-golden

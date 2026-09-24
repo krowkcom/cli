@@ -474,12 +474,17 @@ the versions are the `v*` tags a release is cut from. Entries land under
   way is on the cards it was pushed with: rotate it.
 - The content type a push declares no longer depends on the machine. It came
   from the host's `mime.types`, so the same file declared from macOS and from
-  Linux could differ. krowk now carries its own table, which answers what
-  macOS answered, except that `.md` and `.markdown` are `text/markdown` (they
+  Linux could differ. krowk now carries its own table of the extensions agents
+  produce — images, video, audio, fonts, text and source files, documents,
+  archives — each answering what macOS answered, except that `.md` and `.markdown` are `text/markdown` (they
   were `application/octet-stream` on macOS) and a `.webm` without a video
-  track is `audio/webm` (it was `video/webm` on macOS). On Linux, types the
-  distribution's table knew and krowk's does not — `.diff`, `.yaml`, `.py`
-  and the like — are now `application/octet-stream`.
+  track is `audio/webm` (it was `video/webm` on macOS). An extension outside
+  the table is `application/octet-stream` on every machine: on Linux that
+  includes types the distribution knew, like `.diff`, `.yaml` and `.py`, and on
+  macOS the rarer ones Apache's list names, like `.kml` or `.dmg`.
+- `krowk sessions rebuild` with nobody at a terminal suggested running
+  `krowk sessions rebuild` — the command that had just refused. It now
+  suggests `krowk sessions rebuild --yes`.
 - The opencode importer, still unreleased, holds its review findings: the
   database path rides percent-encoded in the read-only DSN, so `?#&` in a
   directory can no longer escape the path and override `mode=ro`; `Read`

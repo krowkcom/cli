@@ -18,6 +18,5 @@ krowk push a.txt --jq .ok --format human
 krowk push a.txt --jq .ok --quiet
 krowk bogus --jq .ok
 @tty krowk push a.txt --jq '.data.artifacts[0].filename'
-@file evil.txt x
 krowk push a.txt --jq '"\u001b[31mred"'
 @tty krowk push a.txt --jq '"\u001b[31mred"' 

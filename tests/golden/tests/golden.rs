@@ -1,9 +1,9 @@
 //! Black-box cases for any krowk binary: what it printed, how it exited, and
 //! what it left on disk.
 //!
-//! The binary under test is `$KROWK_BIN`, defaulting to the Go build at
-//! bin/krowk. Cases are recorded from the implementation that ships today and
-//! then held against the Rust one:
+//! The binary under test is `$KROWK_BIN`, defaulting to the Go oracle at
+//! bin/golden/krowk. Cases are recorded from the implementation that ships
+//! today and then held against the Rust one:
 //!
 //!     make golden          # Go, the oracle
 //!     make golden-rust     # the port, against the same expectations
@@ -33,8 +33,13 @@
 //!     krowk-mcp args...         run $KROWK_MCP_BIN, default bin/krowk-mcp
 //!     @let NAME .path[0].to     capture a value from the previous command's stdout (JSON,
 //!                               before masking); {NAME} expands in every later line
-//!     @tty krowk args...        run with stdout and stderr on one pseudo-terminal, as a
-//!                               person at a shell would; ESC and CR print as \e and \r
+//!     @tty krowk args...        run with stdout and stderr on one pseudo-terminal, to see
+//!                               what a person sees; ESC and CR print as \e and \r.
+//!                               stdin stays /dev/null, so a path that asks a question —
+//!                               the rebuild confirmation, the sessions picker — takes its
+//!                               nobody-is-here branch. Interactive prompts are drawn by a
+//!                               TUI library whose bytes no port reproduces, so they are
+//!                               outside this gate and checked by hand.
 //!
 //! Every command runs with an empty environment apart from PATH, HOME, TMPDIR,
 //! TZ=UTC, KROWK_NO_UPDATE_CHECK and KROWK_TEST_NOW_MS (the store's clock,
@@ -62,6 +67,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::LazyLock;
 
+/// The version `make golden*` stamps both builds with, one no release carries.
+const GOLDEN_VERSION: &str = "0.0.0-golden";
+
 /// Where the store's test clock starts: 2026-01-01T00:00:00Z.
 const STORE_EPOCH_MS: i64 = 1_767_225_600_000;
 
@@ -78,8 +86,17 @@ fn bin_from(var: &str, default: &str) -> PathBuf {
 
 #[test]
 fn golden() {
-    let krowk = bin_from("KROWK_BIN", "bin/krowk");
-    let mcp = bin_from("KROWK_MCP_BIN", "bin/krowk-mcp");
+    let krowk = bin_from("KROWK_BIN", "bin/golden/krowk");
+    let mcp = bin_from("KROWK_MCP_BIN", "bin/golden/krowk-mcp");
+    // The version is compared like any other output, so a binary stamped with
+    // anything else fails most cases with diffs that never mention why.
+    let stamp = Command::new(&krowk).arg("--version").env_clear().output().unwrap().stdout;
+    assert_eq!(
+        String::from_utf8_lossy(&stamp).trim(),
+        GOLDEN_VERSION,
+        "{} is not stamped {GOLDEN_VERSION} — build it with `make golden` / `make golden-rust`",
+        krowk.display()
+    );
     let registry = bin_from("KROWK_REGISTRY_BIN", "bin/devregistry");
     let update = std::env::var_os("GOLDEN_UPDATE").is_some();
     let only = std::env::var("GOLDEN_CASE").unwrap_or_default();
@@ -279,6 +296,9 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
                 assert_eq!(word, "krowk", "{}: @tty runs krowk only", case.display());
                 let args: Vec<String> = shlex::split(rest).expect("unbalanced quotes").iter().map(|a| expand(a)).collect();
                 let (screen, code) = run_on_tty(bins.krowk, &args, &work, &env, case, line);
+                // What a terminal shows is not JSON to capture; a @let after
+                // this line must fail rather than read the command before it.
+                last_stdout.clear();
                 out.push_str(&format!("$ {line}\ntty:\n{}exit: {code}\n\n", ensure_newline(&visible(&screen))));
             }
             "krowk" | "krowk-mcp" => {
@@ -355,10 +375,11 @@ fn run_on_tty(bin: &Path, args: &[String], work: &Path, env: &[(String, String)]
         .unwrap();
     // The child holds the only slave handles now, so the master reads to
     // EOF (EIO on Linux) exactly when the child exits.
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let (mut master, mut screen) = (master, Vec::new());
         let _ = std::io::Read::read_to_end(&mut master, &mut screen);
-        screen
+        let _ = tx.send(screen);
     });
     let (pid, deadline) = (child.id(), std::time::Instant::now() + std::time::Duration::from_secs(20));
     let status = loop {
@@ -371,7 +392,12 @@ fn run_on_tty(bin: &Path, args: &[String], work: &Path, env: &[(String, String)]
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    let screen = String::from_utf8_lossy(&reader.join().unwrap()).into_owned();
+    // EOF comes when the last holder of the slave closes it; a grandchild that
+    // inherited it — a daemon, a browser opener — would hold it open forever.
+    let screen = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or_else(|_| panic!("{}: `{line}` exited but something it started still holds the terminal", case.display()));
+    let screen = String::from_utf8_lossy(&screen).into_owned();
     (screen, status.code().map_or("signal".into(), |c| c.to_string()))
 }
 
@@ -537,14 +563,23 @@ fn normalize(text: &str, scratch: &Path, registry: Option<&str>, bins: &Bins) ->
         })
         .into_owned();
     // The store's clock starts at STORE_EPOCH_MS and moves a millisecond per
-    // read, so what it wrote depends on how often a build reads it; the order
-    // of rows it stamped is behavior, the exact values are not. A fixture's own
-    // timestamps fall outside the window and stay.
+    // read, so what it wrote depends on how often a build reads it. The order of
+    // what it stamped is behavior — updated after created, a sync moving a row
+    // forward — so each distinct value becomes its rank: <store_ms_1> is the
+    // earliest in the case. A fixture's own timestamps fall outside the window.
     static MILLIS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{13}\b").unwrap());
+    let window = STORE_EPOCH_MS..STORE_EPOCH_MS + 86_400_000;
+    let mut stamped: Vec<i64> =
+        MILLIS.find_iter(&text).filter_map(|m| m.as_str().parse().ok()).filter(|ms| window.contains(ms)).collect();
+    stamped.sort_unstable();
+    stamped.dedup();
     text = MILLIS
         .replace_all(&text, |c: &Captures| {
             let ms: i64 = c[0].parse().unwrap();
-            if (STORE_EPOCH_MS..STORE_EPOCH_MS + 86_400_000).contains(&ms) { "<store_ms>".to_string() } else { c[0].to_string() }
+            match stamped.binary_search(&ms) {
+                Ok(rank) if window.contains(&ms) => format!("<store_ms_{}>", rank + 1),
+                _ => c[0].to_string(),
+            }
         })
         .into_owned();
     for (re, kind) in NUMBERED.iter() {

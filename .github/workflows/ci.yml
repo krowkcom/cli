@@ -1,10 +1,8 @@
 name: CI
 
-# The gate every pull request passes, whatever branch it targets: the Rust
-# port lands through pull requests into rust-rewrite, and those need the same
-# proof as main does.
+# The gate every pull request passes, whatever branch it targets.
 #
-# Both platforms, because v1 ships on both and the golden cases are exactly the
+# Every platform CI can run natively, because the golden cases are exactly the
 # kind of test a platform difference breaks: temp paths, file modes, what the
 # machine's own tables say.
 on:
@@ -31,31 +29,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache: true
-
       # rustup is on every hosted runner; the toolchain is pinned to the
       # workspace's rust-version rather than whatever the image carries.
       - name: Set up Rust
         run: |
-          rustup toolchain install 1.97 --profile minimal
+          rustup toolchain install 1.97 --profile minimal --component clippy
           rustup default 1.97
+
+      - uses: Swatinem/rust-cache@v2
 
       # The opencode fixture is built from SQL at case time.
       - name: Ensure sqlite3
         if: runner.os == 'Linux'
         run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
 
-      - name: Go checks
+      - name: Lint, unit tests and golden cases
         run: make check
-
-      - name: Golden cases against the Go build
-        run: make golden
-
-      - name: Rust lint, unit tests and golden cases (contract mode)
-        run: |
-          rustup component add clippy
-          make rust-check

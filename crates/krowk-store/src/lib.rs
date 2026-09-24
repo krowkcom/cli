@@ -286,7 +286,7 @@ pub fn check(env: Env) -> StatusCheck {
         return status(
             "fail",
             "no home directory in environment, so krowk.db has nowhere to live".into(),
-            "set HOME (or XDG_DATA_HOME to an absolute path) so krowk.db has a place to live (internal/store)".into(),
+            "set HOME (or XDG_DATA_HOME to an absolute path) so krowk.db has a place to live".into(),
         );
     };
     match open(env) {
@@ -294,12 +294,12 @@ pub fn check(env: Env) -> StatusCheck {
         Err(StoreError::SchemaMismatch(m)) => status(
             "fail",
             m,
-            format!("run `krowk sessions rebuild` (delete {} and re-import) (internal/store)", path.display()),
+            format!("run `krowk sessions rebuild` (delete {} and re-import)", path.display()),
         ),
         Err(e) => {
             let msg = e.message().to_string();
             let msg = if msg.contains(&path.display().to_string()) { msg } else { format!("{}: {msg}", path.display()) };
-            status("fail", msg, format!("inspect {} (internal/store)", path.display()))
+            status("fail", msg, format!("inspect {}", path.display()))
         }
     }
 }

@@ -19,7 +19,7 @@
 #
 #   scripts/install_test.sh
 #
-# Needs bash, python3 and either goreleaser or the Go toolchain. Run from
+# Needs bash, python3 and either goreleaser or cargo. Run from
 # anywhere; it finds the repository from its own path.
 
 set -euo pipefail
@@ -121,19 +121,6 @@ sh_goarch=$(sed -n 's/^ *[^ ]*) *arch="\([a-z0-9]*\)".*/\1/p' scripts/install.sh
   || fail ".goreleaser.yaml builds for [$(echo "$yaml_goarch" | tr '\n' ' ')] and scripts/install.sh names [$(echo "$sh_goarch" | tr '\n' ' ')]"
 pass "the platform lists still agree: $(echo "$yaml_goos" | tr '\n' ' ')× $(echo "$yaml_goarch" | tr '\n' ' ')"
 
-# The marker sentence lives in two languages, and a directory claimed by the
-# installer has to be one the binary's gate recognises. So neither copy may
-# drift: both are read out of the files that write them and compared.
-sh_marker=$(sed -n 's/^MANAGED_MARKER_CONTENT="\(.*\)"$/\1/p' scripts/install.sh)
-[[ -n "$sh_marker" ]] || fail "scripts/install.sh no longer defines MANAGED_MARKER_CONTENT"
-grep -qE "^[[:space:]]*managedMarkerContent = \"${sh_marker}\\\\n\"\$" internal/harness/managed.go \
-  || fail "scripts/install.sh writes a marker saying '$sh_marker', which is not what internal/harness/managed.go declares managedMarkerContent to be"
-for name in MANAGED_MARKER INSTALLED_VERSION_FILE; do
-  sh_name=$(sed -n "s/^${name}=\"\(.*\)\"\$/\1/p" scripts/install.sh)
-  grep -qF "\"$sh_name\"" internal/harness/managed.go \
-    || fail "scripts/install.sh writes $sh_name, which internal/harness/managed.go does not name"
-done
-pass "the marker sentence and the two filenames agree with internal/harness/managed.go"
 
 # The combinations the release does not build are the third piece: one the
 # config does not build must be one the installer refuses to offer, and every
@@ -247,9 +234,10 @@ else
     done
     SOURCE="goreleaser"
   else
-    go build -o "$WORK/build/krowk" ./cmd/krowk
-    go build -o "$WORK/build/krowk-mcp" ./cmd/krowk-mcp
-    SOURCE="go build"
+    cargo build --release --locked -p krowk --features sessions >"$WORK/cargo.log" 2>&1 \
+      || { cat "$WORK/cargo.log"; fail "cargo could not build"; }
+    cp target/release/krowk target/release/krowk-mcp "$WORK/build/"
+    SOURCE="cargo build"
   fi
   VERSION="9.9.9"
   ARCHIVE="krowk_${VERSION}_${host_os}_${host_arch}.tar.gz"

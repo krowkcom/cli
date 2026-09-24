@@ -979,8 +979,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const FIXTURE_SQL: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../internal/importer/opencode/testdata/opencode/opencode.sql"));
-    const GOLDEN: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../internal/importer/opencode/testdata/golden.json"));
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/opencode/opencode/opencode.sql"));
+    const GOLDEN: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/opencode/golden.json"));
     const PARENT: &str = "ses_parent";
     const CHILD: &str = "ses_child";
     const PARENT_CURSOR: i64 = 1757000000405;

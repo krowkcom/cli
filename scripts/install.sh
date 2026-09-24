@@ -398,10 +398,8 @@ skills_dir() {
 }
 
 # The ownership marker and the version stamp krowk writes beside every skill it
-# manages. They are the same two filenames, with the same marker sentence, that
-# internal/harness/managed.go writes — a directory claimed here and one claimed
-# by the binary have to be the same directory, or an upgrade would refuse to
-# refresh what this script installed.
+# manages. This script is their only writer: an upgrade re-runs it, and a
+# directory it claimed once is one it recognises and refreshes after.
 MANAGED_MARKER=".managed-by-krowk-cli"
 INSTALLED_VERSION_FILE=".installed-version"
 MANAGED_MARKER_CONTENT="This directory is managed by krowk. Manual edits will be overwritten on upgrade."
@@ -470,14 +468,13 @@ write_managed_file() {
   fi
 }
 
-# claim_skill_dir is the gate every skill write goes through, and the shell half
-# of internal/harness/managed.go's ClaimDir: it creates a missing directory,
+# claim_skill_dir is the gate every skill write goes through: it creates a missing directory,
 # adopts an empty one, accepts one that already carries krowk's marker, and
 # refuses anything else. A populated directory without the marker is somebody's
 # own skill, and an installer that overwrote it would destroy work nobody asked
 # it to touch — so it says why and leaves it exactly as it found it.
 #
-# It also adopts one shape the Go gate deliberately refuses: a directory holding
+# It also adopts one shape a stricter gate would refuse: a directory holding
 # nothing but a regular SKILL.md, which is the only file a pre-marker krowk
 # installer ever wrote and the one it overwrote on every single run. Adopting it
 # now therefore takes nothing from anybody, while anything else in the directory

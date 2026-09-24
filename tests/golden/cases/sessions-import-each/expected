@@ -111,7 +111,7 @@ stderr:
   "ok": false,
   "error": {
     "error": "bad_flag",
-    "fix": "`krowk sessions import` needs --from \u003cclaude|cursor|opencode|all\u003e — it says which agent's transcripts to read",
+    "fix": "`krowk sessions import` needs --from <claude|cursor|opencode|all> — it says which agent's transcripts to read",
     "retryable": false
   }
 }

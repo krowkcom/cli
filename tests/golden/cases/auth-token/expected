@@ -36,8 +36,8 @@ stdout:
   "breadcrumbs": [
     {
       "action": "push",
-      "cmd": "krowk push \u003cfile\u003e",
-      "description": "the key is stored and accepted, so nothing else is needed before uploading; \u003cfile\u003e is the path to upload"
+      "cmd": "krowk push <file>",
+      "description": "the key is stored and accepted, so nothing else is needed before uploading; <file> is the path to upload"
     }
   ]
 }
@@ -62,8 +62,8 @@ stdout:
   "breadcrumbs": [
     {
       "action": "push",
-      "cmd": "krowk push \u003cfile\u003e",
-      "description": "the key works, so an upload with it lands in that workspace and does not expire; \u003cfile\u003e is the path to upload"
+      "cmd": "krowk push <file>",
+      "description": "the key works, so an upload with it lands in that workspace and does not expire; <file> is the path to upload"
     }
   ]
 }
@@ -93,8 +93,8 @@ stdout:
   "breadcrumbs": [
     {
       "action": "push",
-      "cmd": "krowk push \u003cfile\u003e",
-      "description": "the key works, so an upload with it lands in that workspace and does not expire; \u003cfile\u003e is the path to upload"
+      "cmd": "krowk push <file>",
+      "description": "the key works, so an upload with it lands in that workspace and does not expire; <file> is the path to upload"
     }
   ]
 }

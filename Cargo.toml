@@ -1,6 +1,6 @@
-# The Rust port of krowk, growing beside the Go build until it replaces it.
-# Go under cmd/ and internal/ is still what ships; tests/golden is what decides
-# when that stops being true — the same cases, run against both binaries.
+# krowk: the CLI, its MCP server, the session store and importers, and the
+# stand-in registry the tests run against. tests/golden holds the binaries to
+# their recorded transcripts.
 #
 # Crates split where a dependency has to stop, not by layer: the default
 # `krowk` build is the agent-container one and never links sqlite, so it stays

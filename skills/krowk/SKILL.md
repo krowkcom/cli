@@ -357,7 +357,7 @@ for a key, or asked for something a key is required for.
 page are not built there, so the command answers `404 no_such_endpoint` with a fix
 line saying so. Against production, `--token` is the only way in. Use this flow
 against a registry that serves it — the repository's dev stand-in
-(`go run ./internal/devregistry`, then `--dev`), or `api.krowk.com` once the gap
+(`make mock` in a checkout, then `--dev`), or `api.krowk.com` once the gap
 closes. With only an installed krowk there is no local registry to point at:
 don't try to host one, run the flow with `--token` or not at all.
 

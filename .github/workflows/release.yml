@@ -23,8 +23,8 @@ jobs:
     permissions:
       # GoReleaser creates the release and uploads the archives to it.
       contents: write
-      # setup-go needs this to save its build cache; without it every run
-      # ends in "cache write denied: token has no writable scopes".
+      # Kept for the caches the setup actions write; without it they end in
+      # "cache write denied: token has no writable scopes".
       actions: write
     steps:
       - name: Checkout repository
@@ -34,13 +34,6 @@ jobs:
           # the changelog, so a shallow clone gives it nothing to work with.
           fetch-depth: 0
           persist-credentials: false
-
-      # Go only for the stand-in registry the golden cases run against.
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache: true
 
       - name: Set up Rust
         run: |
@@ -61,7 +54,7 @@ jobs:
       # The same gate as a pull request. A tag that cannot pass it should not
       # become bytes anyone downloads.
       - name: Check
-        run: make rust-check
+        run: make check
 
       - name: Set up Node
         uses: actions/setup-node@v7

@@ -780,7 +780,7 @@ mod tests {
     const LINES: usize = 34;
     const TESTDATA: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../internal/importer/claude/testdata"
+        "/testdata/claude"
     );
 
     /// testdata materialised in a temp dir: a home with the transcripts, a

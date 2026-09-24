@@ -6,7 +6,7 @@
 // `@krowk/cli` and `@krowk/mcp` — which depend on all five as optionalDependencies
 // and use whichever npm decided applies. That is the esbuild pattern.
 //
-// The bytes are the release's bytes, read out of dist/, not a second `go build`
+// The bytes are the release's bytes, read out of dist/, not a second `cargo build`
 // that could differ from what the checksums cover.
 //
 //   node npm/build.mjs [--dist dist] [--out dist/npm]

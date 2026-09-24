@@ -1,13 +1,17 @@
 //! Black-box cases for any krowk binary: what it printed, how it exited, and
 //! what it left on disk.
 //!
-//! The binary under test is `$KROWK_BIN`, defaulting to the Go oracle at
-//! bin/golden/krowk. Cases are recorded from the implementation that ships
-//! today and then held against the Rust one:
+//! The binary under test is `$KROWK_BIN`, defaulting to target/release/krowk.
+//! Each case's transcript is held byte for byte:
 //!
-//!     make golden          # Go, the oracle
-//!     make golden-rust     # the port, against the same expectations
-//!     make golden-update   # re-record from Go
+//!     make golden          # build, stamped 0.0.0-golden, and check every case
+//!     make golden-update   # re-record after an intended output change
+//!
+//! The cases were first recorded from the Go build and held against the Rust
+//! one by contract (exit codes, JSON values, prose aside) until every one
+//! passed; the Rust build has been the recording since the Go one was removed.
+//! A re-record is reviewed as a diff: what changed in `expected` is what a
+//! user of that command will see change.
 //!
 //! A case is a directory under cases/ holding a `cmd` script and the
 //! `expected` transcript it produces. Optional `home/` and `work/` directories
@@ -30,7 +34,7 @@
 //!     @ls path                  print a directory tree into the transcript
 //!     @sh command               run /bin/sh -c in work/ for setup; not recorded ({case} expands too)
 //!     krowk args...             run the binary; shell-style quoting
-//!     krowk-mcp args...         run $KROWK_MCP_BIN, default bin/golden/krowk-mcp
+//!     krowk-mcp args...         run $KROWK_MCP_BIN, default target/release/krowk-mcp
 //!     @let NAME .path[0].to     capture a value from the previous command's stdout (JSON,
 //!                               before masking); {NAME} expands in every later line
 //!     @tty krowk args...        run with stdout and stderr on one pseudo-terminal, to see
@@ -53,20 +57,11 @@
 //! uuids, timestamps, expiry dates, the registry port and the temp paths.
 //! Values that repeat keep their identity (`<art_1>` twice is the same
 //! artifact), so a case still proves that one command's output feeds the next.
-//! The binary's version is not masked: `make golden*` stamps both builds
+//! The binary's version is not masked: `make golden` stamps the build
 //! 0.0.0-golden, so a version-dependent path is compared like any other.
 //!
 //! `GOLDEN_UPDATE=1` rewrites `expected` instead of checking it, and
 //! `GOLDEN_CASE=substr` runs only the matching cases.
-//!
-//! Two ways to compare. The Go oracle is held to its own transcript byte for
-//! byte. The port is held to the contract (`GOLDEN_MODE=contract`, which
-//! `make golden-rust` sets): the same exit codes, the same JSON — structure,
-//! values and error codes, key order and number spelling aside — with prose
-//! fields (`fix`, `message`, `summary`, `description` …) left out, since the
-//! port may word things its own way. Output that is not JSON is compared
-//! exactly where it is data (`--jq`, `--format url`) and only for presence
-//! where it is prose; `@cat` compares as JSON when it parses, `@ls` exactly.
 
 use regex::{Captures, Regex};
 use std::collections::HashMap;
@@ -96,26 +91,22 @@ fn bin_from(var: &str, default: &str) -> PathBuf {
 
 #[test]
 fn golden() {
-    let contract = std::env::var("GOLDEN_MODE").is_ok_and(|m| m == "contract");
-    let krowk = bin_from("KROWK_BIN", "bin/golden/krowk");
-    // The port gains its MCP server later than its CLI, so under contract mode
-    // the binary is only required once a case that runs it is ported.
-    let mcp = std::env::var_os("KROWK_MCP_BIN").map(PathBuf::from).unwrap_or_else(|| workspace_path("bin/golden/krowk-mcp"));
+    let krowk = bin_from("KROWK_BIN", "target/release/krowk");
+    let mcp = std::env::var_os("KROWK_MCP_BIN").map(PathBuf::from).unwrap_or_else(|| workspace_path("target/release/krowk-mcp"));
     let mcp = if mcp.is_relative() { workspace_path(&mcp.to_string_lossy()) } else { mcp };
     // The version is compared like any other output, so a binary stamped with
     // anything else fails most cases with diffs that never mention why.
-    for bin in [&krowk, &mcp].into_iter().filter(|b| !contract || b.exists()) {
+    for bin in [&krowk, &mcp] {
         let stamp = Command::new(bin).arg("--version").env_clear().output().unwrap().stdout;
         assert_eq!(
             String::from_utf8_lossy(&stamp).trim(),
             GOLDEN_VERSION,
-            "{} is not stamped {GOLDEN_VERSION} — build it with `make golden` / `make golden-rust`",
+            "{} is not stamped {GOLDEN_VERSION} — build it with `make golden`",
             bin.display()
         );
     }
     let registry = bin_from("KROWK_REGISTRY_BIN", "bin/devregistry");
     let update = std::env::var_os("GOLDEN_UPDATE").is_some();
-    assert!(!(update && contract), "cases are recorded from the Go oracle, byte for byte — not in contract mode");
     let only = std::env::var("GOLDEN_CASE").unwrap_or_default();
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases");
@@ -125,17 +116,7 @@ fn golden() {
 
     let mut failed = Vec::new();
     let mut ran = 0;
-    // Under contract mode only the cases the port claims — tests/golden/ported,
-    // one name per line — run, unless GOLDEN_CASE names others.
-    let ported: Vec<String> = fs::read_to_string(root.parent().unwrap().join("ported"))
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(String::from)
-        .collect();
-    let claimed = |c: &Path| !contract || !only.is_empty() || ported.iter().any(|p| c.file_name().is_some_and(|n| n == p.as_str()));
-    for case in cases.iter().filter(|c| c.to_string_lossy().contains(&only) && claimed(c)) {
+    for case in cases.iter().filter(|c| c.to_string_lossy().contains(&only)) {
         ran += 1;
         let name = case.file_name().unwrap().to_string_lossy().into_owned();
         let got = run_case(case, ran, &Bins { krowk: &krowk, mcp: &mcp, registry: &registry });
@@ -145,8 +126,8 @@ fn golden() {
             continue;
         }
         let want = fs::read_to_string(&path).unwrap_or_default();
-        let differs = if contract { contract_difference(&want, &got) } else { (want != got).then(|| first_difference(&want, &got)) };
-        if let Some(why) = differs {
+        if want != got {
+            let why = first_difference(&want, &got);
             failed.push(format!("── {name}\n{why}"));
         }
     }
@@ -166,166 +147,6 @@ fn first_difference(want: &str, got: &str) -> String {
     let from = at.saturating_sub(3);
     let show = |lines: &[&str]| lines.iter().skip(from).take(at - from + 6).map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
     format!("first difference at line {}\nwant:\n{}\ngot:\n{}", at + 1, show(&w), show(&g))
-}
-
-/// One recorded step: the line that ran it, and its sections by name
-/// (stdout, stderr, tty, exit, or the body of an @cat / @ls).
-struct Step {
-    head: String,
-    sections: Vec<(String, String)>,
-}
-
-fn steps(transcript: &str) -> Vec<Step> {
-    let mut steps: Vec<Step> = Vec::new();
-    let mut section: Option<(String, String)> = None;
-    let flush = |steps: &mut Vec<Step>, section: &mut Option<(String, String)>| {
-        if let (Some(step), Some(done)) = (steps.last_mut(), section.take()) {
-            step.sections.push(done);
-        }
-    };
-    for line in transcript.lines() {
-        if line.starts_with("$ ") || line.starts_with("@cat ") || line.starts_with("@ls ") {
-            flush(&mut steps, &mut section);
-            steps.push(Step { head: line.to_string(), sections: Vec::new() });
-            if !line.starts_with("$ ") {
-                section = Some(("body".into(), String::new()));
-            }
-        } else if let Some(code) = line.strip_prefix("exit: ") {
-            flush(&mut steps, &mut section);
-            if let Some(step) = steps.last_mut() {
-                step.sections.push(("exit".into(), code.to_string()));
-            }
-        } else if matches!(line, "stdout:" | "stderr:" | "tty:") {
-            flush(&mut steps, &mut section);
-            section = Some((line.trim_end_matches(':').to_string(), String::new()));
-        } else if let Some((_, body)) = section.as_mut() {
-            body.push_str(line);
-            body.push('\n');
-        }
-    }
-    flush(&mut steps, &mut section);
-    steps
-}
-
-/// Where the port's transcript breaks the contract the oracle's recorded, if
-/// anywhere.
-fn contract_difference(want: &str, got: &str) -> Option<String> {
-    let (want, got) = (steps(want), steps(got));
-    if want.len() != got.len() {
-        return Some(format!("{} steps recorded, {} run", want.len(), got.len()));
-    }
-    for (w, g) in want.iter().zip(&got) {
-        if w.head != g.head {
-            return Some(format!("step `{}` ran as `{}`", w.head, g.head));
-        }
-        let data = ["--jq", "--format url", "--format markdown"].iter().any(|d| w.head.contains(d)) || w.head.starts_with("@ls ");
-        let names = |s: &Step| s.sections.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
-        let find = |s: &Step, n: &str| s.sections.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
-        for name in ["exit", "stdout", "stderr", "tty", "body"] {
-            let (a, b) = (find(w, name), find(g, name));
-            let why = match (&a, &b) {
-                (None, None) => continue,
-                (Some(_), None) | (None, Some(_)) if name == "tty" => continue,
-                (Some(_), None) | (None, Some(_)) => Some(format!("{name}: {:?} recorded, {:?} got", names(w), names(g))),
-                (Some(a), Some(b)) if name == "exit" => (a != b).then(|| format!("exit {a} recorded, {b} got")),
-                (Some(a), Some(b)) => section_difference(name, a, b, data),
-            };
-            if let Some(why) = why {
-                return Some(format!("at `{}`: {why}", w.head));
-            }
-        }
-    }
-    None
-}
-
-/// One section of one step, judged by what the oracle recorded: a data step's
-/// stdout exactly; otherwise recorded JSON must come back as JSON with the
-/// same value, and recorded prose only has to be there. The
-/// recorded side decides — a port that answers a JSON step with prose, or
-/// with JSON and a trailing line, has broken the contract.
-fn section_difference(name: &str, want: &str, got: &str, data: bool) -> Option<String> {
-    // A data step's spelling is the contract — a shell reads `5`, not `5.0`.
-    // Where it is JSON the prose inside may still be worded differently, so it
-    // is compared by value with prose masked, plus every number as written.
-    if data && name == "stdout" {
-        return match (json_stream(want).filter(|d| !d.is_empty()), json_stream(got)) {
-            (Some(x), Some(y)) if x == y && numbers(want) == numbers(got) => None,
-            (Some(_), Some(_)) => Some(format!("{name} JSON differs:\n{}", first_difference(want, got))),
-            _ => (want != got).then(|| format!("{name} differs:\n{}", first_difference(want, got))),
-        };
-    }
-    let recorded = json_stream(want).filter(|docs| !docs.is_empty() && name != "tty");
-    match (recorded, json_stream(got)) {
-        (Some(x), Some(y)) if x == y => None,
-        (Some(x), Some(y)) => Some(format!(
-            "{name} JSON differs:\n  want {}\n  got  {}",
-            serde_json::to_string(&x).unwrap(),
-            serde_json::to_string(&y).unwrap()
-        )),
-        (Some(_), None) => Some(format!("{name} was JSON and is not:\n{}", first_difference(want, got))),
-        (None, _) if name == "tty" || !data => None,
-        (None, _) => (want != got).then(|| format!("{name} differs:\n{}", first_difference(want, got))),
-    }
-}
-
-/// Every number literal outside a string, as written: `5` and `5.0` are one
-/// value and two spellings, and a shell reading them sees the difference.
-fn numbers(text: &str) -> Vec<String> {
-    let (mut out, mut current, mut in_string, mut escaped) = (Vec::new(), String::new(), false, false);
-    for c in text.chars() {
-        if in_string {
-            match (escaped, c) {
-                (true, _) => escaped = false,
-                (false, '\\') => escaped = true,
-                (false, '"') => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        if c.is_ascii_digit() || (matches!(c, '-' | '+' | '.' | 'e' | 'E') && !current.is_empty()) || (c == '-' && current.is_empty()) {
-            current.push(c);
-            continue;
-        }
-        if !current.is_empty() {
-            out.push(std::mem::take(&mut current));
-        }
-        in_string = c == '"';
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    out
-}
-
-/// Every JSON document in a section, canonical: prose fields dropped,
-/// numbers compared by value. None when the section is not JSON at all.
-fn json_stream(text: &str) -> Option<Vec<serde_json::Value>> {
-    if text.trim().is_empty() {
-        return Some(Vec::new());
-    }
-    let docs: Result<Vec<serde_json::Value>, _> = serde_json::Deserializer::from_str(text).into_iter().collect();
-    docs.ok().map(|docs| docs.iter().map(canonical).collect())
-}
-
-/// The fields a port may word its own way. Their presence is kept — a
-/// breadcrumb must still carry a description — and only the words dropped.
-const PROSE: &[&str] = &["fix", "message", "detail", "summary", "description", "usage", "instructions"];
-
-fn canonical(v: &serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match v {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(k, v)| {
-                    let v = if PROSE.contains(&k.as_str()) && v.is_string() { Value::String("<prose>".into()) } else { canonical(v) };
-                    (k.clone(), v)
-                })
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
-        Value::Number(n) => n.as_f64().map_or(v.clone(), |f| serde_json::json!(f)),
-        other => other.clone(),
-    }
 }
 
 struct Registry(Child);
@@ -796,40 +617,4 @@ fn normalize(text: &str, scratch: &Path, registry: Option<&str>, bins: &Bins) ->
             .into_owned();
     }
     text
-}
-
-#[cfg(test)]
-mod contract {
-    use super::*;
-
-    fn step(stdout: &str) -> String {
-        format!("$ krowk push a.txt\nstdout:\n{stdout}exit: 0\n\n")
-    }
-
-    #[test]
-    fn recorded_json_must_come_back_as_the_same_json() {
-        let want = step("{\n  \"ok\": true,\n  \"summary\": \"one\"\n}\n");
-        assert!(contract_difference(&want, &step("{\"summary\": \"other words\", \"ok\": true}\n")).is_none());
-        assert!(contract_difference(&want, &step("all good, nothing to see\n")).is_some());
-        assert!(contract_difference(&want, &step("{\"ok\": true}\ntrailing\n")).is_some());
-        assert!(contract_difference(&want, &step("{\"ok\": false, \"summary\": \"one\"}\n")).is_some());
-    }
-
-    #[test]
-    fn data_json_keeps_its_number_spelling_but_not_its_prose() {
-        let data = |out: &str| format!("$ krowk help --jq .\nstdout:\n{out}\nexit: 0\n\n");
-        let want = data(r#"{"n":5,"summary":"one"}"#);
-        assert!(contract_difference(&want, &data(r#"{"summary":"other","n":5}"#)).is_none());
-        assert!(contract_difference(&want, &data(r#"{"n":5.0,"summary":"one"}"#)).is_some());
-        assert_eq!(numbers(r#"[1, "2", -3.5e+2, "a\"4"]"#), ["1", "-3.5e+2"]);
-    }
-
-    #[test]
-    fn recorded_prose_is_held_for_presence_and_data_exactly() {
-        let prose = step("✓ Uploaded a.txt\n");
-        assert!(contract_difference(&prose, &step("Uploaded, in other words\n")).is_none());
-        let data = "$ krowk push a.txt --format url\nstdout:\nhttp://x/a\nexit: 0\n\n";
-        assert!(contract_difference(data, &data.replace("http://x/a", "http://x/b")).is_some());
-        assert!(contract_difference(&prose, &prose.replace("exit: 0", "exit: 1")).is_some());
-    }
 }

@@ -36,16 +36,31 @@ const MAX_BODY: u64 = 1 << 20;
 /// and loopback never proxied. ureq's own reading takes whichever variable is
 /// set first for every scheme, which would route https through an http-only
 /// proxy a CI job configured.
+///
+/// Chosen once, by the registry's scheme, where Go chose per request: an http
+/// registry's https uploads go through HTTP_PROXY. ureq holds one proxy per
+/// agent, and an http registry is a local or private one, where that is rare.
+/// NO_PROXY takes host names and `.suffix`es — a bare name also covers its
+/// subdomains, as in Go — but not the CIDR or host:port entries Go reads.
 fn proxy_for(base_url: &str) -> Option<ureq::Proxy> {
-    let var = |names: &[&str]| names.iter().find_map(|n| std::env::var(n).ok().filter(|v| !v.trim().is_empty()));
+    proxy_from(&|name| std::env::var(name).ok(), base_url)
+}
+
+fn proxy_from(get: &dyn Fn(&str) -> Option<String>, base_url: &str) -> Option<ureq::Proxy> {
+    let var = |names: &[&str]| names.iter().find_map(|n| get(n).filter(|v| !v.trim().is_empty()));
     let raw = if base_url.starts_with("https://") { var(&["HTTPS_PROXY", "https_proxy"]) } else { var(&["HTTP_PROXY", "http_proxy"]) }?;
     let raw = if raw.contains("://") { raw } else { format!("http://{raw}") };
     let parsed = ureq::Proxy::new(&raw).ok()?;
     let no_proxy = var(&["NO_PROXY", "no_proxy"]).unwrap_or_default();
     let mut b = ureq::Proxy::builder(parsed.protocol()).host(parsed.host()).port(parsed.port());
     // One entry per call: ureq drops a comma-separated list whole.
-    for entry in ["localhost", "127.0.0.1", "::1"].into_iter().chain(no_proxy.split(',')).map(str::trim).filter(|e| !e.is_empty()) {
+    // ureq compares against the URI's host, which spells IPv6 bracketed.
+    let entries = ["localhost", "127.0.0.1", "[::1]"].into_iter().chain(no_proxy.split(',')).map(str::trim).filter(|e| !e.is_empty());
+    for entry in entries {
         b = b.no_proxy(entry);
+        if !entry.starts_with(['.', '*', '[']) && entry.parse::<std::net::IpAddr>().is_err() {
+            b = b.no_proxy(&format!(".{entry}"));
+        }
     }
     if let Some(user) = parsed.username() {
         b = b.username(user);
@@ -1072,24 +1087,17 @@ mod boundary {
 
     #[test]
     fn no_proxy_and_loopback_bypass_the_proxy() {
-        // Proxy variables are process-wide, so this is the one test that sets them.
-        let (port, _) = server(vec![respond("200 OK", "", "{}")]);
-        unsafe {
-            std::env::set_var("HTTP_PROXY", "http://127.0.0.1:9");
-            std::env::set_var("NO_PROXY", "registry.example,127.0.0.1");
-        }
-        let proxy = proxy_for("http://registry.example/v1").unwrap();
-        for host in ["registry.example", "127.0.0.1", "localhost"] {
+        let env = |name: &str| match name {
+            "HTTP_PROXY" => Some("http://127.0.0.1:9".to_string()),
+            "NO_PROXY" => Some(" registry.example , .corp,".to_string()),
+            _ => None,
+        };
+        let proxy = proxy_from(&env, "http://registry.example/v1").unwrap();
+        for host in ["registry.example", "api.registry.example", "a.corp", "127.0.0.1", "localhost", "[::1]"] {
             assert!(proxy.is_no_proxy(&format!("http://{host}/x").parse().unwrap()), "{host}");
         }
         assert!(!proxy.is_no_proxy(&"http://elsewhere.example/x".parse().unwrap()));
-        let c = quiet(Client::new(&format!("http://127.0.0.1:{port}/v1"), ""));
-        assert!(c.request_url::<Value>("GET", &format!("http://127.0.0.1:{port}/v1/x"), None, 1, None).is_ok());
-        assert!(proxy_for("https://registry.example/v1").is_none(), "HTTP_PROXY is not an https registry's proxy");
-        unsafe {
-            std::env::remove_var("HTTP_PROXY");
-            std::env::remove_var("NO_PROXY");
-        }
+        assert!(proxy_from(&env, "https://registry.example/v1").is_none(), "HTTP_PROXY is not an https registry's proxy");
     }
 
     #[test]

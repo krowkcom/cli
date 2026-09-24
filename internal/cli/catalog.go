@@ -420,6 +420,15 @@ func catalog() Catalog {
 								Usage: "Delete without asking — required when nobody is at a terminal to confirm"},
 						},
 					},
+					{
+						Name:    "sync",
+						Usage:   "krowk sessions sync [--no-network]",
+						Summary: "Import only what changed since the last import, and refresh prices",
+						Flags: []Flag{
+							{Name: "no-network", Type: typeBool, Default: "false",
+								Usage: "Skip the models.dev price refresh"},
+						},
+					},
 				},
 			},
 			{
@@ -493,7 +502,7 @@ var sections = []section{
 	{"PUSH & PASTE", []string{"push", "uploads create"}},
 	{"RUNS", []string{"runs start", "runs finish", "runs show", "runs list"}},
 	{"UPLOADS", []string{"uploads list", "uploads show", "uploads attach", "uploads delete", "claim"}},
-	{"SESSIONS", []string{"sessions", "sessions show", "sessions import", "sessions rebuild"}},
+	{"SESSIONS", []string{"sessions", "sessions show", "sessions import", "sessions rebuild", "sessions sync"}},
 	{"ACCOUNT & SYSTEM", []string{
 		"auth login", "auth verify", "auth token",
 		"workspaces list", "workspaces use",

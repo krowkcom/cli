@@ -88,6 +88,11 @@ type importSource struct {
 	// this source takes. An empty string decodes to the zero cursor, which
 	// every reader reads as "from the start".
 	decode func(string) (importer.Cursor, error)
+	// unchanged is `sessions sync`'s: whether the ref has moved past the
+	// stored cursor at all, asked before Read so an untouched transcript
+	// costs a stat or one query rather than a parse. nil, as import leaves
+	// it, reads every ref.
+	unchanged func(env harnessenv.Env, ref importer.Ref, cur importer.Cursor) bool
 }
 
 // importSources is every reader krowk has, in the order they run. Claude
@@ -143,6 +148,10 @@ type providerReport struct {
 	// FilesFailed is refs whose Read returned an error and which were
 	// therefore not ingested at all.
 	FilesFailed int `json:"files_failed"`
+	// FilesUnchanged is refs `sessions sync` left unread because their
+	// cursor said nothing had moved. Always 0 on import, which reads every
+	// ref.
+	FilesUnchanged int `json:"files_unchanged"`
 	// Errors is the first maxReportedErrors of those, plus a Discover
 	// failure if there was one.
 	Errors []string `json:"errors,omitempty"`
@@ -166,6 +175,9 @@ type importReport struct {
 	// `[]` when there were none — and absent from a plain import's report,
 	// which is what the pointer tells apart.
 	Removed *[]string `json:"removed,omitempty"`
+	// Pricing is what `sessions sync` did about the price cache, and absent
+	// everywhere else: sync is the one sessions command allowed network.
+	Pricing *syncPricing `json:"pricing,omitempty"`
 }
 
 // sessionsImport reads every transcript the named sources can see and writes
@@ -224,16 +236,10 @@ func sessionsImport(w io.Writer, format output.Format, f flags, env runctx.Env) 
 	// A store path is resolved before anything is created, because an
 	// environment that names no home has no answer here at all — not even
 	// for a dry run, which would otherwise be the one shape of this command
-	// that quietly did not care where the store was. store.Open is asked
-	// for the sentence rather than it being written twice: the hint that
-	// says which variable to set belongs to the package that needs it set.
-	storePath := store.DBPath(store.Env(env))
-	if storePath == "" {
-		_, err := store.Open(store.Env(env))
-		if err == nil {
-			err = store.ErrNoHome
-		}
-		return api.Fail("store_unavailable", sanitizeStoreErr(err, storePath))
+	// that quietly did not care where the store was.
+	storePath, err := resolveStorePath(env)
+	if err != nil {
+		return err
 	}
 
 	var db *sql.DB
@@ -242,16 +248,10 @@ func sessionsImport(w io.Writer, format output.Format, f flags, env runctx.Env) 
 		// itself a write — the file is created, the schema is stamped,
 		// pragmas are set — so an open racing another import is exactly
 		// the SQLite-level collision this lock exists to keep away from
-		// the caller. Creating the directory first is what store.Open
-		// would have done anyway, with the same mode, so the lock file
-		// has somewhere to live.
-		if err := os.MkdirAll(filepath.Dir(storePath), 0o700); err != nil {
-			return api.Fail("store_unavailable", err.Error())
-		}
-		lockPath := importLockPath(storePath)
-		release, err := lockImport(lockPath)
+		// the caller.
+		release, err := lockStore(storePath)
 		if err != nil {
-			return importLockFailure(lockPath, err)
+			return err
 		}
 		defer release.Close()
 
@@ -261,17 +261,18 @@ func sessionsImport(w io.Writer, format output.Format, f flags, env runctx.Env) 
 		}
 		defer db.Close()
 	}
-	return importInto(w, format, f, env, db, storePath, sources, nil)
+	return importInto(w, format, f, env, db, storePath, sources, importReport{})
 }
 
 // importInto is the import itself, from an open store (nil on a dry run) to
 // the report and the exit it decides. Split out of sessionsImport so
-// `sessions rebuild` runs exactly this path over the fresh file rather than a
-// copy of it; removed is what rebuild deleted first, and nil for an import.
-func importInto(w io.Writer, format output.Format, f flags, env runctx.Env, db *sql.DB, storePath string, sources []importSource, removed *[]string) error {
+// `sessions rebuild` and `sessions sync` run exactly this path rather than a
+// copy of it; report carries what they did first — rebuild's removed, sync's
+// pricing — and is empty for an import.
+func importInto(w io.Writer, format output.Format, f flags, env runctx.Env, db *sql.DB, storePath string, sources []importSource, report importReport) error {
 	ctx := context.Background()
 	started := time.Now()
-	report := importReport{DryRun: f.dryRun, Store: storePath, Removed: removed}
+	report.DryRun, report.Store = f.dryRun, storePath
 	var broken []string
 	for _, s := range sources {
 		row := runImportSource(ctx, db, storePath, s, harnessenv.Env(env), f)
@@ -293,6 +294,38 @@ func importInto(w io.Writer, format output.Format, f flags, env runctx.Env, db *
 			" — the reasons are in `errors` in the report above")
 	}
 	return nil
+}
+
+// resolveStorePath is where krowk.db lives, or the failure for an environment
+// that names no home. store.Open is asked for the sentence rather than it
+// being written twice: the hint that says which variable to set belongs to
+// the package that needs it set.
+func resolveStorePath(env runctx.Env) (string, error) {
+	storePath := store.DBPath(store.Env(env))
+	if storePath != "" {
+		return storePath, nil
+	}
+	_, err := store.Open(store.Env(env))
+	if err == nil {
+		err = store.ErrNoHome
+	}
+	return "", api.Fail("store_unavailable", sanitizeStoreErr(err, storePath))
+}
+
+// lockStore takes import.lock beside storePath, creating the directory first
+// — what store.Open would have done anyway, with the same mode — so the lock
+// file has somewhere to live. Import, rebuild and sync all go through it, so
+// all three refuse one another the same way.
+func lockStore(storePath string) (io.Closer, error) {
+	if err := os.MkdirAll(filepath.Dir(storePath), 0o700); err != nil {
+		return nil, api.Fail("store_unavailable", err.Error())
+	}
+	lockPath := importLockPath(storePath)
+	release, err := lockImport(lockPath)
+	if err != nil {
+		return nil, importLockFailure(lockPath, err)
+	}
+	return release, nil
 }
 
 // importLockFailure turns a refused lock into the failure a person reads.
@@ -370,6 +403,13 @@ func runImportSource(ctx context.Context, db *sql.DB, storePath string, s import
 		cur, err := s.decode(stored)
 		if err != nil {
 			out.fail(ref, err)
+			continue
+		}
+		// A skipped ref is never re-read, so sync does not backfill what a
+		// reader upgrade would now extract from an unchanged file; import
+		// and rebuild, which read every ref, do.
+		if stored != "" && s.unchanged != nil && s.unchanged(env, ref, cur) {
+			out.FilesUnchanged++
 			continue
 		}
 		th, next, res, err := s.src.Read(env, ref, cur)
@@ -556,6 +596,10 @@ func emitImportReport(w io.Writer, format output.Format, f flags, report importR
 			fmt.Fprintf(w, "removed   %s\n", path)
 		}
 	}
+	if report.Pricing != nil {
+		// The warning, if any, went to stderr before the import ran.
+		fmt.Fprintf(w, "pricing   %s\n", report.Pricing.Status)
+	}
 	for _, p := range report.Providers {
 		fmt.Fprintln(w, humanProviderLine(p, report.DryRun))
 		for _, e := range p.Errors {
@@ -579,6 +623,9 @@ func humanProviderLine(p providerReport, dryRun bool) string {
 		"%d messages new  %dms",
 		p.Provider, p.Files, p.SessionsSeen, p.MessagesSeen, p.PartsSeen,
 		p.MessagesInserted, p.DurationMS)
+	if p.FilesUnchanged > 0 {
+		line += fmt.Sprintf("  (%d unchanged)", p.FilesUnchanged)
+	}
 	if p.FilesFailed > 0 {
 		line += fmt.Sprintf("  (%d failed)", p.FilesFailed)
 	}

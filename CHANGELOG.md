@@ -11,6 +11,26 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- `krowk sessions sync`, the incremental import meant to run on a schedule.
+  It takes the same `import.lock` as import and walks every source, but
+  leaves a ref unread when its stored cursor says nothing moved: a Claude or
+  Cursor transcript the same size as when its byte-offset cursor was taken,
+  or an opencode session with no message or part `time_updated` past its
+  watermark. A file that grew is read, and one that shrank is re-read from 0:
+  for Claude the store's foreign-id dedup keeps that from inserting
+  duplicates, while Cursor messages carry no foreign id, so a shrunk Cursor
+  transcript re-imports its messages, as import already does. A transcript
+  with no `import_state` row yet is new and always read. A file sync skips is
+  never re-read, so what a newer reader would extract from it lands only on
+  `import` or `rebuild`. There is
+  no `--since`: the cursor is the only watermark. It is also the one sessions
+  command that uses the network: it refreshes the models.dev price cache when
+  the last answer is over 24 hours old, within 3 seconds, and a failure is a
+  warning in `pricing` rather than a failed sync. `--no-network` skips it.
+  The report is import's per-provider envelope plus `files_unchanged` per
+  provider and `pricing.status` (`no_network`, `fresh`, `refreshed`,
+  `unchanged` or `failed`, with a `warning`). Claude and opencode still
+  re-read a changed transcript whole, because turns are cumulative.
 - `krowk sessions rebuild`, the recovery the schema gate's hint has been
   naming: it takes the import lock, deletes `krowk.db`, `krowk.db-wal` and
   `krowk.db-shm` — nothing else in the directory — and re-imports every

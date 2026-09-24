@@ -166,3 +166,26 @@ func openReadOnly(dbPath string) (*sql.DB, error) {
 	db.SetMaxOpenConns(1)
 	return db, nil
 }
+
+// ChangedSince reports whether any message or part row of ref's session was
+// updated after since, the SQLiteCursor.TimeUpdated a previous Read handed
+// back. It is `krowk sessions sync`'s way of leaving an unchanged session
+// unread: two EXISTS probes are far cheaper than the whole-session Read,
+// which stays whole because turns are cumulative. The session row itself is
+// not consulted — its time_updated moves with things the watermark does not
+// cover, so counting it would re-read every session every time.
+func ChangedSince(env harness.Env, ref importer.Ref, since int64) (bool, error) {
+	dbPath, err := importer.HomePath(env, dbRel)
+	if err != nil {
+		return false, err
+	}
+	db, err := openReadOnly(dbPath)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = db.Close() }()
+	var changed bool
+	err = db.QueryRow(`SELECT EXISTS (SELECT 1 FROM message WHERE session_id = ?1 AND time_updated > ?2)
+	  OR EXISTS (SELECT 1 FROM part WHERE session_id = ?1 AND time_updated > ?2)`, ref.ID, since).Scan(&changed)
+	return changed, err
+}

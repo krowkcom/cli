@@ -168,10 +168,14 @@ fn fetch(url: &str, limit: u64) -> Result<Vec<u8>, Error> {
 }
 
 fn write_binary(r: &mut impl Read, dest: &Path) -> std::io::Result<()> {
-    let tmp = dest.with_file_name(format!(".{}.new-{}", dest.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
+    let dir = dest.parent().unwrap_or(Path::new("."));
+    let prefix = format!(".{}.new-", dest.file_name().unwrap_or_default().to_string_lossy());
+    // A fresh, exclusively created name: the directory a binary lives in
+    // may be shared, and a predictable name there is one a symlink can wait at.
+    let (mut f, tmp) = krowk_api::tempfile::create_file(dir, &prefix, "", 0o755)?;
     let result = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
         std::io::copy(r, &mut f)?;
+        drop(f);
         #[cfg(unix)]
         std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
         std::fs::rename(&tmp, dest)

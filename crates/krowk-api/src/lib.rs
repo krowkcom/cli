@@ -7,7 +7,7 @@ pub mod creds;
 pub mod error;
 pub mod slug;
 pub mod spec;
-mod tempfile;
+pub mod tempfile;
 pub mod types;
 
 pub use client::Client;

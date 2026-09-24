@@ -170,8 +170,18 @@ impl Server<'_> {
     /// One JSON-RPC message per line, answered in order; notifications (no id)
     /// are dispatched and not answered.
     pub fn serve(&self, input: impl BufRead, out: &mut impl Write) -> std::io::Result<()> {
-        for line in input.split(b'\n') {
-            let line = line?;
+        let mut input = input;
+        loop {
+            // Bounded before it is buffered: a peer that never sends a
+            // newline costs MAX_LINE bytes, not whatever it sends.
+            let mut line = Vec::new();
+            let n = std::io::Read::take(&mut input, MAX_LINE as u64 + 1).read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
             if line.len() > MAX_LINE {
                 return Err(std::io::Error::other(format!("mcp: message longer than {MAX_LINE} bytes")));
             }
@@ -211,7 +221,8 @@ impl Server<'_> {
         match req.method.as_str() {
             "initialize" => {
                 let requested = req.params.as_ref().and_then(|p| p.get("protocolVersion")).and_then(Value::as_str).unwrap_or_default();
-                if req.params.as_ref().is_some_and(|p| !p.is_object() && !p.is_null()) {
+                let bad_version = req.params.as_ref().and_then(|p| p.get("protocolVersion")).is_some_and(|v| !v.is_string() && !v.is_null());
+                if bad_version || req.params.as_ref().is_some_and(|p| !p.is_object() && !p.is_null()) {
                     return Err(rpc_error(-32602, "initialize params are not an object"));
                 }
                 let version = PROTOCOLS.iter().find(|v| **v == requested).unwrap_or(&PROTOCOLS[0]);
@@ -298,7 +309,7 @@ fn arguments<T: for<'de> Deserialize<'de> + Default>(args: &Value, shape: &str) 
 }
 
 #[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 struct PushArgs {
     files: Vec<String>,
     run: String,
@@ -315,7 +326,7 @@ struct PushArgs {
 }
 
 #[derive(Deserialize, Default, Clone)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 struct LinkArg {
     url: String,
     title: String,
@@ -712,5 +723,24 @@ mod tests {
             assert!(secret_component(Path::new(p)).is_some(), "{p}");
         }
         assert!(secret_component(Path::new("src/env.rs")).is_none());
+    }
+
+    fn serve(input: &[u8]) -> (std::io::Result<()>, String) {
+        let env = |_: &str| String::new();
+        let server = Server { client: Client::new("http://127.0.0.1:9", ""), env: &env, version: "t".into(), root: String::new(), workspace_err: None };
+        let mut out = Vec::new();
+        let res = server.serve(input, &mut out);
+        (res, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn an_unterminated_message_is_refused_at_the_cap_and_a_numeric_version_is_invalid() {
+        let (res, _) = serve(&vec![b'x'; MAX_LINE + 10]);
+        assert!(res.is_err());
+        let (res, out) = serve(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":5}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}");
+        assert!(res.is_ok());
+        let lines: Vec<Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines[0]["error"]["code"], -32602);
+        assert_eq!(lines[1]["result"], json!({}), "a last line without its newline is still answered");
     }
 }

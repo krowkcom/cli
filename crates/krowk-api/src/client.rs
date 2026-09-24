@@ -325,7 +325,7 @@ impl Client {
                 req = req.header("Idempotency-Key", key);
             }
             let req = req.body(payload.map(<[u8]>::to_vec).unwrap_or_default()).map_err(|e| fail("bad_request", e.to_string()))?;
-            let mut res = self.agent.run(req).map_err(|e| self.transport(&url, e, "network_unreachable"))?;
+            let mut res = self.agent.run(req).map_err(|e| self.transport(method, &url, e, "network_unreachable"))?;
             let status = res.status().as_u16();
             let mut bytes = Vec::new();
             let _ = res.body_mut().as_reader().take(MAX_BODY).read_to_end(&mut bytes);
@@ -409,7 +409,7 @@ impl Client {
         parse(&self.base_url).is_some_and(|base| on_origin(&base, u))
     }
 
-    fn transport(&self, url: &str, e: ureq::Error, code: &str) -> Error {
+    fn transport(&self, method: &str, url: &str, e: ureq::Error, code: &str) -> Error {
         if let ureq::Error::Other(inner) = &e
             && let Some(refused) = inner.downcast_ref::<Error>()
         {
@@ -417,7 +417,10 @@ impl Client {
         }
         let mut body = BTreeMap::new();
         body.insert("error".into(), json!(code));
-        body.insert("detail".into(), json!(e.to_string()));
+        // Spelled as Go's net/http spells it — `Get "url": cause` — so the
+        // detail reads the same whichever build wrote it.
+        let op = method.chars().next().map(|c| c.to_ascii_uppercase().to_string() + &method[1..].to_ascii_lowercase()).unwrap_or_default();
+        body.insert("detail".into(), json!(format!("{op} {url:?}: {e}")));
         if code == "network_unreachable" {
             body.insert("endpoint".into(), json!(url));
             body.insert(
@@ -510,7 +513,7 @@ impl Client {
         req = req.header("Content-Length", spec.byte_size.to_string());
         let body = ureq::SendBody::from_reader(&mut file);
         let req = req.body(body).map_err(|e| fail("bad_upload_url", e.to_string()))?;
-        let mut res = self.agent.run(req).map_err(|e| self.transport(endpoint, e, "storage_unreachable"))?;
+        let mut res = self.agent.run(req).map_err(|e| self.transport("PUT", endpoint, e, "storage_unreachable"))?;
         let status = res.status().as_u16();
         if (300..400).contains(&status) {
             let location = header(&res, "location");

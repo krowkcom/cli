@@ -2,10 +2,10 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/krowkcom/cli/internal/api"
@@ -48,27 +48,19 @@ type syncPricing struct {
 // after its watermark, is not read at all — and the network. A ref with no
 // import_state row yet is new and is always read, so a new transcript lands
 // on the next sync. There is no --since: the cursor is the only watermark.
-func sessionsSync(w io.Writer, format output.Format, f flags, env runctx.Env) error {
+func sessionsSync(w, stderr io.Writer, format output.Format, f flags, env runctx.Env) error {
 	if err := checkImportOS(); err != nil {
 		return api.Fail("unsupported_os", unsupportedOSMessage)
 	}
-	storePath := store.DBPath(store.Env(env))
-	if storePath == "" {
-		_, err := store.Open(store.Env(env))
-		if err == nil {
-			err = store.ErrNoHome
-		}
-		return api.Fail("store_unavailable", sanitizeStoreErr(err, storePath))
+	storePath, err := resolveStorePath(env)
+	if err != nil {
+		return err
 	}
 	// The same lock and the same order as import: taken before store.Open,
 	// because opening is itself a write.
-	if err := os.MkdirAll(filepath.Dir(storePath), 0o700); err != nil {
-		return api.Fail("store_unavailable", err.Error())
-	}
-	lockPath := importLockPath(storePath)
-	release, err := lockImport(lockPath)
+	release, err := lockStore(storePath)
 	if err != nil {
-		return importLockFailure(lockPath, err)
+		return err
 	}
 	defer release.Close()
 
@@ -82,6 +74,11 @@ func sessionsSync(w io.Writer, format output.Format, f flags, env runctx.Env) er
 	// answer. It is bounded at three seconds, which is the most it can hold
 	// an import off for; move it outside if that ever matters.
 	p := syncPrices(pricing.Env(env), f.noNetwork)
+	// On stderr for a person, like upload's unfurl warning: stdout is the
+	// report. A program reads it from pricing.warning in the envelope.
+	if p.Warning != "" && format == output.Human {
+		fmt.Fprintln(stderr, "! "+p.Warning)
+	}
 	return importInto(w, format, f, env, db, storePath, syncSources(), importReport{Pricing: &p})
 }
 
@@ -160,6 +157,6 @@ func syncPrices(env pricing.Env, noNetwork bool) syncPricing {
 	if info, err := os.Stat(meta); err == nil && info.ModTime().After(before) {
 		return syncPricing{Status: "unchanged"}
 	}
-	return syncPricing{Status: "failed", Warning: "models.dev did not answer with prices within " +
-		syncPricingTimeout.String() + " — the cache or the snapshot still prices everything"}
+	return syncPricing{Status: "failed", Warning: "prices were not refreshed: models.dev could not be reached " +
+		"or did not answer with a price file — the cache or the snapshot still prices everything"}
 }

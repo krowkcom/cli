@@ -140,6 +140,10 @@ func TestSyncAfterAppendingTwoLinesInsertsExactlyTwoMessages(t *testing.T) {
 	}
 }
 
+// What this proves for Claude is that a shrunk file is read rather than
+// skipped, its cursor is retaken over the new size, and the re-read inserts
+// no duplicate foreign id. It cannot tell a read from 0 from a resumed one:
+// the Claude reader always starts at 0 whatever cursor it is handed.
 func TestSyncAfterTruncatingToHalfRereadsFromZeroWithoutDuplicates(t *testing.T) {
 	withSyncTransport(t, noNetwork{t})
 	h, home, env := syncHarness(t)

@@ -560,7 +560,7 @@ func Run(args []string, stdout, stderr io.Writer, env func(string) string, isTTY
 	case len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "rebuild":
 		err = sessionsRebuild(stdout, format, f, env, isTTY)
 	case len(positionals) > 1 && positionals[0] == "sessions" && positionals[1] == "sync":
-		err = sessionsSync(stdout, format, f, env)
+		err = sessionsSync(stdout, stderr, format, f, env)
 	case len(positionals) > 1 && positionals[0] == "pricing" && positionals[1] == "refresh":
 		err = pricingRefresh(stdout, format, f, env)
 	case positionals[0] == "upgrade":

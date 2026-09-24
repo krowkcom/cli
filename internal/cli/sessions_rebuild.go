@@ -6,7 +6,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
 
 	"github.com/charmbracelet/huh"
 	"github.com/mattn/go-isatty"
@@ -34,13 +33,9 @@ func sessionsRebuild(w io.Writer, format output.Format, f flags, env runctx.Env,
 	if err := checkImportOS(); err != nil {
 		return api.Fail("unsupported_os", unsupportedOSMessage)
 	}
-	storePath := store.DBPath(store.Env(env))
-	if storePath == "" {
-		_, err := store.Open(store.Env(env))
-		if err == nil {
-			err = store.ErrNoHome
-		}
-		return api.Fail("store_unavailable", sanitizeStoreErr(err, storePath))
+	storePath, err := resolveStorePath(env)
+	if err != nil {
+		return err
 	}
 	prompt := !f.yes && stdinIsTerminal() && interactive(f, format, env, isTTY)
 	if !f.yes && !prompt {
@@ -64,13 +59,9 @@ func sessionsRebuild(w io.Writer, format output.Format, f flags, env runctx.Env,
 	// The same lock import takes, for the same reason: an import writing
 	// into the file while it is deleted would lose its rows, or land them in
 	// a file that is about to be unlinked.
-	if err := os.MkdirAll(filepath.Dir(storePath), 0o700); err != nil {
-		return api.Fail("store_unavailable", err.Error())
-	}
-	lockPath := importLockPath(storePath)
-	release, err := lockImport(lockPath)
+	release, err := lockStore(storePath)
 	if err != nil {
-		return importLockFailure(lockPath, err)
+		return err
 	}
 	defer release.Close()
 

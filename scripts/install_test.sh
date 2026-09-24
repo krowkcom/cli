@@ -264,7 +264,8 @@ pass "serving $ARCHIVE + checksums.txt, from $SOURCE"
 python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$RELEASE" >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 BASE=""
-for _ in $(seq 1 50); do
+# Up to 30 s: a cold python3 on a busy macOS runner has taken longer than 5.
+for _ in $(seq 1 300); do
   port=$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$WORK/server.log" | head -1)
   if [[ -n "$port" ]]; then
     BASE="http://127.0.0.1:${port}"
@@ -272,7 +273,7 @@ for _ in $(seq 1 50); do
   fi
   sleep 0.1
 done
-[[ -n "$BASE" ]] || fail "the local release server never came up"
+[[ -n "$BASE" ]] || { cat "$WORK/server.log" >&2; fail "the local release server never came up"; }
 pass "serving the release at $BASE"
 
 echo

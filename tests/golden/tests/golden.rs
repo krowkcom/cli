@@ -30,7 +30,7 @@
 //!     @ls path                  print a directory tree into the transcript
 //!     @sh command               run /bin/sh -c in work/ for setup; not recorded ({case} expands too)
 //!     krowk args...             run the binary; shell-style quoting
-//!     krowk-mcp args...         run $KROWK_MCP_BIN, default bin/krowk-mcp
+//!     krowk-mcp args...         run $KROWK_MCP_BIN, default bin/golden/krowk-mcp
 //!     @let NAME .path[0].to     capture a value from the previous command's stdout (JSON,
 //!                               before masking); {NAME} expands in every later line
 //!     @tty krowk args...        run with stdout and stderr on one pseudo-terminal, to see
@@ -43,7 +43,8 @@
 //!
 //! Every command runs with an empty environment apart from PATH, HOME, TMPDIR,
 //! TZ=UTC, KROWK_NO_UPDATE_CHECK and KROWK_TEST_NOW_MS (the store's clock,
-//! starting at 2026-01-01 and advancing a millisecond per read), with KROWK_API_URL on a port nothing listens on
+//! from 2026-01-01, a minute later for each command and a millisecond later
+//! for each read within one), with KROWK_API_URL on a port nothing listens on
 //! and every proxy variable pointing there too, so nothing on the machine — a
 //! key, a krowk.db, a harness transcript — leaks in, and no case reaches the
 //! network (models.dev, GitHub) by accident.
@@ -90,13 +91,15 @@ fn golden() {
     let mcp = bin_from("KROWK_MCP_BIN", "bin/golden/krowk-mcp");
     // The version is compared like any other output, so a binary stamped with
     // anything else fails most cases with diffs that never mention why.
-    let stamp = Command::new(&krowk).arg("--version").env_clear().output().unwrap().stdout;
-    assert_eq!(
-        String::from_utf8_lossy(&stamp).trim(),
-        GOLDEN_VERSION,
-        "{} is not stamped {GOLDEN_VERSION} — build it with `make golden` / `make golden-rust`",
-        krowk.display()
-    );
+    for bin in [&krowk, &mcp] {
+        let stamp = Command::new(bin).arg("--version").env_clear().output().unwrap().stdout;
+        assert_eq!(
+            String::from_utf8_lossy(&stamp).trim(),
+            GOLDEN_VERSION,
+            "{} is not stamped {GOLDEN_VERSION} — build it with `make golden` / `make golden-rust`",
+            bin.display()
+        );
+    }
     let registry = bin_from("KROWK_REGISTRY_BIN", "bin/devregistry");
     let update = std::env::var_os("GOLDEN_UPDATE").is_some();
     let only = std::env::var("GOLDEN_CASE").unwrap_or_default();
@@ -206,8 +209,7 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
         ("HTTPS_PROXY".into(), "http://127.0.0.1:9".into()),
         ("HTTP_PROXY".into(), "http://127.0.0.1:9".into()),
         ("NO_PROXY".into(), "127.0.0.1,localhost".into()),
-        // The store's clock, frozen so every time column — and every listing
-        // ordered by one — is the same on each run and in both builds.
+        // The store's clock: see `step_clock`.
         ("KROWK_TEST_NOW_MS".into(), STORE_EPOCH_MS.to_string()),
         // "expires tomorrow" counts midnights in the local zone.
         ("TZ".into(), "UTC".into()),
@@ -216,6 +218,7 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
     let mut stdin: Option<Vec<u8>> = None;
     let mut out = String::new();
     let mut vars: Vec<(String, String)> = Vec::new();
+    let mut commands = 0;
     let mut last_stdout = String::new();
 
     let script = fs::read_to_string(case.join("cmd")).unwrap();
@@ -295,6 +298,7 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
                 let (word, rest) = rest.split_once(' ').unwrap_or((rest, ""));
                 assert_eq!(word, "krowk", "{}: @tty runs krowk only", case.display());
                 let args: Vec<String> = shlex::split(rest).expect("unbalanced quotes").iter().map(|a| expand(a)).collect();
+                step_clock(&mut env, &mut commands);
                 let (screen, code) = run_on_tty(bins.krowk, &args, &work, &env, case, line);
                 // What a terminal shows is not JSON to capture; a @let after
                 // this line must fail rather than read the command before it.
@@ -302,6 +306,7 @@ fn run_case(case: &Path, n: usize, bins: &Bins) -> String {
                 out.push_str(&format!("$ {line}\ntty:\n{}exit: {code}\n\n", ensure_newline(&visible(&screen))));
             }
             "krowk" | "krowk-mcp" => {
+                step_clock(&mut env, &mut commands);
                 let args: Vec<String> = shlex::split(rest).expect("unbalanced quotes").iter().map(|a| expand(a)).collect();
                 let mut child = Command::new(if word == "krowk" { bins.krowk } else { bins.mcp })
                     .args(&args)
@@ -421,6 +426,16 @@ fn json_path(value: &serde_json::Value, path: &str) -> Option<String> {
         }
     }
     Some(at.as_str().map_or_else(|| at.to_string(), str::to_string))
+}
+
+/// Starts each command's store clock a minute after the last one's. The clock
+/// moves a millisecond per read within a process, but every process starts it
+/// afresh — without a step, a sync run after an import would stamp rows
+/// earlier than the import did, which is the one thing a real clock never
+/// does. A minute is more reads than any command makes.
+fn step_clock(env: &mut Vec<(String, String)>, commands: &mut i64) {
+    set(env, "KROWK_TEST_NOW_MS", &(STORE_EPOCH_MS + *commands * 60_000).to_string());
+    *commands += 1;
 }
 
 fn set(env: &mut Vec<(String, String)>, key: &str, value: &str) {

@@ -269,14 +269,14 @@ exit: 0
 $ krowk sessions --format human
 stdout:
 Title                                                         Source                               Turns        Cost  Updated
-Parent session                                                opencode · gpt-5.5                 2 turns           —  <ago>  #019b76da
-Child session                                                 opencode · gpt-5.5                 1 turn           —  <ago>  #019b76da
-<timestamp>Thursday, Sep 10, 2026, 7:41 AM (UTC+3)</times...  cursor                             2 turns           —  <ago>  #019b76da
-<timestamp>Friday, Sep 11, 2026, 9:00 AM (UTC+3)</timesta...  cursor                             1 turn           —  <ago>  #019b76da
-redacted prompt outside a checkout                            claude · claude-opus-5-20260401    1 turn           —  <ago>  #019b76da
-redacted subagent task                                        claude · claude-opus-5-20260401    1 turn           —  <ago>  #019b76da
-Redacted session title                                        claude · claude-opus-5-20260401    4 turns           —  <ago>  #019b76da
-Redacted unused session                                       claude                             0 turns           —  <ago>  #019b76da
+Parent session                                                opencode · gpt-5.5                 2 turns           —  <ago>  #019b76dc
+Child session                                                 opencode · gpt-5.5                 1 turn           —  <ago>  #019b76dc
+<timestamp>Thursday, Sep 10, 2026, 7:41 AM (UTC+3)</times...  cursor                             2 turns           —  <ago>  #019b76dc
+<timestamp>Friday, Sep 11, 2026, 9:00 AM (UTC+3)</timesta...  cursor                             1 turn           —  <ago>  #019b76dc
+redacted prompt outside a checkout                            claude · claude-opus-5-20260401    1 turn           —  <ago>  #019b76dc
+redacted subagent task                                        claude · claude-opus-5-20260401    1 turn           —  <ago>  #019b76dc
+Redacted session title                                        claude · claude-opus-5-20260401    4 turns           —  <ago>  #019b76dc
+Redacted unused session                                       claude                             0 turns           —  <ago>  #019b76dc
 exit: 0
 
 $ krowk sessions --all

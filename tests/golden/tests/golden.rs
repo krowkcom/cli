@@ -503,7 +503,9 @@ static PLAIN: LazyLock<Vec<(Regex, &str)>> = LazyLock::new(|| {
         // the error code beside it is the behavior, the detail is not.
         (r#"(Get|Post|Put|Patch|Delete|Head) \\?"http[^"\\]*\\?": [^"\n]*"#, "<transport error>"),
         // How many spinner frames draw is how long the command took.
-        (r"(\\r\\e\[K)?([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] [^\\\n]*(\\r\\e\[K)?)+", "<spinner>"),
+        // A frame is erase-line, dim, glyph, message, reset; a run of them —
+        // with the erase that clears the last — is one token.
+        (r"(?:(?:\\r\\e\[K)?(?:\\e\[2m)?[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] [^\\\n]*(?:\\e\[0m)?)+(?:\\r\\e\[K)?", "<spinner>"),
     ]
     .into_iter()
     .map(|(re, to)| (Regex::new(re).unwrap(), to))

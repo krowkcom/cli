@@ -1,6 +1,6 @@
 $ @tty krowk push a.txt --title "a run"
 tty:
-\r\e[K\e[2m<spinner>\e[0m\r\e[K\e[2m<spinner>\e[0m\r\e[K\e[32m✓\e[0m Uploaded a.txt → http://<registry>/a/<art_1>
+<spinner>\e[32m✓\e[0m Uploaded a.txt → http://<registry>/a/<art_1>
 \e[2m  5 B · run <run_1> · a run\e[0m
 
 \e[2m  paste this:\e[0m

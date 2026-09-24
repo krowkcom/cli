@@ -1,6 +1,6 @@
 $ @tty krowk push a.txt
 tty:
-\r\e[K\e[2m<spinner>\e[0m\r\e[K\e[32m✓\e[0m Uploaded a.txt → http://<registry>/a/<art_1>
+<spinner>\e[32m✓\e[0m Uploaded a.txt → http://<registry>/a/<art_1>
 \e[2m  5 B · expires tomorrow\e[0m
 \e[2m  keep it:\e[0m  krowk claim <art_1> <claim_1>
 
@@ -10,7 +10,7 @@ exit: 0
 
 $ @tty krowk push a.txt shot.png
 tty:
-\r\e[K\e[2m<spinner>\e[0m\r\e[K\e[32m✓\e[0m Uploaded 2 files
+<spinner>\e[32m✓\e[0m Uploaded 2 files
   a.txt     http://<registry>/a/<art_2>
   shot.png  http://<registry>/a/<art_3>
 \e[2m  18 B · expires tomorrow\e[0m

@@ -1,0 +1,106 @@
+name: Dist
+
+# Every release binary, one runner per target, in parallel, then one job that
+# gathers them into the release layout. Called by release.yml (full profile,
+# the bytes that ship) and packaging.yml (fast profile, the same layout
+# minutes sooner). scripts/dist.sh does the work, so `make dist` builds the
+# same thing locally.
+#
+# In parallel because a build is the slow part: a size-tuned LTO build of
+# krowk takes ~3 minutes, mostly on one core, and five of them in a row on one
+# runner took ~17.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The version stamped into the binaries and the archive names, without a v.
+        type: string
+        required: true
+      fast:
+        description: Build without LTO (packaging tests); never for a release.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: targets
+        run: echo "matrix=$(scripts/dist.sh matrix)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: targets
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    name: build (${{ matrix.target }})
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.97 --profile minimal --target ${{ matrix.target }}
+          rustup default 1.97
+
+      # zig is the C toolchain for the bundled SQLite and ring on every target
+      # but Apple's, which builds with the macOS SDK the runner carries.
+      - name: Set up zig
+        if: ${{ !contains(matrix.target, 'apple') }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        if: ${{ !contains(matrix.target, 'apple') }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.4
+
+      # Only for the fast profile: a release builds from nothing, so the bytes
+      # that ship never depend on what an earlier run left behind.
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ inputs.fast }}
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          KROWK_FAST_BUILD: ${{ inputs.fast && '1' || '' }}
+        run: scripts/dist.sh build ${{ matrix.target }} ${{ inputs.version }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          retention-days: 3
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums and manifests
+        run: scripts/dist.sh assemble ${{ inputs.version }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7

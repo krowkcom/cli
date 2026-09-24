@@ -10,8 +10,8 @@
 # the latest tag, which needs a tag to resolve.
 #
 # Where the release comes from depends on what is already here. In CI the
-# packaging workflow has just run `goreleaser release --snapshot`, so dist/
-# holds GoReleaser's own archives and its own checksums.txt: those are served
+# packaging workflow has just run `scripts/dist.sh`, so dist/
+# holds the build's own archives and its own checksums.txt: those are served
 # as they are, which is the point — the archiving and the checksums are then
 # what gets tested, rather than a tarball this script rolled by hand. Only when
 # there is no such archive does it build one, and then without --clean, because
@@ -19,7 +19,7 @@
 #
 #   scripts/install_test.sh
 #
-# Needs bash, python3 and either goreleaser or cargo. Run from
+# Needs bash, python3 and cargo. Run from
 # anywhere; it finds the repository from its own path.
 
 set -euo pipefail
@@ -65,48 +65,26 @@ else
   echo "  – shellcheck not installed, skipped"
 fi
 
-# The archive name and checksum file are read straight out of .goreleaser.yaml's
-# templates rather than reproduced from memory: this is the one place the
-# installer and the release pipeline have to agree, so a change to either that
-# the other does not follow should break here.
+# The archive name and the platform table are read straight out of
+# scripts/dist.sh, which writes the release, rather than reproduced from
+# memory: this is the one place the installer and the release have to agree,
+# so a change to either that the other does not follow should break here. The
+# name is the one install.sh builds (krowk_<version>_<goos>_<goarch>.<ext>).
 echo
-echo "Holding the installer to .goreleaser.yaml"
-name_template=$(sed -n 's/^ *name_template: *"\(.*\)"$/\1/p' .goreleaser.yaml | head -1)
-[[ "$name_template" == '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}' ]] \
-  || fail ".goreleaser.yaml's archive name_template is now '$name_template', which scripts/install.sh does not build"
-grep -q 'name_template: checksums.txt' .goreleaser.yaml \
-  || fail ".goreleaser.yaml no longer writes checksums.txt, which scripts/install.sh downloads"
+echo "Holding the installer to scripts/dist.sh"
+[[ "$(scripts/dist.sh archive-name linux amd64 1.2.3)" == "krowk_1.2.3_linux_amd64.tar.gz" \
+   && "$(scripts/dist.sh archive-name windows amd64 1.2.3)" == "krowk_1.2.3_windows_amd64.zip" ]] \
+  || fail "scripts/dist.sh names its archives in a way scripts/install.sh does not build"
+grep -q 'checksums.txt' scripts/dist.sh \
+  || fail "scripts/dist.sh no longer writes checksums.txt, which scripts/install.sh downloads"
 pass "the archive and checksum names still match what the installer builds"
 
-# The other half of that agreement is the platform table. install.sh writes it
-# out as case arms and .goreleaser.yaml as Rust target triples, and a table
-# kept in two places drifts: a platform added to the release that the installer
-# will not name 404s, and a platform the installer names that the release never
-# built 404s the same way, with the same wrong-looking error. So the triples
-# are read out of the config, spelled the way the archives are named, and
-# diffed against the arms.
-goos_goarch_of() {
-  local arch os
-  case "$1" in
-    x86_64-*) arch=amd64 ;;
-    aarch64-*) arch=arm64 ;;
-    *) return 1 ;;
-  esac
-  case "$1" in
-    *-linux-*) os=linux ;;
-    *-apple-darwin) os=darwin ;;
-    *-windows-*) os=windows ;;
-    *) return 1 ;;
-  esac
-  echo "${os}_${arch}"
-}
-yaml_built=""
-for triple in $(sed -n 's/^ *- *\([a-z0-9_]*-[a-z0-9_-]*\) *$/\1/p' .goreleaser.yaml | grep -E -- '-(linux|apple|pc)-' | sort -u); do
-  pair=$(goos_goarch_of "$triple") || fail ".goreleaser.yaml builds $triple, which this test cannot spell as an archive name; add it to goos_goarch_of"
-  yaml_built+="$pair"$'\n'
-done
-yaml_built=$(printf '%s' "$yaml_built" | sort -u)
-[[ -n "$yaml_built" ]] || fail "no target triples found in .goreleaser.yaml, so this check is reading nothing"
+# The other half of that agreement is the platform table. A platform added to
+# the release that the installer will not name 404s, and a platform the
+# installer names that the release never built 404s the same way, with the
+# same wrong-looking error. So the table is read and diffed against the arms.
+yaml_built=$(scripts/dist.sh targets | awk '{print $2 "_" $3}' | sort -u)
+[[ -n "$yaml_built" ]] || fail "scripts/dist.sh lists no targets, so this check is reading nothing"
 yaml_goos=$(cut -d_ -f1 <<<"$yaml_built" | sort -u)
 yaml_goarch=$(cut -d_ -f2 <<<"$yaml_built" | sort -u)
 
@@ -116,9 +94,9 @@ sh_goos=$(sed -n 's/^ *[^ ]*) *os="\([a-z0-9]*\)".*/\1/p' scripts/install.sh | s
 sh_goarch=$(sed -n 's/^ *[^ ]*) *arch="\([a-z0-9]*\)".*/\1/p' scripts/install.sh | sort -u)
 
 [[ "$yaml_goos" == "$sh_goos" ]] \
-  || fail ".goreleaser.yaml builds for [$(echo "$yaml_goos" | tr '\n' ' ')] and scripts/install.sh names [$(echo "$sh_goos" | tr '\n' ' ')]"
+  || fail "scripts/dist.sh builds for [$(echo "$yaml_goos" | tr '\n' ' ')] and scripts/install.sh names [$(echo "$sh_goos" | tr '\n' ' ')]"
 [[ "$yaml_goarch" == "$sh_goarch" ]] \
-  || fail ".goreleaser.yaml builds for [$(echo "$yaml_goarch" | tr '\n' ' ')] and scripts/install.sh names [$(echo "$sh_goarch" | tr '\n' ' ')]"
+  || fail "scripts/dist.sh builds for [$(echo "$yaml_goarch" | tr '\n' ' ')] and scripts/install.sh names [$(echo "$sh_goarch" | tr '\n' ' ')]"
 pass "the platform lists still agree: $(echo "$yaml_goos" | tr '\n' ' ')× $(echo "$yaml_goarch" | tr '\n' ' ')"
 
 
@@ -172,12 +150,12 @@ for goos in $yaml_goos; do
 
     if grep -qx "$want" <<<"$yaml_ignored"; then
       [[ "$named" == "no" ]] \
-        || fail ".goreleaser.yaml does not build $want, but scripts/install.sh offers it as $got"
+        || fail "scripts/dist.sh does not build $want, but scripts/install.sh offers it as $got"
     else
       [[ "$named" == "yes" ]] \
-        || fail ".goreleaser.yaml builds $want, but scripts/install.sh refuses to name it"
+        || fail "scripts/dist.sh builds $want, but scripts/install.sh refuses to name it"
       [[ "$got" == "$want" ]] \
-        || fail ".goreleaser.yaml builds $want, but scripts/install.sh calls that platform $got"
+        || fail "scripts/dist.sh builds $want, but scripts/install.sh calls that platform $got"
     fi
   done
 done
@@ -190,7 +168,7 @@ RELEASE="$WORK/release"
 mkdir -p "$RELEASE"
 
 # dist/ first. In CI the packaging workflow has already run a full snapshot two
-# steps up, so GoReleaser's own archive and its own checksums.txt are sitting
+# steps up, so the build's own archive and its own checksums.txt are sitting
 # there — serving those is what makes this a test of the release rather than of
 # a tarball assembled here. They are copied rather than linked because the
 # tampering test below writes a byte into the archive it serves.
@@ -212,33 +190,14 @@ if [[ -n "$dist_archive" ]]; then
   cp dist/checksums.txt "$RELEASE/checksums.txt"
   SOURCE="the release already in dist/"
 else
-  # No release here to install, so one gets built — and dist/ is left alone
-  # while doing it, because --clean would empty a directory this script does not
-  # own and a build without --clean refuses to write into one that is not empty.
-  # The way out of that is a copy of the config with dist pointed somewhere
-  # disposable: nothing to wipe, nothing to refuse, and the repository's dist/
-  # is neither read nor written. One invocation builds both ids, so there is no
-  # second one to find the first one's leftovers in the way.
+  # No release here to install, so the host's binaries are built and archived
+  # the way scripts/dist.sh archives them, into this run's own directory: the
+  # repository's dist/ is neither read nor written.
   mkdir -p "$WORK/build"
-  if command -v goreleaser >/dev/null 2>&1; then
-    # --snapshot so it needs no tag. Single-target keeps it to the host's
-    # platform: this test is about the installer, and `goreleaser check` in
-    # `make release-check` is what holds the other nine platforms to the config.
-    { cat .goreleaser.yaml; printf '\ndist: %s\n' "$WORK/dist"; } >"$WORK/goreleaser.yaml"
-    goreleaser build --snapshot --single-target --config "$WORK/goreleaser.yaml" \
-      >"$WORK/goreleaser.log" 2>&1 || { cat "$WORK/goreleaser.log"; fail "goreleaser could not build"; }
-    for binary in krowk krowk-mcp; do
-      built=$(find "$WORK/dist" -type f -name "$binary" -print -quit)
-      [[ -n "$built" ]] || fail "goreleaser built no $binary"
-      cp "$built" "$WORK/build/$binary"
-    done
-    SOURCE="goreleaser"
-  else
-    cargo build --release --locked -p krowk --features sessions >"$WORK/cargo.log" 2>&1 \
-      || { cat "$WORK/cargo.log"; fail "cargo could not build"; }
-    cp target/release/krowk target/release/krowk-mcp "$WORK/build/"
-    SOURCE="cargo build"
-  fi
+  cargo build --release --locked -p krowk --features sessions >"$WORK/cargo.log" 2>&1 \
+    || { cat "$WORK/cargo.log"; fail "cargo could not build"; }
+  cp target/release/krowk target/release/krowk-mcp "$WORK/build/"
+  SOURCE="cargo build"
   VERSION="9.9.9"
   ARCHIVE="krowk_${VERSION}_${host_os}_${host_arch}.tar.gz"
   tar -czf "$RELEASE/$ARCHIVE" -C "$WORK/build" krowk krowk-mcp

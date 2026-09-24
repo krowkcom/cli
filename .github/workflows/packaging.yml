@@ -1,20 +1,26 @@
 name: Packaging
 
 # The release workflow only runs on a tag, which is the worst moment to learn
-# that .goreleaser.yaml has a typo in it. This runs the same build on every
-# change to the packaging, without publishing anything and without needing a
-# single secret.
+# that the packaging is broken. This builds the same layout on every change to
+# it — every platform, archived and checksummed — then packs the npm packages,
+# installs through the installer, and runs each binary where it runs. Nothing
+# is published and no secret is needed.
+#
+# The build is the fast profile: no LTO, so the binaries are larger and
+# slower, and in every other way the ones a release ships — the same targets,
+# static where they are static, in the same archives.
 on:
   pull_request:
     paths: &paths
-      - .goreleaser.yaml
       - .cargo/**
       - Cargo.toml
       - Cargo.lock
       - crates/**
       - npm/**
+      - scripts/dist.sh
       - scripts/install.sh
       - scripts/install_test.sh
+      - .github/workflows/dist.yml
       - .github/workflows/packaging.yml
       - .github/workflows/release.yml
       - Makefile
@@ -26,40 +32,26 @@ permissions:
   contents: read
 
 jobs:
+  dist:
+    uses: ./.github/workflows/dist.yml
+    with:
+      version: 0.0.0-snapshot
+      fast: true
+
   packaging:
-    # macOS, as in the release: the darwin builds link Security.framework,
-    # which only the macOS SDK carries. zig cross-compiles everything else.
+    needs: dist
+    # macOS arm64: the npm launcher and the installer run for the host, and
+    # this is the platform most people install on.
     runs-on: macos-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Rust
-        run: |
-          rustup toolchain install 1.97 --profile minimal \
-            --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-pc-windows-gnu
-          rustup default 1.97
-
-      # zig is the C compiler and linker for the C in the build — the bundled
-      # SQLite and ring — on every target the runner is not.
-      - name: Set up zig
-        uses: mlugg/setup-zig@v2
+      - uses: actions/download-artifact@v8
         with:
-          version: 0.16.0
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild@0.23.4
-
-      # Ten full LTO builds, one at a time, take most of this job; the cache
-      # keeps the dependencies from being rebuilt on every run. Not in
-      # release.yml: a tag builds from nothing, so the shipped bytes never
-      # depend on what an earlier run left behind.
-      - uses: Swatinem/rust-cache@v2
+          name: dist
+          path: dist
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -68,24 +60,6 @@ jobs:
 
       - name: Install shellcheck
         run: brew install shellcheck
-
-      - name: Validate the release config
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: check
-
-      # A snapshot is a full release minus the publishing: every binary for
-      # every platform, archived and checksummed, written to dist/. One build
-      # at a time: two cargo-zigbuild runs for the same target race to create
-      # the same linker wrapper.
-      - name: Build a snapshot
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --snapshot --clean --skip=publish --parallelism 1
 
       # Also checks the platform tables in npm/build.mjs and both launchers
       # still name the platforms the release built.
@@ -121,28 +95,16 @@ jobs:
           test "$(./node_modules/.bin/krowk-mcp --version)" = "$version"
           ./node_modules/.bin/krowk --help >/dev/null
 
-      # Serves the dist/ the snapshot step above wrote — GoReleaser's own
-      # archive and its own checksums.txt — and installs out of it, so what is
-      # tested is the release rather than a tarball the test rolled itself.
-      - name: Install from the snapshot built above
+      # Serves the archives and checksums.txt the build above wrote and
+      # installs out of them, so what is tested is the release rather than a
+      # tarball the test rolled itself.
+      - name: Install from the build above
         run: scripts/install_test.sh
-
-      # The binaries this runner cannot run, handed to runners that can.
-      - name: Keep the cross-built binaries
-        uses: actions/upload-artifact@v7
-        with:
-          name: cross-built
-          path: |
-            dist/krowk_*-unknown-linux-musl/
-            dist/krowk-mcp_*-unknown-linux-musl/
-            dist/krowk_x86_64-pc-windows-gnu/
-            dist/krowk-mcp_x86_64-pc-windows-gnu/
-          retention-days: 3
 
   # Static means static: the musl builds run in a container with no libc of
   # ours, on each architecture, natively.
   linux:
-    needs: packaging
+    needs: dist
     strategy:
       matrix:
         include:
@@ -154,25 +116,25 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: cross-built
+          name: dist
           path: dist
       # Alpine through docker rather than as the job container: the runner's
       # JavaScript actions (download-artifact above) do not run inside an
       # arm64 Alpine container.
       - name: Run both binaries in Alpine
         run: |
-          chmod +x dist/*_${{ matrix.triple }}/*
+          chmod +x dist/${{ matrix.triple }}/*
           docker run --rm -v "$PWD/dist:/d:ro" -e KROWK_NO_UPDATE_CHECK=1 -e HOME=/tmp/h alpine:3 sh -euxc '
             mkdir -p "$HOME"
-            /d/krowk_${{ matrix.triple }}/krowk --version
-            /d/krowk-mcp_${{ matrix.triple }}/krowk-mcp --version
-            /d/krowk_${{ matrix.triple }}/krowk sessions import --from all --json
-            /d/krowk_${{ matrix.triple }}/krowk doctor --json
-            printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}" | /d/krowk-mcp_${{ matrix.triple }}/krowk-mcp
+            /d/${{ matrix.triple }}/krowk --version
+            /d/${{ matrix.triple }}/krowk-mcp --version
+            /d/${{ matrix.triple }}/krowk sessions import --from all --json
+            /d/${{ matrix.triple }}/krowk doctor --json
+            printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}" | /d/${{ matrix.triple }}/krowk-mcp
           '
 
   windows:
-    needs: packaging
+    needs: dist
     runs-on: windows-latest
     defaults:
       run:
@@ -180,7 +142,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: cross-built
+          name: dist
           path: dist
       # sessions answers unsupported_os on Windows in v1; everything else runs.
       - name: Run both binaries
@@ -188,14 +150,15 @@ jobs:
           KROWK_NO_UPDATE_CHECK: "1"
         run: |
           set -eux
-          dist/krowk_x86_64-pc-windows-gnu/krowk.exe --version
-          dist/krowk-mcp_x86_64-pc-windows-gnu/krowk-mcp.exe --version
-          dist/krowk_x86_64-pc-windows-gnu/krowk.exe --help >/dev/null
+          bin=dist/x86_64-pc-windows-gnu
+          $bin/krowk.exe --version
+          $bin/krowk-mcp.exe --version
+          $bin/krowk.exe --help >/dev/null
           set +e
-          dist/krowk_x86_64-pc-windows-gnu/krowk.exe sessions --json 2> err.json
+          $bin/krowk.exe sessions --json 2> err.json
           code=$?
           set -e
           cat err.json
           test "$code" = 1
           grep -q unsupported_os err.json
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"ping"}' | dist/krowk-mcp_x86_64-pc-windows-gnu/krowk-mcp.exe
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"ping"}' | $bin/krowk-mcp.exe

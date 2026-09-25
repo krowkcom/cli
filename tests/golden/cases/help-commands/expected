@@ -666,7 +666,7 @@ stdout:
           "name": "from",
           "type": "string",
           "default": "",
-          "usage": "Which transcripts to read: claude, cursor, opencode, or all. Required"
+          "usage": "Which transcripts to read: claude, cursor, opencode, ledger (provider usage ledgers), or all. Required"
         },
         {
           "name": "dry-run",

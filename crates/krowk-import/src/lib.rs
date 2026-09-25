@@ -10,6 +10,7 @@ pub mod claude;
 pub mod cursor;
 mod home;
 mod jsonl;
+pub mod ledger;
 pub mod opencode;
 mod part;
 mod turn;
@@ -29,10 +30,12 @@ pub type Env<'a> = &'a dyn Fn(&str) -> String;
 pub const PROVIDER_CLAUDE: &str = "claude";
 pub const PROVIDER_CURSOR: &str = "cursor";
 pub const PROVIDER_OPENCODE: &str = "opencode";
+pub const PROVIDER_LEDGER: &str = "ledger";
 
-/// Every source, in the order `--from all` reads them.
+/// Every source, in the order `--from all` reads them: the transcripts,
+/// then the provider ledgers they are reconciled against.
 pub fn sources() -> Vec<Box<dyn Source>> {
-    vec![Box::new(claude::Claude), Box::new(cursor::Cursor), Box::new(opencode::Opencode)]
+    vec![Box::new(claude::Claude), Box::new(cursor::Cursor), Box::new(opencode::Opencode), Box::new(ledger::Ledger)]
 }
 
 /// One harness's transcripts.

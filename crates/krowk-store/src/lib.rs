@@ -8,10 +8,12 @@
 //! migration.
 
 mod clock;
+mod ledger;
 mod query;
 mod writer;
 
 pub use clock::{new_id, now_ms};
+pub use ledger::*;
 pub use query::*;
 pub use writer::*;
 pub use rusqlite::Connection;

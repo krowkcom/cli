@@ -84,7 +84,8 @@ SESSIONS FLAGS
   --all                  On `sessions`, list every session, ignoring --limit
   --thinking             On `sessions show`, show full thinking parts
   --from <source>        On `sessions import`, whose transcripts to read:
-                         claude, cursor, opencode, or all. Required
+                         claude, cursor, opencode, ledger, or all.
+                         Required
   --dry-run              Count what would be imported and write nothing
   --limit <n>            On `sessions import`, read at most this many
                          transcripts per source (0, the default, is all)

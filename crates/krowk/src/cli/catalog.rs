@@ -289,7 +289,7 @@ pub fn catalog(version: &str) -> Catalog {
                     },
                     Command {
                         flags: vec![
-                            flag("from", STRING, "Which transcripts to read: claude, cursor, opencode, or all. Required"),
+                            flag("from", STRING, "Which transcripts to read: claude, cursor, opencode, ledger (provider usage ledgers), or all. Required"),
                             flag("dry-run", BOOL, "Count what would be imported and write nothing"),
                             with_default(flag("limit", INT, "Read at most this many transcripts per source (0 is all)"), "0"),
                         ],

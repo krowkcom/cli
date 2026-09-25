@@ -9,6 +9,21 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Added
+
+- **Provider usage ledgers.** A request your agent gave up on — a timeout,
+  a killed shell, a Ctrl-C — can still finish and bill on the provider's
+  side, and no transcript ever sees it. Drop the provider's per-request
+  usage export as JSONL into `~/.local/share/krowk/ledger/<name>.jsonl`
+  (one execution per line: `id`, `provider`, `model`, token counts,
+  optional `cost_usd` and `time`) and `sessions import --from ledger`
+  (or `all`, `sync`, `rebuild`) reads it. Every import then reconciles the
+  ledger against your transcripts: a row a transcript already accounts for
+  is counted once, from the transcript; the same execution in two exports
+  is counted once; a row nothing local saw shows up as its own
+  `unobserved` turn in `krowk sessions` and `sessions show`. The import
+  report says how many of each it found.
+
 ## [0.10.0] - 2026-09-24
 
 krowk is written in Rust now, and it can read your agents' sessions back.

@@ -25,6 +25,32 @@ const SKIPPED_TYPE_OTHER: &str = "krowk:other";
 const UNSUPPORTED_OS: &str = "sessions is not supported on Windows in v1";
 const PRICING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Every source import, sync and rebuild read: the transcripts on this
+/// machine, and in the harness build krowk's own session logs too.
+fn all_sources() -> Vec<Box<dyn Source>> {
+    #[allow(unused_mut)]
+    let mut all = krowk_import::sources();
+    #[cfg(feature = "harness")]
+    all.push(Box::new(krowk_harness::project::Krowk));
+    all
+}
+
+/// Brings one native session's rows up to date from its log, right after a
+/// `krowk -p` turn: the same read and write an import does, for one log.
+#[cfg(feature = "harness")]
+pub(super) fn project_native(ctx: &Ctx, session_id: &str) -> Result<(), Error> {
+    let store_path = resolve_store_path(ctx)?;
+    let src = krowk_harness::project::Krowk;
+    let Some(r) = src.discover(ctx.io.env).map_err(|e| fail("import_failed", e.to_string()))?.into_iter().find(|r| r.id == session_id) else {
+        return Err(fail("import_failed", format!("the log of session {session_id} is not where krowk keeps sessions")));
+    };
+    let _lock = lock_store_waiting(&store_path, REFRESH_LOCK_WAIT)?;
+    let conn = open_store(ctx)?;
+    let (thread, next, _) = src.read(ctx.io.env, &r, "").map_err(|e| fail("import_failed", e.to_string()))?;
+    krowk_store::Writer::new(&conn).ingest_with_cursor(&thread, &r.key(), &next).map_err(|e| store_fail(&e, &store_path))?;
+    Ok(())
+}
+
 pub(super) fn check_os() -> Result<(), Error> {
     krowk_import::check_os().map_err(|_| fail("unsupported_os", UNSUPPORTED_OS))
 }
@@ -564,7 +590,7 @@ const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(15);
 /// `import_locked` rather than answer from a stale store.
 pub(super) fn refresh_session(ctx: &Ctx, provider: &str, foreign_ids: &[String]) -> Result<Refresh, Error> {
     let foreign_ids: Vec<&String> = foreign_ids.iter().filter(|f| !f.is_empty()).collect();
-    let Some(source) = krowk_import::sources().into_iter().find(|s| s.name() == provider) else { return Ok(Refresh::NotRefreshable) };
+    let Some(source) = all_sources().into_iter().find(|s| s.name() == provider) else { return Ok(Refresh::NotRefreshable) };
     if foreign_ids.is_empty() || matches!(provider, krowk_import::PROVIDER_LEDGER | krowk_import::PROVIDER_CURSOR) {
         return Ok(Refresh::NotRefreshable);
     }
@@ -1007,7 +1033,7 @@ fn truncate_for_report(s: &str, max: usize) -> String {
 }
 
 fn selected_sources(from: &str) -> Result<Vec<Box<dyn Source>>, Error> {
-    let all = krowk_import::sources();
+    let all = all_sources();
     let names: Vec<&str> = all.iter().map(|s| s.name()).collect();
     let choices = format!("{}|all", names.join("|"));
     match from {
@@ -1070,7 +1096,7 @@ pub fn rebuild(ctx: &mut Ctx) -> Result<(), Error> {
         }
     }
     let conn = open_store(ctx)?;
-    let sources = krowk_import::sources();
+    let sources = all_sources();
     import_into(ctx, Some(&conn), &store_path, &sources, false, ImportReport { removed: Some(removed), ..ImportReport::default() })
 }
 
@@ -1085,7 +1111,7 @@ pub fn sync(ctx: &mut Ctx) -> Result<(), Error> {
     if !p.warning.is_empty() && ctx.format == Format::Human {
         let _ = writeln!(ctx.io.stderr, "! {}", p.warning);
     }
-    let sources = krowk_import::sources();
+    let sources = all_sources();
     import_into(ctx, Some(&conn), &store_path, &sources, true, ImportReport { pricing: Some(p), ..ImportReport::default() })
 }
 

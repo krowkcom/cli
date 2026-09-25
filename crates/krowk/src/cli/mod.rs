@@ -10,6 +10,8 @@ pub mod flags;
 pub mod help;
 #[cfg(feature = "sessions")]
 mod budget;
+#[cfg(feature = "harness")]
+mod prompt;
 #[cfg(feature = "sessions")]
 mod sessions;
 mod upgrade;
@@ -123,6 +125,18 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     if f.version {
         let _ = writeln!(io.stdout, "{VERSION}");
         return exit::OK;
+    }
+    // `-p` is a mode rather than a command: its arguments are the prompt.
+    #[cfg(feature = "harness")]
+    if f.print && !f.help {
+        let mut ctx = Ctx { io, f, format, colour, filter };
+        return match prompt::run(&mut ctx, &positionals) {
+            Ok(()) => exit::OK,
+            Err(e) => {
+                let quiet = ctx.f.quiet;
+                report(ctx.io, &e, format, quiet, colour, None)
+            }
+        };
     }
     if positionals.is_empty() && !f.help && format != Format::Json {
         let _ = write!(io.stdout, "{}", help::greeting(VERSION));
@@ -291,6 +305,12 @@ fn reject_misplaced_sessions_flags(f: &Flags, p: &[String]) -> Result<(), Error>
         ("yes", "`krowk sessions rebuild`", rebuild),
         ("no-network", "`krowk sessions sync`", sync),
     ];
+    #[cfg(feature = "harness")]
+    for name in ["output-format", "model", "resume", "permission-mode"] {
+        if f.given.contains(name) && !f.print {
+            return Err(fail("bad_flag", format!("`--{name}` is only a flag of `krowk -p`")));
+        }
+    }
     for (name, owner, allowed) in owners {
         if f.given.contains(name) && !allowed {
             return Err(fail("bad_flag", format!("`--{name}` is only a flag of {owner}")));

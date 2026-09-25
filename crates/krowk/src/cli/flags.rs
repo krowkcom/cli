@@ -44,6 +44,17 @@ pub struct Flags {
     pub thinking: bool,
     pub max_usd: String,
     pub max_tokens: String,
+    /// `-p`: run one prompt headless.
+    #[cfg(feature = "harness")]
+    pub print: bool,
+    #[cfg(feature = "harness")]
+    pub output_format: String,
+    #[cfg(feature = "harness")]
+    pub model: String,
+    #[cfg(feature = "harness")]
+    pub resume: String,
+    #[cfg(feature = "harness")]
+    pub permission_mode: String,
     /// Which flags were typed, by canonical name — a different question from
     /// what they carry: `--jq "$UNSET"` was given and is empty.
     pub given: BTreeSet<String>,
@@ -172,6 +183,14 @@ impl Flags {
             "worktree" => text(&mut self.worktree),
             "max-usd" => text(&mut self.max_usd),
             "max-tokens" => text(&mut self.max_tokens),
+            #[cfg(feature = "harness")]
+            "output-format" => text(&mut self.output_format),
+            #[cfg(feature = "harness")]
+            "model" => text(&mut self.model),
+            #[cfg(feature = "harness")]
+            "resume" => text(&mut self.resume),
+            #[cfg(feature = "harness")]
+            "permission-mode" => text(&mut self.permission_mode),
             _ => {
                 let b = parse_bool(name, v)?;
                 *match name {
@@ -188,6 +207,8 @@ impl Flags {
                     "no-network" => &mut self.no_network,
                     "all" => &mut self.all,
                     "thinking" => &mut self.thinking,
+                    #[cfg(feature = "harness")]
+                    "print" => &mut self.print,
                     other => unreachable!("catalog flag {other} has no field"),
                 } = b;
             }

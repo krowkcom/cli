@@ -210,14 +210,21 @@ the versions are the `v*` tags a release is cut from. Entries land under
   settings' `defaultMode` says, and a turn it reports in a looser mode is
   stopped before it runs anything. Tool calls Claude Code asks about are
   answered by krowk's `--permission-mode` (edits need `acceptEdits` and
-  never reach `.git`, `.claude` or the account's config directory; Bash
-  and anything else need `bypassPermissions`). **Claude Code's own allow
+  never reach `.git`, `.claude` — in any case, as macOS and Windows would
+  open it — or the account's config directory; Bash and anything else
+  need `bypassPermissions`). The native edit tools keep out of `.claude`
+  the same way. **Claude Code's own allow
   rules (`permissions.allow` in your or the project's settings) and its
   hooks still apply first**: what they approve runs without krowk being
   asked, as it does when you run `claude` yourself. `ANTHROPIC_API_KEY`,
   `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` set for krowk's native
-  engine are not passed to Claude Code (an instance's `env` can set them),
-  so an exported key never moves a subscription account onto it. Stopping
+  engine are not passed to Claude Code, so an exported key never moves a
+  subscription account onto it. A router is an instance of its own:
+  `krowk providers add claude --name router --base-url
+  https://openrouter.ai/api --api-key-env OPENROUTER_API_KEY` stores the
+  variable's name, and krowk hands its key to Claude Code as
+  `ANTHROPIC_AUTH_TOKEN` (as `ANTHROPIC_API_KEY` without a base URL, for a
+  Console key); no Claude login is run for it. Stopping
   a session stops everything Claude Code started with it, and a host that
   keeps sessions lets an idle one's process go after 15 minutes. krowk's
   own tools reach Claude Code as the `krowk` MCP server — today

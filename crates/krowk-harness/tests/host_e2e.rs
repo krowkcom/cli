@@ -374,3 +374,52 @@ fn r_proto_1_steer_joins_the_running_turn_before_its_next_model_call() {
         .collect();
     assert_eq!(kinds, ["userText", "reasoning", "assistantText", "toolCall", "toolResult", "userText", "assistantText"]);
 }
+
+#[test]
+fn r_proto_1_steering_an_interrupted_turn_never_read_comes_back_on_its_result() {
+    use krowk_harness::host::Host;
+    use krowk_harness::protocol::Command;
+    use tokio::sync::mpsc;
+    // A provider that takes the request and never answers: the turn waits.
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for c in l.incoming().flatten() {
+            held.push(c);
+        }
+    });
+    let home = Home::new("steer-unread", &url);
+    let host = Host::new(home.config());
+    let model = Registry::resolve(&InstancesConfig::default(), &home.env()).parse_model("claude-sonnet-4-6").unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let result = rt.block_on(async {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let cmd = Command::Prompt { session_id: None, text: "wait".into(), model: Some(model), permission_mode: PermissionMode::Default, toolset: None };
+        let exec = host.execute(cmd, tx);
+        tokio::pin!(exec);
+        let mut session = None;
+        loop {
+            tokio::select! {
+                Some(line) = rx.recv() => {
+                    if let StreamLine::Log(LogEvent { body: LogBody::TurnStarted { .. }, session_id, .. }) = &line {
+                        session = Some(session_id.clone());
+                    }
+                    if let Some(id) = session.take() {
+                        // Let the request go out, then steer and interrupt.
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        let (t, _r) = mpsc::channel(8);
+                        host.execute(Command::Steer { session_id: id.clone(), text: "and the docs".into() }, t).await.unwrap();
+                        let (t, _r) = mpsc::channel(8);
+                        host.execute(Command::Interrupt { session_id: id }, t).await.unwrap();
+                    }
+                }
+                r = &mut exec => break r.unwrap().unwrap(),
+            }
+        }
+    });
+    assert_eq!(result.status, TurnStatus::Interrupted);
+    assert_eq!(result.unread_steers, ["and the docs"], "handed back, not dropped");
+    let json = serde_json::to_value(LiveEvent::Result(result)).unwrap();
+    assert_eq!(json["unreadSteers"], serde_json::json!(["and the docs"]), "in the stream's result too");
+}

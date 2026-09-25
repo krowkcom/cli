@@ -181,10 +181,9 @@ impl Host {
         let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, preset, effort, model_info: info, cancel, steers: steers.clone() };
         let mut tally = Tally::default();
         let outcome = w.drive(engine.as_ref(), ctx, &mut tally, &model, &instance, &self.cfg.pricer).await;
-        // Refused from here on, not queued for a turn that is over. What an
-        // interrupted or failed turn never took, the client that sent it
-        // still has.
-        steers.close();
+        // Refused from here on, not queued for a turn that is over; what an
+        // interrupted or failed turn never took goes back on its result.
+        let unread_steers = steers.close();
         self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&session_id);
 
         let (status, error) = match outcome {
@@ -207,6 +206,7 @@ impl Host {
             duration_ms,
             num_model_calls: tally.calls,
             error,
+            unread_steers,
         };
         let _ = out.send(StreamLine::Live(LiveEvent::Result(result.clone()))).await;
         Ok(result)

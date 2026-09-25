@@ -395,6 +395,12 @@ pub struct RunResult {
     pub num_model_calls: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorInfo>,
+    /// Steering the host accepted for this turn and the engine never read —
+    /// the turn was interrupted or failed first — oldest first, handed back
+    /// so the client that sent it can offer it again. Never set on a
+    /// completed turn: a turn does not complete with steering unread.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unread_steers: Vec<String>,
 }
 
 /// One line of `--output-format stream-json`, and of anything else that

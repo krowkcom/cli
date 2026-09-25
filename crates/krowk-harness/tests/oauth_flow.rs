@@ -191,11 +191,13 @@ async fn r_prov_4_metadata_naming_another_issuer_is_refused() {
     assert!(auth.mock.seen.lock().unwrap().iter().all(|s| s.path.starts_with("/.well-known/")), "nothing but metadata was asked of it");
 }
 
-/// An interrupt lands while a SuperGrok call is still getting its token —
-/// waiting on another krowk's refresh, or on a slow token endpoint — and
-/// the call returns interrupted at once rather than after the wait.
+/// An interrupt lands while a SuperGrok call is still getting its token.
+/// Waiting on another krowk's refresh is given up at once. A refresh this
+/// session already sent is not: xAI rotates the refresh token as it answers,
+/// so the answer is taken and saved, and the call stops after it — the login
+/// survives the interrupt, and the next call uses the new token.
 #[test]
-fn r_prov_4_an_interrupt_during_a_slow_refresh_returns_promptly() {
+fn r_prov_4_an_interrupt_while_getting_a_token_stops_the_call_and_keeps_the_login() {
     use krowk_harness::chat::{ChatClient, Credential};
     use krowk_harness::instances::{InstanceKind, InstancesConfig, Registry};
     use krowk_harness::native::{ModelClient, ModelRequest};
@@ -206,9 +208,14 @@ fn r_prov_4_an_interrupt_during_a_slow_refresh_returns_promptly() {
     let store = Store::new(d.join(oauth::CREDENTIALS_FILE));
     let rt = || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let http = krowk_harness::http::client().unwrap();
-    let mut first = rt().block_on(oauth::login_device(&http, &login(&auth.mock.url), &mut |_| {})).unwrap();
-    first.expires_at_ms = Some(0);
+    let expire = |store: &Store| {
+        let mut s = store.load("supergrok").unwrap().unwrap();
+        s.expires_at_ms = Some(0);
+        store.save("supergrok", &s).unwrap();
+    };
+    let first = rt().block_on(oauth::login_device(&http, &login(&auth.mock.url), &mut |_| {})).unwrap();
     store.save("supergrok", &first).unwrap();
+    expire(&store);
     auth.state.lock().unwrap().refresh_delay_ms = 3000;
 
     let cfg = InstancesConfig {
@@ -216,7 +223,8 @@ fn r_prov_4_an_interrupt_during_a_slow_refresh_returns_promptly() {
         ..InstancesConfig::default()
     };
     let instance = Registry::resolve(&cfg, &|_| String::new()).get("supergrok").unwrap().clone();
-    let interrupted_after = |label: &str| {
+    // Runs one call, interrupted 300 ms in; how long it took to return.
+    let interrupted_call = |label: &str| -> Duration {
         let client = ChatClient::new(instance.clone(), Credential::OAuth(std::sync::Arc::new(Tokens::open(store.clone(), "supergrok").unwrap())), "test").unwrap();
         let req = ModelRequest { model: "grok-4.7".into(), system: "s".into(), ..ModelRequest::default() };
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -231,10 +239,11 @@ fn r_prov_4_an_interrupt_during_a_slow_refresh_returns_promptly() {
         let took = started.elapsed();
         drop(flip.join());
         assert!(resp.interrupted, "{label}: the call reports the interrupt");
-        assert!(took < Duration::from_millis(1500), "{label}: returned {took:?} after starting, not after the wait");
+        took
     };
 
-    // Another krowk is refreshing, and holds the store's lock for 3 s.
+    // Another krowk is refreshing, and holds the store's lock for 3 s: the
+    // wait for it is given up at once.
     let other = {
         let store = store.clone();
         std::thread::spawn(move || {
@@ -244,13 +253,23 @@ fn r_prov_4_an_interrupt_during_a_slow_refresh_returns_promptly() {
         })
     };
     std::thread::sleep(Duration::from_millis(100));
-    interrupted_after("waiting on the lock");
+    let took = interrupted_call("waiting on the lock");
+    assert!(took < Duration::from_millis(1500), "returned {took:?} in, not after the other krowk's refresh");
     assert_eq!(other.join().unwrap(), "xai-at-2");
 
-    // This session's own refresh is the slow one.
-    let mut expired = store.load("supergrok").unwrap().unwrap();
-    expired.expires_at_ms = Some(0);
-    store.save("supergrok", &expired).unwrap();
-    interrupted_after("waiting on the token endpoint");
+    // This session's own refresh is under way when the interrupt lands: it
+    // finishes, is saved, and the call stops before it is made.
+    expire(&store);
+    let took = interrupted_call("refreshing");
+    assert!(took >= Duration::from_millis(2500), "the refresh ran to its end: {took:?}");
+    let saved = store.load("supergrok").unwrap().unwrap();
+    assert_eq!((saved.access_token.as_str(), saved.refresh_token.as_deref()), ("xai-at-3", Some("xai-rt-3")), "the rotated token was kept");
+    assert_eq!(auth.state.lock().unwrap().refreshes, 2);
+    // The login survives: a later call needs no refresh, and a forced one
+    // spends the live refresh token without invalid_grant.
+    auth.state.lock().unwrap().refresh_delay_ms = 0;
+    let later = Tokens::open(store.clone(), "supergrok").unwrap();
+    assert_eq!(rt().block_on(later.bearer(&http, false)).unwrap(), "xai-at-3");
+    assert_eq!(rt().block_on(later.bearer(&http, true)).unwrap(), "xai-at-4");
     let _ = std::fs::remove_dir_all(&d);
 }

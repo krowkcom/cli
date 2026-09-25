@@ -625,11 +625,27 @@ impl Tokens {
     /// An access token to send. `refused` says the last one was refused,
     /// so a fresh-looking token is refreshed all the same.
     pub async fn bearer(&self, http: &reqwest::Client, refused: bool) -> Result<String, EngineError> {
-        let mut cur = self.current.lock().await;
+        let (_, never) = tokio::sync::watch::channel(false);
+        Ok(self.bearer_unless(http, refused, never).await?.expect("a switch whose owner is gone never flips"))
+    }
+
+    /// `bearer`, or none when `cancel` flips while it waits — for this
+    /// session's other call, or another krowk's refresh. Only the waits are
+    /// given up. A refresh, once sent, runs to its end (30 s at most) and
+    /// is saved: xAI rotates the refresh token as it answers, and dropping
+    /// the answer would lose the only live one, and the login with it.
+    pub async fn bearer_unless(&self, http: &reqwest::Client, refused: bool, mut cancel: tokio::sync::watch::Receiver<bool>) -> Result<Option<String>, EngineError> {
+        let mut cur = tokio::select! {
+            c = self.current.lock() => c,
+            _ = crate::engine::cancelled(&mut cancel) => return Ok(None),
+        };
         if !refused && cur.fresh(now_ms()) {
-            return Ok(cur.access_token.clone());
+            return Ok(Some(cur.access_token.clone()));
         }
-        let _lock = self.store.lock_async().await?;
+        let _lock = tokio::select! {
+            l = self.store.lock_async() => l?,
+            _ = crate::engine::cancelled(&mut cancel) => return Ok(None),
+        };
         // Another krowk may have refreshed while this one waited: its token
         // is the one to use, and its refresh token the only live one.
         if let Some(disk) = self.store.load(&self.instance)?
@@ -637,7 +653,7 @@ impl Tokens {
         {
             *cur = disk;
             if cur.fresh(now_ms()) {
-                return Ok(cur.access_token.clone());
+                return Ok(Some(cur.access_token.clone()));
             }
         }
         let refresh = cur.refresh_token.clone().ok_or_else(|| self.sign_in_again("the login has no refresh token"))?;
@@ -652,7 +668,7 @@ impl Tokens {
         // fails must not leave this session holding it.
         *cur = stored_from(&v, &e, &cur.client_id, &cur.scope, Some(refresh))?;
         self.store.save_locked(&self.instance, &cur)?;
-        Ok(cur.access_token.clone())
+        Ok(Some(cur.access_token.clone()))
     }
 
     fn sign_in_again(&self, why: &str) -> EngineError {

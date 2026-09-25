@@ -188,11 +188,13 @@ fn messages(system: &str, history: &[HistoryItem], provider: &str) -> Vec<Value>
 }
 
 impl ChatClient {
-    async fn token(&self, refresh: bool) -> Result<Option<String>, EngineError> {
+    /// The token to send (`Some(None)` for a keyless server), or none when
+    /// the turn was interrupted while waiting for one.
+    async fn token(&self, refresh: bool, cancel: &watch::Receiver<bool>) -> Result<Option<Option<String>>, EngineError> {
         Ok(match &self.credential {
-            Credential::Key(k) => Some(k.clone()),
-            Credential::None => None,
-            Credential::OAuth(t) => Some(t.bearer(&self.http, refresh).await?),
+            Credential::Key(k) => Some(Some(k.clone())),
+            Credential::None => Some(None),
+            Credential::OAuth(t) => t.bearer_unless(&self.http, refresh, cancel.clone()).await?.map(Some),
         })
     }
 
@@ -226,15 +228,15 @@ impl ModelClient for ChatClient {
             // An OAuth token the server refuses is refreshed once, whatever
             // its expiry said: the server's clock and ours may disagree.
             for refresh in [false, true] {
-                // Getting a token can wait on another krowk's refresh and on
-                // the token endpoint: an interrupt ends that wait too.
-                let mut cancel_wait = cancel.clone();
-                let token = tokio::select! {
-                    t = self.token(refresh) => t?,
-                    _ = crate::engine::cancelled(&mut cancel_wait) => {
-                        return Ok(ModelResponse { model: req.model.clone(), interrupted: true, ..ModelResponse::default() });
-                    }
-                };
+                // Getting a token can wait on another krowk's refresh: an
+                // interrupt ends that wait. A refresh already sent finishes
+                // and is saved (see Tokens::bearer_unless), and the call
+                // then stops before it is made.
+                let interrupted = || Ok(ModelResponse { model: req.model.clone(), interrupted: true, ..ModelResponse::default() });
+                let Some(token) = self.token(refresh, &cancel).await? else { return interrupted() };
+                if *cancel.borrow() {
+                    return interrupted();
+                }
                 let build = || {
                     let mut r = self
                         .http

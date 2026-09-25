@@ -17,7 +17,10 @@
 //!
 //! Lines of a subagent (`parent_tool_use_id` set) belong to the subagent's
 //! own conversation, which Claude Code keeps; the turn logs the `Task` call
-//! and its result. `result` ends the turn.
+//! and its result. What each of the subagent's calls cost is still the
+//! session's spend, so the usage of its `assistant` messages is reported,
+//! once per message, as `SubagentResponse`. `result` ends the turn, with
+//! Claude Code's own `total_cost_usd` for it.
 
 use crate::anthropic::stream::Decoder;
 use crate::engine::{EngineError, EngineEvent};
@@ -56,6 +59,25 @@ pub struct Outcome {
     pub api_status: Option<u16>,
 }
 
+struct SubagentMessage {
+    id: String,
+    model: String,
+    latest: Usage,
+    reported: Usage,
+}
+
+/// What `latest` adds to `reported`, field by field; never negative.
+fn growth(latest: &Usage, reported: &Usage) -> Usage {
+    let d = |a: i64, b: i64| (a - b).max(0);
+    Usage {
+        input_tokens: d(latest.input_tokens, reported.input_tokens),
+        output_tokens: d(latest.output_tokens, reported.output_tokens),
+        cache_read_tokens: d(latest.cache_read_tokens, reported.cache_read_tokens),
+        cache_write_tokens: d(latest.cache_write_tokens, reported.cache_write_tokens),
+        reasoning_tokens: d(latest.reasoning_tokens, reported.reasoning_tokens),
+    }
+}
+
 /// A response rebuilt from `assistant` messages, for a message whose stream
 /// never arrived.
 struct Whole {
@@ -77,6 +99,16 @@ pub struct Translator {
     held: Vec<EngineEvent>,
     pub init: Option<Init>,
     pub outcome: Option<Outcome>,
+    /// Each subagent message seen, in the order first seen: its model, the
+    /// latest usage Claude Code sent for it, and how much of that has been
+    /// reported. Claude Code sends one `assistant` line per content block,
+    /// each with the message's usage so far, and parallel `Task`s
+    /// interleave theirs, so what is reported is the growth since the last
+    /// report — when another message's line arrives, and at the end — and
+    /// no message is ever counted twice.
+    subagents: Vec<SubagentMessage>,
+    /// The message the last subagent line was for.
+    subagent_at: Option<usize>,
 }
 
 fn str_of<'a>(v: &'a Value, k: &str) -> &'a str {
@@ -98,10 +130,30 @@ impl Translator {
     /// Folds one stream-json line in; returns what the host should be told.
     /// Control messages are the engine's, and never reach here.
     pub fn apply(&mut self, msg: &Value) -> Result<Vec<EngineEvent>, EngineError> {
-        if msg.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
-            return Ok(Vec::new());
-        }
         let mut out = Vec::new();
+        if msg.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
+            if str_of(msg, "type") == "assistant"
+                && let Some(m) = msg.get("message")
+                && let Some(u) = m.get("usage")
+            {
+                let id = str_of(m, "id").to_string();
+                let at = match self.subagents.iter().position(|s| s.id == id && !id.is_empty()) {
+                    Some(at) => at,
+                    None => {
+                        self.subagents.push(SubagentMessage { id, model: String::new(), latest: Usage::default(), reported: Usage::default() });
+                        self.subagents.len() - 1
+                    }
+                };
+                if let Some(prev) = self.subagent_at.filter(|p| *p != at) {
+                    self.report_subagent(prev, &mut out);
+                }
+                let sm = &mut self.subagents[at];
+                sm.model = str_of(m, "model").into();
+                sm.latest = usage(u);
+                self.subagent_at = Some(at);
+            }
+            return Ok(out);
+        }
         match str_of(msg, "type") {
             "system" if str_of(msg, "subtype") == "init" => self.init = Some(init(msg)),
             "stream_event" => self.stream_event(msg.get("event").unwrap_or(&Value::Null), &mut out)?,
@@ -122,6 +174,9 @@ impl Translator {
             }
             "result" => {
                 self.finish(&mut out);
+                if let Some(usd) = msg.get("total_cost_usd").and_then(Value::as_f64) {
+                    out.push(EngineEvent::ReportedCost { usd });
+                }
                 self.outcome = Some(Outcome {
                     subtype: str_of(msg, "subtype").into(),
                     is_error: msg.get("is_error").and_then(Value::as_bool).unwrap_or(false),
@@ -212,6 +267,22 @@ impl Translator {
         self.close_stream(out);
         self.close_whole(out);
         out.append(&mut self.held);
+        for at in 0..self.subagents.len() {
+            self.report_subagent(at, out);
+        }
+        self.subagent_at = None;
+    }
+
+    /// Reports what a subagent message has grown by since it was last
+    /// reported, if anything.
+    fn report_subagent(&mut self, at: usize, out: &mut Vec<EngineEvent>) {
+        let sm = &mut self.subagents[at];
+        let more = growth(&sm.latest, &sm.reported);
+        if more == Usage::default() {
+            return;
+        }
+        sm.reported = sm.latest;
+        out.push(EngineEvent::SubagentResponse { response_id: (!sm.id.is_empty()).then(|| sm.id.clone()), model: sm.model.clone(), usage: more });
     }
 }
 
@@ -316,6 +387,34 @@ mod tests {
 {"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null}
 {"type":"result","subtype":"success","is_error":false,"result":"s-1","session_id":"cc-1"}
 "#;
+
+    #[test]
+    fn r_budget_1_a_subagents_calls_are_metered_once_each_and_the_reported_total_comes_with_the_result() {
+        let mut t = Translator::default();
+        let sub = |id: &str, out: i64| format!(r#"{{"type":"assistant","parent_tool_use_id":"toolu_task","session_id":"s","message":{{"id":"{id}","model":"claude-haiku-4-5","role":"assistant","content":[{{"type":"text","text":"x"}}],"usage":{{"input_tokens":5,"output_tokens":{out}}}}}}}"#);
+        // Two parallel Tasks, their lines interleaved: 1, 1, 2, 1 again.
+        let lines = [sub("msg_sub_1", 3), sub("msg_sub_1", 40), sub("msg_sub_2", 7), sub("msg_sub_1", 55), r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s","total_cost_usd":0.25}"#.to_string()].join("\n");
+        let evs = feed(&mut t, &lines);
+        let metered: Vec<(Option<&str>, i64)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::SubagentResponse { response_id, usage, .. } => Some((response_id.as_deref(), usage.output_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(metered, [(Some("msg_sub_1"), 40), (Some("msg_sub_2"), 7), (Some("msg_sub_1"), 15)], "each message's growth, reported once");
+        let total = |id: &str| {
+            evs.iter()
+                .filter_map(|e| match e {
+                    EngineEvent::SubagentResponse { response_id: Some(r), usage, .. } if r == id => Some((usage.input_tokens, usage.output_tokens)),
+                    _ => None,
+                })
+                .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        };
+        assert_eq!((total("msg_sub_1"), total("msg_sub_2")), ((5, 55), (5, 7)), "every message counted at its final usage, none twice");
+        assert!(completed(&evs).is_empty(), "the subagent's conversation is its own");
+        assert_eq!(evs.last(), Some(&EngineEvent::ReportedCost { usd: 0.25 }));
+    }
 
     #[test]
     fn r_back_5_a_streamed_tool_turn_becomes_the_same_items_a_native_turn_logs() {

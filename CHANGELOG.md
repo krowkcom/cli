@@ -227,8 +227,54 @@ the versions are the `v*` tags a release is cut from. Entries land under
   Console key); no Claude login is run for it. Stopping
   a session stops everything Claude Code started with it, and a host that
   keeps sessions lets an idle one's process go after 15 minutes. krowk's
-  own tools reach Claude Code as the `krowk` MCP server — today
-  `session_info`.
+  own tools reach Claude Code as the `krowk` MCP server: `session_info`
+  and `publish`.
+- **`krowk -p --max-usd 0.50` (or `--max-tokens N`) stops the session
+  before the model call that would take it past the limit.** The check runs
+  inside krowk's engine before every call, from what the provider metered —
+  never from the `max_tokens` a request was sent with, which providers
+  overshoot — over the session and every subagent it spawned, and the
+  next call is counted at the least it can cost (its prompt resent from
+  cache and one token), so a call that could fit is never refused. A
+  stopped session exits 4 with `budget_exceeded`, as `krowk sessions
+  budget` does, keeps what it made, and says how to go on (`krowk -p
+  --resume <id> --max-usd <more>`); a model with no price trips
+  `--max-usd` rather than passing it. A limit holds the invocation it is
+  given to — it is not stored with the session, so a `--resume` without the
+  flag runs with none — and counts the session's whole spend, earlier turns
+  included. Claude Code sessions are checked before each turn and
+  interrupted as soon as a metered call goes over; what Claude Code's own
+  subagents (`Task`) spend counts too, and so does Claude Code's reported
+  total for a turn when it is more than krowk priced (or when the model is
+  an alias like `sonnet` that the price list does not name).
+  Bare `krowk` takes the same flags for its TUI, whose cost item now shows
+  the session's spend after every call, subagents included. For krowk's
+  own sessions this replaces a `krowk sessions budget` hook; the command
+  still checks imported Claude Code and opencode sessions.
+- **krowk's agent can publish evidence: `publish` pushes screenshots,
+  diffs and logs as krowk artifacts.** Like an edit, it runs only under
+  `--permission-mode acceptEdits` or `bypassPermissions` — an artifact is
+  readable by anyone with its link — and elsewhere the model is told which
+  mode it needs. It is `krowk_push`, run with the
+  session's working directory as the root — the same refusals of paths
+  outside it, credential files and hard links — and it answers with each
+  artifact's card URL and markdown embed. With an API key, a session's
+  first publish opens a krowk run recording the session, every artifact is
+  tagged `krowk.session` and attached to that run, and a resumed session
+  keeps publishing under it (`run.opened` in the log). Without a key the
+  upload is anonymous and belongs to no run, and the answer points at
+  `krowk doctor`; the claim command that keeps such an upload is printed
+  for you on stderr (shown on screen in the TUI) and never given to the
+  model, written to the session log or printed by `stream-json`, because its
+  token is a secret. Detecting the run's repository and commit runs git with
+  the repository's `core.fsmonitor` switched off, in the session's own
+  directory, so a repository's config cannot make it run a command — this
+  holds for `krowk push` and krowk-mcp too. **`krowk.vcs.dirty` is left
+  out wherever a git filter is configured** (a `filter.<name>` in the
+  repository's or your git config, git-lfs's included): telling whether a
+  file changed can mean running its clean filter, and a repository can name
+  any command as one. `--dev` publishes to the stand-in registry. Claude Code
+  sessions get the same tool as `mcp__krowk__publish`.
 - **krowk asks before Claude Code runs in a repository you have not
   trusted.** `claude -p` runs a repository's hooks and MCP servers without
   its usual trust prompt, so krowk shows its own on a terminal — `krowk

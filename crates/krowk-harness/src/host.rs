@@ -12,7 +12,9 @@
 use crate::anthropic::AnthropicClient;
 use crate::catalog::ModelInfo;
 use crate::chat::{ChatClient, Credential};
+use crate::budget::Budget;
 use crate::engine::{Engine, EngineError, EngineEvent, HistoryItem, Steers, TurnContext, TurnEnd};
+use crate::evidence::{Evidence, Publisher};
 use crate::instances::{Auth, Registry, Resolved};
 use crate::oauth;
 use crate::openai::ResponsesClient;
@@ -20,7 +22,7 @@ use crate::log::{self, LogError, SessionLog};
 use crate::native::{self, NativeEngine};
 use crate::toolset;
 use crate::protocol::{
-    Billing, Command, ContextRecord, Effort, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus, Usage, WireApi,
+    Billing, BudgetLimits, Command, ContextRecord, Effort, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus, Usage, WireApi,
 };
 use crate::claude::ClaudeEngine;
 use crate::codex::CodexEngine;
@@ -56,6 +58,9 @@ pub struct HostConfig {
     pub credentials: PathBuf,
     /// Asked before a backend is spawned in a repository (R-BACK-6).
     pub trust: trust::Gate,
+    /// Pushes what `publish` is handed to krowk's registry (R-EVID-1);
+    /// none, and the tool says it cannot run.
+    pub publisher: Option<Publisher>,
 }
 
 pub struct Host {
@@ -71,7 +76,7 @@ pub struct Host {
 }
 
 struct Running {
-    cancel: watch::Sender<bool>,
+    cancel: Arc<watch::Sender<bool>>,
     steers: Steers,
 }
 
@@ -173,8 +178,8 @@ impl Host {
     /// `isError`. An error here means no turn ran.
     pub async fn execute(&self, cmd: Command, out: mpsc::Sender<StreamLine>) -> Result<Option<RunResult>, EngineError> {
         match cmd {
-            Command::Prompt { session_id, text, model, permission_mode, toolset, effort } => {
-                self.prompt(session_id.as_deref(), text, model, permission_mode, toolset.as_deref(), effort, out).await.map(Some)
+            Command::Prompt { session_id, text, model, permission_mode, toolset, effort, budget } => {
+                self.prompt(session_id.as_deref(), text, model, permission_mode, toolset.as_deref(), effort, budget.unwrap_or_default(), out).await.map(Some)
             }
             Command::Interrupt { session_id } => {
                 let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
@@ -215,6 +220,7 @@ impl Host {
         permission_mode: PermissionMode,
         toolset: Option<&str>,
         effort: Option<Effort>,
+        limits: BudgetLimits,
         out: mpsc::Sender<StreamLine>,
     ) -> Result<RunResult, EngineError> {
         let started = Instant::now();
@@ -263,12 +269,12 @@ impl Host {
             }
         };
         let effort = effort.or(instance.effort);
-        let mut log = match opened {
-            Some((log, _)) => log,
+        let (mut log, events) = match opened {
+            Some(opened) => opened,
             None => {
                 let (log, root) = SessionLog::create(&self.cfg.sessions_dir, &self.cfg.cwd, &self.cfg.krowk_version).map_err(log_failure)?;
-                let _ = out.send(StreamLine::Log(root)).await;
-                log
+                let _ = out.send(StreamLine::Log(root.clone())).await;
+                (log, vec![root])
             }
         };
         let session_id = log.session_id.clone();
@@ -283,7 +289,7 @@ impl Host {
         let backend_session = past.backend.as_ref().filter(|b| b.instance == model.instance).map(|b| b.session_id.clone());
 
         let turn_id = krowk_store::new_id();
-        let mut w = Writer { log: &mut log, out: &out, turn_id: turn_id.clone(), preset, wire, backend: past.backend.clone() };
+        let mut w = Writer { log: &mut log, out: &out, turn_id: turn_id.clone(), preset, wire, provider: instance.provider.clone(), backend: past.backend.clone() };
         w.log(LogBody::TurnStarted { turn_id: turn_id.clone(), model: model.clone(), provider: engine.provider().into(), wire_api: engine.wire_api(), permission_mode, effort }).await?;
         let prompt_item = Item::UserText { text };
         w.log(LogBody::ItemCompleted { turn_id: turn_id.clone(), item_id: krowk_store::new_id(), item: prompt_item.clone() }).await?;
@@ -291,11 +297,50 @@ impl Host {
         history.push(HistoryItem { item: prompt_item, response: None });
 
         let (cancel_tx, cancel) = watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
         let steers = Steers::default();
-        self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), Running { cancel: cancel_tx, steers: steers.clone() });
-        let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, preset, effort, model_info: info, cancel, steers: steers.clone(), backend_session };
+        self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), Running { cancel: cancel_tx.clone(), steers: steers.clone() });
+        // Everything the session and its subagents have spent, from their
+        // logs; this turn's calls are added as they are metered.
+        let budget = Budget::new(limits, &session_id, &self.cfg.sessions_dir, self.cfg.pricer.clone(), &instance.provider, &model.model, &events);
+        drop(events);
+        let evidence = self.cfg.publisher.clone().map(|p| Evidence::new(p, &session_id, past.run.clone()));
+        let ctx = TurnContext {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            model: model.clone(),
+            history,
+            cwd,
+            permission_mode,
+            preset,
+            effort,
+            model_info: info,
+            cancel,
+            steers: steers.clone(),
+            backend_session,
+            budget: budget.clone(),
+            evidence,
+        };
         let mut tally = Tally::default();
-        let outcome = w.drive(engine.as_ref(), ctx, &mut tally, &model, &instance, &self.cfg.pricer).await;
+        // A backend's calls are the vendor's to make: its turn is not begun
+        // when the session is already at its budget, and is interrupted when
+        // a metered call takes it past (`Writer::handle`). The native loop
+        // asks before each call itself.
+        let watch = (!engine.checks_budget()).then(|| (budget.clone(), cancel_tx.clone()));
+        let before = match &watch {
+            Some((b, _)) => b.admit_turn().await,
+            None => Ok(()),
+        };
+        let outcome = match before {
+            Ok(()) => w.drive(engine.as_ref(), ctx, &mut tally, &model, &budget, watch.as_ref()).await,
+            Err(e) => Err(e),
+        };
+        // A backend turn the budget interrupted failed on it, whatever the
+        // vendor made of the interrupt.
+        let outcome = match tally.tripped.take() {
+            Some(e) => Err(e),
+            None => outcome,
+        };
         // Refused from here on, not queued for a turn that is over; what an
         // interrupted or failed turn never took goes back on its result.
         let unread_steers = steers.close();
@@ -310,7 +355,7 @@ impl Host {
             Err(e) => (TurnStatus::Failed, Some(e.info())),
         };
         let duration_ms = started.elapsed().as_millis() as u64;
-        w.log(LogBody::TurnCompleted { turn_id: turn_id.clone(), status, usage: tally.usage, duration_ms, error: error.clone() }).await?;
+        w.log(LogBody::TurnCompleted { turn_id: turn_id.clone(), status, usage: tally.usage, duration_ms, error: error.clone(), reported_cost_usd: tally.reported }).await?;
         log.sync().map_err(log_failure)?;
         let result = RunResult {
             session_id,
@@ -361,6 +406,8 @@ struct Past {
     model: Option<ModelRef>,
     cwd: Option<PathBuf>,
     backend: Option<BackendRecord>,
+    /// The krowk run its evidence goes under, once `publish` opened one.
+    run: Option<String>,
 }
 
 /// The last `backend.session` of a branch, and the instance it ran on.
@@ -400,7 +447,8 @@ fn replay(branch: &[&LogEvent]) -> Past {
                 }
                 responses += 1;
             }
-            LogBody::TurnCompleted { .. } => {}
+            LogBody::RunOpened { run, .. } => past.run = Some(run.clone()),
+            LogBody::TurnCompleted { .. } | LogBody::SubagentResponse { .. } => {}
         }
     }
     past
@@ -414,6 +462,10 @@ struct Tally {
     unpriced: bool,
     calls: u32,
     last_text: String,
+    /// Why the host interrupted a backend's turn: the budget it went past.
+    tripped: Option<EngineError>,
+    /// What the backend said the turn cost.
+    reported: Option<f64>,
 }
 
 /// Appends and forwards, in that order.
@@ -423,6 +475,8 @@ struct Writer<'a> {
     turn_id: String,
     preset: &'static toolset::Preset,
     wire: WireApi,
+    /// The provider the turn's calls go to, for its context record.
+    provider: String,
     /// The backend session last logged: one that did not change is not
     /// logged again.
     backend: Option<BackendRecord>,
@@ -439,9 +493,24 @@ impl Writer<'_> {
         let _ = self.out.send(StreamLine::Live(ev)).await;
     }
 
+    /// Where a metered call left the turn and the session: the result's
+    /// cost, and R-BUDGET-2's frame for the status bar.
+    async fn spent(&self, session_id: &str, turn_id: String, tally: &mut Tally, spent: &crate::budget::Snapshot) {
+        tally.cost = spent.turn.known_usd;
+        tally.unpriced = !spent.turn.unpriced.is_empty();
+        self.live(LiveEvent::Cost {
+            session_id: session_id.into(),
+            turn_id,
+            cost_usd: spent.total.cost(),
+            turn_cost_usd: spent.turn.cost(),
+            generated_tokens: spent.total.generated(),
+        })
+        .await;
+    }
+
     /// Runs the engine and handles its events as they come. A log that
     /// cannot be written stops the turn: the log is the session.
-    async fn drive(&mut self, engine: &dyn Engine, ctx: TurnContext, tally: &mut Tally, model: &ModelRef, instance: &Resolved, pricer: &crate::host::Pricer) -> Result<TurnEnd, EngineError> {
+    async fn drive(&mut self, engine: &dyn Engine, ctx: TurnContext, tally: &mut Tally, model: &ModelRef, budget: &Budget, watch: Option<&(Budget, Arc<watch::Sender<bool>>)>) -> Result<TurnEnd, EngineError> {
         let (tx, mut rx) = mpsc::channel(256);
         let session_id = ctx.session_id.clone();
         let run = engine.run_turn(ctx, tx);
@@ -452,7 +521,16 @@ impl Writer<'_> {
             tokio::select! {
                 biased;
                 Some(ev) = rx.recv() => {
-                    self.handle(ev, &session_id, tally, &mut texts, model, instance, pricer).await?;
+                    self.handle(ev, &session_id, tally, &mut texts, model, budget).await?;
+                    // A backend past its budget is stopped the way a person
+                    // stops it, keeping what it made.
+                    if let Some((b, cancel)) = watch
+                        && tally.tripped.is_none()
+                        && let Some(e) = b.over()
+                    {
+                        tally.tripped = Some(e);
+                        let _ = cancel.send(true);
+                    }
                 }
                 r = &mut run, if outcome.is_none() => outcome = Some(r),
                 else => break,
@@ -461,8 +539,7 @@ impl Writer<'_> {
         outcome.expect("the loop ends only after the engine does")
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn handle(&mut self, ev: EngineEvent, session_id: &str, tally: &mut Tally, texts: &mut HashMap<String, String>, model: &ModelRef, instance: &Resolved, pricer: &crate::host::Pricer) -> Result<(), EngineError> {
+    async fn handle(&mut self, ev: EngineEvent, session_id: &str, tally: &mut Tally, texts: &mut HashMap<String, String>, model: &ModelRef, budget: &Budget) -> Result<(), EngineError> {
         let turn_id = self.turn_id.clone();
         match ev {
             EngineEvent::Context { system, tools } => {
@@ -470,7 +547,7 @@ impl Writer<'_> {
                     turn_id,
                     time_ms: krowk_store::now_ms(),
                     model: model.clone(),
-                    provider: instance.provider.clone(),
+                    provider: self.provider.clone(),
                     wire_api: self.wire,
                     // A backend brings its own tools; the preset is krowk's.
                     toolset: match self.wire {
@@ -502,15 +579,13 @@ impl Writer<'_> {
                 tally.usage += usage;
                 // Priced by the id the request named; the answering model's
                 // id is the fallback, since a provider may name a snapshot.
-                match pricer(&instance.provider, &model.model, &usage).or_else(|| pricer(&instance.provider, &answered, &usage)) {
-                    Some(usd) => tally.cost += usd,
-                    None => tally.unpriced = true,
-                }
+                let spent = budget.record(&answered, &usage);
                 let said: Vec<&str> = item_ids.iter().filter_map(|id| texts.get(id).map(String::as_str)).collect();
                 if !said.is_empty() {
                     tally.last_text = said.join("\n\n");
                 }
-                self.log(LogBody::ResponseCompleted { turn_id, response_id, model: answered, usage, stop_reason, item_ids }).await?;
+                self.log(LogBody::ResponseCompleted { turn_id: turn_id.clone(), response_id, model: answered, usage, stop_reason, item_ids }).await?;
+                self.spent(session_id, turn_id, tally, &spent).await;
             }
             EngineEvent::BackendSession { backend, session_id: vendor, transcript, billing } => {
                 let rec = BackendRecord { instance: model.instance.clone(), session_id: vendor.clone(), transcript: transcript.clone(), billing };
@@ -518,6 +593,24 @@ impl Writer<'_> {
                     self.log(LogBody::BackendSession { turn_id, backend, vendor_session_id: vendor, transcript_path: transcript, billing }).await?;
                     self.backend = Some(rec);
                 }
+            }
+            EngineEvent::RunOpened { run } => {
+                self.log(LogBody::RunOpened { turn_id, run }).await?;
+            }
+            // Metered, logged apart from the conversation, and counted.
+            EngineEvent::SubagentResponse { response_id, model: answered, usage } => {
+                tally.usage += usage;
+                let spent = budget.record_subagent(&answered, &usage);
+                self.log(LogBody::SubagentResponse { turn_id: turn_id.clone(), response_id, model: answered, usage }).await?;
+                self.spent(session_id, turn_id, tally, &spent).await;
+            }
+            EngineEvent::ReportedCost { usd } => {
+                tally.reported = Some(usd);
+                let spent = budget.reported(usd);
+                self.spent(session_id, turn_id, tally, &spent).await;
+            }
+            EngineEvent::Notice { text } => {
+                self.live(LiveEvent::Notice { session_id: session_id.into(), turn_id, text }).await;
             }
         }
         Ok(())

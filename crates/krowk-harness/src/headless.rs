@@ -44,6 +44,8 @@ pub struct Options {
     pub toolset: Option<String>,
     /// `--effort`: the reasoning effort for this prompt, on krowk's ladder.
     pub effort: Option<crate::protocol::Effort>,
+    /// `--max-usd` and `--max-tokens`: what the session may spend.
+    pub budget: Option<crate::protocol::BudgetLimits>,
     pub format: OutputFormat,
 }
 
@@ -71,7 +73,7 @@ async fn drive(host: Host, opts: Options, stdout: &mut dyn Write) -> Outcome {
     // A resumed session's id is known up front; a new one's arrives with
     // its root event.
     let mut session_id: Option<String> = opts.resume.clone();
-    let cmd = Command::Prompt { session_id: opts.resume, text: opts.prompt, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, effort: opts.effort };
+    let cmd = Command::Prompt { session_id: opts.resume, text: opts.prompt, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, effort: opts.effort, budget: opts.budget };
     let exec = host.execute(cmd, tx);
     tokio::pin!(exec);
     let mut done: Option<Result<Option<RunResult>, EngineError>> = None;
@@ -96,7 +98,11 @@ async fn drive(host: Host, opts: Options, stdout: &mut dyn Write) -> Outcome {
                 if session_id.is_none() {
                     session_id = Some(line_session(&line).to_string());
                 }
-                if format == OutputFormat::StreamJson {
+                // A notice is the person's alone (a claim token is a secret):
+                // the terminal's stderr, never stdout, which a program reads.
+                if let StreamLine::Live(LiveEvent::Notice { text, .. }) = &line {
+                    let _ = writeln!(std::io::stderr(), "! {text}");
+                } else if format == OutputFormat::StreamJson {
                     let _ = writeln!(stdout, "{}", serde_json::to_string(&line).expect("a stream line serializes"));
                     let _ = stdout.flush();
                 }
@@ -154,6 +160,7 @@ fn line_session(line: &StreamLine) -> &str {
     match line {
         StreamLine::Log(ev) => &ev.session_id,
         StreamLine::Live(LiveEvent::ItemStarted { session_id, .. } | LiveEvent::ItemDelta { session_id, .. }) => session_id,
+        StreamLine::Live(LiveEvent::Cost { session_id, .. } | LiveEvent::Notice { session_id, .. }) => session_id,
         StreamLine::Live(LiveEvent::Result(r)) => &r.session_id,
     }
 }

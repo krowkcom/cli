@@ -92,6 +92,10 @@ impl Home {
     }
 
     fn host(&self, instances: Vec<(&str, InstanceKind)>, gate: trust::Gate) -> Host {
+        self.host_publishing(instances, gate, None)
+    }
+
+    fn host_publishing(&self, instances: Vec<(&str, InstanceKind)>, gate: trust::Gate, publisher: Option<krowk_harness::evidence::Publisher>) -> Host {
         let cfg = InstancesConfig { instances: instances.into_iter().map(|(n, k)| (n.to_string(), k)).collect(), ..Default::default() };
         Host::new(HostConfig {
             sessions_dir: log::sessions_dir(&self.env()).unwrap(),
@@ -102,6 +106,7 @@ impl Home {
             catalog: Arc::new(|_, _| None),
             credentials: self.root.join("home/.config/krowk/providers/credentials.json"),
             trust: gate,
+            publisher,
         })
     }
 
@@ -121,6 +126,10 @@ fn rt() -> tokio::runtime::Runtime {
 }
 
 fn prompt(session_id: Option<&str>, text: &str, model: &str, mode: PermissionMode) -> Command {
+    prompt_within(session_id, text, model, mode, None)
+}
+
+fn prompt_within(session_id: Option<&str>, text: &str, model: &str, mode: PermissionMode, budget: Option<krowk_harness::protocol::BudgetLimits>) -> Command {
     let (instance, model) = model.split_once('/').unwrap();
     Command::Prompt {
         session_id: session_id.map(String::from),
@@ -129,6 +138,7 @@ fn prompt(session_id: Option<&str>, text: &str, model: &str, mode: PermissionMod
         permission_mode: mode,
         toolset: None,
         effort: None,
+        budget,
     }
 }
 
@@ -560,4 +570,125 @@ fn r_inst_1_a_router_instance_gets_its_key_from_the_variable_it_names() {
     assert!(fake.contains("env ANTHROPIC_AUTH_TOKEN=sk-or-fake") && fake.contains("ANTHROPIC_BASE_URL=https://router.example/api"), "{fake}");
     assert!(fake.contains("env ANTHROPIC_API_KEY= "), "the token goes where a router reads it, not as an API key: {fake}");
     assert_eq!(processes(&fake), 1);
+}
+
+/// R-EVID-1: a backend is offered `publish` through the bridge, and it runs
+/// the host's publisher for the krowk session, in its working directory —
+/// the run it opens logged once, like a native session's.
+#[test]
+fn r_evid_1_claude_code_publishes_through_krowks_bridge() {
+    let home = Home::new("publish");
+    let dir = home.signed_in("cfg-work");
+    let asked: Arc<std::sync::Mutex<Vec<krowk_harness::evidence::PublishRequest>>> = Arc::default();
+    let seen = asked.clone();
+    let publisher: krowk_harness::evidence::Publisher = Arc::new(move |r: &krowk_harness::evidence::PublishRequest| {
+        seen.lock().unwrap().push(r.clone());
+        Ok(krowk_harness::evidence::Published { text: "Artifact art_1 — shot.png\nhttps://krowk.com/a/art_1".into(), run: Some("run_1".into()), for_person: Vec::new() })
+    });
+    let host = home.host_publishing(vec![("claude:work", home.instance(&dir, Some("publish.jsonl")))], trust::allow_all(), Some(publisher));
+    rt().block_on(async {
+        let (lines, r) = run(&host, prompt(None, "publish the screenshot", "claude:work/sonnet", PermissionMode::AcceptEdits)).await;
+        let r = r.unwrap().unwrap();
+        assert_eq!(r.status, TurnStatus::Completed, "{:?}", r.error);
+        let items = completed(&lines);
+        let result = items.iter().find_map(|i| match i {
+            Item::ToolResult { output, is_error: false, .. } => Some(output.clone()),
+            _ => None,
+        });
+        assert_eq!(result.as_deref(), Some("Artifact art_1 — shot.png\nhttps://krowk.com/a/art_1"), "{items:?}");
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert_eq!((asked[0].session_id.as_str(), asked[0].files.clone(), asked[0].root.clone()), (r.session_id.as_str(), vec!["shot.png".to_string()], home.root.join("repo")));
+        let runs: Vec<String> = home
+            .events(&r.session_id)
+            .into_iter()
+            .filter_map(|e| match e.body {
+                LogBody::RunOpened { run, .. } => Some(run),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs, ["run_1"]);
+        host.shutdown().await;
+    });
+    assert!(home.fake_log().contains(r#""name":"publish""#), "tools/list offered it");
+}
+
+/// R-BUDGET-1 for a backend: its calls are Claude Code's to make, so the
+/// host interrupts the turn once a metered call has gone past the limit,
+/// and refuses the next turn before it starts.
+#[test]
+fn r_budget_1_a_backend_turn_over_its_budget_is_interrupted_and_the_next_refused() {
+    let home = Home::new("budget");
+    let dir = home.signed_in("cfg-work");
+    let host = home.host(vec![("claude:work", home.instance(&dir, Some("session_info.jsonl")))], trust::allow_all());
+    let limits = Some(krowk_harness::protocol::BudgetLimits { max_tokens: Some(50), max_usd: None });
+    rt().block_on(async {
+        // The first call generates 74 tokens, past 50: the turn stops there.
+        let (_, r) = run(&host, prompt_within(None, "what session is this?", "claude:work/sonnet", PermissionMode::Default, limits)).await;
+        let r = r.unwrap().unwrap();
+        assert_eq!(r.status, TurnStatus::Failed);
+        let e = r.error.unwrap();
+        assert_eq!(e.code, "budget_exceeded");
+        assert!(e.message.contains("74 tokens generated, over --max-tokens 50") && e.message.contains("interrupted"), "{}", e.message);
+        let before = home.fake_log().matches("in {\"type\":\"user\"").count();
+        let (_, next) = run(&host, prompt_within(Some(&r.session_id), "and again", "claude:work/sonnet", PermissionMode::Default, limits)).await;
+        let next = next.unwrap().unwrap();
+        assert_eq!(next.error.map(|e| e.code).as_deref(), Some("budget_exceeded"));
+        assert_eq!(home.fake_log().matches("in {\"type\":\"user\"").count(), before, "the refused turn never reached Claude Code");
+        host.shutdown().await;
+    });
+}
+
+/// R-BUDGET-1: what Claude Code's own subagent (`Task`) spends is the
+/// session's spend. Its calls are metered and logged apart from the
+/// conversation, and Claude Code's reported total counts when krowk could
+/// not price the calls itself — here it prices nothing.
+#[test]
+fn r_budget_1_claude_codes_subagent_calls_count_toward_the_budget() {
+    let home = Home::new("subagent");
+    let dir = home.signed_in("cfg-work");
+    let host = home.host(vec![("claude:work", home.instance(&dir, Some("subagent.jsonl")))], trust::allow_all());
+    within(Box::pin(async {
+        let (lines, r) = run(&host, prompt_within(None, "look around", "claude:work/sonnet", PermissionMode::Default, Some(krowk_harness::protocol::BudgetLimits { max_tokens: Some(100), max_usd: None }))).await;
+        let r = r.unwrap().unwrap();
+        // 9 + 8 of its own, 600 of its subagent's: over 100, so interrupted.
+        assert_eq!(r.error.as_ref().map(|e| e.code.as_str()), Some("budget_exceeded"), "{r:?}");
+        assert!(r.error.as_ref().unwrap().message.contains("tokens generated, over --max-tokens 100"), "{r:?}");
+        let events = home.events(&r.session_id);
+        let sub: Vec<i64> = events.iter().filter_map(|e| match &e.body {
+            LogBody::SubagentResponse { usage, .. } => Some(usage.output_tokens),
+            _ => None,
+        }).collect();
+        assert_eq!(sub, [600], "logged once, apart from the conversation");
+        assert!(!completed(&lines).iter().any(|i| matches!(i, Item::AssistantText { text } if text == "the subagent looked")));
+        assert!(r.usage.output_tokens >= 609, "{:?}", r.usage);
+        host.shutdown().await;
+    }));
+    // One Home at a time: the next takes the lock this one holds.
+    drop(host);
+    drop(home);
+    // Without a limit: Claude Code's reported total prices what krowk could not.
+    let home = Home::new("subagent-cost");
+    let dir = home.signed_in("cfg-work");
+    let host = home.host(vec![("claude:work", home.instance(&dir, Some("subagent.jsonl")))], trust::allow_all());
+    within(Box::pin(async {
+        let (lines, r) = run(&host, prompt(None, "look around", "claude:work/sonnet", PermissionMode::Default)).await;
+        let r = r.unwrap().unwrap();
+        assert_eq!(r.status, TurnStatus::Completed, "{:?}", r.error);
+        assert_eq!(r.cost_usd, Some(0.3));
+        let last_cost = lines.iter().rev().find_map(|l| match l {
+            StreamLine::Live(LiveEvent::Cost { cost_usd, .. }) => Some(*cost_usd),
+            _ => None,
+        });
+        assert_eq!(last_cost, Some(Some(0.3)));
+        let events = home.events(&r.session_id);
+        assert!(events.iter().any(|e| matches!(&e.body, LogBody::TurnCompleted { reported_cost_usd: Some(c), .. } if *c == 0.3)));
+        host.shutdown().await;
+    }));
+}
+
+/// Runs `f` on a runtime of its own, and fails rather than hangs when it
+/// does not finish in 30 s: a turn that never ends is a test failure.
+fn within<F: std::future::Future>(f: F) -> F::Output {
+    rt().block_on(async { tokio::time::timeout(std::time::Duration::from_secs(30), f).await.expect("finished within 30 s") })
 }

@@ -439,6 +439,7 @@ impl Engine for CodexEngine {
                 mode: ctx.permission_mode,
                 krowk_version: self.krowk_version.clone(),
                 protected: self.backend().home.iter().chain(&self.backend().shared_home).cloned().collect(),
+                evidence: ctx.evidence.clone(),
             };
             // The running process serves this turn when it is alive and in
             // the same sandbox; another mode is another thread setting,
@@ -503,11 +504,15 @@ struct Answers {
     krowk_version: String,
     /// The instance's home: no edit reaches it.
     protected: Vec<PathBuf>,
+    /// Where a bridged `publish` sends files.
+    evidence: Option<crate::evidence::Evidence>,
 }
 
 impl Answers {
     /// The answer to one of Codex's requests: a result, or a JSON-RPC error.
-    fn answer(&self, method: &str, params: &Value, t: &mut Translator) -> Result<Value, (i64, String)> {
+    /// `events` is where a run `publish` opens is reported: none while a
+    /// process is being set up, before a turn has anywhere to report to.
+    async fn answer(&self, method: &str, params: &Value, t: &mut Translator, events: Option<&Events>) -> Result<Value, (i64, String)> {
         let item = str_of(params, "itemId").to_string();
         // A decline's reason is kept for the call's result: Codex tells the
         // model only that it was declined.
@@ -539,7 +544,7 @@ impl Answers {
                 Ok(json!({ "answers": answers }))
             }
             "mcpServer/elicitation/request" => Ok(json!({"action": "decline"})),
-            "item/tool/call" => Ok(self.tool_call(params)),
+            "item/tool/call" => Ok(self.tool_call(params, events).await),
             // The requests of Codex's first protocol, for a Codex that
             // still sends them.
             "applyPatchApproval" => {
@@ -553,15 +558,24 @@ impl Answers {
     }
 
     /// A call of one of krowk's tools, run by the bridge as a `tools/call`.
-    fn tool_call(&self, params: &Value) -> Value {
+    async fn tool_call(&self, params: &Value, events: Option<&Events>) -> Value {
         let namespace = params.get("namespace").and_then(Value::as_str).unwrap_or_default();
         let tool = str_of(params, "tool");
         if namespace != bridge::SERVER {
             return json!({"contentItems": [{"type": "inputText", "text": format!("krowk has no tool {tool:?} in the namespace {namespace:?} — its tools are in {:?}", bridge::SERVER)}], "success": false});
         }
-        let env = BridgeEnv { session_id: &self.session_id, turn_id: &self.turn_id, model: &self.model, cwd: &self.cwd, backend: BACKEND, krowk_version: &self.krowk_version };
+        let env = BridgeEnv {
+            session_id: &self.session_id,
+            turn_id: &self.turn_id,
+            model: &self.model,
+            cwd: &self.cwd,
+            backend: BACKEND,
+            krowk_version: &self.krowk_version,
+            permission_mode: self.mode,
+            evidence: self.evidence.as_ref().zip(events),
+        };
         let call = json!({"jsonrpc": "2.0", "id": 0, "method": "tools/call", "params": {"name": tool, "arguments": params.get("arguments").cloned().unwrap_or(Value::Null)}});
-        let answer = bridge::handle(&call, &env);
+        let answer = bridge::handle(&call, &env).await;
         let text = answer.pointer("/result/content").and_then(Value::as_array).map(|a| a.iter().filter_map(|c| c.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")).unwrap_or_default();
         let failed = answer.pointer("/result/isError").and_then(Value::as_bool).unwrap_or(true);
         json!({"contentItems": [{"type": "inputText", "text": text}], "success": !failed})
@@ -845,7 +859,7 @@ impl Proc {
                 let Some(msg) = next_msg(&mut self.out).await else { return Err(self.died(&format!("before it answered {method}"))) };
                 match msg {
                     Msg::Request { id, method, params } => {
-                        let answer = ask.answer(&method, &params, &mut scratch);
+                        let answer = ask.answer(&method, &params, &mut scratch, None).await;
                         self.reply(id, answer).await?;
                     }
                     Msg::Response { id: got, result } if got.as_u64() == Some(id) => {
@@ -1032,7 +1046,7 @@ impl Proc {
                                 Some(Pending::Interrupt) | None => {}
                             },
                             Msg::Request { id, method, params } => {
-                                let answer = ask.answer(&method, &params, &mut t);
+                                let answer = ask.answer(&method, &params, &mut t, Some(events)).await;
                                 self.reply(id, answer).await?;
                             }
                             Msg::Note { method, params } => {
@@ -1297,22 +1311,28 @@ mod tests {
             mode: PermissionMode::Default,
             krowk_version: "test".into(),
             protected: vec![],
+            evidence: None,
         };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let mut t = Translator::default();
-        let a = ask.answer("item/tool/call", &json!({"threadId": "th", "turnId": "tu", "callId": "c", "namespace": "krowk", "tool": "session_info", "arguments": {}}), &mut t).unwrap();
+        let a = rt.block_on(ask.answer("item/tool/call", &json!({"threadId": "th", "turnId": "tu", "callId": "c", "namespace": "krowk", "tool": "session_info", "arguments": {}}), &mut t, None)).unwrap();
         assert_eq!(a["success"], true);
         let text = a["contentItems"][0]["text"].as_str().unwrap();
         assert!(text.contains("krowk session: s-1") && text.contains("instance: codex:team") && text.contains("backend: codex-app-server"), "{text}");
-        assert_eq!(ask.answer("item/tool/call", &json!({"namespace": "other", "tool": "x", "arguments": {}}), &mut t).unwrap()["success"], false);
-        assert_eq!(ask.answer("item/commandExecution/requestApproval", &json!({"itemId": "c1"}), &mut t).unwrap()["decision"], "decline");
+        assert_eq!(rt.block_on(ask.answer("item/tool/call", &json!({"namespace": "other", "tool": "x", "arguments": {}}), &mut t, None)).unwrap()["success"], false);
+        assert_eq!(rt.block_on(ask.answer("item/commandExecution/requestApproval", &json!({"itemId": "c1"}), &mut t, None)).unwrap()["decision"], "decline");
         assert!(t.declined["c1"].contains("bypassPermissions"), "the reason is kept for the call's result");
-        assert_eq!(ask.answer("item/fileChange/requestApproval", &json!({"itemId": "f1"}), &mut t).unwrap()["decision"], "decline");
-        assert_eq!(ask.answer("item/permissions/requestApproval", &json!({"itemId": "p1"}), &mut t).unwrap(), json!({"permissions": {}, "scope": "turn"}));
-        assert_eq!(ask.answer("mcpServer/elicitation/request", &json!({}), &mut t).unwrap()["action"], "decline");
-        let q = ask.answer("item/tool/requestUserInput", &json!({"questions": [{"id": "q1", "header": "h", "question": "which?"}]}), &mut t).unwrap();
+        assert_eq!(rt.block_on(ask.answer("item/fileChange/requestApproval", &json!({"itemId": "f1"}), &mut t, None)).unwrap()["decision"], "decline");
+        assert_eq!(rt.block_on(ask.answer("item/permissions/requestApproval", &json!({"itemId": "p1"}), &mut t, None)).unwrap(), json!({"permissions": {}, "scope": "turn"}));
+        assert_eq!(rt.block_on(ask.answer("mcpServer/elicitation/request", &json!({}), &mut t, None)).unwrap()["action"], "decline");
+        let q = rt.block_on(ask.answer("item/tool/requestUserInput", &json!({"questions": [{"id": "q1", "header": "h", "question": "which?"}]}), &mut t, None)).unwrap();
         assert!(q["answers"]["q1"]["answers"][0].as_str().unwrap().contains("decide"));
-        assert_eq!(ask.answer("execCommandApproval", &json!({}), &mut t).unwrap()["decision"], "denied");
-        assert_eq!(ask.answer("account/chatgptAuthTokens/refresh", &json!({}), &mut t).unwrap_err().0, -32601, "krowk never handles Codex's tokens");
+        assert_eq!(rt.block_on(ask.answer("execCommandApproval", &json!({}), &mut t, None)).unwrap()["decision"], "denied");
+        // publish is offered too, and held to what an edit is.
+        let refused = rt.block_on(ask.answer("item/tool/call", &json!({"namespace": "krowk", "tool": "publish", "arguments": {"files": ["a.png"]}}), &mut t, None)).unwrap();
+        assert_eq!(refused["success"], false);
+        assert!(refused["contentItems"][0]["text"].as_str().unwrap().contains("--permission-mode acceptEdits"), "{refused}");
+        assert_eq!(rt.block_on(ask.answer("account/chatgptAuthTokens/refresh", &json!({}), &mut t, None)).unwrap_err().0, -32601, "krowk never handles Codex's tokens");
     }
 
     #[test]

@@ -124,8 +124,10 @@ impl Server<'_> {
 /// A path allowed to be pushed: resolved through its symlinks before the
 /// check, inside the root, no credential name on the way, and not a file with
 /// a second name — a hard link is a key outside the root with nothing to resolve.
-fn permit(root: &Path, path: &str) -> Result<String, Error> {
-    let real = std::fs::canonicalize(path)
+/// A relative path resolves from `base`: the working directory when it is
+/// empty, the session's for the harness's `publish`.
+fn permit(root: &Path, base: &Path, path: &str) -> Result<String, Error> {
+    let real = std::fs::canonicalize(base.join(path))
         .map_err(|_| fail("file_unreadable", format!("cannot read `{path}` — paths resolve from the working directory")))?;
     let Ok(rel) = real.strip_prefix(root) else {
         return Err(fail(
@@ -260,6 +262,74 @@ impl Server<'_> {
     }
 }
 
+/// `publish`, the harness's evidence tool (R-EVID-1): krowk_push for a krowk
+/// session, run with the session's working directory as the root, so its
+/// confinement, its credential-file and hard-link refusals are krowk_push's
+/// own, unchanged. With a key, the session's first publish opens its run —
+/// the session recorded on it — and every artifact is tagged with the
+/// session (`krowk.session`) and attached to that run; without one the
+/// upload is anonymous and belongs to no run, and the result says where to
+/// look.
+#[cfg(feature = "harness")]
+impl Server<'_> {
+    pub fn publish(&self, req: &krowk_harness::evidence::PublishRequest) -> Result<krowk_harness::evidence::Published, String> {
+        self.publish_session(req).map_err(|e| describe_error(&e))
+    }
+
+    fn publish_session(&self, req: &krowk_harness::evidence::PublishRequest) -> Result<krowk_harness::evidence::Published, Error> {
+        let keyed = self.authenticated() && self.workspace_err.is_none();
+        let mut run = req.run.clone();
+        if run.is_none() && keyed {
+            // A publish that would be refused opens no run.
+            let root = self.resolve_root()?;
+            for f in &req.files {
+                permit(&root, &req.root, f)?;
+            }
+            let meta = runctx::resolve_in(
+                self.env,
+                Overrides { session: req.session_id.clone(), agent: "krowk".into(), client: format!("krowk/{}", self.version), ..Overrides::default() },
+                Some(&req.root),
+            );
+            run = Some(self.client.create_run(&serde_json::to_value(&meta).expect("metadata serializes"))?.slug);
+        }
+        let mut metadata = BTreeMap::new();
+        if keyed {
+            metadata.insert("krowk.session", req.session_id.clone());
+            // Pushed by krowk's engine, through its MCP server's code.
+            metadata.insert("krowk.client", format!("krowk/{}", self.version));
+            if let Some(c) = &req.caption {
+                metadata.insert("krowk.caption", c.clone());
+            }
+        }
+        let args = json!({ "files": req.files, "run": run.clone().unwrap_or_default(), "metadata": metadata });
+        let (_, pushed) = self.push_from(&req.root, &args)?;
+        // A keyless upload's claim token is a secret the person spends:
+        // what the model reads is logged, sent to the provider on every
+        // later call and printed by stream-json, so it never carries one.
+        // The claim command goes to the person alone.
+        let mut artifacts: Vec<Artifact> = serde_json::from_value(pushed["artifacts"].clone()).unwrap_or_default();
+        let opened: Option<Run> = pushed.get("run").and_then(|r| serde_json::from_value(r.clone()).ok());
+        let notes: Vec<String> = pushed.get("notes").and_then(|n| serde_json::from_value(n.clone()).ok()).unwrap_or_default();
+        let for_person: Vec<String> = artifacts
+            .iter()
+            .filter(|a| !a.claim_token.is_empty())
+            .map(|a| format!("{} is anonymous and expires within the day — keep it with `{}` (the token is a secret, shown once: do not paste it anywhere public)", a.filename, output::claim_crumb(a).cmd))
+            .collect();
+        for a in &mut artifacts {
+            a.claim_token.clear();
+        }
+        let (mut text, _) = render_push(&artifacts, opened.as_ref(), &notes);
+        if !for_person.is_empty() {
+            text += "\n\nThe command that keeps this anonymous upload past its expiry carries a secret, so it was shown to the person rather than to you.";
+        }
+        match &run {
+            Some(r) => text += &format!("\n\nGrouped under run {r}, this krowk session's run."),
+            None => text += "\n\nNo API key was found, so this upload is anonymous and belongs to no run — `krowk doctor` shows where krowk looks for one.",
+        }
+        Ok(krowk_harness::evidence::Published { text, run, for_person })
+    }
+}
+
 fn tool_result(text: &str, structured: Option<Value>, is_error: bool) -> Value {
     let mut result = json!({ "content": [{ "type": "text", "text": text }], "isError": is_error });
     if let Some(s) = structured {
@@ -341,6 +411,11 @@ impl Server<'_> {
     }
 
     fn push(&self, args: &Value) -> Outcome {
+        self.push_from(Path::new(""), args)
+    }
+
+    /// krowk_push, with relative paths resolved from `base`.
+    fn push_from(&self, base: &Path, args: &Value) -> Outcome {
         let a: PushArgs = arguments(
             args,
             "the arguments are not the shape this tool takes: `files` is an array of paths, `links` an array of {url, title, rel} objects — see the tool's schema",
@@ -358,10 +433,10 @@ impl Server<'_> {
         }
         let named_run = parse_slug(KIND_RUN, &a.run)?;
         let root = self.resolve_root()?;
-        let files = a.files.iter().map(|p| permit(&root, p)).collect::<Result<Vec<_>, _>>()?;
+        let files = a.files.iter().map(|p| permit(&root, base, p)).collect::<Result<Vec<_>, _>>()?;
         let specs = files.iter().map(|p| krowk_api::spec::inspect(p)).collect::<Result<Vec<_>, _>>()?;
 
-        let resolved = runctx::resolve(
+        let resolved = runctx::resolve_in(
             self.env,
             Overrides {
                 repo: a.repo.clone(),
@@ -374,6 +449,7 @@ impl Server<'_> {
                 title: a.title.clone(),
                 client: format!("krowk-mcp/{}", self.version),
             },
+            (!base.as_os_str().is_empty()).then_some(base),
         );
         let (mut run, mut run_slug, mut own_run): (Option<Run>, String, bool) = (None, named_run.clone(), false);
         if run_slug.is_empty() && self.authenticated() {

@@ -67,6 +67,13 @@ impl SessionLog {
     /// A new session: its directory, and the root event, whose id is the
     /// session's id.
     pub fn create(sessions: &Path, cwd: &Path, krowk_version: &str) -> Result<(SessionLog, LogEvent), LogError> {
+        SessionLog::create_child(sessions, cwd, krowk_version, None)
+    }
+
+    /// A new session spawned by `parent` — a subagent — or a top-level one
+    /// when there is none. The root names the parent, which is how a budget
+    /// finds what a session's subagents spent.
+    pub fn create_child(sessions: &Path, cwd: &Path, krowk_version: &str, parent: Option<&str>) -> Result<(SessionLog, LogEvent), LogError> {
         let session_id = krowk_store::new_id();
         let dir = sessions.join(&session_id);
         private_dir(&dir).map_err(|e| io(format_args!("create {}", dir.display()), e))?;
@@ -76,7 +83,12 @@ impl SessionLog {
             parent_id: None,
             session_id,
             time_ms: krowk_store::now_ms(),
-            body: LogBody::SessionStarted { cwd: cwd.display().to_string(), krowk_version: krowk_version.into(), protocol_version: PROTOCOL_VERSION },
+            body: LogBody::SessionStarted {
+                cwd: cwd.display().to_string(),
+                krowk_version: krowk_version.into(),
+                protocol_version: PROTOCOL_VERSION,
+                parent_session_id: parent.map(String::from),
+            },
         };
         log.write(&root)?;
         log.head = Some(root.id.clone());

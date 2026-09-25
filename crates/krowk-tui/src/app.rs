@@ -88,6 +88,10 @@ pub struct App {
     /// Session totals: this run's turns plus a resumed session's past ones.
     cost: f64,
     unpriced: bool,
+    /// The host's own figure for the session and its subagents, from the
+    /// last `cost` frame of the running turn (R-BUDGET-2): shown instead of
+    /// adding the turn's result on top.
+    costed: bool,
     usage: Usage,
     turns: u32,
     /// Some(target) while the API cannot be reached.
@@ -135,6 +139,7 @@ impl App {
             model,
             cost: 0.0,
             unpriced: false,
+            costed: false,
             usage: Usage::default(),
             turns: 0,
             offline: None,
@@ -340,6 +345,21 @@ impl App {
             }
             StreamLine::Live(LiveEvent::ItemDelta { item_id, delta: Delta::Text { text }, .. }) => self.on_text(item_id, text),
             StreamLine::Live(LiveEvent::ItemDelta { .. }) => {}
+            // The session's spend after each metered call, subagents
+            // included, priced by the host: the status bar shows it as is.
+            StreamLine::Live(LiveEvent::Cost { cost_usd, .. }) => {
+                match cost_usd {
+                    Some(usd) => {
+                        self.cost = *usd;
+                        self.unpriced = false;
+                    }
+                    None => self.unpriced = true,
+                }
+                self.costed = true;
+                self.dirty = true;
+            }
+            // For the person alone (a claim command): shown, never logged.
+            StreamLine::Live(LiveEvent::Notice { text, .. }) => self.notice(text),
             StreamLine::Live(LiveEvent::Result(r)) => self.on_result(r),
         }
     }
@@ -397,7 +417,7 @@ impl App {
                 }
             }
             LogBody::ItemCompleted { item_id, item, .. } => self.on_item(item_id, item, live),
-            LogBody::ResponseCompleted { usage, model, .. } => {
+            LogBody::ResponseCompleted { usage, model, .. } | LogBody::SubagentResponse { usage, model, .. } => {
                 self.usage += *usage;
                 // A live turn's cost arrives with its result; a replayed
                 // one is priced here, the way the host priced it.
@@ -412,6 +432,8 @@ impl App {
                     }
                 }
             }
+            // The run the session's evidence goes under: the log's to keep.
+            LogBody::RunOpened { .. } => {}
             LogBody::TurnCompleted { status, usage, duration_ms, error, .. } => {
                 self.turns += 1;
                 self.finish_live();
@@ -511,9 +533,12 @@ impl App {
 
     fn on_result(&mut self, r: &RunResult) {
         self.session_id = Some(r.session_id.clone());
-        match r.cost_usd {
-            Some(usd) => self.cost += usd,
-            None => self.unpriced = true,
+        // A turn that made a call has already said where the session stands.
+        if !std::mem::take(&mut self.costed) {
+            match r.cost_usd {
+                Some(usd) => self.cost += usd,
+                None => self.unpriced = true,
+            }
         }
         self.dirty = true;
     }
@@ -865,7 +890,7 @@ mod tests {
             ev(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "2".into(), item: Item::ToolCall { call_id: "c".into(), name: "read".into(), input: serde_json::json!({"path": "README.md"}) } }),
             ev(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "3".into(), item: Item::ToolResult { call_id: "c".into(), output: "# krowk\nmore\n".into(), is_error: false } }),
             ev(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "4".into(), item: Item::AssistantText { text: "It is a CLI.".into() } }),
-            ev(LogBody::TurnCompleted { turn_id: "t".into(), status: TurnStatus::Completed, usage: Usage { input_tokens: 1200, ..Usage::default() }, duration_ms: 1500, error: None }),
+            ev(LogBody::TurnCompleted { turn_id: "t".into(), status: TurnStatus::Completed, usage: Usage { input_tokens: 1200, ..Usage::default() }, duration_ms: 1500, error: None, reported_cost_usd: None }),
         ];
         a.replay(&evs.iter().collect::<Vec<_>>());
         assert_eq!(text(&a.take_pending()), ["❯ hi", "", "◆ Read README.md (2 lines)", "", "It is a CLI.", "Worked for 1.5s · 1.2k tokens"]);
@@ -884,6 +909,40 @@ mod tests {
         let (rows, _) = a.view(Instant::now());
         assert!(!text(&rows).join("\n").contains("no network"));
         assert!(a.status_bar().contains("online"));
+    }
+
+    #[test]
+    fn r_budget_2_the_status_bar_shows_the_hosts_live_cost_and_the_result_is_not_added_twice() {
+        let mut a = app();
+        a.settings = Settings { status_bar: true, status_items: vec![StatusItem::Cost] };
+        let cost = |usd: Option<f64>| live(LiveEvent::Cost { session_id: "s".into(), turn_id: "t".into(), cost_usd: usd, turn_cost_usd: usd, generated_tokens: 10 });
+        // A resumed session's earlier turns and its subagents are in the
+        // host's figure, so it replaces what the TUI had.
+        a.on_line(&cost(Some(1.25)));
+        assert_eq!(a.status_bar(), "$1.25", "live, before the turn ends");
+        a.on_line(&cost(Some(1.5)));
+        assert_eq!(a.status_bar(), "$1.50");
+        let result = RunResult {
+            session_id: "s".into(),
+            turn_id: "t".into(),
+            status: TurnStatus::Completed,
+            is_error: false,
+            result: String::new(),
+            model: ModelRef { instance: "anthropic".into(), model: "claude-x".into() },
+            usage: Usage::default(),
+            cost_usd: Some(0.25),
+            duration_ms: 1,
+            num_model_calls: 1,
+            error: None,
+            unread_steers: Vec::new(),
+        };
+        a.on_line(&live(LiveEvent::Result(result.clone())));
+        assert_eq!(a.status_bar(), "$1.50", "the result's cost is already in the frame");
+        // A turn that made no call adds its result, as before.
+        a.on_line(&live(LiveEvent::Result(RunResult { cost_usd: Some(0.0), ..result })));
+        assert_eq!(a.status_bar(), "$1.50");
+        a.on_line(&cost(None));
+        assert_eq!(a.status_bar(), "$1.50", "an unknown price keeps what is known");
     }
 
     #[test]

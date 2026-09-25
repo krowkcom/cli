@@ -66,7 +66,7 @@ impl Source for Krowk {
 pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
     let head = events.last()?.id.clone();
     let branch = log::branch(events, &head);
-    let LogBody::SessionStarted { cwd, .. } = &branch.first()?.body else { return None };
+    let LogBody::SessionStarted { cwd, parent_session_id, .. } = &branch.first()?.body else { return None };
     let session_id = branch[0].session_id.clone();
     let mut th = Thread {
         worktree: krowk_import::worktree_for(cwd),
@@ -77,6 +77,9 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
             foreign_session_id: session_id.clone(),
             resume_cmd: format!("krowk -p --resume {session_id}"),
         },
+        // A subagent names the session that spawned it, so krowk.db's
+        // session tree — and `krowk sessions budget` — counts its spend there.
+        parent: parent_session_id.as_ref().map(|p| Binding { provider: HARNESS.into(), harness: HARNESS.into(), foreign_session_id: p.clone(), resume_cmd: String::new() }),
         ..Thread::default()
     };
     // Items waiting for the response that claims them. Items no response
@@ -92,7 +95,9 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
         match &ev.body {
             // The vendor's own record of a backend session stays in the log:
             // krowk.db lists the krowk session, not a second copy of it.
-            LogBody::SessionStarted { .. } | LogBody::BackendSession { .. } => {}
+            // So does the run its evidence went to: the registry holds the
+            // run, and the tool result that published names it.
+            LogBody::SessionStarted { .. } | LogBody::BackendSession { .. } | LogBody::RunOpened { .. } => {}
             LogBody::TurnStarted { model, provider: p, .. } => {
                 flush(&mut th, &mut pending, &provider, turn);
                 provider.clone_from(p);
@@ -123,6 +128,13 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
                 }
                 let usage_json = serde_json::to_string(usage).expect("usage serializes");
                 th.messages.push(message(Role::Assistant, &provider, model, &ev.id, turn, &usage_json, parts));
+                if let Some(t) = turn.and_then(|t| th.turns.get_mut(t as usize)) {
+                    add_usage(t, usage);
+                }
+            }
+            // A backend's subagent's call: its tokens are the turn's spend,
+            // and its conversation is the subagent's.
+            LogBody::SubagentResponse { usage, .. } => {
                 if let Some(t) = turn.and_then(|t| th.turns.get_mut(t as usize)) {
                     add_usage(t, usage);
                 }
@@ -162,6 +174,8 @@ fn event_type(b: &LogBody) -> &'static str {
         LogBody::ResponseCompleted { .. } => "response.completed",
         LogBody::TurnCompleted { .. } => "turn.completed",
         LogBody::BackendSession { .. } => "backend.session",
+        LogBody::RunOpened { .. } => "run.opened",
+        LogBody::SubagentResponse { .. } => "subagent.response",
     }
 }
 
@@ -240,16 +254,16 @@ mod tests {
 
     #[test]
     fn r_log_2_a_turn_that_failed_mid_response_projects_the_same_incrementally_and_on_rebuild() {
-        let mut bodies = vec![LogBody::SessionStarted { cwd: "/nowhere".into(), krowk_version: "t".into(), protocol_version: 1 }];
+        let mut bodies = vec![LogBody::SessionStarted { cwd: "/nowhere".into(), krowk_version: "t".into(), protocol_version: 1, parent_session_id: None }];
         bodies.extend(turn("t1", "first"));
         // The response streamed a text item, then failed: no response.completed.
         bodies.push(LogBody::ItemCompleted { turn_id: "t1".into(), item_id: "t1-a".into(), item: Item::AssistantText { text: "half an answer".into() } });
-        bodies.push(LogBody::TurnCompleted { turn_id: "t1".into(), status: TurnStatus::Failed, usage: Usage::default(), duration_ms: 1, error: None });
+        bodies.push(LogBody::TurnCompleted { turn_id: "t1".into(), status: TurnStatus::Failed, usage: Usage::default(), duration_ms: 1, error: None, reported_cost_usd: None });
         let after_first = bodies.len();
         bodies.extend(turn("t2", "second"));
         bodies.push(LogBody::ItemCompleted { turn_id: "t2".into(), item_id: "t2-a".into(), item: Item::AssistantText { text: "done".into() } });
         bodies.push(LogBody::ResponseCompleted { turn_id: "t2".into(), response_id: None, model: "m".into(), usage: Usage::default(), stop_reason: None, item_ids: vec!["t2-a".into()] });
-        bodies.push(LogBody::TurnCompleted { turn_id: "t2".into(), status: TurnStatus::Completed, usage: Usage::default(), duration_ms: 1, error: None });
+        bodies.push(LogBody::TurnCompleted { turn_id: "t2".into(), status: TurnStatus::Completed, usage: Usage::default(), duration_ms: 1, error: None, reported_cost_usd: None });
         let events = log(bodies);
 
         let home = std::env::temp_dir().join(format!("krowk-harness-project-{}", std::process::id()));

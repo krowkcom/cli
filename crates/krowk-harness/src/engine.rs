@@ -39,6 +39,8 @@
 //!   item, so the log shows where in the turn it landed. A turn does not end
 //!   with steering left untaken.
 
+use crate::budget::Budget;
+use crate::evidence::Evidence;
 use crate::toolset::Preset;
 use crate::catalog::ModelInfo;
 use crate::protocol::{Billing, Delta, Effort, ErrorInfo, Item, ItemKind, ModelRef, PermissionMode, ToolDefinition, Usage, WireApi};
@@ -65,6 +67,18 @@ pub enum EngineEvent {
     /// the vendor keeps its transcript, and what it is billed to. The host
     /// logs it when it is new or has changed.
     BackendSession { backend: String, session_id: String, transcript: Option<String>, billing: Option<Billing> },
+    /// `publish` opened the session's krowk run: the host logs it, so every
+    /// later publish — this session's next turn's too — attaches to it.
+    RunOpened { run: String },
+    /// A call a backend's own subagent made: metered for the budget and the
+    /// session's cost, and kept out of this conversation.
+    SubagentResponse { response_id: Option<String>, model: String, usage: Usage },
+    /// What a backend said the whole turn cost (Claude Code's
+    /// `total_cost_usd`), which counts calls krowk may not have seen.
+    ReportedCost { usd: f64 },
+    /// Something for the person and nobody else — never logged, never sent
+    /// to a model: an anonymous upload's claim command.
+    Notice { text: String },
 }
 
 /// Where an engine sends its events. Bounded, so a slow client slows the
@@ -97,6 +111,11 @@ pub struct TurnContext {
     /// `backend.session` event: what a backend resumes. None for a new
     /// session, and for one that has only run natively.
     pub backend_session: Option<String>,
+    /// What the session has spent and may spend: the engine asks it before
+    /// every model call it makes (R-BUDGET-1).
+    pub budget: Budget,
+    /// Where `publish` sends files; none when this host publishes nothing.
+    pub evidence: Option<Evidence>,
 }
 
 /// The steering a running turn has been sent and not yet taken: a queue
@@ -213,6 +232,13 @@ pub trait Engine: Send + Sync {
     /// Runs one turn to its end. Items produced before a failure were
     /// already sent and stay in the log.
     fn run_turn<'a>(&'a self, ctx: TurnContext, events: Events) -> BoxFuture<'a, Result<TurnEnd, EngineError>>;
+    /// Whether the engine asks `TurnContext::budget` before each model call
+    /// itself. The native loop does; a backend's calls are the vendor's to
+    /// make, so the host checks before its turn and interrupts it when a
+    /// metered call has gone over.
+    fn checks_budget(&self) -> bool {
+        false
+    }
     /// Lets go of whatever outlives a turn — a backend's process — cleanly,
     /// before the host goes away. Nothing, for an engine that keeps nothing.
     fn shutdown(&self) -> BoxFuture<'_, ()> {

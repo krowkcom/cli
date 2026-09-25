@@ -64,7 +64,13 @@ unit = "bytes"
 # translation, approvals, `providers add codex`; no new crate) adds 141,408
 # bytes, and its review round 26,824 more: 7,240,840 (6.91 MiB), 99,192
 # bytes under this.
-max = { x86_64-linux = 7_340_032 }
+# Ticket 08's budget and `publish` (no new crate) add 126,656 bytes of its
+# own (measured on the umbrella before ticket 07); with 07 they measure
+# 7,365,736 (7.02 MiB), 25,704 bytes over 7.00 MiB. Raised 7.00 -> 7.25 MiB
+# by ticket 08: no crate is added — the growth is the budget, the
+# evidence tool, the stream frames and their tests' code paths — and the
+# raise leaves 236,440 bytes for the rest of Harness P0 to justify.
+max = { x86_64-linux = 7_602_176 }
 status = "enforced"
 
 # --- Startup: a new process each run, no daemon ---
@@ -214,7 +220,8 @@ unit = "tokens"
 # not move it. 1,182 when this budget was set (ticket 03: the gpt preset,
 # apply_patch as a JSON tool; claude 1,165, grok 1,178), and about 1,310 for
 # apply_patch in its freeform form, which only a wire API with grammar tools
-# offers. Every model
+# offers. Ticket 08's `publish` brings them to 1,327 (gpt; claude
+# 1,310, grok 1,323), and about 1,450 in the freeform form. Every model
 # call carries these tokens, so a new tool or a longer description has to
 # fit here or raise this with a reason. The unit test
 # `r_tool_1_the_system_prompt_and_tool_definitions_stay_small` holds every

@@ -60,6 +60,7 @@ impl Home {
             catalog: Arc::new(|_, _| None),
             credentials: self.credentials(),
             trust: krowk_harness::trust::allow_all(),
+            publisher: None,
         };
         let opts = headless::Options {
             prompt: prompt.into(),
@@ -68,6 +69,7 @@ impl Home {
             permission_mode: PermissionMode::AcceptEdits,
             toolset: None,
             effort,
+            budget: None,
             format: OutputFormat::StreamJson,
         };
         let mut out = Vec::new();
@@ -194,8 +196,9 @@ fn r_prov_4_a_grok_task_runs_signed_in_with_supergrok_and_its_token_is_refreshed
         catalog: Arc::new(|_, _| None),
         credentials: home.credentials(),
         trust: krowk_harness::trust::allow_all(),
+        publisher: None,
     };
-    let opts = headless::Options { prompt: "hi".into(), resume: None, model: Some(reg.parse_model("supergrok/grok-4.7").unwrap()), permission_mode: PermissionMode::Default, toolset: None, effort: None, format: OutputFormat::Json };
+    let opts = headless::Options { prompt: "hi".into(), resume: None, model: Some(reg.parse_model("supergrok/grok-4.7").unwrap()), permission_mode: PermissionMode::Default, toolset: None, effort: None, budget: None, format: OutputFormat::Json };
     let outcome = headless::run(cfg, opts, &mut Vec::new());
     let e = outcome.error.unwrap();
     assert_eq!(e.code, "not_authenticated");

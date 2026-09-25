@@ -78,6 +78,9 @@ In the full build, bare `krowk` on a terminal opens krowk's own agent: an inline
 | `krowk` | Open the agent (`--model <instance>/<model>`, `--permission-mode`) |
 | `krowk --resume` / `--resume <id>` | Continue a krowk session — picked from a list, or named |
 | `krowk -p "…"` | One prompt, headless (`--output-format text\|json\|stream-json`, `--resume`, `--model`) |
+| `krowk -p "…" --max-usd 0.50` | Stop the session before the model call that would take it, subagents included, past a metered limit (`--max-tokens N`; the TUI takes both) — exits 4 like `krowk sessions budget` |
+
+The agent's tools are read, write, an edit tool in its model's format, bash, grep, glob and `publish`, which pushes a screenshot, diff or log as a krowk artifact with `krowk_push`'s own rules (inside the working directory, no credential files, no hard links). With an API key, a session's first publish opens a krowk run recording the session, and every artifact is tagged `krowk.session` and grouped under it.
 
 What you see: `❯` before what you asked; the answer as it streams, in light markdown (headings, `•` lists, `code` and fenced blocks coloured), wrapped by the terminal itself so it rewraps when you resize; each tool call once, with its outcome — `◆ Read README.md (3 lines)`, `◆ Run cargo test` with the head and tail of its output, `◆ Edit src/main.rs +3/-1` with the removed and added lines on red and green bands, a red `◆` when it failed; thinking collapsed to `◆ Thought for 4.2s`; and `Worked for 12s · 6.2k tokens` when the turn is done. While a turn runs, one line says what it is doing (`⠋ Thinking… 3.2s │ esc to interrupt`). The visual language follows xAI's Grok Build (see THIRD-PARTY-NOTICES).
 

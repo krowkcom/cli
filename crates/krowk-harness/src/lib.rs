@@ -17,7 +17,9 @@
 //!   repositories a backend may run in.
 //! - `codex` — the Codex backend: the user's own `codex`, driven as `codex
 //!   app-server` over JSON-RPC, with krowk's tools as its dynamic tools.
-//! - `tools` — read, write, the edit tools, bash, grep and glob.
+//! - `tools` — read, write, the edit tools, bash, grep and glob;
+//!   `evidence` — `publish`, and the session's krowk run.
+//! - `budget` — what a session may spend, checked before every model call.
 //! - `toolset` — the preset registry: which edit tool a model is offered.
 //! - `host` — executes commands, writes the log, prices the turn.
 //! - `log` — the append-only JSONL session log and its layout on disk.
@@ -31,12 +33,14 @@
 
 pub mod anthropic;
 pub mod bridge;
+pub mod budget;
 pub mod catalog;
 pub mod chat;
 pub mod claude;
 pub mod codex;
 pub mod effort;
 pub mod engine;
+pub mod evidence;
 pub mod group;
 pub mod headless;
 pub mod host;

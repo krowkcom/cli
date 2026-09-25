@@ -294,6 +294,11 @@ pub enum Command {
         /// instance's, else the provider's default, when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<Effort>,
+        /// The spend this session, with its subagents, may reach: the engine
+        /// refuses the model call that would go past it (R-BUDGET-1). No
+        /// limit when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<BudgetLimits>,
     },
     /// Stop the running turn, keeping what it produced so far.
     Interrupt { session_id: String },
@@ -308,6 +313,27 @@ pub enum Command {
     /// Branch the session at an event: the new branch's first event names
     /// it as its parent.
     Fork { session_id: String, from_event_id: String },
+}
+
+/// What a session may spend, counted over the session and every subagent
+/// it spawned, from the usage the provider metered — never from what a
+/// request asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetLimits {
+    /// US dollars, priced from models.dev: `--max-usd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_usd: Option<f64>,
+    /// Generated tokens — output and reasoning, the part that overshoots a
+    /// request's cap: `--max-tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i64>,
+}
+
+impl BudgetLimits {
+    pub fn is_empty(&self) -> bool {
+        self.max_usd.is_none() && self.max_tokens.is_none()
+    }
 }
 
 /// One line of a session's log: typed, with a UUIDv7 `id`, and a `parentId`
@@ -338,7 +364,16 @@ pub struct LogEvent {
 pub enum LogBody {
     /// The root of every session.
     #[serde(rename = "session.started")]
-    SessionStarted { cwd: String, krowk_version: String, protocol_version: u32 },
+    SessionStarted {
+        cwd: String,
+        krowk_version: String,
+        protocol_version: u32,
+        /// The session that spawned this one, for a subagent: its spend is
+        /// part of what that session spent, and a budget counts it there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(regex(pattern = UUID7_PATTERN))]
+        parent_session_id: Option<String>,
+    },
     /// A prompt arrived; the turn runs on `model`. The exact system prompt
     /// and tools it ran with are in the session's `context.jsonl` under
     /// this `turnId` (R-LOG-4).
@@ -390,6 +425,27 @@ pub enum LogBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         billing: Option<Billing>,
     },
+    /// A model call a backend's own subagent made — Claude Code's `Task` —
+    /// which is the subagent's conversation, not this one: metered, so the
+    /// budget and the session's cost count it, and never replayed.
+    #[serde(rename = "subagent.response")]
+    SubagentResponse {
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        /// The model the provider says answered.
+        model: String,
+        usage: Usage,
+    },
+    /// The krowk run this session's evidence is grouped under, opened by
+    /// its first `publish` (R-EVID-1). Logged once; every later publish, and
+    /// a resumed session's, attaches to it.
+    #[serde(rename = "run.opened")]
+    RunOpened {
+        turn_id: String,
+        /// The run's slug, e.g. `run_…`.
+        run: String,
+    },
     /// The turn is over.
     #[serde(rename = "turn.completed")]
     TurnCompleted {
@@ -398,6 +454,11 @@ pub enum LogBody {
         /// Every model call in the turn, summed.
         usage: Usage,
         duration_ms: u64,
+        /// What a backend said the turn cost, when it says (Claude Code's
+        /// `total_cost_usd`). A budget counts it when it is more than krowk
+        /// priced the turn's calls at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reported_cost_usd: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ErrorInfo>,
     },
@@ -411,6 +472,26 @@ pub enum LiveEvent {
     ItemStarted { session_id: String, turn_id: String, item_id: String, item: ItemKind },
     #[serde(rename = "item.delta")]
     ItemDelta { session_id: String, turn_id: String, item_id: String, delta: Delta },
+    /// What the session has spent so far, after each metered model call:
+    /// what the status bar shows (R-BUDGET-2). `costUsd` counts the session
+    /// and its subagents; null when any of it has no price.
+    #[serde(rename = "cost")]
+    Cost {
+        session_id: String,
+        turn_id: String,
+        cost_usd: Option<f64>,
+        /// This turn's part of it.
+        turn_cost_usd: Option<f64>,
+        /// Output and reasoning tokens, session and subagents: what
+        /// `--max-tokens` counts.
+        generated_tokens: i64,
+    },
+    /// Something for the person at the client and nobody else: an
+    /// anonymous upload's claim command, whose token is a secret. Never
+    /// logged, never in what a model reads; `krowk -p` prints it on stderr
+    /// and leaves it out of `stream-json`.
+    #[serde(rename = "notice")]
+    Notice { session_id: String, turn_id: String, text: String },
     /// How a `prompt` came out: the last thing a headless run prints.
     #[serde(rename = "result")]
     Result(RunResult),

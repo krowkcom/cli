@@ -1,7 +1,7 @@
 //! R-BACK-2, non-negotiable: krowk never runs a Claude OAuth flow, never
 //! reads Claude's credentials — the keychain entry or the credentials file
 //! in Claude's config directory — and never passes itself off as Claude
-//! Code. Two checks hold every build to it:
+//! Code. Three checks hold every build to it:
 //!
 //! - the source: no file in the workspace names Claude's credential paths,
 //!   its keychain service, its OAuth endpoints or client, or Claude Code's
@@ -11,7 +11,11 @@
 //!   sessions — runs with each account's credentials file replaced by a
 //!   FIFO that is watched for a reader, and with the macOS and Linux
 //!   keychain tools on PATH as tripwires.
-//!   Opening the file for reading, or asking a keychain, fails the test.
+//!   Opening the file for reading, or asking a keychain, fails the test;
+//! - the dependency tree: no crate in `Cargo.lock` is a keychain or secret
+//!   store client, save the macOS Security framework binding that
+//!   rustls's platform verifier uses to read the system's trusted
+//!   certificates — and only while that is all that uses it.
 //!
 //! The needles are assembled from pieces, so this file does not trip its
 //! own check.
@@ -37,7 +41,12 @@ fn needles() -> Vec<String> {
         c(&["find-internet", "-password"]),
         c(&["SecItem", "CopyMatching"]),
         c(&["secret", "-tool"]),
-        c(&["keyring", "::"]),
+        c(&["key", "ring"]),
+        c(&["security", "-framework"]),
+        c(&["secret", "-service"]),
+        c(&["org.freedesktop", ".secrets"]),
+        c(&["SecKey", "chain"]),
+        c(&["/usr/bin/", "security"]),
         // Claude's OAuth: its endpoints, its client, its tokens.
         c(&["claude.ai/", "oauth"]),
         c(&["console.anthropic.com/v1/", "oauth"]),
@@ -107,6 +116,69 @@ fn r_back_2_no_source_file_names_claudes_credentials_its_oauth_or_its_headers() 
     let caught = scan(std::slice::from_ref(&canary));
     let _ = std::fs::remove_dir_all(&canary);
     assert!(!caught.is_empty(), "the source check did not catch a read of the credentials path");
+}
+
+/// Keychain and secret-store clients, by crate name.
+fn keychain_crates() -> Vec<String> {
+    let c = |parts: &[&str]| parts.concat();
+    vec![
+        c(&["key", "ring"]),
+        c(&["secret", "-service"]),
+        c(&["dbus-secret", "-service"]),
+        c(&["lib", "secret"]),
+        c(&["oo", "7"]),
+        c(&["keychain", "-services"]),
+        c(&["security", "-framework"]),
+        c(&["security", "-framework-sys"]),
+        c(&["apple-native-key", "ring-store"]),
+    ]
+}
+
+/// The crates that may bring in the Security framework binding: they read
+/// the system's certificate trust settings, never a password.
+const TRUST_STORE_READERS: &[&str] = &["rustls-platform-verifier", "rustls-native-certs"];
+
+/// Each keychain crate in a lockfile, with what depends on it, unless all
+/// that depends on it reads trust settings.
+fn keychain_deps(lock: &str) -> Vec<String> {
+    let packages: Vec<(String, Vec<String>)> = lock
+        .split("[[package]]")
+        .filter_map(|blk| {
+            let name = blk.lines().find_map(|l| l.strip_prefix("name = \"")?.strip_suffix('"'))?.to_string();
+            let deps = blk
+                .split_once("dependencies = [")
+                .map(|(_, d)| d.split(']').next().unwrap_or_default().split(',').filter_map(|x| x.trim().trim_matches('"').split(' ').next().filter(|n| !n.is_empty()).map(String::from)).collect())
+                .unwrap_or_default();
+            Some((name, deps))
+        })
+        .collect();
+    let forbidden = keychain_crates();
+    let mut found = Vec::new();
+    for (name, _) in packages.iter().filter(|(n, _)| forbidden.contains(n)) {
+        let users: Vec<&str> = packages.iter().filter(|(_, d)| d.contains(name)).map(|(n, _)| n.as_str()).collect();
+        let only_trust = !users.is_empty() && users.iter().all(|u| TRUST_STORE_READERS.contains(u) || forbidden.iter().any(|f| f == u && f.starts_with("security")));
+        if !(name.starts_with("security") && only_trust) {
+            found.push(format!("{name} (used by {})", if users.is_empty() { "the workspace".to_string() } else { users.join(", ") }));
+        }
+    }
+    found
+}
+
+#[test]
+fn r_back_2_no_crate_krowk_links_is_a_keychain_client() {
+    let lock = std::fs::read_to_string(workspace().join("Cargo.lock")).unwrap();
+    let found = keychain_deps(&lock);
+    assert!(found.is_empty(), "R-BACK-2: krowk links a keychain or secret-store client: {found:?}");
+    // The check itself: a keychain crate, or the Security binding used by
+    // anything but the trust-store readers, is caught.
+    let kr = ["key", "ring"].concat();
+    let broken = format!("[[package]]\nname = \"krowk\"\ndependencies = [\n \"{kr}\",\n]\n\n[[package]]\nname = \"{kr}\"\n");
+    assert_eq!(keychain_deps(&broken).len(), 1);
+    let sf = ["security", "-framework"].concat();
+    let misused = format!("[[package]]\nname = \"krowk\"\ndependencies = [\n \"{sf} 3.5.1\",\n]\n\n[[package]]\nname = \"{sf}\"\n");
+    assert_eq!(keychain_deps(&misused).len(), 1, "the Security binding used directly");
+    let fine = format!("[[package]]\nname = \"rustls-platform-verifier\"\ndependencies = [\n \"{sf}\",\n]\n\n[[package]]\nname = \"{sf}\"\n");
+    assert!(keychain_deps(&fine).is_empty());
 }
 
 /// Watches FIFOs for a reader: a writer's non-blocking open succeeds only

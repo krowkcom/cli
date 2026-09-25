@@ -102,7 +102,10 @@ fn report(ctx: &mut Ctx, data: Value, human: &str) -> Result<(), Error> {
 
 /// The platform's archive, named as the release publishes it — the same
 /// names the Go build's upgrader asks for, so an install of either upgrades
-/// into the other.
+/// into the other. An upgrade stays on the build it is (R-PKG-3): the lean
+/// build, which an installer put in a container or on a CI runner, into
+/// `krowk-lean_…`; anything with the session store into the full build,
+/// under the name every earlier release used.
 fn archive_name(version: &str) -> String {
     let os = if cfg!(target_os = "macos") { "darwin" } else { std::env::consts::OS };
     let arch = match std::env::consts::ARCH {
@@ -110,7 +113,8 @@ fn archive_name(version: &str) -> String {
         "aarch64" => "arm64",
         other => other,
     };
-    format!("krowk_{version}_{os}_{arch}.tar.gz")
+    let name = if cfg!(feature = "sessions") { "krowk" } else { "krowk-lean" };
+    format!("{name}_{version}_{os}_{arch}.tar.gz")
 }
 
 /// Downloads the archive and its checksum, refuses a mismatch, and swaps each
@@ -236,6 +240,7 @@ mod tests {
     fn only_three_numbers_are_a_release_and_order_is_numeric() {
         assert!(is_release("1.2.3") && !is_release("dev") && !is_release("0.0.0-golden") && !is_release("0.9.0-12-gabc"));
         assert!(version_less("1.9.0", "1.10.0") && !version_less("1.10.0", "1.9.0") && !version_less("dev", "9.9.9"));
-        assert!(archive_name("1.2.3").starts_with("krowk_1.2.3_") && archive_name("1.2.3").ends_with(".tar.gz"));
+        let build = if cfg!(feature = "sessions") { "krowk" } else { "krowk-lean" };
+        assert!(archive_name("1.2.3").starts_with(&format!("{build}_1.2.3_")) && archive_name("1.2.3").ends_with(".tar.gz"));
     }
 }

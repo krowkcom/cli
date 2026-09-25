@@ -5,8 +5,8 @@
 #
 #   scripts/dist.sh targets                 the table: triple goos goarch runner
 #   scripts/dist.sh matrix                  the table as a GitHub Actions matrix
-#   scripts/dist.sh archive-name GOOS GOARCH VERSION
-#   scripts/dist.sh build TRIPLE VERSION    both binaries for one target, archived
+#   scripts/dist.sh archive-name GOOS GOARCH VERSION [full|lean]
+#   scripts/dist.sh build TRIPLE VERSION    both builds for one target, archived
 #   scripts/dist.sh assemble VERSION        checksums.txt, metadata.json, artifacts.json
 #   scripts/dist.sh all VERSION             build every target, then assemble
 #
@@ -14,6 +14,14 @@
 # upgrader read it: dist/krowk_<version>_<goos>_<goarch>.tar.gz (.zip on Windows)
 # holding krowk and krowk-mcp at its root, dist/checksums.txt in `sha256sum`
 # form, and dist/<triple>/ holding the loose binaries.
+#
+# Two builds of krowk per target (R-PKG-3). The full build (`--features
+# harness`: the agent, its TUI, the session store) is the one above, under the
+# name every earlier release used, so links, npm and old upgraders keep
+# getting what a person wants. The lean build (no features: the agent-container
+# build, R-PKG-2) is dist/krowk-lean_<version>_<goos>_<goarch>.tar.gz beside
+# it, and dist/<triple>-lean/ loose. krowk-mcp is the same lean binary in both.
+# install.sh picks between them; an upgrade stays on the build it is.
 #
 # KROWK_FAST_BUILD=1 builds without LTO and with parallel codegen: the same
 # binaries in every way a packaging test can see, minutes sooner. Releases
@@ -42,9 +50,28 @@ row() {
 }
 
 archive_name() {
-  local ext="tar.gz"
+  local ext="tar.gz" name="krowk"
   [[ "$1" == windows ]] && ext="zip"
-  echo "krowk_${3}_${1}_${2}.${ext}"
+  case "${4:-full}" in
+    full) ;;
+    lean) name="krowk-lean" ;;
+    *) die "no build ${4} — full or lean" ;;
+  esac
+  echo "${name}_${3}_${1}_${2}.${ext}"
+}
+
+# archive DIR GOOS GOARCH VERSION FLAVOUR: the two binaries in DIR, archived.
+archive() {
+  local dir="$1" goos="$2" goarch="$3" version="$4" flavour="$5" ext="" archive
+  [[ "$goos" == windows ]] && ext=".exe"
+  archive="dist/$(archive_name "$goos" "$goarch" "$version" "$flavour")"
+  rm -f "$archive"
+  if [[ "$goos" == windows ]]; then
+    (cd "$dir" && zip -q -X "$OLDPWD/$archive" "krowk$ext" "krowk-mcp$ext")
+  else
+    tar -czf "$archive" -C "$dir" krowk krowk-mcp
+  fi
+  echo "dist.sh: $archive"
 }
 
 sha256() {
@@ -60,34 +87,33 @@ build() {
   if [[ "${KROWK_FAST_BUILD:-}" == 1 ]]; then
     export CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
   fi
-  # The device build for krowk, the agent build for krowk-mcp: the MCP server
-  # never touches the session store, so it does not carry SQLite.
-  KROWK_VERSION="$version" cargo "$tool" --release --locked --target "$triple" -p krowk --bin krowk --features sessions
-  KROWK_VERSION="$version" cargo "$tool" --release --locked --target "$triple" -p krowk --bin krowk-mcp
+  # The lean build first, both binaries: krowk-mcp never touches the session
+  # store, so it is the lean build in both archives. Its krowk is copied out
+  # before the full build overwrites target/…/krowk.
+  KROWK_VERSION="$version" cargo "$tool" --release --locked --target "$triple" -p krowk --bin krowk --bin krowk-mcp
+  local lean="dist/$triple-lean"
+  rm -rf "$lean" && mkdir -p "$lean"
+  for bin in krowk krowk-mcp; do
+    cp "target/$triple/release/$bin$ext" "$lean/"
+  done
+  KROWK_VERSION="$version" cargo "$tool" --release --locked --target "$triple" -p krowk --bin krowk --features harness
 
   out="dist/$triple"
   rm -rf "$out" && mkdir -p "$out"
-  for bin in krowk krowk-mcp; do
-    cp "target/$triple/release/$bin$ext" "$out/"
-  done
-  local archive
-  archive="dist/$(archive_name "$goos" "$goarch" "$version")"
-  rm -f "$archive"
-  if [[ "$goos" == windows ]]; then
-    (cd "$out" && zip -q -X "../$(basename "$archive")" "krowk$ext" "krowk-mcp$ext")
-  else
-    tar -czf "$archive" -C "$out" krowk krowk-mcp
-  fi
-  echo "dist.sh: $archive"
+  cp "target/$triple/release/krowk$ext" "$lean/krowk-mcp$ext" "$out/"
+  archive "$out" "$goos" "$goarch" "$version" full
+  archive "$lean" "$goos" "$goarch" "$version" lean
 }
 
 assemble() {
   local version="$1" archives=() triple goos goarch ext
   while read -r triple goos goarch _; do
-    local archive
-    archive=$(archive_name "$goos" "$goarch" "$version")
-    [[ -f "dist/$archive" ]] || die "dist/$archive is missing — build $triple first"
-    archives+=("$archive")
+    local archive flavour
+    for flavour in full lean; do
+      archive=$(archive_name "$goos" "$goarch" "$version" "$flavour")
+      [[ -f "dist/$archive" ]] || die "dist/$archive is missing — build $triple first"
+      archives+=("$archive")
+    done
   done <<<"$TARGETS"
   (cd dist && sha256 "${archives[@]}" >checksums.txt)
 
@@ -98,11 +124,14 @@ assemble() {
     while read -r triple goos goarch _; do
       ext=""
       [[ "$goos" == windows ]] && ext=".exe"
-      for bin in krowk krowk-mcp; do
+      # The lean krowk is listed as its own ID, which npm/build.mjs does not
+      # package: npm carries the full build, as it always has.
+      for entry in "krowk $triple krowk" "krowk-mcp $triple krowk-mcp" "krowk-lean $triple-lean krowk"; do
+        read -r id dir bin <<<"$entry"
         [[ $first == 1 ]] || echo ","
         first=0
         printf '  {"name":"%s","path":"dist/%s/%s%s","goos":"%s","goarch":"%s","type":"Binary","extra":{"ID":"%s"}}' \
-          "$bin" "$triple" "$bin" "$ext" "$goos" "$goarch" "$bin"
+          "$bin" "$dir" "$bin" "$ext" "$goos" "$goarch" "$id"
       done
     done <<<"$TARGETS"
     echo
@@ -118,7 +147,7 @@ case "${1:-}" in
     awk 'NR > 1 { printf "," } { printf "{\"target\":\"%s\",\"runner\":\"%s\"}", $1, $4 }' <<<"$TARGETS"
     printf ']}\n'
     ;;
-  archive-name) archive_name "${2:?goos}" "${3:?goarch}" "${4:?version}" ;;
+  archive-name) archive_name "${2:?goos}" "${3:?goarch}" "${4:?version}" "${5:-full}" ;;
   build) build "${2:?triple}" "${3:?version}" ;;
   assemble) assemble "${2:?version}" ;;
   all)

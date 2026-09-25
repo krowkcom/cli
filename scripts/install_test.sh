@@ -72,9 +72,15 @@ fi
 # name is the one install.sh builds (krowk_<version>_<goos>_<goarch>.<ext>).
 echo
 echo "Holding the installer to scripts/dist.sh"
+for flavour in full lean; do
+  for p in linux_amd64 windows_amd64; do
+    [[ "$(scripts/dist.sh archive-name "${p%_*}" "${p#*_}" 1.2.3 "$flavour")" == "$(archive_for 1.2.3 "$p" "$flavour")" ]] \
+      || fail "scripts/dist.sh names its $flavour archive for $p in a way scripts/install.sh does not build"
+  done
+done
 [[ "$(scripts/dist.sh archive-name linux amd64 1.2.3)" == "krowk_1.2.3_linux_amd64.tar.gz" \
-   && "$(scripts/dist.sh archive-name windows amd64 1.2.3)" == "krowk_1.2.3_windows_amd64.zip" ]] \
-  || fail "scripts/dist.sh names its archives in a way scripts/install.sh does not build"
+   && "$(archive_for 1.2.3 linux_amd64 lean)" == "krowk-lean_1.2.3_linux_amd64.tar.gz" ]] \
+  || fail "the full build no longer carries the name every earlier release used, or the lean one lost its own"
 grep -q 'checksums.txt' scripts/dist.sh \
   || fail "scripts/dist.sh no longer writes checksums.txt, which scripts/install.sh downloads"
 pass "the archive and checksum names still match what the installer builds"
@@ -182,30 +188,44 @@ if [[ -f dist/checksums.txt ]]; then
   done
 fi
 
+# Both builds' krowk, unpacked, to tell which one an install put down.
+mkdir -p "$WORK/full" "$WORK/lean"
 if [[ -n "$dist_archive" ]]; then
   ARCHIVE=$(basename "$dist_archive")
   VERSION=${ARCHIVE#krowk_}
   VERSION=${VERSION%"_${host_os}_${host_arch}.tar.gz"}
+  LEAN_ARCHIVE=$(archive_for "$VERSION" "${host_os}_${host_arch}" lean)
+  [[ -f "dist/$LEAN_ARCHIVE" ]] || fail "dist/ holds $ARCHIVE but not $LEAN_ARCHIVE: the release builds both"
   cp "$dist_archive" "$RELEASE/$ARCHIVE"
+  cp "dist/$LEAN_ARCHIVE" "$RELEASE/$LEAN_ARCHIVE"
   cp dist/checksums.txt "$RELEASE/checksums.txt"
+  tar -xzf "$RELEASE/$ARCHIVE" -C "$WORK/full"
+  tar -xzf "$RELEASE/$LEAN_ARCHIVE" -C "$WORK/lean"
   SOURCE="the release already in dist/"
 else
   # No release here to install, so the host's binaries are built and archived
   # the way scripts/dist.sh archives them, into this run's own directory: the
-  # repository's dist/ is neither read nor written.
-  mkdir -p "$WORK/build"
-  cargo build --release --locked -p krowk --features sessions >"$WORK/cargo.log" 2>&1 \
-    || { cat "$WORK/cargo.log"; fail "cargo could not build"; }
-  cp target/release/krowk target/release/krowk-mcp "$WORK/build/"
+  # repository's dist/ is neither read nor written. The lean build first, and
+  # copied out before the full build overwrites target/release/krowk.
+  cargo build --release --locked -p krowk --bin krowk --bin krowk-mcp >"$WORK/cargo.log" 2>&1 \
+    || { cat "$WORK/cargo.log"; fail "cargo could not build the lean build"; }
+  cp target/release/krowk target/release/krowk-mcp "$WORK/lean/"
+  cargo build --release --locked -p krowk --bin krowk --features harness >"$WORK/cargo.log" 2>&1 \
+    || { cat "$WORK/cargo.log"; fail "cargo could not build the full build"; }
+  cp target/release/krowk "$WORK/full/"
+  cp "$WORK/lean/krowk-mcp" "$WORK/full/"
   SOURCE="cargo build"
   VERSION="9.9.9"
-  ARCHIVE="krowk_${VERSION}_${host_os}_${host_arch}.tar.gz"
-  tar -czf "$RELEASE/$ARCHIVE" -C "$WORK/build" krowk krowk-mcp
-  (cd "$RELEASE" && "${SHA256_CMD[@]}" "$ARCHIVE" >checksums.txt)
+  ARCHIVE=$(archive_for "$VERSION" "${host_os}_${host_arch}" full)
+  LEAN_ARCHIVE=$(archive_for "$VERSION" "${host_os}_${host_arch}" lean)
+  tar -czf "$RELEASE/$ARCHIVE" -C "$WORK/full" krowk krowk-mcp
+  tar -czf "$RELEASE/$LEAN_ARCHIVE" -C "$WORK/lean" krowk krowk-mcp
+  (cd "$RELEASE" && "${SHA256_CMD[@]}" "$ARCHIVE" "$LEAN_ARCHIVE" >checksums.txt)
 fi
+if cmp -s "$WORK/full/krowk" "$WORK/lean/krowk"; then fail "the full and lean archives hold the same krowk"; fi
 
 cp skills/krowk/SKILL.md "$RELEASE/SKILL.md"
-pass "serving $ARCHIVE + checksums.txt, from $SOURCE"
+pass "serving $ARCHIVE, $LEAN_ARCHIVE + checksums.txt, from $SOURCE"
 
 # The server. Port 0 so parallel runs do not collide.
 python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$RELEASE" >"$WORK/server.log" 2>&1 &
@@ -240,6 +260,10 @@ env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
 [[ -x "$BIN/krowk" ]]     || fail "krowk was not installed"
 [[ -x "$BIN/krowk-mcp" ]] || fail "krowk-mcp was not installed"
 pass "both binaries landed in $BIN"
+
+cmp -s "$BIN/krowk" "$WORK/full/krowk" || { cat "$WORK/install.log"; fail "R-PKG-3: a workstation install did not get the full build"; }
+grep -q "(full build)" "$WORK/install.log" || fail "the installer did not say which build it installed"
+pass "R-PKG-3: a workstation install gets the full build"
 
 "$BIN/krowk" --version >/dev/null || fail "the installed krowk does not run"
 pass "the installed krowk runs"
@@ -478,6 +502,60 @@ pass "the next steps were printed"
 # NO_COLOR was set above, so nothing may have emitted an escape sequence.
 if grep -q $'\033' "$WORK/install.log"; then fail "the installer emitted colour with NO_COLOR set"; fi
 pass "NO_COLOR was honoured"
+
+# R-PKG-3: which build lands, end to end, for each way of asking. Each line
+# is what the environment says, the installer's arguments, and the build
+# that must land.
+echo
+echo "The full build for people, the lean one for CI and containers (R-PKG-3)"
+BUILD_BIN="$WORK/bin-build"
+mkdir -p "$WORK/docker-root" "$WORK/podman-root/run"
+: >"$WORK/docker-root/.dockerenv"
+: >"$WORK/podman-root/run/.containerenv"
+while IFS='|' read -r envs args want; do
+  rm -rf "$BUILD_BIN"
+  # shellcheck disable=SC2086  # envs and args are word lists on purpose.
+  env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 KROWK_SKIP_SKILL=1 \
+    KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BUILD_BIN" $envs \
+    bash "$REPO_ROOT/scripts/install.sh" $args >"$WORK/build.log" 2>&1 \
+    || { cat "$WORK/build.log"; fail "the installer exited non-zero with [$envs] [$args]"; }
+  cmp -s "$BUILD_BIN/krowk" "$WORK/$want/krowk" \
+    || { cat "$WORK/build.log"; fail "[$envs] [$args] installed the wrong build; want $want"; }
+  pass "${envs:-no CI, no container}${args:+ $args}: the $want build"
+done <<CASES
+CI=true||lean
+CI=1||lean
+CI=false||full
+GITHUB_ACTIONS=true||lean
+GITLAB_CI=true||lean
+KROWK_INSTALL_FS_ROOT=$WORK/docker-root||lean
+KROWK_INSTALL_FS_ROOT=$WORK/podman-root||lean
+container=podman||lean
+KUBERNETES_SERVICE_HOST=10.0.0.1||lean
+|--lean|lean
+CI=true|--full|full
+CI=true KROWK_LEAN=0||full
+KROWK_LEAN=1||lean
+CASES
+grep -q "Pass --full, or set KROWK_LEAN=0" "$WORK/build.log" \
+  || { cat "$WORK/build.log"; fail "a lean install did not say how to get the full build"; }
+pass "a lean install says why, and how to get the full build instead"
+
+if "$BUILD_BIN/krowk" sessions >"$WORK/lean-sessions.log" 2>&1; then fail "the lean build ran krowk sessions"; fi
+grep -q "not_in_build" "$WORK/lean-sessions.log" || { cat "$WORK/lean-sessions.log"; fail "the lean build did not say what it leaves out"; }
+pass "the lean build is the agent build: no session store"
+
+if env -i PATH="$PATH" HOME="$WORK/home" NO_COLOR=1 KROWK_LEAN=maybe \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BUILD_BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/lean-bad.log" 2>&1; then
+  fail "the installer accepted KROWK_LEAN=maybe"
+fi
+if env -i PATH="$PATH" HOME="$WORK/home" NO_COLOR=1 \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BUILD_BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" --tiny >"$WORK/arg-bad.log" 2>&1; then
+  fail "the installer accepted --tiny"
+fi
+pass "a KROWK_LEAN or an argument that means neither build is refused"
 
 echo
 echo "Refusing a bad download"

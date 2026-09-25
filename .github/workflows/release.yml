@@ -1,8 +1,9 @@
 name: Release
 
 # A tag is the whole trigger. `git tag -a v0.1.0 -m ... && git push origin v0.1.0`
-# checks the tag, builds both binaries for five platforms in parallel
-# (dist.yml), opens the GitHub Release with the archives and checksums on it,
+# checks the tag, builds both builds of krowk (full and lean) and krowk-mcp for
+# five platforms in parallel (dist.yml), opens the GitHub Release with the
+# archives and checksums on it,
 # and publishes the seven npm packages.
 #
 # Three components, deliberately: the moving major tag this workflow pushes at
@@ -109,12 +110,18 @@ jobs:
           # npm — the bare \`krowk\` name is blocked by npm's typosquat filter
           npx @krowk/cli push screenshot.png
 
-          # Direct download — no runtime, no package manager
+          # The installer: the full build on a workstation, the lean one in CI
+          # and containers (or with --lean)
+          curl -fsSL https://krowk.com/install | bash
+
+          # Direct download — no runtime, no package manager. krowk_… is the
+          # full build (the agent, its TUI, sessions); krowk-lean_… the lean
+          # agent-container build.
           curl -sSfL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/krowk_${VERSION}_\$(uname -s | tr A-Z a-z)_\$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz \\
             | tar -xz -C /usr/local/bin krowk krowk-mcp
 
           # From source
-          cargo install --locked --git https://github.com/$GITHUB_REPOSITORY --tag $tag --features sessions krowk
+          cargo install --locked --git https://github.com/$GITHUB_REPOSITORY --tag $tag --features harness krowk
           \`\`\`
 
           \`checksums.txt\` covers every archive on this release.

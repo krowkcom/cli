@@ -335,6 +335,7 @@ mod tests {
             "context.tokens",
             "tui.startup_cold",
             "tui.idle_cpu",
+            "tui.turn_cpu",
             "tui.idle_rss",
             "tui.redraw_fps",
             "session.replay_rss",

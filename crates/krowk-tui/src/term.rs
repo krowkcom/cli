@@ -392,14 +392,19 @@ pub fn soft_rows(line: &Line<'_>, width: u16) -> u16 {
 }
 
 /// `line` as text with SGR styling, reset at its end.
+///
+/// Every span is cleaned on its way out, whoever built it: what reaches
+/// scrollback is model output, tool names and paths, and none of it may
+/// carry an escape sequence or a control character to the terminal.
 fn write_styled(out: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
     for span in &line.spans {
         let style = line.style.patch(span.style);
         let sgr = sgr(style);
+        let text: String = span.content.chars().filter(|c| !c.is_control()).collect();
         if sgr.is_empty() {
-            out.write_all(span.content.as_bytes())?;
+            out.write_all(text.as_bytes())?;
         } else {
-            write!(out, "\x1b[{sgr}m{}\x1b[0m", span.content)?;
+            write!(out, "\x1b[{sgr}m{text}\x1b[0m")?;
         }
     }
     Ok(())
@@ -486,6 +491,7 @@ fn build(buf: &FrameBuf, size: Size, top: u16, height: u16) -> io::Result<Termin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::text::Span;
 
     fn frames(bytes: &[u8]) -> usize {
         bytes.windows(SYNC_BEGIN.len()).filter(|w| *w == SYNC_BEGIN).count()
@@ -564,6 +570,19 @@ mod tests {
         let out = after_resize(&mut t, &[(70, 26), (40, 26)]);
         assert_eq!(out.matches("\x1b[J").count(), 1, "one clear, not two: {out:?}");
         assert!(out.starts_with("\x1b[?2026h\x1b[23;1H\x1b[J"), "{out:?}");
+    }
+
+    #[test]
+    fn nothing_reaches_scrollback_with_a_control_character_in_it() {
+        // A tool name the model made up, escapes and all, as the tool line
+        // builds it: into scrollback, it prints as text.
+        let mut t = Term::new(Vec::new(), Size { width: 60, height: 10 }, 0, 2).unwrap();
+        let evil = "evil\x1b]0;pwned\x07\x1b[2J\rname";
+        let line = Line::from(vec![Span::styled("◆ ", ratatui::style::Style::new().fg(ratatui::style::Color::Green)), Span::raw(evil.to_string())]);
+        t.frame(&[line], &[Line::from("❯ "), Line::default()], (2, 0)).unwrap();
+        let out = String::from_utf8_lossy(&t.into_inner()).into_owned();
+        assert!(out.contains("evil]0;pwned[2Jname"), "{out:?}");
+        assert!(!out.contains("\x1b]0;") && !out.contains("\x07") && !out.contains("\x1b[2J"), "{out:?}");
     }
 
     #[test]

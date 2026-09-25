@@ -151,6 +151,20 @@ window_s = 10
 status = "enforced"
 
 [[budget]]
+id = "tui.turn_cpu"
+req = "R-PERF-2"
+what = "TUI with a turn waiting on a silent provider: CPU ticks over 5 s"
+unit = "ticks"
+# Not idle — a turn is running, so the clock and spinner redraw at 8 fps
+# (40 frames in the window) — but nothing else happens, and a frame of a
+# few rows costs well under a tick: 0-1 measured. 10 ticks is 2% of one
+# core; a deadline that has fallen into the past, which spins the loop and
+# redraws at 60 fps, is hundreds.
+max = 10
+window_s = 5
+status = "enforced"
+
+[[budget]]
 id = "tui.idle_rss"
 req = "R-PERF-3"
 what = "TUI plus engine with an idle session: resident memory"

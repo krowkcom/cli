@@ -7,6 +7,8 @@
 //!   first synchronized update), which is the prompt.
 //! - `tui.idle_cpu`, `tui.idle_rss` — the TUI sitting at its prompt with
 //!   nothing running, read from /proc like `engine.idle_*`.
+//! - `tui.turn_cpu` — CPU ticks while a turn waits on a silent provider:
+//!   the spinner's 8 fps and nothing else.
 //! - `tui.redraw_fps` — the most frames begun inside any one second while a
 //!   500 token-a-second answer streams in.
 //! - `session.replay_rss` — peak resident memory (VmHWM) of `krowk --resume`
@@ -119,6 +121,48 @@ pub fn idle(bin: &Path, home: &Path, window: Duration) -> Result<Idle, String> {
     let idle = result?;
     quit?;
     Ok(idle)
+}
+
+/// A provider that takes the request and never answers: a turn that
+/// waits on the model, which is the TUI's busiest quiet state — its clock
+/// and spinner redraw, nothing else happens.
+fn silent_provider() -> Result<String, String> {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind the silent provider: {e}"))?;
+    let url = format!("http://{}", l.local_addr().map_err(|e| e.to_string())?);
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for c in l.incoming().flatten() {
+            held.push(c);
+        }
+    });
+    Ok(url)
+}
+
+/// CPU ticks of the TUI over `window` while a turn waits on a silent
+/// provider, and the frames it drew meanwhile.
+pub fn turn_cpu(bin: &Path, home: &Path, window: Duration) -> Outcome {
+    let run = || -> Result<(u64, usize), String> {
+        std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
+        let url = silent_provider()?;
+        let mut t = pty::Pty::spawn(tui(bin, home, &url, &[]), COLS, ROWS);
+        let pid = t.child.id();
+        let r = (|| {
+            t.wait_for("ask", Duration::from_secs(10)).ok_or("the TUI never reached its prompt")?;
+            t.write(b"wait\r");
+            t.wait_for("esc to interrupt", Duration::from_secs(10)).ok_or("the turn never started")?;
+            // Past the start: the request out, the stall probe answered.
+            std::thread::sleep(Duration::from_secs(2));
+            let (f0, t0) = (t.frames().len(), proc_ticks(pid)?);
+            std::thread::sleep(window);
+            Ok((proc_ticks(pid)?.saturating_sub(t0), t.frames().len() - f0))
+        })();
+        let _ = t.child.kill();
+        r
+    };
+    match run() {
+        Ok((ticks, frames)) => Outcome::Measured { value: ticks as f64, note: format!("{} s window, {frames} frames", window.as_secs()) },
+        Err(e) => Outcome::Error(e),
+    }
 }
 
 /// Peak frames per second while an answer streams at 500 tokens a second

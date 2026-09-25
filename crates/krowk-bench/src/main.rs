@@ -106,6 +106,7 @@ fn main() {
                         }
                     }
                     "tui.startup_cold" | "tui.redraw_fps" | "session.replay_rss" => tui_measure(&b.id, &full, &measure::fresh_dir(&work, &b.id), runs),
+                    "tui.turn_cpu" => tui_turn_cpu(&full, &measure::fresh_dir(&work, "tui-turn"), Duration::from_secs(b.window_s.unwrap_or(5))),
                     "tui.idle_cpu" | "tui.idle_rss" => {
                         let window = Duration::from_secs(b.window_s.unwrap_or(10));
                         let sample = tui_idle.get_or_insert_with(|| tui_idle_sample(&full, &measure::fresh_dir(&work, "tui-idle"), window));
@@ -166,6 +167,16 @@ fn tui_measure(id: &str, full: &std::path::Path, home: &std::path::Path, runs: u
 
 #[cfg(not(target_os = "linux"))]
 fn tui_measure(_: &str, _: &std::path::Path, _: &std::path::Path, _: usize) -> Outcome {
+    Outcome::Skipped(NOT_LINUX.into())
+}
+
+#[cfg(target_os = "linux")]
+fn tui_turn_cpu(bin: &std::path::Path, home: &std::path::Path, window: Duration) -> Outcome {
+    tui::turn_cpu(bin, home, window)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tui_turn_cpu(_: &std::path::Path, _: &std::path::Path, _: Duration) -> Outcome {
     Outcome::Skipped(NOT_LINUX.into())
 }
 

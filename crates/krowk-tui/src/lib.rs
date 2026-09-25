@@ -310,6 +310,15 @@ fn parse_cursor_report(bytes: &[u8]) -> Option<u16> {
     None
 }
 
+/// When the running turn's clock and spinner next change: the first whole
+/// `TICK` after `now`, counted from the turn's start, so it is always in
+/// the future and the loop sleeps until then.
+fn next_tick(started: Instant, now: Instant) -> Instant {
+    let tick = app::TICK.as_millis().max(1);
+    let n = now.saturating_duration_since(started).as_millis() / tick + 1;
+    started + Duration::from_millis((n * tick) as u64)
+}
+
 /// The next of an optional stream, or never.
 async fn next_key(keys: &mut Option<EventStream>) -> Option<std::io::Result<Event>> {
     match keys {
@@ -361,11 +370,7 @@ impl<'h> Ui<'h> {
         loop {
             let now = Instant::now();
             // Deadlines, only for what is actually pending.
-            let tick_at = app.turn.as_ref().map(|t| {
-                let started = Instant::from_std(t.started);
-                let n = (now.saturating_duration_since(started).as_secs() + 1) as u32;
-                started + app::TICK * n
-            });
+            let tick_at = app.turn.as_ref().map(|t| next_tick(Instant::from_std(t.started), now));
             let stall_at = (app.waiting_on_model() && probe.is_none() && app.offline.is_none() && self.target.is_some())
                 .then(|| (last_activity + STALL).max(stall_quiet_until.unwrap_or(now)));
             let retry_at = app.turn.as_ref().filter(|t| (t.want_interrupt && !t.interrupt_sent) || !app.unsent_steers.is_empty()).map(|_| now + INTERRUPT_RETRY);
@@ -740,6 +745,19 @@ impl<'h> Ui<'h> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r_perf_2_the_turn_clock_ticks_at_the_spinner_rate_and_never_in_the_past() {
+        use tokio::time::Instant;
+        let t0 = Instant::now();
+        let tick = super::app::TICK;
+        for ms in [0u64, 1, 124, 125, 126, 999, 1000, 5_001] {
+            let now = t0 + std::time::Duration::from_millis(ms);
+            let next = super::next_tick(t0, now);
+            assert!(next > now, "at {ms} ms the next tick is in the future");
+            assert!(next - now <= tick, "at {ms} ms it is at most one frame away");
+        }
+    }
+
     #[test]
     fn a_cursor_report_is_read_past_whatever_came_before_it() {
         assert_eq!(super::parse_cursor_report(b"\x1b[12;40R"), Some(11));

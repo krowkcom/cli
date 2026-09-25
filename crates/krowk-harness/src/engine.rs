@@ -16,7 +16,8 @@
 //!   driving its own loop), which implement `Engine` directly and translate
 //!   the vendor's stream into these events. `claude::ClaudeEngine` is the
 //!   first: one long-lived `claude` process per session, kept by the host
-//!   between turns.
+//!   between turns; `codex::CodexEngine` drives `codex app-server` the same
+//!   way.
 //!
 //! The rules every engine keeps:
 //!

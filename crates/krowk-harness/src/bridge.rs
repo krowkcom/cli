@@ -5,12 +5,15 @@
 //! model calls it as `mcp__krowk__<tool>`.
 //!
 //! The bridge is transport-free: `handle` answers one JSON-RPC message with
-//! one JSON-RPC answer, and each backend carries the messages its own way.
-//! Claude Code carries them inside its control protocol — an `sdk` MCP
-//! server, declared in `--mcp-config` and answered on the process's own
-//! stdin and stdout — so there is no socket, no port and no second process
-//! for anything else on the host to reach. A backend without such a channel
-//! (Codex, ticket 7) runs `handle` behind a stdio server instead.
+//! one JSON-RPC answer, and each backend carries the messages its own way,
+//! on the pipes krowk already drives it over — so there is no socket, no
+//! port and no second process for anything else on the host to reach, and a
+//! call runs inside the krowk process that owns the session. Claude Code
+//! carries MCP inside its control protocol (an `sdk` server). `codex
+//! app-server` has its own in-band channel instead: the tools are declared
+//! as the thread's dynamic tools, in one `krowk` namespace, and each call
+//! arrives as an `item/tool/call` request, which `crate::codex` answers through
+//! `handle` as a `tools/call`.
 //!
 //! Every tool in `EXPOSED` is offered to every backend session, and only
 //! those: a tool is exposed by being listed there, with its input a Rust

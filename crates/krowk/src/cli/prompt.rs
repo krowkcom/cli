@@ -46,6 +46,15 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
     let toolset = toolset_flag(ctx)?;
     let effort = effort_flag(ctx)?;
     let budget = budget_flag(ctx)?;
+    // Who the trust prompt names: the vendor of the model the turn will run
+    // on — the flag, else a resumed session's last, else the default.
+    let session_model = resume.as_ref().and_then(|id| log::read_events(&sessions_dir.join(id).join(log::EVENTS_FILE)).ok()).and_then(|events| {
+        events.iter().rev().find_map(|e| match &e.body {
+            krowk_harness::protocol::LogBody::TurnStarted { model, .. } => Some(model.clone()),
+            _ => None,
+        })
+    });
+    let vendor = vendor_of(model.clone().or(session_model).or_else(|| registry.default_model().ok()).as_ref(), &registry);
     let cfg = HostConfig {
         sessions_dir,
         cwd,
@@ -54,7 +63,7 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
         pricer: pricer(ctx.io.env),
         catalog: catalog(ctx.io.env),
         credentials: super::providers::credentials_path(),
-        trust: trust_gate(ctx.f.trust, super::interactive(ctx) && std::io::stdin().is_terminal() && ctx.io.err_tty, Some(ctx.env("HOME")).filter(|h| !h.trim().is_empty()).map(std::path::PathBuf::from)),
+        trust: trust_gate(ctx.f.trust, super::interactive(ctx) && std::io::stdin().is_terminal() && ctx.io.err_tty, Some(ctx.env("HOME")).filter(|h| !h.trim().is_empty()).map(std::path::PathBuf::from), vendor),
         publisher: Some(publisher(ctx)),
     };
     let opts = headless::Options { prompt, resume, model, permission_mode, toolset, effort, budget, format };
@@ -198,13 +207,13 @@ pub(super) fn resolve_resume(ctx: &Ctx, sessions_dir: &std::path::Path, referenc
 }
 
 /// R-BACK-6: `claude -p` runs a repository's hooks and MCP servers without
-/// the trust dialog Claude Code shows on a terminal, so krowk asks its own
-/// before a backend is spawned. A repository trusted before, or `--trust`,
+/// the trust dialog Claude Code shows on a terminal, and Codex what its
+/// project config names, so krowk asks its own before a backend is spawned. A repository trusted before, or `--trust`,
 /// goes ahead; a person at the terminal is asked, and a yes is remembered;
 /// anything headless is refused. The home directory and `/` are never
 /// offered: only `--trust`, for one run, starts a backend there. Nothing is
 /// spawned until this answers.
-fn trust_gate(flag: bool, ask: bool, home: Option<std::path::PathBuf>) -> trust::Gate {
+fn trust_gate(flag: bool, ask: bool, home: Option<std::path::PathBuf>, vendor: &'static str) -> trust::Gate {
     let store = trust::Store::new(krowk_api::creds::config_dir().join(trust::FILE), home);
     Arc::new(move |root: &std::path::Path| {
         if flag || store.trusts(root) {
@@ -216,24 +225,37 @@ fn trust_gate(flag: bool, ask: bool, home: Option<std::path::PathBuf>) -> trust:
         if !ask {
             return Err(trust::untrusted(root, "Look at what it would run, then pass --trust to run it anyway, or run krowk -p there once on a terminal and answer its prompt."));
         }
-        if ask_trust(&store, root) { Ok(()) } else { Err(trust::untrusted(root, "Nothing was run.")) }
+        if ask_trust(&store, root, vendor) { Ok(()) } else { Err(trust::untrusted(root, "Nothing was run.")) }
     })
 }
 
+/// The vendor a model runs through, for the trust prompt's words: a
+/// backend instance's (`Claude Code`, `Codex`), else "the backend".
+pub(super) fn vendor_of(model: Option<&krowk_harness::protocol::ModelRef>, registry: &Registry) -> &'static str {
+    model.and_then(|m| registry.get(&m.instance).ok()).filter(|i| i.backend.is_some()).map(|i| i.vendor).unwrap_or("the backend")
+}
+
 /// The trust prompt itself, on the terminal as it is (not raw): what the
-/// repository would make Claude Code run, and a yes-or-no that defaults to
+/// repository would make the vendor run, and a yes-or-no that defaults to
 /// no. A yes is remembered.
-pub(super) fn ask_trust(store: &trust::Store, root: &std::path::Path) -> bool {
+pub(super) fn ask_trust(store: &trust::Store, root: &std::path::Path, vendor: &str) -> bool {
     let runs = trust::what_runs(root);
     use std::io::Write as _;
     let mut stderr = std::io::stderr();
-    let _ = writeln!(stderr, "Claude Code (`claude -p`) runs a repository's own hooks and MCP servers without asking.");
+    match vendor {
+        "Claude Code" => {
+            let _ = writeln!(stderr, "Claude Code (`claude -p`) runs a repository's own hooks and MCP servers without asking.");
+        }
+        v => {
+            let _ = writeln!(stderr, "{v} runs what a repository configures it to — its project config's hooks and MCP servers — without asking.");
+        }
+    }
     if runs.is_empty() {
         let _ = writeln!(stderr, "{} has none of those files now, but it is not a repository you have trusted.", root.display());
     } else {
         let _ = writeln!(stderr, "{} has {}.", root.display(), runs.join(", "));
     }
-    match inquire::Confirm::new(&format!("Trust {} and run Claude Code in it?", root.display())).with_default(false).prompt() {
+    match inquire::Confirm::new(&format!("Trust {} and run {vendor} in it?", root.display())).with_default(false).prompt() {
         Ok(true) => {
             if let Err(e) = store.trust(root) {
                 let _ = writeln!(stderr, "! trusted for this run, but not remembered: {e}");
@@ -254,7 +276,7 @@ pub(super) fn tui_trust_gate(model: Option<&krowk_harness::protocol::ModelRef>, 
     let store = trust::Store::new(krowk_api::creds::config_dir().join(trust::FILE), home);
     let backend = model.and_then(|m| registry.get(&m.instance).ok()).is_some_and(|i| i.backend.is_some());
     let asked = trust::root(cwd);
-    let accepted = backend && !store.trusts(&asked) && store.refuses(&asked).is_none() && ask_trust(&store, &asked);
+    let accepted = backend && !store.trusts(&asked) && store.refuses(&asked).is_none() && ask_trust(&store, &asked, vendor_of(model, registry));
     Arc::new(move |root: &std::path::Path| {
         if store.trusts(root) || (accepted && root == asked) {
             return Ok(());

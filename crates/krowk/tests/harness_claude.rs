@@ -337,3 +337,75 @@ fn r_back_6_the_tui_asks_before_claude_runs_in_an_untrusted_repository() {
         }
     }
 }
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only asks whether the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn gone(pid: i32) -> bool {
+    (0..100).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        !alive(pid)
+    })
+}
+
+/// The pids the fake logged once it started its background command.
+fn claude_pids(b: &Sandbox) -> (i32, i32) {
+    let log = (0..200)
+        .find_map(|_| {
+            let l = b.fake_log();
+            if l.contains("grandchild ") {
+                Some(l)
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            }
+        })
+        .expect("the fake started its command");
+    let pid = |prefix: &str| -> i32 { log.lines().rev().find_map(|l| l.strip_prefix(prefix)).unwrap().trim().parse().unwrap() };
+    (pid("pid "), pid("grandchild "))
+}
+
+/// A second Ctrl-C leaves at once, headless or in the TUI, and takes Claude
+/// Code's whole process group with it.
+#[test]
+fn r_back_1_a_second_ctrl_c_leaves_at_once_and_kills_claude_codes_process_group() {
+    let b = Sandbox::new("ctrlc2");
+    b.json(&["providers", "add", "claude", "--json"], &[]);
+    let mut child = b
+        .command(&["-p", "work for a long time", "--model", "claude/sonnet", "--trust", "--output-format", "stream-json"], &[("FAKE_CLAUDE_SCENARIO", &scenario("hang.jsonl"))])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let (server, grandchild) = claude_pids(&b);
+    for _ in 0..2 {
+        // SAFETY: a signal to the child this test started.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let started = std::time::Instant::now();
+    assert_eq!(child.wait().unwrap().code(), Some(130));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(gone(server) && gone(grandchild), "Claude Code's group outlived krowk -p");
+
+    // The TUI.
+    let _ = std::fs::remove_file(b.root.join("fake.log"));
+    let trusted = b.root.join("home/.config/krowk/trusted.json");
+    std::fs::create_dir_all(trusted.parent().unwrap()).unwrap();
+    std::fs::write(&trusted, serde_json::json!({"directories": [b.root.join("repo")]}).to_string()).unwrap();
+    let cmd = b.command(&["--model", "claude/sonnet"], &[("TERM", "xterm-256color"), ("FAKE_CLAUDE_SCENARIO", &scenario("hang.jsonl"))]);
+    let mut t = pty::Pty::spawn(cmd, 200, 30);
+    assert!(t.wait_for("ask anything", std::time::Duration::from_secs(10)).is_some(), "{:?}", t.text());
+    t.write(b"work for a long time\r");
+    let (server, grandchild) = claude_pids(&b);
+    t.write(b"\x03");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    t.write(b"\x03");
+    let st = t.wait(std::time::Duration::from_secs(5)).expect("the TUI leaves on the second Ctrl-C, not after Claude Code");
+    assert_eq!(st.code(), Some(130), "{st}");
+    assert!(gone(server) && gone(grandchild), "Claude Code's group outlived the TUI");
+}

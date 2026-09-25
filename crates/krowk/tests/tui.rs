@@ -108,7 +108,12 @@ fn r_perf_4_a_500_token_a_second_stream_redraws_at_most_60_times_a_second() {
     assert!(t.wait_for("ask anything", Duration::from_secs(10)).is_some());
     let before = t.frames().len();
     t.write(b"stream\r");
-    assert!(t.wait_for("00125:", Duration::from_secs(20)).is_some(), "the stream never finished");
+    // The turn's end is its token line; a loaded macOS runner has taken
+    // longer than 20 s to get there, so the bound is generous and the wait
+    // is on the turn finishing, not on the last line alone. The last line
+    // must still be there, whole.
+    assert!(t.wait_for("tokens", Duration::from_secs(90)).is_some(), "the stream never finished: {:?}", t.text().len());
+    assert!(t.text().contains("00125:"), "the turn ended without its last line");
     let frames: Vec<Instant> = t.frames()[before..].to_vec();
     let peak = pty::peak_fps(&frames);
     assert!(frames.len() >= 30, "it redrew while streaming: {} frames", frames.len());

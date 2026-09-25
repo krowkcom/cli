@@ -64,6 +64,11 @@ pub enum WireApi {
     /// Claude Code's to replay, never sent to the Messages API by krowk.
     #[serde(rename = "claude-code")]
     ClaudeCode,
+    /// `codex app-server`'s JSON-RPC: Codex runs the loop, on its own
+    /// login, and krowk drives it. Codex keeps its reasoning to itself, so
+    /// nothing streamed here is ever replayed as a blob.
+    #[serde(rename = "codex-app-server")]
+    CodexAppServer,
 }
 
 impl WireApi {
@@ -74,6 +79,7 @@ impl WireApi {
             WireApi::OpenaiResponses => "openai-responses",
             WireApi::ChatCompletions => "chat-completions",
             WireApi::ClaudeCode => "claude-code",
+            WireApi::CodexAppServer => "codex-app-server",
         }
     }
 }
@@ -408,7 +414,7 @@ pub enum LogBody {
     #[serde(rename = "backend.session")]
     BackendSession {
         turn_id: String,
-        /// The backend, e.g. `claude-code`.
+        /// The backend, e.g. `claude-code` or `codex-app-server`.
         backend: String,
         /// The vendor's session id, e.g. Claude Code's.
         vendor_session_id: String,

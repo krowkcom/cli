@@ -288,6 +288,56 @@ the versions are the `v*` tags a release is cut from. Entries land under
   of the repository's and is never asked about. Steering (typing while a
   turn runs, in the TUI) is not taken by a Claude Code turn: it comes back
   into the prompt, unsent.
+- **`krowk -p` can run Codex on your ChatGPT subscription, with as many
+  accounts as you like.** krowk drives OpenAI's own `codex app-server` —
+  the interface OpenAI built for other programs to use Codex — with the
+  `codex` already on your PATH: `--model codex/gpt-5.5` runs it signed in
+  the way you signed it in. `krowk providers add codex --name team` makes
+  a second account, `codex:team`, with a `CODEX_HOME` of its own (under
+  `~/.local/share/krowk/codex/`, or `--config-dir`) that links in your
+  Codex `config.toml`, `AGENTS.md`, prompts, skills and rules, so the
+  accounts share one configuration while each keeps its own login and
+  threads, and signs it in by running `codex login` — OpenAI's own login,
+  on your terminal (`--device` for its device code). krowk never reads
+  Codex's login file or uses Codex's OAuth client; `providers list` asks
+  `codex login status`. One `codex app-server` serves the whole session:
+  its turns stream into the same log and `krowk sessions` listing as
+  native ones, with the commands Codex ran and the patches it applied as
+  tool calls; typing while a turn runs steers it; Ctrl-C interrupts it
+  and keeps the session; `-p --resume` continues the same Codex thread;
+  and the log records the thread, its transcript's path and whether it
+  ran on ChatGPT or an API key, which the TUI's status bar shows beside
+  the instance. Codex runs in its read-only sandbox with every approval
+  routed to krowk — whatever its config's `sandbox_mode` or
+  `approvals_reviewer` say; a thread it opens looser is stopped before a
+  turn runs — and krowk answers by `--permission-mode`: a patch needs
+  `acceptEdits` and never reaches `.git`, `.codex`, `.claude`, the
+  account's home or your own Codex home — a move judged by where it lands;
+  a command beyond the sandbox needs `bypassPermissions`, which is Codex's
+  full access. **The MCP servers your Codex config names do not run
+  outside `bypassPermissions`**: krowk turns each off on the thread, as it
+  keeps Claude Code's out with `--strict-mcp-config` (servers an
+  installed Codex plugin brings may not be listed, and are not covered
+  yet). **What the sandbox lets a command do
+  without asking — read your disk, not write it — and what your own Codex
+  rules allow, still apply first.** `OPENAI_API_KEY`, `OPENAI_BASE_URL`,
+  `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `CODEX_SQLITE_HOME` and Codex's
+  other identity and endpoint overrides in krowk's environment are not
+  passed to Codex. Writes Codex makes to its config (trusting a project)
+  land in your own `config.toml`, which the accounts share; its bundled
+  skills stay in each account's home. A skill you add to your own Codex
+  later reaches every account the next time it starts. A router is an instance of its own: `--api-key-env NAME` hands
+  that variable's key to Codex under the same name, for the model
+  provider its `args` name. krowk's own tools reach Codex as its dynamic
+  tools — today `session_info` — and the trust question above covers a
+  repository's `.codex` too. The native edit tools keep out of `.codex`
+  the way they keep out of `.git`. The app-server's schema is pinned for
+  the Codex version in `crates/krowk-harness/schema/codex/VERSION`, and
+  `scripts/codex_schema.sh --check` fails CI when it goes stale.
+- **A second Ctrl-C leaves at once during a Claude Code or Codex turn,
+  and takes the backend with it.** Headless or in the TUI, the vendor
+  process and everything it started are killed rather than left running,
+  and the TUI no longer hangs waiting on the turn it was asked to abandon.
 - **Native sessions are logs you own, listed beside imported ones.** Each
   session is an append-only JSONL log under
   `~/.local/share/krowk/sessions/<id>/` (with each turn's exact system

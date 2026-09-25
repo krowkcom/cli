@@ -39,6 +39,7 @@ DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 log() { printf '%s\n' "$*" >>"$LOG"; }
 log "argv $*"
 log "config ${CLAUDE_CONFIG_DIR:-<unset>}"
+log "pid $$"
 
 case "${1:-}" in
 --version)

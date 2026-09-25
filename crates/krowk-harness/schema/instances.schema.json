@@ -371,6 +371,64 @@
           "required": [
             "kind"
           ]
+        },
+        {
+          "description": "The user's own, unmodified `codex` binary, driven as `codex\napp-server` — OpenAI's own interface for third-party clients: it runs\nthe loop on its own login, a ChatGPT subscription or an API key, and\nkrowk never reads that login (R-BACK-3). Added with `krowk providers\nadd codex`.",
+          "type": "object",
+          "properties": {
+            "binary": {
+              "description": "The binary; `codex` on PATH when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "codexHome": {
+              "description": "`CODEX_HOME`: where Codex keeps this account's login, threads and\nstate. Codex's own default (`~/.codex`) when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "env": {
+              "description": "More environment for the process, e.g. `OPENAI_BASE_URL` for a\nrouter. Literal values: a key belongs in the environment krowk\nruns in, never in a definition — name it with `apiKeyEnv`.\n`CODEX_HOME` is not one of them: `codexHome` is the one way to\nname it. The ambient `OPENAI_API_KEY`, `OPENAI_BASE_URL` and\n`CODEX_API_KEY` reach the process only when named here or by\n`apiKeyEnv`.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "args": {
+              "description": "More launch arguments, after `app-server`: a router is a model\nprovider named with `-c`, e.g. `-c model_provider=openrouter`.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "apiKeyEnv": {
+              "description": "The environment variable krowk reads a key from and hands the\nprocess under the same name: the one a router's model provider\nreads (its `env_key`). The variable's name is stored, never the\nkey. None: Codex signs in with its own login.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "effort": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Effort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "codex-app-server"
+            }
+          },
+          "required": [
+            "kind"
+          ]
         }
       ]
     },
@@ -417,6 +475,11 @@
           "description": "The `claude` binary's stream-json protocol: Claude Code runs the\nloop and krowk drives it. A thinking signature it streams is\nClaude Code's to replay, never sent to the Messages API by krowk.",
           "type": "string",
           "const": "claude-code"
+        },
+        {
+          "description": "`codex app-server`'s JSON-RPC: Codex runs the loop, on its own\nlogin, and krowk drives it. Codex keeps its reasoning to itself, so\nnothing streamed here is ever replayed as a blob.",
+          "type": "string",
+          "const": "codex-app-server"
         }
       ]
     }

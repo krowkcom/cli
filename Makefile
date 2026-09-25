@@ -2,7 +2,7 @@
 # A checkout and a release should not disagree about what version this is.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
 
-.PHONY: build test lint check install mock clean dist release-check golden golden-update bin/devregistry schema lean-deps bench
+.PHONY: build test lint check install mock clean dist release-check golden golden-update bin/devregistry schema codex-schema codex-schema-update lean-deps bench
 
 build: ## Build target/release/krowk (the full build) and krowk-mcp
 	KROWK_VERSION=$(VERSION) cargo build --release -p krowk --features harness
@@ -43,6 +43,17 @@ bench: ## Hold the release builds to the performance and size budgets
 
 schema: ## Regenerate the harness protocol's JSON Schema after a type change
 	KROWK_SCHEMA_UPDATE=1 cargo test -p krowk-harness --test schema
+
+# R-BACK-3: the schema of the `codex app-server` protocol krowk drives, pinned
+# for the Codex version in crates/krowk-harness/schema/codex/VERSION. Needs
+# that Codex installed (npm install -g @openai/codex@<version>), so it is CI's
+# own job rather than part of `check`; `codex-schema-update` moves the pin to
+# the Codex installed.
+codex-schema: ## Fail when the pinned codex app-server schema is stale against the pinned Codex
+	scripts/codex_schema.sh --check
+
+codex-schema-update: ## Re-pin the codex app-server schema from the Codex installed
+	scripts/codex_schema.sh --update
 
 install: ## Install krowk and krowk-mcp into ~/.cargo/bin
 	KROWK_VERSION=$(VERSION) cargo install --locked --path crates/krowk --features harness

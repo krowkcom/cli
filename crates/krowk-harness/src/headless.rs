@@ -113,6 +113,9 @@ async fn drive(host: Host, opts: Options, stdout: &mut dyn Write) -> Outcome {
                 // The first Ctrl-C asks the turn to stop and keeps what it
                 // made; a second one does not wait.
                 if interrupts > 1 {
+                    // Not waited on, but not left running either: every
+                    // backend's process group goes with krowk.
+                    crate::group::kill_all();
                     std::process::exit(130);
                 }
                 want_interrupt = true;

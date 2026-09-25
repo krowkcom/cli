@@ -56,9 +56,10 @@ def die(msg):
 class Krowk:
     def __init__(self, binary, data, cache):
         self.binary = binary
-        self.env = dict(os.environ, XDG_DATA_HOME=str(data), XDG_CACHE_HOME=str(cache))
-        # Never let a krowk run fall back to the real store.
-        self.env.pop("KROWK_DB", None)
+        # Scratch data, cache and config, and no update check: nothing a run
+        # does lands in the real home.
+        self.env = dict(os.environ, XDG_DATA_HOME=str(data), XDG_CACHE_HOME=str(cache),
+                        XDG_CONFIG_HOME=str(cache / "config"), KROWK_NO_UPDATE_CHECK="1")
 
     def run(self, *args, check=True):
         t0 = time.perf_counter()
@@ -117,11 +118,17 @@ def snapshot():
     return out
 
 
-def compare_snapshots(before, after, t_start_ns):
+def compare_snapshots(before, after):
     """Unchanged, appended (old bytes intact: a live writer), or rewritten."""
-    res = {"files": len(before), "unchanged": 0, "appended": [], "rewritten": [], "new": [], "gone": []}
+    res = {"files": len(before), "unchanged": 0, "appended": [], "rewritten": [], "new": [], "gone": [], "live_db": []}
     for f, b in before.items():
         a = after.get(f)
+        if a is not None and a != b and f.startswith(str(OPENCODE_DB)):
+            # opencode rewrites its own database and WAL while it runs; krowk
+            # opens it read-only (the importer's reads_are_read_only_under_wal
+            # test), so a change here is opencode's, not the import's.
+            res["live_db"].append(f)
+            continue
         if a is None:
             res["gone"].append(f)
         elif a == b:
@@ -219,6 +226,10 @@ def finish(res, messages, calls, results):
     res["first_user"], res["last_user"] = (t[0], t[-1]) if t else (None, None)
     res["tool_results"] = len(results)
     res["unlinked"] = sum(1 for r in results if not r or r not in calls)
+    # Which call every result links to, not just how many link: two sides
+    # linking results to different calls must not compare equal.
+    res["result_links"] = Counter(r if r and r in calls else "" for r in results)
+    res["call_ids"] = frozenset(calls)
     return res
 
 
@@ -314,7 +325,13 @@ def claude_index():
     """binding id -> [files]; parent session id -> child binding ids."""
     idx, children = defaultdict(list), defaultdict(set)
     for f in sorted(CLAUDE_ROOT.rglob("*.jsonl")):
-        if f.stat().st_size > MAX_FILE_BYTES:
+        # Only what the import saw: a file created, or gone, since is not in it.
+        if SIZE_PIN and str(f) not in SIZE_PIN:
+            continue
+        try:
+            if f.stat().st_size > MAX_FILE_BYTES:
+                continue
+        except OSError:
             continue
         bid, parent, sub = claude_binding(str(f))
         idx[bid].append(str(f))
@@ -499,6 +516,15 @@ def oc_part_ok(v):
 
 
 def opencode_source(db, sid):
+    # One read transaction: a live opencode write lands wholly before or after.
+    db.execute("BEGIN")
+    try:
+        return _opencode_source(db, sid)
+    finally:
+        db.execute("COMMIT")
+
+
+def _opencode_source(db, sid):
     res = new_result()
     messages, candidates, toks = [], [], []
     calls, results = set(), []
@@ -707,9 +733,14 @@ def main():
         die(f"--data {data} is not a scratch dir under /tmp; refusing to risk the real store")
     data.mkdir(parents=True, exist_ok=True)
     cache = data.parent / (data.name + "-cache")
+    marker = cache / ".phase1-scratch"
     if cache.exists():
+        # Only a directory this script made is removed.
+        if not marker.exists():
+            die(f"{cache} exists and was not made by this script; refusing to remove it")
         shutil.rmtree(cache)
     cache.mkdir(parents=True)
+    marker.touch()
     if (HOME / ".cache/krowk").is_dir():
         shutil.copytree(HOME / ".cache/krowk", cache / "krowk")
     k = Krowk(binary, data, cache)
@@ -724,7 +755,7 @@ def main():
         rb, rb_ms = k.json("sessions", "rebuild", "--yes")
         print("hashing sources (after)…", file=sys.stderr)
         after = snapshot()
-        cmp = compare_snapshots(before, after, t_start_ns)
+        cmp = compare_snapshots(before, after)
         sizes = {f: a["size"] for f, a in after.items() if before.get(f) == a}
         snap_path.write_text(json.dumps({"t_start_ms": t_start_ns // 1_000_000, "rebuild_ms": rb_ms,
                                          "rebuild": rb.get("data"), "compare": cmp, "sizes": sizes}, indent=1))
@@ -747,9 +778,15 @@ def main():
 
     print("indexing sources…", file=sys.stderr)
     c_idx, c_children = claude_index()
-    recency = {"claude": {b: max(os.stat(f).st_mtime_ns // 1_000_000 for f in fs) for b, fs in c_idx.items()}}
+    def mtime_ms(f):
+        try:
+            return os.stat(f).st_mtime_ns // 1_000_000
+        except OSError:
+            return 0
+
+    recency = {"claude": {b: max(mtime_ms(f) for f in fs) for b, fs in c_idx.items()}}
     cursor_files = {p.parent.name: str(p) for p in CURSOR_ROOT.glob("*/agent-transcripts/*/*.jsonl") if p.parent.name == p.stem}
-    recency["cursor"] = {i: os.stat(f).st_mtime_ns // 1_000_000 for i, f in cursor_files.items()}
+    recency["cursor"] = {i: mtime_ms(f) for i, f in cursor_files.items()}
     oc = oc_connect() if OPENCODE_DB.exists() else None
     recency["opencode"] = dict(oc.execute("SELECT id, time_updated FROM session")) if oc else {}
     oc_parents = [r[0] for r in oc.execute("SELECT parent_id, count(*) n FROM session WHERE parent_id IS NOT NULL GROUP BY 1 ORDER BY n DESC")] if oc else []
@@ -777,7 +814,7 @@ def main():
             show, _ = k.json("sessions", "show", s["id"])
             st = store_counts(show, s["children"])
             if src is None:
-                notes.append(f"{prov} {fid[:12]}: no source found for foreign id {fid}")
+                mismatches.append(f"- {prov} `{fid[:12]}` ({reason}): no source transcript found for foreign id {fid}")
                 continue
             cols = {
                 "messages": src["messages"] == st["messages"],
@@ -787,7 +824,7 @@ def main():
                 "first": src["first_user"] == st["first_user"],
                 "last": src["last_user"] == st["last_user"],
                 "children": src["children"] == st["children"],
-                "relink": src["unlinked"] == st["unlinked"] and not st["linked_flag_disagrees"],
+                "relink": src["result_links"] == st["result_links"] and src["call_ids"] == st["call_ids"] and not st["linked_flag_disagrees"],
             }
             label = f"`{fid[:12]}` {short(show['data'].get('title'))}"
             reason += {"children": f" ({s['children']})", "error/interrupt": f" ({s['errors']} err, {s['interrupts']} int)",
@@ -825,6 +862,15 @@ def main():
                     extra = " — store equals the per-line sum: repeated per-block usage counted once per line"
                 mismatches.append(f"- {prov} `{fid[:12]}` ({reason}): {', '.join(bad)}{extra}")
 
+    # Completeness: every source session the import saw is in the store — a
+    # session dropped whole would never be picked above.
+    bound = {prov: {r[0] for r in store.execute("SELECT foreign_session_id FROM session_binding WHERE harness = ?", (prov,))} for prov in PROVIDERS}
+    seen_oc = set()
+    if oc:
+        seen_oc = {r[0] for r in oc.execute("SELECT id FROM session WHERE time_created <= ?", (import_start_ms,))}
+    source_ids = {"claude": set(c_idx), "cursor": set(cursor_files) - live_fids["cursor"], "opencode": seen_oc}
+    complete = {prov: (len(ids), sorted(ids - bound[prov])) for prov, ids in source_ids.items()}
+
     # Summary figures.
     times = [k.run("sessions", "--json")[1] for _ in range(5)]
     doctor, _ = k.json("doctor", check=False)
@@ -856,16 +902,26 @@ def main():
         print(f"- source files unchanged by the import: **{'yes' if ok else 'NO'}** — {c['files']} files hashed; "
               f"{c['unchanged']} identical, {len(c['appended'])} appended by live writers (old bytes intact), "
               f"{len(c['rewritten'])} rewritten, {len(c['gone'])} gone, {len(c['new'])} new")
+        for f in c.get("live_db", []):
+            print(f"  - changed by opencode itself while it ran (krowk opens it read-only): {f}")
         for f in c["appended"] + c["rewritten"]:
             print(f"  - {'appended' if f in c['appended'] else 'REWRITTEN'}: {f}")
         print(f"- rebuild: {snap['rebuild_ms']:.0f} ms")
     else:
         print("- source files unchanged: not checked (run with --rebuild)")
+    for prov, (n, missing) in complete.items():
+        print(f"- {prov} completeness: {n - len(missing)}/{n} source sessions in the store"
+              + (f" — **missing** {', '.join(m[:12] for m in missing[:10])}" if missing else ""))
     if notes:
         print("\n### Pick notes\n")
         print("\n".join(f"- {n}" for n in notes))
     print("\n### Mismatches\n")
     print("\n".join(mismatches) if mismatches else "none")
+
+    failed = bool(mismatches) or store_check.get("status") != "pass" or mode != "0o600" \
+        or any(missing for _, missing in complete.values()) \
+        or (snap and (snap["compare"]["rewritten"] or snap["compare"]["gone"]))
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":

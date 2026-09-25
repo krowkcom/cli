@@ -1089,30 +1089,33 @@ pub fn sync(ctx: &mut Ctx) -> Result<(), Error> {
     import_into(ctx, Some(&conn), &store_path, &sources, true, ImportReport { pricing: Some(p), ..ImportReport::default() })
 }
 
-/// Refreshes the models.dev cache when it is due, judged by the sidecar's
-/// mtime: a 304 rewrites only the sidecar, and "when did krowk last ask" is
-/// the question.
+/// Refreshes the models.dev cache when its last fetch is a day old, or
+/// unknown, or in the future, or there is no readable cache. The sidecar's
+/// `fetched_at_ms` is the clock: a 304 stamps it too, since "when did krowk
+/// last ask" is the question.
 fn sync_prices(env: &dyn Fn(&str) -> String, no_network: bool) -> SyncPricing {
+    sync_prices_from(env, no_network, pricing::MODELS_URL, now_ms())
+}
+
+fn sync_prices_from(env: &dyn Fn(&str) -> String, no_network: bool, url: &str, now: i64) -> SyncPricing {
     let failed = |w: String| SyncPricing { status: "failed", warning: w };
     if no_network {
         return SyncPricing { status: "no_network", warning: String::new() };
     }
-    let Some(cache) = pricing::cache_path(env) else {
+    if pricing::cache_path(env).is_none() {
         return failed("prices were not refreshed: no cache directory in the environment".into());
-    };
-    let meta = pricing::meta_path(&cache);
-    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    let before = mtime(&meta);
-    if before.is_some_and(|t| t.elapsed().is_ok_and(|age| age < PRICING_MAX_AGE)) {
+    }
+    let fetched = pricing::Freshness::of(env).fetched_at_ms().filter(|f| *f <= now);
+    if fetched.is_some_and(|f| now - f < PRICING_MAX_AGE.as_millis() as i64) {
         return SyncPricing { status: "fresh", warning: String::new() };
     }
-    match pricing::refresh_within(env, "", Duration::from_secs(3)) {
+    match pricing::refresh_within(env, url, Duration::from_secs(3)) {
         Err(e) => failed(format!("prices were not refreshed: {e}")),
-        Ok(true) => SyncPricing { status: "refreshed", warning: String::new() },
-        Ok(false) if mtime(&meta).is_some_and(|now| before.is_none_or(|b| now > b)) => SyncPricing { status: "unchanged", warning: String::new() },
-        Ok(false) => failed(
-            "prices were not refreshed: models.dev could not be reached or did not answer with a price file — the cache or the snapshot still prices everything".into(),
-        ),
+        Ok(pricing::Outcome::Refreshed) => SyncPricing { status: "refreshed", warning: String::new() },
+        Ok(pricing::Outcome::Unchanged) => SyncPricing { status: "unchanged", warning: String::new() },
+        Ok(pricing::Outcome::Unreachable(why)) => {
+            failed(format!("prices were not refreshed: {why} — the cache or the snapshot still prices everything"))
+        }
     }
 }
 
@@ -1391,24 +1394,37 @@ fn lock_file(path: &Path) -> Result<std::fs::File, Option<String>> {
 // ---- pricing refresh --------------------------------------------------------
 
 pub fn pricing_refresh(ctx: &mut Ctx) -> Result<(), Error> {
-    let refreshed = pricing::refresh(ctx.io.env, "").map_err(|e| fail("pricing_failed", e))?;
+    let outcome = pricing::refresh(ctx.io.env, "").map_err(|e| fail("pricing_failed", e))?;
+    let refreshed = outcome == pricing::Outcome::Refreshed;
     let path = pricing::cache_path(ctx.io.env).unwrap_or_default();
     if ctx.format != Format::Human {
-        let report = json!({
+        let fresh = pricing::Freshness::of(ctx.io.env);
+        let mut report = json!({
             "meta_path": pricing::meta_path(&path).display().to_string(),
             "path": path.display().to_string(),
             "refreshed": refreshed,
             "snapshot_date": pricing::SNAPSHOT_DATE,
             "source": pricing::MODELS_URL,
+            "fetched_at_ms": fresh.fetched_at_ms(),
+            "age_days": fresh.age_days(now_ms()),
+            "outcome": match &outcome {
+                pricing::Outcome::Refreshed => "refreshed",
+                pricing::Outcome::Unchanged => "unchanged",
+                pricing::Outcome::Unreachable(_) => "unreachable",
+            },
         });
+        if let pricing::Outcome::Unreachable(why) = &outcome {
+            report["warning"] = json!(why);
+        }
         return ctx.emit(&output::encode(&report));
     }
-    if refreshed {
-        let _ = writeln!(ctx.io.stdout, "prices refreshed from {}", pricing::MODELS_URL);
-    } else {
-        let _ = writeln!(ctx.io.stdout, "prices unchanged (snapshot {})", pricing::SNAPSHOT_DATE);
-    }
+    let _ = match &outcome {
+        pricing::Outcome::Refreshed => writeln!(ctx.io.stdout, "prices refreshed from {}", pricing::MODELS_URL),
+        pricing::Outcome::Unchanged => writeln!(ctx.io.stdout, "prices unchanged — models.dev confirmed the cache"),
+        pricing::Outcome::Unreachable(why) => writeln!(ctx.io.stdout, "prices not refreshed: {why}"),
+    };
     let _ = writeln!(ctx.io.stdout, "cache: {}", path.display());
+    let _ = writeln!(ctx.io.stdout, "{}", pricing::Freshness::of(ctx.io.env).describe(now_ms()));
     Ok(())
 }
 
@@ -1451,5 +1467,83 @@ mod tests {
         assert_eq!((format_cost(0.005), human_cost(0.005), human_cost(0.0)), ("$0.00500".into(), "<$0.01".into(), "free".into()));
         assert_eq!((format_cost(0.000_07), format_cost(0.000_12), format_cost(0.012_3)), ("$0.0000700".into(), "$0.000120".into(), "$0.01".into()));
         assert_eq!(truncate_chars("ąčęėįšųū", 5), "ąč...");
+    }
+
+    /// A models.dev stand-in answering each connection in turn: 200 with the
+    /// body and an ETag, or 304 when the request carries that ETag.
+    fn models_dev(connections: usize) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/api.json", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..connections {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = conn.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                let body = r#"{"p":{"models":{"m":{"cost":{"input":1,"output":2}}}}}"#;
+                let answer = if req.contains("if-none-match: \"v1\"") {
+                    "HTTP/1.1 304 Not Modified\r\netag: \"v1\"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                } else {
+                    format!("HTTP/1.1 200 OK\r\netag: \"v1\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+                };
+                conn.write_all(answer.as_bytes()).unwrap();
+                seen.push(req);
+            }
+            seen
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn a_lost_or_corrupt_cache_is_fetched_whole_whatever_its_sidecar_says() {
+        let dir = std::env::temp_dir().join(format!("krowk-sync-lost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_home = dir.join("cache").display().to_string();
+        let env = move |k: &str| if k == "XDG_CACHE_HOME" { cache_home.clone() } else { String::new() };
+        let cache = pricing::cache_path(&env).unwrap();
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        // A sidecar stamped just now, with the ETag, beside a file that holds nothing.
+        std::fs::write(&cache, "garbage").unwrap();
+        std::fs::write(pricing::meta_path(&cache), format!(r#"{{"etag":"\"v1\"","fetched_at_ms":{}}}"#, now_ms())).unwrap();
+        assert_eq!(pricing::Freshness::of(&env), pricing::Freshness::Unreadable);
+        let (url, server) = models_dev(1);
+        assert_eq!(sync_prices_from(&env, false, &url, now_ms()).status, "refreshed", "no 304 for a file with no prices");
+        assert!(!server.join().unwrap()[0].contains("if-none-match"), "the ETag was not sent");
+        // A sidecar from the future is a clock that is off: no age, so due.
+        std::fs::write(pricing::meta_path(&cache), format!(r#"{{"etag":"","fetched_at_ms":{}}}"#, now_ms() + 86_400_000 * 400)).unwrap();
+        assert_eq!(pricing::Freshness::of(&env).age_days(now_ms()), None);
+        assert!(pricing::Freshness::of(&env).describe(now_ms()).contains("clock is off"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_refreshes_a_stale_price_cache_and_leaves_a_fresh_one_alone() {
+        let dir = std::env::temp_dir().join(format!("krowk-sync-prices-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_home = dir.join("cache").display().to_string();
+        let env = move |k: &str| if k == "XDG_CACHE_HOME" { cache_home.clone() } else { String::new() };
+        let cache = pricing::cache_path(&env).unwrap();
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, r#"{"p":{"m":{"input":9}}}"#).unwrap();
+        let day = 86_400_000;
+        let now = now_ms();
+        std::fs::write(pricing::meta_path(&cache), format!(r#"{{"etag":"","fetched_at_ms":{}}}"#, now - 2 * day)).unwrap();
+        assert_eq!(pricing::Freshness::of(&env).age_days(now), Some(2));
+
+        let (url, server) = models_dev(2);
+        assert_eq!(sync_prices_from(&env, false, &url, now).status, "refreshed", "two days old is due");
+        assert_eq!(pricing::Freshness::of(&env).age_days(now_ms()), Some(0));
+        assert_eq!(sync_prices_from(&env, false, &url, now_ms()).status, "fresh", "just fetched is left alone");
+        // A day on, the same prices: a 304 still counts as having asked.
+        assert_eq!(sync_prices_from(&env, false, &url, now_ms() + day + 1).status, "unchanged");
+        let seen = server.join().unwrap();
+        assert!(seen[1].contains("if-none-match: \"v1\""), "the refresh is conditional: {seen:?}");
+        assert!(pricing::Freshness::of(&env).describe(now_ms()).ends_with(", today"));
+        assert_eq!(sync_prices_from(&env, true, &url, now).status, "no_network");
+        let got: serde_json::Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+        assert_eq!(got["p"]["models"]["m"]["cost"], serde_json::json!({ "input": 1, "output": 2 }), "the stale file was replaced");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

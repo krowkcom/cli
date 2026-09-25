@@ -2,6 +2,23 @@
 //! lookup: the snapshot embedded at build time always works offline, and the
 //! cache `pricing refresh` writes is preferred when it holds the pair. Tokens
 //! are stored per turn and priced at read time, so a refresh reprices history.
+//!
+//! Freshness has one recurring path and no machinery: `sessions sync`
+//! refreshes the cache when its last fetch is a day old, and `doctor` and
+//! `pricing refresh` say how old it is. Nothing on a read path — list, show,
+//! import, doctor — touches the network, and there is no timer: prices move
+//! monthly, and a scheduler would outlive its value.
+//!
+//! Audio rates (`input_audio`, `output_audio`) are read by nobody, on
+//! purpose: Claude, Cursor and opencode transcripts carry no audio tokens,
+//! and the store has no column to keep them in. The one place they could
+//! arrive is an OpenAI-shaped usage block (`prompt_tokens_details` /
+//! `completion_tokens_details.audio_tokens`) in a provider ledger, where
+//! they are counted inside input and output and priced at the text rate —
+//! an undercount, since audio costs more. Revisit when a ledger row or an
+//! importer reports a non-zero audio count: reading the rates is a field
+//! here and a column in the store, not a re-fetch — the cache keeps them as
+//! models.dev wrote them.
 
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
@@ -187,19 +204,31 @@ fn rates_from(cost: &Map<String, Value>) -> Option<Rates> {
     found.then_some(r)
 }
 
-/// Fetches models.dev into the cache, conditionally on the last ETag.
-/// `Ok(false)` covers every way of not having new prices — unchanged, a
-/// network that is not there, an answer that is not a price file — since
-/// the snapshot still answers; only a cache that cannot be written is an error.
-pub fn refresh(env: &dyn Fn(&str) -> String, url: &str) -> Result<bool, String> {
+/// What one refresh did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// New prices are in the cache.
+    Refreshed,
+    /// models.dev confirmed the cache (304): the prices stand, freshly checked.
+    Unchanged,
+    /// No new prices — no network, no answer, or an answer that is not a
+    /// price file. The cache or the snapshot still prices everything.
+    Unreachable(String),
+}
+
+/// Fetches models.dev into the cache, conditionally on the last ETag. Only a
+/// cache that cannot be written (or stamped) is an error.
+pub fn refresh(env: &dyn Fn(&str) -> String, url: &str) -> Result<Outcome, String> {
     refresh_within(env, url, REFRESH_TIMEOUT)
 }
 
 /// `refresh` bounded by `timeout`: sync's is tighter, since a scheduled sync
 /// is not a place to wait on a slow network.
-pub fn refresh_within(env: &dyn Fn(&str) -> String, url: &str, timeout: Duration) -> Result<bool, String> {
+pub fn refresh_within(env: &dyn Fn(&str) -> String, url: &str, timeout: Duration) -> Result<Outcome, String> {
     let path = cache_path(env).ok_or("pricing: no cache directory in environment")?;
-    let etag = load_etag(&path);
+    // The ETag is only worth sending for a cache that still holds prices: a
+    // 304 against a deleted or corrupt file would confirm prices nobody has.
+    let etag = if cache_readable(&path) { load_etag(&path) } else { String::new() };
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .max_redirects(0)
@@ -211,11 +240,16 @@ pub fn refresh_within(env: &dyn Fn(&str) -> String, url: &str, timeout: Duration
     if !etag.is_empty() {
         req = req.header("If-None-Match", &etag);
     }
-    let Ok(mut res) = req.call() else { return Ok(false) };
+    let mut res = match req.call() {
+        Ok(res) => res,
+        // The transport error names an errno that differs by platform; the
+        // news is the same.
+        Err(_) => return Ok(Outcome::Unreachable("models.dev could not be reached".into())),
+    };
     match res.status().as_u16() {
-        304 => {
-            stamp_meta(&path, &etag);
-            Ok(false)
+        304 if !etag.is_empty() => {
+            stamp_meta(&path, &etag).map_err(|e| format!("pricing: stamp {}: {e}", meta_path(&path).display()))?;
+            Ok(Outcome::Unchanged)
         }
         200 => {
             let new_etag = sanitize_etag(res.headers().get("etag").and_then(|v| v.to_str().ok()).unwrap_or_default());
@@ -223,17 +257,72 @@ pub fn refresh_within(env: &dyn Fn(&str) -> String, url: &str, timeout: Duration
             if std::io::Read::read_to_end(&mut std::io::Read::take(res.body_mut().as_reader(), MAX_BODY + 1), &mut body).is_err()
                 || body.len() as u64 > MAX_BODY
             {
-                return Ok(false);
+                return Ok(Outcome::Unreachable("models.dev answered with a body krowk could not read".into()));
             }
             if parse_rates(&body).is_none_or(|t| t.is_empty()) {
-                return Ok(false);
+                return Ok(Outcome::Unreachable("models.dev answered with something that is not a price file".into()));
             }
-            write_atomic(&path, &body).map_err(|e| e.to_string())?;
-            stamp_meta(&path, if new_etag.is_empty() { &etag } else { &new_etag });
+            write_atomic(&path, &body).map_err(|e| format!("pricing: write {}: {e}", path.display()))?;
+            stamp_meta(&path, if new_etag.is_empty() { &etag } else { &new_etag }).map_err(|e| format!("pricing: stamp {}: {e}", meta_path(&path).display()))?;
             *LOADED.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            Ok(true)
+            Ok(Outcome::Refreshed)
         }
-        _ => Ok(false),
+        s => Ok(Outcome::Unreachable(format!("models.dev answered HTTP {s}"))),
+    }
+}
+
+/// Whether the cache file holds prices at all.
+fn cache_readable(cache: &Path) -> bool {
+    std::fs::read(cache).ok().and_then(|raw| parse_rates(&raw)).is_some_and(|t| !t.is_empty())
+}
+
+/// How old the prices are.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Freshness {
+    /// No cache: the snapshot built into krowk prices everything.
+    SnapshotOnly,
+    /// A cache file that holds no prices: the snapshot is doing the work.
+    Unreadable,
+    /// A cache, fetched (or confirmed by a 304) at this moment — unknown
+    /// when its sidecar is missing or corrupt.
+    Cache { fetched_at_ms: Option<i64> },
+}
+
+impl Freshness {
+    pub fn of(env: &dyn Fn(&str) -> String) -> Freshness {
+        let Some(cache) = cache_path(env).filter(|p| p.exists()) else { return Freshness::SnapshotOnly };
+        if !cache_readable(&cache) {
+            return Freshness::Unreadable;
+        }
+        Freshness::Cache { fetched_at_ms: fetched_at_ms(&cache) }
+    }
+
+    pub fn fetched_at_ms(&self) -> Option<i64> {
+        match self {
+            Freshness::Cache { fetched_at_ms } => *fetched_at_ms,
+            _ => None,
+        }
+    }
+
+    /// Whole days since the last fetch; none when unknown, or when the fetch
+    /// is in the future — a clock that is off, which no age describes.
+    pub fn age_days(&self, now_ms: i64) -> Option<i64> {
+        self.fetched_at_ms().filter(|f| *f <= now_ms).map(|f| (now_ms - f) / 86_400_000)
+    }
+
+    /// "models.dev prices fetched 2026-09-10, 15 days ago", or what answers instead.
+    pub fn describe(&self, now_ms: i64) -> String {
+        match self {
+            Freshness::SnapshotOnly => format!("no price cache — prices come from the models.dev snapshot {SNAPSHOT_DATE} embedded in this build"),
+            Freshness::Unreadable => format!("the price cache holds no prices — the models.dev snapshot {SNAPSHOT_DATE} embedded in this build prices everything"),
+            Freshness::Cache { fetched_at_ms: None } => "a price cache of unknown age — its fetch time was not recorded".into(),
+            Freshness::Cache { fetched_at_ms: Some(ms) } => match self.age_days(now_ms) {
+                None => format!("models.dev prices fetched {}, which is in the future — this machine's clock is off", date_of(*ms)),
+                Some(0) => format!("models.dev prices fetched {}, today", date_of(*ms)),
+                Some(1) => format!("models.dev prices fetched {}, 1 day ago", date_of(*ms)),
+                Some(d) => format!("models.dev prices fetched {}, {d} days ago", date_of(*ms)),
+            },
+        }
     }
 }
 
@@ -259,10 +348,10 @@ fn sanitize_etag(etag: &str) -> String {
     etag.to_string()
 }
 
-fn stamp_meta(cache: &Path, etag: &str) {
+fn stamp_meta(cache: &Path, etag: &str) -> std::io::Result<()> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
     let meta = serde_json::json!({ "etag": etag, "fetched_at_ms": now });
-    let _ = write_atomic(&meta_path(cache), format!("{meta}\n").as_bytes());
+    write_atomic(&meta_path(cache), format!("{meta}\n").as_bytes())
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {

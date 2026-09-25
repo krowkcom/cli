@@ -343,7 +343,7 @@ stdout:
     "duration_ms": <n>,
     "pricing": {
       "status": "failed",
-      "warning": "prices were not refreshed: models.dev could not be reached or did not answer with a price file — the cache or the snapshot still prices everything"
+      "warning": "prices were not refreshed: models.dev could not be reached — the cache or the snapshot still prices everything"
     },
     "unpriced_models": [
       "anthropic/claude-opus-5-20260401"

@@ -5,7 +5,11 @@ stdout:
   "path": "<scratch>/home/.cache/krowk/models.json",
   "refreshed": false,
   "snapshot_date": "2026-09-10",
-  "source": "https://models.dev/api.json"
+  "source": "https://models.dev/api.json",
+  "fetched_at_ms": null,
+  "age_days": null,
+  "outcome": "unreachable",
+  "warning": "models.dev could not be reached"
 }
 exit: 0
 

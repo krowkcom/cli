@@ -172,6 +172,27 @@ max = 1000
 runs = 2000
 status = "enforced"
 
+# --- The model's context: what every call pays for before the conversation ---
+
+[[budget]]
+id = "context.tokens"
+req = "R-TOOL-1"
+what = "Full build: system prompt plus tool definitions, largest toolset preset (estimated tokens, bytes / 4)"
+unit = "tokens"
+# An estimate, not a tokenizer's count: four bytes a token, as `krowk -p`
+# records it in context.jsonl, measured from `/` so the checkout's path does
+# not move it. 1,182 when this budget was set (ticket 03: the gpt preset,
+# apply_patch as a JSON tool; claude 1,165, grok 1,178), and about 1,310 for
+# apply_patch in its freeform form, which only a wire API with grammar tools
+# offers. Every model
+# call carries these tokens, so a new tool or a longer description has to
+# fit here or raise this with a reason. The unit test
+# `r_tool_1_the_system_prompt_and_tool_definitions_stay_small` holds every
+# preset in both forms to this same number.
+max = 1500
+runs = 1
+status = "enforced"
+
 # --- Rendering and remote ---
 
 [[budget]]

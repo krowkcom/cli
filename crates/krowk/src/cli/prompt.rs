@@ -40,8 +40,13 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
         r => Some(resolve_resume(ctx, &sessions_dir, r)?),
     };
     let cwd = std::env::current_dir().map_err(|e| fail("no_directory", format!("the working directory cannot be read: {e}")))?;
-    let cfg = HostConfig { sessions_dir, cwd, registry, krowk_version: super::VERSION.into(), pricer: pricer(ctx.io.env) };
-    let opts = headless::Options { prompt, resume, model, permission_mode, format };
+    let toolset = match ctx.f.toolset.trim() {
+        "" => None,
+        t if krowk_harness::toolset::by_name(t).is_some() => Some(t.to_string()),
+        t => return Err(fail("bad_flag", format!("--toolset {t} is not a toolset — one of {}", krowk_harness::toolset::names().join(", ")))),
+    };
+    let cfg = HostConfig { sessions_dir, cwd, registry, krowk_version: super::VERSION.into(), pricer: pricer(ctx.io.env), families: families(ctx.io.env) };
+    let opts = headless::Options { prompt, resume, model, permission_mode, toolset, format };
     let outcome = headless::run(cfg, opts, ctx.io.stdout);
     let _ = ctx.io.stdout.flush();
 
@@ -136,6 +141,20 @@ fn pricer(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Pricer {
             cache_write: u.cache_write_tokens,
             reasoning: u.reasoning_tokens,
         }))
+    })
+}
+
+/// A model's family from the models.dev cache, which picks its toolset
+/// preset. Captured like the pricer's environment.
+fn families(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Families {
+    let (cache, home) = (env("XDG_CACHE_HOME"), env("HOME"));
+    Arc::new(move |provider: &str, model: &str| {
+        let env = |k: &str| match k {
+            "XDG_CACHE_HOME" => cache.clone(),
+            "HOME" => home.clone(),
+            _ => String::new(),
+        };
+        pricing::family(&env, provider, model)
     })
 }
 

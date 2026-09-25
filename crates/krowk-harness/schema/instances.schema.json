@@ -17,6 +17,13 @@
         "string",
         "null"
       ]
+    },
+    "toolset": {
+      "description": "The toolset preset every model runs with (`claude`, `gpt`, `grok`),\ninstead of the one its family picks. `--toolset` overrides it.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "$defs": {

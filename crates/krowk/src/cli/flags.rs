@@ -55,6 +55,8 @@ pub struct Flags {
     pub resume: String,
     #[cfg(feature = "harness")]
     pub permission_mode: String,
+    #[cfg(feature = "harness")]
+    pub toolset: String,
     /// Which flags were typed, by canonical name — a different question from
     /// what they carry: `--jq "$UNSET"` was given and is empty.
     pub given: BTreeSet<String>,
@@ -191,6 +193,8 @@ impl Flags {
             "resume" => text(&mut self.resume),
             #[cfg(feature = "harness")]
             "permission-mode" => text(&mut self.permission_mode),
+            #[cfg(feature = "harness")]
+            "toolset" => text(&mut self.toolset),
             _ => {
                 let b = parse_bool(name, v)?;
                 *match name {

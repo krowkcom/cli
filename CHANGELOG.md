@@ -78,10 +78,35 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `--model <instance>/<model>` picks the model (a bare id runs on the
   `anthropic` instance; `claude-opus-5` by default), `--resume <id>`
   continues a session by the id its result named or its `krowk sessions`
-  id, and Ctrl-C stops a turn and keeps what it made. The agent has two
-  tools, `read` and `bash`; `bash` runs only under `--permission-mode
-  bypassPermissions` until permission rules land, and is refused with a
-  reason the model can read otherwise. Prompt caching is on by default.
+  id, and Ctrl-C stops a turn and keeps what it made. Its `bash` tool runs
+  only under `--permission-mode bypassPermissions` until permission rules
+  land, and is refused with a reason the model can read otherwise (its
+  other tools are below). Its output is the command's stdout and stderr
+  through one pipe, in the order they were written. Prompt caching is on by default.
+- **`krowk -p`'s agent can change files, in the edit format its model was
+  trained on.** Beside `read` and `bash` it now has `write`, `grep`, `glob`
+  and one edit tool: `str_replace` for Claude models, `apply_patch` (the
+  Codex patch envelope) for GPT and Codex models, and `search_replace` for
+  Grok models, picked from the model's family in the models.dev cache, or
+  from its id when the cache does not know it. `--toolset claude|gpt|grok`
+  picks one for a prompt, and `"toolset"` in `config.json` for every
+  model. An edit that matches twice, or no longer matches the file, and a
+  patch that does not apply, change nothing and tell the model why. `grep`
+  and `glob` skip what `.gitignore` excludes and never search binary
+  files. `write` and the edit tools run only under `--permission-mode
+  acceptEdits` or `bypassPermissions` until permission rules land; in the
+  default mode the model is told it may not. Every file tool — `read`,
+  `grep` and `glob` included — reaches only inside the working directory,
+  judged by where a path really leads (`..`, absolute paths and symlinks
+  that point out are refused), unless krowk runs with `bypassPermissions`.
+  Nothing inside a `.git` directory is changed by them either (git runs
+  what its config and hooks name), and a read-only file is refused rather
+  than replaced. Edits are written to a temporary file and renamed into
+  place, keeping the file's permissions, so a failure never leaves half a
+  file. Each turn's `context.jsonl`
+  record now names its `toolset` and estimates the system prompt's and
+  tools' size in tokens (`systemTokens`, `toolsTokens`, at four bytes a
+  token).
 - **Native sessions are logs you own, listed beside imported ones.** Each
   session is an append-only JSONL log under
   `~/.local/share/krowk/sessions/<id>/` (with each turn's exact system

@@ -53,6 +53,8 @@ pub enum Unit {
     Mb,
     #[serde(rename = "fps")]
     Fps,
+    #[serde(rename = "tokens")]
+    Tokens,
 }
 
 /// One number for every target, or one per target where the number is the
@@ -171,6 +173,7 @@ pub fn show(unit: Unit, v: f64) -> String {
         Unit::Wakeups => format!("{v:.0} wakeups"),
         Unit::Mb => format!("{v:.1} MB"),
         Unit::Fps => format!("{v:.0} fps"),
+        Unit::Tokens => format!("{v:.0} est. tokens"),
     }
 }
 
@@ -325,7 +328,7 @@ mod tests {
             assert!(f.budget.iter().any(|b| b.req == req), "budgets.toml has nothing for {req}");
         }
         assert_eq!(find("session.replay_rss").owner.as_deref(), Some("04"), "ticket 04 builds the 200k replay; 12 only verifies");
-        for id in ["lean.size", "lean.deps", "log.append", "engine.idle_cpu"] {
+        for id in ["lean.size", "lean.deps", "log.append", "engine.idle_cpu", "context.tokens"] {
             assert_eq!(find(id).status, Status::Enforced, "{id} is measurable now, so it is enforced");
         }
         let lean = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../krowk/lean-deps.txt")).unwrap();

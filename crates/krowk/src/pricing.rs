@@ -204,6 +204,35 @@ fn rates_from(cost: &Map<String, Value>) -> Option<Rates> {
     found.then_some(r)
 }
 
+/// A model's family as the models.dev cache names it (`claude-opus`,
+/// `gpt-codex`, `grok`): the harness picks a toolset preset by it. The
+/// model under its own provider first, else the same id under any provider,
+/// so a router serving `gpt-5` finds OpenAI's entry. Read from the cache
+/// only: the embedded snapshot is trimmed to prices, and a model it would
+/// miss is read for its family off its id instead.
+#[cfg(feature = "harness")]
+pub fn family(env: &dyn Fn(&str) -> String, provider: &str, model: &str) -> Option<String> {
+    let raw = std::fs::read(cache_path(env)?).ok()?;
+    families(&raw, provider, model)
+}
+
+/// `family`, over a models.dev document. Typed and borrowed, with every
+/// field but `family` skipped unread, as `parse_rates` reads it.
+#[cfg(feature = "harness")]
+fn families(raw: &[u8], provider: &str, model: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        family: Option<String>,
+    }
+    let top: std::collections::BTreeMap<String, &RawValue> = serde_json::from_slice(raw).ok()?;
+    let of = |fields: &RawValue| -> Option<String> {
+        let fields: HashMap<String, &RawValue> = serde_json::from_str(fields.get()).ok()?;
+        let models: HashMap<String, &RawValue> = serde_json::from_str(fields.get("models")?.get()).ok()?;
+        serde_json::from_str::<Entry>(models.get(model)?.get()).ok()?.family.filter(|f| !f.is_empty())
+    };
+    top.get(provider).and_then(|f| of(f)).or_else(|| top.values().find_map(|f| of(f)))
+}
+
 /// What one refresh did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -367,6 +396,22 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "harness")]
+    #[test]
+    fn r_tool_2_a_models_family_comes_from_the_models_dev_catalog() {
+        let raw = br#"{
+            "openai": {"models": {"gpt-5.1-codex": {"family": "gpt-codex", "cost": {"input": 1}}}},
+            "xai": {"models": {"grok-4": {"family": "grok"}}},
+            "router": {"models": {"grok-4": {"family": "router-grok"}, "house": {"family": ""}}}
+        }"#;
+        assert_eq!(families(raw, "openai", "gpt-5.1-codex").as_deref(), Some("gpt-codex"));
+        assert_eq!(families(raw, "anthropic", "gpt-5.1-codex").as_deref(), Some("gpt-codex"), "any provider's entry for the id");
+        assert_eq!(families(raw, "router", "grok-4").as_deref(), Some("router-grok"), "the model's own provider first");
+        assert_eq!(families(raw, "router", "house"), None, "an empty family is none");
+        assert_eq!(families(raw, "openai", "nope"), None);
+        assert_eq!(families(b"not json", "openai", "gpt-5"), None);
+    }
 
     #[test]
     fn both_price_shapes_parse_and_reasoning_falls_back_to_output() {

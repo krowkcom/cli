@@ -31,6 +31,7 @@
 //! - Interruption is cooperative: `TurnContext::cancel` flips, the engine
 //!   stops at the next point it can, and returns `TurnEnd::Interrupted`.
 
+use crate::toolset::Preset;
 use crate::protocol::{Delta, ErrorInfo, Item, ItemKind, ModelRef, PermissionMode, ToolDefinition, Usage, WireApi};
 use std::future::Future;
 use std::path::PathBuf;
@@ -67,6 +68,8 @@ pub struct TurnContext {
     /// Where the session runs: tools resolve paths against it.
     pub cwd: PathBuf,
     pub permission_mode: PermissionMode,
+    /// The toolset preset the host chose for this turn's model.
+    pub preset: &'static Preset,
     /// Flips to true when the turn is to stop.
     pub cancel: watch::Receiver<bool>,
 }

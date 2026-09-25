@@ -13,7 +13,8 @@ use crate::anthropic::AnthropicClient;
 use crate::engine::{Engine, EngineError, EngineEvent, HistoryItem, TurnContext, TurnEnd};
 use crate::instances::{Registry, Resolved};
 use crate::log::{self, LogError, SessionLog};
-use crate::native::NativeEngine;
+use crate::native::{self, NativeEngine};
+use crate::toolset;
 use crate::protocol::{
     Command, ContextRecord, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus, Usage, WireApi,
 };
@@ -27,6 +28,11 @@ use tokio::sync::{mpsc, watch};
 /// model has no price. Supplied by the caller, which owns the price cache.
 pub type Pricer = Arc<dyn Fn(&str, &str, &Usage) -> Option<f64> + Send + Sync>;
 
+/// A model's family in the catalog: (provider, model) to e.g. `gpt-codex`,
+/// or none when the catalog does not know it. It picks the toolset preset.
+/// Supplied by the caller, which owns the models.dev cache.
+pub type Families = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
+
 pub struct HostConfig {
     /// Where session logs live: `log::sessions_dir`.
     pub sessions_dir: PathBuf,
@@ -36,6 +42,7 @@ pub struct HostConfig {
     pub registry: Registry,
     pub krowk_version: String,
     pub pricer: Pricer,
+    pub families: Families,
 }
 
 pub struct Host {
@@ -66,8 +73,8 @@ impl Host {
     /// `isError`. An error here means no turn ran.
     pub async fn execute(&self, cmd: Command, out: mpsc::Sender<StreamLine>) -> Result<Option<RunResult>, EngineError> {
         match cmd {
-            Command::Prompt { session_id, text, model, permission_mode } => {
-                self.prompt(session_id.as_deref(), text, model, permission_mode, out).await.map(Some)
+            Command::Prompt { session_id, text, model, permission_mode, toolset } => {
+                self.prompt(session_id.as_deref(), text, model, permission_mode, toolset.as_deref(), out).await.map(Some)
             }
             Command::Interrupt { session_id } => {
                 let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
@@ -85,7 +92,15 @@ impl Host {
         }
     }
 
-    async fn prompt(&self, session_id: Option<&str>, text: String, model: Option<ModelRef>, permission_mode: PermissionMode, out: mpsc::Sender<StreamLine>) -> Result<RunResult, EngineError> {
+    async fn prompt(
+        &self,
+        session_id: Option<&str>,
+        text: String,
+        model: Option<ModelRef>,
+        permission_mode: PermissionMode,
+        toolset: Option<&str>,
+        out: mpsc::Sender<StreamLine>,
+    ) -> Result<RunResult, EngineError> {
         let started = Instant::now();
         if text.trim().is_empty() {
             return Err(EngineError::new("empty_prompt", "the prompt is empty — pass it as an argument, or on stdin"));
@@ -105,6 +120,8 @@ impl Host {
             },
         };
         let instance = self.cfg.registry.get(&model.instance).map_err(|e| EngineError::new("no_instance", e))?.clone();
+        let family = (self.cfg.families)(instance.provider, &model.model);
+        let (preset, _) = toolset::choose(toolset, self.cfg.registry.toolset.as_deref(), family.as_deref(), &model.model).map_err(|e| EngineError::new("bad_toolset", e))?;
         let engine = engine_for(&instance, &self.cfg.krowk_version)?;
         let mut log = match opened {
             Some((log, _)) => log,
@@ -118,7 +135,7 @@ impl Host {
         let cwd = past.cwd.clone().unwrap_or_else(|| self.cfg.cwd.clone());
 
         let turn_id = krowk_store::new_id();
-        let mut w = Writer { log: &mut log, out: &out, turn_id: turn_id.clone() };
+        let mut w = Writer { log: &mut log, out: &out, turn_id: turn_id.clone(), preset };
         w.log(LogBody::TurnStarted { turn_id: turn_id.clone(), model: model.clone(), provider: engine.provider().into(), wire_api: engine.wire_api(), permission_mode }).await?;
         let prompt_item = Item::UserText { text };
         w.log(LogBody::ItemCompleted { turn_id: turn_id.clone(), item_id: krowk_store::new_id(), item: prompt_item.clone() }).await?;
@@ -127,7 +144,7 @@ impl Host {
 
         let (cancel_tx, cancel) = watch::channel(false);
         self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), cancel_tx);
-        let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, cancel };
+        let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, preset, cancel };
         let mut tally = Tally::default();
         let outcome = w.drive(engine.as_ref(), ctx, &mut tally, &model, &instance, &self.cfg.pricer).await;
         self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&session_id);
@@ -221,6 +238,7 @@ struct Writer<'a> {
     log: &'a mut SessionLog,
     out: &'a mpsc::Sender<StreamLine>,
     turn_id: String,
+    preset: &'static toolset::Preset,
 }
 
 impl Writer<'_> {
@@ -261,7 +279,18 @@ impl Writer<'_> {
         let turn_id = self.turn_id.clone();
         match ev {
             EngineEvent::Context { system, tools } => {
-                let rec = ContextRecord { turn_id, time_ms: krowk_store::now_ms(), model: model.clone(), provider: instance.provider.into(), wire_api: instance.wire_api, system, tools };
+                let rec = ContextRecord {
+                    turn_id,
+                    time_ms: krowk_store::now_ms(),
+                    model: model.clone(),
+                    provider: instance.provider.into(),
+                    wire_api: instance.wire_api,
+                    toolset: self.preset.name.into(),
+                    system_tokens: native::estimate_tokens(&system),
+                    tools_tokens: native::tools_tokens(&tools),
+                    system,
+                    tools,
+                };
                 self.log.record_context(&rec).map_err(log_failure)?;
             }
             EngineEvent::ItemStarted { item_id, kind } => {

@@ -279,7 +279,20 @@ fn format_cost(usd: f64) -> String {
     if usd >= 0.01 || usd <= 0.0 {
         return format!("${usd:.2}");
     }
-    let places = (2 - usd.log10().floor() as i32).clamp(4, 12) as usize;
+    significant(usd)
+}
+
+/// `show`'s figures, where one session's split between models is the point:
+/// three significant digits below a dollar, cents above.
+fn format_cost_precise(usd: f64) -> String {
+    if usd >= 1.0 || usd <= 0.0 {
+        return format!("${usd:.2}");
+    }
+    significant(usd)
+}
+
+fn significant(usd: f64) -> String {
+    let places = (2 - usd.log10().floor() as i32).clamp(2, 12) as usize;
     format!("${usd:.places$}")
 }
 
@@ -604,7 +617,7 @@ fn human_session_show(ctx: &Ctx, d: &SessionDetail, show_thinking: bool, now: i6
         meta += &format!("  {model}");
     }
     let (costs, total) = price_turns(ctx, d);
-    meta += &format!("  {}", total.total().map_or("—".to_string(), format_cost));
+    meta += &format!("  {}", total.total().map_or("—".to_string(), format_cost_precise));
     meta += &format!("  {}", relative_time(s.time_updated, now));
     for extra in [cell(&s.worktree_path), cell(&s.directory)] {
         if !extra.is_empty() {
@@ -626,13 +639,13 @@ fn human_session_show(ctx: &Ctx, d: &SessionDetail, show_thinking: bool, now: i6
         b += &format!("  {} tokens", t.total);
         b += &match (is_observed(t), costs[i]) {
             (true, _) => "  counted elsewhere".to_string(),
-            (false, Some(c)) => format!("  {}{}", format_cost(c.usd), if c.basis.is_none() { " reported" } else { "" }),
+            (false, Some(c)) => format!("  {}{}", format_cost_precise(c.usd), if c.basis.is_none() { " reported" } else { "" }),
             (false, None) => "  —".to_string(),
         };
         b += "\n";
     }
     if total.by_model.len() > 1 {
-        let parts: Vec<String> = total.by_model.iter().map(|(m, usd)| format!("{} {}", cell(m), format_cost(*usd))).collect();
+        let parts: Vec<String> = total.by_model.iter().map(|(m, usd)| format!("{} {}", cell(m), format_cost_precise(*usd))).collect();
         b += &format!("\nby model  {}\n", parts.join("  ·  "));
     }
     if !d.turns.is_empty() {

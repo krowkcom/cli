@@ -127,6 +127,83 @@ fn r_perf_2_nothing_is_drawn_while_idle() {
     assert_eq!(t.output().len(), before, "an idle TUI wrote {:?}", String::from_utf8_lossy(&t.output()[before..]));
 }
 
+/// A provider that takes the request and never answers: a turn that waits.
+fn silent_provider() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for c in l.incoming().flatten() {
+            held.push(c);
+        }
+    });
+    url
+}
+
+fn krowk_sessions(b: &Sandbox, url: &str) -> usize {
+    let out = b.command(url, &["sessions", "--json"]).stdin(std::process::Stdio::null()).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    v["data"]["sessions"].as_array().map_or(0, Vec::len)
+}
+
+#[test]
+fn sigterm_and_sighup_restore_the_terminal_and_record_the_session() {
+    for (name, sig) in [("term", libc::SIGTERM), ("hup", libc::SIGHUP)] {
+        let m = mock::serve(mock::readme_script);
+        let b = Sandbox::new(&format!("sig{name}"));
+        let mut t = pty::Pty::spawn(b.command(&m.url, &[]), 80, 24);
+        assert!(t.wait_for("ask anything", Duration::from_secs(10)).is_some());
+        t.write(b"read README.md and summarise it in one line\r");
+        assert!(t.wait_for("tokens", Duration::from_secs(10)).is_some(), "{:?}", t.text());
+        // SAFETY: a signal to our own child.
+        unsafe {
+            libc::kill(t.child.id() as i32, sig);
+        }
+        let st = t.wait(Duration::from_secs(10)).expect("krowk exits on the signal");
+        assert!(st.success(), "{name}: {st}");
+        let out = t.text();
+        assert!(out.contains("krowk --resume "), "{name}: the resume line: {out:?}");
+        assert!(out.ends_with("\x1b[?2004l\x1b[?25h"), "{name}: bracketed paste off and the cursor back, last: {out:?}");
+        assert_eq!(krowk_sessions(&b, &m.url), 1, "{name}: the session is in krowk.db");
+    }
+}
+
+#[test]
+fn a_second_ctrl_c_leaves_at_once_but_still_records_the_session_and_exits_130() {
+    let url = silent_provider();
+    let b = Sandbox::new("ctrlc2");
+    let mut t = pty::Pty::spawn(b.command(&url, &[]), 80, 24);
+    assert!(t.wait_for("ask anything", Duration::from_secs(10)).is_some());
+    t.write(b"wait forever\r");
+    assert!(t.wait_for("esc to interrupt", Duration::from_secs(10)).is_some(), "{:?}", t.text());
+    t.write(b"\x03\x03");
+    let st = t.wait(Duration::from_secs(10)).expect("krowk exits on the second Ctrl-C");
+    assert_eq!(st.code(), Some(130), "{st}");
+    let out = t.text();
+    assert!(out.contains("krowk --resume ") && out.ends_with("\x1b[?2004l\x1b[?25h"), "{out:?}");
+    assert_eq!(krowk_sessions(&b, &url), 1, "the session is in krowk.db");
+}
+
+#[test]
+fn steering_an_interrupted_turn_never_read_goes_back_into_the_prompt_not_sent() {
+    let url = silent_provider();
+    let b = Sandbox::new("steerback");
+    let mut t = pty::Pty::spawn(b.command(&url, &[]), 80, 24);
+    assert!(t.wait_for("ask anything", Duration::from_secs(10)).is_some());
+    t.write(b"wait forever\r");
+    assert!(t.wait_for("esc to interrupt", Duration::from_secs(10)).is_some(), "{:?}", t.text());
+    t.write(b"also this\r");
+    assert!(t.wait_for("steer queued", Duration::from_secs(5)).is_some(), "{:?}", t.text());
+    t.write(b"\x1b");
+    assert!(t.wait_for("back in the prompt", Duration::from_secs(5)).is_some(), "{:?}", t.text());
+    std::thread::sleep(Duration::from_millis(300));
+    let out = t.text();
+    let tail = &out[out.rfind("back in the prompt").unwrap()..];
+    // Blank cells are skipped, not written: the words arrive apart.
+    assert!(tail.contains("also") && tail.contains("this"), "the steer is in the prompt again: {tail:?}");
+    assert!(!tail.contains("esc to interrupt"), "and no new turn was started with it: {tail:?}");
+}
+
 // ---- tmux ---------------------------------------------------------------------
 
 struct Tmux {
@@ -136,6 +213,12 @@ struct Tmux {
 impl Tmux {
     /// None when tmux is not installed and this is not CI.
     fn start(name: &str, cols: u16, rows: u16, cwd: &Path, env: &[(String, String)], args: &[&str]) -> Option<Tmux> {
+        Tmux::start_after(name, cols, rows, cwd, env, args, "")
+    }
+
+    /// As `start`, with `before` run in the shell first — output a person's
+    /// terminal already holds when they type `krowk`.
+    fn start_after(name: &str, cols: u16, rows: u16, cwd: &Path, env: &[(String, String)], args: &[&str], before: &str) -> Option<Tmux> {
         if Command::new("tmux").arg("-V").output().is_err() {
             assert!(!cfg!(target_os = "linux") || std::env::var_os("CI").is_none(), "tmux is not installed, and CI on Linux must run this check");
             eprintln!("skipped: tmux is not installed");
@@ -144,7 +227,7 @@ impl Tmux {
         let socket = format!("krowk-tui-{name}-{}", std::process::id());
         let conf = std::env::temp_dir().join(format!("{socket}.conf"));
         std::fs::write(&conf, "set -g history-limit 100000\nset -g status off\n").unwrap();
-        let mut line = format!("cd '{}' && exec env -i", cwd.display());
+        let mut line = format!("cd '{}' && {before} exec env -i", cwd.display());
         for (k, v) in env {
             line += &format!(" {k}='{v}'");
         }
@@ -282,6 +365,66 @@ fn r_tui_3_a_resize_mid_stream_never_repeats_a_line_or_leaves_the_live_region_be
     assert_eq!(history.matches("› go").count(), 1, "{history}");
     let bars = tm.screen().matches("api key").count();
     assert_eq!(bars, 1, "one status bar on screen after two resizes:\n{}", tm.screen());
+}
+
+#[test]
+fn r_tui_3_narrowing_the_terminal_leaves_no_reflowed_live_region_in_scrollback() {
+    // Nothing listens: the offline notice goes up, full width. With the
+    // keys overlay open the live region is four wide rows, the notice, the
+    // prompt and the status bar — every one split in two or three by tmux's
+    // reflow at 40 columns.
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let b = Sandbox::new("narrow");
+    // The terminal already holds a screenful, as a person's does: the live
+    // region starts at the bottom, where a reflow grows it upwards.
+    let before = "for i in $(seq 1 40); do echo \"earlier output $i\"; done;";
+    let Some(tm) = Tmux::start_after("narrow", 100, 30, &b.root.join("repo"), &b.env(&format!("http://127.0.0.1:{port}")), &[], before) else { return };
+    assert!(tm.wait_for("no network connectivity", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    tm.keys(&["?"]);
+    assert!(tm.wait_for("? or esc closes this", Duration::from_secs(5)).is_some(), "{}", tm.screen());
+    tm.tmux(&["resize-window", "-t", "t", "-x", "40", "-y", "30"]);
+    std::thread::sleep(Duration::from_millis(800));
+    let history = tm.history();
+    // Each of these starts a full-width row of the old region; redrawn at
+    // 40 columns each is there once more, so a second copy is a leftover.
+    for row in ["enter send · alt-enter", "⚠ no network connectivity", "› ask anything", "claude-opus-5 · anthropic"] {
+        assert_eq!(history.matches(row).count(), 1, "{row:?} is in scrollback twice — the old live region was left behind:\n{history}");
+    }
+    assert_eq!(history.matches("krowk dev").count(), 1, "the header is still there, once:\n{history}");
+    assert!(history.contains("earlier output 40"), "what was on the terminal before is kept:\n{history}");
+}
+
+#[test]
+fn ctrl_z_suspends_to_the_shell_and_fg_brings_the_prompt_back() {
+    let m = mock::serve(mock::readme_script);
+    let b = Sandbox::new("ctrlz");
+    // A job-control shell, as a person has, and krowk typed into it.
+    if Command::new("tmux").arg("-V").output().is_err() {
+        assert!(!cfg!(target_os = "linux") || std::env::var_os("CI").is_none(), "tmux is not installed, and CI on Linux must run this check");
+        return;
+    }
+    let socket = format!("krowk-tui-ctrlz-sh-{}", std::process::id());
+    let tmux = |args: &[&str]| String::from_utf8_lossy(&Command::new("tmux").args(["-L", &socket]).args(args).output().unwrap().stdout).into_owned();
+    let mut envs = String::new();
+    for (k, v) in b.env(&m.url) {
+        envs += &format!(" {k}='{v}'");
+    }
+    let shell = format!("cd '{}' && exec env -i{envs} PS1='sh$ ' bash --norc --noprofile -i", b.root.join("repo").display());
+    tmux(&["-f", "/dev/null", "new-session", "-d", "-s", "t", "-x", "100", "-y", "30", &shell]);
+    let screen = || tmux(&["capture-pane", "-p", "-t", "t"]);
+    let wait = |needle: &str| (0..250).any(|_| screen().contains(needle) || { std::thread::sleep(Duration::from_millis(40)); false });
+    assert!(wait("sh$"), "{}", screen());
+    tmux(&["send-keys", "-t", "t", &format!("'{}'", env!("CARGO_BIN_EXE_krowk")), "Enter"]);
+    assert!(wait("ask anything"), "{}", screen());
+    tmux(&["send-keys", "-t", "t", "C-z"]);
+    assert!(wait("Stopped"), "Ctrl-Z did not stop krowk:\n{}", screen());
+    let stopped = screen();
+    assert!(!stopped.contains("ask anything"), "the live region was cleared before stopping:\n{stopped}");
+    tmux(&["send-keys", "-t", "t", "fg", "Enter"]);
+    assert!(wait("ask anything"), "fg did not bring the prompt back:\n{}", screen());
+    tmux(&["send-keys", "-t", "t", "C-d"]);
+    assert!(wait("krowk --resume") || wait("sh$"), "{}", screen());
+    tmux(&["kill-server"]);
 }
 
 /// A TCP relay in front of the stand-in API that can be cut: new

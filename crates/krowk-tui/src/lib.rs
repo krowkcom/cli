@@ -32,7 +32,7 @@ use futures_core::Stream;
 use krowk_harness::engine::EngineError;
 use krowk_harness::host::{Host, HostConfig, Pricer};
 use krowk_harness::log;
-use krowk_harness::protocol::{Command, ModelRef, PermissionMode, RunResult, StreamLine};
+use krowk_harness::protocol::{Command, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus};
 use net::Target;
 use ratatui::layout::Size;
 use settings::Settings;
@@ -77,6 +77,10 @@ pub struct Outcome {
     pub session_id: Option<String>,
     /// Why it could not run or stopped early.
     pub error: Option<String>,
+    /// Left without waiting for the running turn — a second Ctrl-C, or a
+    /// second SIGTERM/SIGHUP: the caller exits 130 once the session is
+    /// recorded.
+    pub abandoned: bool,
 }
 
 /// Opens the TUI on this process's terminal and runs it until the person
@@ -91,10 +95,10 @@ pub fn run(opts: Options) -> Outcome {
         .build()
     {
         Ok(rt) => rt,
-        Err(e) => return Outcome { session_id: None, error: Some(format!("the async runtime could not start: {e}")) },
+        Err(e) => return Outcome { session_id: None, abandoned: false, error: Some(format!("the async runtime could not start: {e}")) },
     };
     if let Err(e) = crossterm::terminal::enable_raw_mode() {
-        return Outcome { session_id: None, error: Some(format!("the terminal could not be put in raw mode: {e}")) };
+        return Outcome { session_id: None, abandoned: false, error: Some(format!("the terminal could not be put in raw mode: {e}")) };
     }
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -149,22 +153,22 @@ async fn session(opts: Options) -> Outcome {
                 app.session_id = Some(id.clone());
                 app.say(&format!("resumed session {id}"), app::dim());
             }
-            Err(e) => return Outcome { session_id: None, error: Some(format!("session {id} could not be read: {}", e.message())) },
+            Err(e) => return Outcome { session_id: None, abandoned: false, error: Some(format!("session {id} could not be read: {}", e.message())) },
         }
     }
     // The model shown before the first turn names one: the flag, else the
     // session's last, else the configured default.
     let shown = opts.model.clone().or_else(|| app.model.clone()).or_else(|| opts.host.registry.default_model().ok());
-    let target = shown.as_ref().and_then(|m| opts.host.registry.get(&m.instance).ok()).and_then(|i| Target::from_url(&i.base_url));
+    let target = shown.as_ref().and_then(|m| opts.host.registry.get(&m.instance).ok()).and_then(|i| Target::for_url(&i.base_url, &|k| std::env::var(k).unwrap_or_default()));
     app.model = shown;
 
     let initial_height = app.view(Instant::now().into_std()).0.len() as u16;
     let mut term = match Term::new(stdout, size, top, initial_height) {
         Ok(t) => t,
-        Err(e) => return Outcome { session_id: None, error: Some(format!("the terminal could not be drawn on: {e}")) },
+        Err(e) => return Outcome { session_id: None, abandoned: false, error: Some(format!("the terminal could not be drawn on: {e}")) },
     };
     let host = Host::new(opts.host);
-    let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, target, keys: None, turn: None, rx: None };
+    let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, target, keys: None, turn: None, rx: None, abandoned: false };
     let result = ui.run(&mut app, &mut term).await;
     let _ = term.finish();
     let mut out = term.into_inner();
@@ -172,7 +176,7 @@ async fn session(opts: Options) -> Outcome {
         let _ = write!(out, "\x1b[2mresume this session with: krowk --resume {id}\x1b[0m\r\n");
     }
     let _ = out.flush();
-    Outcome { session_id: app.session_id.clone(), error: result.err().map(|e| e.to_string()) }
+    Outcome { session_id: app.session_id.clone(), error: result.err().map(|e| e.to_string()), abandoned: ui.abandoned }
 }
 
 struct Ui<'h> {
@@ -184,6 +188,52 @@ struct Ui<'h> {
     keys: Option<EventStream>,
     turn: Option<TurnFuture<'h>>,
     rx: Option<mpsc::Receiver<StreamLine>>,
+    /// Set to leave now, without the running turn's end.
+    abandoned: bool,
+}
+
+/// SIGTERM and SIGHUP as one stream, registered once. Either asks the TUI
+/// to stop the way Ctrl-D does: the running turn is interrupted and its end
+/// waited for, the terminal restored, the session recorded; a second one
+/// does not wait. Nothing on Windows, where neither is sent.
+struct Hangups {
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    hup: Option<tokio::signal::unix::Signal>,
+}
+
+impl Hangups {
+    fn new() -> Hangups {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Hangups { term: signal(SignalKind::terminate()).ok(), hup: signal(SignalKind::hangup()).ok() }
+        }
+        #[cfg(not(unix))]
+        Hangups {}
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            async fn one(s: &mut Option<tokio::signal::unix::Signal>) {
+                let got = match s {
+                    Some(s) => s.recv().await.is_some(),
+                    None => false,
+                };
+                if !got {
+                    std::future::pending::<()>().await;
+                }
+            }
+            tokio::select! {
+                _ = one(&mut self.term) => {}
+                _ = one(&mut self.hup) => {}
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await
+    }
 }
 
 /// Where the terminal says the cursor is. Stopping the key reader leaves
@@ -240,6 +290,7 @@ impl<'h> Ui<'h> {
         let mut last_activity = Instant::now();
         let mut stall_quiet_until: Option<Instant> = None;
         let mut quitting = false;
+        let mut hangups = Hangups::new();
         self.draw(app, term)?;
         last_frame.replace(Instant::now());
         loop {
@@ -256,6 +307,14 @@ impl<'h> Ui<'h> {
             let wake = [frame_at, tick_at, stall_at, retry_at, probe_at].into_iter().flatten().min();
             tokio::select! {
                 biased;
+                _ = hangups.recv() => {
+                    if !app.running() || quitting {
+                        self.abandoned = app.running();
+                        return Ok(());
+                    }
+                    quitting = true;
+                    self.interrupt(app).await;
+                }
                 ev = next_key(&mut self.keys) => match ev {
                     Some(Ok(ev)) => {
                         if self.on_event(app, term, ev, &mut quitting).await? {
@@ -268,9 +327,11 @@ impl<'h> Ui<'h> {
                 line = recv(&mut self.rx) => {
                     last_activity = Instant::now();
                     if matches!(&line, StreamLine::Live(krowk_harness::protocol::LiveEvent::ItemDelta { .. })) {
-                        // Bytes are arriving from the model: it is reachable.
+                        // Bytes are arriving from the model: it is reachable,
+                        // and a retry probe still scheduled is moot.
                         app.set_online();
                         failures = 0;
+                        probe_at = None;
                     }
                     app.on_line(&line);
                     self.flush_requests(app).await;
@@ -289,6 +350,7 @@ impl<'h> Ui<'h> {
                         Ok(None) => false,
                         Err(e) => e.code == "network_unreachable",
                     };
+                    let completed = matches!(&r, Ok(Some(res)) if res.status == TurnStatus::Completed);
                     if let Err(e) = r {
                         app.error(&e.info());
                     }
@@ -298,9 +360,18 @@ impl<'h> Ui<'h> {
                     if quitting {
                         return Ok(());
                     }
-                    // Steering the turn ended before taking is the next prompt.
+                    // Steering the turn never read: after an answer it is
+                    // the next prompt, as it would have been the turn's next
+                    // step. After an interrupt or a failure it is not sent
+                    // on its own — it goes back into the prompt, to send,
+                    // edit or drop.
                     if !left.is_empty() {
-                        self.prompt(app, left.join("\n\n"));
+                        if completed {
+                            self.prompt(app, left.join("\n\n"));
+                        } else {
+                            app.editor.restore(&left.join("\n\n"));
+                            app.notice("the steering this turn never read is back in the prompt");
+                        }
                     }
                 }
                 ok = finish(&mut probe) => {
@@ -343,7 +414,7 @@ impl<'h> Ui<'h> {
                     }
                 }
             }
-            if app.quit && self.turn.is_none() {
+            if self.abandoned || (app.quit && self.turn.is_none()) {
                 return Ok(());
             }
             if app.take_dirty() && frame_at.is_none() {
@@ -377,15 +448,7 @@ impl<'h> Ui<'h> {
         rows.drain(..skip);
         caret.1 = caret.1.saturating_sub(skip as u16);
         let lines = app.take_pending();
-        let width = term.width();
-        let height = rows.len() as u16;
-        term.frame(&lines, height, |f| {
-            let area = f.area();
-            for (i, row) in rows.iter().enumerate().take(usize::from(area.height)) {
-                f.buffer_mut().set_line(area.x, area.y + i as u16, row, width);
-            }
-            f.set_cursor_position((area.x + caret.0.min(width.saturating_sub(1)), area.y + caret.1.min(area.height.saturating_sub(1))));
-        })
+        term.frame(&lines, &rows, caret)
     }
 
     fn prompt(&mut self, app: &mut App, text: String) {
@@ -429,6 +492,7 @@ impl<'h> Ui<'h> {
     /// One terminal event. True when it asks for a connectivity probe.
     async fn on_event<W: Write>(&mut self, app: &mut App, term: &mut Term<W>, ev: Event, quitting: &mut bool) -> std::io::Result<bool> {
         match ev {
+            Event::Key(k) if k.kind != KeyEventKind::Release && k.code == KeyCode::Char('z') && k.modifiers.contains(KeyModifiers::CONTROL) => self.suspend(app, term)?,
             Event::Key(k) if k.kind != KeyEventKind::Release => return Ok(self.on_key(app, k, quitting).await),
             Event::Paste(s) => {
                 app.editor.insert_str(&s);
@@ -451,6 +515,36 @@ impl<'h> Ui<'h> {
         Ok(())
     }
 
+    /// Ctrl-Z: raw mode swallows the terminal's own, so the job stop is done
+    /// here — the live region cleared and the terminal given back, then
+    /// SIGTSTP to ourselves. The shell has the terminal until `fg`; on
+    /// SIGCONT the stop returns, and the TUI takes the terminal again and
+    /// redraws where the cursor now is. A turn running keeps running: the
+    /// engine is in this process, stopped with it.
+    fn suspend<W: Write>(&mut self, app: &mut App, term: &mut Term<W>) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.keys = None;
+            term.finish()?;
+            restore_terminal();
+            // SAFETY: raise only sends a signal to this process.
+            unsafe {
+                libc::raise(libc::SIGTSTP);
+            }
+            crossterm::terminal::enable_raw_mode()?;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(b"\x1b[?2004h");
+            let _ = out.flush();
+            let (w, h) = crossterm::terminal::size().unwrap_or((term.size().width, term.size().height));
+            term.resume(Size { width: w.max(1), height: h.max(1) }, cursor_row())?;
+            self.keys = Some(EventStream::new());
+            app.set_width(w);
+        }
+        #[cfg(not(unix))]
+        let _ = (app, term);
+        Ok(())
+    }
+
     async fn on_key(&mut self, app: &mut App, k: KeyEvent, quitting: &mut bool) -> bool {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
@@ -460,9 +554,12 @@ impl<'h> Ui<'h> {
             KeyCode::Char('c') if ctrl => {
                 if app.running() {
                     if *quitting || app.turn.as_ref().is_some_and(|t| t.want_interrupt) {
-                        // A second Ctrl-C does not wait for the first.
-                        restore_terminal();
-                        std::process::exit(130);
+                        // A second Ctrl-C does not wait for the first — but
+                        // still leaves through the front door: the terminal
+                        // restored, the resume line printed, the session
+                        // recorded, then exit 130.
+                        self.abandoned = true;
+                        return false;
                     }
                     self.interrupt(app).await;
                 } else if !app.editor.is_empty() {

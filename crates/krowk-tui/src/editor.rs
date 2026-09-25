@@ -69,6 +69,14 @@ impl Editor {
         text
     }
 
+    /// Puts `text` back at the front of the prompt, above whatever is being
+    /// written, with the caret at the end of the whole.
+    pub fn restore(&mut self, text: &str) {
+        self.browsing = None;
+        self.text = if self.text.is_empty() { text.to_string() } else { format!("{text}\n{}", self.text) };
+        self.cursor = self.text.len();
+    }
+
     pub fn insert(&mut self, c: char) {
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
@@ -334,6 +342,16 @@ mod tests {
         e.down();
         e.down();
         assert_eq!(e.text(), "draft", "past the newest, the draft is back");
+    }
+
+    #[test]
+    fn unread_steering_goes_back_above_the_draft() {
+        let mut e = typed("draft");
+        e.restore("also check the tests");
+        assert_eq!(e.text(), "also check the tests\ndraft");
+        let mut e = Editor::new(None);
+        e.restore("only this");
+        assert_eq!((e.text(), e.cursor()), ("only this", 9));
     }
 
     #[test]

@@ -22,9 +22,13 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm_0
 # event stream: key presses and resizes wake the loop, nothing polls.
 crossterm = { version = "0.29", default-features = false, features = ["bracketed-paste", "events", "windows", "event-stream"] }
 futures-core = "0.3"
-tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros", "net"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros", "net", "signal"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 unicode-width = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+# Ctrl-Z: stopping ourselves with SIGTSTP once the terminal is given back.
+libc = "0.2"
 
 [dev-dependencies]
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "scrolling-regions"] }

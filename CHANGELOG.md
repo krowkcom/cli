@@ -19,11 +19,11 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `curl -fsSL https://krowk.com/install | bash` installs the full build on a
   workstation and the lean one in CI (`CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, …)
   and containers (`/.dockerenv`, `/run/.containerenv`, `$container`, a
-  Kubernetes pod); `bash -s -- --lean` / `--full`, or `KROWK_LEAN=1` / `0`,
+  Kubernetes pod, or no terminal at all, as in a Dockerfile `RUN`); a
+  pinned release from before the lean build installs its one build; `bash -s -- --lean` / `--full`, or `KROWK_LEAN=1` / `0`,
   choose either way. `krowk upgrade` stays on the build it is, and the
-  GitHub Action installs the lean build. **If your container build pipes
-  the installer with `CI` unset and no container marker, pass `--lean`** to
-  keep the few-megabyte binary.
+  GitHub Action installs the lean build. **Toolbox and distrobox count as
+  containers: pass `--full` there** for the agent.
 - **Network failures say "no network connectivity".** When the Anthropic
   API cannot be reached, `krowk -p` now fails with that sentence first,
   still under `network_unreachable`.
@@ -98,7 +98,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   or off, under `"tui"` in `config.json` (see the README) — and `?` and
   Ctrl-O toggle the keys and the session's details. When the model's API
   cannot be reached, a persistent **no network connectivity** notice
-  appears within two seconds and clears when it answers again. With stdin
+  appears within two seconds and clears when it answers again (behind a
+  proxy — `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` — the proxy is what is
+  checked). Ctrl-Z stops to the shell and `fg` brings the prompt back;
+  SIGTERM and SIGHUP leave the terminal as they found it. With stdin
   or stdout not a terminal, bare `krowk` prints exactly what it always has.
 - **`krowk -p "…"` runs krowk's own agent, headless, on the Anthropic API.**
   The release's full build carries it; the lean agent build does not. The prompt comes from the arguments, or from stdin when there

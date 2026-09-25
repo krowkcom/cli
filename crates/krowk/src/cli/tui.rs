@@ -82,6 +82,12 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
     {
         let _ = writeln!(ctx.io.stderr, "! the session is saved, but krowk.db was not updated: {} — `krowk sessions sync` retries", e.fix());
     }
+    // Left without waiting for a turn (a second Ctrl-C, SIGTERM or SIGHUP):
+    // recorded above, and exits the way an interrupted command does.
+    if outcome.abandoned {
+        let _ = ctx.io.stdout.flush();
+        std::process::exit(130);
+    }
     match outcome.error {
         Some(e) => Err(fail("tui_failed", e)),
         None => Ok(()),

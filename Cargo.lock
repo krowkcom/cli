@@ -1502,6 +1502,7 @@ dependencies = [
  "crossterm",
  "futures-core",
  "krowk-harness",
+ "libc",
  "ratatui",
  "serde_json",
  "tokio",

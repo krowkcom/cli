@@ -32,7 +32,7 @@ use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Position, Size};
 use ratatui::text::Line;
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::cell::RefCell;
 use std::io::{self, Write};
 use std::rc::Rc;
@@ -146,6 +146,11 @@ pub struct Term<W: Write> {
     /// input caret. After a resize the terminal still knows where the cursor
     /// is, and the viewport's top is found from it.
     caret_row: u16,
+    caret_col: u16,
+    /// How many columns each live row last drawn actually used: after a
+    /// narrowing resize, a terminal that reflows splits each wider row
+    /// into several, and this is how many.
+    widths: Vec<u16>,
     /// Frames written, for the tests and the redraw budget's evidence.
     pub frames: u64,
 }
@@ -156,7 +161,7 @@ impl<W: Write> Term<W> {
     pub fn new(out: W, size: Size, top: u16, height: u16) -> io::Result<Term<W>> {
         let buf = FrameBuf::default();
         let terminal = build(&buf, size, top, height)?;
-        Ok(Term { terminal, buf, out, size, height, caret_row: 0, frames: 0 })
+        Ok(Term { terminal, buf, out, size, height, caret_row: 0, caret_col: 0, widths: Vec::new(), frames: 0 })
     }
 
     pub fn width(&self) -> u16 {
@@ -192,14 +197,31 @@ impl<W: Write> Term<W> {
     }
 
     /// The terminal changed size. `cursor_row` is where the terminal says
-    /// the cursor is now, when it could be asked; the viewport's top is
-    /// that less the caret's row within it. The old live region is cleared
-    /// from there down — it may have been rewrapped — and drawn afresh.
+    /// the cursor is now, when it could be asked. The old live region is
+    /// found from it and cleared from its top down, then drawn afresh.
+    ///
+    /// Where its top is depends on what the terminal did to it. One that
+    /// truncates (xterm) leaves every row where it was, so the top is the
+    /// cursor less the caret's row. One that reflows (tmux, kitty, VTE,
+    /// iTerm) splits each row wider than the new width into several and
+    /// keeps the cursor on the caret, so the top is the cursor less the rows
+    /// the region above the caret now takes — cleared from there, the
+    /// status bar, overlay or notice that was split leaves nothing behind.
+    /// A narrower terminal whose cursor did not move did not reflow.
+    ///
+    /// One case is out of reach: tmux keeps the bottom of its grid on
+    /// screen, blank rows included, so on a nearly empty screen — the live
+    /// region near the top, blank rows under it — the rows a reflow adds
+    /// push the region's own top rows into history, where no clear reaches.
+    /// Once the region sits at the bottom, as it does after a screenful of
+    /// output, every reflowed row stays on screen and is cleared.
     pub fn resize(&mut self, size: Size, cursor_row: Option<u16>) -> io::Result<()> {
         let old_top = self.top();
+        let old_width = self.size.width;
         self.size = size;
         let height = self.height.clamp(1, size.height.max(1));
         let top = match cursor_row {
+            Some(row) if size.width < old_width && row != old_top + self.caret_row => row.saturating_sub(self.reflowed_above_caret(size.width)),
             Some(row) => row.saturating_sub(self.caret_row),
             None => old_top,
         };
@@ -207,25 +229,43 @@ impl<W: Write> Term<W> {
         self.rebuild(top, height)
     }
 
-    /// One frame: `lines` into scrollback, then the live region redrawn at
-    /// `height` rows by `draw`, all as one synchronized write.
-    pub fn frame(&mut self, lines: &[Line<'static>], height: u16, draw: impl FnOnce(&mut Frame)) -> io::Result<()> {
-        self.set_height(height)?;
+    /// Rows the live region above the caret takes once reflowed to `width`.
+    pub fn reflowed_above_caret(&self, width: u16) -> u16 {
+        let width = width.max(1);
+        let rows = |w: u16| w.div_ceil(width).max(1);
+        let above: u16 = self.widths.iter().take(usize::from(self.caret_row)).map(|w| rows(*w)).sum();
+        above + self.caret_col / width
+    }
+
+    /// One frame: `lines` into scrollback, then the live region redrawn as
+    /// `rows` with the cursor at `caret` (column, row), all as one
+    /// synchronized write.
+    pub fn frame(&mut self, lines: &[Line<'static>], rows: &[Line<'static>], caret: (u16, u16)) -> io::Result<()> {
+        self.set_height(rows.len() as u16)?;
         let width = self.size.width;
         // A chunk at a time, so the scratch buffer of a long history never
         // holds more than a screenful of cells.
         for chunk in lines.chunks(64) {
-            let rows = chunk.len() as u16;
-            self.terminal.insert_before(rows, |buf: &mut Buffer| {
+            let n = chunk.len() as u16;
+            self.terminal.insert_before(n, |buf: &mut Buffer| {
                 for (i, line) in chunk.iter().enumerate() {
                     buf.set_line(0, i as u16, line, width);
                 }
             })?;
         }
-        self.terminal.draw(draw)?;
+        let shown = usize::from(self.height);
+        self.terminal.draw(|f| {
+            let area = f.area();
+            for (i, row) in rows.iter().enumerate().take(usize::from(area.height)) {
+                f.buffer_mut().set_line(area.x, area.y + i as u16, row, width);
+            }
+            f.set_cursor_position((area.x + caret.0.min(width.saturating_sub(1)), area.y + caret.1.min(area.height.saturating_sub(1))));
+        })?;
+        self.widths = rows.iter().take(shown).map(|r| (r.width() as u16).min(width)).collect();
         let top = self.top();
-        if let Some(Position { y, .. }) = completed_cursor(&mut self.terminal) {
+        if let Some(Position { x, y }) = completed_cursor(&mut self.terminal) {
             self.caret_row = y.saturating_sub(top);
+            self.caret_col = x;
         }
         self.flush()
     }
@@ -257,6 +297,15 @@ impl<W: Write> Term<W> {
         self.flush()
     }
 
+    /// Back after a job stop: the live region starts afresh on the row the
+    /// cursor is on now (the shell may have printed below it).
+    pub fn resume(&mut self, size: Size, cursor_row: Option<u16>) -> io::Result<()> {
+        self.size = size;
+        let height = self.height.clamp(1, size.height.max(1));
+        let top = cursor_row.unwrap_or(size.height.saturating_sub(height)).min(size.height.saturating_sub(height));
+        self.rebuild(top, height)
+    }
+
     pub fn into_inner(self) -> W {
         self.out
     }
@@ -286,12 +335,32 @@ mod tests {
     #[test]
     fn r_tui_1_every_frame_is_one_synchronized_write() {
         let mut t = Term::new(Vec::new(), Size { width: 40, height: 10 }, 0, 3).unwrap();
-        t.frame(&[Line::from("one"), Line::from("two")], 3, |f| f.render_widget(Line::from("› hi"), f.area())).unwrap();
-        t.frame(&[], 4, |f| f.render_widget(Line::from("› hi there"), f.area())).unwrap();
+        t.frame(&[Line::from("one"), Line::from("two")], &[Line::from("› hi"), Line::default(), Line::default()], (4, 0)).unwrap();
+        t.frame(&[], &[Line::from("› hi there"), Line::default(), Line::default(), Line::default()], (10, 0)).unwrap();
         let out = t.into_inner();
         assert_eq!(frames(&out), 2, "one bracket pair per frame");
         let text = String::from_utf8_lossy(&out);
         assert!(text.starts_with("\x1b[?2026h") && text.ends_with("\x1b[?2026l"), "{text:?}");
         assert!(!text.contains("\x1b[2J"), "the screen is never cleared whole: {text:?}");
+    }
+
+    #[test]
+    fn r_tui_3_a_narrowed_region_is_measured_as_the_terminal_reflows_it() {
+        let mut t = Term::new(Vec::new(), Size { width: 100, height: 30 }, 10, 3).unwrap();
+        let bar = Line::from("x".repeat(90));
+        // An overlay row of 90 columns, the prompt with the caret at column
+        // 50, then a status bar.
+        t.frame(&[], &[bar.clone(), Line::from("y".repeat(60)), bar], (50, 1)).unwrap();
+        // At 40 columns the 90-wide row above the caret takes three rows,
+        // and the caret itself has moved one row down its own line.
+        assert_eq!(t.reflowed_above_caret(40), 3 + 1);
+        assert_eq!(t.reflowed_above_caret(100), 1, "unchanged at the old width");
+        // The terminal says the cursor is now at row 14 (was 11): the
+        // region's top is 14 - 4 = 10, and it is cleared from there.
+        let before = t.out.len();
+        t.resize(Size { width: 40, height: 30 }, Some(14)).unwrap();
+        t.flush().unwrap();
+        let out = String::from_utf8_lossy(&t.out[before..]).into_owned();
+        assert!(out.starts_with("\x1b[?2026h\x1b[11;1H\x1b[J"), "{out:?}");
     }
 }

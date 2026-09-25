@@ -59,6 +59,25 @@ pub struct Outcome {
     pub api_status: Option<u16>,
 }
 
+struct SubagentMessage {
+    id: String,
+    model: String,
+    latest: Usage,
+    reported: Usage,
+}
+
+/// What `latest` adds to `reported`, field by field; never negative.
+fn growth(latest: &Usage, reported: &Usage) -> Usage {
+    let d = |a: i64, b: i64| (a - b).max(0);
+    Usage {
+        input_tokens: d(latest.input_tokens, reported.input_tokens),
+        output_tokens: d(latest.output_tokens, reported.output_tokens),
+        cache_read_tokens: d(latest.cache_read_tokens, reported.cache_read_tokens),
+        cache_write_tokens: d(latest.cache_write_tokens, reported.cache_write_tokens),
+        reasoning_tokens: d(latest.reasoning_tokens, reported.reasoning_tokens),
+    }
+}
+
 /// A response rebuilt from `assistant` messages, for a message whose stream
 /// never arrived.
 struct Whole {
@@ -80,11 +99,16 @@ pub struct Translator {
     held: Vec<EngineEvent>,
     pub init: Option<Init>,
     pub outcome: Option<Outcome>,
-    /// A subagent's message whose usage is not reported yet: Claude Code
-    /// sends one `assistant` line per content block, each with the
-    /// message's usage so far, so it is reported when the next message
-    /// begins, or the turn ends.
-    subagent: Option<(String, String, Usage)>,
+    /// Each subagent message seen, in the order first seen: its model, the
+    /// latest usage Claude Code sent for it, and how much of that has been
+    /// reported. Claude Code sends one `assistant` line per content block,
+    /// each with the message's usage so far, and parallel `Task`s
+    /// interleave theirs, so what is reported is the growth since the last
+    /// report — when another message's line arrives, and at the end — and
+    /// no message is ever counted twice.
+    subagents: Vec<SubagentMessage>,
+    /// The message the last subagent line was for.
+    subagent_at: Option<usize>,
 }
 
 fn str_of<'a>(v: &'a Value, k: &str) -> &'a str {
@@ -113,10 +137,20 @@ impl Translator {
                 && let Some(u) = m.get("usage")
             {
                 let id = str_of(m, "id").to_string();
-                if self.subagent.as_ref().is_some_and(|(seen, _, _)| *seen != id) {
-                    self.close_subagent(&mut out);
+                let at = match self.subagents.iter().position(|s| s.id == id && !id.is_empty()) {
+                    Some(at) => at,
+                    None => {
+                        self.subagents.push(SubagentMessage { id, model: String::new(), latest: Usage::default(), reported: Usage::default() });
+                        self.subagents.len() - 1
+                    }
+                };
+                if let Some(prev) = self.subagent_at.filter(|p| *p != at) {
+                    self.report_subagent(prev, &mut out);
                 }
-                self.subagent = Some((id, str_of(m, "model").into(), usage(u)));
+                let sm = &mut self.subagents[at];
+                sm.model = str_of(m, "model").into();
+                sm.latest = usage(u);
+                self.subagent_at = Some(at);
             }
             return Ok(out);
         }
@@ -233,13 +267,22 @@ impl Translator {
         self.close_stream(out);
         self.close_whole(out);
         out.append(&mut self.held);
-        self.close_subagent(out);
+        for at in 0..self.subagents.len() {
+            self.report_subagent(at, out);
+        }
+        self.subagent_at = None;
     }
 
-    fn close_subagent(&mut self, out: &mut Vec<EngineEvent>) {
-        if let Some((id, model, usage)) = self.subagent.take() {
-            out.push(EngineEvent::SubagentResponse { response_id: (!id.is_empty()).then_some(id), model, usage });
+    /// Reports what a subagent message has grown by since it was last
+    /// reported, if anything.
+    fn report_subagent(&mut self, at: usize, out: &mut Vec<EngineEvent>) {
+        let sm = &mut self.subagents[at];
+        let more = growth(&sm.latest, &sm.reported);
+        if more == Usage::default() {
+            return;
         }
+        sm.reported = sm.latest;
+        out.push(EngineEvent::SubagentResponse { response_id: (!sm.id.is_empty()).then(|| sm.id.clone()), model: sm.model.clone(), usage: more });
     }
 }
 
@@ -349,7 +392,8 @@ mod tests {
     fn r_budget_1_a_subagents_calls_are_metered_once_each_and_the_reported_total_comes_with_the_result() {
         let mut t = Translator::default();
         let sub = |id: &str, out: i64| format!(r#"{{"type":"assistant","parent_tool_use_id":"toolu_task","session_id":"s","message":{{"id":"{id}","model":"claude-haiku-4-5","role":"assistant","content":[{{"type":"text","text":"x"}}],"usage":{{"input_tokens":5,"output_tokens":{out}}}}}}}"#);
-        let lines = [sub("msg_sub_1", 3), sub("msg_sub_1", 40), sub("msg_sub_2", 7), r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s","total_cost_usd":0.25}"#.to_string()].join("\n");
+        // Two parallel Tasks, their lines interleaved: 1, 1, 2, 1 again.
+        let lines = [sub("msg_sub_1", 3), sub("msg_sub_1", 40), sub("msg_sub_2", 7), sub("msg_sub_1", 55), r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s","total_cost_usd":0.25}"#.to_string()].join("\n");
         let evs = feed(&mut t, &lines);
         let metered: Vec<(Option<&str>, i64)> = evs
             .iter()
@@ -358,7 +402,16 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(metered, [(Some("msg_sub_1"), 40), (Some("msg_sub_2"), 7)], "each message once, at its last usage");
+        assert_eq!(metered, [(Some("msg_sub_1"), 40), (Some("msg_sub_2"), 7), (Some("msg_sub_1"), 15)], "each message's growth, reported once");
+        let total = |id: &str| {
+            evs.iter()
+                .filter_map(|e| match e {
+                    EngineEvent::SubagentResponse { response_id: Some(r), usage, .. } if r == id => Some((usage.input_tokens, usage.output_tokens)),
+                    _ => None,
+                })
+                .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        };
+        assert_eq!((total("msg_sub_1"), total("msg_sub_2")), ((5, 55), (5, 7)), "every message counted at its final usage, none twice");
         assert!(completed(&evs).is_empty(), "the subagent's conversation is its own");
         assert_eq!(evs.last(), Some(&EngineEvent::ReportedCost { usd: 0.25 }));
     }

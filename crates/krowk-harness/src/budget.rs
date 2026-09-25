@@ -117,7 +117,14 @@ fn metered(events: &[LogEvent], pricer: &Pricer) -> (Spend, Option<LastCall>) {
             }
             LogBody::ResponseCompleted { turn_id, model: answered, usage, .. } | LogBody::SubagentResponse { turn_id, model: answered, usage, .. } => {
                 let (provider, asked) = turns.get(turn_id.as_str()).copied().unwrap_or(("", answered));
-                per_turn.entry(turn_id).or_default().add(pricer, provider, asked, answered, usage);
+                let spend = per_turn.entry(turn_id).or_default();
+                if matches!(ev.body, LogBody::SubagentResponse { .. }) {
+                    // A subagent runs on a model of its own (a sonnet
+                    // session's haiku Task): priced by the one that answered.
+                    spend.add(pricer, provider, answered, asked, usage);
+                } else {
+                    spend.add(pricer, provider, asked, answered, usage);
+                }
                 if matches!(ev.body, LogBody::ResponseCompleted { .. }) {
                     last = Some(LastCall { provider: provider.into(), model: asked.into(), answered: answered.clone(), usage: *usage });
                 }
@@ -361,10 +368,11 @@ impl Budget {
     }
 
     /// Records a call a backend's subagent made: spend like any other, but
-    /// not the call the next one's floor is worked out from.
+    /// not the call the next one's floor is worked out from, and priced by
+    /// the model that answered first — a subagent runs on its own.
     pub fn record_subagent(&self, answered: &str, usage: &Usage) -> Snapshot {
         let mut s = self.state();
-        s.turn.add(&self.0.pricer, &self.0.provider, &self.0.model, answered, usage);
+        s.turn.add(&self.0.pricer, &self.0.provider, answered, &self.0.model, usage);
         Snapshot { total: Budget::total(&s), turn: s.turn.clone() }
     }
 
@@ -533,6 +541,32 @@ mod tests {
         assert_eq!(snap.turn.cost(), Some(0.12));
         assert!(b.over().is_some_and(|e| e.message.contains("over --max-usd $0.100")), "past the limit on the reported total");
         assert_eq!(b.reported(0.01).turn.cost(), Some(0.12), "a smaller reported total changes nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r_budget_1_a_subagent_is_priced_by_the_model_it_ran_on() {
+        let dir = std::env::temp_dir().join(format!("krowk-budget-subagent-model-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Sonnet a dollar per thousand output tokens, Haiku a tenth of that.
+        let pricer: Pricer = Arc::new(|_, m: &str, u: &Usage| match m {
+            "claude-sonnet-4-6" => Some(u.output_tokens as f64 / 1000.0),
+            "claude-haiku-4-5" => Some(u.output_tokens as f64 / 10_000.0),
+            _ => None,
+        });
+        let (mut log, root) = log::SessionLog::create(&dir, Path::new("/repo"), "t").unwrap();
+        let model = ModelRef { instance: "anthropic".into(), model: "claude-sonnet-4-6".into() };
+        log.append(LogBody::TurnStarted { turn_id: "t1".into(), model, provider: "anthropic".into(), wire_api: crate::protocol::WireApi::ClaudeCode, permission_mode: Default::default(), effort: None }).unwrap();
+        log.append(LogBody::SubagentResponse { turn_id: "t1".into(), response_id: None, model: "claude-haiku-4-5".into(), usage: Usage { output_tokens: 1000, ..Usage::default() } }).unwrap();
+        drop(log);
+        let events = log::read_events(&dir.join(&root.session_id).join(log::EVENTS_FILE)).unwrap();
+        let (spent, _) = metered(&events, &pricer);
+        assert!((spent.cost().unwrap() - 0.1).abs() < 1e-9, "from the log, at Haiku's price: {spent:?}");
+        let b = Budget::new(BudgetLimits::default(), &root.session_id, &dir, pricer, "anthropic", "claude-sonnet-4-6", &[]);
+        let snap = b.record_subagent("claude-haiku-4-5", &Usage { output_tokens: 1000, ..Usage::default() });
+        assert!((snap.turn.cost().unwrap() - 0.1).abs() < 1e-9, "live, at Haiku's price: {:?}", snap.turn);
+        let snap = b.record_subagent("claude-opus-9", &Usage { output_tokens: 1000, ..Usage::default() });
+        assert!((snap.turn.cost().unwrap() - 1.1).abs() < 1e-9, "an unpriced answer falls back to the session's model");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

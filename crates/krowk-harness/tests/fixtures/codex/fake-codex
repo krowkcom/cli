@@ -214,8 +214,14 @@ play_turn() {
       ;;
     "@tool-result "*)
       local item="${line#@tool-result }" text
-      text="$(printf '%s' "$LAST" | sed -E 's/.*"text":"(([^"\\]|\\.)*)".*/\1/')"
-      say "$(fill "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"dynamicToolCall\",\"id\":\"$item\",\"namespace\":\"krowk\",\"tool\":\"session_info\",\"arguments\":{},\"status\":\"completed\",\"success\":true,\"contentItems\":[{\"type\":\"inputText\",\"text\":\"$text\"}]},\"threadId\":\"{{THREAD}}\",\"turnId\":\"{{TURN}}\",\"completedAtMs\":3}}")"
+      # krowk's answer is {"id":…,"result":{"contentItems":[{…,"text":"…"}],"success":…}}:
+      # the text is what lies between its "text":" and the "}], that closes it.
+      text="${LAST#*\"text\":\"}"
+      text="${text%%\"\}\],\"success\"*}"
+      # Built in a variable, not inside "$(…)": bash 3.2 mis-parses escaped
+      # quotes nested in a command substitution inside double quotes.
+      local done_line='{"method":"item/completed","params":{"item":{"type":"dynamicToolCall","id":"'"$item"'","namespace":"krowk","tool":"session_info","arguments":{},"status":"completed","success":true,"contentItems":[{"type":"inputText","text":"'"$text"'"}]},"threadId":"{{THREAD}}","turnId":"{{TURN}}","completedAtMs":3}}'
+      say "$(fill "$done_line")"
       ;;
     "@await-interrupt")
       await turn/interrupt <&3

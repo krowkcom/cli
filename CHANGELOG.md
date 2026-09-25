@@ -192,6 +192,56 @@ the versions are the `v*` tags a release is cut from. Entries land under
   and refreshed as they expire; `krowk -p --model supergrok/grok-4.7`
   then runs on the subscription. `list` shows which instances have their
   key or login; `remove` takes a definition and its login away.
+- **`krowk -p` can run Claude Code on your Claude subscription, with as
+  many accounts as you like.** `--model claude/sonnet` drives the `claude`
+  already on your PATH, signed in the way you signed it in; `krowk
+  providers add claude --name work` makes a second account, `claude:work`,
+  with a config directory of its own (under
+  `~/.local/share/krowk/claude/`, or `--config-dir`) and signs it in by
+  running `claude auth login` — Anthropic's own login, on your terminal.
+  krowk never reads Claude's credentials or keychain entry; `providers
+  list` asks `claude auth status`. One `claude` process serves the whole
+  session: its turns stream into the same log and `krowk sessions` listing
+  as native ones, Ctrl-C interrupts the turn and keeps the session, `-p
+  --resume` continues it on `claude --resume`, and the log records the
+  Claude session id, its transcript's path and whether it ran on the
+  subscription or an API key (`backend.session`). Claude Code runs in
+  its `default` mode (`plan` under `--permission-mode plan`) whatever its
+  settings' `defaultMode` says, and a turn it reports in a looser mode is
+  stopped before it runs anything. Tool calls Claude Code asks about are
+  answered by krowk's `--permission-mode` (edits need `acceptEdits` and
+  never reach `.git`, `.claude` — in any case, as macOS and Windows would
+  open it — or the account's config directory; Bash and anything else
+  need `bypassPermissions`). The native edit tools keep out of `.claude`
+  the same way. **Claude Code's own allow
+  rules (`permissions.allow` in your or the project's settings) and its
+  hooks still apply first**: what they approve runs without krowk being
+  asked, as it does when you run `claude` yourself. `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` set for krowk's native
+  engine are not passed to Claude Code, so an exported key never moves a
+  subscription account onto it. A router is an instance of its own:
+  `krowk providers add claude --name router --base-url
+  https://openrouter.ai/api --api-key-env OPENROUTER_API_KEY` stores the
+  variable's name, and krowk hands its key to Claude Code as
+  `ANTHROPIC_AUTH_TOKEN` (as `ANTHROPIC_API_KEY` without a base URL, for a
+  Console key); no Claude login is run for it. Stopping
+  a session stops everything Claude Code started with it, and a host that
+  keeps sessions lets an idle one's process go after 15 minutes. krowk's
+  own tools reach Claude Code as the `krowk` MCP server — today
+  `session_info`.
+- **krowk asks before Claude Code runs in a repository you have not
+  trusted.** `claude -p` runs a repository's hooks and MCP servers without
+  its usual trust prompt, so krowk shows its own on a terminal — `krowk
+  -p`, and bare `krowk` before the TUI opens — and
+  remembers a yes in `~/.config/krowk/trusted.json` for that repository
+  alone (not for repositories inside it); without a terminal it refuses
+  (exit 4, `untrusted_directory`) unless you pass `--trust`, which lasts
+  for that run. Your home directory and `/` are never trusted for good —
+  in a home kept in git, every plain directory is part of that repository
+  — so only `--trust` runs Claude Code there. A native model runs nothing
+  of the repository's and is never asked about. Steering (typing while a
+  turn runs, in the TUI) is not taken by a Claude Code turn: it comes back
+  into the prompt, unsent.
 - **Native sessions are logs you own, listed beside imported ones.** Each
   session is an append-only JSONL log under
   `~/.local/share/krowk/sessions/<id>/` (with each turn's exact system

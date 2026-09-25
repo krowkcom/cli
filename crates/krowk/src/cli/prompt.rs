@@ -11,6 +11,7 @@ use krowk_harness::host::HostConfig;
 use krowk_harness::instances::{self, Registry};
 use krowk_harness::log;
 use krowk_harness::protocol::{Effort, PermissionMode, TurnStatus, Usage};
+use krowk_harness::trust;
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
 
@@ -50,6 +51,7 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
         pricer: pricer(ctx.io.env),
         catalog: catalog(ctx.io.env),
         credentials: super::providers::credentials_path(),
+        trust: trust_gate(ctx.f.trust, super::interactive(ctx) && std::io::stdin().is_terminal() && ctx.io.err_tty, Some(ctx.env("HOME")).filter(|h| !h.trim().is_empty()).map(std::path::PathBuf::from)),
     };
     let opts = headless::Options { prompt, resume, model, permission_mode, toolset, effort, format };
     let outcome = headless::run(cfg, opts, ctx.io.stdout);
@@ -150,6 +152,75 @@ pub(super) fn resolve_resume(ctx: &Ctx, sessions_dir: &std::path::Path, referenc
         ));
     }
     Ok(d.session.foreign_session_id)
+}
+
+/// R-BACK-6: `claude -p` runs a repository's hooks and MCP servers without
+/// the trust dialog Claude Code shows on a terminal, so krowk asks its own
+/// before a backend is spawned. A repository trusted before, or `--trust`,
+/// goes ahead; a person at the terminal is asked, and a yes is remembered;
+/// anything headless is refused. The home directory and `/` are never
+/// offered: only `--trust`, for one run, starts a backend there. Nothing is
+/// spawned until this answers.
+fn trust_gate(flag: bool, ask: bool, home: Option<std::path::PathBuf>) -> trust::Gate {
+    let store = trust::Store::new(krowk_api::creds::config_dir().join(trust::FILE), home);
+    Arc::new(move |root: &std::path::Path| {
+        if flag || store.trusts(root) {
+            return Ok(());
+        }
+        if let Some(why) = store.refuses(root) {
+            return Err(trust::untrusted(root, &format!("It cannot be trusted for good — {why}. Pass --trust to run there this once, or run krowk -p from a repository of its own.")));
+        }
+        if !ask {
+            return Err(trust::untrusted(root, "Look at what it would run, then pass --trust to run it anyway, or run krowk -p there once on a terminal and answer its prompt."));
+        }
+        if ask_trust(&store, root) { Ok(()) } else { Err(trust::untrusted(root, "Nothing was run.")) }
+    })
+}
+
+/// The trust prompt itself, on the terminal as it is (not raw): what the
+/// repository would make Claude Code run, and a yes-or-no that defaults to
+/// no. A yes is remembered.
+pub(super) fn ask_trust(store: &trust::Store, root: &std::path::Path) -> bool {
+    let runs = trust::what_runs(root);
+    use std::io::Write as _;
+    let mut stderr = std::io::stderr();
+    let _ = writeln!(stderr, "Claude Code (`claude -p`) runs a repository's own hooks and MCP servers without asking.");
+    if runs.is_empty() {
+        let _ = writeln!(stderr, "{} has none of those files now, but it is not a repository you have trusted.", root.display());
+    } else {
+        let _ = writeln!(stderr, "{} has {}.", root.display(), runs.join(", "));
+    }
+    match inquire::Confirm::new(&format!("Trust {} and run Claude Code in it?", root.display())).with_default(false).prompt() {
+        Ok(true) => {
+            if let Err(e) = store.trust(root) {
+                let _ = writeln!(stderr, "! trusted for this run, but not remembered: {e}");
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The TUI's gate. The TUI owns the terminal in raw mode once it opens, so
+/// the question is asked before that — for the model its session will run
+/// on (the flag, a resumed session's last, the default), in the directory
+/// it will run in — and the gate then answers from that answer and the
+/// trusted list. A no, or a home directory, is refused when the first
+/// prompt is sent, and the TUI shows why.
+pub(super) fn tui_trust_gate(model: Option<&krowk_harness::protocol::ModelRef>, registry: &Registry, cwd: &std::path::Path, home: Option<std::path::PathBuf>) -> trust::Gate {
+    let store = trust::Store::new(krowk_api::creds::config_dir().join(trust::FILE), home);
+    let backend = model.and_then(|m| registry.get(&m.instance).ok()).is_some_and(|i| i.backend.is_some());
+    let asked = trust::root(cwd);
+    let accepted = backend && !store.trusts(&asked) && store.refuses(&asked).is_none() && ask_trust(&store, &asked);
+    Arc::new(move |root: &std::path::Path| {
+        if store.trusts(root) || (accepted && root == asked) {
+            return Ok(());
+        }
+        if let Some(why) = store.refuses(root) {
+            return Err(trust::untrusted(root, &format!("It cannot be trusted for good — {why}. Run `krowk -p --trust` there for one run, or start krowk from a repository of its own.")));
+        }
+        Err(trust::untrusted(root, "Nothing was run — start krowk again there and answer its trust prompt."))
+    })
 }
 
 /// Prices a model call from the models.dev cache or the embedded snapshot,

@@ -90,7 +90,9 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
     for ev in &branch {
         res.classify(event_type(&ev.body));
         match &ev.body {
-            LogBody::SessionStarted { .. } => {}
+            // The vendor's own record of a backend session stays in the log:
+            // krowk.db lists the krowk session, not a second copy of it.
+            LogBody::SessionStarted { .. } | LogBody::BackendSession { .. } => {}
             LogBody::TurnStarted { model, provider: p, .. } => {
                 flush(&mut th, &mut pending, &provider, turn);
                 provider.clone_from(p);
@@ -159,6 +161,7 @@ fn event_type(b: &LogBody) -> &'static str {
         LogBody::ItemCompleted { .. } => "item.completed",
         LogBody::ResponseCompleted { .. } => "response.completed",
         LogBody::TurnCompleted { .. } => "turn.completed",
+        LogBody::BackendSession { .. } => "backend.session",
     }
 }
 

@@ -313,6 +313,64 @@
           "required": [
             "kind"
           ]
+        },
+        {
+          "description": "The user's own, unmodified `claude` binary — Claude Code — driven as\na backend: it runs the loop on its own login, a Claude subscription\nor whatever the config directory holds, and krowk never reads that\nlogin (R-BACK-2). Added with `krowk providers add claude`.",
+          "type": "object",
+          "properties": {
+            "binary": {
+              "description": "The binary; `claude` on PATH when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "configDir": {
+              "description": "`CLAUDE_CONFIG_DIR`: where Claude Code keeps this account's\nlogin, settings and transcripts. Claude's own default\n(`~/.claude`) when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "env": {
+              "description": "More environment for the process, e.g. `ANTHROPIC_BASE_URL` for\na router. Literal values: a key belongs in the environment krowk\nruns in, never in a definition. `CLAUDE_CONFIG_DIR` is not one\nof them — `configDir` is the one way to name it. The ambient\n`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and\n`ANTHROPIC_BASE_URL` reach the process only when named here.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "args": {
+              "description": "More launch arguments, after krowk's own.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "apiKeyEnv": {
+              "description": "The environment variable krowk reads a key from and hands the\nprocess — as `ANTHROPIC_AUTH_TOKEN` when `env` names a base URL\n(a router's bearer token), else as `ANTHROPIC_API_KEY`. The\nvariable's name is stored, never the key. None: Claude Code\nsigns in with its own login.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "effort": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Effort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "claude-code"
+            }
+          },
+          "required": [
+            "kind"
+          ]
         }
       ]
     },
@@ -354,6 +412,11 @@
           "description": "Chat Completions: xAI, OpenRouter, and any server that speaks it.",
           "type": "string",
           "const": "chat-completions"
+        },
+        {
+          "description": "The `claude` binary's stream-json protocol: Claude Code runs the\nloop and krowk drives it. A thinking signature it streams is\nClaude Code's to replay, never sent to the Messages API by krowk.",
+          "type": "string",
+          "const": "claude-code"
         }
       ]
     }

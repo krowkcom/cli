@@ -146,7 +146,7 @@ pub fn definitions(ts: &Toolset) -> Vec<ToolDefinition> {
 
 /// The schema of a tool's input, as the Anthropic API wants it: an object
 /// schema, without the `$schema` and `title` noise schemars adds.
-fn input_schema<T: JsonSchema>() -> Value {
+pub(crate) fn input_schema<T: JsonSchema>() -> Value {
     let mut v = schemars::schema_for!(T).to_value();
     if let Value::Object(m) = &mut v {
         m.remove("$schema");
@@ -253,6 +253,10 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
 pub(crate) struct Scope {
     pub cwd: PathBuf,
     pub bypass: bool,
+    /// More directories no edit may reach unless permissions are bypassed,
+    /// beside `.git` and `.claude`: a Claude Code instance's config
+    /// directory, whose settings and hooks it runs.
+    pub protected: Vec<PathBuf>,
 }
 
 /// Symlinks followed at most while resolving one path: a loop is refused,
@@ -261,7 +265,7 @@ const MAX_LINKS: usize = 40;
 
 impl Scope {
     fn new(env: &ToolEnv<'_>) -> Scope {
-        Scope { cwd: env.cwd.to_path_buf(), bypass: env.permission_mode == PermissionMode::BypassPermissions }
+        Scope { cwd: env.cwd.to_path_buf(), bypass: env.permission_mode == PermissionMode::BypassPermissions, protected: Vec::new() }
     }
 
     /// The path a tool was given, resolved against the working directory,
@@ -289,9 +293,11 @@ impl Scope {
 
 impl Scope {
     /// `path`, for a tool that changes the file: also never anything inside
-    /// a `.git` directory, as spelled or as it leads, unless permissions are
-    /// bypassed. git runs what its config names (`core.fsmonitor`, hooks),
-    /// so a model that could write `.git/config` could run any command
+    /// a `.git` or a `.claude` directory, as spelled or as it leads, nor in
+    /// a `protected` one, unless permissions are bypassed. git runs what its
+    /// config names (`core.fsmonitor`, hooks), and Claude Code what its
+    /// settings, hooks and agents name, so a model that could write
+    /// `.git/config` or `.claude/settings.json` could run any command
     /// without the bash permission. Codex keeps `.git` read-only for the
     /// same reason.
     pub fn edit_path(&self, path: &str) -> Result<PathBuf, String> {
@@ -299,13 +305,25 @@ impl Scope {
         if self.bypass {
             return Ok(p);
         }
-        let in_git = |q: &Path| q.components().any(|c| c.as_os_str() == ".git");
+        // Compared the way the file system may: case-insensitively (macOS
+        // and Windows open `.Claude` as `.claude`), and with the trailing
+        // dots and spaces Windows drops (`.git.` is `.git`) — on every OS,
+        // since a checkout travels between them.
+        let fold = |c: &std::ffi::OsStr| c.to_string_lossy().trim_end_matches(['.', ' ']).to_ascii_lowercase();
+        let inside = |q: &Path| q.components().find_map(|c| [".git", ".claude"].into_iter().find(|d| fold(c.as_os_str()) == *d));
         let real = real_path(&p, 0).unwrap_or_else(|_| p.clone());
         let root = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
-        if in_git(p.strip_prefix(&self.cwd).unwrap_or(&p)) || in_git(real.strip_prefix(&root).unwrap_or(&real)) {
+        let fenced = inside(p.strip_prefix(&self.cwd).unwrap_or(&p)).or_else(|| inside(real.strip_prefix(&root).unwrap_or(&real)));
+        if let Some(dir) = fenced {
+            let runs = if dir == ".git" { "git runs what its config and hooks name, so it is left to git itself — use git through bash" } else { "Claude Code runs what its settings, hooks and agents name" };
+            return Err(format!("{} is inside a {dir} directory, which the file tools do not change: {runs}, or ask the person to rerun with `--permission-mode bypassPermissions`", p.display()));
+        }
+        let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+        if let Some(d) = self.protected.iter().find(|d| lower(&real).starts_with(lower(&d.canonicalize().unwrap_or_else(|_| d.to_path_buf())))) {
             return Err(format!(
-                "{} is inside a .git directory, which the file tools do not change: git runs what its config and hooks name, so it is left to git itself — use git through bash, or ask the person to rerun with `--permission-mode bypassPermissions`",
-                p.display()
+                "{} is inside {}, Claude Code's config directory for this session, which the file tools do not change: Claude Code runs what its settings and hooks name — ask the person to rerun with `--permission-mode bypassPermissions`",
+                p.display(),
+                d.display()
             ));
         }
         Ok(p)
@@ -844,6 +862,20 @@ mod tests {
         assert!(!run(READ, &json!({"path": ".git/config"}), &env).await.1);
         let bypass = ToolEnv { permission_mode: PermissionMode::BypassPermissions, ..env };
         assert!(!run(WRITE, &json!({"path": ".git/info/note", "content": "x"}), &bypass).await.1);
+        // .claude is fenced the same way: Claude Code runs its hooks.
+        let claude = |r: (String, bool)| r.1 && r.0.contains("inside a .claude directory");
+        assert!(claude(run(WRITE, &json!({"path": ".claude/settings.json", "content": "{}"}), &env).await));
+        assert!(claude(run(WRITE, &json!({"path": "sub/.claude/agents/x.md", "content": "x"}), &env).await), "any component");
+        // However a case-insensitive or a Windows file system would open it.
+        for p in [".Claude/settings.json", ".CLAUDE/hooks/h.sh", ".claude./settings.json", ".claude /agents/a.md", "sub/.ClAuDe/settings.local.json"] {
+            assert!(claude(run(WRITE, &json!({"path": p, "content": "{}"}), &env).await), "{p}");
+        }
+        for p in [".GIT/config", ".Git/hooks/pre-commit", ".git./config", ".git /hooks/x"] {
+            assert!(refused(run(WRITE, &json!({"path": p, "content": "x"}), &env).await), "{p}");
+        }
+        assert!(!run(WRITE, &json!({"path": ".claudette/notes.md", "content": "x"}), &env).await.1, "a name that only starts like it is fine");
+        assert!(!d.join(".claude").exists());
+        assert!(!run(WRITE, &json!({"path": ".claude/settings.json", "content": "{}"}), &bypass).await.1);
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -963,7 +995,8 @@ mod tests {
         // restarted by each chunk.
         let started = std::time::Instant::now();
         let (out, err) = run(BASH, &json!({"command": "(while :; do echo x; sleep 0.1; done) & echo ok", "timeout_ms": 10000}), &env).await;
-        assert!(!err && out.starts_with("ok\n"), "{out}");
+        // The loop may print before `echo ok` does: order is the scheduler's.
+        assert!(!err && out.lines().any(|l| l == "ok"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
         let _ = std::fs::remove_dir_all(d);
     }

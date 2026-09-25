@@ -124,6 +124,9 @@ async fn drive(host: Host, opts: Options, stdout: &mut dyn Write) -> Outcome {
             }
         }
     }
+    // A backend's process is let go before the answer is reported, so its
+    // transcript is whole when krowk exits.
+    host.shutdown().await;
     match done.expect("the loop ends only once the command has") {
         Ok(Some(result)) => {
             match format {

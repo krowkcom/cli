@@ -11,6 +11,10 @@
 //! - `catalog` — what the models.dev cache says of a model; `effort` — the
 //!   one reasoning-effort ladder, mapped per model.
 //! - `oauth` — the SuperGrok login and its tokens.
+//! - `claude` — the Claude Code backend: the user's own `claude` binary,
+//!   driven over stream-json and its control protocol; `bridge` — krowk's
+//!   tools offered to a backend as an MCP server; `trust` — which
+//!   repositories a backend may run in.
 //! - `tools` — read, write, the edit tools, bash, grep and glob.
 //! - `toolset` — the preset registry: which edit tool a model is offered.
 //! - `host` — executes commands, writes the log, prices the turn.
@@ -24,8 +28,10 @@
 //! not open the code.
 
 pub mod anthropic;
+pub mod bridge;
 pub mod catalog;
 pub mod chat;
+pub mod claude;
 pub mod effort;
 pub mod engine;
 pub mod headless;
@@ -42,3 +48,4 @@ pub mod schema;
 pub mod sse;
 pub mod tools;
 pub mod toolset;
+pub mod trust;

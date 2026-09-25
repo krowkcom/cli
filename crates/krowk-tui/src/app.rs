@@ -187,6 +187,17 @@ impl App {
     }
 
     fn push_wrapped(&mut self, first: &str, rest: &str, text: &str, prefix_style: Style, style: Style) {
+        // Unprefixed text — the answer itself, most of scrollback — goes
+        // out as one line for the terminal to wrap, so it rewraps when the
+        // window does and copies whole. Prefixed items wrap here, under
+        // their hanging indent.
+        if first.is_empty() && rest.is_empty() {
+            let line = Line::from(Span::styled(clean(text), style));
+            self.last_blank = line.width() == 0;
+            self.pending.push(line);
+            self.dirty = true;
+            return;
+        }
         let width = usize::from(self.width);
         for (i, row) in wrap(&clean(text), width.saturating_sub(first.width().max(rest.width())).max(1)).into_iter().enumerate() {
             let prefix = if i == 0 { first } else { rest };

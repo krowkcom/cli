@@ -264,6 +264,12 @@ impl Tmux {
         self.tmux(&["capture-pane", "-p", "-t", "t", "-S", "-", "-E", "-"])
     }
 
+    /// The whole history with the terminal's own soft wraps joined back:
+    /// each line as it was printed.
+    fn history_joined(&self) -> String {
+        self.tmux(&["capture-pane", "-p", "-J", "-t", "t", "-S", "-", "-E", "-"])
+    }
+
     fn wait_for(&self, needle: &str, timeout: Duration) -> Option<Duration> {
         let t0 = Instant::now();
         while t0.elapsed() < timeout {
@@ -341,10 +347,29 @@ fn r_tui_3_a_phone_width_terminal_wraps_and_still_keeps_every_line_once() {
     assert!(tm.wait_for("tokens", Duration::from_secs(60)).is_some(), "{}", tm.screen());
     let history = tm.history();
     assert!(history.lines().all(|l| l.trim_end().chars().count() <= 40), "a row wider than the terminal:\n{history}");
-    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let all = squash(&history);
-    let want = squash(&mock::numbered_lines(200));
-    assert_eq!(all.matches(&want).count(), 1, "the answer, wrapped, is in scrollback once and in order");
+    // The terminal wrapped the answer itself, so joining its wraps gives
+    // back every line exactly as it was streamed, once and in order.
+    let joined = tm.history_joined();
+    let got: Vec<&str> = joined.lines().map(str::trim_end).filter(|l| l.starts_with("line ")).collect();
+    let want: Vec<String> = mock::numbered_lines(200).lines().map(String::from).collect();
+    assert_eq!(got, want, "the answer, wrapped by the terminal, is in scrollback once and in order");
+}
+
+#[test]
+fn r_tui_3_a_widened_terminal_rewraps_the_answer_already_in_scrollback() {
+    // Printed at 40 columns, the answer's lines wrap; widened to 100 the
+    // terminal joins them again, because krowk left the wrapping to it.
+    let m = streamed(20, Duration::from_micros(100));
+    let b = Sandbox::new("widen");
+    let Some(tm) = Tmux::start("widen", 40, 30, &b.root.join("repo"), &b.env(&m.url), &[]) else { return };
+    assert!(tm.wait_for("›", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    tm.keys(&["go", "Enter"]);
+    assert!(tm.wait_for("tokens", Duration::from_secs(30)).is_some(), "{}", tm.screen());
+    tm.tmux(&["resize-window", "-t", "t", "-x", "100", "-y", "30"]);
+    std::thread::sleep(Duration::from_millis(500));
+    let history = tm.history();
+    let whole = history.lines().filter(|l| l.trim_end().ends_with("lazy dog again") && l.starts_with("line ")).count();
+    assert_eq!(whole, 20, "every line is one row again at 100 columns:\n{history}");
 }
 
 #[test]

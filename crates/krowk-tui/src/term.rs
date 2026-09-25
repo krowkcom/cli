@@ -12,10 +12,15 @@
 //!   supports it never shows half a frame, and one that does not ignores
 //!   the brackets. One frame is one bracket pair, which is what the redraw
 //!   budget counts.
-//! - **Lines enter scrollback exactly once.** A finished line is inserted
-//!   above the viewport through a scroll region (ratatui's
-//!   `scrolling-regions`), never redrawn afterwards; the viewport is the only
-//!   thing ever repainted.
+//! - **Lines enter scrollback exactly once, as text.** Finished lines are
+//!   printed where the viewport was — styled text and a CR LF each, the way
+//!   a shell command's output is — and the viewport is rebuilt below them;
+//!   they are never redrawn afterwards. A line wider than the terminal is
+//!   left for the terminal to wrap, so it rewraps itself when the window
+//!   is resized, and copies as one line. (Grok Build's inline terminal,
+//!   `xai-ratatui-inline`'s `emit_to_scrollback`, does the same; this is
+//!   written from the idea, not its code.) The viewport is the only thing
+//!   ever repainted.
 //! - **The terminal is asked where the cursor is only when nothing else is
 //!   reading it**: at start, and after a resize, with the key reader stopped
 //!   (the caller drops it). Everything in between — a taller or shorter live
@@ -29,7 +34,7 @@ use crossterm::cursor::MoveTo;
 use crossterm::terminal::{Clear, ClearType as CtClear};
 use crossterm::{queue, QueueableCommand};
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
-use ratatui::buffer::{Buffer, Cell};
+use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Size};
 use ratatui::text::Line;
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -262,17 +267,12 @@ impl<W: Write> Term<W> {
     /// `rows` with the cursor at `caret` (column, row), all as one
     /// synchronized write.
     pub fn frame(&mut self, lines: &[Line<'static>], rows: &[Line<'static>], caret: (u16, u16)) -> io::Result<()> {
-        self.set_height(rows.len() as u16)?;
         let width = self.size.width;
-        // A chunk at a time, so the scratch buffer of a long history never
-        // holds more than a screenful of cells.
-        for chunk in lines.chunks(64) {
-            let n = chunk.len() as u16;
-            self.terminal.insert_before(n, |buf: &mut Buffer| {
-                for (i, line) in chunk.iter().enumerate() {
-                    buf.set_line(0, i as u16, line, width);
-                }
-            })?;
+        let height = (rows.len() as u16).clamp(1, self.size.height.max(1));
+        if lines.is_empty() {
+            self.set_height(height)?;
+        } else {
+            self.emit(lines, height)?;
         }
         let shown = usize::from(self.height);
         self.terminal.draw(|f| {
@@ -291,6 +291,33 @@ impl<W: Write> Term<W> {
         self.drawn_top = top;
         self.drawn_width = width;
         self.flush()
+    }
+
+    /// `lines` printed from the viewport's top down, over it, and a
+    /// viewport `height` rows tall rebuilt right below them. Printing past
+    /// the bottom row scrolls the screen, which is what moves the
+    /// conversation into scrollback.
+    fn emit(&mut self, lines: &[Line<'static>], height: u16) -> io::Result<()> {
+        let (w, h) = (self.size.width, self.size.height.max(1));
+        let top = self.top();
+        let mut out = self.buf.clone();
+        queue!(out, MoveTo(0, top), Clear(CtClear::FromCursorDown))?;
+        let mut used: u32 = 0;
+        for line in lines {
+            write_styled(&mut out, line)?;
+            out.write_all(b"\r\n")?;
+            used += u32::from(soft_rows(line, w));
+        }
+        // The cursor is on the row after the text, at most the last; line
+        // feeds from there reserve the viewport, scrolling if they must.
+        let below = (u32::from(top) + used).min(u32::from(h - 1)) as u16;
+        for _ in 1..height {
+            out.write_all(b"\n")?;
+        }
+        let y = (below + height - 1).min(h - 1) - (height - 1);
+        self.terminal = build(&self.buf, self.size, y, height)?;
+        self.height = height;
+        Ok(())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -341,6 +368,83 @@ impl<W: Write> Term<W> {
 
 fn completed_cursor(t: &mut Terminal<Back>) -> Option<Position> {
     t.backend_mut().get_cursor_position().ok()
+}
+
+/// How many rows the terminal gives `line` at `width` columns when it wraps
+/// it itself: a wide character that does not fit moves to the next row
+/// whole, and an empty line is still a row.
+pub fn soft_rows(line: &Line<'_>, width: u16) -> u16 {
+    use unicode_width::UnicodeWidthChar;
+    let width = usize::from(width.max(1));
+    let (mut rows, mut col) = (1u16, 0usize);
+    for c in line.spans.iter().flat_map(|s| s.content.chars()) {
+        let cw = c.width().unwrap_or(0);
+        if cw == 0 {
+            continue;
+        }
+        if col + cw > width {
+            rows = rows.saturating_add(1);
+            col = 0;
+        }
+        col += cw;
+    }
+    rows
+}
+
+/// `line` as text with SGR styling, reset at its end.
+fn write_styled(out: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
+    for span in &line.spans {
+        let style = line.style.patch(span.style);
+        let sgr = sgr(style);
+        if sgr.is_empty() {
+            out.write_all(span.content.as_bytes())?;
+        } else {
+            write!(out, "\x1b[{sgr}m{}\x1b[0m", span.content)?;
+        }
+    }
+    Ok(())
+}
+
+fn sgr(style: ratatui::style::Style) -> String {
+    use ratatui::style::{Color, Modifier};
+    let mut codes: Vec<String> = Vec::new();
+    let m = style.add_modifier;
+    for (flag, code) in [(Modifier::BOLD, "1"), (Modifier::DIM, "2"), (Modifier::ITALIC, "3"), (Modifier::UNDERLINED, "4"), (Modifier::REVERSED, "7"), (Modifier::CROSSED_OUT, "9")] {
+        if m.contains(flag) {
+            codes.push(code.into());
+        }
+    }
+    let colour = |c: Color, base: u8| -> Option<String> {
+        let named = |n: u8| Some((base + n).to_string());
+        match c {
+            Color::Reset => None,
+            Color::Black => named(0),
+            Color::Red => named(1),
+            Color::Green => named(2),
+            Color::Yellow => named(3),
+            Color::Blue => named(4),
+            Color::Magenta => named(5),
+            Color::Cyan => named(6),
+            Color::Gray => named(7),
+            Color::DarkGray => Some((base + 60).to_string()),
+            Color::LightRed => Some((base + 61).to_string()),
+            Color::LightGreen => Some((base + 62).to_string()),
+            Color::LightYellow => Some((base + 63).to_string()),
+            Color::LightBlue => Some((base + 64).to_string()),
+            Color::LightMagenta => Some((base + 65).to_string()),
+            Color::LightCyan => Some((base + 66).to_string()),
+            Color::White => Some((base + 67).to_string()),
+            Color::Indexed(i) => Some(format!("{};5;{i}", base + 8)),
+            Color::Rgb(r, g, b) => Some(format!("{};2;{r};{g};{b}", base + 8)),
+        }
+    };
+    if let Some(c) = style.fg.and_then(|c| colour(c, 30)) {
+        codes.push(c);
+    }
+    if let Some(c) = style.bg.and_then(|c| colour(c, 40)) {
+        codes.push(c);
+    }
+    codes.join(";")
 }
 
 /// Whether the terminal the environment names reflows on a narrowing

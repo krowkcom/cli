@@ -12,6 +12,12 @@
 //! whichever edit tool the request offers, rewording README.md, then the
 //! answer — run krowk with `--permission-mode acceptEdits` for it to land.
 //!
+//! `read-edit` reads README.md, then rewords it with whichever edit tool is
+//! offered, then answers: a turn with a read, a diff and thinking in it.
+//! `--pace MS` sends any scripted reply one event every MS milliseconds, so
+//! its thinking and text can be watched arriving. `--fail STATUS` answers
+//! every request with that HTTP status and an Anthropic error body.
+//!
 //! `--long LINES` answers every prompt instead with that many numbered lines
 //! (about twelve tokens each), streamed at `--rate TOKENS` a second (default
 //! 500): the long, steady answer the TUI's scrollback and redraw checks
@@ -23,12 +29,15 @@ mod mock;
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut port = "8788".to_string();
-    let (mut long, mut rate, mut edit) = (0usize, 500u64, false);
+    let (mut long, mut rate, mut edit, mut read_edit, mut pace, mut fail) = (0usize, 500u64, false, false, 0u64, 0u16);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--long" => long = args.next().and_then(|v| v.parse().ok()).expect("--long LINES"),
             "--rate" => rate = args.next().and_then(|v| v.parse().ok()).expect("--rate TOKENS"),
+            "--pace" => pace = args.next().and_then(|v| v.parse().ok()).expect("--pace MS"),
+            "--fail" => fail = args.next().and_then(|v| v.parse().ok()).expect("--fail STATUS"),
             "edit" => edit = true,
+            "read-edit" => read_edit = true,
             p => port = p.to_string(),
         }
     }
@@ -42,10 +51,34 @@ fn main() {
         if long > 0 {
             return mock::Reply::paced(mock::text_stream(&mock::numbered_lines(long)), std::time::Duration::from_micros(1_000_000 / rate.max(1)));
         }
-        if edit { mock::edit_script(body, n) } else { mock::readme_script(body, n) }
+        if fail > 0 {
+            let kind = if fail == 529 { "overloaded_error" } else if fail == 401 { "authentication_error" } else { "api_error" };
+            return mock::Reply::json(fail, &serde_json::json!({"type": "error", "error": {"type": kind, "message": "the stand-in was told to fail"}}));
+        }
+        let reply = if read_edit {
+            read_edit_script(body)
+        } else if edit {
+            mock::edit_script(body, n)
+        } else {
+            mock::readme_script(body, n)
+        };
+        if pace > 0 && reply.status == 200 {
+            return mock::Reply::paced(reply.body, std::time::Duration::from_millis(pace));
+        }
+        reply
     });
     eprintln!("mock: Anthropic stand-in on {}", m.url);
     loop {
         std::thread::park();
+    }
+}
+
+/// Read, then edit, then answer, by how many tool results the request has.
+fn read_edit_script(body: &serde_json::Value) -> mock::Reply {
+    let results = body["messages"].as_array().into_iter().flatten().flat_map(|m| m["content"].as_array().into_iter().flatten()).filter(|b| b["type"] == "tool_result").count();
+    match results {
+        0 => mock::Reply::sse(&mock::fixture("turn1_tool_use.sse")),
+        1 => mock::edit_script(&serde_json::json!({"messages": [], "tools": body["tools"]}), 0),
+        _ => mock::Reply::sse(&mock::fixture("turn1_answer.sse")),
     }
 }

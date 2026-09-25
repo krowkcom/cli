@@ -40,15 +40,8 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
         r => Some(resolve_resume(ctx, &sessions_dir, r)?),
     };
     let cwd = std::env::current_dir().map_err(|e| fail("no_directory", format!("the working directory cannot be read: {e}")))?;
-    let toolset = match ctx.f.toolset.trim() {
-        "" => None,
-        t if krowk_harness::toolset::by_name(t).is_some() => Some(t.to_string()),
-        t => return Err(fail("bad_flag", format!("--toolset {t} is not a toolset — one of {}", krowk_harness::toolset::names().join(", ")))),
-    };
-    let effort = match ctx.f.effort.trim() {
-        "" => None,
-        e => Some(Effort::parse(e).ok_or_else(|| fail("bad_flag", format!("--effort {e} is not a rung of the ladder — one of {}", Effort::names().join(", "))))?),
-    };
+    let toolset = toolset_flag(ctx)?;
+    let effort = effort_flag(ctx)?;
     let cfg = HostConfig {
         sessions_dir,
         cwd,
@@ -104,6 +97,23 @@ fn prompt_text(positionals: &[String]) -> Result<String, Error> {
 /// The harness's part of the global config.json, whose `workspace` key the
 /// rest of krowk reads. A file that does not parse is an error: somebody
 /// wrote it meaning something.
+/// `--effort`, a rung of the harness's ladder.
+pub(super) fn effort_flag(ctx: &Ctx) -> Result<Option<Effort>, Error> {
+    match ctx.f.effort.trim() {
+        "" => Ok(None),
+        e => Ok(Some(Effort::parse(e).ok_or_else(|| fail("bad_flag", format!("--effort {e} is not a rung of the ladder — one of {}", Effort::names().join(", "))))?)),
+    }
+}
+
+/// `--toolset`, checked against the presets the harness has.
+pub(super) fn toolset_flag(ctx: &Ctx) -> Result<Option<String>, Error> {
+    match ctx.f.toolset.trim() {
+        "" => Ok(None),
+        t if krowk_harness::toolset::by_name(t).is_some() => Ok(Some(t.to_string())),
+        t => Err(fail("bad_flag", format!("--toolset {t} is not a toolset — one of {}", krowk_harness::toolset::names().join(", ")))),
+    }
+}
+
 pub(super) fn load_instances() -> Result<instances::InstancesConfig, Error> {
     instances_from(&config_json()?)
 }
@@ -168,7 +178,7 @@ pub(super) fn pricer(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Price
 /// efforts and wire API (R-PROV-2). Read from the cache only: the embedded
 /// snapshot is trimmed to prices, and a model it would miss is read for its
 /// family off its id instead. Captured like the pricer's environment.
-fn catalog(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Catalog {
+pub(super) fn catalog(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Catalog {
     let (cache, home) = (env("XDG_CACHE_HOME"), env("HOME"));
     Arc::new(move |provider: &str, model: &str| {
         let env = |k: &str| match k {

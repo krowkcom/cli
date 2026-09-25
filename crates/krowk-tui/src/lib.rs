@@ -61,6 +61,8 @@ pub struct Options {
     /// The model for every prompt; the session's own when absent.
     pub model: Option<ModelRef>,
     pub permission_mode: PermissionMode,
+    /// The toolset preset for every prompt; the model's own when absent.
+    pub toolset: Option<String>,
     pub settings: Settings,
     /// Where prompt history is kept; none keeps it in memory only.
     pub history_file: Option<PathBuf>,
@@ -162,7 +164,7 @@ async fn session(opts: Options) -> Outcome {
         Err(e) => return Outcome { session_id: None, error: Some(format!("the terminal could not be drawn on: {e}")) },
     };
     let host = Host::new(opts.host);
-    let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, target, keys: None, turn: None, rx: None };
+    let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, target, keys: None, turn: None, rx: None };
     let result = ui.run(&mut app, &mut term).await;
     let _ = term.finish();
     let mut out = term.into_inner();
@@ -177,6 +179,7 @@ struct Ui<'h> {
     host: &'h Host,
     model: Option<ModelRef>,
     permission_mode: PermissionMode,
+    toolset: Option<String>,
     target: Option<Target>,
     keys: Option<EventStream>,
     turn: Option<TurnFuture<'h>>,
@@ -387,7 +390,7 @@ impl<'h> Ui<'h> {
 
     fn prompt(&mut self, app: &mut App, text: String) {
         let (tx, rx) = mpsc::channel(1024);
-        let cmd = Command::Prompt { session_id: app.session_id.clone(), text, model: self.model.clone(), permission_mode: self.permission_mode };
+        let cmd = Command::Prompt { session_id: app.session_id.clone(), text, model: self.model.clone(), permission_mode: self.permission_mode, toolset: self.toolset.clone() };
         self.turn = Some(Box::pin(self.host.execute(cmd, tx)));
         self.rx = Some(rx);
         app.start_turn(std::time::Instant::now());

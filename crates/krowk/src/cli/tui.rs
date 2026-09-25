@@ -1,6 +1,6 @@
 //! Bare `krowk` on a terminal: the inline TUI (R-PKG-1). The TUI itself is
 //! `krowk-tui`; this is the command line around it — when it opens, the
-//! flags it takes (`--model`, `--permission-mode`, `--resume [id]`), the
+//! flags it takes (`--model`, `--permission-mode`, `--toolset`, `--resume [id]`), the
 //! config it reads, and the session it leaves in krowk.db.
 
 use super::flags::Flags;
@@ -56,12 +56,21 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
     let cwd = std::env::current_dir().map_err(|e| fail("no_directory", format!("the working directory cannot be read: {e}")))?;
     // Beside krowk.db and the session logs, so it goes where they go.
     let history_file = sessions_dir.parent().map(|d| d.join("tui-history.jsonl"));
-    let host = HostConfig { sessions_dir, cwd, registry, krowk_version: super::VERSION.into(), pricer: prompt::pricer(ctx.io.env) };
+    let toolset = prompt::toolset_flag(ctx)?;
+    let host = HostConfig {
+        sessions_dir,
+        cwd,
+        registry,
+        krowk_version: super::VERSION.into(),
+        pricer: prompt::pricer(ctx.io.env),
+        families: prompt::families(ctx.io.env),
+    };
     let outcome = krowk_tui::run(krowk_tui::Options {
         host,
         resume,
         model,
         permission_mode,
+        toolset,
         settings,
         history_file,
         notices,

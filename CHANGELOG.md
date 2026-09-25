@@ -43,8 +43,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   on a real session). Each message now counts once, at its final usage.
   Claude turns also keep thinking tokens apart from output
   (`output_tokens_details.thinking_tokens` → reasoning), as opencode and
-  ledger turns already did. Run `krowk sessions rebuild` to apply both to
-  sessions already imported — `sync` does not re-read them.
+  ledger turns already did. opencode subagents are now linked to their
+  parent session even though opencode lists them first. Run `krowk
+  sessions rebuild` to apply all three to sessions already imported —
+  `sync` does not re-read them.
 - **You can see how old the prices are.** `krowk doctor` has a `pricing`
   check naming when models.dev prices were last fetched and how many days
   ago — a warning past 30 days, or when only the snapshot built into

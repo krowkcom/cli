@@ -333,7 +333,7 @@ fn r_proto_1_steer_joins_the_running_turn_before_its_next_model_call() {
         assert_eq!(err.code, "no_running_turn");
 
         let (tx, mut rx) = mpsc::channel(1024);
-        let cmd = Command::Prompt { session_id: None, text: "read README.md and summarise it in one line".into(), model: Some(model), permission_mode: PermissionMode::Default, toolset: None };
+        let cmd = Command::Prompt { session_id: None, text: "read README.md and summarise it in one line".into(), model: Some(model), permission_mode: PermissionMode::Default, toolset: None, effort: None };
         let exec = host.execute(cmd, tx);
         tokio::pin!(exec);
         let mut lines = Vec::new();
@@ -395,7 +395,7 @@ fn r_proto_1_steering_an_interrupted_turn_never_read_comes_back_on_its_result() 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let result = rt.block_on(async {
         let (tx, mut rx) = mpsc::channel(1024);
-        let cmd = Command::Prompt { session_id: None, text: "wait".into(), model: Some(model), permission_mode: PermissionMode::Default, toolset: None };
+        let cmd = Command::Prompt { session_id: None, text: "wait".into(), model: Some(model), permission_mode: PermissionMode::Default, toolset: None, effort: None };
         let exec = host.execute(cmd, tx);
         tokio::pin!(exec);
         let mut session = None;

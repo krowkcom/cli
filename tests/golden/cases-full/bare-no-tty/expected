@@ -736,6 +736,79 @@ stdout:
           "required": false
         }
       ]
+    },
+    {
+      "name": "providers",
+      "summary": "The native engine's provider instances",
+      "subcommands": [
+        {
+          "name": "add",
+          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device]",
+          "summary": "Add an instance for the native engine, or sign in to SuperGrok",
+          "args": [
+            {
+              "name": "provider",
+              "summary": "anthropic, openai, xai, openrouter, openai-compatible, or supergrok (xAI with a SuperGrok or X Premium subscription)",
+              "required": true
+            }
+          ],
+          "flags": [
+            {
+              "name": "name",
+              "type": "string",
+              "default": "",
+              "usage": "Name the instance <provider>:<name> (for openai-compatible, <name> alone); the provider's own name when absent"
+            },
+            {
+              "name": "api-key-env",
+              "type": "string",
+              "default": "",
+              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance"
+            },
+            {
+              "name": "base-url",
+              "type": "string",
+              "default": "",
+              "usage": "Where the API is, for a gateway, a router or a local server — required for openai-compatible"
+            },
+            {
+              "name": "client-id",
+              "type": "string",
+              "default": "",
+              "usage": "supergrok: the OAuth client id to sign in as, when xAI's server offers no registration"
+            },
+            {
+              "name": "device",
+              "type": "bool",
+              "default": "false",
+              "usage": "supergrok: sign in with a code typed into any browser, instead of one opened here"
+            },
+            {
+              "name": "no-browser",
+              "type": "bool",
+              "default": "false",
+              "usage": "supergrok: print the sign-in link instead of opening a browser"
+            }
+          ]
+        },
+        {
+          "name": "list",
+          "usage": "krowk providers list",
+          "summary": "List every instance the native engine can use, and whether it has its key or login"
+        },
+        {
+          "name": "remove",
+          "usage": "krowk providers remove <instance>",
+          "summary": "Remove an instance's definition, and forget its login",
+          "args": [
+            {
+              "name": "instance",
+              "summary": "The instance to remove, e.g. openai:work",
+              "required": true
+            }
+          ]
+        }
+      ]
     }
   ],
   "global_flags": [
@@ -831,6 +904,12 @@ stdout:
       "type": "string",
       "default": "",
       "usage": "With -p: the tools' preset — claude (str_replace), gpt (apply_patch) or grok (search_replace). The model's family picks one when absent"
+    },
+    {
+      "name": "effort",
+      "type": "string",
+      "default": "",
+      "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
     }
   ],
   "environment": [
@@ -1601,6 +1680,79 @@ stdout:
           "required": false
         }
       ]
+    },
+    {
+      "name": "providers",
+      "summary": "The native engine's provider instances",
+      "subcommands": [
+        {
+          "name": "add",
+          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device]",
+          "summary": "Add an instance for the native engine, or sign in to SuperGrok",
+          "args": [
+            {
+              "name": "provider",
+              "summary": "anthropic, openai, xai, openrouter, openai-compatible, or supergrok (xAI with a SuperGrok or X Premium subscription)",
+              "required": true
+            }
+          ],
+          "flags": [
+            {
+              "name": "name",
+              "type": "string",
+              "default": "",
+              "usage": "Name the instance <provider>:<name> (for openai-compatible, <name> alone); the provider's own name when absent"
+            },
+            {
+              "name": "api-key-env",
+              "type": "string",
+              "default": "",
+              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance"
+            },
+            {
+              "name": "base-url",
+              "type": "string",
+              "default": "",
+              "usage": "Where the API is, for a gateway, a router or a local server — required for openai-compatible"
+            },
+            {
+              "name": "client-id",
+              "type": "string",
+              "default": "",
+              "usage": "supergrok: the OAuth client id to sign in as, when xAI's server offers no registration"
+            },
+            {
+              "name": "device",
+              "type": "bool",
+              "default": "false",
+              "usage": "supergrok: sign in with a code typed into any browser, instead of one opened here"
+            },
+            {
+              "name": "no-browser",
+              "type": "bool",
+              "default": "false",
+              "usage": "supergrok: print the sign-in link instead of opening a browser"
+            }
+          ]
+        },
+        {
+          "name": "list",
+          "usage": "krowk providers list",
+          "summary": "List every instance the native engine can use, and whether it has its key or login"
+        },
+        {
+          "name": "remove",
+          "usage": "krowk providers remove <instance>",
+          "summary": "Remove an instance's definition, and forget its login",
+          "args": [
+            {
+              "name": "instance",
+              "summary": "The instance to remove, e.g. openai:work",
+              "required": true
+            }
+          ]
+        }
+      ]
     }
   ],
   "global_flags": [
@@ -1696,6 +1848,12 @@ stdout:
       "type": "string",
       "default": "",
       "usage": "With -p: the tools' preset — claude (str_replace), gpt (apply_patch) or grok (search_replace). The model's family picks one when absent"
+    },
+    {
+      "name": "effort",
+      "type": "string",
+      "default": "",
+      "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
     }
   ],
   "environment": [
@@ -2480,6 +2638,79 @@ stdout:
           "required": false
         }
       ]
+    },
+    {
+      "name": "providers",
+      "summary": "The native engine's provider instances",
+      "subcommands": [
+        {
+          "name": "add",
+          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device]",
+          "summary": "Add an instance for the native engine, or sign in to SuperGrok",
+          "args": [
+            {
+              "name": "provider",
+              "summary": "anthropic, openai, xai, openrouter, openai-compatible, or supergrok (xAI with a SuperGrok or X Premium subscription)",
+              "required": true
+            }
+          ],
+          "flags": [
+            {
+              "name": "name",
+              "type": "string",
+              "default": "",
+              "usage": "Name the instance <provider>:<name> (for openai-compatible, <name> alone); the provider's own name when absent"
+            },
+            {
+              "name": "api-key-env",
+              "type": "string",
+              "default": "",
+              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance"
+            },
+            {
+              "name": "base-url",
+              "type": "string",
+              "default": "",
+              "usage": "Where the API is, for a gateway, a router or a local server — required for openai-compatible"
+            },
+            {
+              "name": "client-id",
+              "type": "string",
+              "default": "",
+              "usage": "supergrok: the OAuth client id to sign in as, when xAI's server offers no registration"
+            },
+            {
+              "name": "device",
+              "type": "bool",
+              "default": "false",
+              "usage": "supergrok: sign in with a code typed into any browser, instead of one opened here"
+            },
+            {
+              "name": "no-browser",
+              "type": "bool",
+              "default": "false",
+              "usage": "supergrok: print the sign-in link instead of opening a browser"
+            }
+          ]
+        },
+        {
+          "name": "list",
+          "usage": "krowk providers list",
+          "summary": "List every instance the native engine can use, and whether it has its key or login"
+        },
+        {
+          "name": "remove",
+          "usage": "krowk providers remove <instance>",
+          "summary": "Remove an instance's definition, and forget its login",
+          "args": [
+            {
+              "name": "instance",
+              "summary": "The instance to remove, e.g. openai:work",
+              "required": true
+            }
+          ]
+        }
+      ]
     }
   ],
   "global_flags": [
@@ -2575,6 +2806,12 @@ stdout:
       "type": "string",
       "default": "",
       "usage": "With -p: the tools' preset — claude (str_replace), gpt (apply_patch) or grok (search_replace). The model's family picks one when absent"
+    },
+    {
+      "name": "effort",
+      "type": "string",
+      "default": "",
+      "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
     }
   ],
   "environment": [
@@ -3359,6 +3596,79 @@ tty:
           "required": false
         }
       ]
+    },
+    {
+      "name": "providers",
+      "summary": "The native engine's provider instances",
+      "subcommands": [
+        {
+          "name": "add",
+          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device]",
+          "summary": "Add an instance for the native engine, or sign in to SuperGrok",
+          "args": [
+            {
+              "name": "provider",
+              "summary": "anthropic, openai, xai, openrouter, openai-compatible, or supergrok (xAI with a SuperGrok or X Premium subscription)",
+              "required": true
+            }
+          ],
+          "flags": [
+            {
+              "name": "name",
+              "type": "string",
+              "default": "",
+              "usage": "Name the instance <provider>:<name> (for openai-compatible, <name> alone); the provider's own name when absent"
+            },
+            {
+              "name": "api-key-env",
+              "type": "string",
+              "default": "",
+              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance"
+            },
+            {
+              "name": "base-url",
+              "type": "string",
+              "default": "",
+              "usage": "Where the API is, for a gateway, a router or a local server — required for openai-compatible"
+            },
+            {
+              "name": "client-id",
+              "type": "string",
+              "default": "",
+              "usage": "supergrok: the OAuth client id to sign in as, when xAI's server offers no registration"
+            },
+            {
+              "name": "device",
+              "type": "bool",
+              "default": "false",
+              "usage": "supergrok: sign in with a code typed into any browser, instead of one opened here"
+            },
+            {
+              "name": "no-browser",
+              "type": "bool",
+              "default": "false",
+              "usage": "supergrok: print the sign-in link instead of opening a browser"
+            }
+          ]
+        },
+        {
+          "name": "list",
+          "usage": "krowk providers list",
+          "summary": "List every instance the native engine can use, and whether it has its key or login"
+        },
+        {
+          "name": "remove",
+          "usage": "krowk providers remove <instance>",
+          "summary": "Remove an instance's definition, and forget its login",
+          "args": [
+            {
+              "name": "instance",
+              "summary": "The instance to remove, e.g. openai:work",
+              "required": true
+            }
+          ]
+        }
+      ]
     }
   ],
   "global_flags": [
@@ -3454,6 +3764,12 @@ tty:
       "type": "string",
       "default": "",
       "usage": "With -p: the tools' preset — claude (str_replace), gpt (apply_patch) or grok (search_replace). The model's family picks one when absent"
+    },
+    {
+      "name": "effort",
+      "type": "string",
+      "default": "",
+      "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
     }
   ],
   "environment": [

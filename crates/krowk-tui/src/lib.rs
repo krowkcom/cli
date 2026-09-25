@@ -32,7 +32,7 @@ use futures_core::Stream;
 use krowk_harness::engine::EngineError;
 use krowk_harness::host::{Host, HostConfig, Pricer};
 use krowk_harness::log;
-use krowk_harness::protocol::{Command, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus};
+use krowk_harness::protocol::{Command, Effort, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus};
 use net::Target;
 use ratatui::layout::Size;
 use settings::Settings;
@@ -63,6 +63,8 @@ pub struct Options {
     pub permission_mode: PermissionMode,
     /// The toolset preset for every prompt; the model's own when absent.
     pub toolset: Option<String>,
+    /// The reasoning effort for every prompt, on krowk's ladder.
+    pub effort: Option<Effort>,
     pub settings: Settings,
     /// Where prompt history is kept; none keeps it in memory only.
     pub history_file: Option<PathBuf>,
@@ -171,7 +173,7 @@ async fn session(opts: Options) -> Outcome {
         Err(e) => return Outcome { session_id: None, abandoned: false, error: Some(format!("the terminal could not be drawn on: {e}")) },
     };
     let host = Host::new(opts.host);
-    let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, target, keys: None, turn: None, rx: None, abandoned: false };
+    let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, effort: opts.effort, target, keys: None, turn: None, rx: None, abandoned: false };
     let result = ui.run(&mut app, &mut term).await;
     let _ = term.finish();
     let mut out = term.into_inner();
@@ -187,6 +189,7 @@ struct Ui<'h> {
     model: Option<ModelRef>,
     permission_mode: PermissionMode,
     toolset: Option<String>,
+    effort: Option<Effort>,
     target: Option<Target>,
     keys: Option<EventStream>,
     turn: Option<TurnFuture<'h>>,
@@ -521,7 +524,7 @@ impl<'h> Ui<'h> {
 
     fn prompt(&mut self, app: &mut App, text: String) {
         let (tx, rx) = mpsc::channel(1024);
-        let cmd = Command::Prompt { session_id: app.session_id.clone(), text, model: self.model.clone(), permission_mode: self.permission_mode, toolset: self.toolset.clone() };
+        let cmd = Command::Prompt { session_id: app.session_id.clone(), text, model: self.model.clone(), permission_mode: self.permission_mode, toolset: self.toolset.clone(), effort: self.effort };
         self.turn = Some(Box::pin(self.host.execute(cmd, tx)));
         self.rx = Some(rx);
         app.start_turn(std::time::Instant::now());

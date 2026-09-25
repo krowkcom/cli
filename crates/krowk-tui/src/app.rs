@@ -709,7 +709,7 @@ mod tests {
         let ev = |body| LogEvent { id: "e".into(), parent_id: None, session_id: "s".into(), time_ms: 0, body };
         let model = ModelRef { instance: "anthropic".into(), model: "claude-y".into() };
         let evs = [
-            ev(LogBody::TurnStarted { turn_id: "t".into(), model: model.clone(), provider: "anthropic".into(), wire_api: krowk_harness::protocol::WireApi::AnthropicMessages, permission_mode: PermissionMode::Default }),
+            ev(LogBody::TurnStarted { turn_id: "t".into(), model: model.clone(), provider: "anthropic".into(), wire_api: krowk_harness::protocol::WireApi::AnthropicMessages, permission_mode: PermissionMode::Default, effort: None }),
             ev(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "1".into(), item: Item::UserText { text: "hi".into() } }),
             ev(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "2".into(), item: Item::ToolCall { call_id: "c".into(), name: "read".into(), input: serde_json::json!({"path": "README.md"}) } }),
             ev(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "3".into(), item: Item::ToolResult { call_id: "c".into(), output: "# krowk\nmore\n".into(), is_error: false } }),

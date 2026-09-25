@@ -229,16 +229,19 @@ the versions are the `v*` tags a release is cut from. Entries land under
   keeps sessions lets an idle one's process go after 15 minutes. krowk's
   own tools reach Claude Code as the `krowk` MCP server — today
   `session_info`.
-- **`-p` asks before Claude Code runs in a repository you have not
+- **krowk asks before Claude Code runs in a repository you have not
   trusted.** `claude -p` runs a repository's hooks and MCP servers without
-  its usual trust prompt, so krowk shows its own on a terminal and
+  its usual trust prompt, so krowk shows its own on a terminal — `krowk
+  -p`, and bare `krowk` before the TUI opens — and
   remembers a yes in `~/.config/krowk/trusted.json` for that repository
   alone (not for repositories inside it); without a terminal it refuses
   (exit 4, `untrusted_directory`) unless you pass `--trust`, which lasts
   for that run. Your home directory and `/` are never trusted for good —
   in a home kept in git, every plain directory is part of that repository
-  — so only `--trust` runs Claude Code there. Native `-p` runs nothing of the repository's and
-  never asks.
+  — so only `--trust` runs Claude Code there. A native model runs nothing
+  of the repository's and is never asked about. Steering (typing while a
+  turn runs, in the TUI) is not taken by a Claude Code turn: it comes back
+  into the prompt, unsent.
 - **Native sessions are logs you own, listed beside imported ones.** Each
   session is an append-only JSONL log under
   `~/.local/share/krowk/sessions/<id>/` (with each turn's exact system

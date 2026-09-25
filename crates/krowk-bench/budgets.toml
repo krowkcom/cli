@@ -70,6 +70,10 @@ unit = "bytes"
 # by ticket 08: no crate is added — the growth is the budget, the
 # evidence tool, the stream frames and their tests' code paths — and the
 # raise leaves 236,440 bytes for the rest of Harness P0 to justify.
+# Ticket 09's permissions (no new crate: the rule evaluator and its shell
+# splitter, the settings loader, remembered grants, approval frames and the
+# TUI's prompt for them, Claude-format hooks, instructions and skills) adds
+# 172,864 bytes: 7,538,600 (7.19 MiB), 63,576 under this.
 max = { x86_64-linux = 7_602_176 }
 status = "enforced"
 

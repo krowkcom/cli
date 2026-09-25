@@ -239,14 +239,35 @@ impl<'a> Writer<'a> {
         let (mut messages, mut parts) = (Count::default(), Count::default());
         let mut pending = Vec::new();
         let mut next = max_seq + 1;
+        let mut relink = Vec::new();
         for m in msgs {
             if !m.foreign_id.is_empty() && !known.insert(m.foreign_id.clone()) {
                 messages.skipped += 1;
                 parts.skipped += m.parts.len();
+                if let Some(turn) = m.turn_seq {
+                    relink.push((&m.foreign_id, turn));
+                }
                 continue;
             }
             pending.push((m, next));
             next += 1;
+        }
+        // A message stored before the source named its turn gets the link
+        // now, so an upgraded store prices per turn without a rebuild.
+        if !relink.is_empty() {
+            let tx = self.conn.unchecked_transaction().map_err(e("begin"))?;
+            {
+                let mut st = tx
+                    .prepare(
+                        "UPDATE message SET turn_id = (SELECT id FROM turn WHERE session_id = ?1 AND seq = ?2) \
+                         WHERE session_id = ?1 AND foreign_id = ?3 AND turn_id IS NULL",
+                    )
+                    .map_err(e("relink messages"))?;
+                for (fid, turn) in relink {
+                    st.execute(params![session_id, turn, fid]).map_err(e("relink message"))?;
+                }
+            }
+            tx.commit().map_err(e("commit"))?;
         }
         for chunk in pending.chunks(INGEST_BATCH) {
             let tx = self.conn.unchecked_transaction().map_err(e("begin"))?;

@@ -131,6 +131,8 @@ struct Priced {
     unpriced: BTreeSet<String>,
     unpriced_empty: BTreeSet<String>,
     known: bool,
+    /// Every turn is counted in another session.
+    elsewhere: bool,
     bases: BTreeSet<pricing::Basis>,
     /// The known dollars per (provider, model), unrounded.
     by_model: BTreeMap<String, f64>,
@@ -192,10 +194,11 @@ fn pair_name(provider: &str, model: &str) -> String {
     }
 }
 
-/// Reported dollars win: the source knew what it was charged. Otherwise the
-/// tokens are priced at current rates, or the cost is unknown.
+/// Reported dollars win: the source knew what it was charged. A reported 0
+/// is no report — opencode writes 0 for any model it cannot price — so it
+/// falls through to the tokens, priced at current rates, or unknown.
 fn cost_of(ctx: &Ctx, provider: &str, model: &str, reported_micros: Option<i64>, t: pricing::Tokens) -> Option<TurnCost> {
-    if let Some(m) = reported_micros {
+    if let Some(m) = reported_micros.filter(|m| *m > 0) {
         return Some(TurnCost { usd: m as f64 / 1e6, basis: None });
     }
     let model = real_model(model);
@@ -217,15 +220,28 @@ fn turn_tokens(t: &TurnDetail) -> pricing::Tokens {
 /// A session priced per (provider, model) its turns ran on. A session with
 /// no turns costs what its own model says nothing costs: 0 when the model
 /// has a price, unknown when it has none.
+///
+/// A session whose every turn is counted elsewhere (a ledger whose rows all
+/// sit in transcripts) costs 0 here, and says where the cost went.
 fn price_session(ctx: &Ctx, r: &SessionRow, groups: Option<&Vec<CostGroup>>) -> Priced {
+    let groups: &[CostGroup] = groups.map_or(&[], Vec::as_slice);
+    price_groups(ctx, &r.provider, &r.model, r.turn_count, groups)
+}
+
+/// The one roll-up both the listing and `show` use, so both sum the same
+/// figures in the same order.
+fn price_groups(ctx: &Ctx, provider: &str, model: &str, turn_count: i64, groups: &[CostGroup]) -> Priced {
     let mut p = Priced::default();
-    match groups.filter(|g| !g.is_empty()) {
-        Some(groups) => {
-            for g in groups {
-                p.add(cost_of(ctx, &g.provider, &g.model, g.reported.then_some(g.usd_micros), group_tokens(g)), &g.provider, &g.model, group_tokens(g));
-            }
-        }
-        None => p.add(cost_of(ctx, &r.provider, &r.model, None, pricing::Tokens::default()), &r.provider, &r.model, pricing::Tokens::default()),
+    if groups.is_empty() && turn_count > 0 {
+        p.known = true;
+        p.elsewhere = true;
+        return p;
+    }
+    if groups.is_empty() {
+        p.add(cost_of(ctx, provider, model, None, pricing::Tokens::default()), provider, model, pricing::Tokens::default());
+    }
+    for g in groups {
+        p.add(cost_of(ctx, &g.provider, &g.model, g.reported.then_some(g.usd_micros), group_tokens(g)), &g.provider, &g.model, group_tokens(g));
     }
     p
 }
@@ -256,7 +272,7 @@ fn session_row_json(r: &SessionRow, p: &Priced, now: i64) -> Value {
         "provider": r.provider,
         "turns": r.turn_count,
         "cost_usd": cost,
-        "cost_display": cost.map_or("—".to_string(), format_cost),
+        "cost_display": cost_display(p),
         "time_updated_ms": r.time_updated,
         "time_updated_relative": relative_time(r.time_updated, now),
         "worktree": r.worktree_path,
@@ -275,6 +291,13 @@ fn session_row_json(r: &SessionRow, p: &Priced, now: i64) -> Value {
 
 /// Cents from a cent up; below that, three significant digits, so $0.00007
 /// and $0.00012 do not both read as $0.0001. Rounded here, once, at display.
+fn cost_display(p: &Priced) -> String {
+    if p.elsewhere {
+        return "counted elsewhere".into();
+    }
+    p.total().map_or("—".to_string(), format_cost)
+}
+
 fn format_cost(usd: f64) -> String {
     if usd >= 0.01 || usd <= 0.0 {
         return format!("${usd:.2}");
@@ -394,6 +417,7 @@ fn human_sessions_list(rows: &[SessionRow], priced: &[Priced], colour: bool, now
         let title = truncate_chars(&titles[i], MAX_TITLE);
         let turns = format!("{:3} {}", r.turn_count, paint(colour, "2", if r.turn_count == 1 { "turn" } else { "turns" }));
         let (cost, code) = match priced[i].total() {
+            Some(_) if priced[i].elsewhere => ("elsewhere".into(), "2"),
             Some(p) => (human_cost(p), if p == 0.0 { "2" } else { "32" }),
             None => ("—".into(), "2"),
         };
@@ -476,25 +500,32 @@ pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
 
 /// A shown session's turns priced one by one, and their sum. A turn a
 /// transcript accounts for (an observed ledger row) is counted there, not here.
+/// Each turn priced for display, and the session's total rolled up exactly
+/// as the listing rolls it up: per (provider, model, reported), in that order.
 fn price_turns(ctx: &Ctx, d: &SessionDetail) -> (Vec<Option<TurnCost>>, Priced) {
-    let mut total = Priced::default();
-    let costs: Vec<Option<TurnCost>> = d
-        .turns
-        .iter()
-        .map(|t| {
-            if is_observed(t) {
-                return None;
-            }
-            let c = turn_cost(ctx, t);
-            total.add(c, &t.provider, &t.model, turn_tokens(t));
-            c
-        })
-        .collect();
-    if d.turns.is_empty() {
-        let s = &d.session;
-        total.add(cost_of(ctx, &s.provider, &s.model, None, pricing::Tokens::default()), &s.provider, &s.model, pricing::Tokens::default());
+    let costs: Vec<Option<TurnCost>> = d.turns.iter().map(|t| if is_observed(t) { None } else { turn_cost(ctx, t) }).collect();
+    let mut groups: BTreeMap<(String, String, bool), CostGroup> = BTreeMap::new();
+    for t in d.turns.iter().filter(|t| !is_observed(t)) {
+        let reported = t.usd_micros.is_some_and(|m| m > 0);
+        let g = groups.entry((t.provider.clone(), t.model.clone(), reported)).or_insert_with(|| CostGroup {
+            provider: t.provider.clone(),
+            model: t.model.clone(),
+            reported,
+            ..CostGroup::default()
+        });
+        g.turns += 1;
+        g.input += t.input;
+        g.output += t.output;
+        g.cache_read += t.cache_read;
+        g.cache_write += t.cache_write;
+        g.reasoning += t.reasoning;
+        if reported {
+            g.usd_micros += t.usd_micros.unwrap_or(0);
+        }
     }
-    (costs, total)
+    let groups: Vec<CostGroup> = groups.into_values().collect();
+    let s = &d.session;
+    (costs, price_groups(ctx, &s.provider, &s.model, d.turns.len() as i64, &groups))
 }
 
 fn session_show_json(ctx: &Ctx, d: &SessionDetail) -> (Value, String) {
@@ -593,7 +624,7 @@ fn session_show_json(ctx: &Ctx, d: &SessionDetail) -> (Value, String) {
     out.insert("turns".into(), Value::Array(turns));
     out.insert("messages".into(), Value::Array(messages));
     out.insert("cost_usd".into(), json!(total.total()));
-    out.insert("cost_display".into(), json!(total.total().map_or("—".to_string(), format_cost)));
+    out.insert("cost_display".into(), json!(cost_display(&total)));
     if total.total().is_none() {
         out.insert("unpriced".into(), json!(total.missing()));
     }
@@ -617,7 +648,7 @@ fn human_session_show(ctx: &Ctx, d: &SessionDetail, show_thinking: bool, now: i6
         meta += &format!("  {model}");
     }
     let (costs, total) = price_turns(ctx, d);
-    meta += &format!("  {}", total.total().map_or("—".to_string(), format_cost_precise));
+    meta += &format!("  {}", if total.elsewhere { "counted elsewhere".to_string() } else { total.total().map_or("—".to_string(), format_cost_precise) });
     meta += &format!("  {}", relative_time(s.time_updated, now));
     for extra in [cell(&s.worktree_path), cell(&s.directory)] {
         if !extra.is_empty() {

@@ -35,7 +35,7 @@ fn the_zen_demo_prices_per_turn_and_an_unknown_model_reads_as_a_dash() {
     let ledger = home.join(".local/share/krowk/ledger");
     std::fs::create_dir_all(&ledger).unwrap();
     std::fs::write(ledger.join("zen.jsonl"), ZEN).unwrap();
-    std::fs::write(ledger.join("mystery.jsonl"), r#"{"id":"m-1","provider":"opencode","model":"mystery-model","input_tokens":5,"output_tokens":5}"#.to_string() + "\n").unwrap();
+    std::fs::write(ledger.join("mystery.jsonl"), r#"{"id":"m-1","provider":"opencode","model":"mystery-model","input_tokens":5,"output_tokens":5,"cost_usd":0}"#.to_string() + "\n").unwrap();
     let cache = home.join(".cache/krowk");
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::write(cache.join("models.json"), RATES).unwrap();
@@ -48,6 +48,7 @@ fn the_zen_demo_prices_per_turn_and_an_unknown_model_reads_as_a_dash() {
     let sessions = listed["data"]["sessions"].as_array().unwrap();
     let by_title = |t: &str| sessions.iter().find(|s| s["title"].as_str().unwrap().contains(t)).unwrap().clone();
     let (zen, mystery) = (by_title("(zen)"), by_title("(mystery)"));
+    // opencode writes cost 0 for a model it cannot price; a stated 0 is no price.
     assert_eq!((mystery["cost_usd"].clone(), mystery["cost_display"].as_str()), (Value::Null, Some("—")), "a missing price is missing, not free");
     assert_eq!(mystery["unpriced"], serde_json::json!(["opencode/mystery-model"]));
     assert_eq!(listed["data"]["priced_with"], "priced at current rates (models.dev prices fetched 2026-09-10), not the rates in force at the time");

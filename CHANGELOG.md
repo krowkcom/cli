@@ -27,6 +27,16 @@ the versions are the `v*` tags a release is cut from. Entries land under
   costs are today's rates, not the ones in force when the tokens were
   spent. JSON costs are unrounded; costs under a cent print to three
   significant digits, so $0.00007 and $0.00012 no longer both read $0.0001.
+- **JSON changes** for anyone reading costs programmatically: `sessions
+  show` turns drop `cost_unknown` and gain `cost_usd` (null when unknown),
+  `cost_source` (`priced` or `reported`), `model`, `provider` and the
+  reasoning and cache token counts; the session's `priced_cost_usd` is now
+  `cost_usd`, and `priced_with` reads as a footnote. `sessions` rows gain
+  `unpriced`, the list gains `priced_with`, and the import report gains
+  `unpriced_models`. `cost_display` prints sub-cent figures to three
+  significant digits (`$0.00500`), and a ledger session whose rows all
+  sit in transcripts reads `counted elsewhere`. A reported cost of 0 is
+  treated as no report — opencode writes 0 for models it cannot price.
 - `sessions` lists in ~25 ms on a machine whose price cache holds the whole
   models.dev file (was ~80 ms): the cache is parsed without building the
   fields pricing never reads.

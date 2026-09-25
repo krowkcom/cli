@@ -436,7 +436,8 @@ impl Builder {
         let mut usage = TokenUsage::default();
         if let Some(m) = &l.message {
             msg.model.clone_from(&m.model);
-            if !m.model.is_empty() {
+            // `<synthetic>` is Claude's word for a line no model wrote.
+            if !m.model.is_empty() && !m.model.starts_with('<') {
                 self.model.clone_from(&m.model);
             }
             if let Some(u) = &m.usage {
@@ -1514,5 +1515,36 @@ mod tests {
             .unwrap();
         assert_eq!(costs(&db2), want);
         let _ = (std::fs::remove_dir_all(d1), std::fs::remove_dir_all(d2));
+    }
+
+    #[test]
+    fn each_message_names_its_turn_so_a_model_switch_prices_per_turn() {
+        let dir = std::env::temp_dir().join(format!("krowk-claude-turns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let slug = dir.join("home/.claude/projects/-work");
+        std::fs::create_dir_all(&slug).unwrap();
+        std::fs::create_dir_all(dir.join("home/work")).unwrap();
+        let home = dir.join("home").canonicalize().unwrap().display().to_string();
+        let cwd = format!("{home}/work");
+        let sid = "55555555-5555-4555-8555-555555555555";
+        let line = |kind: &str, uuid: &str, message: Value| json!({ "type": kind, "uuid": uuid, "sessionId": sid, "cwd": cwd, "message": message }).to_string();
+        let asst = |model: &str, id: &str| json!({ "id": id, "role": "assistant", "model": model, "content": [{ "type": "text", "text": "ok" }], "usage": { "input_tokens": 1, "output_tokens": 1 } });
+        let body = [
+            line("user", "u1", json!({ "role": "user", "content": "first" })),
+            line("assistant", "a1", asst("claude-opus-5", "msg_1")),
+            line("user", "u2", json!({ "role": "user", "content": "second" })),
+            line("assistant", "a2", asst("claude-sonnet-5", "msg_2")),
+            line("assistant", "a3", asst("<synthetic>", "msg_3")),
+        ]
+        .join("\n");
+        std::fs::write(slug.join(format!("{sid}.jsonl")), body + "\n").unwrap();
+        let env = move |k: &str| if k == "HOME" { home.clone() } else { String::new() };
+        let r = Claude.discover(&env).unwrap().into_iter().next().unwrap();
+        let (th, _, _) = Claude.read(&env, &r, "").unwrap();
+        assert_eq!(th.turns.len(), 2);
+        let links: Vec<(Option<i64>, &str)> = th.messages.iter().map(|m| (m.turn_seq, m.model.as_str())).collect();
+        assert_eq!(links, vec![(Some(0), ""), (Some(0), "claude-opus-5"), (Some(1), ""), (Some(1), "claude-sonnet-5"), (Some(1), "<synthetic>")]);
+        assert_eq!(th.session.model, "claude-sonnet-5", "a synthetic line names no session model");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -146,6 +146,9 @@ CREATE INDEX idx_session_updated ON session(time_updated DESC);
 CREATE INDEX idx_turn_session ON turn(session_id);
 CREATE INDEX idx_session_parent ON session(parent_id);
 CREATE INDEX idx_binding_session ON session_binding(session_id);
-CREATE INDEX idx_message_turn ON message(turn_id);
+-- Covering for the per-turn model lookup pricing does on every listing:
+-- (turn_id, role, seq) finds a turn's last assistant message, and model and
+-- provider are read from the index without touching the row.
+CREATE INDEX idx_message_turn ON message(turn_id, role, seq, model, provider);
 CREATE INDEX idx_part_message ON part(message_id);
 CREATE INDEX idx_part_session ON part(session_id);

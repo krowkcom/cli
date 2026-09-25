@@ -133,6 +133,7 @@ pub fn price_with_basis(env: &dyn Fn(&str) -> String, provider: &str, model: &st
 /// field but `cost` skipped unread: the full file is megabytes, and it is
 /// parsed on every `sessions` listing.
 fn parse_rates(raw: &[u8]) -> Option<Table> {
+    // One bad entry costs that entry, never its provider.
     #[derive(serde::Deserialize)]
     struct FullModel {
         cost: Option<Map<String, Value>>,
@@ -143,8 +144,13 @@ fn parse_rates(raw: &[u8]) -> Option<Table> {
         let Ok(fields) = serde_json::from_str::<HashMap<String, &RawValue>>(fields.get()) else { continue };
         let full: Vec<(String, Map<String, Value>)> = fields
             .get("models")
-            .and_then(|m| serde_json::from_str::<HashMap<String, FullModel>>(m.get()).ok())
-            .map(|models| models.into_iter().filter_map(|(m, v)| Some((m, v.cost.filter(|c| !c.is_empty())?))).collect())
+            .and_then(|m| serde_json::from_str::<HashMap<String, &RawValue>>(m.get()).ok())
+            .map(|models| {
+                models
+                    .into_iter()
+                    .filter_map(|(m, v)| Some((m, serde_json::from_str::<FullModel>(v.get()).ok()?.cost.filter(|c| !c.is_empty())?)))
+                    .collect()
+            })
             .unwrap_or_default();
         let entries: Vec<(String, Map<String, Value>)> = if full.is_empty() {
             fields.iter().filter_map(|(m, v)| Some((m.clone(), serde_json::from_str::<Map<String, Value>>(v.get()).ok()?))).collect()
@@ -283,6 +289,8 @@ mod tests {
         let cost = r.cost(Tokens { input: 1_000_000, output: 500_000, reasoning: 500_000, cache_read: -5, ..Tokens::default() });
         assert!((cost - 3.0).abs() < 1e-9);
         assert!(parse_rates(b"not json").is_none());
+        let bad_neighbours = parse_rates(br#"{"p":{"models":{"m":{"cost":{"input":1}},"n":null,"o":{"cost":"free"}}}}"#).unwrap();
+        assert_eq!(bad_neighbours.len(), 1, "a bad entry costs itself, not its provider");
         assert_eq!(sanitize_etag("W/\"abc\""), "W/\"abc\"");
         assert_eq!(sanitize_etag("bad etag"), "");
     }

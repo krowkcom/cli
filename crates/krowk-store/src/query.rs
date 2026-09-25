@@ -12,7 +12,8 @@ pub const DEFAULT_SESSION_PAGE: i64 = 50;
 /// The (provider, model) a turn is priced by: its last assistant message
 /// naming a real model, else the session's. Claude writes `<synthetic>` on
 /// messages no model produced, which name no price. A scalar subquery per
-/// turn, over idx_message_turn, so a page of sessions reads only its own.
+/// turn, answered from idx_message_turn alone (it covers every column read
+/// here), so a page of sessions reads only its own turns and no message rows.
 const TURN_MODEL_FROM: &str = "FROM message m WHERE m.turn_id = t.id AND m.role = 'assistant' AND m.model != '' AND m.model NOT LIKE '<%>' ORDER BY m.seq DESC LIMIT 1";
 
 /// A session's turns summed per (provider, model) — the pair a price is
@@ -23,7 +24,9 @@ const TURN_MODEL_FROM: &str = "FROM message m WHERE m.turn_id = t.id AND m.role 
 pub struct CostGroup {
     pub provider: String,
     pub model: String,
-    /// The source stated the cost of these turns; `usd_micros` is its sum.
+    /// The source stated a cost above 0 for these turns; `usd_micros` is its
+    /// sum. opencode writes 0 for a model it cannot price, so a stated 0 is
+    /// no statement — those turns are priced from their tokens instead.
     pub reported: bool,
     pub turns: i64,
     pub input: i64,
@@ -39,8 +42,8 @@ pub struct CostGroup {
 pub fn cost_groups(conn: &Connection, session_ids: &[String]) -> Result<HashMap<String, Vec<CostGroup>>, StoreError> {
     let base = format!(
         "SELECT t.session_id, COALESCE((SELECT m.provider {TURN_MODEL_FROM}), s.provider), COALESCE((SELECT m.model {TURN_MODEL_FROM}), s.model), \
-         t.cost_usd_micros IS NOT NULL, COUNT(*), SUM(t.cost_input_tokens), SUM(t.cost_output_tokens), SUM(t.cost_cache_read_tokens), \
-         SUM(t.cost_cache_write_tokens), SUM(t.cost_reasoning_tokens), COALESCE(SUM(t.cost_usd_micros), 0) \
+         COALESCE(t.cost_usd_micros, 0) > 0, COUNT(*), SUM(t.cost_input_tokens), SUM(t.cost_output_tokens), SUM(t.cost_cache_read_tokens), \
+         SUM(t.cost_cache_write_tokens), SUM(t.cost_reasoning_tokens), COALESCE(SUM(CASE WHEN t.cost_usd_micros > 0 THEN t.cost_usd_micros END), 0) \
          FROM turn t JOIN session s ON s.id = t.session_id WHERE t.status NOT IN ('{observed}', '{duplicate}')",
         observed = crate::STATUS_OBSERVED,
         duplicate = crate::STATUS_DUPLICATE,
@@ -546,5 +549,11 @@ mod tests {
         assert_eq!(cost_groups(&conn, &[]).unwrap()[&id], *groups, "no ids is every session");
         let d = load_session_detail(&conn, &id).unwrap();
         assert_eq!(d.turns.iter().map(|t| t.model.as_str()).collect::<Vec<_>>(), vec!["opus", "sonnet", "fable"]);
+
+        // A store from before the link: a re-import links what it skips.
+        conn.execute("UPDATE message SET turn_id = NULL", []).unwrap();
+        assert_eq!(load_session_detail(&conn, &id).unwrap().turns[0].model, "fable");
+        Writer::new(&conn).ingest(&th).unwrap();
+        assert_eq!(load_session_detail(&conn, &id).unwrap().turns[0].model, "opus");
     }
 }

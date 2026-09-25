@@ -404,7 +404,7 @@ fn narrowing(name: &str, before: &str, steps: &[&str]) {
     tm.tmux(&args);
     std::thread::sleep(Duration::from_millis(800));
     let history = tm.history();
-    for row in ["enter send · alt-enter", "⚠ no network connectivity", "› ask anything", "claude-opus-5 · anthropic"] {
+    for row in ["enter send · alt-enter", "⚠ no network connectivity", "› ask anything", "· anthropic · api key"] {
         assert_eq!(history.matches(row).count(), 1, "{row:?} is in scrollback twice — the old live region was left behind:\n{history}");
     }
     assert_eq!(history.matches("krowk dev").count(), 1, "the header is still there, once:\n{history}");

@@ -56,17 +56,29 @@ impl Home {
                     (u.input_tokens as f64 * 3.0 + u.output_tokens as f64 * 15.0 + u.cache_read_tokens as f64 * 0.3 + u.cache_write_tokens as f64 * 3.75) / 1e6
                 })
             }),
+            // A catalog that knows one model a router serves under a name
+            // that says nothing of its family.
+            families: Arc::new(|_, model| (model == "house-coder").then(|| "grok-build".to_string())),
         }
     }
 
     fn run(&self, prompt: &str, resume: Option<&str>) -> (Vec<StreamLine>, RunResult) {
+        self.run_on(prompt, resume, "claude-sonnet-4-6", None)
+    }
+
+    fn run_on(&self, prompt: &str, resume: Option<&str>, model: &str, toolset: Option<&str>) -> (Vec<StreamLine>, RunResult) {
+        self.run_as(prompt, resume, model, toolset, PermissionMode::Default)
+    }
+
+    fn run_as(&self, prompt: &str, resume: Option<&str>, model: &str, toolset: Option<&str>, permission_mode: PermissionMode) -> (Vec<StreamLine>, RunResult) {
         let mut out = Vec::new();
         let reg = Registry::resolve(&InstancesConfig::default(), &self.env());
         let opts = headless::Options {
             prompt: prompt.into(),
             resume: resume.map(String::from),
-            model: Some(reg.parse_model("claude-sonnet-4-6").unwrap()),
-            permission_mode: PermissionMode::Default,
+            model: Some(reg.parse_model(model).unwrap()),
+            permission_mode,
+            toolset: toolset.map(String::from),
             format: OutputFormat::StreamJson,
         };
         let outcome = headless::run(self.config(), opts, &mut out);
@@ -163,7 +175,13 @@ fn a_prompt_reads_a_file_streams_its_items_and_a_resume_continues_on_the_cache()
     let ctx: Vec<ContextRecord> = std::fs::read_to_string(dir.join(log::CONTEXT_FILE)).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(ctx.len(), 2);
     assert_eq!(ctx[0].system, seen_system(&m));
-    assert_eq!(ctx[0].tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["read", "bash"]);
+    assert_eq!(ctx[0].tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["read", "write", "str_replace", "bash", "grep", "glob"]);
+    assert_eq!(ctx[0].toolset, "claude");
+    assert!(ctx[0].system_tokens > 0 && ctx[0].tools_tokens > ctx[0].system_tokens, "{} {}", ctx[0].system_tokens, ctx[0].tools_tokens);
+    let context_schema = schema("context-record.schema.json");
+    for l in std::fs::read_to_string(dir.join(log::CONTEXT_FILE)).unwrap().lines() {
+        assert!(context_schema.is_valid(&serde_json::from_str(l).unwrap()), "{l}");
+    }
 
     // R-LOG-2, R-LOG-5: the log projects into krowk.db, and a rebuild from
     // the JSONL alone gives the same rows.
@@ -177,6 +195,88 @@ fn a_prompt_reads_a_file_streams_its_items_and_a_resume_continues_on_the_cache()
     let rebuilt = project_all(&env);
     let row2 = rebuilt.iter().find(|r| r.harness == "krowk").unwrap();
     assert_eq!(detail(&env, &row2.id), before, "rebuilt from the JSONL alone");
+}
+
+/// R-TOOL-2: the recorded tool definitions carry each family's edit tool —
+/// chosen from the model id, from the catalog's family, or by `--toolset` —
+/// and the request the provider was sent carries the same tools.
+#[test]
+fn r_tool_2_the_recorded_tools_carry_each_model_familys_edit_tool_and_toolset_overrides_it() {
+    let m = mock::serve(|_, _| mock::Reply::sse(&mock::fixture("turn2_answer.sse")));
+    let home = Home::new("toolset", &m.url);
+    let cases = [
+        ("claude-sonnet-4-6", None, "claude", "str_replace"),
+        ("gpt-5.1-codex", None, "gpt", "apply_patch"),
+        ("openai/gpt-5", None, "gpt", "apply_patch"),
+        ("grok-code-fast-1", None, "grok", "search_replace"),
+        // Known to the catalog only, as a grok-build.
+        ("house-coder", None, "grok", "search_replace"),
+        // An unknown family gets the plain JSON edit tool.
+        ("llama-4-maverick", None, "claude", "str_replace"),
+        // --toolset wins over the family, either way round.
+        ("claude-sonnet-4-6", Some("gpt"), "gpt", "apply_patch"),
+        ("gpt-5", Some("grok"), "grok", "search_replace"),
+    ];
+    for (n, (model, toolset, preset, edit)) in cases.iter().enumerate() {
+        let (_, r) = home.run_on("hello", None, model, *toolset);
+        assert_eq!(r.status, TurnStatus::Completed, "{model}");
+        let dir = log::sessions_dir(&home.env()).unwrap().join(&r.session_id);
+        let ctx: ContextRecord = serde_json::from_str(std::fs::read_to_string(dir.join(log::CONTEXT_FILE)).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(ctx.toolset, *preset, "{model} {toolset:?}");
+        assert_eq!(ctx.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["read", "write", edit, "bash", "grep", "glob"], "{model} {toolset:?}");
+        assert!(ctx.system.contains(&format!("Change existing files with {edit};")), "the system prompt names the edit tool");
+        // No grammar tool on the Messages API: apply_patch is a JSON function there.
+        assert!(ctx.tools.iter().all(|t| t.grammar.is_none() && t.input_schema["type"] == "object"));
+        let seen = m.seen.lock().unwrap();
+        let sent: Vec<&str> = seen[n].body["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(sent, ["read", "write", edit, "bash", "grep", "glob"], "what was recorded is what was sent");
+    }
+    // A toolset that does not exist is refused before any session is made.
+    let mut out = Vec::new();
+    let opts = headless::Options {
+        prompt: "hello".into(),
+        resume: None,
+        model: None,
+        permission_mode: PermissionMode::Default,
+        toolset: Some("vim".into()),
+        format: OutputFormat::Json,
+    };
+    let outcome = headless::run(home.config(), opts, &mut out);
+    let e = outcome.error.expect("refused");
+    assert_eq!(e.code, "bad_toolset");
+    assert!(e.message.contains("claude, gpt, grok"), "{}", e.message);
+    assert!(outcome.session_id.is_none());
+}
+
+/// Each family's model edits a file through the whole loop in its own
+/// format, and the edit lands; where edits are not allowed, it does not.
+#[test]
+fn r_tool_2_each_edit_format_runs_through_the_loop() {
+    let m = mock::serve(mock::edit_script);
+    let home = Home::new("edit-loop", &m.url);
+    let readme = home.repo().join("README.md");
+    for (model, edit) in [("claude-sonnet-4-6", "str_replace"), ("gpt-5.1-codex", "apply_patch"), ("grok-code-fast-1", "search_replace")] {
+        std::fs::write(&readme, "# krowk\n\nPermalinks for agent output.\n").unwrap();
+        let (lines, r) = home.run_as("reword the README", None, model, None, PermissionMode::AcceptEdits);
+        assert_eq!(r.status, TurnStatus::Completed, "{model}");
+        let result = lines.iter().find_map(|l| match l {
+            StreamLine::Log(LogEvent { body: LogBody::ItemCompleted { item: Item::ToolResult { output, is_error, .. }, .. }, .. }) => Some((output.clone(), *is_error)),
+            _ => None,
+        });
+        let (output, is_error) = result.expect("a tool result");
+        assert!(!is_error, "{edit}: {output}");
+        assert_eq!(std::fs::read_to_string(&readme).unwrap(), "# krowk\n\nPermalinks for everything agents make.\n", "{edit}");
+        let call = lines.iter().any(|l| matches!(l, StreamLine::Log(LogEvent { body: LogBody::ItemCompleted { item: Item::ToolCall { name, .. }, .. }, .. }) if name == edit));
+        assert!(call, "the call was logged as {edit}");
+    }
+    // In the default mode the edit is refused, and the model is told why.
+    std::fs::write(&readme, "# krowk\n\nPermalinks for agent output.\n").unwrap();
+    let (lines, _) = home.run_as("reword the README", None, "gpt-5", None, PermissionMode::Default);
+    let refused = lines.iter().any(|l| {
+        matches!(l, StreamLine::Log(LogEvent { body: LogBody::ItemCompleted { item: Item::ToolResult { output, is_error: true, .. }, .. }, .. }) if output.contains("acceptEdits"))
+    });
+    assert!(refused);
+    assert_eq!(std::fs::read_to_string(&readme).unwrap(), "# krowk\n\nPermalinks for agent output.\n");
 }
 
 fn seen_system(m: &mock::Mock) -> String {

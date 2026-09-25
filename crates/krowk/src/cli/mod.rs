@@ -306,7 +306,7 @@ fn reject_misplaced_sessions_flags(f: &Flags, p: &[String]) -> Result<(), Error>
         ("no-network", "`krowk sessions sync`", sync),
     ];
     #[cfg(feature = "harness")]
-    for name in ["output-format", "model", "resume", "permission-mode"] {
+    for name in ["output-format", "model", "resume", "permission-mode", "toolset"] {
         if f.given.contains(name) && !f.print {
             return Err(fail("bad_flag", format!("`--{name}` is only a flag of `krowk -p`")));
         }

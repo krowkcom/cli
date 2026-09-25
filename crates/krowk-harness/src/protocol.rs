@@ -233,6 +233,10 @@ pub enum Command {
         model: Option<ModelRef>,
         #[serde(default)]
         permission_mode: PermissionMode,
+        /// The toolset preset for this turn (`claude`, `gpt`, `grok`); the
+        /// config's, else the one the model's family picks, when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        toolset: Option<String>,
     },
     /// Stop the running turn, keeping what it produced so far.
     Interrupt { session_id: String },
@@ -361,8 +365,22 @@ pub enum StreamLine {
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
-    /// JSON Schema for the tool's input.
+    /// JSON Schema for the tool's input: an object for a function tool,
+    /// `{"type": "string"}` for a freeform one.
     pub input_schema: Value,
+    /// Set on a freeform tool, whose input is text in this grammar rather
+    /// than a JSON object — offered only where the wire API takes them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<Grammar>,
+}
+
+/// The grammar a freeform tool's input is written in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Grammar {
+    /// `lark`.
+    pub syntax: String,
+    pub definition: String,
 }
 
 /// One line of a session's `context.jsonl`: the exact system prompt and
@@ -377,6 +395,18 @@ pub struct ContextRecord {
     pub model: ModelRef,
     pub provider: String,
     pub wire_api: WireApi,
+    /// The toolset preset the tools came from.
+    #[serde(default)]
+    pub toolset: String,
     pub system: String,
     pub tools: Vec<ToolDefinition>,
+    /// The system prompt's size in tokens, estimated at four bytes a token:
+    /// no provider's tokenizer ships with krowk, and a budget compares the
+    /// estimate with itself, so growth shows whatever the true ratio is.
+    #[serde(default)]
+    pub system_tokens: u64,
+    /// The tool definitions' size, estimated the same way over the JSON the
+    /// provider is sent.
+    #[serde(default)]
+    pub tools_tokens: u64,
 }

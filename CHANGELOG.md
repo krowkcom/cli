@@ -82,6 +82,21 @@ the versions are the `v*` tags a release is cut from. Entries land under
   tools, `read` and `bash`; `bash` runs only under `--permission-mode
   bypassPermissions` until permission rules land, and is refused with a
   reason the model can read otherwise. Prompt caching is on by default.
+- **`krowk -p`'s agent can change files, in the edit format its model was
+  trained on.** Beside `read` and `bash` it now has `write`, `grep`, `glob`
+  and one edit tool: `str_replace` for Claude models, `apply_patch` (the
+  Codex patch envelope) for GPT and Codex models, and `search_replace` for
+  Grok models, picked from the model's family in the models.dev cache, or
+  from its id when the cache does not know it. `--toolset claude|gpt|grok`
+  picks one for a prompt, and `"toolset"` in `config.json` for every
+  model. An edit that matches twice, or no longer matches the file, and a
+  patch that does not apply, change nothing and tell the model why. `grep`
+  and `glob` skip what `.gitignore` excludes and never search binary
+  files. `write` and the edit tools run only under `--permission-mode
+  acceptEdits` or `bypassPermissions` until permission rules land; in the
+  default mode the model is told it may not. Each turn's `context.jsonl`
+  record now names its `toolset` and estimates the system prompt's and
+  tools' size in tokens (`systemTokens`, `toolsTokens`).
 - **Native sessions are logs you own, listed beside imported ones.** Each
   session is an append-only JSONL log under
   `~/.local/share/krowk/sessions/<id>/` (with each turn's exact system

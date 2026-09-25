@@ -1175,6 +1175,7 @@ dependencies = [
  "krowk-import",
  "krowk-store",
  "libc",
+ "regex-lite",
  "reqwest",
  "rustls",
  "rustls-platform-verifier",

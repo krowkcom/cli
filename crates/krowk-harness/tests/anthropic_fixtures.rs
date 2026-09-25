@@ -147,7 +147,7 @@ fn r_log_3_redacted_thinking_is_kept_opaque_and_replayed_as_it_came() {
 
 #[test]
 fn r_prov_3_cache_breakpoints_sit_on_the_stable_prefix_and_the_growing_tail() {
-    let tools = vec![ToolDefinition { name: "read".into(), description: "d".into(), input_schema: json!({ "type": "object" }) }];
+    let tools = vec![ToolDefinition { name: "read".into(), description: "d".into(), input_schema: json!({ "type": "object" }), grammar: None }];
     let turn = |text: &str| HistoryItem { item: Item::UserText { text: text.into() }, response: None };
     let said = |text: &str, r: usize| HistoryItem { item: Item::AssistantText { text: text.into() }, response: Some(r) };
     let history = vec![turn("one"), said("a", 0), turn("two"), said("b", 1), turn("three")];

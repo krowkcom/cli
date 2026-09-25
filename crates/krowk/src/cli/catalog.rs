@@ -392,6 +392,11 @@ fn prompt_flags() -> Vec<Flag> {
             ),
             "default",
         ),
+        flag(
+            "toolset",
+            STRING,
+            "With -p: the tools' preset — claude (str_replace), gpt (apply_patch) or grok (search_replace). The model's family picks one when absent",
+        ),
     ]
 }
 

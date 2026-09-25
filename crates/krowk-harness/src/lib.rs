@@ -6,7 +6,8 @@
 //!   implement, and the `EngineEvent`s they report.
 //! - `native` — krowk's own loop over a `ModelClient`; `anthropic` is the
 //!   first client, for the Messages API.
-//! - `tools` — `read` and `bash`.
+//! - `tools` — read, write, the edit tools, bash, grep and glob.
+//! - `toolset` — the preset registry: which edit tool a model is offered.
 //! - `host` — executes commands, writes the log, prices the turn.
 //! - `log` — the append-only JSONL session log and its layout on disk.
 //! - `project` — the log as a `krowk_import::Source`, so krowk.db lists
@@ -28,3 +29,4 @@ pub mod project;
 pub mod protocol;
 pub mod schema;
 pub mod tools;
+pub mod toolset;

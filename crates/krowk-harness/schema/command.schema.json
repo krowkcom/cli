@@ -31,6 +31,13 @@
           "$ref": "#/$defs/PermissionMode",
           "default": "default"
         },
+        "toolset": {
+          "description": "The toolset preset for this turn (`claude`, `gpt`, `grok`); the\nconfig's, else the one the model's family picks, when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "type": {
           "type": "string",
           "const": "prompt"

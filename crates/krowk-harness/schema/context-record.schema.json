@@ -20,6 +20,11 @@
     "wireApi": {
       "$ref": "#/$defs/WireApi"
     },
+    "toolset": {
+      "description": "The toolset preset the tools came from.",
+      "type": "string",
+      "default": ""
+    },
     "system": {
       "type": "string"
     },
@@ -28,6 +33,20 @@
       "items": {
         "$ref": "#/$defs/ToolDefinition"
       }
+    },
+    "systemTokens": {
+      "description": "The system prompt's size in tokens, estimated at four bytes a token:\nno provider's tokenizer ships with krowk, and a budget compares the\nestimate with itself, so growth shows whatever the true ratio is.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 0
+    },
+    "toolsTokens": {
+      "description": "The tool definitions' size, estimated the same way over the JSON the\nprovider is sent.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 0
     }
   },
   "required": [
@@ -76,13 +95,41 @@
           "type": "string"
         },
         "inputSchema": {
-          "description": "JSON Schema for the tool's input."
+          "description": "JSON Schema for the tool's input: an object for a function tool,\n`{\"type\": \"string\"}` for a freeform one."
+        },
+        "grammar": {
+          "description": "Set on a freeform tool, whose input is text in this grammar rather\nthan a JSON object — offered only where the wire API takes them.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Grammar"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "name",
         "description",
         "inputSchema"
+      ]
+    },
+    "Grammar": {
+      "description": "The grammar a freeform tool's input is written in.",
+      "type": "object",
+      "properties": {
+        "syntax": {
+          "description": "`lark`.",
+          "type": "string"
+        },
+        "definition": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "syntax",
+        "definition"
       ]
     }
   }

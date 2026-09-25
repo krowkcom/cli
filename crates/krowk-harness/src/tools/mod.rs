@@ -1,21 +1,36 @@
-//! The tools the native loop offers: `read` and `bash`, for now. Each input
-//! is a Rust type the tool's JSON Schema is derived from, so the definition
-//! the model sees and the parser that reads its call cannot disagree.
+//! The tools the native loop offers (R-TOOL-1): `read`, `write`, one edit
+//! tool, `bash`, `grep` and `glob`. Which edit tool — `str_replace`,
+//! `apply_patch` or `search_replace` — is the turn's toolset preset's to
+//! say (`crate::toolset`). Each input is a Rust type the tool's JSON Schema
+//! is derived from, so the definition the model sees and the parser that
+//! reads its call cannot disagree.
 //!
 //! A tool never fails the turn. A bad input, a missing file, a timeout or a
-//! refusal is a result with `isError`, which the model reads and corrects.
+//! refusal is a result with `isError`, which the model reads and corrects:
+//! the result item is `toolResult {callId, output, isError}`, `output` the
+//! text the model is sent back.
 //!
-//! `bash` runs only under `--permission-mode bypassPermissions` until the
-//! permission system lands (ticket 9): anywhere else the call is refused
-//! with a result that says so. `read` needs no permission, as in every
-//! harness whose rules krowk follows.
+//! Until the permission system lands (ticket 9), a tool's mode is coarse:
+//! `read`, `grep` and `glob` need no permission, as in every harness whose
+//! rules krowk follows; `write` and the edit tools run under `acceptEdits`
+//! and `bypassPermissions`; `bash` runs only under `bypassPermissions`.
+//! Anywhere else the call is refused with a result that says so.
 
-use crate::protocol::{PermissionMode, ToolDefinition};
+mod edit;
+mod patch;
+mod search;
+
+use crate::protocol::{Grammar, PermissionMode, ToolDefinition};
+use crate::toolset::{EditTool, Toolset};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+pub use edit::{SearchReplaceInput, StrReplaceInput, WriteInput};
+pub use patch::{ApplyPatchInput, GRAMMAR as APPLY_PATCH_GRAMMAR};
+pub use search::{GlobInput, GrepInput};
 
 pub const READ: &str = "read";
 pub const BASH: &str = "bash";
@@ -58,20 +73,74 @@ pub struct BashInput {
     pub timeout_ms: Option<u64>,
 }
 
+pub const WRITE: &str = "write";
+pub const STR_REPLACE: &str = "str_replace";
+pub const APPLY_PATCH: &str = "apply_patch";
+pub const SEARCH_REPLACE: &str = "search_replace";
+pub const GREP: &str = "grep";
+pub const GLOB: &str = "glob";
+
+impl EditTool {
+    /// The tool's name, as the model calls it.
+    pub fn name(self) -> &'static str {
+        match self {
+            EditTool::StrReplace => STR_REPLACE,
+            EditTool::ApplyPatch => APPLY_PATCH,
+            EditTool::SearchReplace => SEARCH_REPLACE,
+        }
+    }
+}
+
+const APPLY_PATCH_DESCRIPTION: &str = "Edit files with a patch. The patch is an envelope:\n\
+*** Begin Patch\n\
+[one or more hunks]\n\
+*** End Patch\n\
+A hunk is `*** Add File: <path>` followed by the new file's lines, each prefixed with `+`; `*** Delete File: <path>`; or `*** Update File: <path>`, optionally followed by `*** Move to: <new path>`, then its changes. A change is a run of lines prefixed with ` ` (context, unchanged), `-` (removed) or `+` (added), with about three lines of context above and below; start each run with `@@ <a line just above it, such as its function or class>` when the context alone is ambiguous, and end a run that reaches the end of the file with `*** End of File`. Paths are relative to the working directory. The patch applies whole or not at all.";
+
 /// The definitions, in the order the model is shown them. The order is part
-/// of the cached prefix, so it never varies.
-pub fn definitions() -> Vec<ToolDefinition> {
+/// of the cached prefix, so it never varies within a toolset.
+pub fn definitions(ts: &Toolset) -> Vec<ToolDefinition> {
+    let function = |name: &str, description: &str, input_schema: Value| ToolDefinition { name: name.into(), description: description.into(), input_schema, grammar: None };
+    let edit = match ts.preset.edit {
+        EditTool::StrReplace => function(
+            STR_REPLACE,
+            "Edit a file by replacing text. `old_str` must match the file exactly, whitespace and indentation included, and occur exactly once — include enough surrounding lines to make it unique — unless `replace_all` is set. Read the file before editing it. Use write to create a file.",
+            input_schema::<StrReplaceInput>(),
+        ),
+        EditTool::SearchReplace => function(
+            SEARCH_REPLACE,
+            "Edit a file by searching for text and replacing it. `old_string` must match the file exactly, whitespace and indentation included, and occur exactly once — include enough surrounding lines to make it unique — unless `replace_all` is set. Read the file before editing it. Use write to create a file.",
+            input_schema::<SearchReplaceInput>(),
+        ),
+        // Freeform where the model takes grammar tools: the patch is the
+        // call's whole input, with no JSON string escaping to get wrong.
+        EditTool::ApplyPatch if ts.custom_tools => ToolDefinition {
+            name: APPLY_PATCH.into(),
+            description: APPLY_PATCH_DESCRIPTION.into(),
+            input_schema: serde_json::json!({ "type": "string" }),
+            grammar: Some(Grammar { syntax: "lark".into(), definition: patch::GRAMMAR.into() }),
+        },
+        EditTool::ApplyPatch => function(APPLY_PATCH, APPLY_PATCH_DESCRIPTION, input_schema::<ApplyPatchInput>()),
+    };
     vec![
-        ToolDefinition {
-            name: READ.into(),
-            description: "Read a text file. Returns its lines numbered from 1, like `cat -n`, 2000 lines at most unless `limit` says otherwise; use `offset` to read further. Prefer this to running `cat` through bash.".into(),
-            input_schema: input_schema::<ReadInput>(),
-        },
-        ToolDefinition {
-            name: BASH.into(),
-            description: "Run a shell command with `bash -c` in the working directory and return its combined stdout and stderr, followed by the exit code. Output beyond 30000 bytes is cut from the middle. Commands time out after 120 seconds unless `timeout_ms` says otherwise.".into(),
-            input_schema: input_schema::<BashInput>(),
-        },
+        function(
+            READ,
+            "Read a text file. Returns its lines numbered from 1, like `cat -n`, 2000 lines at most unless `limit` says otherwise; use `offset` to read further. Prefer this to running `cat` through bash.",
+            input_schema::<ReadInput>(),
+        ),
+        function(WRITE, "Write a file, creating it or replacing it whole. To change part of an existing file, use the edit tool instead.", input_schema::<WriteInput>()),
+        edit,
+        function(
+            BASH,
+            "Run a shell command with `bash -c` in the working directory and return its combined stdout and stderr, followed by the exit code. Output beyond 30000 bytes is cut from the middle. Commands time out after 120 seconds unless `timeout_ms` says otherwise.",
+            input_schema::<BashInput>(),
+        ),
+        function(
+            GREP,
+            "Search file contents with a regular expression. Returns matching lines as `path:line:text`, 200 at most. Skips binary files and what .gitignore excludes. Prefer this to running grep or rg through bash.",
+            input_schema::<GrepInput>(),
+        ),
+        function(GLOB, "Find files whose path matches a glob. Returns paths sorted, 1000 at most, skipping what .gitignore excludes.", input_schema::<GlobInput>()),
     ]
 }
 
@@ -88,27 +157,84 @@ fn input_schema<T: JsonSchema>() -> Value {
 }
 
 /// Everything a tool call is run with.
+#[derive(Clone, Copy)]
 pub struct ToolEnv<'a> {
     pub cwd: &'a Path,
     pub permission_mode: PermissionMode,
+    /// The edit tool the turn offers: the only one it runs.
+    pub edit: EditTool,
+}
+
+const EDIT_REFUSED: &str = "changes files, which this session does not allow: until krowk's permission rules land, write and the edit tools run only when krowk is started with `--permission-mode acceptEdits` or `bypassPermissions`. Say what you would change instead, or ask the person to rerun with one of those flags.";
+
+/// Parses a call's input, or answers why it cannot.
+fn parse_input<T: for<'de> Deserialize<'de>>(name: &str, input: &Value) -> Result<T, (String, bool)> {
+    T::deserialize(input).map_err(|e| (format!("invalid input for {name}: {e}"), true))
+}
+
+/// Blocking file work, off the async runtime: the runtime also has to hear
+/// an interrupt while it runs.
+async fn blocking(f: impl FnOnce() -> (String, bool) + Send + 'static) -> (String, bool) {
+    tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| (format!("the tool failed: {e}"), true))
 }
 
 /// Runs one call. Returns the output and whether it is an error.
 pub async fn run(name: &str, input: &Value, env: &ToolEnv<'_>) -> (String, bool) {
+    let may_edit = matches!(env.permission_mode, PermissionMode::AcceptEdits | PermissionMode::BypassPermissions);
+    let cwd = env.cwd.to_path_buf();
+    let is_edit = [WRITE, STR_REPLACE, APPLY_PATCH, SEARCH_REPLACE].contains(&name);
+    if is_edit && name != WRITE && name != env.edit.name() {
+        return (format!("there is no tool named {name:?} in this session — edit files with {}", env.edit.name()), true);
+    }
+    if is_edit && !may_edit {
+        return (format!("{name} {EDIT_REFUSED}"), true);
+    }
     match name {
-        READ => match ReadInput::deserialize(input) {
+        READ => match parse_input::<ReadInput>(name, input) {
             Ok(i) => read(&i, env.cwd).await,
-            Err(e) => (format!("invalid input for read: {e}"), true),
+            Err(e) => e,
         },
-        BASH => match BashInput::deserialize(input) {
+        WRITE => match parse_input::<WriteInput>(name, input) {
+            Ok(i) => blocking(move || edit::write(&i, &cwd)).await,
+            Err(e) => e,
+        },
+        STR_REPLACE => match parse_input::<StrReplaceInput>(name, input) {
+            Ok(i) => blocking(move || {
+                let r = edit::Replace { tool: STR_REPLACE, old_name: "old_str", path: &i.path, old: &i.old_str, new: &i.new_str, replace_all: i.replace_all.unwrap_or(false) };
+                edit::replace(&r, &cwd)
+            })
+            .await,
+            Err(e) => e,
+        },
+        SEARCH_REPLACE => match parse_input::<SearchReplaceInput>(name, input) {
+            Ok(i) => blocking(move || {
+                let r = edit::Replace { tool: SEARCH_REPLACE, old_name: "old_string", path: &i.file_path, old: &i.old_string, new: &i.new_string, replace_all: i.replace_all.unwrap_or(false) };
+                edit::replace(&r, &cwd)
+            })
+            .await,
+            Err(e) => e,
+        },
+        APPLY_PATCH => match patch::input_text(input) {
+            Ok(text) => blocking(move || patch::apply(&text, &cwd)).await,
+            Err(e) => (format!("invalid input for apply_patch: {e}"), true),
+        },
+        GREP => match parse_input::<GrepInput>(name, input) {
+            Ok(i) => blocking(move || search::grep(&i, &cwd)).await,
+            Err(e) => e,
+        },
+        GLOB => match parse_input::<GlobInput>(name, input) {
+            Ok(i) => blocking(move || search::glob(&i, &cwd)).await,
+            Err(e) => e,
+        },
+        BASH => match parse_input::<BashInput>(name, input) {
             Ok(i) if env.permission_mode == PermissionMode::BypassPermissions => bash(&i, env.cwd).await,
             Ok(_) => (
-                "bash is not allowed in this session: until krowk's permission rules land, bash runs only when krowk is started with `--permission-mode bypassPermissions`. Use the read tool, or ask the person to rerun with that flag.".into(),
+                "bash is not allowed in this session: until krowk's permission rules land, bash runs only when krowk is started with `--permission-mode bypassPermissions`. Use read, grep and glob, or ask the person to rerun with that flag.".into(),
                 true,
             ),
-            Err(e) => (format!("invalid input for bash: {e}"), true),
+            Err(e) => e,
         },
-        other => (format!("there is no tool named {other:?} — the tools are read and bash"), true),
+        other => (format!("there is no tool named {other:?} — the tools are read, write, {}, bash, grep and glob", env.edit.name()), true),
     }
 }
 
@@ -375,21 +501,56 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn dir(name: &str) -> PathBuf {
+    pub(super) fn dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("krowk-harness-tools-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
+    fn toolset(name: &str, custom_tools: bool) -> Toolset {
+        Toolset { preset: crate::toolset::by_name(name).unwrap(), custom_tools }
+    }
+
     #[test]
-    fn tool_definitions_are_derived_object_schemas_in_a_fixed_order() {
-        let defs = definitions();
-        assert_eq!(defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), [READ, BASH]);
-        assert_eq!(defs[0].input_schema["type"], "object");
+    fn r_tool_1_the_core_tools_are_derived_object_schemas_in_a_fixed_order() {
+        for (preset, edit) in [("claude", STR_REPLACE), ("gpt", APPLY_PATCH), ("grok", SEARCH_REPLACE)] {
+            let defs = definitions(&toolset(preset, false));
+            assert_eq!(defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), [READ, WRITE, edit, BASH, GREP, GLOB], "{preset}");
+            assert!(defs.iter().all(|d| d.input_schema["type"] == "object" && d.grammar.is_none()), "function tools everywhere without custom tools");
+            assert_eq!(definitions(&toolset(preset, false)), defs, "deterministic: the definitions are part of the cached prefix");
+        }
+        let defs = definitions(&toolset("claude", false));
         assert_eq!(defs[0].input_schema["required"], json!(["path"]));
-        assert!(defs[1].input_schema["properties"]["timeout_ms"].is_object());
-        assert_eq!(definitions(), defs, "deterministic: the definitions are part of the cached prefix");
+        assert_eq!(defs[2].input_schema["required"], json!(["path", "old_str", "new_str"]));
+        assert!(defs[3].input_schema["properties"]["timeout_ms"].is_object());
+        assert_eq!(definitions(&toolset("grok", false))[2].input_schema["required"], json!(["file_path", "old_string", "new_string"]));
+        assert_eq!(definitions(&toolset("gpt", false))[2].input_schema["required"], json!(["input"]));
+    }
+
+    #[test]
+    fn r_tool_2_apply_patch_is_a_grammar_tool_where_custom_tools_are_taken() {
+        let defs = definitions(&toolset("gpt", true));
+        let patch = &defs[2];
+        assert_eq!((patch.name.as_str(), &patch.input_schema), (APPLY_PATCH, &json!({"type": "string"})));
+        let g = patch.grammar.as_ref().expect("freeform");
+        assert_eq!(g.syntax, "lark");
+        assert!(g.definition.starts_with("start: begin_patch hunk+ end_patch"));
+        // Only apply_patch has a freeform form; the other presets are the
+        // same either way.
+        assert_eq!(definitions(&toolset("claude", true)), definitions(&toolset("claude", false)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_the_turns_edit_tool_runs() {
+        let d = dir("edit-gate");
+        std::fs::write(d.join("a.txt"), "x\n").unwrap();
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::BypassPermissions, edit: EditTool::ApplyPatch };
+        let (out, err) = run(STR_REPLACE, &json!({"path": "a.txt", "old_str": "x", "new_str": "y"}), &env).await;
+        assert!(err && out.contains("edit files with apply_patch"), "{out}");
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "x\n");
+        assert!(run("frobnicate", &json!({}), &env).await.0.contains("read, write, apply_patch, bash, grep and glob"));
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -397,7 +558,7 @@ mod tests {
         let d = dir("read");
         std::fs::write(d.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         std::fs::write(d.join("bin"), [0u8, 1, 2]).unwrap();
-        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::Default };
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::Default, edit: EditTool::StrReplace };
         let (out, err) = run(READ, &json!({"path": "a.txt"}), &env).await;
         assert!(!err);
         assert_eq!(out, "     1\tone\n     2\ttwo\n     3\tthree\n");
@@ -421,7 +582,7 @@ mod tests {
         let fifo = d.join("fifo");
         let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
         assert!(made.success());
-        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::Default };
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::Default, edit: EditTool::StrReplace };
         for path in [fifo.display().to_string(), "/dev/zero".into(), "/dev/stdin".into(), d.display().to_string()] {
             let r = tokio::time::timeout(Duration::from_secs(2), run(READ, &json!({ "path": path }), &env)).await.expect("read never blocks");
             assert!(r.1 && r.0.contains("not a regular file"), "{path}: {r:?}");
@@ -436,9 +597,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn bash_runs_only_when_permissions_are_bypassed_and_is_bounded() {
         let d = dir("bash");
-        let refused = run(BASH, &json!({"command": "echo hi"}), &ToolEnv { cwd: &d, permission_mode: PermissionMode::Default }).await;
+        let refused = run(BASH, &json!({"command": "echo hi"}), &ToolEnv { cwd: &d, permission_mode: PermissionMode::Default, edit: EditTool::StrReplace }).await;
         assert!(refused.1 && refused.0.contains("bypassPermissions"), "{refused:?}");
-        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::BypassPermissions };
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::BypassPermissions, edit: EditTool::StrReplace };
         assert_eq!(run(BASH, &json!({"command": "echo hi; echo oops >&2"}), &env).await, ("hi\noops\nexit code 0".into(), false));
         assert_eq!(run(BASH, &json!({"command": "exit 3"}), &env).await, ("exit code 3".into(), true));
         let started = std::time::Instant::now();
@@ -470,7 +631,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn an_interrupted_bash_call_kills_what_the_command_started() {
         let d = dir("bash-cancel");
-        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::BypassPermissions };
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::BypassPermissions, edit: EditTool::StrReplace };
         let input = json!({"command": "sleep 30 & echo $! > grandchild; wait"});
         let call = run(BASH, &input, &env);
         // Dropped mid-run, as the loop drops a call when the turn is interrupted.

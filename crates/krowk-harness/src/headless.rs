@@ -40,6 +40,8 @@ pub struct Options {
     pub resume: Option<String>,
     pub model: Option<ModelRef>,
     pub permission_mode: PermissionMode,
+    /// `--toolset`: the preset for this prompt, instead of the model's.
+    pub toolset: Option<String>,
     pub format: OutputFormat,
 }
 
@@ -67,7 +69,7 @@ async fn drive(host: Host, opts: Options, stdout: &mut dyn Write) -> Outcome {
     // A resumed session's id is known up front; a new one's arrives with
     // its root event.
     let mut session_id: Option<String> = opts.resume.clone();
-    let cmd = Command::Prompt { session_id: opts.resume, text: opts.prompt, model: opts.model, permission_mode: opts.permission_mode };
+    let cmd = Command::Prompt { session_id: opts.resume, text: opts.prompt, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset };
     let exec = host.execute(cmd, tx);
     tokio::pin!(exec);
     let mut done: Option<Result<Option<RunResult>, EngineError>> = None;

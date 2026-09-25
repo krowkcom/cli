@@ -119,3 +119,46 @@ pub fn readme_script(body: &serde_json::Value, _n: usize) -> Reply {
         Reply::sse(&fixture("turn1_tool_use.sse"))
     }
 }
+
+/// A response that calls one tool, streamed the way the API streams one:
+/// the input as JSON deltas, split mid-string.
+pub fn tool_use(id: &str, name: &str, input: &serde_json::Value) -> String {
+    let json = input.to_string();
+    let cut = json.char_indices().map(|(i, _)| i).nth(json.chars().count() / 2).unwrap_or(0);
+    let delta = |part: &str| {
+        format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": part}})
+        )
+    };
+    format!(
+        "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\n{}{}event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":40}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+        serde_json::json!({"type": "message_start", "message": {"id": format!("msg_{id}"), "type": "message", "role": "assistant", "model": "claude-sonnet-4-6", "content": [], "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 20, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1}}}),
+        serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}),
+        delta(&json[..cut]),
+        delta(&json[cut..]),
+    )
+}
+
+/// The edit the edit script makes to README.md, in each edit tool's format.
+pub fn readme_edit(tool: &str) -> serde_json::Value {
+    match tool {
+        "str_replace" => serde_json::json!({"path": "README.md", "old_str": "Permalinks for agent output.", "new_str": "Permalinks for everything agents make."}),
+        "search_replace" => serde_json::json!({"file_path": "README.md", "old_string": "Permalinks for agent output.", "new_string": "Permalinks for everything agents make."}),
+        "apply_patch" => serde_json::json!({"input": "*** Begin Patch\n*** Update File: README.md\n@@ # krowk\n \n-Permalinks for agent output.\n+Permalinks for everything agents make.\n*** End Patch\n"}),
+        other => panic!("no edit tool {other}"),
+    }
+}
+
+/// A model that edits README.md with whichever edit tool the request
+/// offers, then answers once it has the result.
+pub fn edit_script(body: &serde_json::Value, _n: usize) -> Reply {
+    let messages = body["messages"].as_array().cloned().unwrap_or_default();
+    let has_result = messages.last().and_then(|m| m["content"].as_array().cloned()).is_some_and(|c| c.iter().any(|b| b["type"] == "tool_result"));
+    if has_result {
+        return Reply::sse(&fixture("turn2_answer.sse"));
+    }
+    let tools: Vec<String> = body["tools"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str().map(String::from)).collect();
+    let tool = ["str_replace", "apply_patch", "search_replace"].into_iter().find(|t| tools.iter().any(|n| n == t)).expect("an edit tool is offered");
+    Reply::sse(&tool_use("toolu_01EditReadme", tool, &readme_edit(tool)))
+}

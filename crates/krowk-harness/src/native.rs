@@ -5,6 +5,7 @@
 use crate::engine::{BoxFuture, Engine, EngineError, EngineEvent, Events, HistoryItem, TurnContext, TurnEnd};
 use crate::protocol::{Item, ItemKind, ToolDefinition, Usage, WireApi};
 use crate::tools;
+use crate::toolset::Toolset;
 use tokio::sync::watch;
 
 /// Model calls in one turn, at most: a loop that never stops asking for
@@ -39,6 +40,11 @@ pub struct ModelResponse {
 pub trait ModelClient: Send + Sync {
     fn provider(&self) -> &str;
     fn wire_api(&self) -> WireApi;
+    /// Whether this model takes freeform (grammar) tools, so `apply_patch`
+    /// is offered as one. The Messages API has none.
+    fn custom_tools(&self, _model: &str) -> bool {
+        false
+    }
     fn stream<'a>(&'a self, req: &'a ModelRequest, events: &'a Events, cancel: watch::Receiver<bool>) -> BoxFuture<'a, Result<ModelResponse, EngineError>>;
 }
 
@@ -49,14 +55,31 @@ pub struct NativeEngine<C: ModelClient> {
 /// The system prompt: small and identical from call to call, because it is
 /// the front of the cached prefix. Nothing volatile goes in it — no date,
 /// no clock, nothing a second call would render differently.
-pub fn system_prompt(cwd: &std::path::Path) -> String {
+/// It names the turn's edit tool, which is fixed for the session's model.
+pub fn system_prompt(cwd: &std::path::Path, toolset: &Toolset) -> String {
     format!(
         "You are krowk, a coding agent working in a terminal on the user's machine.\n\
          The working directory is {}. Relative paths resolve against it.\n\
-         Use the tools to look before you answer: read files rather than guessing what they hold.\n\
+         Use the tools to look before you answer: read files rather than guessing what they hold, and find them with grep and glob.\n\
+         Change existing files with {}; create new ones with write.\n\
          Be direct and brief. When the task is done, say what you found or did in plain text.",
-        cwd.display()
+        cwd.display(),
+        toolset.preset.edit.name()
     )
+}
+
+/// Tokens in a text, estimated at four bytes a token — the ratio providers
+/// quote for English and code. No tokenizer ships with krowk; what the
+/// estimate is for is noticing growth, which it does whatever the true
+/// ratio is.
+pub fn estimate_tokens(text: &str) -> u64 {
+    (text.len() as u64).div_ceil(4)
+}
+
+/// The tool definitions' estimated tokens, over the JSON a provider is sent
+/// for them.
+pub fn tools_tokens(tools: &[ToolDefinition]) -> u64 {
+    tools.iter().map(|t| estimate_tokens(&serde_json::to_string(t).expect("a definition serializes"))).sum()
 }
 
 impl<C: ModelClient> Engine for NativeEngine<C> {
@@ -70,14 +93,15 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
 
     fn run_turn<'a>(&'a self, ctx: TurnContext, events: Events) -> BoxFuture<'a, Result<TurnEnd, EngineError>> {
         Box::pin(async move {
-            let system = system_prompt(&ctx.cwd);
-            let tool_defs = tools::definitions();
+            let toolset = Toolset { preset: ctx.preset, custom_tools: self.client.custom_tools(&ctx.model.model) };
+            let system = system_prompt(&ctx.cwd, &toolset);
+            let tool_defs = tools::definitions(&toolset);
             let _ = events.send(EngineEvent::Context { system: system.clone(), tools: tool_defs.clone() }).await;
             let mut req = ModelRequest { model: ctx.model.model.clone(), system, tools: tool_defs, history: ctx.history.clone() };
             // Response indexes continue from the history's, so a replayed
             // turn and this one never share an index.
             let first_response = req.history.iter().filter_map(|h| h.response).max().map_or(0, |m| m + 1);
-            let tool_env = tools::ToolEnv { cwd: &ctx.cwd, permission_mode: ctx.permission_mode };
+            let tool_env = tools::ToolEnv { cwd: &ctx.cwd, permission_mode: ctx.permission_mode, edit: ctx.preset.edit };
             for response in (first_response..).take(MAX_STEPS) {
                 if *ctx.cancel.borrow() {
                     return Ok(TurnEnd::Interrupted);
@@ -140,5 +164,37 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                 format!("the turn made {MAX_STEPS} model calls without finishing, so it was stopped — ask again with a narrower task"),
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::toolset::PRESETS;
+
+    /// The ceiling on the system prompt plus tool definitions, in estimated
+    /// tokens, for every preset in either tool form. Every model call pays
+    /// for these, so growth has to be a decision: a new tool or a longer
+    /// description that crosses it moves the number here, with a reason.
+    /// Measured at ticket 03: 1,178 for `claude`, 1,191 for `grok`, 1,195
+    /// for `gpt` as a JSON tool and 1,320 with its freeform grammar — the
+    /// largest, since the grammar rides along with the description.
+    const CONTEXT_TOKENS_BUDGET: u64 = 1_500;
+
+    #[test]
+    fn r_tool_1_the_system_prompt_and_tool_definitions_stay_small() {
+        // A long, realistic working directory: it is the one variable part.
+        let cwd = std::path::Path::new("/home/someone/Repositories/a-project-with-a-long-name");
+        for preset in PRESETS {
+            for custom_tools in [false, true] {
+                let ts = Toolset { preset, custom_tools };
+                let system = system_prompt(cwd, &ts);
+                let (s, t) = (estimate_tokens(&system), tools_tokens(&tools::definitions(&ts)));
+                println!("R-TOOL-1 context tokens: {} (custom tools {custom_tools}): system {s} + tools {t} = {}", preset.name, s + t);
+                assert!(s < 150, "the system prompt is {s} tokens: keep it a few lines");
+                assert!(s + t <= CONTEXT_TOKENS_BUDGET, "{}: system + tools is {} tokens, over the {CONTEXT_TOKENS_BUDGET} budget", preset.name, s + t);
+                assert_eq!(system, system_prompt(cwd, &ts), "nothing volatile: the prompt is the front of the cached prefix");
+            }
+        }
     }
 }

@@ -36,6 +36,10 @@ pub struct InstancesConfig {
     /// `<instance>/<model>`, or a bare model id on the default instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// The toolset preset every model runs with (`claude`, `gpt`, `grok`),
+    /// instead of the one its family picks. `--toolset` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset: Option<String>,
 }
 
 /// What an instance is. Tagged by `kind`.
@@ -102,6 +106,8 @@ impl std::fmt::Debug for Resolved {
 pub struct Registry {
     pub instances: BTreeMap<String, Resolved>,
     pub default_model: Option<String>,
+    /// Config's `toolset`, already known to name a preset.
+    pub toolset: Option<String>,
 }
 
 impl Registry {
@@ -114,7 +120,7 @@ impl Registry {
         for (name, kind) in std::iter::once((DEFAULT_INSTANCE, &implicit)).chain(defined) {
             instances.insert(name.to_string(), resolve_one(name, kind, env));
         }
-        Registry { instances, default_model: cfg.default_model.clone() }
+        Registry { instances, default_model: cfg.default_model.clone(), toolset: cfg.toolset.clone() }
     }
 
     /// `--model`'s reading: `<instance>/<model>` when the part before the
@@ -187,6 +193,13 @@ pub fn from_config_json(raw: &serde_json::Value) -> Result<InstancesConfig, Stri
     if let Some(v) = raw.get("defaultModel") {
         cfg.default_model = Some(v.as_str().ok_or("\"defaultModel\" must be a string")?.to_string());
     }
+    if let Some(v) = raw.get("toolset") {
+        let name = v.as_str().ok_or("\"toolset\" must be a string")?;
+        if crate::toolset::by_name(name).is_none() {
+            return Err(format!("\"toolset\": {name:?} is not a toolset — one of {}", crate::toolset::names().join(", ")));
+        }
+        cfg.toolset = Some(name.to_string());
+    }
     Ok(cfg)
 }
 
@@ -220,5 +233,8 @@ mod tests {
         assert!(reg.get("nope").unwrap_err().contains("anthropic, anthropic:work"));
         assert_eq!(reg.default_model().unwrap().model, DEFAULT_MODEL);
         assert!(from_config_json(&serde_json::json!({"instances": {"x": {"kind": "martian"}}})).is_err());
+        // R-TOOL-2: config can pin a toolset, and only one that exists.
+        assert_eq!(Registry::resolve(&from_config_json(&serde_json::json!({"toolset": "grok"})).unwrap(), &env).toolset.as_deref(), Some("grok"));
+        assert!(from_config_json(&serde_json::json!({"toolset": "vim"})).unwrap_err().contains("claude, gpt, grok"));
     }
 }

@@ -312,6 +312,22 @@ pub(super) fn input_text(input: &serde_json::Value) -> Result<String, String> {
     }
 }
 
+/// Every path a patch names — each hunk's, and a move's destination —
+/// for the permission evaluator, which judges the patch by all of them.
+pub(super) fn paths(patch: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for h in parse(patch)? {
+        match h {
+            Hunk::Add { path, .. } | Hunk::Delete { path } => out.push(path),
+            Hunk::Update { path, move_to, .. } => {
+                out.push(path);
+                out.extend(move_to);
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub(super) fn apply(patch: &str, scope: &Scope) -> (String, bool) {
     let hunks = match parse(patch) {
         Ok(h) => h,
@@ -571,7 +587,7 @@ mod tests {
         assert_eq!(before(), "one\ntwo\nthree\n");
         // And no patch at all where edits are not allowed.
         let refused = run(APPLY_PATCH, &json!({ "input": "*** Begin Patch\n*** Delete File: a.txt\n*** End Patch" }), &ToolEnv { permission_mode: PermissionMode::Plan, ..e }).await;
-        assert!(refused.1 && refused.0.contains("acceptEdits") && d.join("a.txt").exists());
+        assert!(refused.1 && refused.0.contains("plan mode") && d.join("a.txt").exists(), "{refused:?}");
         let _ = std::fs::remove_dir_all(d);
     }
 }

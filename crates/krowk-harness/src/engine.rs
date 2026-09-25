@@ -43,7 +43,7 @@ use crate::budget::Budget;
 use crate::evidence::Evidence;
 use crate::toolset::Preset;
 use crate::catalog::ModelInfo;
-use crate::protocol::{Billing, Delta, Effort, ErrorInfo, Item, ItemKind, ModelRef, PermissionMode, ToolDefinition, Usage, WireApi};
+use crate::protocol::{ApprovalDecision, ApprovalRequest, Billing, Delta, Effort, ErrorInfo, Item, ItemKind, ModelRef, PermissionMode, ToolDefinition, Usage, WireApi};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -79,6 +79,11 @@ pub enum EngineEvent {
     /// Something for the person and nobody else — never logged, never sent
     /// to a model: an anonymous upload's claim command.
     Notice { text: String },
+    /// A call waits for a person's say: the host sends it to the session's
+    /// clients as `approval.requested`.
+    Approval(ApprovalRequest),
+    /// It was answered.
+    ApprovalResolved { request_id: String, decision: ApprovalDecision },
 }
 
 /// Where an engine sends its events. Bounded, so a slow client slows the
@@ -116,6 +121,12 @@ pub struct TurnContext {
     pub budget: Budget,
     /// Where `publish` sends files; none when this host publishes nothing.
     pub evidence: Option<Evidence>,
+    /// The turn's permissions: every call the engine runs or is asked about
+    /// is judged here, and asked about through it.
+    pub gate: crate::permissions::Gate,
+    /// What the repository and the person's settings bring to a native
+    /// turn: instructions, skills, hooks.
+    pub compat: std::sync::Arc<crate::compat::Compat>,
 }
 
 /// The steering a running turn has been sent and not yet taken: a queue

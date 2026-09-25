@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Command",
-  "description": "What a client asks of the engine. `prompt`, `interrupt` and `steer` are\nserved today; the rest are typed now so every client is written against\nthe whole vocabulary, and are refused with `not_implemented` until their\ntickets land.",
+  "description": "What a client asks of the engine. `prompt`, `interrupt`, `steer` and\n`approve` are served today; the rest are typed now so every client is written against\nthe whole vocabulary, and are refused with `not_implemented` until their\ntickets land.",
   "oneOf": [
     {
       "description": "Start a turn: in `sessionId` when given, else in a new session.",
@@ -109,7 +109,7 @@
       ]
     },
     {
-      "description": "Answer a permission request.",
+      "description": "Answer an `approval.requested`.",
       "type": "object",
       "properties": {
         "sessionId": {
@@ -196,7 +196,7 @@
       ]
     },
     "PermissionMode": {
-      "description": "Claude-Code-compatible permission modes. Until the permission system\nlands, only `bypassPermissions` changes anything: it is the one mode in\nwhich `bash` runs.",
+      "description": "Claude-Code-compatible permission modes (R-PERM-1): `default` asks\nbefore edits and commands, `acceptEdits` before commands, `plan` changes\nnothing, and `bypassPermissions` asks before nothing — though a deny\nrule still holds in every one (`crate::permissions`).",
       "type": "string",
       "enum": [
         "default",
@@ -241,10 +241,12 @@
       }
     },
     "ApprovalDecision": {
-      "description": "An answer to a permission request.",
+      "description": "An answer to a permission request: allow this call, allow calls like it\nfor the rest of the session or for good in this project (the request's\n`remember` rules), or deny it.",
       "type": "string",
       "enum": [
         "allow",
+        "allowSession",
+        "allowProject",
         "deny"
       ]
     }

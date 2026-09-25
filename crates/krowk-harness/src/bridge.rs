@@ -42,8 +42,11 @@ pub struct BridgeEnv<'a> {
     /// The backend running the session, e.g. `claude-code`.
     pub backend: &'a str,
     pub krowk_version: &'a str,
-    /// The mode the turn runs in: `publish` needs `acceptEdits` or more.
-    pub permission_mode: crate::protocol::PermissionMode,
+    /// The turn's permissions: `publish` is judged by them, as the native
+    /// one is — whatever a vendor's own settings allowed.
+    pub gate: &'a crate::permissions::Gate,
+    /// The turn's interrupt, while a person is asked; none outside a turn.
+    pub cancel: Option<&'a tokio::sync::watch::Receiver<bool>>,
     /// Where `publish` sends files, and where a run it opens is reported;
     /// none when the host publishes nothing.
     pub evidence: Option<(&'a Evidence, &'a Events)>,
@@ -73,9 +76,22 @@ pub const EXPOSED: &[Exposed] = &[
 
 fn publish<'a>(env: &'a BridgeEnv<'a>, input: &'a Value) -> BoxFuture<'a, (String, bool)> {
     Box::pin(async move {
-        // Held here as well as at Claude Code's approval: an allow rule in
-        // its settings approves a call without asking krowk.
-        if let Err(why) = evidence::permitted(env.permission_mode) {
+        // Judged here, whatever the vendor asked or allowed by itself: an
+        // allow rule in Claude Code's settings approves a call without
+        // asking krowk, and Codex's dynamic tools are never asked about.
+        let call = match evidence::call(env.cwd, input) {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        let judged = match (env.evidence, env.cancel) {
+            (Some((_, events)), Some(cancel)) => env.gate.check(&call, evidence::PUBLISH, input, None, events, cancel).await.map(drop),
+            _ => match env.gate.verdict(&call, None) {
+                crate::permissions::Verdict::Allow(_) => Ok(()),
+                crate::permissions::Verdict::Deny(m) => Err(m),
+                crate::permissions::Verdict::Ask { reason, .. } => Err(format!("publish needs approval — {reason} — and it was called where nobody can be asked")),
+            },
+        };
+        if let Err(why) = judged {
             return (why, true);
         }
         match env.evidence {
@@ -169,7 +185,8 @@ mod tests {
     #[test]
     fn r_back_1_the_bridge_lists_and_runs_session_info_and_refuses_what_it_lacks() {
         let model = ModelRef { instance: "claude:work".into(), model: "haiku".into() };
-        let env = BridgeEnv { session_id: "s-1", turn_id: "t-1", model: &model, cwd: Path::new("/repo"), backend: "claude-code", krowk_version: "test", permission_mode: Default::default(), evidence: None };
+        let gate = crate::permissions::Gate::modes_only(Path::new("/repo"), crate::protocol::PermissionMode::Default);
+        let env = BridgeEnv { session_id: "s-1", turn_id: "t-1", model: &model, cwd: Path::new("/repo"), backend: "claude-code", krowk_version: "test", gate: &gate, cancel: None, evidence: None };
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let handle = |msg: &Value| rt.block_on(handle(msg, &env));
         let init = handle(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}));
@@ -201,7 +218,8 @@ mod tests {
         });
         let ev = Evidence::new(publisher, "s-1", None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let env = BridgeEnv { session_id: "s-1", turn_id: "t-1", model: &model, cwd: Path::new("/repo"), backend: "claude-code", krowk_version: "test", permission_mode: crate::protocol::PermissionMode::AcceptEdits, evidence: Some((&ev, &tx)) };
+        let accept = crate::permissions::Gate::modes_only(Path::new("/repo"), crate::protocol::PermissionMode::AcceptEdits);
+        let env = BridgeEnv { session_id: "s-1", turn_id: "t-1", model: &model, cwd: Path::new("/repo"), backend: "claude-code", krowk_version: "test", gate: &accept, cancel: None, evidence: Some((&ev, &tx)) };
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let list = rt.block_on(handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), &env));
         assert_eq!(list["result"]["tools"][1]["name"], "publish");
@@ -213,10 +231,11 @@ mod tests {
         assert_eq!(definitions()[1].name, "mcp__krowk__publish");
         // Under the default mode it is refused, even when Claude Code's own
         // allow rules let the call through without asking krowk.
-        let plain = BridgeEnv { permission_mode: Default::default(), ..env };
+        let default = crate::permissions::Gate::modes_only(Path::new("/repo"), crate::protocol::PermissionMode::Default);
+        let plain = BridgeEnv { gate: &default, ..env };
         let refused = rt.block_on(handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "publish", "arguments": {"files": ["shot.png"]}}}), &plain));
         assert_eq!(refused["result"]["isError"], true);
-        assert!(refused["result"]["content"][0]["text"].as_str().unwrap().contains("--permission-mode acceptEdits"), "{refused}");
+        assert!(refused["result"]["content"][0]["text"].as_str().unwrap().contains("needs approval"), "judged by the same evaluator as the native tool: {refused}");
         assert!(rx.try_recv().is_err(), "nothing was published");
     }
 }

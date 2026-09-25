@@ -26,7 +26,7 @@
 //! | subtype | direction | what krowk does |
 //! |---|---|---|
 //! | `initialize` | krowk → claude | first, on every process; its answer lists the `models`, which is how in-place model switching is detected |
-//! | `can_use_tool` | claude → krowk | answered by krowk's own approval path (`approve`) |
+//! | `can_use_tool` | claude → krowk | judged by krowk's permission evaluator (`crate::permissions`), asking the person when a client is attached |
 //! | `mcp_message` | claude → krowk | a JSON-RPC message for the `krowk` MCP server, answered by `crate::bridge` |
 //! | `interrupt` | krowk → claude | a `Command::Interrupt`; the turn ends at the next `result` and the process lives on |
 //! | `set_model` | krowk → claude | a turn on another model of the same instance, when `initialize` listed models; otherwise a new process on `--resume` |
@@ -41,13 +41,16 @@
 //! the project's settings (`permissions.allow`), a `PreToolUse` hook that
 //! approves, an agent's own `permissionMode`, and the read-only calls its
 //! mode never asks about. Those run without krowk's `can_use_tool` — that
-//! is Claude Code behaving as its user configured it, and ticket 09's rules
-//! are where krowk takes them into account. What krowk does hold is the
-//! mode: the process is started `--permission-mode default` (or `plan`),
+//! is Claude Code behaving as its user configured it, from the same
+//! `.claude/settings.json` files krowk's own rules read. Every deny rule
+//! krowk holds is handed to it as `--disallowedTools`, so what Claude Code
+//! would allow by itself still meets them: deny wins here too. What krowk
+//! also holds is the mode: the process is started `--permission-mode default` (or `plan`),
 //! so a `defaultMode` in settings cannot loosen it, and a turn whose
 //! `system`/`init` reports a mode looser than krowk's is stopped before it
-//! runs anything. Every call Claude Code does ask about is answered by
-//! `approve`.
+//! runs anything. Every call Claude Code does ask about is judged by krowk's
+//! permission evaluator (`crate::permissions`) under Claude Code's own tool
+//! names, and asked of the person when a client is attached.
 //!
 //! **Compliance** (R-BACK-2) is structural: krowk starts the binary as the
 //! user installed it, sends it no system prompt and no headers, sets only
@@ -62,6 +65,7 @@ pub mod stream;
 use crate::bridge::{self, BridgeEnv};
 use crate::engine::{cancelled, BoxFuture, Engine, EngineError, EngineEvent, Events, TurnContext, TurnEnd};
 use crate::instances::{Backend, Resolved};
+use crate::permissions::{self, Access, Call, Gate, Verdict};
 use crate::protocol::{Billing, Effort, Item, ModelRef, PermissionMode, ToolDefinition, WireApi};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -104,6 +108,10 @@ pub struct Launch {
     pub resume: Option<String>,
     pub effort: Option<&'static str>,
     pub plan: bool,
+    /// Every deny rule that applies, in Claude Code's spelling, as
+    /// `--disallowedTools`: what Claude Code would allow by itself still
+    /// meets them, so deny wins on this backend too.
+    pub disallowed: Vec<String>,
 }
 
 /// The `--mcp-config` that injects krowk's tools: one in-process (`sdk`)
@@ -142,7 +150,11 @@ pub fn args(l: &Launch, extra: &[String]) -> Vec<String> {
     // the project's settings (acceptEdits, bypassPermissions) would decide
     // it. Plan changes what Claude Code does, not only what it may do, so it
     // is Claude Code's to know; every looser krowk mode stays krowk's, and
-    // what Claude Code asks is answered by `approve`.
+    // what Claude Code asks is judged by krowk's permission evaluator.
+    if !l.disallowed.is_empty() {
+        a.push("--disallowedTools".into());
+        a.extend(l.disallowed.iter().cloned());
+    }
     a.extend(["--permission-mode".into(), if l.plan { "plan" } else { "default" }.into()]);
     a.extend(extra.iter().cloned());
     a
@@ -178,51 +190,45 @@ pub fn transcript_path(config_dir: &Path, cwd: &str, session_id: &str) -> PathBu
         .unwrap_or(direct)
 }
 
-/// A tool call Claude Code asks about, answered until the permission system
-/// lands (ticket 9 replaces this evaluator). Calls Claude Code approves
-/// itself — its settings' allow rules, its hooks — never reach here (see
-/// the module's notes). The rule is the native loop's: reading needs no
-/// mode, writing needs `acceptEdits`, running commands needs
-/// `bypassPermissions`, and the file tools reach only inside the working
-/// directory unless permissions are bypassed. No edit reaches `.git`,
-/// `.claude` or the instance's own config directory (`protected`) unless
-/// permissions are bypassed: Claude Code runs what their settings, hooks
-/// and agents name. krowk's own bridged tools are allowed, `publish` under
-/// the rule that holds it natively (`acceptEdits` and up). Anything
-/// this build does not know is treated as running a command.
-pub fn approve(mode: PermissionMode, tool: &str, input: &Value, cwd: &Path, protected: &[PathBuf]) -> Result<(), String> {
-    let bypass = mode == PermissionMode::BypassPermissions;
-    if let Some(own) = tool.strip_prefix(&format!("mcp__{}__", bridge::SERVER)) {
-        return if own == crate::evidence::PUBLISH { crate::evidence::permitted(mode) } else { Ok(()) };
-    }
-    let scope = crate::tools::Scope { cwd: cwd.to_path_buf(), bypass, protected: protected.to_vec() };
-    let path = ["file_path", "notebook_path", "path"].iter().find_map(|k| input.get(*k).and_then(Value::as_str));
-    // A glob can name where it searches as much as a path can: an absolute
-    // `pattern` (Glob) or `glob` (Grep) is judged by its fixed part.
-    let glob_key = match tool {
-        "Glob" => Some("pattern"),
-        "Grep" => Some("glob"),
-        _ => None,
+/// A tool call Claude Code asks about, as krowk's permission evaluator
+/// judges it (`crate::permissions`): Claude Code's own tool names are the
+/// names rules are written in. Calls Claude Code allows itself — its
+/// settings' allow rules, its hooks — never reach here (see the module's
+/// notes); what does is judged like a native call. krowk's own bridged
+/// tools need no permission; a tool this build does not know is asked
+/// about.
+pub fn call_of(tool: &str, input: &Value, cwd: &Path) -> Call {
+    let at = |p: &str| {
+        let p = Path::new(p);
+        if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
     };
-    let globbed = glob_key.and_then(|k| input.get(k).and_then(Value::as_str)).filter(|g| Path::new(g).is_absolute()).map(glob_root);
-    match tool {
-        "Read" | "Grep" | "Glob" | "LS" | "NotebookRead" => {
-            if let Some(g) = &globbed {
-                scope.path(g)?;
+    let path = ["file_path", "notebook_path", "path"].iter().find_map(|k| input.get(*k).and_then(Value::as_str)).map(at);
+    let access = if tool.starts_with(&format!("mcp__{}__", bridge::SERVER)) {
+        Access::Free
+    } else if let Some(rest) = tool.strip_prefix("mcp__") {
+        let (server, t) = rest.split_once("__").unwrap_or((rest, ""));
+        Access::Mcp { server: server.into(), tool: t.into() }
+    } else {
+        match tool {
+            "Read" | "NotebookRead" => Access::Read(vec![path.unwrap_or_else(|| cwd.to_path_buf())]),
+            "Grep" | "Glob" | "LS" => {
+                // A glob can name where it searches as much as a path can:
+                // an absolute `pattern` (Glob) or `glob` (Grep) is judged by
+                // its fixed part.
+                let key = if tool == "Glob" { "pattern" } else { "glob" };
+                let globbed = input.get(key).and_then(Value::as_str).filter(|g| Path::new(g).is_absolute()).map(|g| PathBuf::from(glob_root(g)));
+                let mut ps = vec![path.unwrap_or_else(|| cwd.to_path_buf())];
+                ps.extend(globbed);
+                Access::Read(ps)
             }
-            path.map(|p| scope.path(p).map(drop)).unwrap_or(Ok(()))
+            "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => Access::Edit(path.into_iter().collect()),
+            "Bash" => Access::Bash(input.get("command").and_then(Value::as_str).unwrap_or_default().to_string()),
+            "WebFetch" => Access::Fetch(input.get("url").and_then(Value::as_str).unwrap_or_default().to_string()),
+            "TodoWrite" | "ToolSearch" | "Task" | "Agent" | "EnterPlanMode" | "ExitPlanMode" | "BashOutput" | "KillShell" | "KillBash" => Access::Free,
+            _ => Access::Other,
         }
-        "TodoWrite" | "ToolSearch" | "Task" | "Agent" | "EnterPlanMode" | "ExitPlanMode" => Ok(()),
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
-            if !matches!(mode, PermissionMode::AcceptEdits | PermissionMode::BypassPermissions) {
-                return Err(format!("{tool} changes files, which this session does not allow: until krowk's permission rules land, edits run only when krowk is started with `--permission-mode acceptEdits` or `bypassPermissions`. Say what you would change instead."));
-            }
-            path.map(|p| scope.edit_path(p).map(drop)).unwrap_or(Ok(()))
-        }
-        "AskUserQuestion" if !bypass => Err("krowk is running this turn without a person to ask: decide, say what you assumed, and carry on.".into()),
-        _ if bypass => Ok(()),
-        _ => Err(format!("{tool} is not allowed in this session: until krowk's permission rules land, it runs only when krowk is started with `--permission-mode bypassPermissions`. Use Read, Grep and Glob, or ask the person to rerun with that flag.")),
-    }
+    };
+    Call { tool: tool.to_string(), access, subject: input.get("subagent_type").or_else(|| input.get("skill")).and_then(Value::as_str).map(String::from) }
 }
 
 /// The fixed part of an absolute glob: the directories before the first
@@ -324,6 +330,7 @@ impl Engine for ClaudeEngine {
                 resume: ctx.backend_session.clone(),
                 effort: ctx.effort.map(effort_level),
                 plan: ctx.permission_mode == PermissionMode::Plan,
+                disallowed: ctx.gate.policy().deny_list(),
             };
             let ask = Answers {
                 session_id: ctx.session_id.clone(),
@@ -332,7 +339,7 @@ impl Engine for ClaudeEngine {
                 cwd: ctx.cwd.clone(),
                 mode: ctx.permission_mode,
                 krowk_version: self.krowk_version.clone(),
-                protected: self.backend().home.iter().cloned().collect(),
+                gate: ctx.gate.protecting(self.backend().home.iter().cloned()),
                 evidence: ctx.evidence.clone(),
             };
             // The running process serves this turn when its launch still
@@ -344,7 +351,7 @@ impl Engine for ClaudeEngine {
                 // EnterPlanMode's plan). It is launched in one of two modes,
                 // and serves only a turn that wants the one it is in.
                 let mode_fits = p.mode.is_empty() || (want.plan == (p.mode == "plan") && !looser_than(&p.mode, ctx.permission_mode));
-                let fits = p.alive() && mode_fits && p.launch.plan == want.plan && p.launch.effort == want.effort;
+                let fits = p.alive() && mode_fits && p.launch.plan == want.plan && p.launch.effort == want.effort && p.launch.disallowed == want.disallowed;
                 let switched = fits && (p.launch.model == want.model || (p.set_model && p.set_model(&want.model, &ask).await));
                 if !switched && let Some(old) = slot.take() {
                     old.shutdown().await;
@@ -387,26 +394,45 @@ struct Answers {
     cwd: PathBuf,
     mode: PermissionMode,
     krowk_version: String,
-    /// The instance's config directory: no edit reaches it.
-    protected: Vec<PathBuf>,
+    /// The turn's permissions, with the instance's config directory kept
+    /// from edits too.
+    gate: Gate,
     /// Where a bridged `publish` sends files.
     evidence: Option<crate::evidence::Evidence>,
 }
 
+/// Where a question for a person goes while a turn runs: the turn's events,
+/// and its interrupt. Outside a turn (a request krowk made, such as
+/// `initialize`) nobody is asked.
+type Asking<'a> = Option<(&'a Events, &'a tokio::sync::watch::Receiver<bool>)>;
+
 impl Answers {
-    /// The answer to one of Claude Code's control requests. A bridged tool
-    /// call can take a while — `publish` uploads — and Claude Code waits for
-    /// its answer before it goes on, so it is awaited here.
-    /// `events` is none while a process is being set up, before a turn
-    /// has anywhere to report to; nothing is published then.
-    async fn answer(&self, request_id: &str, req: &Value, events: Option<&Events>) -> Value {
+    /// Judges a call, asking a person when the verdict says to and a turn
+    /// is there to ask through.
+    async fn permit(&self, tool: &str, input: &Value, asking: Asking<'_>) -> Result<(), String> {
+        if tool == "AskUserQuestion" && self.mode != PermissionMode::BypassPermissions {
+            return Err("krowk is running this turn without a person to ask: decide, say what you assumed, and carry on.".into());
+        }
+        let call = call_of(tool, input, &self.cwd);
+        match asking {
+            Some((events, cancel)) => self.gate.check(&call, tool, input, None, events, cancel).await.map(drop),
+            None => match self.gate.verdict(&call, None) {
+                Verdict::Allow(_) => Ok(()),
+                Verdict::Deny(m) => Err(m),
+                Verdict::Ask { reason, .. } => Err(format!("{} needs approval — {reason} — and Claude Code asked outside a turn, where nobody can be asked", permissions::summary(&call))),
+            },
+        }
+    }
+
+    /// The answer to one of Claude Code's control requests.
+    async fn answer(&self, request_id: &str, req: &Value, asking: Asking<'_>) -> Value {
         let subtype = req.get("subtype").and_then(Value::as_str).unwrap_or_default();
         let success = |response: Value| json!({"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": response}});
         match subtype {
             "can_use_tool" => {
                 let tool = req.get("tool_name").and_then(Value::as_str).unwrap_or_default();
                 let input = req.get("input").cloned().unwrap_or_else(|| json!({}));
-                match approve(self.mode, tool, &input, &self.cwd, &self.protected) {
+                match self.permit(tool, &input, asking).await {
                     Ok(()) => success(json!({"behavior": "allow", "updatedInput": input})),
                     Err(message) => success(json!({"behavior": "deny", "message": message})),
                 }
@@ -419,8 +445,9 @@ impl Answers {
                     cwd: &self.cwd,
                     backend: BACKEND,
                     krowk_version: &self.krowk_version,
-                    permission_mode: self.mode,
-                    evidence: self.evidence.as_ref().zip(events),
+                    gate: &self.gate,
+                    cancel: asking.map(|(_, c)| c),
+                    evidence: self.evidence.as_ref().zip(asking.map(|(e, _)| e)),
                 };
                 success(json!({"mcp_response": bridge::handle(req.get("message").unwrap_or(&Value::Null), &env).await}))
             }
@@ -693,7 +720,7 @@ impl Proc {
                     };
                     match msg["type"].as_str() {
                         Some("control_request") => {
-                            let answer = ask.answer(msg["request_id"].as_str().unwrap_or_default(), &msg["request"], Some(events)).await;
+                            let answer = ask.answer(msg["request_id"].as_str().unwrap_or_default(), &msg["request"], Some((events, &ctx.cancel))).await;
                             // An approved ExitPlanMode or EnterPlanMode moves
                             // Claude Code to default or plan for what follows.
                             if msg.pointer("/request/subtype").and_then(Value::as_str) == Some("can_use_tool")
@@ -843,13 +870,16 @@ mod tests {
 
     #[test]
     fn r_back_1_the_process_is_launched_with_the_stream_json_protocol_and_krowks_mcp_server() {
-        let l = Launch { model: "haiku".into(), resume: Some("cc-1".into()), effort: Some("high"), plan: false };
+        let l = Launch { model: "haiku".into(), resume: Some("cc-1".into()), effort: Some("high"), plan: false, disallowed: Vec::new() };
         let a = args(&l, &["--add-dir".into(), "/x".into()]);
         let s = a.join(" ");
         assert!(s.starts_with("-p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --mcp-config "), "{s}");
         assert!(s.contains(r#"{"mcpServers":{"krowk":{"name":"krowk","type":"sdk"}}} --strict-mcp-config --model haiku --resume cc-1 --effort high --permission-mode default --add-dir /x"#) || s.contains(r#"{"mcpServers":{"krowk":{"type":"sdk","name":"krowk"}}} --strict-mcp-config --model haiku --resume cc-1 --effort high --permission-mode default --add-dir /x"#), "{s}");
         assert!(s.contains("--permission-mode default --add-dir"), "the mode is always named, so settings cannot loosen it: {s}");
-        assert!(args(&Launch { plan: true, resume: None, effort: None, ..l }, &[]).join(" ").ends_with("--model haiku --permission-mode plan"));
+        assert!(args(&Launch { plan: true, resume: None, effort: None, ..l.clone() }, &[]).join(" ").ends_with("--model haiku --permission-mode plan"));
+        // R-PERM-1: krowk's deny rules reach what Claude Code allows by itself.
+        let denied = args(&Launch { disallowed: vec!["Bash(rm:*)".into(), "Read(.env)".into()], ..l }, &[]).join(" ");
+        assert!(denied.contains("--disallowedTools Bash(rm:*) Read(.env) --permission-mode default"), "{denied}");
         assert!(looser_than("bypassPermissions", PermissionMode::AcceptEdits) && looser_than("acceptEdits", PermissionMode::Default) && looser_than("auto", PermissionMode::AcceptEdits));
         assert!(looser_than("default", PermissionMode::Plan) && looser_than("somethingNew", PermissionMode::AcceptEdits));
         assert!(!looser_than("default", PermissionMode::Default) && !looser_than("plan", PermissionMode::Plan) && !looser_than("bypassPermissions", PermissionMode::BypassPermissions));
@@ -861,41 +891,41 @@ mod tests {
         let cwd = std::env::temp_dir().join(format!("krowk-approve-{}", std::process::id()));
         std::fs::create_dir_all(&cwd).unwrap();
         let cwd = cwd.canonicalize().unwrap();
-        let approve = |m, t: &str, i: &Value, c: &Path| super::approve(m, t, i, c, &[]);
+        let judge = |m, t: &str, i: &Value, protected: &[PathBuf]| crate::permissions::judge(m, Ok(call_of(t, i, &cwd)), &cwd, protected);
+        let approve = |m, t: &str, i: &Value| judge(m, t, i, &[]);
         let d = PermissionMode::Default;
-        assert!(approve(d, "mcp__krowk__session_info", &json!({}), &cwd).is_ok());
-        // publish uploads to a public link: held to what an edit is.
-        assert!(approve(d, "mcp__krowk__publish", &json!({"files": ["a.png"]}), &cwd).unwrap_err().contains("acceptEdits"));
-        assert!(approve(PermissionMode::Plan, "mcp__krowk__publish", &json!({"files": ["a.png"]}), &cwd).is_err());
-        assert!(approve(PermissionMode::AcceptEdits, "mcp__krowk__publish", &json!({"files": ["a.png"]}), &cwd).is_ok());
-        assert!(approve(d, "Read", &json!({"file_path": "README.md"}), &cwd).is_ok());
-        assert!(approve(d, "Read", &json!({"file_path": "/etc/passwd"}), &cwd).unwrap_err().contains("outside the working directory"));
-        assert!(approve(d, "Edit", &json!({"file_path": "a.txt"}), &cwd).unwrap_err().contains("acceptEdits"));
-        assert!(approve(PermissionMode::AcceptEdits, "Edit", &json!({"file_path": "a.txt"}), &cwd).is_ok());
-        assert!(approve(PermissionMode::AcceptEdits, "Write", &json!({"file_path": ".git/config"}), &cwd).unwrap_err().contains(".git"));
-        assert!(approve(PermissionMode::AcceptEdits, "Bash", &json!({"command": "ls"}), &cwd).unwrap_err().contains("bypassPermissions"));
-        assert!(approve(PermissionMode::BypassPermissions, "Bash", &json!({"command": "ls"}), &cwd).is_ok());
-        assert!(approve(d, "WebFetch", &json!({"url": "https://x"}), &cwd).is_err(), "an unknown tool is a command");
+        assert!(approve(d, "mcp__krowk__session_info", &json!({})).is_ok());
+        assert!(approve(d, "Read", &json!({"file_path": "README.md"})).is_ok());
+        assert!(approve(d, "Read", &json!({"file_path": "/etc/passwd"})).unwrap_err().contains("outside the working directory"));
+        assert!(approve(d, "Edit", &json!({"file_path": "a.txt"})).unwrap_err().contains("default mode"));
+        assert!(approve(PermissionMode::AcceptEdits, "Edit", &json!({"file_path": "a.txt"})).is_ok());
+        assert!(approve(PermissionMode::AcceptEdits, "Write", &json!({"file_path": ".git/config"})).unwrap_err().contains(".git"));
+        assert!(approve(PermissionMode::AcceptEdits, "Bash", &json!({"command": "ls"})).unwrap_err().contains("runs a command"));
+        assert!(approve(PermissionMode::BypassPermissions, "Bash", &json!({"command": "ls"})).is_ok());
+        assert!(approve(d, "WebFetch", &json!({"url": "https://x"})).is_err(), "a fetch is asked about");
+        assert!(approve(d, "SomethingNew", &json!({})).is_err(), "and so is a tool this build does not know");
+        assert!(approve(PermissionMode::Plan, "Write", &json!({"file_path": "a.txt"})).unwrap_err().contains("plan mode"));
         // A glob that names another directory is judged like a path.
-        assert!(approve(d, "Glob", &json!({"pattern": "/etc/**/*.conf"}), &cwd).unwrap_err().contains("outside the working directory"));
-        assert!(approve(d, "Grep", &json!({"pattern": "x", "glob": "/root/*"}), &cwd).unwrap_err().contains("outside the working directory"));
-        assert!(approve(d, "Glob", &json!({"pattern": "**/*.rs"}), &cwd).is_ok() && approve(d, "Grep", &json!({"pattern": "/etc/"}), &cwd).is_ok(), "a relative glob, and grep's regex, are not paths");
-        assert!(approve(d, "Glob", &json!({"pattern": format!("{}/src/**", cwd.display())}), &cwd).is_ok());
-        assert!(approve(PermissionMode::BypassPermissions, "Glob", &json!({"pattern": "/etc/*"}), &cwd).is_ok());
+        assert!(approve(d, "Glob", &json!({"pattern": "/etc/**/*.conf"})).unwrap_err().contains("outside the working directory"));
+        assert!(approve(d, "Grep", &json!({"pattern": "x", "glob": "/root/*"})).unwrap_err().contains("outside the working directory"));
+        assert!(approve(d, "Glob", &json!({"pattern": "**/*.rs"})).is_ok() && approve(d, "Grep", &json!({"pattern": "/etc/"})).is_ok(), "a relative glob, and grep's regex, are not paths");
+        assert!(approve(d, "Glob", &json!({"pattern": format!("{}/src/**", cwd.display())})).is_ok());
+        assert!(approve(PermissionMode::BypassPermissions, "Glob", &json!({"pattern": "/etc/*"})).is_ok());
         // R-BACK-6's other half: an edit that would make Claude Code run
-        // something — its settings, hooks, agents — needs bypassPermissions.
+        // something — its settings, hooks, agents — needs a person's say.
         let ae = PermissionMode::AcceptEdits;
-        for f in [".claude/settings.json", ".claude/settings.local.json", ".claude/agents/x.md", "sub/.claude/hooks/h.sh", ".Claude/settings.json", ".CLAUDE./agents/a.md", ".claude /settings.json"] {
-            assert!(approve(ae, "Write", &json!({"file_path": f}), &cwd).unwrap_err().contains(".claude"), "{f}");
+        for f in [".claude/settings.json", ".claude/settings.local.json", ".claude/agents/x.md", "sub/.claude/hooks/h.sh", ".Claude/settings.json", ".CLAUDE./agents/a.md", ".claude /settings.json", ".krowk/config.json"] {
+            let e = approve(ae, "Write", &json!({"file_path": f})).unwrap_err();
+            assert!(e.contains(".claude") || e.contains(".krowk"), "{f}: {e}");
         }
         let config = cwd.join("cc-config");
         std::fs::create_dir_all(&config).unwrap();
-        let err = super::approve(ae, "Edit", &json!({"file_path": config.join("settings.json").display().to_string()}), &cwd, std::slice::from_ref(&config)).unwrap_err();
-        assert!(err.contains("config directory"), "{err}");
-        assert!(approve(ae, "Edit", &json!({"file_path": ".GIT/config"}), &cwd).unwrap_err().contains(".git"));
-        let err = super::approve(ae, "Write", &json!({"file_path": cwd.join("CC-Config/settings.json").display().to_string()}), &cwd, std::slice::from_ref(&config)).unwrap_err();
-        assert!(err.contains("config directory"), "the config directory in another case: {err}");
-        assert!(super::approve(PermissionMode::BypassPermissions, "Write", &json!({"file_path": ".claude/settings.json"}), &cwd, &[config]).is_ok());
+        let err = judge(ae, "Edit", &json!({"file_path": config.join("settings.json").display().to_string()}), std::slice::from_ref(&config)).unwrap_err();
+        assert!(err.contains("settings decide what runs"), "{err}");
+        assert!(approve(ae, "Edit", &json!({"file_path": ".GIT/config"})).unwrap_err().contains(".git"));
+        let err = judge(ae, "Write", &json!({"file_path": cwd.join("CC-Config/settings.json").display().to_string()}), std::slice::from_ref(&config)).unwrap_err();
+        assert!(err.contains("settings decide what runs"), "the config directory in another case: {err}");
+        assert!(judge(PermissionMode::BypassPermissions, "Write", &json!({"file_path": ".claude/settings.json"}), &[config]).is_ok());
         let _ = std::fs::remove_dir_all(&cwd);
     }
 

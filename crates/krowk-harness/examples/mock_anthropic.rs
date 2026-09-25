@@ -23,6 +23,9 @@
 //! artifact land. `reread` reads README.md forever, each call reading 20,000
 //! tokens from cache — about $0.0067 at Sonnet's prices — so `--max-usd` and
 //! `--max-tokens` have something to stop.
+//! `tool NAME JSON` calls that one tool with that input, then answers with
+//! the tool result it was sent back, word for word — what the model read,
+//! for watching a permission rule, an approval or a hook decide a call.
 //!
 //! `--long LINES` answers every prompt instead with that many numbered lines
 //! (about twelve tokens each), streamed at `--rate TOKENS` a second (default
@@ -37,6 +40,7 @@ fn main() {
     let mut port = "8788".to_string();
     let (mut long, mut rate, mut edit, mut read_edit, mut pace, mut fail) = (0usize, 500u64, false, false, 0u64, 0u16);
     let (mut publish, mut reread): (Option<String>, bool) = (None, false);
+    let mut tool: Option<(String, serde_json::Value)> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--long" => long = args.next().and_then(|v| v.parse().ok()).expect("--long LINES"),
@@ -47,6 +51,11 @@ fn main() {
             "read-edit" => read_edit = true,
             "publish" => publish = Some(args.next().expect("publish FILE")),
             "reread" => reread = true,
+            "tool" => {
+                let name = args.next().expect("tool NAME JSON");
+                let input = args.next().and_then(|j| serde_json::from_str(&j).ok()).expect("tool NAME JSON: the input as JSON");
+                tool = Some((name, input));
+            }
             p => port = p.to_string(),
         }
     }
@@ -72,6 +81,15 @@ fn main() {
             mock::Reply::sse(&mock::tool_use(&format!("toolu_pub{n}"), "publish", &serde_json::json!({"files": [file], "caption": "published by the stand-in"})))
         } else if publish.is_some() {
             mock::Reply::sse(&mock::fixture("turn2_answer.sse"))
+        } else if let Some((name, input)) = &tool {
+            let last = body["messages"].as_array().and_then(|m| m.last().cloned()).unwrap_or_default();
+            match last["content"].as_array().and_then(|c| c.iter().find(|b| b["type"] == "tool_result").cloned()) {
+                Some(r) => {
+                    let text = r["content"].as_str().map(String::from).unwrap_or_else(|| r["content"].to_string());
+                    mock::Reply::sse(&mock::text_stream(&format!("The tool said: {text}")))
+                }
+                None => mock::Reply::sse(&mock::tool_use("toolu_01Evidence", name, input)),
+            }
         } else if read_edit {
             read_edit_script(body)
         } else if edit {

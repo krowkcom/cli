@@ -189,7 +189,7 @@ pub(super) fn glob(i: &GlobInput, scope: &Scope) -> (String, bool) {
             w.truncated = true;
             break;
         }
-        if matcher.matches(f) {
+        if matcher.matches(f) && !scope.hidden.hides(&root.join(f)) {
             hits.push(f);
         }
     }
@@ -262,6 +262,9 @@ pub(super) fn grep(i: &GrepInput, scope: &Scope) -> (String, bool) {
             continue;
         }
         let path = root.join(rel);
+        if scope.hidden.hides(&path) {
+            continue;
+        }
         let Ok((f, size)) = open_regular(&path) else { continue };
         if size > GREP_MAX_FILE {
             continue;
@@ -304,7 +307,7 @@ pub(super) fn grep(i: &GrepInput, scope: &Scope) -> (String, bool) {
 /// A compiled glob: `*`, `?`, `**`, `[…]` and `{a,b}`, over `/`-separated
 /// paths. A pattern with no `/` matches the file name at any depth, as in
 /// `.gitignore` and ripgrep.
-pub(super) struct Glob {
+pub(crate) struct Glob {
     alternatives: Vec<Vec<char>>,
     name_only: bool,
 }

@@ -1,0 +1,313 @@
+use super::*;
+use serde_json::json;
+
+fn repo(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("krowk-perm-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join(".git")).unwrap();
+    std::fs::create_dir_all(d.join("src")).unwrap();
+    d.canonicalize().unwrap()
+}
+
+fn policy(cwd: &Path, rules: &[(Kind, &str)]) -> Policy {
+    let mut p = Policy::modes_only(cwd);
+    p.loaded.rules = rules.iter().map(|(k, t)| (*k, rules::parse(t, "test settings", cwd).unwrap())).collect();
+    p
+}
+
+fn gate(p: &Policy, mode: PermissionMode) -> Gate {
+    Gate::new(p.clone(), mode, SessionGrants::default(), None, None, "s", "t")
+}
+
+fn bash(cmd: &str) -> Call {
+    Call { tool: "Bash".into(), access: Access::Bash(cmd.into()), subject: None }
+}
+
+fn read(p: PathBuf) -> Call {
+    Call { tool: "Read".into(), access: Access::Read(vec![p]), subject: None }
+}
+
+fn edit(p: PathBuf) -> Call {
+    Call { tool: "Write".into(), access: Access::Edit(vec![p]), subject: None }
+}
+
+/// What a verdict is, in one letter: Allow, Ask, Deny.
+fn letter(v: &Verdict) -> char {
+    match v {
+        Verdict::Allow(_) => 'Y',
+        Verdict::Ask { .. } => '?',
+        Verdict::Deny(_) => 'N',
+    }
+}
+
+const MODES: [PermissionMode; 4] = [PermissionMode::Default, PermissionMode::AcceptEdits, PermissionMode::Plan, PermissionMode::BypassPermissions];
+
+#[test]
+fn r_perm_1_the_rule_matrix_covers_every_mode_against_allow_ask_and_deny() {
+    let d = repo("matrix");
+    let inside = d.join("src/a.rs");
+    let outside = PathBuf::from("/etc/hosts");
+    // Each call, under no rule, and under an allow, an ask and a deny rule
+    // that names it: the verdict in default, acceptEdits, plan and
+    // bypassPermissions, in that order — Y allowed, ? asked, N denied. Deny
+    // wins in every mode; an ask rule asks even under bypassPermissions;
+    // plan refuses every change and command whatever allows it.
+    let cases: Vec<(&str, Call, &str, [&str; 4])> = vec![
+        //                                                                  none    allow   ask     deny
+        ("read inside", read(inside.clone()), "Read(src/**)", ["YYYY", "YYYY", "????", "NNNN"]),
+        ("read outside", read(outside.clone()), "Read(//etc/**)", ["???Y", "YYYY", "????", "NNNN"]),
+        ("edit inside", edit(inside.clone()), "Edit(src/**)", ["?YNY", "YYNY", "??N?", "NNNN"]),
+        ("edit outside", edit(PathBuf::from("/tmp/krowk-matrix-x")), "Edit(//tmp/**)", ["??NY", "YYNY", "??N?", "NNNN"]),
+        ("bash", bash("npm test"), "Bash(npm test)", ["??NY", "YYNY", "??N?", "NNNN"]),
+        ("fetch", Call { tool: "WebFetch".into(), access: Access::Fetch("https://docs.rs/x".into()), subject: None }, "WebFetch(domain:docs.rs)", ["???Y", "YYYY", "????", "NNNN"]),
+        ("mcp", Call { tool: "mcp__gh__issue".into(), access: Access::Mcp { server: "gh".into(), tool: "issue".into() }, subject: None }, "Mcp(gh:issue)", ["??NY", "YYNY", "??N?", "NNNN"]),
+    ];
+    let mut table = String::new();
+    for (name, call, rule, expected) in &cases {
+        for (col, kind) in [None, Some(Kind::Allow), Some(Kind::Ask), Some(Kind::Deny)].into_iter().enumerate() {
+            let p = match kind {
+                None => policy(&d, &[]),
+                Some(k) => policy(&d, &[(k, rule)]),
+            };
+            let got: String = MODES.iter().map(|m| letter(&gate(&p, *m).verdict(call, None))).collect();
+            table += &format!("{name:12} {:5} {got}\n", ["none", "allow", "ask", "deny"][col]);
+            assert_eq!(got, expected[col], "{name} under {} ({rule}): default, acceptEdits, plan, bypassPermissions", ["no rule", "allow", "ask", "deny"][col]);
+        }
+    }
+    println!("R-PERM-1 rule matrix (default acceptEdits plan bypassPermissions):\n{table}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_perm_1_a_repository_that_denies_bash_rm_blocks_it_in_every_mode_bypass_included() {
+    let d = repo("deny-rm");
+    std::fs::create_dir_all(d.join(".claude")).unwrap();
+    std::fs::write(d.join(".claude/settings.json"), json!({"permissions": {"deny": ["Bash(rm:*)"]}}).to_string()).unwrap();
+    // Even the person's own settings allowing every command, and the
+    // repository trusted and allowing it too: deny wins.
+    let user = json!({"permissions": {"allow": ["Bash"]}});
+    for trusted in [false, true] {
+        let cfg = Config { user: Some(user.clone()), trusted: Some(Arc::new(move |_: &Path| trusted)), ..Config::default() };
+        let p = Policy::load(&cfg, &d).unwrap();
+        for m in MODES {
+            for cmd in ["rm -rf build", "sudo rm -rf /", "git status && rm x", "bash -c 'rm -rf .'", "find . -delete"] {
+                match gate(&p, m).verdict(&bash(cmd), None) {
+                    Verdict::Deny(why) => assert!(why.contains("Bash(rm:*)") && why.contains(".claude/settings.json"), "{why}"),
+                    v => panic!("{cmd:?} in {m:?} (trusted {trusted}): {v:?}"),
+                }
+            }
+            if m != PermissionMode::Plan {
+                assert_eq!(letter(&gate(&p, m).verdict(&bash("ls"), None)), 'Y', "{m:?}: the person's own allow rule still allows the rest");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_perm_1_plan_mode_refuses_writes_whatever_the_rules_allow() {
+    let d = repo("plan");
+    let p = policy(&d, &[(Kind::Allow, "Edit"), (Kind::Allow, "Bash"), (Kind::Allow, "mcp__gh")]);
+    let g = gate(&p, PermissionMode::Plan);
+    for call in [edit(d.join("src/a.rs")), bash("touch x"), Call { tool: "mcp__gh__x".into(), access: Access::Mcp { server: "gh".into(), tool: "x".into() }, subject: None }, Call { tool: "NotebookEdit".into(), access: Access::Other, subject: None }] {
+        match g.verdict(&call, Some(hooks::Decision::Allow)) {
+            Verdict::Deny(why) => assert!(why.contains("plan mode"), "{why}"),
+            v => panic!("{call:?}: {v:?}"),
+        }
+    }
+    assert_eq!(letter(&g.verdict(&read(d.join("src/a.rs")), None)), 'Y', "plan mode reads");
+    let publish = Call { tool: "Publish".into(), access: Access::Publish(vec![d.join("shot.png")]), subject: None };
+    assert!(matches!(g.verdict(&publish, None), Verdict::Deny(why) if why.contains("plan mode")), "publishing is refused in plan");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_perm_1_an_untrusted_repository_narrows_but_never_widens() {
+    let d = repo("untrusted");
+    std::fs::create_dir_all(d.join(".claude")).unwrap();
+    std::fs::create_dir_all(d.join("src/.claude")).unwrap();
+    std::fs::write(
+        d.join(".claude/settings.json"),
+        json!({"permissions": {"allow": ["Bash(curl:*)", "Edit(//etc/**)"], "ask": ["Read(secrets/**)"], "deny": ["Read(.env)"], "defaultMode": "bypassPermissions", "additionalDirectories": ["/"]},
+               "hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "touch /tmp/pwned"}]}]}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(d.join("src/.claude/settings.local.json"), json!({"permissions": {"defaultMode": "acceptEdits"}}).to_string()).unwrap();
+    let untrusted = Policy::load(&Config::default(), &d.join("src")).unwrap();
+    assert!(untrusted.loaded.widens && !untrusted.loaded.trusted);
+    assert!(untrusted.loaded.hooks.is_empty() && untrusted.loaded.dirs.is_empty() && untrusted.loaded.default_mode.is_none(), "no hook, directory or mode from a repository nobody trusted");
+    let g = gate(&untrusted, PermissionMode::Default);
+    assert_eq!(letter(&g.verdict(&bash("curl https://x"), None)), '?', "its allow rule is not taken");
+    assert_eq!(letter(&g.verdict(&read(d.join("src/.env")), None)), 'N', "its deny rule is");
+    assert_eq!(letter(&g.verdict(&read(d.join("src/secrets/k")), None)), '?', "and its ask rule");
+    let why = g.nobody_to_ask(&bash("curl https://x"), "Bash `curl https://x`", "it runs a command", &[]);
+    assert!(why.contains("apply only once it is trusted") && why.contains("Bash(curl:*)"), "the refusal says why the repository's rule did not count: {why}");
+
+    let cfg = Config { trusted: Some(Arc::new(|_: &Path| true)), ..Config::default() };
+    let trusted = Policy::load(&cfg, &d.join("src")).unwrap();
+    assert!(!trusted.loaded.hooks.is_empty() && trusted.loaded.dirs == [PathBuf::from("/")]);
+    assert_eq!(trusted.loaded.default_mode, Some(PermissionMode::AcceptEdits), "the deeper file's mode wins, and a repository's bypassPermissions never counts");
+    assert_eq!(letter(&gate(&trusted, PermissionMode::Default).verdict(&bash("curl https://x"), None)), 'Y');
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_perm_1_the_fenced_directories_are_asked_about_and_no_rule_opens_them() {
+    let d = repo("fence");
+    let p = policy(&d, &[(Kind::Allow, "Edit"), (Kind::Allow, "Write(.claude/**)")]);
+    for m in [PermissionMode::Default, PermissionMode::AcceptEdits] {
+        for f in [".claude/settings.json", ".git/hooks/pre-commit", ".krowk/config.json", "sub/.CODEX/config.toml"] {
+            match gate(&p, m).verdict(&edit(d.join(f)), Some(hooks::Decision::Allow)) {
+                Verdict::Ask { reason, remember } => assert!(reason.contains("with a person's say") && remember.is_empty(), "{f}: never remembered: {reason}"),
+                v => panic!("{f} in {m:?}: {v:?}"),
+            }
+        }
+    }
+    assert_eq!(letter(&gate(&p, PermissionMode::BypassPermissions).verdict(&edit(d.join(".claude/settings.json")), None)), 'Y');
+    let mut protected = policy(&d, &[(Kind::Allow, "Edit")]);
+    protected.protected.push(PathBuf::from("/home/someone/.config/krowk"));
+    assert_eq!(letter(&gate(&protected, PermissionMode::AcceptEdits).verdict(&edit(PathBuf::from("/home/someone/.config/krowk/config.json")), None)), '?', "krowk's own config directory, wherever it is");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_perm_1_rules_load_from_every_source_and_a_broken_file_stops_the_turn() {
+    let d = repo("sources");
+    let home = d.join("home");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(home.join(".claude/settings.json"), json!({"permissions": {"allow": ["Bash(git status)"]}}).to_string()).unwrap();
+    std::fs::create_dir_all(d.join(".krowk")).unwrap();
+    std::fs::write(d.join(".krowk/config.json"), json!({"workspace": "w", "permissions": {"deny": ["WebFetch"]}}).to_string()).unwrap();
+    let cfg = Config { home: Some(home.clone()), user: Some(json!({"permissions": {"ask": ["Bash(git push:*)"]}})), ..Config::default() };
+    let p = Policy::load(&cfg, &d).unwrap();
+    let texts: Vec<(Kind, &str)> = p.loaded.rules.iter().map(|(k, r)| (*k, r.text.as_str())).collect();
+    assert_eq!(texts, [(Kind::Ask, "Bash(git push:*)"), (Kind::Allow, "Bash(git status)"), (Kind::Deny, "WebFetch")], "krowk's user config, Claude's user settings, the project's");
+    assert_eq!(p.deny_list(), ["WebFetch"]);
+    std::fs::create_dir_all(d.join(".claude")).unwrap();
+    std::fs::write(d.join(".claude/settings.local.json"), "{ not json").unwrap();
+    assert!(Policy::load(&cfg, &d).unwrap_err().contains("settings.local.json is not valid JSON"));
+    std::fs::write(d.join(".claude/settings.local.json"), json!({"permissions": {"deny": ["Bash(unclosed"]}}).to_string()).unwrap();
+    assert!(Policy::load(&cfg, &d).unwrap_err().contains("does not close"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r_perm_2_an_asked_call_is_an_approval_request_any_client_answers_and_grants_are_remembered() {
+    let d = repo("approve");
+    let krowk = d.join("krowk-config");
+    let approvals = Approvals::default();
+    let grants = SessionGrants::default();
+    let file = krowk.join(settings::GRANTS_FILE);
+    let g = Gate::new(Policy::modes_only(&d), PermissionMode::Default, grants.clone(), Some(approvals.clone()), Some(file.clone()), "s1", "t1");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let (_c, cancel) = watch::channel(false);
+    let call = bash("npm test");
+    // A client — any client — answers the request it was sent.
+    let answering = approvals.clone();
+    let client = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            if let EngineEvent::Approval(req) = &ev {
+                assert!(answering.answer("another-session", &req.request_id, ApprovalDecision::Allow).is_err(), "only its own session answers it");
+                answering.answer("s1", &req.request_id, ApprovalDecision::AllowSession).unwrap();
+            }
+            seen.push(ev);
+            if seen.len() == 2 {
+                return seen;
+            }
+        }
+        seen
+    });
+    let opens = g.check(&call, "bash", &json!({"command": "npm test"}), None, &tx, &cancel).await.unwrap();
+    assert!(opens.fences, "a person's yes is for exactly this call");
+    let seen = client.await.unwrap();
+    let EngineEvent::Approval(req) = &seen[0] else { panic!("{seen:?}") };
+    assert_eq!((req.session_id.as_str(), req.turn_id.as_str(), req.tool.as_str(), req.summary.as_str()), ("s1", "t1", "bash", "Bash `npm test`"));
+    assert_eq!(req.remember, ["Bash(npm test)"]);
+    assert!(matches!(&seen[1], EngineEvent::ApprovalResolved { decision: ApprovalDecision::AllowSession, .. }));
+    // Remembered for the session: asked no more, and only that command.
+    assert_eq!(letter(&g.verdict(&call, None)), 'Y');
+    assert_eq!(letter(&g.verdict(&bash("npm publish"), None)), '?');
+    assert!(!file.exists(), "a session grant is not written down");
+    assert_eq!(remember(&bash("rm 'a b'")), ["Bash(rm 'a b')"], "a grant reads back as the command it was for");
+    let quoted = rules::parse("Bash(rm 'a b')", "t", &d).unwrap();
+    let at = rules::Places { cwd: &d, home: None };
+    assert!(rules::matches(&quoted, &bash("rm 'a b'"), &at, true) && !rules::matches(&quoted, &bash("rm a b"), &at, true));
+    assert!(remember(&bash("git status && rm x")).is_empty(), "a line of several commands is allowed once, never remembered");
+
+    // A project grant is written to krowk's own file, for that project.
+    let g2 = Gate::new(Policy::modes_only(&d), PermissionMode::Default, SessionGrants::default(), Some(approvals.clone()), Some(file.clone()), "s2", "t2");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let answering = approvals.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let EngineEvent::Approval(req) = ev {
+                answering.answer("s2", &req.request_id, ApprovalDecision::AllowProject).unwrap();
+            }
+        }
+    });
+    g2.check(&bash("cargo test"), "bash", &json!({}), None, &tx, &cancel).await.unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(saved["projects"][d.display().to_string()]["allow"], json!(["Bash(cargo test)"]));
+    let cfg = Config { krowk_dir: Some(krowk.clone()), ..Config::default() };
+    let next = Policy::load(&cfg, &d).unwrap();
+    assert_eq!(letter(&gate(&next, PermissionMode::Default).verdict(&bash("cargo test"), None)), 'Y', "the next session has it");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    // A person's no, and an interrupt while waiting, are both refusals.
+    let g3 = Gate::new(Policy::modes_only(&d), PermissionMode::Default, SessionGrants::default(), Some(approvals.clone()), None, "s3", "t3");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let answering = approvals.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let EngineEvent::Approval(req) = ev {
+                answering.answer("s3", &req.request_id, ApprovalDecision::Deny).unwrap();
+            }
+        }
+    });
+    assert!(g3.check(&bash("rm x"), "bash", &json!({}), None, &tx, &cancel).await.unwrap_err().contains("declined"));
+    let (stop, cancel) = watch::channel(false);
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (rm, input) = (bash("rm y"), json!({}));
+    let waiting = g3.check(&rm, "bash", &input, None, &tx, &cancel);
+    let _ = stop.send(true);
+    assert!(waiting.await.unwrap_err().contains("interrupted"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r_perm_2_with_nobody_to_ask_a_call_is_refused_at_once_with_what_would_allow_it() {
+    let d = repo("headless");
+    let g = gate(&Policy::modes_only(&d), PermissionMode::Default);
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let (_c, cancel) = watch::channel(false);
+    let t = std::time::Instant::now();
+    let why = g.check(&bash("npm test"), "bash", &json!({}), None, &tx, &cancel).await.unwrap_err();
+    assert!(t.elapsed() < std::time::Duration::from_secs(1), "never waits");
+    assert!(why.contains("nobody is here to give it") && why.contains("`Bash(npm test)`") && why.contains("--permission-mode bypassPermissions"), "{why}");
+    let why = g.check(&edit(d.join("src/a.rs")), "write", &json!({}), None, &tx, &cancel).await.unwrap_err();
+    assert!(why.contains("--permission-mode acceptEdits"), "an edit inside the working directory names acceptEdits: {why}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_perm_1_publish_is_held_to_what_an_edit_is_and_a_read_deny_keeps_a_file_from_it() {
+    // One rule, the evaluator's, for the native tool and the bridged one.
+    let d = repo("publish");
+    let shot = Call { tool: "Publish".into(), access: Access::Publish(vec![d.join("shot.png")]), subject: None };
+    let got: String = MODES.iter().map(|m| letter(&gate(&policy(&d, &[]), *m).verdict(&shot, None))).collect();
+    assert_eq!(got, "?YNY", "asked in default, run in acceptEdits, refused in plan, run under bypass");
+    let env = Call { tool: "Publish".into(), access: Access::Publish(vec![d.join("src/.env")]), subject: None };
+    let p = policy(&d, &[(Kind::Deny, "Read(.env)")]);
+    for m in MODES {
+        assert_eq!(letter(&gate(&p, m).verdict(&env, None)), 'N', "{m:?}: a file a deny rule keeps from being read is not uploaded");
+    }
+    assert_eq!(letter(&gate(&policy(&d, &[(Kind::Allow, "Publish(*.png)")]), PermissionMode::Default).verdict(&shot, None)), 'Y');
+    assert_eq!(letter(&gate(&policy(&d, &[(Kind::Allow, "Read")]), PermissionMode::Default).verdict(&shot, None)), '?', "a Read allow rule does not allow uploading");
+    let _ = std::fs::remove_dir_all(&d);
+}

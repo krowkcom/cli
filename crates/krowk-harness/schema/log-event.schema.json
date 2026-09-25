@@ -382,7 +382,7 @@
       ]
     },
     "PermissionMode": {
-      "description": "Claude-Code-compatible permission modes. Until the permission system\nlands, only `bypassPermissions` changes anything: it is the one mode in\nwhich `bash` runs.",
+      "description": "Claude-Code-compatible permission modes (R-PERM-1): `default` asks\nbefore edits and commands, `acceptEdits` before commands, `plan` changes\nnothing, and `bypassPermissions` asks before nothing — though a deny\nrule still holds in every one (`crate::permissions`).",
       "type": "string",
       "enum": [
         "default",

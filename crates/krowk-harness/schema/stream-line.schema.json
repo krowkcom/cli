@@ -393,7 +393,7 @@
       ]
     },
     "PermissionMode": {
-      "description": "Claude-Code-compatible permission modes. Until the permission system\nlands, only `bypassPermissions` changes anything: it is the one mode in\nwhich `bash` runs.",
+      "description": "Claude-Code-compatible permission modes (R-PERM-1): `default` asks\nbefore edits and commands, `acceptEdits` before commands, `plan` changes\nnothing, and `bypassPermissions` asks before nothing — though a deny\nrule still holds in every one (`crate::permissions`).",
       "type": "string",
       "enum": [
         "default",
@@ -766,6 +766,49 @@
           ]
         },
         {
+          "description": "A tool call waits for a person's say.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "approval.requested"
+            }
+          },
+          "$ref": "#/$defs/ApprovalRequest",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "A request was answered — by any client, or by an interrupt (`deny`):\nevery other client that shows it can put it away.",
+          "type": "object",
+          "properties": {
+            "sessionId": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            },
+            "requestId": {
+              "type": "string"
+            },
+            "decision": {
+              "$ref": "#/$defs/ApprovalDecision"
+            },
+            "type": {
+              "type": "string",
+              "const": "approval.resolved"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId",
+            "turnId",
+            "requestId",
+            "decision"
+          ]
+        },
+        {
           "description": "How a `prompt` came out: the last thing a headless run prints.",
           "type": "object",
           "properties": {
@@ -895,6 +938,63 @@
             "partialJson"
           ]
         }
+      ]
+    },
+    "ApprovalRequest": {
+      "description": "A tool call waiting for a person's say (R-PERM-2): sent to every client\nof the session as `approval.requested`, and answered by one of them with\n`approve`. It waits until answered or the turn is interrupted; a host\nwith no client that answers never sends one, and refuses the call.",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "requestId": {
+          "description": "What `approve` names.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "The tool, as the model called it.",
+          "type": "string"
+        },
+        "input": {
+          "description": "Its input, as the model gave it."
+        },
+        "summary": {
+          "description": "What it would do, in a line, e.g. Bash `rm -rf build` or Write /x/y.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it is asked rather than run.",
+          "type": "string"
+        },
+        "remember": {
+          "description": "The rules `allowSession` or `allowProject` would remember; none when\nthis call can only be allowed once.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "sessionId",
+        "turnId",
+        "requestId",
+        "tool",
+        "input",
+        "summary",
+        "reason"
+      ]
+    },
+    "ApprovalDecision": {
+      "description": "An answer to a permission request: allow this call, allow calls like it\nfor the rest of the session or for good in this project (the request's\n`remember` rules), or deny it.",
+      "type": "string",
+      "enum": [
+        "allow",
+        "allowSession",
+        "allowProject",
+        "deny"
       ]
     },
     "RunResult": {

@@ -225,9 +225,10 @@ pub struct ErrorInfo {
     pub http_status: Option<u16>,
 }
 
-/// Claude-Code-compatible permission modes. Until the permission system
-/// lands, only `bypassPermissions` changes anything: it is the one mode in
-/// which `bash` runs.
+/// Claude-Code-compatible permission modes (R-PERM-1): `default` asks
+/// before edits and commands, `acceptEdits` before commands, `plan` changes
+/// nothing, and `bypassPermissions` asks before nothing — though a deny
+/// rule still holds in every one (`crate::permissions`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum PermissionMode {
@@ -261,16 +262,45 @@ pub enum Billing {
     ApiKey,
 }
 
-/// An answer to a permission request.
+/// An answer to a permission request: allow this call, allow calls like it
+/// for the rest of the session or for good in this project (the request's
+/// `remember` rules), or deny it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum ApprovalDecision {
     Allow,
+    AllowSession,
+    AllowProject,
     Deny,
 }
 
-/// What a client asks of the engine. `prompt`, `interrupt` and `steer` are
-/// served today; the rest are typed now so every client is written against
+/// A tool call waiting for a person's say (R-PERM-2): sent to every client
+/// of the session as `approval.requested`, and answered by one of them with
+/// `approve`. It waits until answered or the turn is interrupted; a host
+/// with no client that answers never sends one, and refuses the call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRequest {
+    pub session_id: String,
+    pub turn_id: String,
+    /// What `approve` names.
+    pub request_id: String,
+    /// The tool, as the model called it.
+    pub tool: String,
+    /// Its input, as the model gave it.
+    pub input: Value,
+    /// What it would do, in a line, e.g. Bash `rm -rf build` or Write /x/y.
+    pub summary: String,
+    /// Why it is asked rather than run.
+    pub reason: String,
+    /// The rules `allowSession` or `allowProject` would remember; none when
+    /// this call can only be allowed once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remember: Vec<String>,
+}
+
+/// What a client asks of the engine. `prompt`, `interrupt`, `steer` and
+/// `approve` are served today; the rest are typed now so every client is written against
 /// the whole vocabulary, and are refused with `not_implemented` until their
 /// tickets land.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -306,7 +336,7 @@ pub enum Command {
     /// it before its next model call, and it is logged there as a
     /// `userText` item.
     Steer { session_id: String, text: String },
-    /// Answer a permission request.
+    /// Answer an `approval.requested`.
     Approve { session_id: String, request_id: String, decision: ApprovalDecision },
     /// Continue the session on another model.
     SwitchModel { session_id: String, model: ModelRef },
@@ -492,6 +522,13 @@ pub enum LiveEvent {
     /// and leaves it out of `stream-json`.
     #[serde(rename = "notice")]
     Notice { session_id: String, turn_id: String, text: String },
+    /// A tool call waits for a person's say.
+    #[serde(rename = "approval.requested")]
+    ApprovalRequested(ApprovalRequest),
+    /// A request was answered — by any client, or by an interrupt (`deny`):
+    /// every other client that shows it can put it away.
+    #[serde(rename = "approval.resolved")]
+    ApprovalResolved { session_id: String, turn_id: String, request_id: String, decision: ApprovalDecision },
     /// How a `prompt` came out: the last thing a headless run prints.
     #[serde(rename = "result")]
     Result(RunResult),

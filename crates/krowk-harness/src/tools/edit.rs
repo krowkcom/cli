@@ -207,7 +207,8 @@ mod tests {
         assert!(run(WRITE, &json!({"path": "src", "content": "x"}), &e).await.0.contains("not a regular file"));
         for mode in [PermissionMode::Default, PermissionMode::Plan] {
             let refused = run(WRITE, &json!({"path": "x", "content": "x"}), &ToolEnv { cwd: &d, permission_mode: mode, edit: EditTool::StrReplace, evidence: None }).await;
-            assert!(refused.1 && refused.0.contains("acceptEdits"), "{refused:?}");
+            let why = if mode == PermissionMode::Plan { "plan mode" } else { "acceptEdits" };
+            assert!(refused.1 && refused.0.contains(why), "{refused:?}");
         }
         assert!(!d.join("x").exists());
         let _ = std::fs::remove_dir_all(d);

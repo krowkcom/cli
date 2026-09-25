@@ -10,16 +10,18 @@
 //! the result item is `toolResult {callId, output, isError}`, `output` the
 //! text the model is sent back.
 //!
-//! Until the permission system lands (ticket 9), a tool's mode is coarse:
-//! `read`, `grep` and `glob` need no permission, as in every harness whose
-//! rules krowk follows; `write` and the edit tools run under `acceptEdits`
-//! and `bypassPermissions`; `bash` runs only under `bypassPermissions`.
-//! Anywhere else the call is refused with a result that says so.
+//! Whether a call runs is the permission evaluator's to say
+//! (`crate::permissions`): `describe` says what a call reads, changes or
+//! runs, the evaluator judges that against the mode, the rules and the
+//! grants, and `execute` runs it in the scope the verdict opened — the
+//! working directory and its added directories, unless a rule, a person or
+//! bypassPermissions opened more.
 
 mod edit;
 mod patch;
-mod search;
+pub(crate) mod search;
 
+use crate::permissions::{Access, Call};
 use crate::protocol::{Grammar, PermissionMode, ToolDefinition};
 use crate::toolset::{EditTool, Toolset};
 use schemars::JsonSchema;
@@ -169,8 +171,6 @@ pub struct ToolEnv<'a> {
     pub evidence: Option<(&'a crate::evidence::Evidence, &'a crate::engine::Events)>,
 }
 
-const EDIT_REFUSED: &str = "changes files, which this session does not allow: until krowk's permission rules land, write and the edit tools run only when krowk is started with `--permission-mode acceptEdits` or `bypassPermissions`. Say what you would change instead, or ask the person to rerun with one of those flags.";
-
 /// Parses a call's input, or answers why it cannot.
 fn parse_input<T: for<'de> Deserialize<'de>>(name: &str, input: &Value) -> Result<T, (String, bool)> {
     T::deserialize(input).map_err(|e| (format!("invalid input for {name}: {e}"), true))
@@ -182,17 +182,63 @@ async fn blocking(f: impl FnOnce() -> (String, bool) + Send + 'static) -> (Strin
     tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| (format!("the tool failed: {e}"), true))
 }
 
-/// Runs one call. Returns the output and whether it is an error.
-pub async fn run(name: &str, input: &Value, env: &ToolEnv<'_>) -> (String, bool) {
-    let may_edit = matches!(env.permission_mode, PermissionMode::AcceptEdits | PermissionMode::BypassPermissions);
-    let scope = Scope::new(env);
+/// What a call of one of these tools is, in the terms permission rules are
+/// written in (`crate::permissions`): the paths it reads or changes, or the
+/// command it runs. A call that cannot run at all — a bad input, a tool the
+/// turn does not offer, a patch that does not parse — is answered here.
+pub fn describe(name: &str, input: &Value, env: &ToolEnv<'_>) -> Result<Call, (String, bool)> {
     let is_edit = [WRITE, STR_REPLACE, APPLY_PATCH, SEARCH_REPLACE].contains(&name);
     if is_edit && name != WRITE && name != env.edit.name() {
-        return (format!("there is no tool named {name:?} in this session — edit files with {}", env.edit.name()), true);
+        return Err((format!("there is no tool named {name:?} in this session — edit files with {}", env.edit.name()), true));
     }
-    if is_edit && !may_edit {
-        return (format!("{name} {EDIT_REFUSED}"), true);
+    let at = |p: &str| resolve(env.cwd, p);
+    let call = |access: Access| Call { tool: crate::permissions::rules::canonical(name), access, subject: None };
+    Ok(match name {
+        READ => call(Access::Read(vec![at(&parse_input::<ReadInput>(name, input)?.path)])),
+        WRITE => call(Access::Edit(vec![at(&parse_input::<WriteInput>(name, input)?.path)])),
+        STR_REPLACE => call(Access::Edit(vec![at(&parse_input::<StrReplaceInput>(name, input)?.path)])),
+        SEARCH_REPLACE => call(Access::Edit(vec![at(&parse_input::<SearchReplaceInput>(name, input)?.file_path)])),
+        APPLY_PATCH => {
+            let text = patch::input_text(input).map_err(|e| (format!("invalid input for apply_patch: {e}"), true))?;
+            let paths = patch::paths(&text).map_err(|e| (format!("the patch did not parse, so nothing was changed: {e}"), true))?;
+            call(Access::Edit(paths.iter().map(|p| at(p)).collect()))
+        }
+        GREP => call(Access::Read(vec![parse_input::<GrepInput>(name, input)?.path.as_deref().map_or_else(|| env.cwd.to_path_buf(), at)])),
+        GLOB => call(Access::Read(vec![parse_input::<GlobInput>(name, input)?.path.as_deref().map_or_else(|| env.cwd.to_path_buf(), at)])),
+        BASH => call(Access::Bash(parse_input::<BashInput>(name, input)?.command)),
+        crate::evidence::PUBLISH => crate::evidence::call(env.cwd, input)?,
+        other => return Err((format!("there is no tool named {other:?} — the tools are read, write, {}, bash, grep, glob and publish", env.edit.name()), true)),
+    })
+}
+
+/// Runs one call judged by the mode alone, with nobody to ask: what a
+/// caller with no settings and no client gets. The native loop judges by
+/// the turn's whole policy instead (`describe`, then its gate, then
+/// `execute`). Returns the output and whether it is an error.
+pub async fn run(name: &str, input: &Value, env: &ToolEnv<'_>) -> (String, bool) {
+    let call = match describe(name, input, env) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let gate = crate::permissions::Gate::modes_only(env.cwd, env.permission_mode);
+    match gate.verdict(&call, None) {
+        crate::permissions::Verdict::Allow(opens) => execute(name, input, env, gate.scope(opens)).await,
+        crate::permissions::Verdict::Deny(m) => (m, true),
+        crate::permissions::Verdict::Ask { .. } => {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let (_c, cancel) = tokio::sync::watch::channel(false);
+            match gate.check(&call, name, input, None, &tx, &cancel).await {
+                Ok(opens) => execute(name, input, env, gate.scope(opens)).await,
+                Err(m) => (m, true),
+            }
+        }
     }
+}
+
+/// Runs one call the permission evaluator allowed, in the scope it opened:
+/// the tools still hold every path to that scope, a second fence behind the
+/// first.
+pub async fn execute(name: &str, input: &Value, env: &ToolEnv<'_>, scope: Scope) -> (String, bool) {
     match name {
         READ => match parse_input::<ReadInput>(name, input) {
             Ok(i) => read(&i, &scope).await,
@@ -231,20 +277,15 @@ pub async fn run(name: &str, input: &Value, env: &ToolEnv<'_>) -> (String, bool)
             Err(e) => e,
         },
         BASH => match parse_input::<BashInput>(name, input) {
-            Ok(i) if env.permission_mode == PermissionMode::BypassPermissions => bash(&i, env.cwd).await,
-            Ok(_) => (
-                "bash is not allowed in this session: until krowk's permission rules land, bash runs only when krowk is started with `--permission-mode bypassPermissions`. Use read, grep and glob, or ask the person to rerun with that flag.".into(),
-                true,
-            ),
+            Ok(i) => bash(&i, env.cwd).await,
             Err(e) => e,
         },
         // krowk_push's rules keep it in the working directory and away from
         // credential files and hard links; the mode keeps it from running at
         // all where nothing may leave the session.
-        crate::evidence::PUBLISH => match (crate::evidence::permitted(env.permission_mode), env.evidence) {
-            (Err(why), _) => (why, true),
-            (Ok(()), Some((ev, events))) => ev.publish(env.cwd, input, events).await,
-            (Ok(()), None) => (crate::evidence::UNAVAILABLE.into(), true),
+        crate::evidence::PUBLISH => match env.evidence {
+            Some((ev, events)) => ev.publish(env.cwd, input, events).await,
+            None => (crate::evidence::UNAVAILABLE.into(), true),
         },
         other => (format!("there is no tool named {other:?} — the tools are read, write, {}, bash, grep, glob and publish", env.edit.name()), true),
     }
@@ -255,86 +296,133 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
 }
 
-/// Where the file tools may reach. Until the permission system lands
-/// (ticket 9 adds more directories, and asking), that is the working
-/// directory and what is under it, unless permissions are bypassed: a path
-/// is judged by where it really leads — `..`, an absolute path, a symlinked
-/// directory or file, a dangling symlink a write would follow — never by
-/// how it is spelled.
+/// Files a deny rule keeps from being read, which a search skips rather
+/// than shows: `Read(.env)` denied holds for grep over the directory too.
+#[derive(Clone, Default)]
+pub struct Hidden(pub Option<HideFn>);
+
+/// Whether a path is one a deny rule keeps from being read.
+pub type HideFn = std::sync::Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
+impl Hidden {
+    pub fn hides(&self, p: &Path) -> bool {
+        self.0.as_ref().is_some_and(|f| f(p))
+    }
+}
+
+impl std::fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Hidden(rules)" } else { "Hidden(none)" })
+    }
+}
+
+/// Where the file tools may reach: the working directory and the
+/// directories the settings add to it (`additionalDirectories`), and for reading
+/// the skills' directories too. A path is judged by where it really leads —
+/// `..`, an absolute path, a symlinked directory or file, a dangling
+/// symlink a write would follow — never by how it is spelled. The
+/// permission evaluator judges a call against this scope first; the tools
+/// hold the scope the verdict opened.
 #[derive(Debug, Clone)]
-pub(crate) struct Scope {
+pub struct Scope {
     pub cwd: PathBuf,
-    pub bypass: bool,
-    /// More directories no edit may reach unless permissions are bypassed,
-    /// beside `.git`, `.claude` and `.codex`: a backend instance's own
-    /// config directory (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), whose settings
-    /// and hooks the vendor runs.
+    /// More directories the file tools reach as they reach the working
+    /// directory.
+    pub roots: Vec<PathBuf>,
+    /// Directories they may read and never change.
+    pub read_roots: Vec<PathBuf>,
+    /// Reaching outside all of those is allowed: by bypassPermissions, an
+    /// allow rule, or a person.
+    pub outside: bool,
+    /// The fenced directories are open: bypassPermissions, or a person
+    /// approved this call.
+    pub open: bool,
+    /// More directories no edit may reach unless they are open, beside
+    /// `.git`, `.claude`, `.codex` and `.krowk`: krowk's own config
+    /// directory, Claude Code's, a backend instance's (`CLAUDE_CONFIG_DIR`,
+    /// `CODEX_HOME`), whose settings and hooks decide what runs next.
     pub protected: Vec<PathBuf>,
+    pub hidden: Hidden,
+}
+
+/// Where one path leads, for the evaluator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    Inside,
+    /// Outside the working directory and its added directories: why.
+    Outside(String),
+    /// Inside a fenced directory: why.
+    Fenced(String),
 }
 
 /// Symlinks followed at most while resolving one path: a loop is refused,
 /// not followed forever.
 const MAX_LINKS: usize = 40;
 
+/// The directories the file tools keep out of, whichever repository they
+/// are in.
+const FENCED: [&str; 4] = [".git", ".claude", ".codex", ".krowk"];
+
 impl Scope {
-    fn new(env: &ToolEnv<'_>) -> Scope {
-        Scope { cwd: env.cwd.to_path_buf(), bypass: env.permission_mode == PermissionMode::BypassPermissions, protected: Vec::new() }
+    /// Only the working directory, nothing opened.
+    pub fn within(cwd: &Path) -> Scope {
+        Scope { cwd: cwd.to_path_buf(), roots: Vec::new(), read_roots: Vec::new(), outside: false, open: false, protected: Vec::new(), hidden: Hidden::default() }
     }
 
-    /// The path a tool was given, resolved against the working directory,
-    /// or why the tool may not touch it. The path is returned as spelled
-    /// (joined to the working directory), so messages name what the model
-    /// asked for; the check is on where it leads.
-    pub fn path(&self, path: &str) -> Result<PathBuf, String> {
-        let p = resolve(&self.cwd, path);
-        if self.bypass {
-            return Ok(p);
+    /// Where `p` (absolute) leads against the tools' reach, for a read or an
+    /// edit, before anything is opened.
+    pub fn reach(&self, p: &Path, edit: bool) -> Reach {
+        let real = match real_path(p, 0) {
+            Ok(r) => r,
+            Err(e) => return Reach::Outside(format!("{} cannot be resolved: {e}", p.display())),
+        };
+        let canon = |d: &Path| d.canonicalize().unwrap_or_else(|_| d.to_path_buf());
+        let root = canon(&self.cwd);
+        let mut roots: Vec<PathBuf> = vec![root.clone()];
+        roots.extend(self.roots.iter().map(|d| canon(d)));
+        if !edit {
+            roots.extend(self.read_roots.iter().map(|d| canon(d)));
         }
-        let root = self.cwd.canonicalize().map_err(|e| format!("the working directory {} cannot be resolved: {e}", self.cwd.display()))?;
-        let real = real_path(&p, 0).map_err(|e| format!("{} cannot be resolved: {e}", p.display()))?;
-        if real.starts_with(&root) {
-            return Ok(p);
+        let inside = roots.iter().any(|r| real.starts_with(r));
+        if edit && let Some(why) = self.fence(p, &real, &root) {
+            return Reach::Fenced(why);
+        }
+        if inside {
+            return Reach::Inside;
         }
         let leads = if real == p { String::new() } else { format!(" (it leads to {})", real.display()) };
-        Err(format!(
-            "{}{leads} is outside the working directory {}: until krowk's permission rules land, the file tools reach only inside it unless krowk is started with `--permission-mode bypassPermissions`",
-            p.display(),
-            root.display()
-        ))
+        Reach::Outside(format!("{}{leads} is outside the working directory {}", p.display(), root.display()))
     }
-}
 
-impl Scope {
-    /// `path`, for a tool that changes the file: also never anything inside
-    /// a `.git`, a `.claude` or a `.codex` directory, as spelled or as it
-    /// leads, nor in a `protected` one, unless permissions are bypassed. git
-    /// runs what its config names (`core.fsmonitor`, hooks), Claude Code
-    /// what its settings, hooks and agents name, and Codex what its project
-    /// config, rules and hooks name, so a model that could write
-    /// `.git/config`, `.claude/settings.json` or `.codex/config.toml` could
-    /// run any command without the bash permission. Codex keeps `.git`
-    /// read-only for the same reason.
-    pub fn edit_path(&self, path: &str) -> Result<PathBuf, String> {
-        let p = self.path(path)?;
-        if self.bypass {
-            return Ok(p);
-        }
+    /// The reason `p` may not be changed without a person's say, if it may
+    /// not: inside a `.git`, `.claude`, `.codex` or `.krowk` directory, as
+    /// spelled or as it leads, or inside a `protected` one. git runs what
+    /// its config names (`core.fsmonitor`, hooks), Claude Code what its
+    /// settings, hooks and agents name, Codex what its project config, rules
+    /// and hooks name, krowk what its own settings and hooks name — so a
+    /// model that could write `.git/config` or `.claude/settings.json`
+    /// could run any command without the bash permission. Codex keeps
+    /// `.git` read-only for the same reason.
+    fn fence(&self, p: &Path, real: &Path, root: &Path) -> Option<String> {
         // Compared the way the file system may: case-insensitively (macOS
         // and Windows open `.Claude` as `.claude`), and with the trailing
         // dots and spaces Windows drops (`.git.` is `.git`) — on every OS,
         // since a checkout travels between them.
         let fold = |c: &std::ffi::OsStr| c.to_string_lossy().trim_end_matches(['.', ' ']).to_ascii_lowercase();
-        let inside = |q: &Path| q.components().find_map(|c| [".git", ".claude", ".codex"].into_iter().find(|d| fold(c.as_os_str()) == *d));
-        let real = real_path(&p, 0).unwrap_or_else(|_| p.clone());
-        let root = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
-        let fenced = inside(p.strip_prefix(&self.cwd).unwrap_or(&p)).or_else(|| inside(real.strip_prefix(&root).unwrap_or(&real)));
-        if let Some(dir) = fenced {
+        let inside = |q: &Path| q.components().find_map(|c| FENCED.into_iter().find(|d| fold(c.as_os_str()) == *d));
+        let rel = |q: &Path| {
+            let mut bases: Vec<PathBuf> = vec![self.cwd.clone(), root.to_path_buf()];
+            bases.extend(self.roots.iter().cloned());
+            bases.iter().find_map(|b| q.strip_prefix(b).ok().map(Path::to_path_buf)).unwrap_or_else(|| q.to_path_buf())
+        };
+        if let Some(dir) = inside(&rel(p)).or_else(|| inside(&rel(real))) {
             let runs = match dir {
-                ".git" => "git runs what its config and hooks name, so it is left to git itself — use git through bash",
+                ".git" => "git runs what its config and hooks name, so it is left to git itself",
                 ".claude" => "Claude Code runs what its settings, hooks and agents name",
-                _ => "Codex runs what its project config, rules and hooks name",
+                ".codex" => "Codex runs what its project config, rules and hooks name",
+                _ => "krowk runs what its project config's hooks name, and its rules decide what else runs",
             };
-            return Err(format!("{} is inside a {dir} directory, which the file tools do not change: {runs}, or ask the person to rerun with `--permission-mode bypassPermissions`", p.display()));
+            return Some(format!("{} is inside a {dir} directory, which the file tools change only with a person's say: {runs}", p.display()));
         }
         // Judged as spelled and as it leads, against the directory as named
         // and as it leads: a home reached through a symlink, or a link inside
@@ -344,14 +432,37 @@ impl Scope {
             let q = lower(q);
             q.starts_with(lower(d)) || q.starts_with(lower(&d.canonicalize().unwrap_or_else(|_| d.to_path_buf())))
         };
-        if let Some(d) = self.protected.iter().find(|d| within(&real, d) || within(&p, d)) {
-            return Err(format!(
-                "{} is inside {}, the backend's own config directory for this session, which the file tools do not change: the vendor runs what its settings and hooks there name — ask the person to rerun with `--permission-mode bypassPermissions`",
-                p.display(),
-                d.display()
-            ));
+        self.protected.iter().find(|d| within(real, d) || within(p, d)).map(|d| {
+            format!("{} is inside {}, a directory whose settings decide what runs (krowk's, or a backend's own), which the file tools change only with a person's say", p.display(), d.display())
+        })
+    }
+
+    /// The path a tool was given, resolved against the working directory,
+    /// or why the tool may not touch it. The path is returned as spelled
+    /// (joined to the working directory), so messages name what the model
+    /// asked for; the check is on where it leads.
+    pub fn path(&self, path: &str) -> Result<PathBuf, String> {
+        let p = resolve(&self.cwd, path);
+        if self.outside {
+            return Ok(p);
         }
-        Ok(p)
+        match self.reach(&p, false) {
+            Reach::Inside | Reach::Fenced(_) => Ok(p),
+            Reach::Outside(why) => Err(format!("{why}: the file tools reach only inside the working directory and the directories the settings add, unless a person allows it, an allow rule covers it, or krowk runs with `--permission-mode bypassPermissions`")),
+        }
+    }
+
+    /// `path`, for a tool that changes the file: also never inside a fenced
+    /// or `protected` directory unless the scope is open.
+    pub fn edit_path(&self, path: &str) -> Result<PathBuf, String> {
+        let p = resolve(&self.cwd, path);
+        match self.reach(&p, true) {
+            Reach::Inside => Ok(p),
+            Reach::Fenced(_) if self.open => Ok(p),
+            Reach::Outside(_) if self.outside => Ok(p),
+            Reach::Fenced(why) => Err(format!("{why} — ask the person, or rerun with `--permission-mode bypassPermissions`")),
+            Reach::Outside(why) => Err(format!("{why}: the file tools reach only inside the working directory and the directories the settings add, unless a person allows it, an allow rule covers it, or krowk runs with `--permission-mode bypassPermissions`")),
+        }
     }
 }
 
@@ -360,7 +471,7 @@ impl Scope {
 /// and the rest, which cannot hold a symlink, is appended. A dangling
 /// symlink is followed to where it points, since a write through it would
 /// create that.
-fn real_path(p: &Path, links: usize) -> Result<PathBuf, String> {
+pub(crate) fn real_path(p: &Path, links: usize) -> Result<PathBuf, String> {
     use std::path::Component;
     if links > MAX_LINKS {
         return Err("too many levels of symbolic links".into());
@@ -923,8 +1034,8 @@ mod tests {
         // The instance's own home, protected by name.
         let home = d.join("codex-home");
         std::fs::create_dir_all(&home).unwrap();
-        let scope = Scope { cwd: d.clone(), bypass: false, protected: vec![home.clone()] };
-        assert!(scope.edit_path("codex-home/config.toml").unwrap_err().contains("config directory"));
+        let scope = Scope { protected: vec![home.clone()], ..Scope::within(&d) };
+        assert!(scope.edit_path("codex-home/config.toml").unwrap_err().contains("settings decide what runs"));
         assert!(scope.edit_path(&home.join("sub/x").display().to_string()).is_err());
         assert!(scope.edit_path("codex-homework.txt").is_ok(), "a sibling that shares the prefix is not inside it");
         // Named through a link, and spelled as the link: both are the home.
@@ -932,11 +1043,11 @@ mod tests {
         {
             let alias = d.join("home-alias");
             std::os::unix::fs::symlink(&home, &alias).unwrap();
-            let via_alias = Scope { cwd: d.clone(), bypass: false, protected: vec![alias.clone()] };
+            let via_alias = Scope { protected: vec![alias.clone()], ..Scope::within(&d) };
             assert!(via_alias.edit_path("codex-home/config.toml").is_err(), "the home as it leads");
             assert!(via_alias.edit_path("home-alias/config.toml").is_err(), "the home as spelled");
         }
-        assert!(Scope { bypass: true, ..scope }.edit_path("codex-home/config.toml").is_ok());
+        assert!(Scope { open: true, outside: true, ..scope }.edit_path("codex-home/config.toml").is_ok());
         let bypass = ToolEnv { permission_mode: PermissionMode::BypassPermissions, ..env };
         assert!(!run(WRITE, &json!({"path": ".codex/config.toml", "content": "x"}), &bypass).await.1);
         let _ = std::fs::remove_dir_all(d);

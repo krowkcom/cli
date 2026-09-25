@@ -265,13 +265,19 @@ the versions are the `v*` tags a release is cut from. Entries land under
   routed to krowk — whatever its config's `sandbox_mode` or
   `approvals_reviewer` say; a thread it opens looser is stopped before a
   turn runs — and krowk answers by `--permission-mode`: a patch needs
-  `acceptEdits` and never reaches `.git`, `.codex`, `.claude` or the
-  account's home; a command beyond the sandbox needs `bypassPermissions`,
-  which is Codex's full access. **What the sandbox lets a command do
+  `acceptEdits` and never reaches `.git`, `.codex`, `.claude`, the
+  account's home or your own Codex home — a move judged by where it lands;
+  a command beyond the sandbox needs `bypassPermissions`, which is Codex's
+  full access. **The MCP servers your Codex config names do not run
+  outside `bypassPermissions`**: krowk turns each off on the thread, as it
+  keeps Claude Code's out with `--strict-mcp-config`. **What the sandbox lets a command do
   without asking — read your disk, not write it — and what your own Codex
-  rules allow, still apply first.** `OPENAI_API_KEY`, `OPENAI_BASE_URL`
-  and `CODEX_API_KEY` set for krowk's native engine are not passed to
-  Codex. A router is an instance of its own: `--api-key-env NAME` hands
+  rules allow, still apply first.** `OPENAI_API_KEY`, `OPENAI_BASE_URL`,
+  `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `CODEX_SQLITE_HOME` and Codex's
+  other identity and endpoint overrides in krowk's environment are not
+  passed to Codex. Writes Codex makes to its config (trusting a project)
+  land in your own `config.toml`, which the accounts share; its bundled
+  skills stay in each account's home. A router is an instance of its own: `--api-key-env NAME` hands
   that variable's key to Codex under the same name, for the model
   provider its `args` name. krowk's own tools reach Codex as its dynamic
   tools — today `session_info` — and the trust question above covers a
@@ -279,6 +285,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   the way they keep out of `.git`. The app-server's schema is pinned for
   the Codex version in `crates/krowk-harness/schema/codex/VERSION`, and
   `scripts/codex_schema.sh --check` fails CI when it goes stale.
+- **A second Ctrl-C leaves at once during a Claude Code or Codex turn,
+  and takes the backend with it.** Headless or in the TUI, the vendor
+  process and everything it started are killed rather than left running,
+  and the TUI no longer hangs waiting on the turn it was asked to abandon.
 - **Native sessions are logs you own, listed beside imported ones.** Each
   session is an append-only JSONL log under
   `~/.local/share/krowk/sessions/<id>/` (with each turn's exact system

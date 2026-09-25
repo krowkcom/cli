@@ -20,7 +20,7 @@ lint:
 
 check: lint lean-deps test golden ## Everything CI runs
 
-# R-PKG-2: the agent build links exactly the crates crates/krowk/lean-deps.txt lists.
+# R-PKG-2: the agent build links exactly the crates crates/krowk/lean-deps.txt lists, on every target.
 lean-deps: ## Hold the agent build to its dependency list
 	scripts/lean_deps_check.sh
 

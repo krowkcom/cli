@@ -33,14 +33,16 @@ krowk push screenshot.png \
 # The installer — picks your platform, verifies checksums, installs the agent skill
 curl -fsSL https://krowk.com/install | bash
 
-# Go
-cargo install --locked --git https://github.com/krowkcom/krowk --features sessions krowk
+# From source (the full build)
+cargo install --locked --git https://github.com/krowkcom/krowk --features harness krowk
 
 # npm
 npx @krowk/cli push screenshot.png
 ```
 
 Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.txt`.
+
+Every release has two builds of `krowk`. The **full build** carries krowk's own agent (bare `krowk` opens it), the session store and everything else; the **lean build** is the few-megabyte agent-container build — push, runs, uploads, no SQLite. The installer gives a workstation the full build and CI or a container (it reads `CI`, `GITHUB_ACTIONS` and the like, and `/.dockerenv`, `/run/.containerenv`, `$container`) the lean one. Ask for either with `bash -s -- --lean` / `--full`, or `KROWK_LEAN=1` / `0`. `krowk upgrade` stays on the build it is; the GitHub Action installs the lean build.
 
 ## Usage
 
@@ -66,6 +68,18 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 | `krowk sessions rebuild` | Delete the local store and re-import every transcript — the fix when the store's schema version does not match (`--yes` off a terminal) |
 | `krowk pricing refresh` | Refresh the models.dev price cache (conditional GET, silent on failure) |
 | `krowk upgrade` | Upgrade krowk to the latest release |
+
+### The agent
+
+In the full build, bare `krowk` on a terminal opens krowk's own agent: an inline prompt at the bottom of your terminal, with everything finished going into the terminal's normal scrollback — no alternate screen, so it scrolls, copies and searches like any other output, over SSH, in tmux and on a phone. With stdout or stdin not a terminal, bare `krowk` prints exactly what it always did.
+
+| | |
+| --- | --- |
+| `krowk` | Open the agent (`--model <instance>/<model>`, `--permission-mode`) |
+| `krowk --resume` / `--resume <id>` | Continue a krowk session — picked from a list, or named |
+| `krowk -p "…"` | One prompt, headless (`--output-format text\|json\|stream-json`, `--resume`, `--model`) |
+
+Enter sends; Alt-Enter, Ctrl-J or a trailing `\` starts a new line, and ↑/↓ walk the prompt history. Esc or Ctrl-C interrupts the running turn, keeping what arrived; typing while it runs steers it — the model reads it before its next step. `?` on an empty prompt shows the keys, Ctrl-O the session's details (tokens, log path), Ctrl-D or `/exit` quits. When the model's API cannot be reached, a persistent **no network connectivity** notice says so within two seconds, and clears when the API answers again; nothing hangs waiting for it.
 
 Wherever a command takes `<artifact>`, `<run>` or `--run`, it takes the link as readily as the slug: paste `https://krowk.com/a/art_…` or the CDN URL under it, and the slug is read out of it.
 
@@ -183,13 +197,26 @@ Tools: `krowk_push`, `krowk_list_artifacts`, `krowk_get_artifact`, `krowk_claim_
 | `KROWK_MODEL` | Name the model doing the work (`gen_ai.request.model`) — harness-agnostic; `ANTHROPIC_MODEL` is also read |
 | `KROWK_NO_UPDATE_CHECK` | `1`/`true` — never check for or mention new releases |
 
+The agent's status bar is configured in `~/.config/krowk/config.json`, under `tui`:
+
+```json
+{ "tui": { "statusBar": true, "statusItems": ["model", "instance", "cost", "connectivity"] } }
+```
+
+| Key | Purpose |
+| --- | --- |
+| `tui.statusBar` | `false` hides the status bar. The no-network notice shows regardless |
+| `tui.statusItems` | Which items the bar shows, in order: `model`, `instance`, `cost` (the session's, priced from models.dev), `connectivity`, `session` (its id) |
+
+A key or item the TUI does not know is named above the first prompt, and the rest still applies. Prompt history is kept beside the session logs, in `~/.local/share/krowk/tui-history.jsonl`.
+
 Credentials from `krowk auth login` live in `~/.config/krowk/credentials.json` (0600), one key per workspace. Which key a command uses resolves in order: `--workspace` → `KROWK_WORKSPACE` → `.krowk/config.json` at the git root → `~/.config/krowk/config.json` → whichever key logged in last. Commit the repo file and everyone who clones the repository — person or agent — uploads to the right workspace without naming it; the file selects among keys already on the machine and never carries one itself.
 
 ## Development
 
 ```bash
 make check          # clippy, the unit tests and every golden case
-make build          # → target/release/krowk (with sessions) and krowk-mcp
+make build          # → target/release/krowk (the full build) and krowk-mcp
 make mock           # a local stand-in registry — then run any command with --dev
 make golden-update  # re-record tests/golden/cases after an intended output change
 make bench          # hold the release builds to the performance and size budgets

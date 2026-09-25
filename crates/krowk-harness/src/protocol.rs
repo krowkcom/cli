@@ -58,7 +58,8 @@ pub enum WireApi {
 /// State a provider needs back verbatim and nobody else may read: a thinking
 /// signature, redacted thinking, encrypted reasoning. Stored as the provider
 /// sent it and replayed unmodified, only to the provider and wire API named
-/// here; anywhere else it is dropped and the item's neutral text stands in.
+/// here. Anywhere else the reasoning is left out of the request — its text
+/// is never passed off as something the other model said.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderBlob {

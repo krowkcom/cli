@@ -123,7 +123,7 @@ impl Host {
         let prompt_item = Item::UserText { text };
         w.log(LogBody::ItemCompleted { turn_id: turn_id.clone(), item_id: krowk_store::new_id(), item: prompt_item.clone() }).await?;
         let mut history = past.items;
-        history.push(HistoryItem { item: prompt_item, response: None, provider: None });
+        history.push(HistoryItem { item: prompt_item, response: None });
 
         let (cancel_tx, cancel) = watch::channel(false);
         self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), cancel_tx);
@@ -183,24 +183,19 @@ struct Past {
 fn replay(branch: &[&LogEvent]) -> Past {
     let mut past = Past::default();
     let mut at: HashMap<&str, usize> = HashMap::new();
-    let mut provider: Option<(String, WireApi)> = None;
     let mut responses = 0usize;
     for ev in branch {
         match &ev.body {
             LogBody::SessionStarted { cwd, .. } => past.cwd = Some(PathBuf::from(cwd)),
-            LogBody::TurnStarted { model, provider: p, wire_api, .. } => {
-                past.model = Some(model.clone());
-                provider = Some((p.clone(), *wire_api));
-            }
+            LogBody::TurnStarted { model, .. } => past.model = Some(model.clone()),
             LogBody::ItemCompleted { item_id, item, .. } => {
                 at.insert(item_id, past.items.len());
-                past.items.push(HistoryItem { item: item.clone(), response: None, provider: None });
+                past.items.push(HistoryItem { item: item.clone(), response: None });
             }
             LogBody::ResponseCompleted { item_ids, .. } => {
                 for id in item_ids {
                     if let Some(&i) = at.get(id.as_str()) {
                         past.items[i].response = Some(responses);
-                        past.items[i].provider = provider.clone();
                     }
                 }
                 responses += 1;

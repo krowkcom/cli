@@ -74,7 +74,6 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
             let tool_defs = tools::definitions();
             let _ = events.send(EngineEvent::Context { system: system.clone(), tools: tool_defs.clone() }).await;
             let mut req = ModelRequest { model: ctx.model.model.clone(), system, tools: tool_defs, history: ctx.history.clone() };
-            let provider = Some((self.client.provider().to_string(), self.client.wire_api()));
             // Response indexes continue from the history's, so a replayed
             // turn and this one never share an index.
             let first_response = req.history.iter().filter_map(|h| h.response).max().map_or(0, |m| m + 1);
@@ -103,7 +102,7 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                         _ => None,
                     })
                     .collect();
-                req.history.extend(resp.items.into_iter().map(|(_, item)| HistoryItem { item, response, provider: provider.clone() }));
+                req.history.extend(resp.items.into_iter().map(|(_, item)| HistoryItem { item, response }));
                 if resp.interrupted {
                     return Ok(TurnEnd::Interrupted);
                 }
@@ -130,7 +129,7 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                     };
                     let item = Item::ToolResult { call_id, output, is_error };
                     let _ = events.send(EngineEvent::ItemCompleted { item_id, item: item.clone() }).await;
-                    req.history.push(HistoryItem { item, response: None, provider: None });
+                    req.history.push(HistoryItem { item, response: None });
                 }
                 if interrupted {
                     return Ok(TurnEnd::Interrupted);

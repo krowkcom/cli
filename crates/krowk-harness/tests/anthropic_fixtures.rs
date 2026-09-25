@@ -16,7 +16,7 @@ use krowk_harness::anthropic::{request_body, AnthropicClient};
 use krowk_harness::engine::{EngineEvent, HistoryItem};
 use krowk_harness::instances::{InstancesConfig, Registry, Resolved};
 use krowk_harness::native::{ModelClient, ModelRequest};
-use krowk_harness::protocol::{Item, LogBody, LogEvent, ToolDefinition, WireApi};
+use krowk_harness::protocol::{Item, LogBody, LogEvent, ToolDefinition};
 use serde_json::json;
 
 /// The signature the tool-use fixture streams, as its two deltas decode.
@@ -39,10 +39,6 @@ fn decode(name: &str, chunk: usize) -> (Decoder, Vec<EngineEvent>) {
 fn instance() -> Resolved {
     let env = |k: &str| if k == "ANTHROPIC_API_KEY" { "sk-test".to_string() } else { String::new() };
     Registry::resolve(&InstancesConfig::default(), &env).instances["anthropic"].clone()
-}
-
-fn anthropic() -> Option<(String, WireApi)> {
-    Some(("anthropic".into(), WireApi::AnthropicMessages))
 }
 
 #[test]
@@ -97,9 +93,9 @@ fn r_log_3_a_thinking_signature_round_trips_through_the_log_byte_identical() {
             other => panic!("{other:?}"),
         })
         .collect();
-    let mut history = vec![HistoryItem { item: Item::UserText { text: "read README.md and summarise it in one line".into() }, response: None, provider: None }];
-    history.extend(read_back.into_iter().map(|item| HistoryItem { item, response: Some(0), provider: anthropic() }));
-    history.push(HistoryItem { item: Item::ToolResult { call_id: "toolu_01ReadReadme".into(), output: "# krowk".into(), is_error: false }, response: None, provider: None });
+    let mut history = vec![HistoryItem { item: Item::UserText { text: "read README.md and summarise it in one line".into() }, response: None }];
+    history.extend(read_back.into_iter().map(|item| HistoryItem { item, response: Some(0) }));
+    history.push(HistoryItem { item: Item::ToolResult { call_id: "toolu_01ReadReadme".into(), output: "# krowk".into(), is_error: false }, response: None });
     let req = ModelRequest { model: "claude-sonnet-4-6".into(), system: "s".into(), tools: vec![], history };
     let body = request_body(&req, &instance());
     let assistant = &body["messages"][1];
@@ -109,14 +105,27 @@ fn r_log_3_a_thinking_signature_round_trips_through_the_log_byte_identical() {
     let wire = body.to_string();
     assert!(wire.contains(&format!("\"signature\":\"{SIGNATURE}\"")), "the signature goes back byte for byte");
 
-    // Replayed only to its own provider: anywhere else the text stands in.
+    // Decided by the blob, not by where the item sits: reasoning from a
+    // response that failed before completing (no response index) replays too.
+    let mut failed = req.clone();
+    for h in failed.history.iter_mut() {
+        h.response = None;
+    }
+    assert_eq!(request_body(&failed, &instance())["messages"][1]["content"][0]["signature"], SIGNATURE);
+
+    // Another provider's blob never replays here, and its reasoning is not
+    // passed off as something the model said.
     let mut foreign = req.clone();
-    for h in foreign.history.iter_mut().filter(|h| h.response.is_some()) {
-        h.provider = Some(("openai".into(), WireApi::AnthropicMessages));
+    for h in foreign.history.iter_mut() {
+        if let Item::Reasoning { blob: Some(b), .. } = &mut h.item {
+            b.provider = "openai".into();
+        }
     }
     let body = request_body(&foreign, &instance());
     assert!(!body.to_string().contains(SIGNATURE));
-    assert_eq!(body["messages"][1]["content"][0], json!({ "type": "text", "text": THINKING }));
+    assert!(!body.to_string().contains(THINKING), "reasoning never becomes assistant text");
+    assert_eq!(body["messages"][1]["content"][0]["type"], "text");
+    assert_eq!(body["messages"][1]["content"][0]["text"], "I'll read the README.");
 }
 
 #[test]
@@ -127,10 +136,10 @@ fn r_log_3_redacted_thinking_is_kept_opaque_and_replayed_as_it_came() {
     let data = blob.data["data"].as_str().unwrap().to_string();
     assert_eq!(d.items[1].1, Item::AssistantText { text: "Done.".into() });
     let history = vec![
-        HistoryItem { item: Item::UserText { text: "q".into() }, response: None, provider: None },
-        HistoryItem { item: d.items[0].1.clone(), response: Some(0), provider: anthropic() },
-        HistoryItem { item: d.items[1].1.clone(), response: Some(0), provider: anthropic() },
-        HistoryItem { item: Item::UserText { text: "again".into() }, response: None, provider: None },
+        HistoryItem { item: Item::UserText { text: "q".into() }, response: None },
+        HistoryItem { item: d.items[0].1.clone(), response: Some(0) },
+        HistoryItem { item: d.items[1].1.clone(), response: Some(0) },
+        HistoryItem { item: Item::UserText { text: "again".into() }, response: None },
     ];
     let body = request_body(&ModelRequest { model: "m".into(), system: "s".into(), tools: vec![], history }, &instance());
     assert_eq!(body["messages"][1]["content"][0], json!({ "type": "redacted_thinking", "data": data }));
@@ -139,8 +148,8 @@ fn r_log_3_redacted_thinking_is_kept_opaque_and_replayed_as_it_came() {
 #[test]
 fn r_prov_3_cache_breakpoints_sit_on_the_stable_prefix_and_the_growing_tail() {
     let tools = vec![ToolDefinition { name: "read".into(), description: "d".into(), input_schema: json!({ "type": "object" }) }];
-    let turn = |text: &str| HistoryItem { item: Item::UserText { text: text.into() }, response: None, provider: None };
-    let said = |text: &str, r: usize| HistoryItem { item: Item::AssistantText { text: text.into() }, response: Some(r), provider: anthropic() };
+    let turn = |text: &str| HistoryItem { item: Item::UserText { text: text.into() }, response: None };
+    let said = |text: &str, r: usize| HistoryItem { item: Item::AssistantText { text: text.into() }, response: Some(r) };
     let history = vec![turn("one"), said("a", 0), turn("two"), said("b", 1), turn("three")];
     let body = request_body(&ModelRequest { model: "m".into(), system: "sys".into(), tools, history }, &instance());
     assert_eq!(body["system"][0]["cache_control"], json!({ "type": "ephemeral" }), "tools and system, cached together");
@@ -161,9 +170,9 @@ fn r_prov_3_cache_breakpoints_sit_on_the_stable_prefix_and_the_growing_tail() {
 #[test]
 fn an_interrupted_tool_call_is_answered_before_it_is_sent_back() {
     let history = vec![
-        HistoryItem { item: Item::UserText { text: "q".into() }, response: None, provider: None },
-        HistoryItem { item: Item::ToolCall { call_id: "toolu_x".into(), name: "read".into(), input: json!({}) }, response: Some(0), provider: anthropic() },
-        HistoryItem { item: Item::UserText { text: "next".into() }, response: None, provider: None },
+        HistoryItem { item: Item::UserText { text: "q".into() }, response: None },
+        HistoryItem { item: Item::ToolCall { call_id: "toolu_x".into(), name: "read".into(), input: json!({}) }, response: Some(0) },
+        HistoryItem { item: Item::UserText { text: "next".into() }, response: None },
     ];
     let body = request_body(&ModelRequest { model: "m".into(), system: "s".into(), tools: vec![], history }, &instance());
     let next = &body["messages"][2]["content"];

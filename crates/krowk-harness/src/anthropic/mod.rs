@@ -122,14 +122,14 @@ fn messages(history: &[HistoryItem]) -> Vec<Value> {
             Item::AssistantText { text } if !text.is_empty() => push(&mut out, "assistant", json!({ "type": "text", "text": text })),
             Item::AssistantText { .. } => {}
             Item::ToolCall { call_id, name, input } => push(&mut out, "assistant", json!({ "type": "tool_use", "id": call_id, "name": name, "input": input })),
+            // Replayed only when the blob itself says it is ours — never
+            // by where the item sits, which a response that failed before
+            // completing does not record. Reasoning that cannot replay is
+            // left out of the request, never turned into assistant text:
+            // that would put words in the model's mouth it never said.
             Item::Reasoning { text, blob } => {
-                let ours = h.provider.as_ref().is_some_and(|(p, w)| p == stream::PROVIDER && *w == WireApi::AnthropicMessages);
-                match blob.as_ref().filter(|_| ours).and_then(|b| replay(b, text)) {
-                    Some(block) => push(&mut out, "assistant", block),
-                    // Another provider's reasoning is kept as its text: its
-                    // blob means nothing here (R-SWITCH-1).
-                    None if !text.is_empty() && !ours => push(&mut out, "assistant", json!({ "type": "text", "text": text })),
-                    None => {}
+                if let Some(block) = blob.as_ref().filter(|b| b.provider == stream::PROVIDER && b.wire_api == WireApi::AnthropicMessages).and_then(|b| replay(b, text)) {
+                    push(&mut out, "assistant", block);
                 }
             }
         }

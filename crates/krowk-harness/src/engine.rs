@@ -71,16 +71,17 @@ pub struct TurnContext {
     pub cancel: watch::Receiver<bool>,
 }
 
-/// An item of the branch, with the grouping the provider needs to replay it:
-/// which model call produced it, and on which wire API.
+/// An item of the branch, with the model call that produced it. Whether a
+/// reasoning item's blob may replay is the blob's own to say — it names its
+/// provider and wire API — so an item whose response never completed
+/// replays as faithfully as any other.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryItem {
     pub item: Item,
     /// The index of the response this item came out of, unique within the
-    /// history; none for items the host or a tool produced.
+    /// history; none for items the host or a tool produced, and for items of
+    /// a response that failed before it completed.
     pub response: Option<usize>,
-    /// Who produced the response, for deciding whether its blobs replay.
-    pub provider: Option<(String, WireApi)>,
 }
 
 /// How a turn that did not fail ended.

@@ -825,6 +825,12 @@ stdout:
       "type": "string",
       "default": "default",
       "usage": "With -p: default, acceptEdits, plan or bypassPermissions. Until permission rules land, bash runs only under bypassPermissions"
+    },
+    {
+      "name": "toolset",
+      "type": "string",
+      "default": "",
+      "usage": "With -p: the tools' preset — claude (str_replace), gpt (apply_patch) or grok (search_replace). The model's family picks one when absent"
     }
   ],
   "environment": [
@@ -1684,6 +1690,12 @@ stdout:
       "type": "string",
       "default": "default",
       "usage": "With -p: default, acceptEdits, plan or bypassPermissions. Until permission rules land, bash runs only under bypassPermissions"
+    },
+    {
+      "name": "toolset",
+      "type": "string",
+      "default": "",
+      "usage": "With -p: the tools' preset — claude (str_replace), gpt (apply_patch) or grok (search_replace). The model's family picks one when absent"
     }
   ],
   "environment": [
@@ -2557,6 +2569,12 @@ stdout:
       "type": "string",
       "default": "default",
       "usage": "With -p: default, acceptEdits, plan or bypassPermissions. Until permission rules land, bash runs only under bypassPermissions"
+    },
+    {
+      "name": "toolset",
+      "type": "string",
+      "default": "",
+      "usage": "With -p: the tools' preset — claude (str_replace), gpt (apply_patch) or grok (search_replace). The model's family picks one when absent"
     }
   ],
   "environment": [
@@ -3430,6 +3448,12 @@ tty:
       "type": "string",
       "default": "default",
       "usage": "With -p: default, acceptEdits, plan or bypassPermissions. Until permission rules land, bash runs only under bypassPermissions"
+    },
+    {
+      "name": "toolset",
+      "type": "string",
+      "default": "",
+      "usage": "With -p: the tools' preset — claude (str_replace), gpt (apply_patch) or grok (search_replace). The model's family picks one when absent"
     }
   ],
   "environment": [

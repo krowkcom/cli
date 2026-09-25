@@ -65,8 +65,12 @@ unit = "bytes"
 # bytes, and its review round 26,824 more: 7,240,840 (6.91 MiB), 99,192
 # bytes under this.
 # Ticket 08's budget and `publish` (no new crate) add 126,656 bytes of its
-# own (measured on the umbrella before ticket 07).
-max = { x86_64-linux = 7_340_032 }
+# own (measured on the umbrella before ticket 07); with 07 they measure
+# 7,365,736 (7.02 MiB), 25,704 bytes over 7.00 MiB. Raised 7.00 -> 7.25 MiB
+# by ticket 08: no crate is added — the growth is the budget, the
+# evidence tool, the stream frames and their tests' code paths — and the
+# raise leaves 236,440 bytes for the rest of Harness P0 to justify.
+max = { x86_64-linux = 7_602_176 }
 status = "enforced"
 
 # --- Startup: a new process each run, no daemon ---

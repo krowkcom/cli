@@ -5,10 +5,14 @@
 //! executions — a request the client killed or timed out on that still ran,
 //! and billed, on the provider's side. Only the ledger knows about those.
 //!
-//! Ledger sessions are imported like any other thread (harness `ledger`, one
-//! turn per row, each message linked to its turn). Reconciling then decides,
-//! per row, whether a local transcript already accounts for it:
+//! Ledger sessions are imported as messages only (harness `ledger`, one
+//! message per row, deduped on the provider's id). Reconciling owns their
+//! turns: one per message, numbered by the message's own seq — which never
+//! changes once stored, however the file is re-exported — and linked to it.
+//! It then decides, per row, whether anything else already accounts for it:
 //!
+//! - **duplicate**: an earlier-stored ledger message has the same provider
+//!   and id — the same execution in two exports. Zeroed, counted once.
 //! - **observed**: an assistant message outside the ledger has the same model
 //!   and the same input and completion token counts. The turn keeps its
 //!   message (the provider's record) but its token columns are zeroed, so the
@@ -17,8 +21,11 @@
 //!   and any cost the provider reported, and every roll-up counts it.
 //!
 //! Each local message accounts for at most one ledger row, so two identical
-//! calls where the client saw one leave one unobserved. Rows are taken in seq
-//! order, which makes the answer the same on every run. Reconciling reads
+//! calls where the client saw one leave one unobserved. Claude writes one
+//! transcript line per content block, each repeating its API message's
+//! usage, so lines sharing a `message.id` are one message. Rows are taken in
+//! the order they were first stored, which makes the answer the same on
+//! every run. Reconciling reads
 //! only what is stored — the message usage is the source of truth, the turn
 //! columns are derived from it — so running it again changes nothing, and a
 //! transcript imported after the ledger turns its row observed on the next run.
@@ -32,12 +39,14 @@ use std::collections::HashMap;
 pub const LEDGER_HARNESS: &str = "ledger";
 pub const STATUS_OBSERVED: &str = "observed";
 pub const STATUS_UNOBSERVED: &str = "unobserved";
+pub const STATUS_DUPLICATE: &str = "duplicate";
 
 /// What one reconciliation found across every ledger session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reconciled {
     pub observed: usize,
     pub unobserved: usize,
+    pub duplicate: usize,
 }
 
 /// Input and completion tokens as a transcript's usage block reports them,
@@ -48,24 +57,51 @@ pub struct Reconciled {
 const FINGERPRINT: &str = "COALESCE(json_extract(m.usage, '$.input_tokens'), json_extract(m.usage, '$.input'), json_extract(m.usage, '$.prompt_tokens')), \
      COALESCE(json_extract(m.usage, '$.output_tokens'), json_extract(m.usage, '$.output') + COALESCE(json_extract(m.usage, '$.reasoning'), 0), json_extract(m.usage, '$.completion_tokens'))";
 
-/// Marks every ledger turn observed or unobserved, in one transaction.
+/// Gives every ledger message its turn and marks each turn duplicate,
+/// observed or unobserved, in one transaction.
 pub fn reconcile_ledger(conn: &Connection) -> Result<Reconciled, StoreError> {
     let tx = conn.unchecked_transaction().map_err(|e| other("reconcile ledger", e))?;
-    let rows: Vec<(String, String, String)> = tx
+    let now = crate::now_ms();
+    // One turn per message, at the message's seq, created once.
+    let missing: Vec<(String, i64)> = tx
         .prepare(
-            "SELECT t.id, m.model, m.usage FROM message m JOIN turn t ON t.id = m.turn_id JOIN session s ON s.id = m.session_id \
-             WHERE s.harness = ?1 ORDER BY s.id, t.seq",
+            "SELECT m.session_id, m.seq FROM message m JOIN session s ON s.id = m.session_id \
+             WHERE s.harness = ?1 AND NOT EXISTS (SELECT 1 FROM turn t WHERE t.session_id = m.session_id AND t.seq = m.seq)",
         )
-        .and_then(|mut st| st.query_map([LEDGER_HARNESS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect())
+        .and_then(|mut st| st.query_map([LEDGER_HARNESS], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+        .map_err(|e| other("reconcile ledger: find new rows", e))?;
+    for (session_id, seq) in missing {
+        tx.execute(
+            "INSERT INTO turn (id, session_id, seq, status, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)",
+            params![crate::new_id(), session_id, seq, STATUS_UNOBSERVED, now, now],
+        )
+        .map_err(|e| other("reconcile ledger: insert turn", e))?;
+    }
+    tx.execute(
+        "UPDATE message SET turn_id = (SELECT t.id FROM turn t WHERE t.session_id = message.session_id AND t.seq = message.seq) \
+         WHERE turn_id IS NULL AND session_id IN (SELECT id FROM session WHERE harness = ?1)",
+        [LEDGER_HARNESS],
+    )
+    .map_err(|e| other("reconcile ledger: link turns", e))?;
+
+    // Oldest-stored first, so the first export of an execution keeps it.
+    let rows: Vec<(String, String, String, String, String)> = tx
+        .prepare(
+            "SELECT t.id, m.provider, COALESCE(m.foreign_id, ''), m.model, m.usage FROM message m JOIN turn t ON t.id = m.turn_id \
+             JOIN session s ON s.id = m.session_id WHERE s.harness = ?1 ORDER BY m.id",
+        )
+        .and_then(|mut st| st.query_map([LEDGER_HARNESS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect())
         .map_err(|e| other("reconcile ledger: read ledger rows", e))?;
     if rows.is_empty() {
+        tx.commit().map_err(|e| other("reconcile ledger", e))?;
         return Ok(Reconciled::default());
     }
     let mut local: HashMap<(String, i64, i64), usize> = HashMap::new();
     {
         let mut st = tx
             .prepare(&format!(
-                "SELECT m.model, {FINGERPRINT} FROM message m JOIN session s ON s.id = m.session_id \
+                "SELECT DISTINCT m.model, {FINGERPRINT}, COALESCE(json_extract(m.raw_json, '$.message.id'), m.id) \
+                 FROM message m JOIN session s ON s.id = m.session_id \
                  WHERE s.harness != ?1 AND m.role = 'assistant' \
                  AND m.model IN (SELECT DISTINCT lm.model FROM message lm JOIN session ls ON ls.id = lm.session_id WHERE ls.harness = ?1)"
             ))
@@ -79,28 +115,30 @@ pub fn reconcile_ledger(conn: &Connection) -> Result<Reconciled, StoreError> {
             }
         }
     }
+    let zero = |status: &str, turn_id: &str| {
+        tx.execute(
+            "UPDATE turn SET status = ?, cost_input_tokens = 0, cost_output_tokens = 0, cost_total_tokens = 0, cost_cache_read_tokens = 0, cost_cache_write_tokens = 0, cost_reasoning_tokens = 0, cost_usd_micros = NULL, time_updated = ? WHERE id = ?",
+            params![status, now, turn_id],
+        )
+    };
     let mut out = Reconciled::default();
-    for (turn_id, model, usage) in rows {
+    let mut executions = std::collections::HashSet::new();
+    for (turn_id, provider, foreign_id, model, usage) in rows {
         let u = LedgerUsage::parse(&usage);
-        let key = (model, u.input, u.output);
-        let seen = local.get_mut(&key).filter(|n| **n > 0);
-        let result = match seen {
-            Some(n) => {
-                *n -= 1;
-                out.observed += 1;
-                tx.execute(
-                    "UPDATE turn SET status = ?, cost_input_tokens = 0, cost_output_tokens = 0, cost_total_tokens = 0, cost_cache_read_tokens = 0, cost_cache_write_tokens = 0, cost_reasoning_tokens = 0, cost_usd_micros = NULL WHERE id = ?",
-                    params![STATUS_OBSERVED, turn_id],
-                )
-            }
-            None => {
-                out.unobserved += 1;
-                let t = u.turn_columns();
-                tx.execute(
-                    "UPDATE turn SET status = ?, cost_input_tokens = ?, cost_output_tokens = ?, cost_total_tokens = ?, cost_cache_read_tokens = ?, cost_cache_write_tokens = ?, cost_reasoning_tokens = ?, cost_usd_micros = ? WHERE id = ?",
-                    params![STATUS_UNOBSERVED, t.cost_input, t.cost_output, t.cost_total, t.cost_cache_read, t.cost_cache_write, t.cost_reasoning, t.cost_usd_micros, turn_id],
-                )
-            }
+        let result = if !executions.insert((provider, foreign_id)) {
+            out.duplicate += 1;
+            zero(STATUS_DUPLICATE, &turn_id)
+        } else if let Some(n) = local.get_mut(&(model, u.input, u.output)).filter(|n| **n > 0) {
+            *n -= 1;
+            out.observed += 1;
+            zero(STATUS_OBSERVED, &turn_id)
+        } else {
+            out.unobserved += 1;
+            let t = u.turn_columns();
+            tx.execute(
+                "UPDATE turn SET status = ?, cost_input_tokens = ?, cost_output_tokens = ?, cost_total_tokens = ?, cost_cache_read_tokens = ?, cost_cache_write_tokens = ?, cost_reasoning_tokens = ?, cost_usd_micros = ?, time_updated = ? WHERE id = ?",
+                params![STATUS_UNOBSERVED, t.cost_input, t.cost_output, t.cost_total, t.cost_cache_read, t.cost_cache_write, t.cost_reasoning, t.cost_usd_micros, now, turn_id],
+            )
         };
         result.map_err(|e| other("reconcile ledger: update turn", e))?;
     }
@@ -163,27 +201,23 @@ mod tests {
         serde_json::json!({ "input_tokens": input, "output_tokens": output, "reasoning_tokens": reasoning, "cost_usd": cost }).to_string()
     }
 
-    fn ledger(rows: &[(&str, &str, String)]) -> Thread {
-        let turns = rows.iter().map(|(_, _, u)| LedgerUsage::parse(u).turn_columns()).collect();
+    fn ledger(file: &str, rows: &[(&str, &str, String)]) -> Thread {
         let messages = rows
             .iter()
-            .enumerate()
-            .map(|(i, (id, model, u))| Message {
+            .map(|(id, model, u)| Message {
                 role: Role::Assistant,
                 provider: "opencode".into(),
                 model: (*model).into(),
                 foreign_id: (*id).into(),
                 usage: u.clone(),
                 raw_json: None,
-                turn_seq: Some(i as i64),
                 parts: Vec::new(),
             })
             .collect();
         Thread {
             worktree: Worktree { path: "/ledger".into(), vcs: "none".into(), ..Worktree::default() },
             session: Session { title: "ledger".into(), harness: LEDGER_HARNESS.into(), provider: "opencode".into(), ..Session::default() },
-            binding: Binding { provider: LEDGER_HARNESS.into(), harness: LEDGER_HARNESS.into(), foreign_session_id: "zen".into(), ..Binding::default() },
-            turns,
+            binding: Binding { provider: LEDGER_HARNESS.into(), harness: LEDGER_HARNESS.into(), foreign_session_id: file.into(), ..Binding::default() },
             messages,
             ..Thread::default()
         }
@@ -202,7 +236,6 @@ mod tests {
                 foreign_id: "msg_1".into(),
                 usage: usage.into(),
                 raw_json: None,
-                turn_seq: None,
                 parts: Vec::new(),
             }],
             ..Thread::default()
@@ -228,19 +261,19 @@ mod tests {
             ("gen_ghost", "qwen3.5-plus", usage(84, 3422, 3405, Some(0.0041))),
         ];
         let w = Writer::new(&conn);
-        w.ingest(&ledger(&rows)).unwrap();
+        w.ingest(&ledger("zen", &rows)).unwrap();
         // opencode keeps reasoning beside output: 17 + 1362 is the 1379 billed.
         w.ingest(&transcript("qwen3.5-plus", r#"{"input":84,"output":17,"reasoning":1362,"cache":{"read":0,"write":0}}"#)).unwrap();
 
-        assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 1, unobserved: 1 });
+        assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 1, unobserved: 1, duplicate: 0 });
         assert_eq!(
             statuses(&conn),
             vec![("observed".into(), 0, 0, None), ("unobserved".into(), 17, 3405, Some(4100))],
             "the ghost keeps its reasoning split and the provider's cost"
         );
         // Converges: a re-import and a second pass change nothing.
-        w.ingest(&ledger(&rows)).unwrap();
-        assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 1, unobserved: 1 });
+        w.ingest(&ledger("zen", &rows)).unwrap();
+        assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 1, unobserved: 1, duplicate: 0 });
         assert_eq!(statuses(&conn)[1].0, "unobserved");
     }
 
@@ -251,12 +284,56 @@ mod tests {
         let conn = open(&env).unwrap();
         let w = Writer::new(&conn);
         let rows = [("a", "m", usage(10, 20, 0, None)), ("b", "m", usage(10, 20, 0, None))];
-        w.ingest(&ledger(&rows)).unwrap();
-        assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 0, unobserved: 2 });
+        w.ingest(&ledger("zen", &rows)).unwrap();
+        assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 0, unobserved: 2, duplicate: 0 });
         w.ingest(&transcript("m", r#"{"input_tokens":10,"output_tokens":20}"#)).unwrap();
-        assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 1, unobserved: 1 });
+        assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 1, unobserved: 1, duplicate: 0 });
         let st = statuses(&conn);
         assert_eq!((st[0].0.as_str(), st[1].0.as_str()), ("observed", "unobserved"));
         assert_eq!(reconcile_ledger(&Connection::open_in_memory().unwrap()).map_err(|_| ()), Err(()), "no schema, no answer");
+    }
+
+    #[test]
+    fn a_reordered_re_export_keeps_every_row_on_its_own_turn_and_a_second_export_counts_once() {
+        let home = Home::new("ledger-reorder");
+        let env = home.env();
+        let conn = open(&env).unwrap();
+        let w = Writer::new(&conn);
+        let (a, b, c) = (("a", "m", usage(1, 100, 0, Some(1.0))), ("b", "m", usage(2, 200, 0, Some(2.0))), ("c", "m", usage(3, 300, 0, Some(3.0))));
+        w.ingest(&ledger("zen", &[a.clone(), b.clone()])).unwrap();
+        reconcile_ledger(&conn).unwrap();
+        // A row prepended and the file truncated to it and a: nothing moves.
+        w.ingest(&ledger("zen", &[c.clone(), a.clone(), b.clone()])).unwrap();
+        w.ingest(&ledger("zen", &[c.clone(), a.clone()])).unwrap();
+        assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 0, unobserved: 3, duplicate: 0 });
+        let costs: Vec<(String, Option<i64>)> = conn
+            .prepare("SELECT m.foreign_id, t.cost_usd_micros FROM message m JOIN turn t ON t.id = m.turn_id ORDER BY m.seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(costs, vec![("a".into(), Some(1_000_000)), ("b".into(), Some(2_000_000)), ("c".into(), Some(3_000_000))]);
+        // The same executions in a second file are the same executions.
+        w.ingest(&ledger("zen-copy", &[a, c])).unwrap();
+        assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 0, unobserved: 3, duplicate: 2 });
+    }
+
+    #[test]
+    fn claude_lines_repeating_one_api_message_match_one_row() {
+        let home = Home::new("ledger-claude");
+        let env = home.env();
+        let conn = open(&env).unwrap();
+        let w = Writer::new(&conn);
+        let rows = [("a", "m", usage(10, 20, 0, None)), ("b", "m", usage(10, 20, 0, None))];
+        w.ingest(&ledger("zen", &rows)).unwrap();
+        let mut th = transcript("m", r#"{"input_tokens":10,"output_tokens":20}"#);
+        let line = th.messages[0].clone();
+        th.messages = ["l1", "l2"]
+            .iter()
+            .map(|id| Message { foreign_id: (*id).into(), raw_json: Some(r#"{"message":{"id":"msg_1"}}"#.into()), ..line.clone() })
+            .collect();
+        w.ingest(&th).unwrap();
+        assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 1, unobserved: 1, duplicate: 0 });
     }
 }

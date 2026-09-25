@@ -19,9 +19,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   optional `cost_usd` and `time`) and `sessions import --from ledger`
   (or `all`, `sync`, `rebuild`) reads it. Every import then reconciles the
   ledger against your transcripts: a row a transcript already accounts for
-  is counted once, from the transcript; a row nothing local saw shows up
-  as its own `unobserved` turn in `krowk sessions` and `sessions show`.
-  The import report says how many of each it found.
+  is counted once, from the transcript; the same execution in two exports
+  is counted once; a row nothing local saw shows up as its own
+  `unobserved` turn in `krowk sessions` and `sessions show`. The import
+  report says how many of each it found.
 
 ## [0.10.0] - 2026-09-24
 

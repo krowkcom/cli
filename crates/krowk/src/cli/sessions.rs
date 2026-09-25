@@ -540,12 +540,13 @@ struct SyncPricing {
 }
 
 /// What reconciling the provider ledgers found: rows a transcript accounts
-/// for, and rows only the provider saw — billed executions the client never
-/// received an answer for.
+/// for, rows only the provider saw — billed executions the client never
+/// received an answer for — and rows another export already holds.
 #[derive(Debug, Serialize)]
 struct LedgerReport {
     observed: usize,
     unobserved: usize,
+    duplicate: usize,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -742,7 +743,9 @@ fn import_into(ctx: &mut Ctx, conn: Option<&Connection>, store_path: &str, sourc
     // its ledger row is what turns that row observed.
     if let Some(conn) = conn {
         match krowk_store::reconcile_ledger(conn) {
-            Ok(r) if r.observed + r.unobserved > 0 => report.ledger = Some(LedgerReport { observed: r.observed, unobserved: r.unobserved }),
+            Ok(r) if r.observed + r.unobserved + r.duplicate > 0 => {
+                report.ledger = Some(LedgerReport { observed: r.observed, unobserved: r.unobserved, duplicate: r.duplicate })
+            }
             Ok(_) => {}
             Err(e) => broken.push(format!("the provider ledgers could not be reconciled: {}", sanitize_store_err(e.message(), store_path))),
         }
@@ -836,7 +839,11 @@ fn emit_import_report(ctx: &mut Ctx, report: &ImportReport) -> Result<(), Error>
         }
     }
     if let Some(l) = &report.ledger {
-        out += &format!("reconciled {} ledger rows a transcript saw, {} only the provider saw\n", l.observed, l.unobserved);
+        out += &format!("reconciled {} ledger rows a transcript saw, {} only the provider saw", l.observed, l.unobserved);
+        if l.duplicate > 0 {
+            out += &format!(", {} already in another export", l.duplicate);
+        }
+        out += "\n";
     }
     let _ = write!(ctx.io.stdout, "{out}");
     Ok(())

@@ -232,7 +232,6 @@ impl<'a> Builder<'a> {
             foreign_id: String::new(),
             usage: String::new(),
             raw_json: std::str::from_utf8(raw).ok().map(String::from),
-            turn_seq: None,
             parts,
         });
         Ok(())

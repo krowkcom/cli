@@ -1,7 +1,8 @@
 //! A request the client killed still ran, and still billed, on the provider's
 //! side. This holds the whole path to that fact: a stand-in provider that
-//! finishes a request after its client has given up and meters it into its
-//! ledger, then `sessions import` and the listing, run as the binary does.
+//! meters every request it finishes into its ledger — one its client waited
+//! for, whose answer lands in a transcript, and one its client gave up on —
+//! then `sessions import` and the listing, run as the binary does.
 //!
 //! The binary runs with an empty environment and a temporary HOME, so the
 //! store and the ledger directory are the test's own.
@@ -21,55 +22,97 @@ fn a_request_killed_client_side_is_still_counted_from_the_provider_ledger() {
     let ledger = home.join(".local/share/krowk/ledger/fake.jsonl");
     std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
 
-    // The provider: it reads the request, keeps generating past the client's
-    // patience, then meters the completion — as a provider does whether or
-    // not anybody is still listening — and answers into a closed socket.
+    // The provider: it reads a request, generates for `think` ms, meters
+    // the completion — as a provider does whether or not anybody is still
+    // listening — and answers, into a closed socket if need be.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let meter = ledger.clone();
     let provider = std::thread::spawn(move || {
-        let (mut conn, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 4096];
-        let _ = conn.read(&mut buf);
-        std::thread::sleep(Duration::from_millis(400));
-        let row = r#"{"id":"gen_ghost","provider":"fake","model":"qwen3.5-plus","time":"2026-09-10T11:32:05Z","input_tokens":84,"output_tokens":3422,"reasoning_tokens":3405,"cost_usd":0.0041}"#;
-        std::fs::OpenOptions::new().create(true).append(true).open(&meter).unwrap().write_all(format!("{row}\n").as_bytes()).unwrap();
-        let body = r#"{"usage":{"prompt_tokens":84,"completion_tokens":3422}}"#;
-        let _ = write!(conn, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+        for (id, think, output) in [("gen_seen", 0, 1379), ("gen_ghost", 400, 3422)] {
+            let (mut conn, _) = listener.accept().unwrap();
+            let body = read_body(&mut conn);
+            let model = body["model"].as_str().unwrap();
+            std::thread::sleep(Duration::from_millis(think));
+            let row = serde_json::json!({ "id": id, "provider": "fake", "model": model, "input_tokens": 84, "output_tokens": output, "reasoning_tokens": output - 17, "cost_usd": output as f64 * 1.2e-6 });
+            std::fs::OpenOptions::new().create(true).append(true).open(&meter).unwrap().write_all(format!("{row}\n").as_bytes()).unwrap();
+            let answer = serde_json::json!({ "id": id, "model": model, "usage": { "prompt_tokens": 84, "completion_tokens": output } }).to_string();
+            let _ = write!(conn, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}", answer.len());
+        }
     });
+    let ask = |timeout: Duration| -> Result<Value, std::io::Error> {
+        let mut client = TcpStream::connect(addr).unwrap();
+        let req = r#"{"model":"qwen3.5-plus","max_tokens":1200,"messages":[{"role":"user","content":"hi"}]}"#;
+        client.write_all(format!("POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\ncontent-length: {}\r\n\r\n{req}", req.len()).as_bytes()).unwrap();
+        client.set_read_timeout(Some(timeout)).unwrap();
+        let mut answer = String::new();
+        client.read_to_string(&mut answer)?;
+        Ok(serde_json::from_str(answer.split("\r\n\r\n").nth(1).unwrap()).unwrap())
+    };
 
-    // The client gives up after 100 ms and goes away without an answer.
-    let mut client = TcpStream::connect(addr).unwrap();
-    let req = r#"{"model":"qwen3.5-plus","max_tokens":1200,"messages":[{"role":"user","content":"hi"}]}"#;
-    write!(client, "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\ncontent-length: {}\r\n\r\n{req}", req.len()).unwrap();
-    client.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-    let mut answer = Vec::new();
-    let err = client.read_to_end(&mut answer).expect_err("the client times out before the provider answers");
+    // The first call is answered, and the agent's transcript records it.
+    let seen = ask(Duration::from_secs(5)).unwrap();
+    transcript(&home, &seen);
+    // The second the client gives up on after 100 ms, and goes away.
+    let err = ask(Duration::from_millis(100)).expect_err("the client times out before the provider answers");
     assert!(matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut), "{err}");
-    assert!(answer.is_empty(), "the client saw no usage block");
-    drop(client);
     provider.join().unwrap();
+    assert_eq!(std::fs::read_to_string(&ledger).unwrap().lines().count(), 2, "the provider metered both");
 
-    let imported = krowk(&home, &["sessions", "import", "--from", "ledger"]);
-    assert_eq!(imported["data"]["ledger"], serde_json::json!({ "observed": 0, "unobserved": 1 }), "{imported}");
+    let imported = krowk(&home, &["sessions", "import", "--from", "all"]);
+    assert_eq!(imported["data"]["ledger"], serde_json::json!({ "observed": 1, "unobserved": 1, "duplicate": 0 }), "{imported}");
 
-    let listed = krowk(&home, &["sessions"]);
+    let listed = krowk(&home, &["sessions", "--harness", "ledger"]);
     let sessions = listed["data"]["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1, "{listed}");
-    assert_eq!((sessions[0]["harness"].as_str(), sessions[0]["turns"].as_i64()), (Some("ledger"), Some(1)));
+    assert_eq!(sessions[0]["turns"].as_i64(), Some(2));
 
     let id = sessions[0]["id"].as_str().unwrap();
     let shown = krowk(&home, &["sessions", "show", id]);
-    let turn = &shown["data"]["turns"][0];
-    assert_eq!(turn["status"], "unobserved", "{shown}");
-    assert_eq!((turn["input_tokens"].as_i64(), turn["output_tokens"].as_i64()), (Some(84), Some(17)), "reasoning is split out of output");
-    assert_eq!(turn["cost_usd_micros"], 4100, "the provider's stated cost is kept");
+    let turns = &shown["data"]["turns"];
+    assert_eq!((turns[0]["status"].as_str(), turns[0]["total_tokens"].as_i64()), (Some("observed"), Some(0)), "the transcript counts it: {shown}");
+    assert_eq!(turns[1]["status"], "unobserved", "{shown}");
+    assert_eq!((turns[1]["input_tokens"].as_i64(), turns[1]["output_tokens"].as_i64()), (Some(84), Some(17)), "reasoning is split out of output");
+    assert_eq!(turns[1]["cost_usd_micros"], 4106, "the provider's stated cost is kept");
 
-    // A second import converges on the same one row.
-    let again = krowk(&home, &["sessions", "import", "--from", "ledger"]);
-    assert_eq!(again["data"]["providers"][0]["messages_inserted"], 0);
+    // A second import converges on the same rows.
+    let again = krowk(&home, &["sessions", "import", "--from", "all"]);
+    assert_eq!(again["data"]["providers"][3]["messages_inserted"], 0);
     assert_eq!(again["data"]["ledger"]["unobserved"], 1);
     let _ = std::fs::remove_dir_all(home.parent().unwrap());
+}
+
+/// The JSON body of one HTTP message, read until it is all there.
+fn read_body(conn: &mut TcpStream) -> Value {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = conn.read(&mut buf).unwrap();
+        assert!(n > 0, "the request ended early");
+        raw.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&raw);
+        if let Some((_, body)) = text.split_once("\r\n\r\n")
+            && let Ok(v) = serde_json::from_str(body)
+        {
+            return v;
+        }
+    }
+}
+
+/// A Claude Code transcript of one answered call, as the agent writes it.
+fn transcript(home: &Path, answer: &Value) {
+    let dir = home.join(".claude/projects/-work");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(home.join("work")).unwrap();
+    let cwd = home.join("work").display().to_string();
+    let sid = "33333333-3333-4333-8333-333333333333";
+    let user = serde_json::json!({ "type": "user", "uuid": "u1", "sessionId": sid, "cwd": cwd, "timestamp": "2026-09-10T11:30:00Z", "message": { "role": "user", "content": "hi" } });
+    let asst = serde_json::json!({
+        "type": "assistant", "uuid": "a1", "parentUuid": "u1", "sessionId": sid, "cwd": cwd, "timestamp": "2026-09-10T11:30:02Z",
+        "message": { "id": answer["id"], "role": "assistant", "model": answer["model"], "content": [{ "type": "text", "text": "hello" }],
+            "usage": { "input_tokens": answer["usage"]["prompt_tokens"], "output_tokens": answer["usage"]["completion_tokens"] } }
+    });
+    std::fs::write(dir.join(format!("{sid}.jsonl")), format!("{user}\n{asst}\n")).unwrap();
 }
 
 fn scratch() -> PathBuf {

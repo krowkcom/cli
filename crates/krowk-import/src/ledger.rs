@@ -1,9 +1,8 @@
 //! Provider-side usage ledgers: what a provider metered, read beside the
 //! transcripts so an execution the client never saw still counts.
 //!
-//! A ledger is a JSONL file in `ledger/` beside krowk.db
-//! (`~/.local/share/krowk/ledger/<name>.jsonl`), one metered execution per
-//! line, in the provider's words:
+//! A ledger is a JSONL file in `~/.local/share/krowk/ledger/<name>.jsonl`,
+//! one metered execution per line, in the provider's words:
 //!
 //! ```json
 //! {"id":"gen_01…","provider":"opencode","model":"qwen3.5-plus","time":"2026-09-10T11:32:05Z",
@@ -12,37 +11,39 @@
 //!
 //! `id`, `provider` and `model` are required; `id` is the provider's own id
 //! for the execution and is what a re-import dedups on — never a derived one.
-//! `output_tokens` is every completion token billed, reasoning included;
-//! `reasoning_tokens` says how many of those were reasoning.
-//! `cache_read_tokens`, `cache_write_tokens`, `time` (RFC 3339) or `time_ms`,
-//! and `cost_usd` (only when the provider states it) are optional.
+//! `input_tokens` excludes cached input, which is `cache_read_tokens` and
+//! `cache_write_tokens`; `output_tokens` is every completion token billed,
+//! reasoning included, and `reasoning_tokens` says how many of those were
+//! reasoning. Token counts, `time` (RFC 3339) or `time_ms`, and `cost_usd`
+//! (only when the provider states it) are optional. A billed execution is
+//! never dropped for a bad optional field: an unreadable time is left out,
+//! and reasoning over output is capped at output.
+//!
+//! The directory is under home whatever `XDG_DATA_HOME` says, like every
+//! transcript an importer reads, so the home sandbox covers it.
 //!
 //! Each file is one session (harness `ledger`, bound on the file name), one
-//! turn per row with its message linked to it. Whether a row is also in a
-//! local transcript is not decided here — `krowk_store::reconcile_ledger`
-//! does that against the whole store after every import. The file is read
-//! whole: turns are positional, and rows are few.
+//! message per row. Turns, and whether a row is also in a local transcript
+//! or an earlier export, are `krowk_store::reconcile_ledger`'s, run against
+//! the whole store after every import. The file is read whole; rows are few.
 
 use crate::{
-    check_os, decode_line, encode_cursor, home_path, jsonl_unchanged, open_home, read_jsonl, Env, ImportError, JsonlCursor,
+    check_os, decode_line, encode_cursor, home_dir, home_path, jsonl_unchanged, open_home, read_jsonl, Env, ImportError, JsonlCursor,
     LineError, ReadResult, Ref, Source,
 };
 use krowk_store::{Binding, LedgerUsage, Message, Role, Session, Thread, Worktree, LEDGER_HARNESS};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const LEDGER_DIR: &str = "ledger";
+/// Where ledgers live, relative to home.
+pub const LEDGER_REL: &str = ".local/share/krowk/ledger";
 const LEDGER_EXT: &str = "jsonl";
 const VCS_NONE: &str = "none";
 
 pub struct Ledger;
-
-/// `ledger/` beside krowk.db, wherever the store resolves to.
-pub fn ledger_dir(env: Env) -> Option<PathBuf> {
-    krowk_store::db_path(env).and_then(|db| db.parent().map(|d| d.join(LEDGER_DIR)))
-}
 
 impl Source for Ledger {
     fn name(&self) -> &'static str {
@@ -53,11 +54,11 @@ impl Source for Ledger {
     /// is no ledger, which is the usual answer.
     fn discover(&self, env: Env) -> Result<Vec<Ref>, ImportError> {
         check_os()?;
-        let Some(dir) = ledger_dir(env) else { return Ok(Vec::new()) };
-        if std::fs::symlink_metadata(&dir).is_err() {
+        let home = home_dir(env);
+        if home.is_empty() || std::fs::symlink_metadata(Path::new(&home).join(LEDGER_REL)).is_err() {
             return Ok(Vec::new());
         }
-        let dir = home_path(env, &dir.display().to_string()).map_err(|e| context(e, "ledger: resolve directory"))?;
+        let dir = home_path(env, LEDGER_REL).map_err(|e| context(e, "ledger: resolve directory"))?;
         let mut names: Vec<String> = std::fs::read_dir(&dir)
             .map_err(|e| ImportError::Other(format!("ledger: list {}: {e}", dir.display())))?
             .filter_map(Result::ok)
@@ -159,16 +160,8 @@ impl Row {
                 c => c,
             },
         };
-        if usage.reasoning > usage.output {
-            return Err(LineError::Skip("usage row has more reasoning_tokens than output_tokens, which include them".into()));
-        }
-        let time_ms = match (w.time_ms, w.time) {
-            (Some(ms), _) => Some(ms),
-            (None, Some(t)) => Some(
-                t.parse::<jiff::Timestamp>().map_err(|e| LineError::Skip(format!("usage row time {t:?} is not RFC 3339: {e}")))?.as_millisecond(),
-            ),
-            (None, None) => None,
-        };
+        let usage = LedgerUsage { reasoning: usage.reasoning.min(usage.output), ..usage };
+        let time_ms = w.time_ms.or_else(|| w.time.and_then(|t| t.parse::<jiff::Timestamp>().ok()).map(|t| t.as_millisecond()));
         Ok(Row { id, provider, model, time_ms, usage, raw: String::from_utf8_lossy(raw).into_owned() })
     }
 
@@ -205,18 +198,15 @@ fn thread(r: &Ref, dir: &str, rows: &[Row]) -> Thread {
             harness: LEDGER_HARNESS.into(),
         },
         binding: Binding { provider: LEDGER_HARNESS.into(), harness: LEDGER_HARNESS.into(), foreign_session_id: r.id.clone(), ..Binding::default() },
-        turns: rows.iter().map(|row| row.usage.turn_columns()).collect(),
         messages: rows
             .iter()
-            .enumerate()
-            .map(|(i, row)| Message {
+            .map(|row| Message {
                 role: Role::Assistant,
                 provider: row.provider.clone(),
                 model: row.model.clone(),
                 foreign_id: row.id.clone(),
                 usage: row.usage_json(),
                 raw_json: Some(row.raw.clone()),
-                turn_seq: Some(i as i64),
                 parts: Vec::new(),
             })
             .collect(),
@@ -228,7 +218,7 @@ fn thread(r: &Ref, dir: &str, rows: &[Row]) -> Thread {
 mod tests {
     use super::*;
 
-    struct Tmp(PathBuf);
+    struct Tmp(std::path::PathBuf);
     impl Drop for Tmp {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -258,7 +248,7 @@ mod tests {
                 r#"{"id":"g2","provider":"opencode","model":"glm-5.3-flash","input_tokens":26,"output_tokens":1854}"#,
                 r#"{"provider":"opencode","model":"m","input_tokens":1}"#,
                 r#"{"id":"g3","provider":"opencode","model":"m","input_tokens":-1}"#,
-                r#"{"id":"g4","provider":"opencode","model":"m","output_tokens":1,"reasoning_tokens":2}"#,
+                r#"{"id":"g4","provider":"opencode","model":"m","output_tokens":1,"reasoning_tokens":2,"time":"yesterday"}"#,
                 "",
             ]
             .join("\n"),
@@ -268,14 +258,17 @@ mod tests {
         let refs = Ledger.discover(&env).unwrap();
         assert_eq!(refs.iter().map(|r| r.key()).collect::<Vec<_>>(), vec!["ledger:zen".to_string()]);
         let (th, cursor, res) = Ledger.read(&env, &refs[0], "").unwrap();
-        assert_eq!((th.turns.len(), th.messages.len(), res.skipped_count), (2, 2, 3));
+        assert_eq!((th.turns.len(), th.messages.len(), res.skipped_count), (0, 3, 2), "reconciling makes the turns");
         assert_eq!(th.binding.foreign_session_id, "zen");
         assert_eq!(th.session.harness, LEDGER_HARNESS);
-        assert_eq!((th.turns[0].cost_output, th.turns[0].cost_reasoning, th.turns[0].cost_usd_micros), (17, 3405, Some(4100)));
-        assert_eq!(th.turns[1].cost_usd_micros, None, "no stated cost is priced at read time, never a silent 0");
-        assert_eq!(th.messages[1].turn_seq, Some(1));
+        let usage = |i: usize| LedgerUsage::parse(&th.messages[i].usage);
+        let t = usage(0).turn_columns();
+        assert_eq!((t.cost_output, t.cost_reasoning, t.cost_usd_micros), (17, 3405, Some(4100)));
+        assert_eq!(usage(1).cost_usd, None, "no stated cost is priced at read time, never a silent 0");
+        assert_eq!((usage(2).output, usage(2).reasoning), (1, 1), "a bad field is capped, the billed row kept");
         let u: Value = serde_json::from_str(&th.messages[0].usage).unwrap();
         assert_eq!(u["time_ms"], 1_789_039_925_000_i64);
+        assert!(serde_json::from_str::<Value>(&th.messages[2].usage).unwrap().get("time_ms").is_none());
         assert!(Ledger.unchanged(&env, &refs[0], &cursor));
 
         std::fs::write(dir.join("empty.jsonl"), "\n").unwrap();

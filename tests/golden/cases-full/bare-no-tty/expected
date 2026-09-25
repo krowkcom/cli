@@ -924,6 +924,18 @@ stdout:
       "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
     },
     {
+      "name": "max-usd",
+      "type": "string",
+      "default": "",
+      "usage": "With -p, and in the TUI: stop the session before the model call that would take it, with its subagents, past this many dollars — metered, priced from models.dev. Exits 4, like `krowk sessions budget`"
+    },
+    {
+      "name": "max-tokens",
+      "type": "string",
+      "default": "",
+      "usage": "With -p, and in the TUI: stop the session before the model call that would take its generated tokens (output and reasoning, subagents included) past this many. Exits 4"
+    },
+    {
       "name": "trust",
       "type": "bool",
       "default": "false",
@@ -1884,6 +1896,18 @@ stdout:
       "type": "string",
       "default": "",
       "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
+    },
+    {
+      "name": "max-usd",
+      "type": "string",
+      "default": "",
+      "usage": "With -p, and in the TUI: stop the session before the model call that would take it, with its subagents, past this many dollars — metered, priced from models.dev. Exits 4, like `krowk sessions budget`"
+    },
+    {
+      "name": "max-tokens",
+      "type": "string",
+      "default": "",
+      "usage": "With -p, and in the TUI: stop the session before the model call that would take its generated tokens (output and reasoning, subagents included) past this many. Exits 4"
     },
     {
       "name": "trust",
@@ -2862,6 +2886,18 @@ stdout:
       "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
     },
     {
+      "name": "max-usd",
+      "type": "string",
+      "default": "",
+      "usage": "With -p, and in the TUI: stop the session before the model call that would take it, with its subagents, past this many dollars — metered, priced from models.dev. Exits 4, like `krowk sessions budget`"
+    },
+    {
+      "name": "max-tokens",
+      "type": "string",
+      "default": "",
+      "usage": "With -p, and in the TUI: stop the session before the model call that would take its generated tokens (output and reasoning, subagents included) past this many. Exits 4"
+    },
+    {
       "name": "trust",
       "type": "bool",
       "default": "false",
@@ -3836,6 +3872,18 @@ tty:
       "type": "string",
       "default": "",
       "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
+    },
+    {
+      "name": "max-usd",
+      "type": "string",
+      "default": "",
+      "usage": "With -p, and in the TUI: stop the session before the model call that would take it, with its subagents, past this many dollars — metered, priced from models.dev. Exits 4, like `krowk sessions budget`"
+    },
+    {
+      "name": "max-tokens",
+      "type": "string",
+      "default": "",
+      "usage": "With -p, and in the TUI: stop the session before the model call that would take its generated tokens (output and reasoning, subagents included) past this many. Exits 4"
     },
     {
       "name": "trust",

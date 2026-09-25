@@ -58,6 +58,7 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
     let history_file = sessions_dir.parent().map(|d| d.join("tui-history.jsonl"));
     let toolset = prompt::toolset_flag(ctx)?;
     let effort = prompt::effort_flag(ctx)?;
+    let budget = prompt::budget_flag(ctx)?;
     // R-BACK-6: asked now, while the terminal is still the person's — the
     // TUI takes it raw from here on. A resumed session runs on its last
     // model and in the directory it started in.
@@ -82,6 +83,7 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
         catalog: prompt::catalog(ctx.io.env),
         credentials: super::providers::credentials_path(),
         trust,
+        publisher: Some(prompt::publisher(ctx)),
     };
     let outcome = krowk_tui::run(krowk_tui::Options {
         host,
@@ -90,6 +92,7 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
         permission_mode,
         toolset,
         effort,
+        budget,
         settings,
         history_file,
         notices,

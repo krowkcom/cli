@@ -10,7 +10,9 @@ use krowk_harness::headless::{self, OutputFormat};
 use krowk_harness::host::HostConfig;
 use krowk_harness::instances::{self, Registry};
 use krowk_harness::log;
-use krowk_harness::protocol::{Effort, PermissionMode, TurnStatus, Usage};
+use krowk_harness::evidence::{PublishRequest, Publisher};
+use krowk_harness::protocol::{BudgetLimits, Effort, PermissionMode, TurnStatus, Usage};
+use std::collections::HashMap;
 use krowk_harness::trust;
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
@@ -43,6 +45,7 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
     let cwd = std::env::current_dir().map_err(|e| fail("no_directory", format!("the working directory cannot be read: {e}")))?;
     let toolset = toolset_flag(ctx)?;
     let effort = effort_flag(ctx)?;
+    let budget = budget_flag(ctx)?;
     let cfg = HostConfig {
         sessions_dir,
         cwd,
@@ -52,8 +55,9 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
         catalog: catalog(ctx.io.env),
         credentials: super::providers::credentials_path(),
         trust: trust_gate(ctx.f.trust, super::interactive(ctx) && std::io::stdin().is_terminal() && ctx.io.err_tty, Some(ctx.env("HOME")).filter(|h| !h.trim().is_empty()).map(std::path::PathBuf::from)),
+        publisher: Some(publisher(ctx)),
     };
-    let opts = headless::Options { prompt, resume, model, permission_mode, toolset, effort, format };
+    let opts = headless::Options { prompt, resume, model, permission_mode, toolset, effort, budget, format };
     let outcome = headless::run(cfg, opts, ctx.io.stdout);
     let _ = ctx.io.stdout.flush();
 
@@ -105,6 +109,45 @@ pub(super) fn effort_flag(ctx: &Ctx) -> Result<Option<Effort>, Error> {
         "" => Ok(None),
         e => Ok(Some(Effort::parse(e).ok_or_else(|| fail("bad_flag", format!("--effort {e} is not a rung of the ladder — one of {}", Effort::names().join(", "))))?)),
     }
+}
+
+/// `--max-usd` and `--max-tokens`, as `krowk sessions budget` reads them:
+/// the engine refuses the model call that would take the session past
+/// either (R-BUDGET-1).
+pub(super) fn budget_flag(ctx: &Ctx) -> Result<Option<BudgetLimits>, Error> {
+    let l = super::budget::given_limits(ctx)?;
+    let limits = BudgetLimits { max_usd: l.usd, max_tokens: l.tokens };
+    Ok((!limits.is_empty()).then_some(limits))
+}
+
+/// R-EVID-1: what the host's `publish` runs — krowk_push, the MCP server's
+/// own code, against the registry this invocation pushes to (`--dev` is the
+/// stand-in), with the key read the way krowk-mcp reads it: KROWK_TOKEN, then
+/// the workspace the config names. A workspace that names no stored key
+/// refuses uploads rather than landing them anonymously, as there.
+pub(super) fn publisher(ctx: &Ctx) -> Publisher {
+    let base = krowk_api::base_url_for(ctx.f.dev, ctx.io.env);
+    let (token, workspace_err) = match crate::config::load("", ctx.io.env, &ctx.f.workspace) {
+        Err(e) => (String::new(), Some(fail("bad_config", e))),
+        Ok(cfg) => match krowk_api::creds::resolve_token(ctx.io.env, &cfg.workspace) {
+            Ok(t) => (t, None),
+            Err(e) => (String::new(), Some(e)),
+        },
+    };
+    // The engine runs on its own thread, so the environment the run
+    // metadata is detected from is captured now.
+    let vars: HashMap<String, String> = std::env::vars().collect();
+    Arc::new(move |req: &PublishRequest| {
+        let env = |k: &str| vars.get(k).cloned().unwrap_or_default();
+        let server = crate::mcp::Server {
+            client: krowk_api::Client::new(&base, &token),
+            env: &env,
+            version: super::VERSION.to_string(),
+            root: req.root.display().to_string(),
+            workspace_err: workspace_err.clone(),
+        };
+        server.publish(req)
+    })
 }
 
 /// `--toolset`, checked against the presets the harness has.

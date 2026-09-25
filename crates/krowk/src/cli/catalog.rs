@@ -442,6 +442,16 @@ fn prompt_flags() -> Vec<Flag> {
             "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent",
         ),
         flag(
+            "max-usd",
+            STRING,
+            "With -p, and in the TUI: stop the session before the model call that would take it, with its subagents, past this many dollars — metered, priced from models.dev. Exits 4, like `krowk sessions budget`",
+        ),
+        flag(
+            "max-tokens",
+            STRING,
+            "With -p, and in the TUI: stop the session before the model call that would take its generated tokens (output and reasoning, subagents included) past this many. Exits 4",
+        ),
+        flag(
             "trust",
             BOOL,
             "With -p: let a Claude Code instance run in a repository not yet trusted — it runs the repository's hooks and MCP servers without asking. Without it, -p refuses unless a person at the terminal says yes",

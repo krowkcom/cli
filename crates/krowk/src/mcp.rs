@@ -124,8 +124,10 @@ impl Server<'_> {
 /// A path allowed to be pushed: resolved through its symlinks before the
 /// check, inside the root, no credential name on the way, and not a file with
 /// a second name — a hard link is a key outside the root with nothing to resolve.
-fn permit(root: &Path, path: &str) -> Result<String, Error> {
-    let real = std::fs::canonicalize(path)
+/// A relative path resolves from `base`: the working directory when it is
+/// empty, the session's for the harness's `publish`.
+fn permit(root: &Path, base: &Path, path: &str) -> Result<String, Error> {
+    let real = std::fs::canonicalize(base.join(path))
         .map_err(|_| fail("file_unreadable", format!("cannot read `{path}` — paths resolve from the working directory")))?;
     let Ok(rel) = real.strip_prefix(root) else {
         return Err(fail(
@@ -260,6 +262,54 @@ impl Server<'_> {
     }
 }
 
+/// `publish`, the harness's evidence tool (R-EVID-1): krowk_push for a krowk
+/// session, run with the session's working directory as the root, so its
+/// confinement, its credential-file and hard-link refusals are krowk_push's
+/// own, unchanged. With a key, the session's first publish opens its run —
+/// the session recorded on it — and every artifact is tagged with the
+/// session (`krowk.session`) and attached to that run; without one the
+/// upload is anonymous and belongs to no run, and the result says where to
+/// look.
+#[cfg(feature = "harness")]
+impl Server<'_> {
+    pub fn publish(&self, req: &krowk_harness::evidence::PublishRequest) -> Result<krowk_harness::evidence::Published, String> {
+        self.publish_session(req).map_err(|e| describe_error(&e))
+    }
+
+    fn publish_session(&self, req: &krowk_harness::evidence::PublishRequest) -> Result<krowk_harness::evidence::Published, Error> {
+        let keyed = self.authenticated() && self.workspace_err.is_none();
+        let mut run = req.run.clone();
+        if run.is_none() && keyed {
+            // A publish that would be refused opens no run.
+            let root = self.resolve_root()?;
+            for f in &req.files {
+                permit(&root, &req.root, f)?;
+            }
+            let meta = runctx::resolve(
+                self.env,
+                Overrides { session: req.session_id.clone(), agent: "krowk".into(), client: format!("krowk/{}", self.version), ..Overrides::default() },
+            );
+            run = Some(self.client.create_run(&serde_json::to_value(&meta).expect("metadata serializes"))?.slug);
+        }
+        let mut metadata = BTreeMap::new();
+        if keyed {
+            metadata.insert("krowk.session", req.session_id.clone());
+            // Pushed by krowk's engine, through its MCP server's code.
+            metadata.insert("krowk.client", format!("krowk/{}", self.version));
+            if let Some(c) = &req.caption {
+                metadata.insert("krowk.caption", c.clone());
+            }
+        }
+        let args = json!({ "files": req.files, "run": run.clone().unwrap_or_default(), "metadata": metadata });
+        let (mut text, _) = self.push_from(&req.root, &args)?;
+        match &run {
+            Some(r) => text += &format!("\n\nGrouped under run {r}, this krowk session's run."),
+            None => text += "\n\nNo API key was found, so this upload is anonymous and belongs to no run — `krowk doctor` shows where krowk looks for one.",
+        }
+        Ok(krowk_harness::evidence::Published { text, run })
+    }
+}
+
 fn tool_result(text: &str, structured: Option<Value>, is_error: bool) -> Value {
     let mut result = json!({ "content": [{ "type": "text", "text": text }], "isError": is_error });
     if let Some(s) = structured {
@@ -341,6 +391,11 @@ impl Server<'_> {
     }
 
     fn push(&self, args: &Value) -> Outcome {
+        self.push_from(Path::new(""), args)
+    }
+
+    /// krowk_push, with relative paths resolved from `base`.
+    fn push_from(&self, base: &Path, args: &Value) -> Outcome {
         let a: PushArgs = arguments(
             args,
             "the arguments are not the shape this tool takes: `files` is an array of paths, `links` an array of {url, title, rel} objects — see the tool's schema",
@@ -358,7 +413,7 @@ impl Server<'_> {
         }
         let named_run = parse_slug(KIND_RUN, &a.run)?;
         let root = self.resolve_root()?;
-        let files = a.files.iter().map(|p| permit(&root, p)).collect::<Result<Vec<_>, _>>()?;
+        let files = a.files.iter().map(|p| permit(&root, base, p)).collect::<Result<Vec<_>, _>>()?;
         let specs = files.iter().map(|p| krowk_api::spec::inspect(p)).collect::<Result<Vec<_>, _>>()?;
 
         let resolved = runctx::resolve(

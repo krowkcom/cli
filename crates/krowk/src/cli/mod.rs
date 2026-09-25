@@ -345,6 +345,15 @@ fn reject_misplaced_sessions_flags(f: &Flags, p: &[String]) -> Result<(), Error>
                 return Err(fail("bad_flag", format!("`--{name}` is only a flag of `krowk -p`")));
             }
         }
+        // A budget holds a -p session (and the TUI's, which takes no words)
+        // or is the one `sessions budget` checks; anywhere else it would
+        // hold nothing.
+        let budget = words.starts_with(&["sessions", "budget"]);
+        for name in ["max-usd", "max-tokens"] {
+            if f.given.contains(name) && !f.print && !budget {
+                return Err(fail("bad_flag", format!("`--{name}` is only a flag of `krowk -p`, the TUI and `krowk sessions budget`")));
+            }
+        }
         let add = words.starts_with(&["providers", "add"]);
         for name in ["name", "api-key-env", "base-url", "client-id", "device", "binary", "config-dir"] {
             if f.given.contains(name) && !add {

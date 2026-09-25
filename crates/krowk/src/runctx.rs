@@ -22,7 +22,9 @@ pub struct Metadata {
     pub commit: String,
     #[serde(rename = "vcs.ref.head.name", skip_serializing_if = "String::is_empty")]
     pub branch: String,
-    /// None outside a git checkout — the distinction a plain bool cannot carry.
+    /// None outside a git checkout, and where it cannot be told without
+    /// running a repository's filters — the distinction a plain bool cannot
+    /// carry.
     #[serde(rename = "krowk.vcs.dirty", skip_serializing_if = "Option::is_none")]
     pub dirty: Option<bool>,
     #[serde(rename = "krowk.harness", skip_serializing_if = "String::is_empty")]
@@ -393,8 +395,24 @@ pub fn ci_pull_request(env: Env) -> String {
     }
 }
 
+/// Whether the work tree differs from HEAD. `git status` reads a file's
+/// content when its stat data cannot settle it — a racily clean entry, a
+/// touched one — and reading it runs the `filter.<driver>.clean` (or
+/// `.process`) command `.gitattributes` maps it to: a command any
+/// repository can name. No work-tree comparison git offers avoids that
+/// read (measured: `status`, `diff-files`, `diff-index HEAD` and
+/// `ls-files -m` all run a clean filter on a racy entry), so where any
+/// filter is configured — the repository's, the person's, git-lfs's — the
+/// answer is unknown rather than a command run. Submodules, whose own
+/// config is another repository's, are not looked into.
 fn dirty(dir: Option<&Path>) -> Option<bool> {
-    let out = git_cmd(dir).args(["status", "--porcelain"]).output().ok().filter(|o| o.status.success())?;
+    let filters = git_cmd(dir).args(["config", "--get-regexp", r"^filter\."]).output().ok()?;
+    // 1: no filter is configured; 0: some are; anything else, no answer.
+    match filters.status.code() {
+        Some(1) => {}
+        _ => return None,
+    }
+    let out = git_cmd(dir).args(["status", "--porcelain", "--ignore-submodules=all"]).output().ok().filter(|o| o.status.success())?;
     Some(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
@@ -451,9 +469,34 @@ mod tests {
         let marker = d.join("fsmonitor-ran");
         let config = std::fs::read_to_string(d.join(".git/config")).unwrap();
         std::fs::write(d.join(".git/config"), format!("{config}[core]\n\tfsmonitor = \"touch '{}'; false\"\n", marker.display())).unwrap();
+        // A filter in the person's own config (git-lfs's) makes it unknown
+        // anywhere; the machine running this may have one.
+        let own_filters = Command::new("git").args(["config", "--global", "--get-regexp", r"^filter\."]).output().is_ok_and(|o| o.status.success())
+            || Command::new("git").args(["config", "--system", "--get-regexp", r"^filter\."]).output().is_ok_and(|o| o.status.success());
         let m = detect_in(&env(&[]), Some(&d));
-        assert_eq!(m.dirty, Some(true), "read from the directory named, not the process's");
+        assert_eq!(m.dirty, if own_filters { None } else { Some(true) }, "read from the directory named, not the process's");
         assert!(!marker.exists(), "the repository's fsmonitor ran");
+
+        // A clean (or process, or smudge) filter .gitattributes maps a file
+        // to: git runs it to read a racily clean or touched file, so with
+        // one configured dirtiness is unknown and nothing runs.
+        let g = |args: &[&str]| Command::new("git").args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.fsmonitor=false"]).args(args).current_dir(&d).status().is_ok_and(|s| s.success());
+        std::fs::write(d.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+        assert!(g(&["add", "-A"]) && g(&["commit", "-qm", "x"]));
+        for (key, cmd) in [("clean", "cat"), ("process", "false"), ("smudge", "cat")] {
+            let mut config = std::fs::read_to_string(d.join(".git/config")).unwrap();
+            config = config.split("[filter \"evil\"]").next().unwrap().to_string();
+            std::fs::write(d.join(".git/config"), format!("{config}[filter \"evil\"]\n\t{key} = \"touch '{}'; {cmd}\"\n", marker.display())).unwrap();
+            // Rewritten in the same second the index was: racily clean.
+            std::fs::write(d.join("a.txt"), "x\n").unwrap();
+            assert_eq!(detect_in(&env(&[]), Some(&d)).dirty, None, "{key}: unknown, not run");
+            assert!(!marker.exists(), "the repository's {key} filter ran");
+            // A touched file: stat-dirty, same content.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            std::fs::write(d.join("a.txt"), "x\n").unwrap();
+            assert_eq!(detect_in(&env(&[]), Some(&d)).dirty, None);
+            assert!(!marker.exists(), "the repository's {key} filter ran on a touched file");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -1,0 +1,193 @@
+# Every performance and size number krowk promises, in one file. `make bench`
+# measures each enforced budget and fails when a median lands over its `max`;
+# CI runs the same thing on every pull request (R-PERF-7). How a budget is
+# measured, and how a pending one is turned on, is in README.md beside this
+# file.
+#
+# A number here is a promise, not a record of the last run: changing one needs
+# a line of justification in the pull request that changes it. A measurement
+# is compared against the absolute number below, never against a previous run,
+# so a slow drift fails as surely as a jump.
+#
+# Fields:
+#   id      what the bench measures; an enforced id must have a measurement
+#   req     the requirement it holds the build to
+#   what    the line the CI summary prints
+#   unit    bytes, count, ms, us, ticks, wakeups, MB or fps
+#   max     the budget, the most the median may be; a table of numbers per
+#           target ("x86_64-linux", "aarch64-macos", …) where the number
+#           depends on the target — a target with no number is reported,
+#           not held
+#   runs    how many times it is measured; the median is what is compared
+#   status  "enforced", or "pending" until the ticket named in `owner`
+#           builds the thing it measures
+
+# --- The agent build (no features): what a container fetches or compiles ---
+
+[[budget]]
+id = "lean.size"
+req = "R-PKG-2"
+what = "Agent build (no features): release binary size"
+unit = "bytes"
+# 3,943,808 bytes (3.76 MiB) with rust 1.97 when this budget was set. The
+# headroom is a quarter of a megabyte, so one real new dependency breaks it.
+max = { x86_64-linux = 4_194_304 }
+status = "enforced"
+
+[[budget]]
+id = "lean.deps"
+req = "R-PKG-2"
+what = "Agent build (no features): crates linked, every target"
+unit = "count"
+# The length of crates/krowk/lean-deps.txt, which `make lean-deps` holds to
+# the exact list; this is the number the promise is stated in.
+max = 136
+status = "enforced"
+
+# --- The full build (--features harness): everything krowk can link ---
+
+[[budget]]
+id = "full.size"
+req = "R-OSS-7"
+what = "Full build (--features harness): release binary size"
+unit = "bytes"
+# 6,253,544 bytes (5.96 MiB) when this budget was set. The harness is
+# growing: a ticket that adds a dependency raises this in its own PR, with
+# the dependency's cost in the justification.
+max = { x86_64-linux = 6_815_744 }
+status = "enforced"
+
+# --- Startup: a new process each run, no daemon ---
+
+[[budget]]
+id = "startup.version"
+req = "R-PERF-1"
+what = "Agent build: `krowk --version`, cold process"
+unit = "ms"
+# ~2.3 ms locally. A tripwire well under R-PERF-1's 150 ms cold prompt:
+# nothing krowk does before its prompt may cost more than printing a version.
+max = 15
+runs = 21
+status = "enforced"
+
+[[budget]]
+id = "startup.sessions"
+req = "R-PERF-1"
+what = "Full build: `krowk sessions` on an empty store, cold process"
+unit = "ms"
+# ~3.5 ms locally: opening krowk.db and listing it, the picker's first step.
+max = 30
+runs = 21
+status = "enforced"
+
+[[budget]]
+id = "tui.startup_cold"
+req = "R-PERF-1"
+what = "Bare `krowk` to an interactive prompt, no daemon running"
+unit = "ms"
+max = 150
+runs = 21
+status = "pending"
+owner = "04"
+
+[[budget]]
+id = "tui.startup_warm"
+req = "R-PERF-1"
+what = "Bare `krowk` to an interactive prompt, daemon warm"
+unit = "ms"
+max = 50
+runs = 21
+status = "pending"
+owner = "13"
+
+# --- Idle: no polling and no timers while nothing happens (Linux /proc) ---
+
+[[budget]]
+id = "engine.idle_cpu"
+req = "R-PERF-2"
+what = "`krowk -p` waiting on a silent provider: CPU ticks over 10 s"
+unit = "ticks"
+max = 0
+window_s = 10
+status = "enforced"
+
+[[budget]]
+id = "engine.idle_wakeups"
+req = "R-PERF-2"
+what = "`krowk -p` waiting on a silent provider: thread wakeups over 10 s"
+unit = "wakeups"
+# Stricter than ticks: a timer that wakes for a microsecond a second rarely
+# lands on a tick, but it is a context switch every time.
+max = 0
+window_s = 10
+status = "enforced"
+
+[[budget]]
+id = "engine.idle_rss"
+req = "R-PERF-3"
+what = "`krowk -p` waiting on a silent provider: resident memory"
+unit = "MB"
+# The engine alone, held to the TUI-plus-engine number: if the engine does
+# not fit, the pair cannot.
+max = 30
+window_s = 10
+status = "enforced"
+
+[[budget]]
+id = "tui.idle_cpu"
+req = "R-PERF-2"
+what = "TUI with an idle session: CPU ticks over 10 s"
+unit = "ticks"
+max = 0
+window_s = 10
+status = "pending"
+owner = "04"
+
+[[budget]]
+id = "tui.idle_rss"
+req = "R-PERF-3"
+what = "TUI plus engine with an idle session: resident memory"
+unit = "MB"
+max = 30
+status = "pending"
+owner = "04"
+
+[[budget]]
+id = "session.replay_rss"
+req = "R-PERF-3"
+what = "TUI plus engine replaying a synthetic 200k-token session: peak resident memory"
+unit = "MB"
+max = 100
+status = "pending"
+owner = "12"
+
+# --- The session log ---
+
+[[budget]]
+id = "log.append"
+req = "R-PERF-5"
+what = "Session log: one event appended (1 KiB assistant text)"
+unit = "us"
+max = 1000
+runs = 2000
+status = "enforced"
+
+# --- Rendering and remote ---
+
+[[budget]]
+id = "tui.redraw_fps"
+req = "R-PERF-4"
+what = "TUI under a synthetic token stream: redraws per second"
+unit = "fps"
+max = 60
+status = "pending"
+owner = "04"
+
+[[budget]]
+id = "remote.attach"
+req = "R-PERF-6"
+what = "Attach from a checkpoint on a remote device"
+unit = "ms"
+max = 500
+status = "pending"
+owner = "19"

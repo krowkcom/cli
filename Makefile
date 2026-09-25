@@ -2,7 +2,7 @@
 # A checkout and a release should not disagree about what version this is.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
 
-.PHONY: build test lint check install mock clean dist release-check golden golden-update bin/devregistry schema lean-deps
+.PHONY: build test lint check install mock clean dist release-check golden golden-update bin/devregistry schema lean-deps bench
 
 build: ## Build target/release/krowk (with sessions) and krowk-mcp
 	KROWK_VERSION=$(VERSION) cargo build --release -p krowk --features sessions
@@ -23,6 +23,23 @@ check: lint lean-deps test golden ## Everything CI runs
 # R-PKG-2: the agent build links exactly the crates crates/krowk/lean-deps.txt lists, on every target.
 lean-deps: ## Hold the agent build to its dependency list
 	scripts/lean_deps_check.sh
+
+# R-PERF-7: every number in crates/krowk-bench/budgets.toml, measured on the
+# release profile and failed on the first one broken. The same table CI prints
+# in the job summary. Both builds are stamped with one version so a size is
+# the code's, not the length of `git describe`; each is copied out before the
+# next overwrites target/release/krowk (rm first, for the macOS inode reason
+# at bin/devregistry below).
+BENCH_DIR := target/bench
+BENCH_VERSION := 0.0.0-bench
+
+bench: ## Hold the release builds to the performance and size budgets
+	KROWK_VERSION=$(BENCH_VERSION) cargo build --release --locked -p krowk --bin krowk
+	mkdir -p $(BENCH_DIR) && rm -f $(BENCH_DIR)/krowk-lean && cp target/release/krowk $(BENCH_DIR)/krowk-lean
+	KROWK_VERSION=$(BENCH_VERSION) cargo build --release --locked -p krowk --bin krowk --features harness
+	rm -f $(BENCH_DIR)/krowk-full && cp target/release/krowk $(BENCH_DIR)/krowk-full
+	cargo run --profile bench-tool --locked -p krowk-bench -- --budgets crates/krowk-bench/budgets.toml \
+		--lean $(BENCH_DIR)/krowk-lean --full $(BENCH_DIR)/krowk-full --work $(BENCH_DIR)/work $(BENCH_FLAGS)
 
 schema: ## Regenerate the harness protocol's JSON Schema after a type change
 	KROWK_SCHEMA_UPDATE=1 cargo test -p krowk-harness --test schema

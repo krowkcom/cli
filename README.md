@@ -192,9 +192,12 @@ make check          # clippy, the unit tests and every golden case
 make build          # → target/release/krowk (with sessions) and krowk-mcp
 make mock           # a local stand-in registry — then run any command with --dev
 make golden-update  # re-record tests/golden/cases after an intended output change
+make bench          # hold the release builds to the performance and size budgets
 ```
 
 Rust (a cargo workspace under `crates/`). The repository ships the registry it develops against as a crate of its own (`crates/krowk-devregistry`, run by `make mock`), so trying krowk out needs neither the network nor a key. It is not part of any released binary.
+
+Every performance and size number krowk promises is in [`crates/krowk-bench/budgets.toml`](crates/krowk-bench/budgets.toml); [its README](crates/krowk-bench/README.md) explains how the numbers are measured and how a pending budget is turned on.
 
 ## Who uses Krowk?
 

@@ -44,9 +44,11 @@ the versions are the `v*` tags a release is cut from. Entries land under
   reports `fetched_at_ms` and `age_days` too. `sessions sync` still
   refreshes prices once they are a day old, now judged by the recorded
   fetch time rather than a file's mtime. Nothing else touches the
-  network, and there is no background timer. Audio rates stay unread:
-  no transcript krowk imports reports audio tokens apart from text, so
-  there is nothing yet to price them against.
+  network, and there is no background timer. A cache that is missing or holds no prices is fetched whole again
+  rather than confirmed by a stale ETag. Audio rates stay unread: no
+  transcript krowk imports carries audio tokens, and in a provider ledger
+  they are priced at the text rate inside input and output — an
+  undercount to revisit when one reports audio at all.
 - `sessions` lists in ~25 ms on a machine whose price cache holds the whole
   models.dev file (was ~80 ms): the cache is parsed without building the
   fields pricing never reads.

@@ -67,14 +67,17 @@ fn store_check(_: &Ctx) -> Value {
 #[cfg(feature = "sessions")]
 fn pricing_check(ctx: &Ctx) -> Value {
     const STALE_DAYS: i64 = 30;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+    // The store's clock, which the golden cases can hold still.
+    let now = krowk_store::now_ms();
     let fresh = crate::pricing::Freshness::of(ctx.io.env);
     let status = match fresh.age_days(now) {
         Some(d) if d <= STALE_DAYS => "pass",
         _ => "warn",
     };
-    let hint = if status == "pass" { "" } else { "run `krowk pricing refresh`, or `krowk sessions sync`, which refreshes prices once a day" };
-    let mut v = json!({ "name": "pricing", "status": status, "message": fresh.describe(now), "hint": hint });
+    let mut v = json!({ "name": "pricing", "status": status, "message": fresh.describe(now) });
+    if status == "warn" {
+        v["hint"] = json!("run `krowk pricing refresh`, or `krowk sessions sync`, which refreshes prices once a day");
+    }
     if let Some(d) = fresh.age_days(now) {
         v["age_days"] = json!(d);
     }

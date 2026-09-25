@@ -948,9 +948,10 @@ pub fn sync(ctx: &mut Ctx) -> Result<(), Error> {
     import_into(ctx, Some(&conn), &store_path, &sources, true, ImportReport { pricing: Some(p), ..ImportReport::default() })
 }
 
-/// Refreshes the models.dev cache when its last fetch is a day old or
-/// there is none. The sidecar's `fetched_at_ms` is the clock: a 304 stamps
-/// it too, since "when did krowk last ask" is the question.
+/// Refreshes the models.dev cache when its last fetch is a day old, or
+/// unknown, or in the future, or there is no readable cache. The sidecar's
+/// `fetched_at_ms` is the clock: a 304 stamps it too, since "when did krowk
+/// last ask" is the question.
 fn sync_prices(env: &dyn Fn(&str) -> String, no_network: bool) -> SyncPricing {
     sync_prices_from(env, no_network, pricing::MODELS_URL, now_ms())
 }
@@ -963,19 +964,17 @@ fn sync_prices_from(env: &dyn Fn(&str) -> String, no_network: bool, url: &str, n
     if pricing::cache_path(env).is_none() {
         return failed("prices were not refreshed: no cache directory in the environment".into());
     }
-    let before = pricing::Freshness::of(env).fetched_at_ms;
-    if before.is_some_and(|f| (0..PRICING_MAX_AGE.as_millis() as i64).contains(&(now - f))) {
+    let day = (PRICING_MAX_AGE.as_millis() as i64) / 86_400_000;
+    if pricing::Freshness::of(env).age_days(now).is_some_and(|d| d < day) {
         return SyncPricing { status: "fresh", warning: String::new() };
     }
     match pricing::refresh_within(env, url, Duration::from_secs(3)) {
         Err(e) => failed(format!("prices were not refreshed: {e}")),
-        Ok(true) => SyncPricing { status: "refreshed", warning: String::new() },
-        Ok(false) if pricing::Freshness::of(env).fetched_at_ms.is_some_and(|f| before.is_none_or(|b| f > b)) => {
-            SyncPricing { status: "unchanged", warning: String::new() }
+        Ok(pricing::Outcome::Refreshed) => SyncPricing { status: "refreshed", warning: String::new() },
+        Ok(pricing::Outcome::Unchanged) => SyncPricing { status: "unchanged", warning: String::new() },
+        Ok(pricing::Outcome::Unreachable(why)) => {
+            failed(format!("prices were not refreshed: {why} — the cache or the snapshot still prices everything"))
         }
-        Ok(false) => failed(
-            "prices were not refreshed: models.dev could not be reached or did not answer with a price file — the cache or the snapshot still prices everything".into(),
-        ),
     }
 }
 
@@ -1230,7 +1229,8 @@ fn lock_file(path: &Path) -> Result<std::fs::File, Option<String>> {
 // ---- pricing refresh --------------------------------------------------------
 
 pub fn pricing_refresh(ctx: &mut Ctx) -> Result<(), Error> {
-    let refreshed = pricing::refresh(ctx.io.env, "").map_err(|e| fail("pricing_failed", e))?;
+    let outcome = pricing::refresh(ctx.io.env, "").map_err(|e| fail("pricing_failed", e))?;
+    let refreshed = outcome == pricing::Outcome::Refreshed;
     let path = pricing::cache_path(ctx.io.env).unwrap_or_default();
     if ctx.format != Format::Human {
         let fresh = pricing::Freshness::of(ctx.io.env);
@@ -1240,8 +1240,13 @@ pub fn pricing_refresh(ctx: &mut Ctx) -> Result<(), Error> {
             "refreshed": refreshed,
             "snapshot_date": pricing::SNAPSHOT_DATE,
             "source": pricing::MODELS_URL,
-            "fetched_at_ms": fresh.fetched_at_ms,
+            "fetched_at_ms": fresh.fetched_at_ms(),
             "age_days": fresh.age_days(now_ms()),
+            "outcome": match &outcome {
+                pricing::Outcome::Refreshed => "refreshed",
+                pricing::Outcome::Unchanged => "unchanged",
+                pricing::Outcome::Unreachable(_) => "unreachable",
+            },
         });
         return ctx.emit(&output::encode(&report));
     }
@@ -1324,6 +1329,28 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_or_corrupt_cache_is_fetched_whole_whatever_its_sidecar_says() {
+        let dir = std::env::temp_dir().join(format!("krowk-sync-lost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache_home = dir.join("cache").display().to_string();
+        let env = move |k: &str| if k == "XDG_CACHE_HOME" { cache_home.clone() } else { String::new() };
+        let cache = pricing::cache_path(&env).unwrap();
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        // A sidecar stamped just now, with the ETag, beside a file that holds nothing.
+        std::fs::write(&cache, "garbage").unwrap();
+        std::fs::write(pricing::meta_path(&cache), format!(r#"{{"etag":"\"v1\"","fetched_at_ms":{}}}"#, now_ms())).unwrap();
+        assert_eq!(pricing::Freshness::of(&env), pricing::Freshness::Unreadable);
+        let (url, server) = models_dev(1);
+        assert_eq!(sync_prices_from(&env, false, &url, now_ms()).status, "refreshed", "no 304 for a file with no prices");
+        assert!(!server.join().unwrap()[0].contains("if-none-match"), "the ETag was not sent");
+        // A sidecar from the future is a clock that is off: no age, so due.
+        std::fs::write(pricing::meta_path(&cache), format!(r#"{{"etag":"","fetched_at_ms":{}}}"#, now_ms() + 86_400_000 * 400)).unwrap();
+        assert_eq!(pricing::Freshness::of(&env).age_days(now_ms()), None);
+        assert!(pricing::Freshness::of(&env).describe(now_ms()).contains("clock is off"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn sync_refreshes_a_stale_price_cache_and_leaves_a_fresh_one_alone() {
         let dir = std::env::temp_dir().join(format!("krowk-sync-prices-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1347,6 +1374,7 @@ mod tests {
         assert!(seen[1].contains("if-none-match: \"v1\""), "the refresh is conditional: {seen:?}");
         assert!(pricing::Freshness::of(&env).describe(now_ms()).ends_with(", today"));
         assert_eq!(sync_prices_from(&env, true, &url, now).status, "no_network");
+        assert_eq!(pricing::price(&env, "p", "m").map(|r| (r.input, r.output)), Some((1.0, 2.0)), "the stale file was replaced");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

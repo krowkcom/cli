@@ -8,6 +8,7 @@
 //! - `term` — the inline viewport and synchronized frames (R-TUI-1).
 //! - `app` — what is shown, driven by frames and keys.
 //! - `editor` — the multi-line prompt and its history.
+//! - `look` — glyphs, colours, the spinner and the light markdown.
 //! - `settings` — the status bar's configuration (R-TUI-2).
 //! - `net` — the connectivity probe behind the offline notice (R-OFF-1).
 //!
@@ -21,6 +22,7 @@
 
 pub mod app;
 pub mod editor;
+pub mod look;
 pub mod net;
 pub mod settings;
 pub mod term;

@@ -10,6 +10,7 @@
 //! only the unfinished tail is drawn in the live region.
 
 use crate::editor::Editor;
+use crate::look::{self, SEP};
 use crate::settings::{Item as StatusItem, Settings};
 use krowk_harness::host::Pricer;
 use krowk_harness::protocol::{Delta, ErrorInfo, Item, ItemKind, LiveEvent, LogBody, LogEvent, ModelRef, RunResult, StreamLine, TurnStatus, Usage};
@@ -23,21 +24,8 @@ const MAX_INPUT_ROWS: usize = 8;
 /// Rows of an unfinished line shown while it streams.
 const MAX_LIVE_ROWS: usize = 3;
 
-pub fn dim() -> Style {
-    Style::new().add_modifier(Modifier::DIM)
-}
-
-fn bold() -> Style {
-    Style::new().add_modifier(Modifier::BOLD)
-}
-
-fn red() -> Style {
-    Style::new().fg(Color::Red)
-}
-
-fn yellow() -> Style {
-    Style::new().fg(Color::Yellow)
-}
+pub use look::dim;
+use look::{bold, error as red, warning as yellow};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -63,6 +51,16 @@ enum LiveKind {
     Reasoning,
     Call(String),
     Result,
+}
+
+/// A tool call the model made whose result has not come back yet: it is
+/// shown once, with its outcome, when it does.
+#[derive(Debug)]
+struct Call {
+    call_id: String,
+    name: String,
+    input: serde_json::Value,
+    started: Instant,
 }
 
 /// A turn in flight.
@@ -110,6 +108,12 @@ pub struct App {
     pricer: Option<Pricer>,
     /// The provider and model of the turn being replayed, for pricing.
     replay_model: Option<(String, String)>,
+    /// Tool calls waiting for their results, oldest first.
+    calls: Vec<Call>,
+    /// Whether the answer being shown has a fenced code block open.
+    fence: bool,
+    /// When the reasoning streaming now began.
+    thinking_since: Option<Instant>,
 }
 
 impl App {
@@ -139,6 +143,9 @@ impl App {
             dirty: true,
             pricer,
             replay_model: None,
+            calls: Vec::new(),
+            fence: false,
+            thinking_since: None,
         }
     }
 
@@ -213,10 +220,88 @@ impl App {
         self.push_wrapped("! ", "  ", text, yellow(), yellow());
     }
 
+    /// A failed request or turn: the headline in the warning colour, which
+    /// names the next action, and its code dim.
     pub fn error(&mut self, e: &ErrorInfo) {
         self.gap();
-        self.push_wrapped("✗ ", "  ", &e.message, red(), red());
+        self.push_wrapped(look::WARN, "  ", &e.message, yellow(), yellow());
         self.push_wrapped("  ", "  ", &format!("({})", e.code), dim(), dim());
+    }
+
+    /// One line of an answer, in light markdown, for the terminal to wrap.
+    fn push_md(&mut self, text: &str) {
+        let line = look::markdown_line(&clean(text), &mut self.fence);
+        self.last_blank = line.width() == 0;
+        self.pending.push(line);
+        self.dirty = true;
+    }
+
+    /// A tool call and what came of it, as one block: `◆ Verb arg (detail)`
+    /// — the bullet green, or red when it failed — then what is worth
+    /// seeing of its result: a failure's first lines, a command's output
+    /// cut to its head and tail, an edit's lines as removed and added.
+    fn commit_tool(&mut self, name: &str, input: &serde_json::Value, output: &str, is_error: bool) {
+        self.gap();
+        let width = usize::from(self.width.max(8));
+        let (verb, arg) = look::tool_title(name, input);
+        let lines: Vec<&str> = output.lines().collect();
+        let edit = if is_error { None } else { look::edit_lines(name, input) };
+        let mut head = vec![Span::styled(look::TOOL, if is_error { red() } else { look::success() }), Span::styled(verb.clone(), bold())];
+        if !arg.is_empty() {
+            head.push(Span::raw(" "));
+            head.push(Span::styled(clip(&arg, width.saturating_sub(verb.width() + 14)), look::path()));
+        }
+        match (&edit, name, is_error) {
+            (_, _, true) => head.push(Span::styled(" (failed)", red())),
+            (Some((del, add)), _, _) => {
+                head.push(Span::styled(format!(" +{}", add.len()), look::success()));
+                head.push(Span::styled(format!("/-{}", del.len()), red()));
+            }
+            (None, "read" | "grep" | "glob" | "write", _) => head.push(Span::styled(format!(" ({} lines)", lines.len()), dim())),
+            _ => {}
+        }
+        self.push_line(Line::from(head));
+        let body_width = width.saturating_sub(2);
+        if is_error {
+            for l in lines.iter().filter(|l| !l.trim().is_empty()).take(3) {
+                self.push_line(Line::from(vec![Span::raw("  "), Span::styled(clip(l, body_width), red())]));
+            }
+            return;
+        }
+        if let Some((del, add)) = edit {
+            const SHOWN: usize = 8;
+            for (rows, band) in [(del, look::delete_band()), (add, look::insert_band())] {
+                for l in rows.iter().take(SHOWN) {
+                    self.push_line(Line::from(vec![Span::raw("  "), Span::styled(clip(l, body_width), band)]));
+                }
+                if rows.len() > SHOWN {
+                    self.push_line(Line::from(Span::styled(format!("  … +{} lines", rows.len() - SHOWN), dim())));
+                }
+            }
+            return;
+        }
+        if name == "bash" {
+            let shown: Vec<&str> = if lines.len() <= 5 { lines.clone() } else { lines[..2].iter().chain(&lines[lines.len() - 3..]).copied().collect() };
+            for (i, l) in shown.iter().enumerate() {
+                if lines.len() > 5 && i == 2 {
+                    self.push_line(Line::from(Span::styled(format!("  … +{} lines", lines.len() - 5), dim())));
+                }
+                self.push_line(Line::from(vec![Span::raw("  "), Span::styled(clip(l, body_width), dim())]));
+            }
+        }
+    }
+
+    fn push_line(&mut self, line: Line<'static>) {
+        self.last_blank = line.width() == 0;
+        self.pending.push(line);
+        self.dirty = true;
+    }
+
+    /// Calls still waiting when a turn ends are shown as they stand.
+    fn flush_calls(&mut self) {
+        for c in std::mem::take(&mut self.calls) {
+            self.commit_tool(&c.name, &c.input, "no result — the turn stopped first", true);
+        }
     }
 
     // ---- the protocol --------------------------------------------------------
@@ -230,8 +315,14 @@ impl App {
                     t.tool_running = matches!(item, ItemKind::ToolResult { .. });
                 }
                 let kind = match item {
-                    ItemKind::AssistantText => LiveKind::Text,
-                    ItemKind::Reasoning => LiveKind::Reasoning,
+                    ItemKind::AssistantText => {
+                        self.fence = false;
+                        LiveKind::Text
+                    }
+                    ItemKind::Reasoning => {
+                        self.thinking_since = Some(Instant::now());
+                        LiveKind::Reasoning
+                    }
                     ItemKind::ToolCall { name, .. } => LiveKind::Call(name.clone()),
                     ItemKind::ToolResult { .. } => LiveKind::Result,
                     ItemKind::UserText => return,
@@ -259,7 +350,7 @@ impl App {
                         self.gap();
                     }
                     for l in done.trim_end_matches('\n').split('\n') {
-                        self.push_wrapped("", "", l, Style::new(), Style::new());
+                        self.push_md(l);
                     }
                 }
             }
@@ -310,13 +401,15 @@ impl App {
             LogBody::TurnCompleted { status, usage, duration_ms, error, .. } => {
                 self.turns += 1;
                 self.finish_live();
+                self.flush_calls();
                 match status {
                     TurnStatus::Completed => {
-                        let secs = *duration_ms as f64 / 1000.0;
-                        self.push_wrapped("  ", "  ", &format!("{secs:.1}s · {} tokens", tokens(usage.total())), dim(), dim());
+                        let took = look::duration(Duration::from_millis(*duration_ms));
+                        self.push_wrapped("", "", &format!("Worked for {took} · {} tokens", tokens(usage.total())), dim(), dim());
                     }
                     TurnStatus::Interrupted => {
-                        self.push_wrapped("  ", "  ", "⎿ interrupted — what arrived is kept", yellow(), yellow());
+                        let took = look::duration(Duration::from_millis(*duration_ms));
+                        self.push_wrapped(look::STOPPED, "  ", &format!("interrupted after {took} — what arrived is kept"), yellow(), yellow());
                     }
                     TurnStatus::Failed => {
                         if let Some(e) = error {
@@ -338,47 +431,52 @@ impl App {
                 }
                 self.finish_live();
                 self.gap();
-                self.push_wrapped("› ", "  ", text, bold().fg(Color::Cyan), bold());
+                self.push_wrapped(look::PROMPT, "  ", text, look::prompt(), bold());
             }
             Item::AssistantText { text } => {
                 if streamed && live {
                     self.finish_live();
                 } else if !text.is_empty() {
                     self.gap();
+                    self.fence = false;
                     for l in text.split('\n') {
-                        self.push_wrapped("", "", l, Style::new(), Style::new());
+                        self.push_md(l);
                     }
                 }
                 self.live = None;
             }
+            // Thinking is shown collapsed, as how long it took.
             Item::Reasoning { .. } => {
                 if streamed {
                     self.live = None;
                 }
+                let took = if live { self.thinking_since.take().map(|t| format!(" for {}", look::duration(t.elapsed()))) } else { None };
+                self.gap();
+                self.push_line(Line::from(vec![
+                    Span::styled(look::TOOL, dim()),
+                    Span::styled(format!("Thought{}", took.unwrap_or_default()), dim().add_modifier(Modifier::ITALIC)),
+                ]));
             }
-            Item::ToolCall { name, input, .. } => {
+            Item::ToolCall { call_id, name, input } => {
                 if streamed {
                     self.live = None;
                 }
-                self.gap();
-                let what = call_summary(input);
-                let text = if what.is_empty() { name.clone() } else { format!("{name} {what}") };
-                let width = usize::from(self.width).saturating_sub(2);
-                self.push_wrapped("● ", "  ", &clip(&text, width), Style::new().fg(Color::Green), bold());
+                self.calls.push(Call { call_id: call_id.clone(), name: name.clone(), input: input.clone(), started: Instant::now() });
             }
-            Item::ToolResult { output, is_error, .. } => {
+            Item::ToolResult { call_id, output, is_error } => {
                 if streamed {
                     self.live = None;
                 }
                 if let Some(t) = &mut self.turn {
                     t.tool_running = false;
                 }
-                let lines = output.lines().count();
-                let first = output.lines().find(|l| !l.trim().is_empty()).unwrap_or("(no output)").trim();
-                let more = if lines > 1 { format!(" … +{} lines", lines - 1) } else { String::new() };
-                let width = usize::from(self.width).saturating_sub(4 + more.width());
-                let style = if *is_error { red() } else { dim() };
-                self.push_wrapped("  ⎿ ", "    ", &(clip(first, width) + &more), style, style);
+                match self.calls.iter().position(|c| &c.call_id == call_id) {
+                    Some(i) => {
+                        let c = self.calls.remove(i);
+                        self.commit_tool(&c.name, &c.input, output, *is_error);
+                    }
+                    None => self.commit_tool("tool", &serde_json::Value::Null, output, *is_error),
+                }
             }
         }
     }
@@ -392,7 +490,7 @@ impl App {
                 self.gap();
             }
             for l in live.tail.split('\n') {
-                self.push_wrapped("", "", l, Style::new(), Style::new());
+                self.push_md(l);
             }
         }
     }
@@ -429,24 +527,47 @@ impl App {
                 LiveKind::Text => {}
                 LiveKind::Reasoning => {
                     let tail = clean(live.tail.trim());
-                    let text = if tail.is_empty() { "thinking…".to_string() } else { format!("thinking… {tail}") };
-                    rows.push(Line::from(Span::styled(clip(&text, width), dim().add_modifier(Modifier::ITALIC))));
+                    if !tail.is_empty() {
+                        rows.push(Line::from(Span::styled(clip(&format!("  {tail}"), width), dim().add_modifier(Modifier::ITALIC))));
+                    }
                 }
-                LiveKind::Call(name) => rows.push(Line::from(Span::styled(clip(&format!("● {name} …"), width), dim()))),
-                LiveKind::Result => rows.push(Line::from(Span::styled(clip("  ⎿ running…", width), dim()))),
+                LiveKind::Call(name) => rows.push(Line::from(vec![Span::styled(look::TOOL, dim()), Span::styled(clip(name, width.saturating_sub(2)), dim())])),
+                LiveKind::Result => {}
             }
         }
+        // Calls out, their results not back: each as it will be shown.
+        for c in &self.calls {
+            let (verb, arg) = look::tool_title(&c.name, &c.input);
+            let text = clip(&format!("{verb} {arg}"), width.saturating_sub(2));
+            rows.push(Line::from(vec![Span::styled(look::TOOL, look::accent()), Span::styled(text, dim())]));
+        }
         if let Some(t) = &self.turn {
-            let secs = now.saturating_duration_since(t.started).as_secs();
-            let what = if t.want_interrupt { "interrupting…".to_string() } else { format!("working {secs}s · esc to interrupt") };
-            rows.push(Line::from(Span::styled(clip(&what, width), dim())));
+            let since = now.saturating_duration_since(t.started);
+            let frame = look::SPINNER[(since.as_millis() / look::SPIN_FRAME.as_millis()) as usize % look::SPINNER.len()];
+            let label = match (&self.live, t.want_interrupt) {
+                (_, true) => "Interrupting…".to_string(),
+                (Some(Live { kind: LiveKind::Reasoning, .. }), _) => "Thinking…".to_string(),
+                (Some(Live { kind: LiveKind::Text, .. }), _) => "Responding…".to_string(),
+                _ if t.tool_running => match self.calls.first() {
+                    Some(c) => format!("Running for {}…", look::duration(now.saturating_duration_since(c.started))),
+                    None => "Running…".to_string(),
+                },
+                _ => "Working…".to_string(),
+            };
+            let label_style = if t.want_interrupt { red() } else { look::accent() };
+            let right = format!(" {}{SEP}esc to interrupt", look::duration(since));
+            rows.push(Line::from(vec![
+                Span::styled(format!("{frame} "), look::accent()),
+                Span::styled(clip(&label, width.saturating_sub(right.width() + 2)), label_style),
+                Span::styled(clip(&right, width.saturating_sub(label.width() + 2)), dim()),
+            ]));
             for s in self.steers.iter().chain(&self.unsent_steers) {
                 let first = s.lines().next().unwrap_or_default();
-                rows.push(Line::from(Span::styled(clip(&format!("↳ steer queued: {first}"), width), dim())));
+                rows.push(Line::from(vec![Span::styled(look::STEER, look::accent()), Span::styled(clip(&format!("steer queued: {first}"), width.saturating_sub(2)), dim())]));
             }
         }
         if let Some(target) = &self.offline {
-            let text = format!("⚠ no network connectivity — {target} cannot be reached; krowk keeps retrying");
+            let text = format!("{}no network connectivity — {target} cannot be reached; krowk keeps retrying", look::WARN);
             for row in wrap(&text, width) {
                 rows.push(Line::from(Span::styled(row, yellow().add_modifier(Modifier::BOLD))));
             }
@@ -461,7 +582,7 @@ impl App {
         let first = (crow as usize + 1).saturating_sub(MAX_INPUT_ROWS);
         let top = rows.len() as u16;
         for (i, row) in input.iter().enumerate().skip(first).take(MAX_INPUT_ROWS) {
-            let prefix = if i == 0 { Span::styled("› ", bold().fg(Color::Cyan)) } else { Span::raw("  ") };
+            let prefix = if i == 0 { Span::styled(look::PROMPT, look::prompt()) } else { Span::raw("  ") };
             if i == 0 && self.editor.is_empty() {
                 let hint = if self.running() { "type to steer the running turn" } else { "ask anything · ? for keys · ctrl-d to quit" };
                 rows.push(Line::from(vec![prefix, Span::styled(clip(hint, width.saturating_sub(2)), dim())]));
@@ -473,7 +594,17 @@ impl App {
         if self.settings.status_bar {
             let bar = self.status_bar();
             if !bar.is_empty() {
-                rows.push(Line::from(Span::styled(clip(&bar, width), dim())));
+                // Offline is the one item not dim: it is news.
+                let clipped = clip(&bar, width);
+                let line = match clipped.find("offline") {
+                    Some(i) if self.offline.is_some() => Line::from(vec![
+                        Span::styled(clipped[..i].to_string(), dim()),
+                        Span::styled("offline".to_string(), yellow()),
+                        Span::styled(clipped[i + "offline".len()..].to_string(), dim()),
+                    ]),
+                    _ => Line::from(Span::styled(clipped, dim())),
+                };
+                rows.push(line);
             }
         }
         (rows, caret)
@@ -493,7 +624,7 @@ impl App {
                         parts.push(format!("{} · api key", m.instance));
                     }
                 }
-                StatusItem::Cost => parts.push(if self.unpriced && self.cost == 0.0 { "$—".into() } else { format!("${:.4}", self.cost) }),
+                StatusItem::Cost => parts.push(if self.unpriced && self.cost == 0.0 { "$—".into() } else { format!("${:.2}", self.cost) }),
                 StatusItem::Connectivity => parts.push(
                     match (&self.offline, self.online_known) {
                         (Some(_), _) => "offline",
@@ -509,7 +640,7 @@ impl App {
                 }
             }
         }
-        parts.join(" · ")
+        parts.join(SEP)
     }
 
     fn keys_overlay(&self, width: usize) -> Vec<Line<'static>> {
@@ -564,6 +695,7 @@ impl App {
     pub fn end_turn_parts(&mut self) -> (Vec<String>, Vec<String>) {
         self.turn = None;
         self.finish_live();
+        self.flush_calls();
         self.dirty = true;
         (std::mem::take(&mut self.steers), std::mem::take(&mut self.unsent_steers))
     }
@@ -648,19 +780,6 @@ pub fn clip(s: &str, width: usize) -> String {
     out
 }
 
-/// What a tool call is about, in a few words: its command or its path.
-fn call_summary(input: &serde_json::Value) -> String {
-    for key in ["command", "path", "file_path", "pattern", "url"] {
-        if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
-            return s.to_string();
-        }
-    }
-    match input {
-        serde_json::Value::Object(m) if m.is_empty() => String::new(),
-        v => v.to_string(),
-    }
-}
-
 fn tokens(n: i64) -> String {
     match n {
         n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
@@ -670,8 +789,8 @@ fn tokens(n: i64) -> String {
     }
 }
 
-/// How long the turn has run, redrawn once a second while it does.
-pub const TICK: Duration = Duration::from_secs(1);
+/// The spinner's frame, redrawn while a turn runs (never while idle).
+pub const TICK: Duration = look::SPIN_FRAME;
 
 #[cfg(test)]
 mod tests {
@@ -728,7 +847,7 @@ mod tests {
             ev(LogBody::TurnCompleted { turn_id: "t".into(), status: TurnStatus::Completed, usage: Usage { input_tokens: 1200, ..Usage::default() }, duration_ms: 1500, error: None }),
         ];
         a.replay(&evs.iter().collect::<Vec<_>>());
-        assert_eq!(text(&a.take_pending()), ["› hi", "", "● read README.md", "  ⎿ # krowk … +1 lines", "", "It is a CLI.", "  1.5s · 1.2k tokens"]);
+        assert_eq!(text(&a.take_pending()), ["❯ hi", "", "◆ Read README.md (2 lines)", "", "It is a CLI.", "Worked for 1.5s · 1.2k tokens"]);
         assert_eq!(a.model, Some(model), "the session's model is the one shown");
     }
 
@@ -749,9 +868,9 @@ mod tests {
     #[test]
     fn r_tui_2_the_status_bar_follows_its_settings() {
         let mut a = app();
-        assert_eq!(a.status_bar(), "claude-x · anthropic · api key · $0.0000 · connecting…");
+        assert_eq!(a.status_bar(), "claude-x │ anthropic · api key │ $0.00 │ connecting…");
         a.settings = Settings { status_bar: true, status_items: vec![StatusItem::Cost] };
-        assert_eq!(a.status_bar(), "$0.0000");
+        assert_eq!(a.status_bar(), "$0.00");
         a.settings.status_bar = false;
         let (rows, _) = a.view(Instant::now());
         assert_eq!(rows.len(), 1, "only the prompt: {:?}", text(&rows));

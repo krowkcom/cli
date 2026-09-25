@@ -333,7 +333,7 @@ fn r_tui_1_a_10k_token_answer_lands_in_tmux_scrollback_exactly_once() {
     assert_eq!(got.len(), want.len(), "every line once, none twice");
     assert!(got.iter().zip(&want).all(|(g, w)| g.trim_end() == w), "in order, byte for byte");
     // The prompt line is in scrollback once too, and the live region is not.
-    assert_eq!(history.matches("› write it all out").count(), 1, "{history}");
+    assert_eq!(history.matches("❯ write it all out").count(), 1, "{history}");
     assert_eq!(history.matches("esc to interrupt").count(), 0, "a live row leaked into scrollback");
 }
 
@@ -342,7 +342,7 @@ fn r_tui_3_a_phone_width_terminal_wraps_and_still_keeps_every_line_once() {
     let m = streamed(200, Duration::from_micros(100));
     let b = Sandbox::new("phone");
     let Some(tm) = Tmux::start("phone", 40, 20, &b.root.join("repo"), &b.env(&m.url), &[]) else { return };
-    assert!(tm.wait_for("›", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    assert!(tm.wait_for("❯", Duration::from_secs(10)).is_some(), "{}", tm.screen());
     tm.keys(&["go", "Enter"]);
     assert!(tm.wait_for("tokens", Duration::from_secs(60)).is_some(), "{}", tm.screen());
     let history = tm.history();
@@ -362,7 +362,7 @@ fn r_tui_3_a_widened_terminal_rewraps_the_answer_already_in_scrollback() {
     let m = streamed(20, Duration::from_micros(100));
     let b = Sandbox::new("widen");
     let Some(tm) = Tmux::start("widen", 40, 30, &b.root.join("repo"), &b.env(&m.url), &[]) else { return };
-    assert!(tm.wait_for("›", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    assert!(tm.wait_for("❯", Duration::from_secs(10)).is_some(), "{}", tm.screen());
     tm.keys(&["go", "Enter"]);
     assert!(tm.wait_for("tokens", Duration::from_secs(30)).is_some(), "{}", tm.screen());
     tm.tmux(&["resize-window", "-t", "t", "-x", "100", "-y", "30"]);
@@ -402,7 +402,7 @@ fn r_tui_3_a_resize_mid_stream_never_repeats_a_line_or_leaves_the_live_region_be
     for live in ["esc to interrupt", "type to steer"] {
         assert!(!history.contains(live), "the old live region was left in scrollback:\n{history}");
     }
-    assert_eq!(history.matches("› go").count(), 1, "{history}");
+    assert_eq!(history.matches("❯ go").count(), 1, "{history}");
     let bars = tm.screen().matches("api key").count();
     assert_eq!(bars, 1, "one status bar on screen after two resizes:\n{}", tm.screen());
 }
@@ -429,7 +429,7 @@ fn narrowing(name: &str, before: &str, steps: &[&str]) {
     tm.tmux(&args);
     std::thread::sleep(Duration::from_millis(800));
     let history = tm.history();
-    for row in ["enter send · alt-enter", "⚠ no network connectivity", "› ask anything", "· anthropic · api key"] {
+    for row in ["enter send · alt-enter", "⚠ no network connectivity", "❯ ask anything", "anthropic · api key"] {
         assert_eq!(history.matches(row).count(), 1, "{row:?} is in scrollback twice — the old live region was left behind:\n{history}");
     }
     assert_eq!(history.matches("krowk dev").count(), 1, "the header is still there, once:\n{history}");

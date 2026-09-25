@@ -248,9 +248,9 @@ pub enum ApprovalDecision {
     Deny,
 }
 
-/// What a client asks of the engine. `prompt` and `interrupt` are served
-/// today; the rest are typed now so every client is written against the
-/// whole vocabulary, and are refused with `not_implemented` until their
+/// What a client asks of the engine. `prompt`, `interrupt` and `steer` are
+/// served today; the rest are typed now so every client is written against
+/// the whole vocabulary, and are refused with `not_implemented` until their
 /// tickets land.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -276,7 +276,9 @@ pub enum Command {
     },
     /// Stop the running turn, keeping what it produced so far.
     Interrupt { session_id: String },
-    /// Add input to the running turn without stopping it.
+    /// Add input to the running turn without stopping it. The engine takes
+    /// it before its next model call, and it is logged there as a
+    /// `userText` item.
     Steer { session_id: String, text: String },
     /// Answer a permission request.
     Approve { session_id: String, request_id: String, decision: ApprovalDecision },

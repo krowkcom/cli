@@ -30,6 +30,11 @@
 //!   system prompt and tools that call carries (R-LOG-4).
 //! - Interruption is cooperative: `TurnContext::cancel` flips, the engine
 //!   stops at the next point it can, and returns `TurnEnd::Interrupted`.
+//! - Steering is cooperative too: what a client adds with `Command::Steer`
+//!   waits in `TurnContext::steers`, and the engine takes it at its next
+//!   step — before its next model call — reporting each as a `UserText`
+//!   item, so the log shows where in the turn it landed. A turn does not end
+//!   with steering left untaken.
 
 use crate::toolset::Preset;
 use crate::catalog::ModelInfo;
@@ -37,6 +42,7 @@ use crate::protocol::{Delta, Effort, ErrorInfo, Item, ItemKind, ModelRef, Permis
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 
 /// A boxed future that can move between threads: what a dyn-compatible
@@ -78,6 +84,30 @@ pub struct TurnContext {
     pub model_info: Option<ModelInfo>,
     /// Flips to true when the turn is to stop.
     pub cancel: watch::Receiver<bool>,
+    /// Input added while the turn runs, oldest first.
+    pub steers: Steers,
+}
+
+/// The steering a running turn has been sent and not yet taken: a queue
+/// the host pushes onto and the engine drains between model calls. Shared,
+/// because the host's `execute(Steer)` and the engine's loop run
+/// concurrently; a plain mutex, because neither holds it across an await.
+#[derive(Debug, Clone, Default)]
+pub struct Steers(Arc<Mutex<Vec<String>>>);
+
+impl Steers {
+    pub fn push(&self, text: String) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(text);
+    }
+
+    /// Everything waiting, oldest first, leaving the queue empty.
+    pub fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
 }
 
 /// An item of the branch, with the model call that produced it. Whether a

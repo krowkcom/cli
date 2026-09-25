@@ -12,7 +12,7 @@
 use crate::anthropic::AnthropicClient;
 use crate::catalog::ModelInfo;
 use crate::chat::{ChatClient, Credential};
-use crate::engine::{Engine, EngineError, EngineEvent, HistoryItem, TurnContext, TurnEnd};
+use crate::engine::{Engine, EngineError, EngineEvent, HistoryItem, Steers, TurnContext, TurnEnd};
 use crate::instances::{Auth, Registry, Resolved};
 use crate::oauth;
 use crate::openai::ResponsesClient;
@@ -55,8 +55,14 @@ pub struct HostConfig {
 
 pub struct Host {
     cfg: HostConfig,
-    /// The cancel switch of each session with a turn running.
-    running: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Each session with a turn running: its cancel switch and the queue
+    /// its steering waits in.
+    running: Mutex<HashMap<String, Running>>,
+}
+
+struct Running {
+    cancel: watch::Sender<bool>,
+    steers: Steers,
 }
 
 fn log_failure(e: LogError) -> EngineError {
@@ -87,14 +93,29 @@ impl Host {
             Command::Interrupt { session_id } => {
                 let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
                 match running.get(&session_id) {
-                    Some(tx) => {
-                        let _ = tx.send(true);
+                    Some(r) => {
+                        let _ = r.cancel.send(true);
                         Ok(None)
                     }
                     None => Err(EngineError::new("no_running_turn", format!("session {session_id} has no turn running, so there is nothing to interrupt"))),
                 }
             }
-            Command::Steer { .. } | Command::Approve { .. } | Command::SwitchModel { .. } | Command::Fork { .. } => {
+            // Queued for the engine's next step; it comes back in the log as
+            // a `userText` item where the turn took it.
+            Command::Steer { session_id, text } => {
+                if text.trim().is_empty() {
+                    return Err(EngineError::new("empty_prompt", "the steering text is empty"));
+                }
+                let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+                match running.get(&session_id) {
+                    Some(r) => {
+                        r.steers.push(text);
+                        Ok(None)
+                    }
+                    None => Err(EngineError::new("no_running_turn", format!("session {session_id} has no turn running to steer — send it as a prompt instead"))),
+                }
+            }
+            Command::Approve { .. } | Command::SwitchModel { .. } | Command::Fork { .. } => {
                 Err(EngineError::new("not_implemented", "this command is part of the protocol but not served by this build yet"))
             }
         }
@@ -156,8 +177,9 @@ impl Host {
         history.push(HistoryItem { item: prompt_item, response: None });
 
         let (cancel_tx, cancel) = watch::channel(false);
-        self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), cancel_tx);
-        let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, preset, effort, model_info: info, cancel };
+        let steers = Steers::default();
+        self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), Running { cancel: cancel_tx, steers: steers.clone() });
+        let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, preset, effort, model_info: info, cancel, steers };
         let mut tally = Tally::default();
         let outcome = w.drive(engine.as_ref(), ctx, &mut tally, &model, &instance, &self.cfg.pricer).await;
         self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&session_id);

@@ -210,6 +210,14 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                 if *ctx.cancel.borrow() {
                     return Ok(TurnEnd::Interrupted);
                 }
+                // Steering sent since the last step joins the history here,
+                // after the tool results it arrived during: the model reads
+                // it on this call.
+                for text in ctx.steers.take() {
+                    let item = Item::UserText { text };
+                    let _ = events.send(EngineEvent::ItemCompleted { item_id: krowk_store::new_id(), item: item.clone() }).await;
+                    req.history.push(HistoryItem { item, response: None });
+                }
                 let resp = self.client.stream(&req, &events, ctx.cancel.clone()).await?;
                 let item_ids: Vec<String> = resp.items.iter().map(|(id, _)| id.clone()).collect();
                 let _ = events
@@ -235,7 +243,12 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                     return Ok(TurnEnd::Interrupted);
                 }
                 if calls.is_empty() {
-                    return Ok(TurnEnd::Completed);
+                    // An answer that crossed a steer in flight is not the
+                    // end: the model has not read it yet.
+                    if ctx.steers.is_empty() {
+                        return Ok(TurnEnd::Completed);
+                    }
+                    continue;
                 }
                 let mut interrupted = false;
                 for (call_id, name, input) in calls {

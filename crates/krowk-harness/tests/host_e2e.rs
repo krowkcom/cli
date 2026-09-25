@@ -311,3 +311,66 @@ fn detail(env: &dyn Fn(&str) -> String, id: &str) -> String {
         .collect();
     format!("{}\n{}\n{}", d.session.title, turns.join("\n"), msgs.join("\n"))
 }
+
+#[test]
+fn r_proto_1_steer_joins_the_running_turn_before_its_next_model_call() {
+    use krowk_harness::host::Host;
+    use krowk_harness::protocol::Command;
+    use tokio::sync::mpsc;
+    // The first call streams slowly, so the steering lands while it runs.
+    let m = mock::serve(|body, n| {
+        let r = mock::readme_script(body, n);
+        if n == 0 { mock::Reply::paced(r.body, std::time::Duration::from_millis(60)) } else { r }
+    });
+    let home = Home::new("steer", &m.url);
+    let host = Host::new(home.config());
+    let model = Registry::resolve(&InstancesConfig::default(), &home.env()).parse_model("claude-sonnet-4-6").unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let (lines, result) = rt.block_on(async {
+        // No turn is running yet: there is nothing to steer.
+        let (tx, _rx) = mpsc::channel(8);
+        let err = host.execute(Command::Steer { session_id: "none".into(), text: "x".into() }, tx).await.unwrap_err();
+        assert_eq!(err.code, "no_running_turn");
+
+        let (tx, mut rx) = mpsc::channel(1024);
+        let cmd = Command::Prompt { session_id: None, text: "read README.md and summarise it in one line".into(), model: Some(model), permission_mode: PermissionMode::Default, toolset: None };
+        let exec = host.execute(cmd, tx);
+        tokio::pin!(exec);
+        let mut lines = Vec::new();
+        let mut steered = false;
+        let result = loop {
+            tokio::select! {
+                Some(line) = rx.recv() => {
+                    if !steered && let StreamLine::Live(LiveEvent::ItemStarted { session_id, .. }) = &line {
+                        let (tx, _rx) = mpsc::channel(8);
+                        host.execute(Command::Steer { session_id: session_id.clone(), text: "and say which licence it has".into() }, tx).await.unwrap();
+                        steered = true;
+                    }
+                    lines.push(line);
+                }
+                r = &mut exec => break r.unwrap().unwrap(),
+            }
+        };
+        while let Ok(l) = rx.try_recv() {
+            lines.push(l);
+        }
+        (lines, result)
+    });
+    assert_eq!(result.status, TurnStatus::Completed);
+    // The model read it on its next call, after the tool's result.
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "one call per step, and no extra one");
+    let last = seen[1].body["messages"].as_array().unwrap().last().unwrap().clone();
+    let blocks: Vec<&str> = last["content"].as_array().unwrap().iter().map(|b| b["type"].as_str().unwrap()).collect();
+    assert_eq!(blocks, ["tool_result", "text"], "{last}");
+    assert_eq!(last["content"][1]["text"], "and say which licence it has");
+    // And the log shows where in the turn it landed.
+    let kinds: Vec<String> = lines
+        .iter()
+        .filter_map(|l| match l {
+            StreamLine::Log(LogEvent { body: LogBody::ItemCompleted { item, .. }, .. }) => Some(serde_json::to_value(item).unwrap()["kind"].as_str().unwrap().to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, ["userText", "reasoning", "assistantText", "toolCall", "toolResult", "userText", "assistantText"]);
+}

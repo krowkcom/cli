@@ -17,7 +17,10 @@
 //!
 //! Lines of a subagent (`parent_tool_use_id` set) belong to the subagent's
 //! own conversation, which Claude Code keeps; the turn logs the `Task` call
-//! and its result. `result` ends the turn.
+//! and its result. What each of the subagent's calls cost is still the
+//! session's spend, so the usage of its `assistant` messages is reported,
+//! once per message, as `SubagentResponse`. `result` ends the turn, with
+//! Claude Code's own `total_cost_usd` for it.
 
 use crate::anthropic::stream::Decoder;
 use crate::engine::{EngineError, EngineEvent};
@@ -77,6 +80,11 @@ pub struct Translator {
     held: Vec<EngineEvent>,
     pub init: Option<Init>,
     pub outcome: Option<Outcome>,
+    /// A subagent's message whose usage is not reported yet: Claude Code
+    /// sends one `assistant` line per content block, each with the
+    /// message's usage so far, so it is reported when the next message
+    /// begins, or the turn ends.
+    subagent: Option<(String, String, Usage)>,
 }
 
 fn str_of<'a>(v: &'a Value, k: &str) -> &'a str {
@@ -98,10 +106,20 @@ impl Translator {
     /// Folds one stream-json line in; returns what the host should be told.
     /// Control messages are the engine's, and never reach here.
     pub fn apply(&mut self, msg: &Value) -> Result<Vec<EngineEvent>, EngineError> {
-        if msg.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
-            return Ok(Vec::new());
-        }
         let mut out = Vec::new();
+        if msg.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
+            if str_of(msg, "type") == "assistant"
+                && let Some(m) = msg.get("message")
+                && let Some(u) = m.get("usage")
+            {
+                let id = str_of(m, "id").to_string();
+                if self.subagent.as_ref().is_some_and(|(seen, _, _)| *seen != id) {
+                    self.close_subagent(&mut out);
+                }
+                self.subagent = Some((id, str_of(m, "model").into(), usage(u)));
+            }
+            return Ok(out);
+        }
         match str_of(msg, "type") {
             "system" if str_of(msg, "subtype") == "init" => self.init = Some(init(msg)),
             "stream_event" => self.stream_event(msg.get("event").unwrap_or(&Value::Null), &mut out)?,
@@ -122,6 +140,9 @@ impl Translator {
             }
             "result" => {
                 self.finish(&mut out);
+                if let Some(usd) = msg.get("total_cost_usd").and_then(Value::as_f64) {
+                    out.push(EngineEvent::ReportedCost { usd });
+                }
                 self.outcome = Some(Outcome {
                     subtype: str_of(msg, "subtype").into(),
                     is_error: msg.get("is_error").and_then(Value::as_bool).unwrap_or(false),
@@ -212,6 +233,13 @@ impl Translator {
         self.close_stream(out);
         self.close_whole(out);
         out.append(&mut self.held);
+        self.close_subagent(out);
+    }
+
+    fn close_subagent(&mut self, out: &mut Vec<EngineEvent>) {
+        if let Some((id, model, usage)) = self.subagent.take() {
+            out.push(EngineEvent::SubagentResponse { response_id: (!id.is_empty()).then_some(id), model, usage });
+        }
     }
 }
 
@@ -316,6 +344,24 @@ mod tests {
 {"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null}
 {"type":"result","subtype":"success","is_error":false,"result":"s-1","session_id":"cc-1"}
 "#;
+
+    #[test]
+    fn r_budget_1_a_subagents_calls_are_metered_once_each_and_the_reported_total_comes_with_the_result() {
+        let mut t = Translator::default();
+        let sub = |id: &str, out: i64| format!(r#"{{"type":"assistant","parent_tool_use_id":"toolu_task","session_id":"s","message":{{"id":"{id}","model":"claude-haiku-4-5","role":"assistant","content":[{{"type":"text","text":"x"}}],"usage":{{"input_tokens":5,"output_tokens":{out}}}}}}}"#);
+        let lines = [sub("msg_sub_1", 3), sub("msg_sub_1", 40), sub("msg_sub_2", 7), r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s","total_cost_usd":0.25}"#.to_string()].join("\n");
+        let evs = feed(&mut t, &lines);
+        let metered: Vec<(Option<&str>, i64)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::SubagentResponse { response_id, usage, .. } => Some((response_id.as_deref(), usage.output_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(metered, [(Some("msg_sub_1"), 40), (Some("msg_sub_2"), 7)], "each message once, at its last usage");
+        assert!(completed(&evs).is_empty(), "the subagent's conversation is its own");
+        assert_eq!(evs.last(), Some(&EngineEvent::ReportedCost { usd: 0.25 }));
+    }
 
     #[test]
     fn r_back_5_a_streamed_tool_turn_becomes_the_same_items_a_native_turn_logs() {

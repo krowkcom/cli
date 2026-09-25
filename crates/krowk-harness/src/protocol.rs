@@ -419,6 +419,18 @@ pub enum LogBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         billing: Option<Billing>,
     },
+    /// A model call a backend's own subagent made — Claude Code's `Task` —
+    /// which is the subagent's conversation, not this one: metered, so the
+    /// budget and the session's cost count it, and never replayed.
+    #[serde(rename = "subagent.response")]
+    SubagentResponse {
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        /// The model the provider says answered.
+        model: String,
+        usage: Usage,
+    },
     /// The krowk run this session's evidence is grouped under, opened by
     /// its first `publish` (R-EVID-1). Logged once; every later publish, and
     /// a resumed session's, attaches to it.
@@ -436,6 +448,11 @@ pub enum LogBody {
         /// Every model call in the turn, summed.
         usage: Usage,
         duration_ms: u64,
+        /// What a backend said the turn cost, when it says (Claude Code's
+        /// `total_cost_usd`). A budget counts it when it is more than krowk
+        /// priced the turn's calls at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reported_cost_usd: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ErrorInfo>,
     },
@@ -463,6 +480,12 @@ pub enum LiveEvent {
         /// `--max-tokens` counts.
         generated_tokens: i64,
     },
+    /// Something for the person at the client and nobody else: an
+    /// anonymous upload's claim command, whose token is a secret. Never
+    /// logged, never in what a model reads; `krowk -p` prints it on stderr
+    /// and leaves it out of `stream-json`.
+    #[serde(rename = "notice")]
+    Notice { session_id: String, turn_id: String, text: String },
     /// How a `prompt` came out: the last thing a headless run prints.
     #[serde(rename = "result")]
     Result(RunResult),

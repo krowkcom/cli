@@ -69,6 +69,15 @@ pub enum EngineEvent {
     /// `publish` opened the session's krowk run: the host logs it, so every
     /// later publish — this session's next turn's too — attaches to it.
     RunOpened { run: String },
+    /// A call a backend's own subagent made: metered for the budget and the
+    /// session's cost, and kept out of this conversation.
+    SubagentResponse { response_id: Option<String>, model: String, usage: Usage },
+    /// What a backend said the whole turn cost (Claude Code's
+    /// `total_cost_usd`), which counts calls krowk may not have seen.
+    ReportedCost { usd: f64 },
+    /// Something for the person and nobody else — never logged, never sent
+    /// to a model: an anonymous upload's claim command.
+    Notice { text: String },
 }
 
 /// Where an engine sends its events. Bounded, so a slow client slows the

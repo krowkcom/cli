@@ -350,6 +350,8 @@ impl App {
                 self.costed = true;
                 self.dirty = true;
             }
+            // For the person alone (a claim command): shown, never logged.
+            StreamLine::Live(LiveEvent::Notice { text, .. }) => self.notice(text),
             StreamLine::Live(LiveEvent::Result(r)) => self.on_result(r),
         }
     }
@@ -401,7 +403,7 @@ impl App {
                 }
             }
             LogBody::ItemCompleted { item_id, item, .. } => self.on_item(item_id, item, live),
-            LogBody::ResponseCompleted { usage, model, .. } => {
+            LogBody::ResponseCompleted { usage, model, .. } | LogBody::SubagentResponse { usage, model, .. } => {
                 self.usage += *usage;
                 // A live turn's cost arrives with its result; a replayed
                 // one is priced here, the way the host priced it.
@@ -868,7 +870,7 @@ mod tests {
             ev(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "2".into(), item: Item::ToolCall { call_id: "c".into(), name: "read".into(), input: serde_json::json!({"path": "README.md"}) } }),
             ev(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "3".into(), item: Item::ToolResult { call_id: "c".into(), output: "# krowk\nmore\n".into(), is_error: false } }),
             ev(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "4".into(), item: Item::AssistantText { text: "It is a CLI.".into() } }),
-            ev(LogBody::TurnCompleted { turn_id: "t".into(), status: TurnStatus::Completed, usage: Usage { input_tokens: 1200, ..Usage::default() }, duration_ms: 1500, error: None }),
+            ev(LogBody::TurnCompleted { turn_id: "t".into(), status: TurnStatus::Completed, usage: Usage { input_tokens: 1200, ..Usage::default() }, duration_ms: 1500, error: None, reported_cost_usd: None }),
         ];
         a.replay(&evs.iter().collect::<Vec<_>>());
         assert_eq!(text(&a.take_pending()), ["❯ hi", "", "◆ Read README.md (2 lines)", "", "It is a CLI.", "Worked for 1.5s · 1.2k tokens"]);

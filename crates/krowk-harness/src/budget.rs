@@ -86,27 +86,49 @@ impl Spend {
 #[derive(Debug, Clone, PartialEq)]
 struct LastCall {
     provider: String,
+    /// The id the request named — an alias, for a backend (`sonnet`).
     model: String,
+    /// The id the provider says answered (`claude-sonnet-4-6-…`): what an
+    /// alias is priced by.
+    answered: String,
     usage: Usage,
 }
 
-/// Every model call a log records, priced, and the last of them.
+/// A turn's spend once its backend has said what it cost: the larger of
+/// the two, since a vendor's total counts what krowk never saw metered, and
+/// a reported total prices what krowk could not.
+fn reconcile(turn: &mut Spend, reported: f64) {
+    if reported > turn.known_usd || !turn.unpriced.is_empty() {
+        turn.known_usd = turn.known_usd.max(reported);
+        turn.unpriced.clear();
+    }
+}
+
+/// Every model call a log records — a backend's subagents' included —
+/// priced, turn by turn, and the last of the session's own calls.
 fn metered(events: &[LogEvent], pricer: &Pricer) -> (Spend, Option<LastCall>) {
     let mut turns: HashMap<&str, (&str, &str)> = HashMap::new();
-    let mut spend = Spend::default();
+    let mut per_turn: HashMap<&str, Spend> = HashMap::new();
     let mut last = None;
     for ev in events {
         match &ev.body {
             LogBody::TurnStarted { turn_id, model, provider, .. } => {
                 turns.insert(turn_id, (provider, &model.model));
             }
-            LogBody::ResponseCompleted { turn_id, model: answered, usage, .. } => {
+            LogBody::ResponseCompleted { turn_id, model: answered, usage, .. } | LogBody::SubagentResponse { turn_id, model: answered, usage, .. } => {
                 let (provider, asked) = turns.get(turn_id.as_str()).copied().unwrap_or(("", answered));
-                spend.add(pricer, provider, asked, answered, usage);
-                last = Some(LastCall { provider: provider.into(), model: asked.into(), usage: *usage });
+                per_turn.entry(turn_id).or_default().add(pricer, provider, asked, answered, usage);
+                if matches!(ev.body, LogBody::ResponseCompleted { .. }) {
+                    last = Some(LastCall { provider: provider.into(), model: asked.into(), answered: answered.clone(), usage: *usage });
+                }
             }
+            LogBody::TurnCompleted { turn_id, reported_cost_usd: Some(r), .. } => reconcile(per_turn.entry(turn_id).or_default(), *r),
             _ => {}
         }
+    }
+    let mut spend = Spend::default();
+    for s in per_turn.values() {
+        spend.merge(s);
     }
     (spend, last)
 }
@@ -338,12 +360,28 @@ impl Budget {
         t
     }
 
+    /// Records a call a backend's subagent made: spend like any other, but
+    /// not the call the next one's floor is worked out from.
+    pub fn record_subagent(&self, answered: &str, usage: &Usage) -> Snapshot {
+        let mut s = self.state();
+        s.turn.add(&self.0.pricer, &self.0.provider, &self.0.model, answered, usage);
+        Snapshot { total: Budget::total(&s), turn: s.turn.clone() }
+    }
+
+    /// What the backend said the turn cost: counted when it is more than
+    /// the turn's calls were priced at, or prices what they could not.
+    pub fn reported(&self, usd: f64) -> Snapshot {
+        let mut s = self.state();
+        reconcile(&mut s.turn, usd);
+        Snapshot { total: Budget::total(&s), turn: s.turn.clone() }
+    }
+
     /// Records one metered call of this turn.
     pub fn record(&self, answered: &str, usage: &Usage) -> Snapshot {
         let snap = {
             let mut s = self.state();
             s.turn.add(&self.0.pricer, &self.0.provider, &self.0.model, answered, usage);
-            s.last = Some(LastCall { provider: self.0.provider.clone(), model: self.0.model.clone(), usage: *usage });
+            s.last = Some(LastCall { provider: self.0.provider.clone(), model: self.0.model.clone(), answered: answered.into(), usage: *usage });
             Snapshot { total: Budget::total(&s), turn: s.turn.clone() }
         };
         self.0.recorded.send_modify(|n| *n += 1);
@@ -355,6 +393,19 @@ impl Budget {
     /// limit. `made` is how many calls this turn has made so far; their
     /// usage is waited for first, so none is missed.
     pub async fn admit(&self, made: u64) -> Result<(), EngineError> {
+        self.check_before(made, false).await
+    }
+
+    /// Before a backend's turn. Its model is often an alias the price list
+    /// does not name (`sonnet`), and its calls are the vendor's: with no
+    /// call metered yet the floor is zero — `over` interrupts it once its
+    /// first priced call goes past — and after one, the floor is priced by
+    /// the id that answered.
+    pub async fn admit_turn(&self) -> Result<(), EngineError> {
+        self.check_before(0, true).await
+    }
+
+    async fn check_before(&self, made: u64, backend: bool) -> Result<(), EngineError> {
         if self.0.limits.is_empty() {
             return Ok(());
         }
@@ -364,12 +415,19 @@ impl Budget {
         // the parent's turn. Off the runtime, like any file work.
         let (sessions, id, pricer) = (self.0.sessions.clone(), self.0.session_id.clone(), self.0.pricer.clone());
         let subagents = tokio::task::spawn_blocking(move || subagents_spent(&sessions, &id, &pricer)).await.unwrap_or_default();
-        let (spent, next) = {
+        let (spent, next, answered) = {
             let mut s = self.state();
             s.subagents = subagents;
-            (Budget::total(&s), floor(s.last.as_ref(), &self.0.provider, &self.0.model))
+            let answered = s.last.as_ref().filter(|l| l.provider == self.0.provider && l.model == self.0.model).map(|l| l.answered.clone());
+            (Budget::total(&s), floor(s.last.as_ref(), &self.0.provider, &self.0.model), answered)
         };
-        let price = (self.0.pricer)(&self.0.provider, &self.0.model, &next);
+        if backend && answered.is_none() {
+            return match judge(&self.0.limits, &spent, None) {
+                None => Ok(()),
+                Some(trip) => Err(self.refusal(&trip, true)),
+            };
+        }
+        let price = (self.0.pricer)(&self.0.provider, &self.0.model, &next).or_else(|| answered.and_then(|a| (self.0.pricer)(&self.0.provider, &a, &next)));
         let model = format!("{}/{}", self.0.provider, self.0.model);
         match judge(&self.0.limits, &spent, Some((&next, price, &model))) {
             None => Ok(()),
@@ -447,10 +505,35 @@ mod tests {
 
     #[test]
     fn r_budget_1_the_floor_is_the_last_prompt_resent_from_cache_and_one_token() {
-        let last = LastCall { provider: "anthropic".into(), model: "m".into(), usage: Usage { input_tokens: 10, cache_read_tokens: 3000, cache_write_tokens: 40, output_tokens: 50, reasoning_tokens: 900 } };
+        let last = LastCall { provider: "anthropic".into(), model: "m".into(), answered: "m-2026".into(), usage: Usage { input_tokens: 10, cache_read_tokens: 3000, cache_write_tokens: 40, output_tokens: 50, reasoning_tokens: 900 } };
         assert_eq!(floor(Some(&last), "anthropic", "m"), Usage { cache_read_tokens: 3100, output_tokens: 1, ..Usage::default() });
         assert_eq!(floor(Some(&last), "anthropic", "other"), Usage { output_tokens: 1, ..Usage::default() }, "another model counts tokens its own way");
         assert_eq!(floor(None, "anthropic", "m"), Usage { output_tokens: 1, ..Usage::default() });
+    }
+
+    #[test]
+    fn r_budget_1_a_backend_alias_is_priced_by_the_model_that_answered_and_its_reported_total_counts() {
+        let dir = std::env::temp_dir().join(format!("krowk-budget-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_, root) = log::SessionLog::create(&dir, Path::new("/repo"), "t").unwrap();
+        // Prices the snapshot id only, as models.dev does: `sonnet` is Claude
+        // Code's alias for it.
+        let pricer: Pricer = Arc::new(|_, m: &str, u: &Usage| (m == "claude-sonnet-4-6").then(|| u.output_tokens as f64 / 1000.0 + u.cache_read_tokens as f64 / 1e6));
+        let limits = BudgetLimits { max_usd: Some(0.10), max_tokens: None };
+        let b = Budget::new(limits, &root.session_id, &dir, pricer.clone(), "anthropic", "sonnet", std::slice::from_ref(&root));
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        assert!(rt.block_on(b.admit_turn()).is_ok(), "no call yet: the floor is zero, not an unknown price");
+        assert!(matches!(rt.block_on(b.admit(0)), Err(e) if e.message.contains("no price for anthropic/sonnet")), "a native call on an unpriced id still trips");
+        let snap = b.record("claude-sonnet-4-6", &Usage { output_tokens: 50, cache_read_tokens: 1000, ..Usage::default() });
+        assert!((snap.turn.cost().unwrap() - 0.051).abs() < 1e-9, "priced by the answering id: {:?}", snap.turn);
+        assert!(rt.block_on(b.admit_turn()).is_ok(), "the next floor is priced by the answering id too");
+        // A subagent's call counts, and the vendor's reported total wins when larger.
+        b.record_subagent("claude-sonnet-4-6", &Usage { output_tokens: 20, ..Usage::default() });
+        let snap = b.reported(0.12);
+        assert_eq!(snap.turn.cost(), Some(0.12));
+        assert!(b.over().is_some_and(|e| e.message.contains("over --max-usd $0.100")), "past the limit on the reported total");
+        assert_eq!(b.reported(0.01).turn.cost(), Some(0.12), "a smaller reported total changes nothing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn pricer() -> Pricer {

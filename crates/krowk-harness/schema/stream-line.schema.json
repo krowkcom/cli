@@ -238,6 +238,38 @@
           ]
         },
         {
+          "description": "A model call a backend's own subagent made — Claude Code's `Task` —\nwhich is the subagent's conversation, not this one: metered, so the\nbudget and the session's cost count it, and never replayed.",
+          "type": "object",
+          "properties": {
+            "turnId": {
+              "type": "string"
+            },
+            "responseId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "description": "The model the provider says answered.",
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/Usage"
+            },
+            "type": {
+              "type": "string",
+              "const": "subagent.response"
+            }
+          },
+          "required": [
+            "type",
+            "turnId",
+            "model",
+            "usage"
+          ]
+        },
+        {
           "description": "The krowk run this session's evidence is grouped under, opened by\nits first `publish` (R-EVID-1). Logged once; every later publish, and\na resumed session's, attaches to it.",
           "type": "object",
           "properties": {
@@ -277,6 +309,14 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "reportedCostUsd": {
+              "description": "What a backend said the turn cost, when it says (Claude Code's\n`total_cost_usd`). A budget counts it when it is more than krowk\npriced the turn's calls at.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
             },
             "error": {
               "anyOf": [
@@ -693,6 +733,31 @@
             "sessionId",
             "turnId",
             "generatedTokens"
+          ]
+        },
+        {
+          "description": "Something for the person at the client and nobody else: an\nanonymous upload's claim command, whose token is a secret. Never\nlogged, never in what a model reads; `krowk -p` prints it on stderr\nand leaves it out of `stream-json`.",
+          "type": "object",
+          "properties": {
+            "sessionId": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "notice"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId",
+            "turnId",
+            "text"
           ]
         },
         {

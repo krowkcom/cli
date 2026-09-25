@@ -132,6 +132,13 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
                     add_usage(t, usage);
                 }
             }
+            // A backend's subagent's call: its tokens are the turn's spend,
+            // and its conversation is the subagent's.
+            LogBody::SubagentResponse { usage, .. } => {
+                if let Some(t) = turn.and_then(|t| th.turns.get_mut(t as usize)) {
+                    add_usage(t, usage);
+                }
+            }
             LogBody::TurnCompleted { status, .. } => {
                 flush(&mut th, &mut pending, &provider, turn);
                 if let Some(t) = turn.and_then(|t| th.turns.get_mut(t as usize)) {
@@ -168,6 +175,7 @@ fn event_type(b: &LogBody) -> &'static str {
         LogBody::TurnCompleted { .. } => "turn.completed",
         LogBody::BackendSession { .. } => "backend.session",
         LogBody::RunOpened { .. } => "run.opened",
+        LogBody::SubagentResponse { .. } => "subagent.response",
     }
 }
 
@@ -250,12 +258,12 @@ mod tests {
         bodies.extend(turn("t1", "first"));
         // The response streamed a text item, then failed: no response.completed.
         bodies.push(LogBody::ItemCompleted { turn_id: "t1".into(), item_id: "t1-a".into(), item: Item::AssistantText { text: "half an answer".into() } });
-        bodies.push(LogBody::TurnCompleted { turn_id: "t1".into(), status: TurnStatus::Failed, usage: Usage::default(), duration_ms: 1, error: None });
+        bodies.push(LogBody::TurnCompleted { turn_id: "t1".into(), status: TurnStatus::Failed, usage: Usage::default(), duration_ms: 1, error: None, reported_cost_usd: None });
         let after_first = bodies.len();
         bodies.extend(turn("t2", "second"));
         bodies.push(LogBody::ItemCompleted { turn_id: "t2".into(), item_id: "t2-a".into(), item: Item::AssistantText { text: "done".into() } });
         bodies.push(LogBody::ResponseCompleted { turn_id: "t2".into(), response_id: None, model: "m".into(), usage: Usage::default(), stop_reason: None, item_ids: vec!["t2-a".into()] });
-        bodies.push(LogBody::TurnCompleted { turn_id: "t2".into(), status: TurnStatus::Completed, usage: Usage::default(), duration_ms: 1, error: None });
+        bodies.push(LogBody::TurnCompleted { turn_id: "t2".into(), status: TurnStatus::Completed, usage: Usage::default(), duration_ms: 1, error: None, reported_cost_usd: None });
         let events = log(bodies);
 
         let home = std::env::temp_dir().join(format!("krowk-harness-project-{}", std::process::id()));

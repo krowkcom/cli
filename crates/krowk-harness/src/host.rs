@@ -309,7 +309,7 @@ impl Host {
         // asks before each call itself.
         let watch = (!engine.checks_budget()).then(|| (budget.clone(), cancel_tx.clone()));
         let before = match &watch {
-            Some((b, _)) => b.admit(0).await,
+            Some((b, _)) => b.admit_turn().await,
             None => Ok(()),
         };
         let outcome = match before {
@@ -336,7 +336,7 @@ impl Host {
             Err(e) => (TurnStatus::Failed, Some(e.info())),
         };
         let duration_ms = started.elapsed().as_millis() as u64;
-        w.log(LogBody::TurnCompleted { turn_id: turn_id.clone(), status, usage: tally.usage, duration_ms, error: error.clone() }).await?;
+        w.log(LogBody::TurnCompleted { turn_id: turn_id.clone(), status, usage: tally.usage, duration_ms, error: error.clone(), reported_cost_usd: tally.reported }).await?;
         log.sync().map_err(log_failure)?;
         let result = RunResult {
             session_id,
@@ -428,7 +428,7 @@ fn replay(branch: &[&LogEvent]) -> Past {
                 responses += 1;
             }
             LogBody::RunOpened { run, .. } => past.run = Some(run.clone()),
-            LogBody::TurnCompleted { .. } => {}
+            LogBody::TurnCompleted { .. } | LogBody::SubagentResponse { .. } => {}
         }
     }
     past
@@ -444,6 +444,8 @@ struct Tally {
     last_text: String,
     /// Why the host interrupted a backend's turn: the budget it went past.
     tripped: Option<EngineError>,
+    /// What the backend said the turn cost.
+    reported: Option<f64>,
 }
 
 /// Appends and forwards, in that order.
@@ -469,6 +471,21 @@ impl Writer<'_> {
 
     async fn live(&self, ev: LiveEvent) {
         let _ = self.out.send(StreamLine::Live(ev)).await;
+    }
+
+    /// Where a metered call left the turn and the session: the result's
+    /// cost, and R-BUDGET-2's frame for the status bar.
+    async fn spent(&self, session_id: &str, turn_id: String, tally: &mut Tally, spent: &crate::budget::Snapshot) {
+        tally.cost = spent.turn.known_usd;
+        tally.unpriced = !spent.turn.unpriced.is_empty();
+        self.live(LiveEvent::Cost {
+            session_id: session_id.into(),
+            turn_id,
+            cost_usd: spent.total.cost(),
+            turn_cost_usd: spent.turn.cost(),
+            generated_tokens: spent.total.generated(),
+        })
+        .await;
     }
 
     /// Runs the engine and handles its events as they come. A log that
@@ -539,22 +556,12 @@ impl Writer<'_> {
                 // Priced by the id the request named; the answering model's
                 // id is the fallback, since a provider may name a snapshot.
                 let spent = budget.record(&answered, &usage);
-                tally.cost = spent.turn.known_usd;
-                tally.unpriced = !spent.turn.unpriced.is_empty();
                 let said: Vec<&str> = item_ids.iter().filter_map(|id| texts.get(id).map(String::as_str)).collect();
                 if !said.is_empty() {
                     tally.last_text = said.join("\n\n");
                 }
                 self.log(LogBody::ResponseCompleted { turn_id: turn_id.clone(), response_id, model: answered, usage, stop_reason, item_ids }).await?;
-                // R-BUDGET-2: the status bar's figure, after every call.
-                self.live(LiveEvent::Cost {
-                    session_id: session_id.into(),
-                    turn_id,
-                    cost_usd: spent.total.cost(),
-                    turn_cost_usd: spent.turn.cost(),
-                    generated_tokens: spent.total.generated(),
-                })
-                .await;
+                self.spent(session_id, turn_id, tally, &spent).await;
             }
             EngineEvent::BackendSession { backend, session_id: vendor, transcript, billing } => {
                 let rec = BackendRecord { instance: model.instance.clone(), session_id: vendor.clone(), transcript: transcript.clone(), billing };
@@ -565,6 +572,21 @@ impl Writer<'_> {
             }
             EngineEvent::RunOpened { run } => {
                 self.log(LogBody::RunOpened { turn_id, run }).await?;
+            }
+            // Metered, logged apart from the conversation, and counted.
+            EngineEvent::SubagentResponse { response_id, model: answered, usage } => {
+                tally.usage += usage;
+                let spent = budget.record_subagent(&answered, &usage);
+                self.log(LogBody::SubagentResponse { turn_id: turn_id.clone(), response_id, model: answered, usage }).await?;
+                self.spent(session_id, turn_id, tally, &spent).await;
+            }
+            EngineEvent::ReportedCost { usd } => {
+                tally.reported = Some(usd);
+                let spent = budget.reported(usd);
+                self.spent(session_id, turn_id, tally, &spent).await;
+            }
+            EngineEvent::Notice { text } => {
+                self.live(LiveEvent::Notice { session_id: session_id.into(), turn_id, text }).await;
             }
         }
         Ok(())

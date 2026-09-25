@@ -583,11 +583,11 @@ fn r_evid_1_claude_code_publishes_through_krowks_bridge() {
     let seen = asked.clone();
     let publisher: krowk_harness::evidence::Publisher = Arc::new(move |r: &krowk_harness::evidence::PublishRequest| {
         seen.lock().unwrap().push(r.clone());
-        Ok(krowk_harness::evidence::Published { text: "Artifact art_1 — shot.png\nhttps://krowk.com/a/art_1".into(), run: Some("run_1".into()) })
+        Ok(krowk_harness::evidence::Published { text: "Artifact art_1 — shot.png\nhttps://krowk.com/a/art_1".into(), run: Some("run_1".into()), for_person: Vec::new() })
     });
     let host = home.host_publishing(vec![("claude:work", home.instance(&dir, Some("publish.jsonl")))], trust::allow_all(), Some(publisher));
     rt().block_on(async {
-        let (lines, r) = run(&host, prompt(None, "publish the screenshot", "claude:work/sonnet", PermissionMode::Default)).await;
+        let (lines, r) = run(&host, prompt(None, "publish the screenshot", "claude:work/sonnet", PermissionMode::AcceptEdits)).await;
         let r = r.unwrap().unwrap();
         assert_eq!(r.status, TurnStatus::Completed, "{:?}", r.error);
         let items = completed(&lines);
@@ -637,4 +637,58 @@ fn r_budget_1_a_backend_turn_over_its_budget_is_interrupted_and_the_next_refused
         assert_eq!(home.fake_log().matches("in {\"type\":\"user\"").count(), before, "the refused turn never reached Claude Code");
         host.shutdown().await;
     });
+}
+
+/// R-BUDGET-1: what Claude Code's own subagent (`Task`) spends is the
+/// session's spend. Its calls are metered and logged apart from the
+/// conversation, and Claude Code's reported total counts when krowk could
+/// not price the calls itself — here it prices nothing.
+#[test]
+fn r_budget_1_claude_codes_subagent_calls_count_toward_the_budget() {
+    let home = Home::new("subagent");
+    let dir = home.signed_in("cfg-work");
+    let host = home.host(vec![("claude:work", home.instance(&dir, Some("subagent.jsonl")))], trust::allow_all());
+    within(Box::pin(async {
+        let (lines, r) = run(&host, prompt_within(None, "look around", "claude:work/sonnet", PermissionMode::Default, Some(krowk_harness::protocol::BudgetLimits { max_tokens: Some(100), max_usd: None }))).await;
+        let r = r.unwrap().unwrap();
+        // 9 + 8 of its own, 600 of its subagent's: over 100, so interrupted.
+        assert_eq!(r.error.as_ref().map(|e| e.code.as_str()), Some("budget_exceeded"), "{r:?}");
+        assert!(r.error.as_ref().unwrap().message.contains("tokens generated, over --max-tokens 100"), "{r:?}");
+        let events = home.events(&r.session_id);
+        let sub: Vec<i64> = events.iter().filter_map(|e| match &e.body {
+            LogBody::SubagentResponse { usage, .. } => Some(usage.output_tokens),
+            _ => None,
+        }).collect();
+        assert_eq!(sub, [600], "logged once, apart from the conversation");
+        assert!(!completed(&lines).iter().any(|i| matches!(i, Item::AssistantText { text } if text == "the subagent looked")));
+        assert!(r.usage.output_tokens >= 609, "{:?}", r.usage);
+        host.shutdown().await;
+    }));
+    // One Home at a time: the next takes the lock this one holds.
+    drop(host);
+    drop(home);
+    // Without a limit: Claude Code's reported total prices what krowk could not.
+    let home = Home::new("subagent-cost");
+    let dir = home.signed_in("cfg-work");
+    let host = home.host(vec![("claude:work", home.instance(&dir, Some("subagent.jsonl")))], trust::allow_all());
+    within(Box::pin(async {
+        let (lines, r) = run(&host, prompt(None, "look around", "claude:work/sonnet", PermissionMode::Default)).await;
+        let r = r.unwrap().unwrap();
+        assert_eq!(r.status, TurnStatus::Completed, "{:?}", r.error);
+        assert_eq!(r.cost_usd, Some(0.3));
+        let last_cost = lines.iter().rev().find_map(|l| match l {
+            StreamLine::Live(LiveEvent::Cost { cost_usd, .. }) => Some(*cost_usd),
+            _ => None,
+        });
+        assert_eq!(last_cost, Some(Some(0.3)));
+        let events = home.events(&r.session_id);
+        assert!(events.iter().any(|e| matches!(&e.body, LogBody::TurnCompleted { reported_cost_usd: Some(c), .. } if *c == 0.3)));
+        host.shutdown().await;
+    }));
+}
+
+/// Runs `f` on a runtime of its own, and fails rather than hangs when it
+/// does not finish in 30 s: a turn that never ends is a test failure.
+fn within<F: std::future::Future>(f: F) -> F::Output {
+    rt().block_on(async { tokio::time::timeout(std::time::Duration::from_secs(30), f).await.expect("finished within 30 s") })
 }

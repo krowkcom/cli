@@ -265,3 +265,35 @@ fn r_perm_2_headless_never_waits_on_an_ask_and_says_what_would_allow_it() {
     let sent = tool_result_sent(&m);
     assert!(sent.contains("nobody is here to give it") && sent.contains("`Bash(npm test)`") && sent.contains("--permission-mode bypassPermissions"), "{sent}");
 }
+
+#[test]
+fn r_compat_1_a_skill_denied_by_rule_never_enters_the_context_and_hooks_see_skill_calls() {
+    let m = mock::serve(one_tool("skill", json!({"name": "deploy"})));
+    let h = Home::new("skill-deny", &m.url);
+    h.write(".claude/skills/deploy/SKILL.md", "---\nname: deploy\ndescription: Ship it\n---\nSTEP ONE: push to production.");
+    h.write(".claude/settings.json", &json!({"permissions": {"deny": ["Skill(deploy)"]}}).to_string());
+    let hook = json!({"hooks": {"PreToolUse": [{"matcher": "Skill", "hooks": [{"type": "command", "command": "cat > \"$CLAUDE_PROJECT_DIR/skill-hook.json\""}]}]}});
+    let host = h.host(Config { user: Some(hook), ..Config::default() });
+    let (_, r) = run(&host, prompt("ship", PermissionMode::BypassPermissions));
+    assert_eq!(r.result, "Done.");
+    let sent = tool_result_sent(&m);
+    assert!(sent.contains("denied by the rule `Skill(deploy)`"), "{sent}");
+    let everything: String = m.seen.lock().unwrap().iter().map(|s| s.raw.clone()).collect();
+    assert!(!everything.contains("STEP ONE"), "the body never reached the model");
+    let input: Value = serde_json::from_str(&std::fs::read_to_string(h.repo().join("skill-hook.json")).unwrap()).unwrap();
+    assert_eq!((input["tool_name"].as_str(), input["tool_input"]["skill"].as_str()), (Some("Skill"), Some("deploy")), "{input}");
+}
+
+#[test]
+fn r_compat_1_a_hook_that_says_continue_false_stops_the_turn_with_its_reason() {
+    let m = mock::serve(one_tool("bash", json!({"command": "ls"})));
+    let h = Home::new("hook-stop", &m.url);
+    let hooks = json!({"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "echo '{\"continue\": false, \"stopReason\": \"quota reached\", \"systemMessage\": \"see the dashboard\"}'"}]}]}});
+    let host = h.host(Config { user: Some(hooks), ..Config::default() });
+    let (lines, r) = run(&host, prompt("list", PermissionMode::BypassPermissions));
+    let e = r.error.expect("stopped");
+    assert_eq!(e.code, "hook_stopped");
+    assert!(e.message.contains("quota reached"), "{}", e.message);
+    assert!(lines.iter().any(|l| matches!(l, StreamLine::Live(LiveEvent::Notice { text, .. }) if text.contains("see the dashboard"))), "systemMessage is the person's notice");
+    assert_eq!(m.seen.lock().unwrap().len(), 1, "no model call after the stop");
+}

@@ -276,8 +276,35 @@ fn remembered(path: &Path, root: &Path) -> Result<Vec<File>, String> {
     Ok(vec![read_object(&serde_json::json!({ "permissions": p }), &source, root, root, None)?])
 }
 
-/// Remembers `allow` for the project at `root`: `0600`, replaced by rename.
+/// Holds the grants file's lock while it is read, changed and replaced:
+/// two sessions granting at once each keep what the other wrote.
+struct GrantsLock(#[allow(dead_code)] std::fs::File);
+
+fn lock_grants(path: &Path) -> Result<GrantsLock, String> {
+    let dir = path.parent().ok_or_else(|| format!("{} has no directory", path.display()))?;
+    crate::log::private_dir(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let lock = path.with_extension("json.lock");
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let f = o.open(&lock).map_err(|e| format!("open {}: {e}", lock.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor this function owns; released when
+        // the returned guard closes it.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!("lock {}: {}", lock.display(), std::io::Error::last_os_error()));
+        }
+    }
+    Ok(GrantsLock(f))
+}
+
+/// Remembers `allow` for the project at `root`: `0600`, under a lock, and
+/// replaced by rename from a temporary file of this process's own.
 pub fn remember(path: &Path, root: &Path, allow: &[String]) -> Result<(), String> {
+    let _held = lock_grants(path)?;
     let mut v: Value = match std::fs::read(path) {
         Ok(raw) => serde_json::from_slice(&raw).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
@@ -305,11 +332,11 @@ pub fn remember(path: &Path, root: &Path, allow: &[String]) -> Result<(), String
             arr.push(Value::String(r.clone()));
         }
     }
-    let dir = path.parent().ok_or_else(|| format!("{} has no directory", path.display()))?;
-    crate::log::private_dir(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let tmp = path.with_extension("json.tmp");
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!("json.{}-{}.tmp", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
     let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
+    o.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
     let body = serde_json::to_vec_pretty(&v).expect("the grants serialize");

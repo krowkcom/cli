@@ -214,13 +214,14 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                 effort: effort_for(self.client.wire_api(), ctx.effort, &takes),
                 reasoning: ctx.model_info.as_ref().map_or_else(|| crate::toolset::reasons(&ctx.model.model), |i| i.reasoning),
             };
-            let hooks = Hooked::new(&ctx);
+            let hooks = Hooked::new(&ctx, &events);
             // SessionStart and UserPromptSubmit, before the model sees the
             // prompt: what they print is context the model reads with it,
             // and a prompt hook that blocks ends the turn with its reason.
             if let Some(source) = ctx.compat.session_start {
                 let o = hooks.run(hooks::Event::SessionStart, Some(source), json!({"source": source})).await;
                 add_context(&events, &mut req, "SessionStart", o.context).await;
+                hooks.stopped()?;
             }
             let prompt = match ctx.history.last().map(|h| &h.item) {
                 Some(Item::UserText { text }) => text.clone(),
@@ -231,6 +232,7 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                 return Err(EngineError::new("prompt_blocked", format!("a UserPromptSubmit hook refused the prompt: {why}")));
             }
             add_context(&events, &mut req, "UserPromptSubmit", o.context).await;
+            hooks.stopped()?;
             let mut stops = 0usize;
             // Response indexes continue from the history's, so a replayed
             // turn and this one never share an index.
@@ -283,6 +285,7 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                     // a hook that always blocks cannot hold the turn forever.
                     if stops < MAX_STOP_HOOK_CONTINUES && ctx.compat.hooks.has(hooks::Event::Stop) {
                         let o = hooks.run(hooks::Event::Stop, None, json!({"stop_hook_active": stops > 0})).await;
+                        hooks.stopped()?;
                         if let Some(why) = o.block {
                             stops += 1;
                             add_context(&events, &mut req, "Stop", vec![why]).await;
@@ -304,6 +307,8 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                     // with no result cannot be sent back to the provider.
                     let (output, is_error) = if interrupted {
                         ("not run: the turn was interrupted".to_string(), true)
+                    } else if hooks.is_stopped() {
+                        ("not run: a hook stopped the turn".to_string(), true)
                     } else {
                         let mut cancel = ctx.cancel.clone();
                         let r = tokio::select! {
@@ -323,6 +328,8 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                 if interrupted {
                     return Ok(TurnEnd::Interrupted);
                 }
+                // Every call has its result; then a hook's stop ends the turn.
+                hooks.stopped()?;
             }
             Err(EngineError::new(
                 "turn_step_limit",
@@ -338,18 +345,35 @@ const MAX_STOP_HOOK_CONTINUES: usize = 8;
 /// A turn's hooks, with what every event's input carries.
 struct Hooked<'a> {
     ctx: &'a TurnContext,
+    events: &'a Events,
     mode: &'static str,
+    /// A hook said `continue: false`: why.
+    stop: std::sync::Mutex<Option<String>>,
 }
 
 impl<'a> Hooked<'a> {
-    fn new(ctx: &'a TurnContext) -> Hooked<'a> {
+    fn new(ctx: &'a TurnContext, events: &'a Events) -> Hooked<'a> {
         let mode = crate::protocol::PermissionMode::NAMES[match ctx.permission_mode {
             crate::protocol::PermissionMode::Default => 0,
             crate::protocol::PermissionMode::AcceptEdits => 1,
             crate::protocol::PermissionMode::Plan => 2,
             crate::protocol::PermissionMode::BypassPermissions => 3,
         }];
-        Hooked { ctx, mode }
+        Hooked { ctx, events, mode, stop: std::sync::Mutex::new(None) }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stop.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// The turn's end when a hook stopped it (Claude Code's `continue:
+    /// false`): a failure named `hook_stopped`, with the hook's
+    /// `stopReason`, which the person reads and the model does not.
+    fn stopped(&self) -> Result<(), EngineError> {
+        match self.stop.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            Some(why) => Err(EngineError::new("hook_stopped", format!("a hook stopped the turn: {why}"))),
+            None => Ok(()),
+        }
     }
 
     async fn run(&self, event: hooks::Event, subject: Option<&str>, fields: serde_json::Value) -> hooks::Outcome {
@@ -358,7 +382,16 @@ impl<'a> Hooked<'a> {
             return hooks::Outcome::default();
         }
         let base = hooks::Base { session_id: &self.ctx.session_id, transcript_path: &c.transcript, cwd: &self.ctx.cwd, project_dir: &c.project_dir, permission_mode: self.mode };
-        hooks::run(&c.hooks, event, subject, &base, fields, &self.ctx.cancel).await
+        let o = hooks::run(&c.hooks, event, subject, &base, fields, &self.ctx.cancel).await;
+        // A hook's systemMessage is the person's: a notice, never logged,
+        // never read by the model.
+        for m in &o.messages {
+            let _ = self.events.send(EngineEvent::Notice { text: format!("{} hook: {m}", event.name()) }).await;
+        }
+        if let Some(why) = &o.stop {
+            self.stop.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| why.clone());
+        }
+        o
     }
 }
 
@@ -399,24 +432,33 @@ fn claude_input(name: &str, input: &serde_json::Value) -> serde_json::Value {
 /// One tool call, whole: the skill tool, or a file tool or bash — its
 /// PreToolUse hooks, its permission, the run, its PostToolUse hooks.
 async fn call_tool(ctx: &TurnContext, hooks: &Hooked<'_>, env: &tools::ToolEnv<'_>, events: &Events, name: &str, input: &serde_json::Value) -> (String, bool) {
-    if name == crate::compat::skills::TOOL && !ctx.compat.skills.is_empty() {
-        return crate::compat::skills::load(&ctx.compat.skills, input);
-    }
-    let call = match tools::describe(name, input, env) {
-        Ok(c) => c,
-        Err(e) => return e,
+    // The skill tool is a call like any other: its hooks see it as
+    // Claude Code's `Skill`, and `Skill(name)` rules — and a `Read` deny of
+    // its file — judge it before its body enters the conversation.
+    let skill = name == crate::compat::skills::TOOL && !ctx.compat.skills.is_empty();
+    let (call, claude, tool_input) = if skill {
+        match crate::compat::skills::call(&ctx.compat.skills, input) {
+            Ok((call, skill_name)) => (call, "Skill".to_string(), json!({ "skill": skill_name })),
+            Err(e) => return e,
+        }
+    } else {
+        match tools::describe(name, input, env) {
+            Ok(c) => (c, crate::permissions::rules::canonical(name), claude_input(name, input)),
+            Err(e) => return e,
+        }
     };
-    let claude = crate::permissions::rules::canonical(name);
-    let tool_input = claude_input(name, input);
     let pre = hooks.run(hooks::Event::PreToolUse, Some(&claude), json!({"tool_name": claude, "tool_input": tool_input})).await;
     if let Some(why) = pre.block {
         return (format!("{name} was not run: a PreToolUse hook blocked it: {why}"), true);
+    }
+    if hooks.is_stopped() {
+        return (format!("{name} was not run: a hook stopped the turn"), true);
     }
     let opens = match ctx.gate.check(&call, name, input, pre.decision, events, &ctx.cancel).await {
         Ok(o) => o,
         Err(why) => return (why, true),
     };
-    let (mut output, is_error) = tools::execute(name, input, env, ctx.gate.scope(opens)).await;
+    let (mut output, is_error) = if skill { crate::compat::skills::load(&ctx.compat.skills, input) } else { tools::execute(name, input, env, ctx.gate.scope(opens)).await };
     let post = hooks.run(hooks::Event::PostToolUse, Some(&claude), json!({"tool_name": claude, "tool_input": tool_input, "tool_response": {"output": output, "isError": is_error}})).await;
     if let Some(why) = post.block {
         output.push_str(&format!("\n\n(a PostToolUse hook says: {why})"));

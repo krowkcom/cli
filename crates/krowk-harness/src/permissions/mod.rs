@@ -109,8 +109,10 @@ impl Policy {
     pub fn deny_list(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for (k, r) in &self.loaded.rules {
-            let s = rules::claude_spelling(r);
-            if *k == Kind::Deny && !out.contains(&s) {
+            if *k == Kind::Deny
+                && let Some(s) = rules::claude_spelling(r)
+                && !out.contains(&s)
+            {
                 out.push(s);
             }
         }
@@ -140,6 +142,7 @@ pub fn summary(call: &Call) -> String {
         Access::Bash(c) => format!("Bash `{}`", c.trim()),
         Access::Fetch(u) => format!("WebFetch {u}"),
         Access::Mcp { server, tool } => format!("the MCP tool {tool} of {server}"),
+        Access::Skill(_) => format!("the skill {}", call.subject.as_deref().unwrap_or("?")),
         Access::Free | Access::Other => match &call.subject {
             Some(s) => format!("{} {s}", call.tool),
             None => call.tool.clone(),
@@ -163,9 +166,12 @@ fn remember(call: &Call) -> Vec<String> {
         }
         Access::Edit(ps) => ps.iter().map(|p| format!("Edit({})", abs(p))).collect(),
         Access::Publish(ps) => ps.iter().map(|p| format!("Publish({})", abs(p))).collect(),
-        Access::Read(ps) => ps.iter().map(|p| format!("Read({}/**)", abs(if p.is_dir() { p } else { p.parent().unwrap_or(p) }).trim_end_matches('/'))).collect(),
+        // The file read, exactly; a directory's contents only when the call
+        // read the directory itself.
+        Access::Read(ps) => ps.iter().map(|p| if p.is_dir() { format!("Read({}/**)", abs(p).trim_end_matches('/')) } else { format!("Read({})", abs(p)) }).collect(),
         Access::Fetch(u) => url::Url::parse(u).ok().and_then(|u| u.host_str().map(|h| vec![format!("WebFetch(domain:{h})")])).unwrap_or_default(),
         Access::Mcp { server, tool } => vec![format!("mcp__{server}__{tool}")],
+        Access::Skill(_) => call.subject.iter().map(|s| format!("Skill({s})")).collect(),
         Access::Free | Access::Other => vec![call.tool.clone()],
     }
 }
@@ -351,7 +357,7 @@ impl Gate {
             return Verdict::Allow(Opens::default());
         }
         let mode = self.0.mode;
-        if mode == PermissionMode::Plan && !matches!(call.access, Access::Read(_) | Access::Fetch(_)) {
+        if mode == PermissionMode::Plan && !matches!(call.access, Access::Read(_) | Access::Fetch(_) | Access::Skill(_)) {
             return Verdict::Deny(format!("{what} is not run in plan mode, which reads and plans but changes nothing. Say what you would do instead; the person leaves plan mode to have it done."));
         }
         let bypass = mode == PermissionMode::BypassPermissions;
@@ -364,6 +370,16 @@ impl Gate {
         }
         if hook == Some(hooks::Decision::Ask) {
             return Verdict::Ask { reason: "a PreToolUse hook asks for it to be approved".into(), remember: Vec::new() };
+        }
+        // A command line whose program the shell computes, or that krowk
+        // cannot follow, cannot be held to a deny rule: where one applies,
+        // it is asked about — in bypassPermissions too, and refused where
+        // nobody can be asked.
+        if let Access::Bash(cmd) = &call.access
+            && p.loaded.rules.iter().any(|(k, r)| *k == Kind::Deny && r.tool == "Bash")
+            && rules::split(cmd).opaque
+        {
+            return Verdict::Ask { reason: "krowk cannot tell which program it runs (a name the shell expands, a quote it cannot follow), so a deny rule could not hold it".into(), remember: Vec::new() };
         }
         if bypass {
             return Verdict::Allow(Opens { outside: true, fences: true });
@@ -384,6 +400,8 @@ impl Gate {
             Access::Bash(_) => "it runs a command, and no allow rule covers it".into(),
             Access::Fetch(_) => "it fetches from the network, and no allow rule covers the host".into(),
             Access::Mcp { .. } => "it calls an MCP tool no allow rule covers".into(),
+            // Loading a skill reads its own file: what reading needs.
+            Access::Skill(_) => return Verdict::Allow(Opens::default()),
             Access::Free | Access::Other => format!("no allow rule covers {}", call.tool),
         };
         Verdict::Ask { reason, remember: remember(call) }

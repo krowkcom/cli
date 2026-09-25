@@ -21,10 +21,15 @@
 //! the repository root — what Claude Code gives one, so a script written
 //! for it runs as it is. It has `timeout` seconds (60 by default); at the
 //! timeout, or when the turn is interrupted, its group is killed. Exit 0 is
-//! success, and a JSON object on stdout is read as Claude Code reads it
-//! (`decision`/`reason`, `hookSpecificOutput.permissionDecision`,
-//! `.additionalContext`); exit 2 blocks, with stderr as the reason; any
-//! other exit is a failure that blocks nothing.
+//! success, and a JSON object on stdout is read as Claude Code reads it:
+//! `continue: false` stops the turn with its `stopReason` (shown to the
+//! person), `systemMessage` is shown to the person, `decision`/`reason`,
+//! `hookSpecificOutput.permissionDecision` and `.additionalContext` are
+//! the model's. Exit 2 blocks, with stderr as the reason; any other exit is
+//! a failure that blocks nothing. Not read: `suppressOutput` (krowk shows
+//! no hook output anywhere to suppress), a `PreToolUse` hook's
+//! `updatedInput` (a hook cannot rewrite what the model asked for), and a
+//! `timeout` longer than a day, which is held to a day.
 //!
 //! **Hooks are commands, so where they come from matters**: only the
 //! person's own settings, and a repository's once it is trusted — never a
@@ -71,6 +76,8 @@ impl Event {
 
 /// Claude Code's default: a minute.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest a hook may be given.
+const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 /// What of a hook's stdout and stderr is kept.
 const MAX_OUTPUT: usize = 64 << 10;
 
@@ -128,7 +135,15 @@ pub fn parse(v: &Value, source: &str) -> Result<Hooks, String> {
                     continue;
                 }
                 let command = h.get("command").and_then(Value::as_str).filter(|c| !c.trim().is_empty()).ok_or_else(|| format!("{source}: a hooks.{name} command hook needs a \"command\""))?;
-                let timeout = h.get("timeout").and_then(Value::as_f64).filter(|t| *t > 0.0).map_or(DEFAULT_TIMEOUT, Duration::from_secs_f64);
+                let timeout = match h.get("timeout") {
+                    None | Some(Value::Null) => DEFAULT_TIMEOUT,
+                    Some(t) => match t.as_f64().filter(|t| t.is_finite() && *t > 0.0) {
+                        // A day is more than any hook needs; what is longer
+                        // is held to it rather than overflowing a clock.
+                        Some(t) => Duration::from_secs_f64(t.min(MAX_TIMEOUT.as_secs_f64())),
+                        None => return Err(format!("{source}: a hooks.{name} hook's \"timeout\" must be a positive number of seconds, not {t}")),
+                    },
+                };
                 commands.push(Command { command: command.to_string(), timeout });
             }
             if !commands.is_empty() {
@@ -162,6 +177,11 @@ pub struct Outcome {
     pub context: Vec<String>,
     /// Hooks that failed without blocking (another exit, a timeout).
     pub failures: Vec<String>,
+    /// A hook said `continue: false`: the turn stops, with its
+    /// `stopReason` — for the person, not the model.
+    pub stop: Option<String>,
+    /// `systemMessage`s: shown to the person, never to the model.
+    pub messages: Vec<String>,
 }
 
 /// A `PreToolUse` hook's say in a call's permission.
@@ -212,7 +232,7 @@ pub async fn run(hooks: &Hooks, event: Event, subject: Option<&str>, base: &Base
             }
             let ran = exec(c, &body, base, cancel.clone()).await;
             read(event, c, &g.source, ran, &mut out);
-            if out.block.is_some() {
+            if out.block.is_some() || out.stop.is_some() {
                 return out;
             }
         }
@@ -264,6 +284,13 @@ fn read(event: Event, c: &Command, source: &str, ran: Result<Ran, String>, out: 
     };
     let reason = |k: &str| j.get(k).and_then(Value::as_str).map(str::trim).filter(|r| !r.is_empty()).map(String::from);
     let specific = j.get("hookSpecificOutput");
+    if let Some(m) = reason("systemMessage") {
+        out.messages.push(m);
+    }
+    if j.get("continue").and_then(Value::as_bool) == Some(false) {
+        out.stop = Some(reason("stopReason").unwrap_or_else(|| format!("the {} hook `{}` stopped the turn", event.name(), c.command)));
+        return;
+    }
     if let Some(ctx) = specific.and_then(|s| s.get("additionalContext")).and_then(Value::as_str).filter(|c| !c.trim().is_empty()) {
         out.context.push(ctx.trim().to_string());
     }
@@ -373,6 +400,20 @@ mod tests {
         let o = run(&slow, Event::PostToolUse, Some("Bash"), &base(&d), json!({}), &cancel).await;
         assert!(o.block.is_none() && o.failures[0].contains("exit 3"), "another exit blocks nothing: {o:?}");
         assert!(parse(&json!({"PreToolUse": [{"hooks": [{"type": "command"}]}]}), "f").unwrap_err().contains("needs a \"command\""));
+        // A timeout that would overflow the clock, or is not a duration at
+        // all, is named with its file — never a panic.
+        for bad in [json!(-1), json!(0), json!("soon"), json!(1e300)] {
+            let r = parse(&json!({"Stop": [{"hooks": [{"command": "true", "timeout": bad}]}]}), "/x/settings.json");
+            if bad == json!(1e300) {
+                assert!(r.is_ok(), "a huge timeout is held to a day");
+            } else {
+                assert!(r.unwrap_err().contains("/x/settings.json"), "{bad}");
+            }
+        }
+        // continue:false stops, with its reason; systemMessage is the person's.
+        let stop = hooks(json!({"Stop": [{"hooks": [{"command": "echo '{\"continue\": false, \"stopReason\": \"the build broke\", \"systemMessage\": \"see CI\"}'"}]}]}));
+        let o = run(&stop, Event::Stop, None, &base(&d), json!({}), &cancel).await;
+        assert_eq!((o.stop.as_deref(), o.messages.as_slice()), (Some("the build broke"), ["see CI".to_string()].as_slice()));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

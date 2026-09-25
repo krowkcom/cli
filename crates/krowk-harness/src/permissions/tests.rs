@@ -311,3 +311,69 @@ fn r_perm_1_publish_is_held_to_what_an_edit_is_and_a_read_deny_keeps_a_file_from
     assert_eq!(letter(&gate(&policy(&d, &[(Kind::Allow, "Read")]), PermissionMode::Default).verdict(&shot, None)), '?', "a Read allow rule does not allow uploading");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn r_perm_1_a_line_krowk_cannot_read_is_asked_about_where_a_bash_deny_applies_even_in_bypass() {
+    let d = repo("opaque");
+    let p = policy(&d, &[(Kind::Deny, "Bash(rm:*)")]);
+    for cmd in ["$(printf rm) -rf x", "r{m,} -rf x", "$'\\cA'; rm x", "echo 'open"] {
+        for m in [PermissionMode::Default, PermissionMode::AcceptEdits, PermissionMode::BypassPermissions] {
+            assert_ne!(letter(&gate(&p, m).verdict(&bash(cmd), None)), 'Y', "{cmd:?} in {m:?}");
+        }
+    }
+    assert_eq!(letter(&gate(&policy(&d, &[]), PermissionMode::BypassPermissions).verdict(&bash("$(printf ls)"), None)), 'Y', "with no Bash deny rule, bypass is bypass");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_perm_2_a_remembered_read_is_the_file_read_and_a_directory_only_when_one_was_read() {
+    let d = repo("grant-read");
+    std::fs::write(d.join("src/a.rs"), "").unwrap();
+    std::fs::write(d.join("src/b.rs"), "").unwrap();
+    let file = remember(&read(d.join("src/a.rs")));
+    assert_eq!(file, [format!("Read(/{})", d.join("src/a.rs").display())]);
+    let dir = remember(&read(d.join("src")));
+    assert_eq!(dir, [format!("Read(/{}/**)", d.join("src").display())]);
+    std::fs::create_dir_all(d.join("elsewhere")).unwrap();
+    // Run from another directory, so reading src/ is outside and asked.
+    let g = gate(&Policy::modes_only(&d.join("elsewhere")), PermissionMode::Default);
+    assert_eq!(letter(&g.verdict(&read(d.join("src/a.rs")), None)), '?');
+    g.0.grants.lock().unwrap().push(rules::parse(&file[0], "grant", &d).unwrap());
+    assert_eq!(letter(&g.verdict(&read(d.join("src/a.rs")), None)), 'Y');
+    assert_eq!(letter(&g.verdict(&read(d.join("src/b.rs")), None)), '?', "its sibling is not granted with it");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_perm_2_project_grants_made_at_once_all_survive() {
+    let d = repo("grant-race");
+    let file = d.join("krowk/permissions.json");
+    let threads: Vec<_> = (0..16)
+        .map(|i| {
+            let (file, d) = (file.clone(), d.clone());
+            std::thread::spawn(move || settings::remember(&file, &d, &[format!("Bash(make t{i})")]).unwrap())
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let allow = saved["projects"][d.display().to_string()]["allow"].as_array().unwrap().len();
+    assert_eq!(allow, 16, "every grant made at once is kept: {saved}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_compat_1_a_skill_is_judged_by_skill_rules_and_a_read_deny_of_its_file() {
+    let d = repo("skill-rule");
+    let skill = |n: &str| Call { tool: "Skill".into(), access: Access::Skill(Some(d.join(format!(".claude/skills/{n}/SKILL.md")))), subject: Some(n.into()) };
+    let p = policy(&d, &[(Kind::Deny, "Skill(deploy)"), (Kind::Ask, "Skill(release-*)"), (Kind::Deny, "Read(**/secret/**)")]);
+    for m in MODES {
+        assert_eq!(letter(&gate(&p, m).verdict(&skill("deploy"), None)), 'N', "{m:?}");
+        assert_eq!(letter(&gate(&p, m).verdict(&skill("release-notes"), None)), '?', "{m:?}");
+        assert_eq!(letter(&gate(&p, m).verdict(&skill("lint"), None)), 'Y', "{m:?}: a skill reads its own file, which plan allows too");
+    }
+    let hidden = Call { tool: "Skill".into(), access: Access::Skill(Some(d.join(".claude/skills/secret/x/SKILL.md"))), subject: Some("x".into()) };
+    assert_eq!(letter(&gate(&p, PermissionMode::Default).verdict(&hidden, None)), 'N', "a Read deny of its file");
+    let _ = std::fs::remove_dir_all(&d);
+}

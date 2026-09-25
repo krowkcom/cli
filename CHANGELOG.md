@@ -102,7 +102,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   mode, `bypassPermissions` included**, and a command line is judged the way
   the shell runs it: `git status && rm -rf x` is two commands, `sudo rm`,
   `bash -c 'rm …'` and `find -delete` still meet `Bash(rm:*)`, and an allow
-  rule never covers a line that writes a file through `>`. Plan mode
+  rule never covers a line that writes a file through `>`, nor
+  `git -c …`. A command whose program name the shell computes (`$X`,
+  `$(printf rm)`, `r{m,}`) is asked about whenever a `Bash` deny rule
+  applies, even under `bypassPermissions`, and refused by `krowk -p`. Plan mode
   refuses every edit and command. `bash` now runs in `default` and
   `acceptEdits` when a rule allows the command. Claude Code backends are
   started with your deny rules as `--disallowedTools`, and Codex's

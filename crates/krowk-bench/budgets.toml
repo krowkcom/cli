@@ -73,7 +73,9 @@ unit = "bytes"
 # Ticket 09's permissions (no new crate: the rule evaluator and its shell
 # splitter, the settings loader, remembered grants, approval frames and the
 # TUI's prompt for them, Claude-format hooks, instructions and skills) adds
-# 172,864 bytes: 7,538,600 (7.19 MiB), 63,576 under this.
+# 172,864 bytes: 7,538,600 (7.19 MiB), and its review round (bash's
+# quoting, opaque program names, anchored path rules, skill and hook
+# fields) 26,880 more: 7,565,480 (7.22 MiB), 36,696 under this.
 max = { x86_64-linux = 7_602_176 }
 status = "enforced"
 

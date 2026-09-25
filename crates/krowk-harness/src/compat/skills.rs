@@ -56,7 +56,7 @@ fn read_dir_of(root: &Path, out: &mut Vec<Skill>, repo: Option<&Path>) {
         let (fm, _) = super::instructions::front_matter(&text);
         let get = |k: &str| fm.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone()).unwrap_or_default();
         let name = Some(get("name")).filter(|n| !n.is_empty()).unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
-        let description = get("description");
+        let description = get("description").split_whitespace().collect::<Vec<_>>().join(" ");
         if description.is_empty() {
             continue;
         }
@@ -101,6 +101,18 @@ pub fn definition() -> crate::protocol::ToolDefinition {
         input_schema: crate::tools::input_schema::<SkillInput>(),
         grammar: None,
     }
+}
+
+/// A `skill` call, as the permission evaluator judges it: the skill by
+/// name, reading its `SKILL.md`. One that names no skill is answered here.
+pub fn call(list: &[Skill], input: &serde_json::Value) -> Result<(crate::permissions::Call, String), (String, bool)> {
+    let name = SkillInput::deserialize(input).map_err(|e| (format!("invalid input for skill: {e}"), true))?.name.trim().to_string();
+    let Some(k) = list.iter().find(|k| k.name == name) else {
+        let names: Vec<&str> = list.iter().map(|k| k.name.as_str()).collect();
+        return Err((format!("there is no skill named {name:?} — the skills are {}", names.join(", ")), true));
+    };
+    let call = crate::permissions::Call { tool: "Skill".into(), access: crate::permissions::Access::Skill(Some(k.dir.join("SKILL.md"))), subject: Some(name.clone()) };
+    Ok((call, name))
 }
 
 /// Runs the `skill` tool: the body of the skill named.

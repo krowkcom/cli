@@ -49,12 +49,52 @@ pub(crate) fn front_matter(text: &str) -> (Vec<(String, String)>, &str) {
     let Some(end) = rest.find("\n---") else { return (Vec::new(), t) };
     let head = &rest[..end];
     let body = rest[end + 4..].trim_start_matches(['\r', '\n']);
-    let pairs = head
-        .lines()
-        .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().trim_matches('"').trim_matches('\'').to_string()))
-        .collect();
-    (pairs, body)
+    (pairs(head), body)
+}
+
+/// The `key: value` pairs of YAML front matter, as far as skills and rules
+/// use it: plain and quoted scalars, and the `>` (folded) and `|` (literal)
+/// block scalars a long `description` is often written in, with their
+/// `-`/`+` chomping. Nested maps and lists are skipped.
+fn pairs(head: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = head.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let v = v.trim();
+        let block = v.chars().next().filter(|c| *c == '>' || *c == '|') ;
+        let value = match block {
+            Some(style) if v[1..].chars().all(|c| matches!(c, '-' | '+' | '0'..='9')) => {
+                let mut body = Vec::new();
+                while i < lines.len() && (lines[i].trim().is_empty() || lines[i].starts_with([' ', '\t'])) {
+                    body.push(lines[i].trim());
+                    i += 1;
+                }
+                while body.last().is_some_and(|l| l.is_empty()) {
+                    body.pop();
+                }
+                if style == '|' { body.join("\n") } else { body.join(" ").split_whitespace().collect::<Vec<_>>().join(" ") }
+            }
+            _ => {
+                // A plain scalar may run on over indented lines.
+                let mut v = v.trim_matches('"').trim_matches('\'').to_string();
+                while i < lines.len() && lines[i].starts_with([' ', '\t']) && !lines[i].trim().is_empty() && !lines[i].trim_start().starts_with('-') {
+                    v.push(' ');
+                    v.push_str(lines[i].trim());
+                    i += 1;
+                }
+                v
+            }
+        };
+        out.push((k.trim().to_string(), value));
+    }
+    out
 }
 
 fn cursor_rule(p: &Path, out: &mut Vec<Instruction>) {
@@ -212,6 +252,10 @@ mod tests {
         assert!(prompt.contains("the later one — the deeper directory — wins"));
         assert!(prompt.contains("root cursor always") && !prompt.contains("not inlined") && prompt.contains("TypeScript rules (files matching *.ts)"));
         assert!(!prompt.contains("a secret outside"), "a repository's instruction file that links out of it is not read");
+        // A description in a YAML block scalar, as long ones are written.
+        let (fm, body) = front_matter("---\nname: notes\ndescription: >-\n  Write the release\n  notes for a tag\nother: |\n  a\n  b\n---\nbody");
+        assert_eq!(fm, [("name".into(), "notes".into()), ("description".into(), "Write the release notes for a tag".into()), ("other".into(), "a\nb".into())]);
+        assert_eq!(body, "body");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

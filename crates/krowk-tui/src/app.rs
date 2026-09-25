@@ -877,15 +877,38 @@ pub const TICK: Duration = look::SPIN_FRAME;
 /// the call can be remembered.
 fn approval_rows(req: &ApprovalRequest, waiting: usize, width: usize) -> Vec<Line<'static>> {
     let more = if waiting > 1 { format!(" (1 of {waiting})") } else { String::new() };
-    let mut rows: Vec<Line<'static>> = wrap(&clean(&format!("{}allow {}?{more}", look::TOOL, req.summary)), width).into_iter().map(|l| Line::from(Span::styled(l, yellow().add_modifier(Modifier::BOLD)))).collect();
-    rows.extend(wrap(&clean(&format!("  {}", req.reason)), width).into_iter().map(|l| Line::from(Span::styled(l, dim()))));
+    let summary = shown(&req.summary, MAX_APPROVAL_TEXT);
+    let mut rows: Vec<Line<'static>> = wrap(&format!("{}allow {summary}?{more}", look::TOOL), width).into_iter().map(|l| Line::from(Span::styled(l, yellow().add_modifier(Modifier::BOLD)))).collect();
+    rows.extend(wrap(&format!("  {}", shown(&req.reason, MAX_APPROVAL_TEXT)), width).into_iter().map(|l| Line::from(Span::styled(l, dim()))));
     let keys = if req.remember.is_empty() {
         "  y allow once · n deny".to_string()
     } else {
-        format!("  y allow once · s allow {} for this session · p … for this project · n deny", req.remember.join(", "))
+        format!("  y allow once · s allow {} for this session · p … for this project · n deny", shown(&req.remember.join(", "), MAX_APPROVAL_TEXT / 2))
     };
     rows.push(Line::from(Span::styled(clip(&keys, width), look::accent())));
     rows
+}
+
+/// How much of a model-supplied string an approval shows.
+const MAX_APPROVAL_TEXT: usize = 400;
+
+/// A string the model supplied, as the approval prompt may show it: on one
+/// line (a newline is `⏎`, so a command cannot draw a line of its own that
+/// looks like the prompt's keys), without control or formatting characters
+/// (escapes, bidi overrides, zero-width marks), and at most `max`
+/// characters.
+fn shown(s: &str, max: usize) -> String {
+    let flat: String = s
+        .chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' => Some('⏎'),
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}' => None,
+            c => Some(c),
+        })
+        .collect();
+    if flat.chars().count() > max { flat.chars().take(max).collect::<String>() + "…" } else { flat }
 }
 
 #[cfg(test)]
@@ -1047,8 +1070,12 @@ mod tests {
         assert!(shown.contains("allow Bash `npm test`? (1 of 2)") && shown.contains("no allow rule covers it") && shown.contains("s allow Bash(npm test) for this session"), "{shown}");
         // Answered elsewhere — another client, or an interrupt — it goes.
         a.on_line(&live(LiveEvent::ApprovalResolved { session_id: "s".into(), turn_id: "t".into(), request_id: "r1".into(), decision: krowk_harness::protocol::ApprovalDecision::Allow }));
-        let shown = text(&a.view(Instant::now()).0).join("\n");
-        assert!(shown.contains("y allow once · n deny") && !shown.contains("1 of 2"), "one that cannot be remembered offers once only: {shown}");
+        let shown_now = text(&a.view(Instant::now()).0).join("\n");
+        assert!(shown_now.contains("y allow once · n deny") && !shown_now.contains("1 of 2"), "one that cannot be remembered offers once only: {shown_now}");
+        // A model's string cannot draw a row of its own, hide, or run on.
+        let spoof = super::shown("rm x\n  y allow once · n deny\u{202E}\x1b[2J", 400);
+        assert_eq!(spoof, "rm x⏎  y allow once · n deny[2J");
+        assert_eq!(super::shown(&"a".repeat(500), 400).chars().count(), 401);
     }
 
     #[test]

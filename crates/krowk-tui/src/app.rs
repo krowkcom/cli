@@ -542,12 +542,19 @@ impl App {
     /// The turn is over. Steering it never took is returned, to be sent as
     /// the next prompt rather than lost.
     pub fn end_turn(&mut self) -> Vec<String> {
+        let (mut left, mut unsent) = self.end_turn_parts();
+        left.append(&mut unsent);
+        left
+    }
+
+    /// The turn is over: the steering the host accepted and this client has
+    /// not seen come back in the log, and the steering never sent (the host
+    /// refused it, or the turn ended first).
+    pub fn end_turn_parts(&mut self) -> (Vec<String>, Vec<String>) {
         self.turn = None;
         self.finish_live();
         self.dirty = true;
-        let mut left = std::mem::take(&mut self.steers);
-        left.append(&mut self.unsent_steers);
-        left
+        (std::mem::take(&mut self.steers), std::mem::take(&mut self.unsent_steers))
     }
 
     pub fn set_offline(&mut self, target: String) {

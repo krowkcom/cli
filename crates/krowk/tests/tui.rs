@@ -367,31 +367,61 @@ fn r_tui_3_a_resize_mid_stream_never_repeats_a_line_or_leaves_the_live_region_be
     assert_eq!(bars, 1, "one status bar on screen after two resizes:\n{}", tm.screen());
 }
 
-#[test]
-fn r_tui_3_narrowing_the_terminal_leaves_no_reflowed_live_region_in_scrollback() {
-    // Nothing listens: the offline notice goes up, full width. With the
-    // keys overlay open the live region is four wide rows, the notice, the
-    // prompt and the status bar — every one split in two or three by tmux's
-    // reflow at 40 columns.
+/// The live region at its widest — the offline notice, the keys overlay,
+/// the prompt and the status bar, every row split two or three ways by a
+/// reflow at 40 columns — then narrowed by `steps`. Each of those rows must
+/// be in scrollback exactly once afterwards.
+fn narrowing(name: &str, before: &str, steps: &[&str]) {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let b = Sandbox::new("narrow");
-    // The terminal already holds a screenful, as a person's does: the live
-    // region starts at the bottom, where a reflow grows it upwards.
-    let before = "for i in $(seq 1 40); do echo \"earlier output $i\"; done;";
-    let Some(tm) = Tmux::start_after("narrow", 100, 30, &b.root.join("repo"), &b.env(&format!("http://127.0.0.1:{port}")), &[], before) else { return };
+    let b = Sandbox::new(name);
+    let Some(tm) = Tmux::start_after(name, 100, 30, &b.root.join("repo"), &b.env(&format!("http://127.0.0.1:{port}")), &[], before) else { return };
     assert!(tm.wait_for("no network connectivity", Duration::from_secs(10)).is_some(), "{}", tm.screen());
     tm.keys(&["?"]);
     assert!(tm.wait_for("? or esc closes this", Duration::from_secs(5)).is_some(), "{}", tm.screen());
-    tm.tmux(&["resize-window", "-t", "t", "-x", "40", "-y", "30"]);
+    // Back to back in one tmux command: no frame in between.
+    let mut args: Vec<&str> = Vec::new();
+    for (i, w) in steps.iter().enumerate() {
+        if i > 0 {
+            args.push(";");
+        }
+        args.extend(["resize-window", "-t", "t", "-x", w, "-y", "30"]);
+    }
+    tm.tmux(&args);
     std::thread::sleep(Duration::from_millis(800));
     let history = tm.history();
-    // Each of these starts a full-width row of the old region; redrawn at
-    // 40 columns each is there once more, so a second copy is a leftover.
     for row in ["enter send · alt-enter", "⚠ no network connectivity", "› ask anything", "claude-opus-5 · anthropic"] {
         assert_eq!(history.matches(row).count(), 1, "{row:?} is in scrollback twice — the old live region was left behind:\n{history}");
     }
     assert_eq!(history.matches("krowk dev").count(), 1, "the header is still there, once:\n{history}");
-    assert!(history.contains("earlier output 40"), "what was on the terminal before is kept:\n{history}");
+    if !before.is_empty() {
+        // What was on the terminal is kept, and moving the region to the
+        // bottom left no gap between it and the conversation.
+        let lines: Vec<&str> = history.lines().collect();
+        let last = lines.iter().rposition(|l| l.starts_with("earlier output")).expect("the earlier output is kept");
+        let n: usize = lines[last].trim_start_matches("earlier output ").trim().parse().unwrap();
+        assert_eq!(lines.iter().filter(|l| l.starts_with("earlier output")).count(), n, "every earlier line, once:\n{history}");
+        assert!(lines[last + 1].starts_with("krowk dev"), "the header follows the earlier output directly:\n{history}");
+    }
+}
+
+#[test]
+fn r_tui_3_narrowing_a_fresh_terminal_leaves_no_reflowed_live_region_in_scrollback() {
+    narrowing("narrow-fresh", "", &["40"]);
+}
+
+#[test]
+fn r_tui_3_narrowing_under_a_screenful_leaves_no_reflowed_live_region_in_scrollback() {
+    narrowing("narrow-full", "for i in $(seq 1 40); do echo \"earlier output $i\"; done;", &["40"]);
+}
+
+#[test]
+fn r_tui_3_narrowing_under_a_few_lines_leaves_no_reflowed_live_region_in_scrollback() {
+    narrowing("narrow-few", "for i in $(seq 1 5); do echo \"earlier output $i\"; done;", &["40"]);
+}
+
+#[test]
+fn r_tui_3_two_narrowings_back_to_back_leave_no_fragment() {
+    narrowing("narrow-twice", "", &["70", "40"]);
 }
 
 #[test]

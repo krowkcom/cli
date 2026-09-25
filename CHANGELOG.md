@@ -101,7 +101,16 @@ the versions are the `v*` tags a release is cut from. Entries land under
   appears within two seconds and clears when it answers again (behind a
   proxy — `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` — the proxy is what is
   checked). Ctrl-Z stops to the shell and `fg` brings the prompt back;
-  SIGTERM and SIGHUP leave the terminal as they found it. With stdin
+  SIGTERM and SIGHUP leave the terminal as they found it. The prompt sits
+  at the bottom of the terminal, what was on screen moved down to meet
+  it, so narrowing the window never leaves a copy of it in scrollback.
+  **Known limits:** krowk takes a terminal to reflow on resize unless it is
+  real xterm (`XTERM_VERSION`) or the Linux console; one that is taken
+  wrongly can leave a copy of the prompt area in scrollback, or blank a
+  few lines above it. A live region that reflows taller than the whole
+  screen (a very narrow window under a long overlay) leaves its top rows in
+  scrollback. Steering an interrupted turn never read comes back into the
+  prompt, and on `-p`'s result as `unreadSteers`. With stdin
   or stdout not a terminal, bare `krowk` prints exactly what it always has.
 - **`krowk -p "…"` runs krowk's own agent, headless, on the Anthropic API.**
   The release's full build carries it; the lean agent build does not. The prompt comes from the arguments, or from stdin when there

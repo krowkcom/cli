@@ -151,17 +151,34 @@ pub struct Term<W: Write> {
     /// narrowing resize, a terminal that reflows splits each wider row
     /// into several, and this is how many.
     widths: Vec<u16>,
+    /// Where the region was, and how wide the terminal, when the last frame
+    /// reached it: what a resize is measured against, however many resizes
+    /// come before the next frame.
+    drawn_top: u16,
+    drawn_width: u16,
+    /// Whether this terminal reflows lines on a narrowing resize. Most do;
+    /// xterm and the Linux console truncate instead (see `reflows_from`).
+    pub reflows: bool,
     /// Frames written, for the tests and the redraw budget's evidence.
     pub frames: u64,
 }
 
 impl<W: Write> Term<W> {
-    /// A viewport `height` rows tall whose top is at `top` (where the cursor
-    /// was when the TUI started, or the row below it).
-    pub fn new(out: W, size: Size, top: u16, height: u16) -> io::Result<Term<W>> {
+    /// A viewport `height` rows tall at the bottom of the screen. `top` is
+    /// where the cursor was when the TUI started: what is above it on screen
+    /// is moved down to sit right above the viewport (see `anchor`).
+    pub fn new(mut out: W, size: Size, top: u16, height: u16) -> io::Result<Term<W>> {
         let buf = FrameBuf::default();
+        let height = height.clamp(1, size.height.max(1));
+        let top = anchor(&buf, size, top, height)?;
+        // Out now, not with the first frame: a resize before that frame
+        // measures against a screen that has already moved.
+        out.write_all(&buf.take())?;
+        out.flush()?;
         let terminal = build(&buf, size, top, height)?;
-        Ok(Term { terminal, buf, out, size, height, caret_row: 0, caret_col: 0, widths: Vec::new(), frames: 0 })
+        let mut t = Term { terminal, buf, out, size, height, caret_row: 0, caret_col: 0, widths: Vec::new(), drawn_top: top, drawn_width: size.width, reflows: true, frames: 0 };
+        t.drawn_top = t.top();
+        Ok(t)
     }
 
     pub fn width(&self) -> u16 {
@@ -201,29 +218,33 @@ impl<W: Write> Term<W> {
     /// found from it and cleared from its top down, then drawn afresh.
     ///
     /// Where its top is depends on what the terminal did to it. One that
-    /// truncates (xterm) leaves every row where it was, so the top is the
-    /// cursor less the caret's row. One that reflows (tmux, kitty, VTE,
-    /// iTerm) splits each row wider than the new width into several and
-    /// keeps the cursor on the caret, so the top is the cursor less the rows
-    /// the region above the caret now takes — cleared from there, the
-    /// status bar, overlay or notice that was split leaves nothing behind.
-    /// A narrower terminal whose cursor did not move did not reflow.
+    /// truncates (xterm, the Linux console) leaves every row where it was, so
+    /// the top is the cursor less the caret's row. One that reflows (tmux,
+    /// kitty, VTE, iTerm, WezTerm, Windows Terminal) splits each row wider
+    /// than the new width into several and keeps the cursor on the caret, so
+    /// the top is the cursor less the rows the region above the caret now
+    /// takes — cleared from there, the status bar, overlay or notice that
+    /// was split leaves nothing behind.
     ///
-    /// One case is out of reach: tmux keeps the bottom of its grid on
-    /// screen, blank rows included, so on a nearly empty screen — the live
-    /// region near the top, blank rows under it — the rows a reflow adds
-    /// push the region's own top rows into history, where no clear reaches.
-    /// Once the region sits at the bottom, as it does after a screenful of
-    /// output, every reflowed row stays on screen and is cleared.
+    /// Everything is measured against the last frame the terminal actually
+    /// got: bytes queued by an earlier resize and never flushed are dropped,
+    /// so two resizes before a frame are one resize from what is on screen.
+    ///
+    /// A reflow never pushes the region into history, because the region
+    /// sits at the bottom of the screen (`anchor`): tmux and the others keep
+    /// the bottom of their grid on screen, so the rows a reflow adds push
+    /// out what is above the region — conversation, already in scrollback's
+    /// order — and never the region itself, unless the reflowed region is
+    /// taller than the whole screen.
     pub fn resize(&mut self, size: Size, cursor_row: Option<u16>) -> io::Result<()> {
-        let old_top = self.top();
-        let old_width = self.size.width;
+        self.buf.take();
         self.size = size;
         let height = self.height.clamp(1, size.height.max(1));
+        let narrowed = size.width < self.drawn_width;
         let top = match cursor_row {
-            Some(row) if size.width < old_width && row != old_top + self.caret_row => row.saturating_sub(self.reflowed_above_caret(size.width)),
+            Some(row) if narrowed && self.reflows => row.saturating_sub(self.reflowed_above_caret(size.width)),
             Some(row) => row.saturating_sub(self.caret_row),
-            None => old_top,
+            None => self.drawn_top,
         };
         let top = top.min(size.height.saturating_sub(height));
         self.rebuild(top, height)
@@ -267,6 +288,8 @@ impl<W: Write> Term<W> {
             self.caret_row = y.saturating_sub(top);
             self.caret_col = x;
         }
+        self.drawn_top = top;
+        self.drawn_width = width;
         self.flush()
     }
 
@@ -300,10 +323,15 @@ impl<W: Write> Term<W> {
     /// Back after a job stop: the live region starts afresh on the row the
     /// cursor is on now (the shell may have printed below it).
     pub fn resume(&mut self, size: Size, cursor_row: Option<u16>) -> io::Result<()> {
+        self.buf.take();
         self.size = size;
         let height = self.height.clamp(1, size.height.max(1));
         let top = cursor_row.unwrap_or(size.height.saturating_sub(height)).min(size.height.saturating_sub(height));
-        self.rebuild(top, height)
+        let top = anchor(&self.buf, size, top, height)?;
+        self.rebuild(top, height)?;
+        self.drawn_top = self.top();
+        self.drawn_width = size.width;
+        Ok(())
     }
 
     pub fn into_inner(self) -> W {
@@ -313,6 +341,33 @@ impl<W: Write> Term<W> {
 
 fn completed_cursor(t: &mut Terminal<Back>) -> Option<Position> {
     t.backend_mut().get_cursor_position().ok()
+}
+
+/// Whether the terminal the environment names reflows on a narrowing
+/// resize. Real xterm (which sets XTERM_VERSION) and the Linux console
+/// truncate; everything else in use today reflows, tmux and screen included.
+pub fn reflows_from(env: &dyn Fn(&str) -> String) -> bool {
+    let inside_mux = !env("TMUX").is_empty() || env("TERM").starts_with("screen") || env("TERM").starts_with("tmux");
+    inside_mux || !(env("TERM") == "linux" || !env("XTERM_VERSION").is_empty())
+}
+
+/// Moves the viewport to the bottom of the screen: the rows above `top`
+/// (the shell's output, the command line) scroll down to sit right above
+/// it, and the blank rows below the cursor become blank rows at the top of
+/// the screen. Nothing on screen is lost or drawn twice — only blank rows
+/// are scrolled out of the region. A region at the bottom is what keeps a
+/// reflowing resize from pushing it into history (see `Term::resize`).
+fn anchor(buf: &FrameBuf, size: Size, top: u16, height: u16) -> io::Result<u16> {
+    let bottom = size.height.saturating_sub(height);
+    // Already at the bottom, or below it: ratatui makes room by scrolling
+    // the screen up, as a new line would.
+    if top >= bottom {
+        return Ok(top);
+    }
+    if top > 0 {
+        CrosstermBackend::new(buf.clone()).scroll_region_down(0..bottom, bottom - top)?;
+    }
+    Ok(bottom)
 }
 
 fn build(buf: &FrameBuf, size: Size, top: u16, height: u16) -> io::Result<Terminal<Back>> {
@@ -344,23 +399,75 @@ mod tests {
         assert!(!text.contains("\x1b[2J"), "the screen is never cleared whole: {text:?}");
     }
 
-    #[test]
-    fn r_tui_3_a_narrowed_region_is_measured_as_the_terminal_reflows_it() {
+    /// A 90-wide overlay row, the prompt with the caret at column 50, and a
+    /// 90-wide status bar, on a 100x30 terminal whose cursor started at row 10.
+    fn drawn() -> Term<Vec<u8>> {
         let mut t = Term::new(Vec::new(), Size { width: 100, height: 30 }, 10, 3).unwrap();
         let bar = Line::from("x".repeat(90));
-        // An overlay row of 90 columns, the prompt with the caret at column
-        // 50, then a status bar.
         t.frame(&[], &[bar.clone(), Line::from("y".repeat(60)), bar], (50, 1)).unwrap();
+        t
+    }
+
+    fn after_resize(t: &mut Term<Vec<u8>>, steps: &[(u16, u16)]) -> String {
+        let before = t.out.len();
+        for (w, row) in steps {
+            t.resize(Size { width: *w, height: 30 }, Some(*row)).unwrap();
+        }
+        t.flush().unwrap();
+        String::from_utf8_lossy(&t.out[before..]).into_owned()
+    }
+
+    #[test]
+    fn r_tui_3_the_region_starts_at_the_bottom_with_what_was_above_it_moved_down() {
+        let t = Term::new(Vec::new(), Size { width: 40, height: 10 }, 4, 3).unwrap();
+        assert_eq!(t.drawn_top, 7, "the bottom three rows");
+        let out = String::from_utf8_lossy(&t.out).into_owned();
+        // Rows 1-7 scrolled down by 3: the four rows above the cursor land
+        // right above the viewport, and only blank rows leave the region.
+        assert_eq!(out, "\x1b[1;7r\x1b[3T\x1b[r", "{out:?}");
+        let t = Term::new(Vec::new(), Size { width: 40, height: 10 }, 0, 3).unwrap();
+        assert!(t.out.is_empty(), "nothing above the cursor: nothing to move");
+    }
+
+    #[test]
+    fn r_tui_3_a_narrowed_region_is_measured_as_the_terminal_reflows_it() {
+        let mut t = drawn();
+        assert_eq!(t.drawn_top, 27);
         // At 40 columns the 90-wide row above the caret takes three rows,
         // and the caret itself has moved one row down its own line.
         assert_eq!(t.reflowed_above_caret(40), 3 + 1);
         assert_eq!(t.reflowed_above_caret(100), 1, "unchanged at the old width");
-        // The terminal says the cursor is now at row 14 (was 11): the
-        // region's top is 14 - 4 = 10, and it is cleared from there.
-        let before = t.out.len();
-        t.resize(Size { width: 40, height: 30 }, Some(14)).unwrap();
-        t.flush().unwrap();
-        let out = String::from_utf8_lossy(&t.out[before..]).into_owned();
-        assert!(out.starts_with("\x1b[?2026h\x1b[11;1H\x1b[J"), "{out:?}");
+        // Reflowed at the bottom of the grid, the region is 3 + 2 + 3 rows,
+        // 22 to 29, and the caret on row 26: its top is 26 - 4 = 22.
+        let out = after_resize(&mut t, &[(40, 26)]);
+        assert!(out.starts_with("\x1b[?2026h\x1b[23;1H\x1b[J"), "{out:?}");
+    }
+
+    #[test]
+    fn r_tui_3_a_terminal_that_truncates_keeps_the_region_where_it_was() {
+        let mut t = drawn();
+        t.reflows = false;
+        let out = after_resize(&mut t, &[(40, 28)]);
+        assert!(out.starts_with("\x1b[?2026h\x1b[28;1H\x1b[J"), "{out:?}");
+    }
+
+    #[test]
+    fn r_tui_3_two_resizes_before_a_frame_are_one_from_what_is_on_screen() {
+        let mut t = drawn();
+        // 100 -> 70 (the region reflows to 2 + 1 + 2 rows, caret on row 26),
+        // then 70 -> 40 before any frame: measured from the frame drawn at
+        // 100, and the first resize's clear is never sent.
+        let out = after_resize(&mut t, &[(70, 26), (40, 26)]);
+        assert_eq!(out.matches("\x1b[J").count(), 1, "one clear, not two: {out:?}");
+        assert!(out.starts_with("\x1b[?2026h\x1b[23;1H\x1b[J"), "{out:?}");
+    }
+
+    #[test]
+    fn only_xterm_and_the_console_are_taken_to_truncate() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string()).unwrap_or_default();
+        assert!(reflows_from(&env(&[("TERM", "xterm-256color")])), "gnome, alacritty and the rest say xterm too");
+        assert!(!reflows_from(&env(&[("TERM", "xterm-256color"), ("XTERM_VERSION", "XTerm(390)")])));
+        assert!(!reflows_from(&env(&[("TERM", "linux")])));
+        assert!(reflows_from(&env(&[("TERM", "linux"), ("TMUX", "/tmp/tmux-1000/default,1,0")])), "tmux reflows whatever it runs in");
     }
 }

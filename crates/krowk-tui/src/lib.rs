@@ -164,7 +164,10 @@ async fn session(opts: Options) -> Outcome {
 
     let initial_height = app.view(Instant::now().into_std()).0.len() as u16;
     let mut term = match Term::new(stdout, size, top, initial_height) {
-        Ok(t) => t,
+        Ok(mut t) => {
+            t.reflows = term::reflows_from(&|k| std::env::var(k).unwrap_or_default());
+            t
+        }
         Err(e) => return Outcome { session_id: None, abandoned: false, error: Some(format!("the terminal could not be drawn on: {e}")) },
     };
     let host = Host::new(opts.host);
@@ -344,7 +347,15 @@ impl<'h> Ui<'h> {
                             app.on_line(&line);
                         }
                     }
-                    let left = app.end_turn();
+                    // What the engine never read, as the host says on the
+                    // result (its own queue, so nothing is guessed), and what
+                    // was never accepted at all.
+                    let (acked, unsent) = app.end_turn_parts();
+                    let mut left = match &r {
+                        Ok(Some(res)) => res.unread_steers.clone(),
+                        _ => acked,
+                    };
+                    left.extend(unsent);
                     let network = match &r {
                         Ok(Some(res)) => res.error.as_ref().is_some_and(|e| e.code == "network_unreachable"),
                         Ok(None) => false,

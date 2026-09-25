@@ -346,6 +346,13 @@
                 "type": "string"
               }
             },
+            "apiKeyEnv": {
+              "description": "The environment variable krowk reads a key from and hands the\nprocess — as `ANTHROPIC_AUTH_TOKEN` when `env` names a base URL\n(a router's bearer token), else as `ANTHROPIC_API_KEY`. The\nvariable's name is stored, never the key. None: Claude Code\nsigns in with its own login.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "effort": {
               "anyOf": [
                 {

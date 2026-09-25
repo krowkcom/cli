@@ -419,7 +419,7 @@ fn prompt_flags() -> Vec<Flag> {
             ..flag("print", BOOL, "Run the prompt given as the arguments (or on stdin) headless: krowk's own agent answers it, then exits")
         },
         with_default(flag("output-format", STRING, "With -p: text (the answer), json (the result event) or stream-json (every event, one per line)"), "text"),
-        flag("model", STRING, "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5"),
+        flag("model", STRING, "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5"),
         flag("resume", STRING, "With -p: continue this krowk session — the sessionId a result names, or its krowk.db id"),
         with_default(
             flag(

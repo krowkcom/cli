@@ -161,7 +161,7 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         None => {}
     }
     let example = match provider.as_str() {
-        "anthropic" => "claude-opus-5",
+        "anthropic" => "claude-opus-5-5",
         "openai" => "gpt-5.4",
         "xai" | "supergrok" => "grok-4.7",
         "openrouter" => "openai/gpt-5.4",

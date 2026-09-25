@@ -31,13 +31,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const UUID7_PATTERN: &str = "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 
 /// A model, named as the instance that serves it and the provider's own id
-/// for it: `{"instance": "anthropic", "model": "claude-opus-5"}`.
+/// for it: `{"instance": "anthropic", "model": "claude-opus-5-5"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRef {
     /// A name from the instance registry, e.g. `anthropic` or `anthropic:work`.
     pub instance: String,
-    /// The provider's model id, e.g. `claude-opus-5`.
+    /// The provider's model id, e.g. `claude-opus-5-5`.
     pub model: String,
 }
 

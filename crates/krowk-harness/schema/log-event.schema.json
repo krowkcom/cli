@@ -218,7 +218,7 @@
   ],
   "$defs": {
     "ModelRef": {
-      "description": "A model, named as the instance that serves it and the provider's own id\nfor it: `{\"instance\": \"anthropic\", \"model\": \"claude-opus-5\"}`.",
+      "description": "A model, named as the instance that serves it and the provider's own id\nfor it: `{\"instance\": \"anthropic\", \"model\": \"claude-opus-5-5\"}`.",
       "type": "object",
       "properties": {
         "instance": {
@@ -226,7 +226,7 @@
           "type": "string"
         },
         "model": {
-          "description": "The provider's model id, e.g. `claude-opus-5`.",
+          "description": "The provider's model id, e.g. `claude-opus-5-5`.",
           "type": "string"
         }
       },

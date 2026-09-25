@@ -222,7 +222,7 @@ fn r_prov_1_the_client_streams_over_http_and_names_what_went_wrong() {
 #[test]
 fn r_prov_2_effort_none_is_thinking_off_and_any_other_rung_is_the_apis_effort() {
     use krowk_harness::protocol::Effort;
-    let req = |effort| ModelRequest { model: "claude-opus-5".into(), system: "s".into(), effort, ..ModelRequest::default() };
+    let req = |effort| ModelRequest { model: "claude-opus-5-5".into(), system: "s".into(), effort, ..ModelRequest::default() };
     let off = request_body(&req(Some(Effort::None)), &instance());
     assert!(off.get("thinking").is_none() && off.get("output_config").is_none(), "{off}");
     let high = request_body(&req(Some(Effort::High)), &instance());

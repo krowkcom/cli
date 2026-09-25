@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 pub const DEFAULT_INSTANCE: &str = "anthropic";
 /// The model a session runs on when neither the command line, the session
 /// nor the config names one.
-pub const DEFAULT_MODEL: &str = "claude-opus-5";
+pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
 pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com";
 pub const OPENAI_API_URL: &str = "https://api.openai.com/v1";
 pub const XAI_API_URL: &str = "https://api.x.ai/v1";

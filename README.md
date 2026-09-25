@@ -42,7 +42,7 @@ npx @krowk/cli push screenshot.png
 
 Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.txt`.
 
-Every release has two builds of `krowk`. The **full build** carries krowk's own agent (bare `krowk` opens it), the session store and everything else; the **lean build** is the few-megabyte agent-container build — push, runs, uploads, no SQLite. The installer gives a workstation the full build and CI or a container (it reads `CI`, `GITHUB_ACTIONS` and the like, and `/.dockerenv`, `/run/.containerenv`, `$container`) the lean one. Ask for either with `bash -s -- --lean` / `--full`, or `KROWK_LEAN=1` / `0`. `krowk upgrade` stays on the build it is; the GitHub Action installs the lean build.
+Every release has two builds of `krowk`. The **full build** carries krowk's own agent (bare `krowk` opens it), the session store and everything else; the **lean build** is the few-megabyte agent-container build — push, runs, uploads, no SQLite. The installer gives a workstation the full build and CI or a container (it reads `CI`, `GITHUB_ACTIONS` and the like, and `/.dockerenv`, `/run/.containerenv`, `$container`) the lean one. Ask for either with `bash -s -- --lean` / `--full`, or `KROWK_LEAN=1` / `0`. `krowk upgrade` stays on the build it is; the GitHub Action installs the lean build. A shell with no terminal (a Dockerfile `RUN`, a provisioning script) counts as a container too, and so do toolbox and distrobox: there, pass `--full` for the agent.
 
 ## Usage
 

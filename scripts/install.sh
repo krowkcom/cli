@@ -13,7 +13,9 @@
 # containers run: a few megabytes, no SQLite, nothing to fail on. CI is read
 # from the variables CI systems set (CI, GITHUB_ACTIONS, GITLAB_CI, …) and a
 # container from the markers container runtimes leave (/.dockerenv,
-# /run/.containerenv, $container, a Kubernetes service host). `--lean` or
+# /run/.containerenv, $container, a Kubernetes service host), or from there
+# being no controlling terminal at all — a Dockerfile RUN, a provisioning
+# script. `--lean` or
 # KROWK_LEAN=1 asks for the lean build anywhere; `--full` or KROWK_LEAN=0 for
 # the full one:
 #
@@ -43,6 +45,9 @@
 #                     Test-only. Where the container markers are looked for,
 #                     instead of /, so the detection can be tested on a machine
 #                     that is, or is not, a container.
+#   KROWK_INSTALL_TTY Test-only. The terminal device opened to tell whether a
+#                     person is there (default /dev/tty), so a test run with no
+#                     terminal can stand in for one that has one.
 
 set -euo pipefail
 
@@ -53,6 +58,7 @@ BIN_DIR="${KROWK_BIN_DIR:-}"
 VERSION="${KROWK_VERSION:-}"
 BASE_URL_OVERRIDE="${KROWK_INSTALL_BASE_URL:-}"
 FS_ROOT="${KROWK_INSTALL_FS_ROOT:-}"
+TTY_DEVICE="${KROWK_INSTALL_TTY:-/dev/tty}"
 # full or lean, and why; main settles both from the arguments, KROWK_LEAN and
 # what this machine is, before anything is downloaded.
 BUILD=""
@@ -274,18 +280,13 @@ release_base_url() {
 # archive, or names a different digest all end the install — there is no path
 # through this function that installs an unverified binary.
 verify_checksum() {
-  local base_url="$1" tmp_dir="$2" archive="$3"
-  local expected actual why
+  local tmp_dir="$1" archive="$2"
+  local expected actual
 
   step "Verifying the download"
 
-  if ! curl_run -fsSL "${base_url}/checksums.txt" -o "${tmp_dir}/checksums.txt"; then
-    why=$(curl_reason)
-    error "checksums.txt would not download from ${base_url}${why:+ (${why})}. Nothing is installed: an archive nobody can check is not one to run."
-  fi
-
   # scripts/dist.sh writes `<digest>  <name>`; a binary-mode digest writes `*<name>`.
-  expected=$(awk -v f="$archive" '$2 == f || $2 == ("*" f) {print $1; exit}' "${tmp_dir}/checksums.txt")
+  expected=$(checksum_for "$tmp_dir" "$archive")
   if [[ -z "$expected" ]]; then
     error "checksums.txt does not mention ${archive}, so there is nothing to check it against. Report this at https://github.com/${REPO}/issues"
   fi
@@ -296,6 +297,21 @@ verify_checksum() {
     error "${archive} is not the file the release signed for (expected ${expected}, got ${actual}). Nothing is installed. Retry, and if it happens again report it at https://github.com/${REPO}/issues"
   fi
   info "Checksum matches"
+}
+
+# fetch_checksums downloads the release's checksums.txt into tmp_dir, before
+# any archive: it is also the release's list of what it carries, which is how
+# a release from before the lean build is told apart.
+fetch_checksums() {
+  local base_url="$1" tmp_dir="$2" why
+  if ! curl_run -fsSL "${base_url}/checksums.txt" -o "${tmp_dir}/checksums.txt"; then
+    why=$(curl_reason)
+    error "checksums.txt would not download from ${base_url}${why:+ (${why})}. Nothing is installed: an archive nobody can check is not one to run."
+  fi
+}
+
+checksum_for() {
+  awk -v f="$2" '$2 == f || $2 == ("*" f) {print $1; exit}' "$1/checksums.txt"
 }
 
 # truthy says whether a CI variable is set to something that means yes: CI
@@ -325,7 +341,14 @@ ci_name() {
 # nothing. Only markers a runtime leaves on purpose: guessing from cgroup paths
 # misreads a systemd desktop as a container.
 container_name() {
-  if [[ -e "${FS_ROOT}/.dockerenv" ]]; then
+  # BuildKit, which runs every `docker build` now, leaves no /.dockerenv
+  # during a RUN step, so a Dockerfile `RUN curl … | bash` is found here: no
+  # controlling terminal means no person, and a script or an image build
+  # wants the lean build. Toolbox and distrobox are containers too, and say
+  # so; their users pass --full.
+  if ! { : <"$TTY_DEVICE"; } 2>/dev/null; then
+    echo "no terminal"
+  elif [[ -e "${FS_ROOT}/.dockerenv" ]]; then
     echo "/.dockerenv"
   elif [[ -e "${FS_ROOT}/run/.containerenv" ]]; then
     echo "/run/.containerenv"
@@ -366,7 +389,11 @@ choose_build() {
     return
   fi
   found=$(container_name)
-  if [[ -n "$found" ]]; then
+  if [[ "$found" == "no terminal" ]]; then
+    BUILD=lean
+    BUILD_REASON="no terminal, so no person (a Dockerfile RUN, a script)"
+    return
+  elif [[ -n "$found" ]]; then
     BUILD=lean
     BUILD_REASON="a container detected (${found})"
     return
@@ -394,8 +421,21 @@ download_binaries() {
     suffix=".exe"
   fi
 
-  archive=$(archive_for "$version" "$platform" "$BUILD")
   base_url=$(release_base_url "$version")
+  fetch_checksums "$base_url" "$tmp_dir"
+  archive=$(archive_for "$version" "$platform" "$BUILD")
+  # A release cut before the lean build existed has only the one archive.
+  # Asking it for krowk-lean_… would 404 every CI install of a pinned old
+  # version, so that release's only build is installed, and said so.
+  if [[ "$BUILD" == lean && -z "$(checksum_for "$tmp_dir" "$archive")" ]]; then
+    local full
+    full=$(archive_for "$version" "$platform" full)
+    if [[ -n "$(checksum_for "$tmp_dir" "$full")" ]]; then
+      BUILD=full
+      BUILD_REASON="krowk ${version} predates the lean build, so its one build is installed"
+      archive="$full"
+    fi
+  fi
 
   step "Downloading krowk ${version} (${BUILD} build) for ${platform//_/ }, from ${REPO}"
   if [[ "$BUILD" == lean ]]; then
@@ -408,7 +448,7 @@ download_binaries() {
     error "Could not download ${base_url}/${archive}${why:+ (${why})}. Check that ${version} is a released version: https://github.com/${REPO}/releases"
   fi
 
-  verify_checksum "$base_url" "$tmp_dir" "$archive"
+  verify_checksum "$tmp_dir" "$archive"
 
   if [[ "$ext" == "zip" ]]; then
     command -v unzip >/dev/null 2>&1 || error "unzip is needed to open ${archive} and is not installed"

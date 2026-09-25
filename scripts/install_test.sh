@@ -252,7 +252,7 @@ mkdir -p "$CLAUDE/skills"
 # HOME is redirected so a failing test cannot write to the real one, and SHELL is
 # named so the PATH branch picks a file inside the redirected HOME.
 env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
-  CLAUDE_CONFIG_DIR="$CLAUDE" \
+  CLAUDE_CONFIG_DIR="$CLAUDE" KROWK_INSTALL_TTY=/dev/null \
   KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
   bash "$REPO_ROOT/scripts/install.sh" >"$WORK/install.log" 2>&1 \
   || { cat "$WORK/install.log"; fail "the installer exited non-zero"; }
@@ -515,7 +515,9 @@ mkdir -p "$WORK/docker-root" "$WORK/podman-root/run"
 while IFS='|' read -r envs args want; do
   rm -rf "$BUILD_BIN"
   # shellcheck disable=SC2086  # envs and args are word lists on purpose.
-  env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 KROWK_SKIP_SKILL=1 \
+  # A terminal stands in (/dev/null opens where /dev/tty would), so each
+  # case is decided by what it sets, not by how this test was started.
+  env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 KROWK_SKIP_SKILL=1 KROWK_INSTALL_TTY=/dev/null \
     KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BUILD_BIN" $envs \
     bash "$REPO_ROOT/scripts/install.sh" $args >"$WORK/build.log" 2>&1 \
     || { cat "$WORK/build.log"; fail "the installer exited non-zero with [$envs] [$args]"; }
@@ -536,6 +538,8 @@ KUBERNETES_SERVICE_HOST=10.0.0.1||lean
 CI=true|--full|full
 CI=true KROWK_LEAN=0||full
 KROWK_LEAN=1||lean
+KROWK_INSTALL_TTY=$WORK/no-such-tty|--full|full
+KROWK_INSTALL_TTY=$WORK/no-such-tty||lean
 CASES
 grep -q "Pass --full, or set KROWK_LEAN=0" "$WORK/build.log" \
   || { cat "$WORK/build.log"; fail "a lean install did not say how to get the full build"; }
@@ -544,6 +548,29 @@ pass "a lean install says why, and how to get the full build instead"
 if "$BUILD_BIN/krowk" sessions >"$WORK/lean-sessions.log" 2>&1; then fail "the lean build ran krowk sessions"; fi
 grep -q "not_in_build" "$WORK/lean-sessions.log" || { cat "$WORK/lean-sessions.log"; fail "the lean build did not say what it leaves out"; }
 pass "the lean build is the agent build: no session store"
+
+# A Dockerfile RUN under BuildKit: no /.dockerenv, no CI, and no terminal.
+rm -rf "$BUILD_BIN"
+env -i PATH="$PATH" HOME="$WORK/home" NO_COLOR=1 KROWK_SKIP_SKILL=1 KROWK_INSTALL_TTY="$WORK/no-such-tty" \
+  KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BUILD_BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" >"$WORK/notty.log" 2>&1 || { cat "$WORK/notty.log"; fail "the installer failed with no terminal"; }
+grep -q "no terminal, so no person" "$WORK/notty.log" || { cat "$WORK/notty.log"; fail "a terminal-less install did not say why it is lean"; }
+pass "no controlling terminal (a Dockerfile RUN under BuildKit): the lean build, and why"
+
+# A release from before the lean build: one archive, one checksum. A lean
+# install of it must install that, not 404 on krowk-lean_….
+OLD_REL="$RELEASE/old"
+mkdir -p "$OLD_REL"
+cp "$RELEASE/$ARCHIVE" "$RELEASE/SKILL.md" "$OLD_REL/"
+(cd "$OLD_REL" && "${SHA256_CMD[@]}" "$ARCHIVE" >checksums.txt)
+rm -rf "$BUILD_BIN"
+env -i PATH="$PATH" HOME="$WORK/home" NO_COLOR=1 KROWK_SKIP_SKILL=1 CI=true \
+  KROWK_INSTALL_BASE_URL="$BASE/old" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BUILD_BIN" \
+  bash "$REPO_ROOT/scripts/install.sh" --lean >"$WORK/old-release.log" 2>&1 \
+  || { cat "$WORK/old-release.log"; fail "a lean install of a release that predates the lean build failed"; }
+cmp -s "$BUILD_BIN/krowk" "$WORK/full/krowk" || fail "a release without a lean build installed something other than its one build"
+grep -q "predates the lean build" "$WORK/old-release.log" || { cat "$WORK/old-release.log"; fail "the fallback to an old release's one build was not said"; }
+pass "a release that predates the lean build installs its one build, and says so"
 
 if env -i PATH="$PATH" HOME="$WORK/home" NO_COLOR=1 KROWK_LEAN=maybe \
   KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BUILD_BIN" \
@@ -564,7 +591,7 @@ rm -rf "${BIN:?}"/*
 # a tampered or truncated download.
 printf 'x' >>"$RELEASE/$ARCHIVE"
 if env -i PATH="$PATH" HOME="$WORK/home" SHELL=/bin/bash NO_COLOR=1 \
-  KROWK_SKIP_SKILL=1 \
+  KROWK_SKIP_SKILL=1 KROWK_INSTALL_TTY=/dev/null \
   KROWK_INSTALL_BASE_URL="$BASE" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BIN" \
   bash "$REPO_ROOT/scripts/install.sh" >"$WORK/bad.log" 2>&1; then
   fail "the installer accepted an archive whose checksum does not match"

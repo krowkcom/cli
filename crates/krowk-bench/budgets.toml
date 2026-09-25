@@ -85,10 +85,12 @@ id = "tui.startup_cold"
 req = "R-PERF-1"
 what = "Bare `krowk` to an interactive prompt, no daemon running"
 unit = "ms"
+# Spawn to the first complete frame (the end of the first synchronized
+# update), which is the prompt, on a pseudo-terminal answering the cursor
+# query; the startup connectivity probe is not waited for.
 max = 150
 runs = 21
-status = "pending"
-owner = "04"
+status = "enforced"
 
 [[budget]]
 id = "tui.startup_warm"
@@ -138,28 +140,32 @@ id = "tui.idle_cpu"
 req = "R-PERF-2"
 what = "TUI with an idle session: CPU ticks over 10 s"
 unit = "ticks"
+# At its prompt, nothing running, the start-up probe answered: the crossterm
+# reader parked on the terminal and the runtime on nothing. Wakeups are
+# printed beside it.
 max = 0
 window_s = 10
-status = "pending"
-owner = "04"
+status = "enforced"
 
 [[budget]]
 id = "tui.idle_rss"
 req = "R-PERF-3"
 what = "TUI plus engine with an idle session: resident memory"
 unit = "MB"
+# The same idle TUI: the whole process, engine and runtime included.
 max = 30
-status = "pending"
-owner = "04"
+status = "enforced"
 
 [[budget]]
 id = "session.replay_rss"
 req = "R-PERF-3"
 what = "TUI plus engine replaying a synthetic 200k-token session: peak resident memory"
 unit = "MB"
+# `krowk --resume` on a synthetic session of 100 turns and 200k tokens of
+# answer: the history drawn into scrollback, then one more turn that sends
+# all of it to the provider. VmHWM, the process's peak.
 max = 100
-status = "pending"
-owner = "04"
+status = "enforced"
 
 # --- The session log ---
 
@@ -200,9 +206,10 @@ id = "tui.redraw_fps"
 req = "R-PERF-4"
 what = "TUI under a synthetic token stream: redraws per second"
 unit = "fps"
+# The most frames begun inside any one second while an answer streams at
+# 500 tokens a second (one delta every 2 ms, for about four seconds).
 max = 60
-status = "pending"
-owner = "04"
+status = "enforced"
 
 [[budget]]
 id = "remote.attach"

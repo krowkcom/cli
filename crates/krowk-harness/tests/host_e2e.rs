@@ -61,6 +61,7 @@ impl Home {
             // that says nothing of its family.
             catalog: Arc::new(|_, model| (model == "house-coder").then(|| ModelInfo { family: Some("grok-build".into()), ..ModelInfo::default() })),
             credentials: self.root.join("home/.config/krowk/providers/credentials.json"),
+            trust: krowk_harness::trust::allow_all(),
         }
     }
 

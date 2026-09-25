@@ -20,8 +20,10 @@ use crate::log::{self, LogError, SessionLog};
 use crate::native::{self, NativeEngine};
 use crate::toolset;
 use crate::protocol::{
-    Command, ContextRecord, Effort, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus, Usage, WireApi,
+    Billing, Command, ContextRecord, Effort, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus, Usage, WireApi,
 };
+use crate::claude::ClaudeEngine;
+use crate::trust;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -51,6 +53,8 @@ pub struct HostConfig {
     pub catalog: Catalog,
     /// krowk's provider credentials file, where OAuth logins live.
     pub credentials: PathBuf,
+    /// Asked before a backend is spawned in a repository (R-BACK-6).
+    pub trust: trust::Gate,
 }
 
 pub struct Host {
@@ -58,12 +62,18 @@ pub struct Host {
     /// Each session with a turn running: its cancel switch and the queue
     /// its steering waits in.
     running: Mutex<HashMap<String, Running>>,
+    /// Each session's backend engine, with the instance it runs on: its
+    /// process outlives a turn and serves the session's next one.
+    backends: Mutex<HashMap<String, Backend>>,
 }
 
 struct Running {
     cancel: watch::Sender<bool>,
     steers: Steers,
 }
+
+/// A session's backend engine and the instance it was made for.
+type Backend = (String, Arc<dyn Engine>);
 
 fn log_failure(e: LogError) -> EngineError {
     match e {
@@ -75,7 +85,31 @@ fn log_failure(e: LogError) -> EngineError {
 
 impl Host {
     pub fn new(cfg: HostConfig) -> Host {
-        Host { cfg, running: Mutex::new(HashMap::new()) }
+        Host { cfg, running: Mutex::new(HashMap::new()), backends: Mutex::new(HashMap::new()) }
+    }
+
+    /// Lets every backend process go cleanly. A host dropped without this
+    /// still stops them (they are killed with their handles), just less
+    /// politely.
+    pub async fn shutdown(&self) {
+        let engines: Vec<Arc<dyn Engine>> = self.backends.lock().unwrap_or_else(|e| e.into_inner()).drain().map(|(_, (_, e))| e).collect();
+        for e in engines {
+            e.shutdown().await;
+        }
+    }
+
+    /// The session's backend engine on `instance`: the one already running
+    /// it, else a new one (and a process started by its first turn).
+    fn backend_for(&self, session_id: &str, instance: &Resolved) -> Result<Arc<dyn Engine>, EngineError> {
+        let mut backends = self.backends.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((name, e)) = backends.get(session_id)
+            && *name == instance.name
+        {
+            return Ok(e.clone());
+        }
+        let e: Arc<dyn Engine> = Arc::new(ClaudeEngine::new(instance.clone(), &self.cfg.krowk_version)?);
+        backends.insert(session_id.to_string(), (instance.name.clone(), e.clone()));
+        Ok(e)
     }
 
     pub fn registry(&self) -> &Registry {
@@ -154,7 +188,23 @@ impl Host {
         let family = info.as_ref().and_then(|i| i.family.clone());
         let (preset, _) = toolset::choose(toolset, self.cfg.registry.toolset.as_deref(), family.as_deref(), &model.model).map_err(|e| EngineError::new("bad_toolset", e))?;
         let wire = instance.wire_for(info.as_ref().and_then(|i| i.wire_api));
-        let engine = engine_for(&instance, wire, &self.cfg.credentials, &self.cfg.krowk_version)?;
+        let cwd_before = past.cwd.clone().unwrap_or_else(|| self.cfg.cwd.clone());
+        let native = match &instance.backend {
+            None => Some(engine_for(&instance, wire, &self.cfg.credentials, &self.cfg.krowk_version)?),
+            // A backend runs the repository's own hooks and MCP servers, so
+            // it is not started in one nobody trusted; and a binary that is
+            // not there is named before a session exists for it.
+            Some(b) => {
+                if b.path.is_none() {
+                    return Err(EngineError::new(
+                        "backend_not_found",
+                        format!("{} was not found — install Claude Code (https://claude.com/claude-code), or name the binary with `krowk providers add claude --binary <path>`", b.binary),
+                    ));
+                }
+                (self.cfg.trust)(&trust::root(&cwd_before))?;
+                None
+            }
+        };
         let effort = effort.or(instance.effort);
         let mut log = match opened {
             Some((log, _)) => log,
@@ -165,10 +215,17 @@ impl Host {
             }
         };
         let session_id = log.session_id.clone();
-        let cwd = past.cwd.clone().unwrap_or_else(|| self.cfg.cwd.clone());
+        let cwd = cwd_before;
+        let engine: Arc<dyn Engine> = match native {
+            Some(e) => Arc::from(e),
+            None => self.backend_for(&session_id, &instance)?,
+        };
+        // The Claude session to resume: the branch's last, if it ran on this
+        // instance — another account's config directory does not have it.
+        let backend_session = past.backend.as_ref().filter(|b| b.instance == model.instance).map(|b| b.session_id.clone());
 
         let turn_id = krowk_store::new_id();
-        let mut w = Writer { log: &mut log, out: &out, turn_id: turn_id.clone(), preset, wire };
+        let mut w = Writer { log: &mut log, out: &out, turn_id: turn_id.clone(), preset, wire, backend: past.backend.clone() };
         w.log(LogBody::TurnStarted { turn_id: turn_id.clone(), model: model.clone(), provider: engine.provider().into(), wire_api: engine.wire_api(), permission_mode, effort }).await?;
         let prompt_item = Item::UserText { text };
         w.log(LogBody::ItemCompleted { turn_id: turn_id.clone(), item_id: krowk_store::new_id(), item: prompt_item.clone() }).await?;
@@ -178,7 +235,7 @@ impl Host {
         let (cancel_tx, cancel) = watch::channel(false);
         let steers = Steers::default();
         self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), Running { cancel: cancel_tx, steers: steers.clone() });
-        let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, preset, effort, model_info: info, cancel, steers: steers.clone() };
+        let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, preset, effort, model_info: info, cancel, steers: steers.clone(), backend_session };
         let mut tally = Tally::default();
         let outcome = w.drive(engine.as_ref(), ctx, &mut tally, &model, &instance, &self.cfg.pricer).await;
         // Refused from here on, not queued for a turn that is over; what an
@@ -222,23 +279,35 @@ fn engine_for(instance: &Resolved, wire: WireApi, credentials: &std::path::Path,
     }
     let credential = match &instance.auth {
         Auth::ApiKey => Credential::Key(instance.api_key.clone()),
-        Auth::Keyless => Credential::None,
+        Auth::Keyless | Auth::Vendor => Credential::None,
         Auth::OAuth { .. } => Credential::OAuth(Arc::new(oauth::Tokens::open(oauth::Store::new(credentials.to_path_buf()), &instance.name)?)),
     };
     match wire {
         WireApi::AnthropicMessages => Ok(Box::new(NativeEngine { client: AnthropicClient::new(instance.clone(), krowk_version)? })),
         WireApi::OpenaiResponses => Ok(Box::new(NativeEngine { client: ResponsesClient::new(instance.clone(), krowk_version)? })),
         WireApi::ChatCompletions => Ok(Box::new(NativeEngine { client: ChatClient::new(instance.clone(), credential, krowk_version)? })),
+        WireApi::ClaudeCode => Err(EngineError::new("bad_config", format!("{} runs Claude Code as a backend, not a native wire API", instance.name))),
     }
 }
 
 /// What the branch so far says: its items, grouped the way they were on the
-/// wire, the model it last ran on, and where it runs.
+/// wire, the model it last ran on, where it runs, and the backend session
+/// behind it.
 #[derive(Default)]
 struct Past {
     items: Vec<HistoryItem>,
     model: Option<ModelRef>,
     cwd: Option<PathBuf>,
+    backend: Option<BackendRecord>,
+}
+
+/// The last `backend.session` of a branch, and the instance it ran on.
+#[derive(Debug, Clone, PartialEq)]
+struct BackendRecord {
+    instance: String,
+    session_id: String,
+    transcript: Option<String>,
+    billing: Option<Billing>,
 }
 
 fn replay(branch: &[&LogEvent]) -> Past {
@@ -249,6 +318,14 @@ fn replay(branch: &[&LogEvent]) -> Past {
         match &ev.body {
             LogBody::SessionStarted { cwd, .. } => past.cwd = Some(PathBuf::from(cwd)),
             LogBody::TurnStarted { model, .. } => past.model = Some(model.clone()),
+            LogBody::BackendSession { vendor_session_id, transcript_path, billing, .. } => {
+                past.backend = Some(BackendRecord {
+                    instance: past.model.as_ref().map(|m| m.instance.clone()).unwrap_or_default(),
+                    session_id: vendor_session_id.clone(),
+                    transcript: transcript_path.clone(),
+                    billing: *billing,
+                });
+            }
             LogBody::ItemCompleted { item_id, item, .. } => {
                 at.insert(item_id, past.items.len());
                 past.items.push(HistoryItem { item: item.clone(), response: None });
@@ -284,6 +361,9 @@ struct Writer<'a> {
     turn_id: String,
     preset: &'static toolset::Preset,
     wire: WireApi,
+    /// The backend session last logged: one that did not change is not
+    /// logged again.
+    backend: Option<BackendRecord>,
 }
 
 impl Writer<'_> {
@@ -330,7 +410,8 @@ impl Writer<'_> {
                     model: model.clone(),
                     provider: instance.provider.clone(),
                     wire_api: self.wire,
-                    toolset: self.preset.name.into(),
+                    // A backend brings its own tools; the preset is krowk's.
+                    toolset: if self.wire == WireApi::ClaudeCode { crate::claude::BACKEND.into() } else { self.preset.name.into() },
                     system_tokens: native::estimate_tokens(&system),
                     tools_tokens: native::tools_tokens(&tools),
                     system,
@@ -364,6 +445,13 @@ impl Writer<'_> {
                     tally.last_text = said.join("\n\n");
                 }
                 self.log(LogBody::ResponseCompleted { turn_id, response_id, model: answered, usage, stop_reason, item_ids }).await?;
+            }
+            EngineEvent::BackendSession { backend, session_id: vendor, transcript, billing } => {
+                let rec = BackendRecord { instance: model.instance.clone(), session_id: vendor.clone(), transcript: transcript.clone(), billing };
+                if self.backend.as_ref() != Some(&rec) {
+                    self.log(LogBody::BackendSession { turn_id, backend, vendor_session_id: vendor, transcript_path: transcript, billing }).await?;
+                    self.backend = Some(rec);
+                }
             }
         }
         Ok(())

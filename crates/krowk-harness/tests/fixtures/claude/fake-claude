@@ -1,0 +1,216 @@
+#!/bin/bash
+# A stand-in for Claude Code's `claude` binary, so no test needs a real
+# login. It speaks what krowk drives: `auth login|status|logout` against a
+# marker file in CLAUDE_CONFIG_DIR (never a credential), and `-p` with
+# stream-json in and out, replaying a recorded scenario turn by turn.
+#
+# Written for the bash macOS ships (3.2): no associative arrays, no
+# fractional `read -t`. It reads krowk's lines by their leading `"type"`,
+# which is how krowk writes them.
+#
+# Environment:
+#   FAKE_CLAUDE_SCENARIO  the scenario file (below); a plain answer without one
+#   FAKE_CLAUDE_LOG       where every argv, config dir and line in or out is appended
+#   FAKE_CLAUDE_SESSION   the session id of a new session
+#   FAKE_CLAUDE_LOGIN     `fail`: `auth login` gives up, as a person closing the browser would
+#
+# A scenario is turns separated by lines holding `---`. Each user line from
+# krowk plays the next turn: `system/init` first, then each line of the turn:
+#   a JSON line        printed, with {{SESSION}}, {{MODEL}} and {{CWD}} filled in
+#   @ask <request>     sent as a control_request; waits for krowk's answer
+#   @tool_result <id>  a tool_result for <id> built from the last answer: the
+#                      denial's message, or the MCP result's text
+#   @await-interrupt   waits for krowk's interrupt, and acknowledges it
+#   @sleep <seconds>   waits
+#   @exit <code>       exits mid-turn, as a crashed process would
+# The turn ends with the scenario's own `result` line.
+
+set -u
+LOG="${FAKE_CLAUDE_LOG:-/dev/null}"
+DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+log() { printf '%s\n' "$*" >>"$LOG"; }
+log "argv $*"
+log "config ${CLAUDE_CONFIG_DIR:-<unset>}"
+
+case "${1:-}" in
+--version)
+  echo "2.1.280 (Claude Code)"
+  exit 0
+  ;;
+auth)
+  case "${2:-}" in
+  login)
+    if [ "${FAKE_CLAUDE_LOGIN:-}" = fail ]; then
+      echo "Login cancelled." >&2
+      exit 1
+    fi
+    mkdir -p "$DIR" && : >"$DIR/fake-login"
+    echo "Login successful."
+    exit 0
+    ;;
+  status)
+    if [ -f "$DIR/fake-login" ]; then
+      printf '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"person@example.com","subscriptionType":"max"}\n'
+      exit 0
+    fi
+    printf '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}\n'
+    exit 1
+    ;;
+  logout)
+    rm -f "$DIR/fake-login"
+    exit 0
+    ;;
+  esac
+  echo "unknown auth command" >&2
+  exit 2
+  ;;
+esac
+
+MODEL=default
+SESSION="${FAKE_CLAUDE_SESSION:-fa4e0000-0000-4000-8000-000000000001}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --model) MODEL="$2"; shift ;;
+  --resume) SESSION="$2"; log "resume $2"; shift ;;
+  esac
+  shift
+done
+
+SOURCE=none
+[ -n "${ANTHROPIC_API_KEY:-}" ] && SOURCE=ANTHROPIC_API_KEY
+SLUG="${PWD//[^a-zA-Z0-9]/-}"
+TRANSCRIPT="$DIR/projects/$SLUG/$SESSION.jsonl"
+
+LINES=()
+if [ -n "${FAKE_CLAUDE_SCENARIO:-}" ]; then
+  while IFS= read -r l || [ -n "$l" ]; do LINES+=("$l"); done <"$FAKE_CLAUDE_SCENARIO"
+fi
+POS=0
+ASKED=0
+ANSWER=""
+
+emit() {
+  local out="$1" p
+  p='{{SESSION}}'; out="${out//$p/$SESSION}"
+  p='{{MODEL}}'; out="${out//$p/$MODEL}"
+  p='{{CWD}}'; out="${out//$p/$PWD}"
+  log "out $out"
+  printf '%s\n' "$out"
+}
+
+ack() {
+  local body="${2:-}"
+  [ -z "$body" ] && body='{}'
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$1\",\"response\":$body}}"
+}
+
+request_id() {
+  local re='"request_id":"([^"]+)"'
+  [[ $1 =~ $re ]] && printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# A control request from krowk, whenever it arrives.
+control() {
+  local line="$1" id
+  id="$(request_id "$line")"
+  case "$line" in
+  *'"subtype":"initialize"'*)
+    # As Claude Code does: the MCP servers are connected before initialize
+    # is answered.
+    ask '{"subtype":"mcp_message","server_name":"krowk","message":{"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fake-claude","version":"0"}},"jsonrpc":"2.0","id":0}}'
+    ask '{"subtype":"mcp_message","server_name":"krowk","message":{"method":"tools/list","jsonrpc":"2.0","id":1}}'
+    ack "$id" '{"commands":[],"models":[{"value":"sonnet"},{"value":"haiku"}],"pid":'$$'}'
+    ;;
+  *'"subtype":"set_model"'*)
+    local re='"model":"([^"]+)"'
+    [[ $line =~ $re ]] && MODEL="${BASH_REMATCH[1]}" && log "set_model $MODEL"
+    ack "$id"
+    ;;
+  *'"subtype":"interrupt"'*)
+    log "interrupt"
+    ack "$id" '{"still_queued":[]}'
+    return 1
+    ;;
+  *) ack "$id" ;;
+  esac
+  return 0
+}
+
+readline() {
+  IFS= read -r LINE || { log "eof"; exit 0; }
+  log "in $LINE"
+}
+
+# Sends a control request and waits for krowk's answer to it.
+ask() {
+  ASKED=$((ASKED + 1))
+  local id="fake_$ASKED"
+  emit "{\"type\":\"control_request\",\"request_id\":\"$id\",\"request\":$1}"
+  while readline; do
+    case "$LINE" in
+    '{"type":"control_response"'*"\"request_id\":\"$id\""*)
+      ANSWER="$LINE"
+      log "answer $LINE"
+      return 0
+      ;;
+    '{"type":"control_request"'*) control "$LINE" ;;
+    esac
+  done
+}
+
+tool_result() {
+  local id="$1" text="" err=false re
+  re='"behavior":"deny","message":"(([^"\\]|\\.)*)"'
+  if [[ $ANSWER =~ $re ]]; then
+    text="${BASH_REMATCH[1]}"
+    err=true
+  else
+    re='"content":\[\{"type":"text","text":"(([^"\\]|\\.)*)"\}\]'
+    [[ $ANSWER =~ $re ]] && text="${BASH_REMATCH[1]}"
+  fi
+  emit "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"$id\",\"type\":\"tool_result\",\"content\":[{\"type\":\"text\",\"text\":\"$text\"}],\"is_error\":$err}]},\"parent_tool_use_id\":null,\"session_id\":\"$SESSION\"}"
+}
+
+await_interrupt() {
+  while readline; do
+    case "$LINE" in
+    '{"type":"control_request"'*) control "$LINE" || return 0 ;;
+    esac
+  done
+}
+
+turn() {
+  mkdir -p "$(dirname "$TRANSCRIPT")" && printf '%s\n' "$1" >>"$TRANSCRIPT"
+  emit '{"type":"system","subtype":"init","cwd":"{{CWD}}","session_id":"{{SESSION}}","tools":["Read","Edit","Bash","mcp__krowk__session_info"],"mcp_servers":[{"name":"krowk","status":"connected","source":"sdk"}],"model":"{{MODEL}}","permissionMode":"default","apiKeySource":"'$SOURCE'","claude_code_version":"2.1.280","capabilities":["interrupt_receipt_v1"]}'
+  if [ ! -f "$DIR/fake-login" ] && [ "$SOURCE" = none ]; then
+    emit '{"type":"assistant","message":{"id":"msg_login","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Not logged in · Please run /login"}]},"parent_tool_use_id":null,"session_id":"{{SESSION}}"}'
+    emit '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login","session_id":"{{SESSION}}"}'
+    return
+  fi
+  if [ $POS -ge ${#LINES[@]} ]; then
+    emit '{"type":"assistant","message":{"id":"msg_plain","model":"{{MODEL}}","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":3,"output_tokens":1}},"parent_tool_use_id":null,"session_id":"{{SESSION}}"}'
+    emit '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"{{SESSION}}"}'
+    return
+  fi
+  while [ $POS -lt ${#LINES[@]} ]; do
+    local l="${LINES[$POS]}"
+    POS=$((POS + 1))
+    case "$l" in
+    ---) return ;;
+    '') ;;
+    '@ask '*) ask "${l#@ask }" ;;
+    '@tool_result '*) tool_result "${l#@tool_result }" ;;
+    @await-interrupt) await_interrupt ;;
+    '@sleep '*) sleep "${l#@sleep }" ;;
+    '@exit '*) exit "${l#@exit }" ;;
+    *) emit "$l" ;;
+    esac
+  done
+}
+
+while readline; do
+  case "$LINE" in
+  '{"type":"control_request"'*) control "$LINE" || true ;;
+  '{"type":"user"'*) turn "$LINE" ;;
+  esac
+done

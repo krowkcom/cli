@@ -174,6 +174,51 @@
       ]
     },
     {
+      "description": "The vendor's own session behind a backend turn: what the next\nprocess resumes (`claude --resume`), and where the vendor keeps its\ntranscript, so the session can travel with it (R-BACK-5). Logged\nwhen a backend first reports it, and again only when it changes.",
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string"
+        },
+        "backend": {
+          "description": "The backend, e.g. `claude-code`.",
+          "type": "string"
+        },
+        "vendorSessionId": {
+          "description": "The vendor's session id, e.g. Claude Code's.",
+          "type": "string"
+        },
+        "transcriptPath": {
+          "description": "The vendor's transcript file for that session, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "billing": {
+          "description": "Whether the vendor runs on the account's subscription or an API key.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Billing"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "backend.session"
+        }
+      },
+      "required": [
+        "type",
+        "turnId",
+        "backend",
+        "vendorSessionId"
+      ]
+    },
+    {
       "description": "The turn is over.",
       "type": "object",
       "properties": {
@@ -253,6 +298,11 @@
           "description": "Chat Completions: xAI, OpenRouter, and any server that speaks it.",
           "type": "string",
           "const": "chat-completions"
+        },
+        {
+          "description": "The `claude` binary's stream-json protocol: Claude Code runs the\nloop and krowk drives it. A thinking signature it streams is\nClaude Code's to replay, never sent to the Messages API by krowk.",
+          "type": "string",
+          "const": "claude-code"
         }
       ]
     },
@@ -446,6 +496,14 @@
         "cacheReadTokens",
         "cacheWriteTokens",
         "reasoningTokens"
+      ]
+    },
+    "Billing": {
+      "description": "What a backend session is billed to, as the vendor reports it: the\naccount's subscription, or an API key (R-INST-3).",
+      "type": "string",
+      "enum": [
+        "subscription",
+        "apiKey"
       ]
     },
     "TurnStatus": {

@@ -10,17 +10,23 @@
 //! are the native providers' (R-PROV-4): `anthropic-api`, `openai-api`,
 //! `xai-api`, `openrouter-api`, `openai-compatible` for anything else that
 //! speaks Chat Completions, and `xai-oauth` for a SuperGrok subscription.
-//! The vendor backends will be more variants of `InstanceKind`.
+//! The vendor backends are more variants: `claude-code` drives the user's
+//! own `claude` binary (R-BACK-1), and is a binary path, a config directory
+//! (`CLAUDE_CONFIG_DIR`), environment variables and launch arguments
+//! (R-INST-1) — so `claude:work` and `claude:personal` are two Claude
+//! accounts on one host, each logged in through Claude's own flow.
 //!
 //! With nothing configured there is still one instance per provider —
 //! `anthropic`, `openai`, `xai`, `openrouter`, reading the conventional key
 //! variables, so a machine already set up for a provider's own tools works
-//! unconfigured, and `supergrok`, which needs only a login.
+//! unconfigured, `supergrok`, which needs only a login, and `claude`, the
+//! `claude` on PATH with Claude's own default config directory.
 
 use crate::protocol::{Effort, ModelRef, WireApi};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 pub const DEFAULT_INSTANCE: &str = "anthropic";
 /// The model a session runs on when neither the command line, the session
@@ -164,6 +170,31 @@ pub enum InstanceKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<Effort>,
     },
+    /// The user's own, unmodified `claude` binary — Claude Code — driven as
+    /// a backend: it runs the loop on its own login, a Claude subscription
+    /// or whatever the config directory holds, and krowk never reads that
+    /// login (R-BACK-2). Added with `krowk providers add claude`.
+    #[serde(rename = "claude-code")]
+    ClaudeCode {
+        /// The binary; `claude` on PATH when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binary: Option<String>,
+        /// `CLAUDE_CONFIG_DIR`: where Claude Code keeps this account's
+        /// login, settings and transcripts. Claude's own default
+        /// (`~/.claude`) when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config_dir: Option<String>,
+        /// More environment for the process, e.g. `ANTHROPIC_BASE_URL` for
+        /// a router. Literal values: a key belongs in the environment krowk
+        /// runs in, never in a definition.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
+        /// More launch arguments, after krowk's own.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+    },
 }
 
 impl InstanceKind {
@@ -176,6 +207,7 @@ impl InstanceKind {
             InstanceKind::OpenrouterApi { .. } => "openrouter-api",
             InstanceKind::OpenaiCompatible { .. } => "openai-compatible",
             InstanceKind::XaiOauth { .. } => "xai-oauth",
+            InstanceKind::ClaudeCode { .. } => "claude-code",
         }
     }
 }
@@ -196,6 +228,27 @@ pub enum Auth {
     Keyless,
     /// Tokens from the OAuth login, refreshed as they expire.
     OAuth { issuer: String, client_id: Option<String>, scope: String },
+    /// The vendor binary's own login, in its config directory. krowk asks
+    /// the binary whether there is one (`claude auth status`) and never
+    /// reads it (R-BACK-2, R-INST-2).
+    Vendor,
+}
+
+/// How a backend instance's process is started (R-INST-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backend {
+    /// The binary, as configured: a path, or a name looked up on PATH.
+    pub binary: String,
+    /// Where it was found; none when it is not there.
+    pub path: Option<PathBuf>,
+    /// `CLAUDE_CONFIG_DIR`, set for the process; none leaves the vendor's
+    /// own default.
+    pub config_dir: Option<PathBuf>,
+    /// The config directory the process will use, set or not — where its
+    /// transcripts are. None when there is no home to find it in.
+    pub home: Option<PathBuf>,
+    pub env: BTreeMap<String, String>,
+    pub args: Vec<String>,
 }
 
 /// An instance ready to use: its definition with the secret read.
@@ -224,6 +277,8 @@ pub struct Resolved {
     pub thinking: Thinking,
     pub max_tokens: u32,
     pub effort: Option<Effort>,
+    /// Set on a backend instance: the process krowk drives.
+    pub backend: Option<Backend>,
 }
 
 // Hand-written so a key never reaches a log line through `{:?}`.
@@ -258,8 +313,9 @@ impl Resolved {
 }
 
 /// The instances every host has without configuring any: one per provider
-/// with an API-key kind, reading the conventional variable, and SuperGrok,
-/// which needs only a login. A config entry of the same name replaces one.
+/// with an API-key kind, reading the conventional variable, SuperGrok,
+/// which needs only a login, and `claude`, the Claude Code on PATH with its
+/// own default config directory. A config entry of the same name replaces one.
 pub fn implicit() -> Vec<(&'static str, InstanceKind)> {
     vec![
         ("anthropic", InstanceKind::AnthropicApi { api_key_env: None, base_url: None, thinking: None, max_tokens: None, effort: None }),
@@ -267,6 +323,7 @@ pub fn implicit() -> Vec<(&'static str, InstanceKind)> {
         ("xai", InstanceKind::XaiApi { api_key_env: None, base_url: None, effort: None }),
         ("openrouter", InstanceKind::OpenrouterApi { api_key_env: None, base_url: None, effort: None }),
         ("supergrok", InstanceKind::XaiOauth { base_url: None, issuer: None, client_id: None, scope: None, effort: None }),
+        ("claude", InstanceKind::ClaudeCode { binary: None, config_dir: None, env: BTreeMap::new(), args: Vec::new(), effort: None }),
     ]
 }
 
@@ -336,12 +393,32 @@ impl Registry {
     }
 }
 
+/// A binary as the shell finds it: a path is taken as it is, a bare name
+/// is looked up on PATH.
+pub fn find_binary(binary: &str, path: &str) -> Option<PathBuf> {
+    let runnable = |p: &std::path::Path| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        p.is_file()
+    };
+    if binary.contains(std::path::MAIN_SEPARATOR) || binary.contains('/') {
+        let p = PathBuf::from(binary);
+        return runnable(&p).then_some(p);
+    }
+    std::env::split_paths(path).map(|d| d.join(binary)).find(|p| runnable(p))
+}
+
 fn clean_url(u: &str) -> String {
     u.trim().trim_end_matches('/').to_string()
 }
 
 const RESPONSES_OR_CHAT: &[WireApi] = &[WireApi::OpenaiResponses, WireApi::ChatCompletions];
 const CHAT: &[WireApi] = &[WireApi::ChatCompletions];
+const CLAUDE_CODE: &[WireApi] = &[WireApi::ClaudeCode];
 
 fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) -> Resolved {
     // A base URL from config, else (for the instance reading the
@@ -370,6 +447,7 @@ fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) ->
         thinking: Thinking::Adaptive,
         max_tokens: 32_000,
         effort,
+        backend: None,
     };
     match kind {
         InstanceKind::AnthropicApi { api_key_env, base_url, thinking, max_tokens, effort } => {
@@ -433,6 +511,30 @@ fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) ->
             },
             ..template("xai", "xAI", WireApi::ChatCompletions, CHAT, *effort)
         },
+        // Priced and described as Anthropic's models, which it runs; its
+        // login is Claude Code's own.
+        InstanceKind::ClaudeCode { binary, config_dir: dir, env: extra, args, effort } => {
+            let config_dir = dir.as_deref().filter(|d| !d.trim().is_empty()).map(PathBuf::from);
+            // Claude Code's own rule for its directory: CLAUDE_CONFIG_DIR —
+            // the instance's, else the environment's — else ~/.claude.
+            let home = config_dir.clone().or_else(|| extra.get("CLAUDE_CONFIG_DIR").or(Some(&env("CLAUDE_CONFIG_DIR"))).filter(|d| !d.trim().is_empty()).map(PathBuf::from)).or_else(|| {
+                let h = env("HOME");
+                (!h.trim().is_empty()).then(|| PathBuf::from(h).join(".claude"))
+            });
+            let binary = binary.clone().filter(|b| !b.trim().is_empty()).unwrap_or_else(|| crate::claude::BINARY.into());
+            Resolved {
+                auth: Auth::Vendor,
+                backend: Some(Backend {
+                    path: find_binary(&binary, &env("PATH")),
+                    binary,
+                    config_dir,
+                    home,
+                    env: extra.clone(),
+                    args: args.clone(),
+                }),
+                ..template("anthropic", "Claude Code", WireApi::ClaudeCode, CLAUDE_CODE, *effort)
+            }
+        }
     }
 }
 
@@ -489,7 +591,7 @@ mod tests {
         assert_eq!(reg.parse_model("claude-x").unwrap().instance, "anthropic");
         assert_eq!(reg.parse_model("router/some/model").unwrap(), ModelRef { instance: "anthropic".into(), model: "router/some/model".into() });
         assert!(reg.parse_model("anthropic/").is_err());
-        assert!(reg.get("nope").unwrap_err().contains("anthropic, anthropic:work, openai"));
+        assert!(reg.get("nope").unwrap_err().contains("anthropic, anthropic:work, claude, openai"));
         assert_eq!(reg.default_model().unwrap().model, DEFAULT_MODEL);
         assert!(from_config_json(&serde_json::json!({"instances": {"x": {"kind": "martian"}}})).is_err());
         // R-TOOL-2: config can pin a toolset, and only one that exists.
@@ -544,4 +646,35 @@ mod tests {
         assert_eq!(reg.parse_model("supergrok/grok-4.7").unwrap().instance, "supergrok");
         assert!(from_config_json(&serde_json::json!({"instances": {"x": {"kind": "openai-compatible"}}})).is_err(), "a compatible server needs its base URL");
     }
+
+    #[test]
+    fn r_inst_1_a_claude_instance_is_a_binary_a_config_directory_an_environment_and_arguments() {
+        let env = |k: &str| match k {
+            "HOME" => "/home/p".to_string(),
+            "PATH" => "/nowhere".to_string(),
+            _ => String::new(),
+        };
+        let cfg = from_config_json(&serde_json::json!({"instances": {
+            "claude:work": {"kind": "claude-code", "configDir": "/cfg/work", "env": {"ANTHROPIC_BASE_URL": "https://router.example"}, "args": ["--add-dir", "/x"]},
+            "claude:mine": {"kind": "claude-code", "binary": "/opt/claude/bin/claude"},
+        }}))
+        .unwrap();
+        let reg = Registry::resolve(&cfg, &env);
+        let d = reg.get("claude").unwrap();
+        let b = d.backend.as_ref().unwrap();
+        assert_eq!((d.kind, d.provider.as_str(), d.wire_api, d.auth.clone()), ("claude-code", "anthropic", WireApi::ClaudeCode, Auth::Vendor));
+        assert_eq!((b.binary.as_str(), b.config_dir.as_deref(), b.home.as_deref()), ("claude", None, Some(std::path::Path::new("/home/p/.claude"))), "the default account is Claude Code's own");
+        assert_eq!(b.path, None, "not on this PATH");
+        assert_eq!(d.missing_key(), None, "its login is Claude Code's to check");
+        let w = reg.get("claude:work").unwrap().backend.clone().unwrap();
+        assert_eq!((w.config_dir.as_deref(), w.home.as_deref()), (Some(std::path::Path::new("/cfg/work")), Some(std::path::Path::new("/cfg/work"))));
+        assert_eq!((w.env["ANTHROPIC_BASE_URL"].as_str(), w.args.clone()), ("https://router.example", vec!["--add-dir".to_string(), "/x".to_string()]), "a router is the same mechanism");
+        assert_eq!(reg.get("claude:mine").unwrap().backend.as_ref().unwrap().binary, "/opt/claude/bin/claude");
+        assert_eq!(reg.parse_model("claude:work/sonnet").unwrap(), ModelRef { instance: "claude:work".into(), model: "sonnet".into() });
+        assert_eq!(reg.parse_model("claude/haiku").unwrap().instance, "claude");
+        assert_eq!(reg.parse_model("claude-sonnet-4-6").unwrap().instance, "anthropic", "a bare Claude id is still the API's");
+        let sh = find_binary("sh", &std::env::var("PATH").unwrap_or_default());
+        assert!(sh.is_some_and(|p| p.is_absolute()), "a name is found on PATH");
+    }
+
 }

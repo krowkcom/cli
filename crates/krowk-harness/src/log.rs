@@ -203,7 +203,7 @@ pub fn list(sessions: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
     Ok(out)
 }
 
-fn private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;

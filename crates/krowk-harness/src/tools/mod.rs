@@ -146,7 +146,7 @@ pub fn definitions(ts: &Toolset) -> Vec<ToolDefinition> {
 
 /// The schema of a tool's input, as the Anthropic API wants it: an object
 /// schema, without the `$schema` and `title` noise schemars adds.
-fn input_schema<T: JsonSchema>() -> Value {
+pub(crate) fn input_schema<T: JsonSchema>() -> Value {
     let mut v = schemars::schema_for!(T).to_value();
     if let Value::Object(m) = &mut v {
         m.remove("$schema");

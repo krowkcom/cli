@@ -14,7 +14,9 @@
 //!   Chat Completions are more `ModelClient`s under the same loop.
 //! - Backends (a vendor harness such as `claude -p` or `codex app-server`
 //!   driving its own loop), which implement `Engine` directly and translate
-//!   the vendor's stream into these events.
+//!   the vendor's stream into these events. `claude::ClaudeEngine` is the
+//!   first: one long-lived `claude` process per session, kept by the host
+//!   between turns.
 //!
 //! The rules every engine keeps:
 //!
@@ -38,7 +40,7 @@
 
 use crate::toolset::Preset;
 use crate::catalog::ModelInfo;
-use crate::protocol::{Delta, Effort, ErrorInfo, Item, ItemKind, ModelRef, PermissionMode, ToolDefinition, Usage, WireApi};
+use crate::protocol::{Billing, Delta, Effort, ErrorInfo, Item, ItemKind, ModelRef, PermissionMode, ToolDefinition, Usage, WireApi};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -58,6 +60,10 @@ pub enum EngineEvent {
     ItemDelta { item_id: String, delta: Delta },
     ItemCompleted { item_id: String, item: Item },
     ResponseCompleted { response_id: Option<String>, model: String, usage: Usage, stop_reason: Option<String>, item_ids: Vec<String> },
+    /// A backend's own session: its id, which a later turn resumes, where
+    /// the vendor keeps its transcript, and what it is billed to. The host
+    /// logs it when it is new or has changed.
+    BackendSession { backend: String, session_id: String, transcript: Option<String>, billing: Option<Billing> },
 }
 
 /// Where an engine sends its events. Bounded, so a slow client slows the
@@ -86,6 +92,10 @@ pub struct TurnContext {
     pub cancel: watch::Receiver<bool>,
     /// Input added while the turn runs, oldest first.
     pub steers: Steers,
+    /// The backend session the branch last ran in, from its
+    /// `backend.session` event: what a backend resumes. None for a new
+    /// session, and for one that has only run natively.
+    pub backend_session: Option<String>,
 }
 
 /// The steering a running turn has been sent and not yet taken: a queue
@@ -202,6 +212,11 @@ pub trait Engine: Send + Sync {
     /// Runs one turn to its end. Items produced before a failure were
     /// already sent and stay in the log.
     fn run_turn<'a>(&'a self, ctx: TurnContext, events: Events) -> BoxFuture<'a, Result<TurnEnd, EngineError>>;
+    /// Lets go of whatever outlives a turn — a backend's process — cleanly,
+    /// before the host goes away. Nothing, for an engine that keeps nothing.
+    fn shutdown(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
 }
 
 /// Resolves once `cancel` flips to true. A switch whose owner is gone never

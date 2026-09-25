@@ -1,17 +1,22 @@
-//! `krowk providers`: the native engine's instances (R-PROV-4). `add`
-//! writes a named definition into the global config.json — an API-key
+//! `krowk providers`: the instances a model runs on (R-PROV-4, R-INST-1).
+//! `add` writes a named definition into the global config.json — an API-key
 //! profile with a base URL, `openai:work` — or signs in to SuperGrok and
-//! keeps the tokens in krowk's provider credentials file; `list` shows every
-//! instance and whether it can run; `remove` takes a definition, and a
+//! keeps the tokens in krowk's provider credentials file, or adds a Claude
+//! Code account, `claude:personal`: a config directory of its own, signed in
+//! by `claude auth login` in Anthropic's own flow (R-INST-2). `list` shows
+//! every instance and whether it can run; `remove` takes a definition, and a
 //! login, away.
 //!
 //! A definition names the variable its key is read from and never holds the
-//! key, so config.json stays something that can sync between hosts.
+//! key, so config.json stays something that can sync between hosts. A
+//! Claude Code login is Claude Code's: krowk asks `claude auth status`
+//! whether there is one and never reads it (R-BACK-2).
 
 use super::{auth, Ctx};
 use crate::config;
 use crate::output::Format;
 use krowk_api::{fail, Error};
+use krowk_harness::claude::auth as claude_auth;
 use krowk_harness::instances::{self, Auth, InstanceKind, Registry};
 use krowk_harness::oauth::{self, Step, Store};
 use serde_json::{json, Value};
@@ -22,7 +27,7 @@ pub(super) fn credentials_path() -> PathBuf {
     krowk_api::creds::config_dir().join(oauth::CREDENTIALS_FILE)
 }
 
-const PROVIDERS: &[&str] = &["anthropic", "openai", "xai", "openrouter", "openai-compatible", "supergrok"];
+const PROVIDERS: &[&str] = &["anthropic", "openai", "xai", "openrouter", "openai-compatible", "supergrok", "claude"];
 
 /// `NAME` in `OPENAI_NAME_API_KEY`: upper case, anything else an underscore.
 fn env_part(s: &str) -> String {
@@ -52,10 +57,16 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         (Some(n), p) => format!("{p}:{n}"),
         (None, p) => p.to_string(),
     };
+    if provider == "claude" && ctx.f.given.contains("api-key-env") {
+        return Err(fail("bad_flag", "a Claude Code instance signs in with Claude's own login — `--api-key-env` is for the API-key providers; Claude Code reads its own environment"));
+    }
+    if provider != "claude" && (ctx.f.given.contains("binary") || ctx.f.given.contains("config-dir")) {
+        return Err(fail("bad_flag", "`--binary` and `--config-dir` describe a Claude Code instance: `krowk providers add claude --name work --config-dir …`"));
+    }
     // A named profile of a provider reads its own variable, so two
     // profiles never share a key by accident.
     let key_env = opt(&ctx.f.api_key_env).or_else(|| match (&name, provider.as_str()) {
-        (_, "supergrok") => None,
+        (_, "supergrok" | "claude") => None,
         (Some(n), "openai-compatible") => Some(format!("{}_API_KEY", env_part(n))),
         (Some(n), p) => Some(format!("{}_{}_API_KEY", env_part(p), env_part(n))),
         (None, _) => None,
@@ -71,6 +82,16 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
             api_key_env: opt(&ctx.f.api_key_env),
             provider: None,
             wire_api: None,
+            effort: None,
+        },
+        // A router in front of Claude Code is its environment: the base URL
+        // it sends to, and whatever key variable the router wants, which
+        // Claude Code reads from the environment krowk runs in.
+        "claude" => InstanceKind::ClaudeCode {
+            binary: opt(&ctx.f.binary),
+            config_dir: opt(&ctx.f.config_dir),
+            env: base_url.clone().map(|u| [("ANTHROPIC_BASE_URL".to_string(), u)].into()).unwrap_or_default(),
+            args: Vec::new(),
             effort: None,
         },
         _ => InstanceKind::XaiOauth { base_url, issuer: None, client_id: opt(&ctx.f.client_id), scope: None, effort: None },
@@ -92,6 +113,27 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
             serde_json::from_value(merged).map_err(|e| fail("bad_config", format!("{instance}: {e}")))?
         }
         None => kind,
+    };
+
+    // A Claude Code account signs in first, in its own config directory: a
+    // login that fails leaves no definition behind.
+    let mut claude_status = None;
+    let kind = match kind {
+        InstanceKind::ClaudeCode { binary, config_dir, env, args, effort } => {
+            // A named instance is its own account, so it gets a config
+            // directory of its own unless one is named; the unnamed one is
+            // Claude Code as the person already uses it.
+            let config_dir = config_dir.or_else(|| {
+                name.as_ref().and_then(|_| {
+                    krowk_harness::log::sessions_dir(ctx.io.env).and_then(|d| d.parent().map(|p| p.join("claude").join(instance.replace(':', "-")).display().to_string()))
+                })
+            });
+            let kind = InstanceKind::ClaudeCode { binary, config_dir, env, args, effort };
+            let (status, _) = sign_in_claude(ctx, &instance, &kind)?;
+            claude_status = Some(status);
+            kind
+        }
+        k => k,
     };
 
     // SuperGrok signs in first: a login that fails leaves nothing behind.
@@ -143,6 +185,10 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
             report["signed_in"] = json!(true);
             report["credentials"] = json!(credentials_path().display().to_string());
         }
+        if let Some(st) = &claude_status {
+            report["signed_in"] = json!(st.logged_in);
+            report["login"] = json!(st.describe());
+        }
         let summary = format!("added {instance}");
         return super::sessions::emit_data(ctx, report, summary);
     }
@@ -160,10 +206,15 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         }
         None => {}
     }
+    if let (Some(st), Some(b)) = (&claude_status, &r.backend) {
+        let dir = b.config_dir.as_ref().map(|d| format!(" with CLAUDE_CONFIG_DIR={}", d.display())).unwrap_or_default();
+        let _ = writeln!(out, "runs Claude Code ({}){dir} — {}", b.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| b.binary.clone()), st.describe());
+    }
     let example = match provider.as_str() {
         "anthropic" => "claude-opus-5-5",
         "openai" => "gpt-5.4",
         "xai" | "supergrok" => "grok-4.7",
+        "claude" => "sonnet",
         "openrouter" => "openai/gpt-5.4",
         _ => "<model>",
     };
@@ -179,10 +230,16 @@ pub(super) fn list(ctx: &mut Ctx) -> Result<(), Error> {
         .instances
         .values()
         .map(|r| {
-            let (auth, ready) = match &r.auth {
-                Auth::ApiKey => (format!("api key from ${}", r.api_key_env), !r.api_key.is_empty()),
-                Auth::Keyless => ("no key".to_string(), true),
-                Auth::OAuth { .. } => ("SuperGrok login".to_string(), logins.contains(&r.name)),
+            let (auth, ready, state) = match &r.auth {
+                Auth::ApiKey => (format!("api key from ${}", r.api_key_env), !r.api_key.is_empty(), "key not set"),
+                Auth::Keyless => ("no key".to_string(), true, ""),
+                Auth::OAuth { .. } => ("SuperGrok login".to_string(), logins.contains(&r.name), "not signed in"),
+                // Asked of Claude Code, the only thing that may read its login.
+                Auth::Vendor => match r.backend.as_ref().filter(|b| b.path.is_some()).map(claude_auth::status) {
+                    None => ("runs Claude Code".to_string(), false, "not installed"),
+                    Some(Ok(st)) => (format!("runs Claude Code: {}", st.describe()), st.logged_in, "not signed in"),
+                    Some(Err(e)) => (format!("runs Claude Code: {e}"), false, "unknown"),
+                },
             };
             json!({
                 "instance": r.name,
@@ -192,6 +249,7 @@ pub(super) fn list(ctx: &mut Ctx) -> Result<(), Error> {
                 "base_url": r.base_url,
                 "auth": auth,
                 "ready": ready,
+                "state": if ready { "ready" } else { state },
                 "configured": cfg.instances.contains_key(&r.name),
             })
         })
@@ -204,7 +262,7 @@ pub(super) fn list(ctx: &mut Ctx) -> Result<(), Error> {
     let out = &mut *ctx.io.stdout;
     for r in &rows {
         let s = |k: &str| r[k].as_str().unwrap_or_default().to_string();
-        let state = if r["ready"] == true { "ready" } else if s("kind") == "xai-oauth" { "not signed in" } else { "key not set" };
+        let state = s("state");
         let _ = writeln!(out, "{:<width$}  {:<17}  {:<13}  {}  ({})", s("instance"), s("kind"), state, s("base_url"), s("auth"));
     }
     Ok(())
@@ -231,9 +289,19 @@ pub(super) fn remove(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         let why = if implicit { format!("{instance} is built in and has no definition or login to remove") } else { format!("no instance named {instance} is defined — `krowk providers list` shows them") };
         return Err(fail("no_instance", why));
     }
+    // A Claude Code account's directory holds Claude's own login, which is
+    // Claude Code's to sign out of: krowk leaves it as it is.
+    let kept = match cfg.instances.get(&instance) {
+        Some(InstanceKind::ClaudeCode { config_dir: Some(dir), .. }) => Some(dir.clone()),
+        _ => None,
+    };
     if ctx.format != Format::Human {
         let summary = format!("removed {instance}");
-        return super::sessions::emit_data(ctx, json!({ "instance": instance, "removed_definition": defined, "removed_login": forgot }), summary);
+        let mut report = json!({ "instance": instance, "removed_definition": defined, "removed_login": forgot });
+        if let Some(dir) = &kept {
+            report["config_dir_kept"] = json!(dir);
+        }
+        return super::sessions::emit_data(ctx, report, summary);
     }
     let what = match (defined, forgot) {
         (true, true) => "its definition and its login",
@@ -241,5 +309,58 @@ pub(super) fn remove(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         _ => "its login",
     };
     let _ = writeln!(ctx.io.stdout, "removed {instance}: {what}");
+    if let Some(dir) = &kept {
+        let _ = writeln!(ctx.io.stdout, "its config directory {dir} is kept, with Claude Code's login in it — `CLAUDE_CONFIG_DIR={dir} claude auth logout` signs it out");
+    }
     Ok(())
+}
+
+/// R-INST-2: a Claude Code account is signed in by Claude Code. Its config
+/// directory is made (0700) if it is new, `claude auth status` is asked,
+/// and when it says no, `claude auth login` runs on this terminal in
+/// Anthropic's own flow; then status is asked again. A router instance (a
+/// base URL in its environment) signs in with the router's key, so no
+/// login is run for it. A failure removes a directory this made.
+fn sign_in_claude(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<(claude_auth::Status, bool), Error> {
+    let reg = Registry::resolve(&instances::InstancesConfig { instances: [(instance.to_string(), kind.clone())].into(), ..Default::default() }, ctx.io.env);
+    let backend = reg.get(instance).map_err(|e| fail("bad_config", e))?.backend.clone().expect("a claude-code instance has a backend");
+    if backend.path.is_none() {
+        return Err(fail("backend_not_found", format!("{} was not found — install Claude Code (https://claude.com/claude-code), or name the binary with --binary", backend.binary)));
+    }
+    let made = match &backend.config_dir {
+        Some(dir) if !dir.exists() => {
+            private_dir(dir).map_err(|e| fail("config_unwritable", format!("create {}: {e}", dir.display())))?;
+            Some(dir.clone())
+        }
+        _ => None,
+    };
+    let undo = |e: Error| {
+        if let Some(dir) = &made {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        e
+    };
+    let status = claude_auth::status(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
+    if status.logged_in || backend.env.contains_key("ANTHROPIC_BASE_URL") {
+        return Ok((status, false));
+    }
+    let _ = writeln!(ctx.io.stderr, "Signing {instance} in to Claude Code — what follows is Claude's own login (`claude auth login`){}:", backend.config_dir.as_ref().map(|d| format!(", kept in {}", d.display())).unwrap_or_default());
+    let _ = ctx.io.stderr.flush();
+    let exit = claude_auth::login(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
+    let status = claude_auth::status(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
+    if !status.logged_in {
+        let how = if exit.success() { "finished without signing in".to_string() } else { format!("stopped ({exit})") };
+        return Err(undo(fail("not_authenticated", format!("`claude auth login` {how}, so {instance} was not added — run `krowk providers add claude{}` again to retry", instance.split_once(':').map(|(_, n)| format!(" --name {n}")).unwrap_or_default()))));
+    }
+    Ok((status, true))
+}
+
+fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
 }

@@ -11,6 +11,7 @@ use krowk_harness::host::HostConfig;
 use krowk_harness::instances::{self, Registry};
 use krowk_harness::log;
 use krowk_harness::protocol::{Effort, PermissionMode, TurnStatus, Usage};
+use krowk_harness::trust;
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
 
@@ -50,6 +51,7 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
         pricer: pricer(ctx.io.env),
         catalog: catalog(ctx.io.env),
         credentials: super::providers::credentials_path(),
+        trust: trust_gate(ctx.f.trust, super::interactive(ctx) && std::io::stdin().is_terminal() && ctx.io.err_tty),
     };
     let opts = headless::Options { prompt, resume, model, permission_mode, toolset, effort, format };
     let outcome = headless::run(cfg, opts, ctx.io.stdout);
@@ -150,6 +152,41 @@ pub(super) fn resolve_resume(ctx: &Ctx, sessions_dir: &std::path::Path, referenc
         ));
     }
     Ok(d.session.foreign_session_id)
+}
+
+/// R-BACK-6: `claude -p` runs a repository's hooks and MCP servers without
+/// the trust dialog Claude Code shows on a terminal, so krowk asks its own
+/// before a backend is spawned. A repository trusted before, or `--trust`,
+/// goes ahead; a person at the terminal is asked, and a yes is remembered;
+/// anything headless is refused. Nothing is spawned until this answers.
+fn trust_gate(flag: bool, ask: bool) -> trust::Gate {
+    let store = trust::Store::new(krowk_api::creds::config_dir().join(trust::FILE));
+    Arc::new(move |root: &std::path::Path| {
+        if flag || store.trusts(root) {
+            return Ok(());
+        }
+        if !ask {
+            return Err(trust::untrusted(root, "Look at what it would run, then pass --trust to run it anyway, or run krowk -p there once on a terminal and answer its prompt."));
+        }
+        let runs = trust::what_runs(root);
+        use std::io::Write as _;
+        let mut stderr = std::io::stderr();
+        let _ = writeln!(stderr, "Claude Code (`claude -p`) runs a repository's own hooks and MCP servers without asking.");
+        if runs.is_empty() {
+            let _ = writeln!(stderr, "{} has none of those files now, but it is not a repository you have trusted.", root.display());
+        } else {
+            let _ = writeln!(stderr, "{} has {}.", root.display(), runs.join(", "));
+        }
+        match inquire::Confirm::new(&format!("Trust {} and run Claude Code in it?", root.display())).with_default(false).prompt() {
+            Ok(true) => {
+                if let Err(e) = store.trust(root) {
+                    let _ = writeln!(stderr, "! trusted for this run, but not remembered: {e}");
+                }
+                Ok(())
+            }
+            _ => Err(trust::untrusted(root, "Nothing was run.")),
+        }
+    })
 }
 
 /// Prices a model call from the models.dev cache or the embedded snapshot,

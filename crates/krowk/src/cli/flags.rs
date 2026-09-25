@@ -62,6 +62,9 @@ pub struct Flags {
     pub toolset: String,
     #[cfg(feature = "harness")]
     pub effort: String,
+    /// `-p`: run a backend in a repository nobody has trusted yet.
+    #[cfg(feature = "harness")]
+    pub trust: bool,
     /// `providers add`: the instance's name, its key's variable, its base
     /// URL, and how SuperGrok signs in.
     #[cfg(feature = "harness")]
@@ -74,6 +77,11 @@ pub struct Flags {
     pub client_id: String,
     #[cfg(feature = "harness")]
     pub device: bool,
+    /// `providers add claude`: the binary, and the config directory.
+    #[cfg(feature = "harness")]
+    pub binary: String,
+    #[cfg(feature = "harness")]
+    pub config_dir: String,
     /// Which flags were typed, by canonical name — a different question from
     /// what they carry: `--jq "$UNSET"` was given and is empty.
     pub given: BTreeSet<String>,
@@ -231,6 +239,10 @@ impl Flags {
             "base-url" => text(&mut self.base_url),
             #[cfg(feature = "harness")]
             "client-id" => text(&mut self.client_id),
+            #[cfg(feature = "harness")]
+            "binary" => text(&mut self.binary),
+            #[cfg(feature = "harness")]
+            "config-dir" => text(&mut self.config_dir),
             _ => {
                 let b = parse_bool(name, v)?;
                 *match name {
@@ -251,6 +263,8 @@ impl Flags {
                     "print" => &mut self.print,
                     #[cfg(feature = "harness")]
                     "device" => &mut self.device,
+                    #[cfg(feature = "harness")]
+                    "trust" => &mut self.trust,
                     other => unreachable!("catalog flag {other} has no field"),
                 } = b;
             }

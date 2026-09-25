@@ -59,6 +59,11 @@ pub enum WireApi {
     /// Chat Completions: xAI, OpenRouter, and any server that speaks it.
     #[serde(rename = "chat-completions")]
     ChatCompletions,
+    /// The `claude` binary's stream-json protocol: Claude Code runs the
+    /// loop and krowk drives it. A thinking signature it streams is
+    /// Claude Code's to replay, never sent to the Messages API by krowk.
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
 }
 
 impl WireApi {
@@ -68,6 +73,7 @@ impl WireApi {
             WireApi::AnthropicMessages => "anthropic-messages",
             WireApi::OpenaiResponses => "openai-responses",
             WireApi::ChatCompletions => "chat-completions",
+            WireApi::ClaudeCode => "claude-code",
         }
     }
 }
@@ -240,6 +246,15 @@ impl PermissionMode {
     }
 }
 
+/// What a backend session is billed to, as the vendor reports it: the
+/// account's subscription, or an API key (R-INST-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum Billing {
+    Subscription,
+    ApiKey,
+}
+
 /// An answer to a permission request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -350,6 +365,24 @@ pub enum LogBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop_reason: Option<String>,
         item_ids: Vec<String>,
+    },
+    /// The vendor's own session behind a backend turn: what the next
+    /// process resumes (`claude --resume`), and where the vendor keeps its
+    /// transcript, so the session can travel with it (R-BACK-5). Logged
+    /// when a backend first reports it, and again only when it changes.
+    #[serde(rename = "backend.session")]
+    BackendSession {
+        turn_id: String,
+        /// The backend, e.g. `claude-code`.
+        backend: String,
+        /// The vendor's session id, e.g. Claude Code's.
+        vendor_session_id: String,
+        /// The vendor's transcript file for that session, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transcript_path: Option<String>,
+        /// Whether the vendor runs on the account's subscription or an API key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        billing: Option<Billing>,
     },
     /// The turn is over.
     #[serde(rename = "turn.completed")]

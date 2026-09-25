@@ -380,7 +380,7 @@ pub fn global_flags() -> Vec<Flag> {
 /// compatible servers, and the SuperGrok login. The harness build's only.
 #[cfg(feature = "harness")]
 fn providers_command() -> Command {
-    const PROVIDER_ARG: &str = "anthropic, openai, xai, openrouter, openai-compatible, or supergrok (xAI with a SuperGrok or X Premium subscription)";
+    const PROVIDER_ARG: &str = "anthropic, openai, xai, openrouter, openai-compatible, supergrok (xAI with a SuperGrok or X Premium subscription), or claude (runs Claude Code, signed in with its own login)";
     Command {
         subcommands: vec![
             Command {
@@ -392,20 +392,22 @@ fn providers_command() -> Command {
                     flag("client-id", STRING, "supergrok: the OAuth client id to sign in as, when xAI's server offers no registration"),
                     flag("device", BOOL, "supergrok: sign in with a code typed into any browser, instead of one opened here"),
                     flag("no-browser", BOOL, "supergrok: print the sign-in link instead of opening a browser"),
+                    flag("binary", STRING, "claude: the claude binary to run; claude on PATH when absent"),
+                    flag("config-dir", STRING, "claude: the CLAUDE_CONFIG_DIR this instance signs in and keeps its sessions in; a new one under krowk's data directory for a named instance"),
                 ],
                 ..cmd(
                     "add",
-                    "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device]",
-                    "Add an instance for the native engine, or sign in to SuperGrok",
+                    "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device] [--binary PATH] [--config-dir DIR]",
+                    "Add an instance, sign in to SuperGrok, or add a Claude Code account (signed in with `claude auth login`)",
                 )
             },
-            cmd("list", "krowk providers list", "List every instance the native engine can use, and whether it has its key or login"),
+            cmd("list", "krowk providers list", "List every instance, and whether it has its key or login — a Claude Code one as `claude auth status` reports it"),
             Command {
                 args: vec![arg("instance", "The instance to remove, e.g. openai:work", true)],
                 ..cmd("remove", "krowk providers remove <instance>", "Remove an instance's definition, and forget its login")
             },
         ],
-        ..cmd("providers", "", "The native engine's provider instances")
+        ..cmd("providers", "", "The provider instances: API keys, logins, and Claude Code accounts")
     }
 }
 
@@ -419,7 +421,7 @@ fn prompt_flags() -> Vec<Flag> {
             ..flag("print", BOOL, "Run the prompt given as the arguments (or on stdin) headless: krowk's own agent answers it, then exits")
         },
         with_default(flag("output-format", STRING, "With -p: text (the answer), json (the result event) or stream-json (every event, one per line)"), "text"),
-        flag("model", STRING, "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5"),
+        flag("model", STRING, "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, or claude:work/sonnet to run Claude Code"),
         flag("resume", STRING, "With -p: continue this krowk session — the sessionId a result names, or its krowk.db id"),
         with_default(
             flag(
@@ -438,6 +440,11 @@ fn prompt_flags() -> Vec<Flag> {
             "effort",
             STRING,
             "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent",
+        ),
+        flag(
+            "trust",
+            BOOL,
+            "With -p: let a Claude Code instance run in a repository not yet trusted — it runs the repository's hooks and MCP servers without asking. Without it, -p refuses unless a person at the terminal says yes",
         ),
     ]
 }

@@ -16,6 +16,7 @@
 //! it through the tool bridge as `mcp__krowk__publish`.
 
 use crate::engine::{EngineEvent, Events};
+use crate::protocol::PermissionMode;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -59,6 +60,10 @@ pub struct PublishRequest {
 pub struct Published {
     pub text: String,
     pub run: Option<String>,
+    /// What only the person may see — an anonymous upload's claim command,
+    /// whose token is a secret: sent as a `notice`, never logged, never in
+    /// `text`.
+    pub for_person: Vec<String>,
 }
 
 /// Runs one publish, blocking: `Ok` with what was published, `Err` with the
@@ -103,6 +108,9 @@ impl Evidence {
         // stay free to hear an interrupt.
         match tokio::task::spawn_blocking(move || publisher(&req)).await {
             Ok(Ok(p)) => {
+                for text in p.for_person {
+                    let _ = events.send(EngineEvent::Notice { text }).await;
+                }
                 if let Some(opened) = p.run.filter(|r| run.as_ref() != Some(r)) {
                     *run = Some(opened.clone());
                     let _ = events.send(EngineEvent::RunOpened { run: opened }).await;
@@ -112,6 +120,17 @@ impl Evidence {
             Ok(Err(why)) => (why, true),
             Err(e) => (format!("publish failed: {e}"), true),
         }
+    }
+}
+
+/// Whether a session in `mode` may publish. An artifact is at a URL that
+/// needs no credential to read, so until the permission rules land (ticket
+/// 9) publishing is held to what changing files is: `acceptEdits` and up.
+/// The same rule for the native tool and the bridged one, whoever asks.
+pub fn permitted(mode: PermissionMode) -> Result<(), String> {
+    match mode {
+        PermissionMode::AcceptEdits | PermissionMode::BypassPermissions => Ok(()),
+        _ => Err("publish uploads files to a public link, which this session does not allow: until krowk's permission rules land, it runs only when krowk is started with `--permission-mode acceptEdits` or `bypassPermissions`. Say which files you would publish instead, or ask the person to rerun with one of those flags.".into()),
     }
 }
 
@@ -131,7 +150,7 @@ mod tests {
         let seen = asked.clone();
         let publisher: Publisher = Arc::new(move |r: &PublishRequest| {
             seen.lock().unwrap().push(r.clone());
-            Ok(Published { text: format!("published {}", r.files.join(", ")), run: Some(r.run.clone().unwrap_or_else(|| "run_1".into())) })
+            Ok(Published { text: format!("published {}", r.files.join(", ")), run: Some(r.run.clone().unwrap_or_else(|| "run_1".into())), for_person: Vec::new() })
         });
         let ev = Evidence::new(publisher, "s-1", None);
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();

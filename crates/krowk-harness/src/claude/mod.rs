@@ -187,12 +187,13 @@ pub fn transcript_path(config_dir: &Path, cwd: &str, session_id: &str) -> PathBu
 /// directory unless permissions are bypassed. No edit reaches `.git`,
 /// `.claude` or the instance's own config directory (`protected`) unless
 /// permissions are bypassed: Claude Code runs what their settings, hooks
-/// and agents name. krowk's own bridged tools are always allowed. Anything
+/// and agents name. krowk's own bridged tools are allowed, `publish` under
+/// the rule that holds it natively (`acceptEdits` and up). Anything
 /// this build does not know is treated as running a command.
 pub fn approve(mode: PermissionMode, tool: &str, input: &Value, cwd: &Path, protected: &[PathBuf]) -> Result<(), String> {
     let bypass = mode == PermissionMode::BypassPermissions;
-    if tool.starts_with(&format!("mcp__{}__", bridge::SERVER)) {
-        return Ok(());
+    if let Some(own) = tool.strip_prefix(&format!("mcp__{}__", bridge::SERVER)) {
+        return if own == crate::evidence::PUBLISH { crate::evidence::permitted(mode) } else { Ok(()) };
     }
     let scope = crate::tools::Scope { cwd: cwd.to_path_buf(), bypass, protected: protected.to_vec() };
     let path = ["file_path", "notebook_path", "path"].iter().find_map(|k| input.get(*k).and_then(Value::as_str));
@@ -418,6 +419,7 @@ impl Answers {
                     cwd: &self.cwd,
                     backend: BACKEND,
                     krowk_version: &self.krowk_version,
+                    permission_mode: self.mode,
                     evidence: self.evidence.as_ref().zip(events),
                 };
                 success(json!({"mcp_response": bridge::handle(req.get("message").unwrap_or(&Value::Null), &env).await}))
@@ -859,6 +861,10 @@ mod tests {
         let approve = |m, t: &str, i: &Value, c: &Path| super::approve(m, t, i, c, &[]);
         let d = PermissionMode::Default;
         assert!(approve(d, "mcp__krowk__session_info", &json!({}), &cwd).is_ok());
+        // publish uploads to a public link: held to what an edit is.
+        assert!(approve(d, "mcp__krowk__publish", &json!({"files": ["a.png"]}), &cwd).unwrap_err().contains("acceptEdits"));
+        assert!(approve(PermissionMode::Plan, "mcp__krowk__publish", &json!({"files": ["a.png"]}), &cwd).is_err());
+        assert!(approve(PermissionMode::AcceptEdits, "mcp__krowk__publish", &json!({"files": ["a.png"]}), &cwd).is_ok());
         assert!(approve(d, "Read", &json!({"file_path": "README.md"}), &cwd).is_ok());
         assert!(approve(d, "Read", &json!({"file_path": "/etc/passwd"}), &cwd).unwrap_err().contains("outside the working directory"));
         assert!(approve(d, "Edit", &json!({"file_path": "a.txt"}), &cwd).unwrap_err().contains("acceptEdits"));

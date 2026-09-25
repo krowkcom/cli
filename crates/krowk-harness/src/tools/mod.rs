@@ -238,11 +238,13 @@ pub async fn run(name: &str, input: &Value, env: &ToolEnv<'_>) -> (String, bool)
             ),
             Err(e) => e,
         },
-        // krowk_push's rules, not a mode's, keep it safe: the working
-        // directory as the root, credential files and hard links refused.
-        crate::evidence::PUBLISH => match env.evidence {
-            Some((ev, events)) => ev.publish(env.cwd, input, events).await,
-            None => (crate::evidence::UNAVAILABLE.into(), true),
+        // krowk_push's rules keep it in the working directory and away from
+        // credential files and hard links; the mode keeps it from running at
+        // all where nothing may leave the session.
+        crate::evidence::PUBLISH => match (crate::evidence::permitted(env.permission_mode), env.evidence) {
+            (Err(why), _) => (why, true),
+            (Ok(()), Some((ev, events))) => ev.publish(env.cwd, input, events).await,
+            (Ok(()), None) => (crate::evidence::UNAVAILABLE.into(), true),
         },
         other => (format!("there is no tool named {other:?} — the tools are read, write, {}, bash, grep, glob and publish", env.edit.name()), true),
     }
@@ -928,6 +930,10 @@ mod tests {
         assert!(run("frobnicate", &json!({}), &env).await.0.contains("read, write, apply_patch, bash, grep, glob and publish"));
         let (out, err) = run(crate::evidence::PUBLISH, &json!({"files": ["a.txt"]}), &env).await;
         assert!(err && out.contains("publish is not available"), "a host with no publisher says so: {out}");
+        for mode in [PermissionMode::Default, PermissionMode::Plan] {
+            let (out, err) = run(crate::evidence::PUBLISH, &json!({"files": ["a.txt"]}), &ToolEnv { permission_mode: mode, ..env }).await;
+            assert!(err && out.contains("--permission-mode acceptEdits"), "{mode:?}: publish is held to what an edit is: {out}");
+        }
         let _ = std::fs::remove_dir_all(d);
     }
 

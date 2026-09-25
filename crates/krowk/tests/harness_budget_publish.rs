@@ -195,7 +195,7 @@ fn r_evid_1_publish_pushes_a_screenshot_tagged_with_the_session_under_its_run() 
     b.token = "krowk_sk_test_publish".into();
     // A real PNG header, so it is served as the image it is.
     std::fs::write(b.root.join("repo/shot.png"), b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89").unwrap();
-    let out = b.krowk(&["-p", "publish the screenshot", "--model", "claude-sonnet-4-6", "--output-format", "json"]);
+    let out = b.krowk(&["-p", "publish the screenshot", "--model", "claude-sonnet-4-6", "--output-format", "json", "--permission-mode", "acceptEdits"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     let session = serde_json::from_slice::<Value>(&out.stdout).unwrap()["sessionId"].as_str().unwrap().to_string();
     let (said, is_error) = tool_result(&m);
@@ -217,7 +217,7 @@ fn r_evid_1_publish_pushes_a_screenshot_tagged_with_the_session_under_its_run() 
     assert_eq!(artifact["run"]["metadata"]["krowk.harness"], "krowk");
 
     // A resumed session publishes under the same run, and logs no second one.
-    let out = b.krowk(&["-p", "publish it again", "--resume", &session]);
+    let out = b.krowk(&["-p", "publish it again", "--resume", &session, "--permission-mode", "acceptEdits"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     let (said, _) = tool_result(&m);
     assert!(said.contains(&format!("Grouped under run {run}")), "{said}");
@@ -227,19 +227,77 @@ fn r_evid_1_publish_pushes_a_screenshot_tagged_with_the_session_under_its_run() 
 }
 
 #[test]
-fn r_evid_1_without_a_key_publish_is_anonymous_opens_no_run_and_points_at_doctor() {
+fn r_evid_1_without_a_key_publish_is_anonymous_opens_no_run_and_its_claim_token_reaches_only_the_person() {
     let registry = krowk_devregistry::start(TcpListener::bind("127.0.0.1:0").unwrap(), krowk_devregistry::Config::default()).unwrap();
     let m = mock::serve(publishing(json!(["notes.txt"])));
     let mut b = Sandbox::new("keyless", &m.url);
     b.api = format!("{}/v1", registry.url());
     std::fs::write(b.root.join("repo/notes.txt"), "what the agent saw\n").unwrap();
-    let out = b.krowk(&["-p", "publish the notes", "--model", "claude-sonnet-4-6", "--output-format", "json"]);
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    let session = serde_json::from_slice::<Value>(&out.stdout).unwrap()["sessionId"].as_str().unwrap().to_string();
+    let out = b.krowk(&["-p", "publish the notes", "--model", "claude-sonnet-4-6", "--output-format", "stream-json", "--permission-mode", "acceptEdits"]);
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    let session = stdout.lines().next().and_then(|l| serde_json::from_str::<Value>(l).ok()).unwrap()["sessionId"].as_str().unwrap().to_string();
     let (said, is_error) = tool_result(&m);
     assert!(!is_error && said.contains("/a/art_"), "{said}");
     assert!(said.contains("belongs to no run") && said.contains("krowk doctor"), "{said}");
+    assert!(said.contains("shown to the person rather than to you"), "{said}");
     assert!(!b.log(&session).iter().any(|e| e["type"] == "run.opened"));
+    // The claim token is a secret: the person gets it on stderr, and it is
+    // nowhere a model, a log or a program reading stdout would see it.
+    let token = stderr.split_whitespace().find(|w| w.starts_with("krowk_claim_")).unwrap_or_else(|| panic!("no claim command on stderr: {stderr}")).trim_end_matches(['`', ')']).to_string();
+    assert!(stderr.contains("krowk claim art_"), "{stderr}");
+    assert!(!said.contains("krowk_claim_"), "the model was sent the claim token: {said}");
+    let dir = b.sessions().join(&session);
+    for f in ["events.jsonl", "context.jsonl"] {
+        assert!(!std::fs::read_to_string(dir.join(f)).unwrap().contains(&token), "{f} holds the claim token");
+    }
+    assert!(!stdout.contains(&token), "stream-json printed the claim token");
+    assert!(!m.seen.lock().unwrap().iter().any(|r| r.raw.contains(&token)), "the provider was sent the claim token");
+}
+
+/// publish uploads to a public link, so until the permission rules land it
+/// is held to what an edit is: refused in the default and plan modes.
+#[test]
+fn r_evid_1_publish_needs_accept_edits_as_an_edit_does() {
+    let registry = krowk_devregistry::start(TcpListener::bind("127.0.0.1:0").unwrap(), krowk_devregistry::Config::default()).unwrap();
+    let m = mock::serve(publishing(json!(["notes.txt"])));
+    let mut b = Sandbox::new("mode", &m.url);
+    b.api = format!("{}/v1", registry.url());
+    b.token = "krowk_sk_test_mode".into();
+    std::fs::write(b.root.join("repo/notes.txt"), "x\n").unwrap();
+    for mode in ["default", "plan"] {
+        let out = b.krowk(&["-p", "publish the notes", "--model", "claude-sonnet-4-6", "--output-format", "json", "--permission-mode", mode]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let (said, is_error) = tool_result(&m);
+        assert!(is_error && said.contains("--permission-mode acceptEdits"), "{mode}: {said}");
+        let session = serde_json::from_slice::<Value>(&out.stdout).unwrap()["sessionId"].as_str().unwrap().to_string();
+        assert!(!b.log(&session).iter().any(|e| e["type"] == "run.opened"), "{mode}: nothing was published");
+    }
+}
+
+/// A repository can name a command in its git config (`core.fsmonitor`);
+/// the run metadata publish detects runs none of it, in any mode.
+#[test]
+fn r_evid_1_publish_detects_the_run_context_without_running_the_repositorys_git_config() {
+    let registry = krowk_devregistry::start(TcpListener::bind("127.0.0.1:0").unwrap(), krowk_devregistry::Config::default()).unwrap();
+    let m = mock::serve(publishing(json!(["notes.txt"])));
+    let mut b = Sandbox::new("fsmonitor", &m.url);
+    b.api = format!("{}/v1", registry.url());
+    b.token = "krowk_sk_test_fsmonitor".into();
+    let repo = b.root.join("repo");
+    std::fs::remove_dir_all(repo.join(".git")).unwrap();
+    if !Command::new("git").args(["init", "-q"]).current_dir(&repo).status().is_ok_and(|s| s.success()) {
+        eprintln!("git is not installed: skipping");
+        return;
+    }
+    let marker = b.root.join("fsmonitor-ran");
+    let config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+    std::fs::write(repo.join(".git/config"), format!("{config}[core]\n\tfsmonitor = \"touch '{}'; false\"\n", marker.display())).unwrap();
+    std::fs::write(repo.join("notes.txt"), "x\n").unwrap();
+    let out = b.krowk(&["-p", "publish the notes", "--model", "claude-sonnet-4-6", "--permission-mode", "acceptEdits"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!tool_result(&m).1, "published");
+    assert!(!marker.exists(), "the repository's fsmonitor ran");
 }
 
 /// The golden case `mcp-credential-refusals` holds krowk_push to these
@@ -271,7 +329,7 @@ fn r_evid_1_publish_refuses_credentials_paths_outside_the_root_and_hard_links_as
     for (file, code) in cases {
         let m = mock::serve(publishing(json!([file])));
         b.url = m.url.clone();
-        let out = b.krowk(&["-p", "publish it", "--model", "claude-sonnet-4-6", "--output-format", "json"]);
+        let out = b.krowk(&["-p", "publish it", "--model", "claude-sonnet-4-6", "--output-format", "json", "--permission-mode", "acceptEdits"]);
         assert!(out.status.success(), "a refusal is a tool result, not a failed turn: {}", text(&out.stderr));
         let (said, is_error) = tool_result(&m);
         assert!(is_error && said.contains(&format!("krowk failed: {code}")), "{file}: {said}");

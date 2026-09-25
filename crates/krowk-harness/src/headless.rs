@@ -98,7 +98,11 @@ async fn drive(host: Host, opts: Options, stdout: &mut dyn Write) -> Outcome {
                 if session_id.is_none() {
                     session_id = Some(line_session(&line).to_string());
                 }
-                if format == OutputFormat::StreamJson {
+                // A notice is the person's alone (a claim token is a secret):
+                // the terminal's stderr, never stdout, which a program reads.
+                if let StreamLine::Live(LiveEvent::Notice { text, .. }) = &line {
+                    let _ = writeln!(std::io::stderr(), "! {text}");
+                } else if format == OutputFormat::StreamJson {
                     let _ = writeln!(stdout, "{}", serde_json::to_string(&line).expect("a stream line serializes"));
                     let _ = stdout.flush();
                 }
@@ -153,7 +157,7 @@ fn line_session(line: &StreamLine) -> &str {
     match line {
         StreamLine::Log(ev) => &ev.session_id,
         StreamLine::Live(LiveEvent::ItemStarted { session_id, .. } | LiveEvent::ItemDelta { session_id, .. }) => session_id,
-        StreamLine::Live(LiveEvent::Cost { session_id, .. }) => session_id,
+        StreamLine::Live(LiveEvent::Cost { session_id, .. } | LiveEvent::Notice { session_id, .. }) => session_id,
         StreamLine::Live(LiveEvent::Result(r)) => &r.session_id,
     }
 }

@@ -205,6 +205,10 @@ mod tests {
     fn r_compat_1_instructions_are_read_from_the_root_down_agents_first_and_deeper_wins() {
         let base = std::env::temp_dir().join(format!("krowk-instructions-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // Canonical, as the repository root is found: macOS's temporary
+        // directory is a symlink into /private.
+        let base = base.canonicalize().unwrap();
         let repo = base.join("repo");
         for d in [".git", "app/web/deep", "other", ".cursor/rules/nested", "app/.cursor/rules"] {
             std::fs::create_dir_all(repo.join(d)).unwrap();

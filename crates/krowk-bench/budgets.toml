@@ -60,6 +60,8 @@ unit = "bytes"
 # the control protocol, the stream translation, the MCP bridge, trust,
 # `providers add claude`; no new crate) adds 183,392 bytes: 7,087,016
 # (6.76 MiB) on x86_64 Linux with both, 253,016 bytes under this.
+# Ticket 08's budget and `publish` (no new crate) add 107,424 bytes:
+# 7,194,440 (6.86 MiB), 145,592 under this.
 max = { x86_64-linux = 7_340_032 }
 status = "enforced"
 
@@ -210,7 +212,8 @@ unit = "tokens"
 # not move it. 1,182 when this budget was set (ticket 03: the gpt preset,
 # apply_patch as a JSON tool; claude 1,165, grok 1,178), and about 1,310 for
 # apply_patch in its freeform form, which only a wire API with grammar tools
-# offers. Every model
+# offers. Ticket 08's `publish` brings them to 1,327 (gpt; claude
+# 1,310, grok 1,323), and about 1,450 in the freeform form. Every model
 # call carries these tokens, so a new tool or a longer description has to
 # fit here or raise this with a reason. The unit test
 # `r_tool_1_the_system_prompt_and_tool_definitions_stay_small` holds every

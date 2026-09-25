@@ -253,6 +253,10 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
 pub(crate) struct Scope {
     pub cwd: PathBuf,
     pub bypass: bool,
+    /// More directories no edit may reach unless permissions are bypassed,
+    /// beside `.git` and `.claude`: a Claude Code instance's config
+    /// directory, whose settings and hooks it runs.
+    pub protected: Vec<PathBuf>,
 }
 
 /// Symlinks followed at most while resolving one path: a loop is refused,
@@ -261,7 +265,7 @@ const MAX_LINKS: usize = 40;
 
 impl Scope {
     fn new(env: &ToolEnv<'_>) -> Scope {
-        Scope { cwd: env.cwd.to_path_buf(), bypass: env.permission_mode == PermissionMode::BypassPermissions }
+        Scope { cwd: env.cwd.to_path_buf(), bypass: env.permission_mode == PermissionMode::BypassPermissions, protected: Vec::new() }
     }
 
     /// The path a tool was given, resolved against the working directory,
@@ -289,9 +293,11 @@ impl Scope {
 
 impl Scope {
     /// `path`, for a tool that changes the file: also never anything inside
-    /// a `.git` directory, as spelled or as it leads, unless permissions are
-    /// bypassed. git runs what its config names (`core.fsmonitor`, hooks),
-    /// so a model that could write `.git/config` could run any command
+    /// a `.git` or a `.claude` directory, as spelled or as it leads, nor in
+    /// a `protected` one, unless permissions are bypassed. git runs what its
+    /// config names (`core.fsmonitor`, hooks), and Claude Code what its
+    /// settings, hooks and agents name, so a model that could write
+    /// `.git/config` or `.claude/settings.json` could run any command
     /// without the bash permission. Codex keeps `.git` read-only for the
     /// same reason.
     pub fn edit_path(&self, path: &str) -> Result<PathBuf, String> {
@@ -299,13 +305,19 @@ impl Scope {
         if self.bypass {
             return Ok(p);
         }
-        let in_git = |q: &Path| q.components().any(|c| c.as_os_str() == ".git");
+        let inside = |q: &Path| q.components().find_map(|c| [".git", ".claude"].into_iter().find(|d| c.as_os_str() == *d));
         let real = real_path(&p, 0).unwrap_or_else(|_| p.clone());
         let root = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
-        if in_git(p.strip_prefix(&self.cwd).unwrap_or(&p)) || in_git(real.strip_prefix(&root).unwrap_or(&real)) {
+        let fenced = inside(p.strip_prefix(&self.cwd).unwrap_or(&p)).or_else(|| inside(real.strip_prefix(&root).unwrap_or(&real)));
+        if let Some(dir) = fenced {
+            let runs = if dir == ".git" { "git runs what its config and hooks name, so it is left to git itself — use git through bash" } else { "Claude Code runs what its settings, hooks and agents name" };
+            return Err(format!("{} is inside a {dir} directory, which the file tools do not change: {runs}, or ask the person to rerun with `--permission-mode bypassPermissions`", p.display()));
+        }
+        if let Some(d) = self.protected.iter().find(|d| real.starts_with(d.canonicalize().unwrap_or_else(|_| d.to_path_buf()))) {
             return Err(format!(
-                "{} is inside a .git directory, which the file tools do not change: git runs what its config and hooks name, so it is left to git itself — use git through bash, or ask the person to rerun with `--permission-mode bypassPermissions`",
-                p.display()
+                "{} is inside {}, Claude Code's config directory for this session, which the file tools do not change: Claude Code runs what its settings and hooks name — ask the person to rerun with `--permission-mode bypassPermissions`",
+                p.display(),
+                d.display()
             ));
         }
         Ok(p)
@@ -844,6 +856,12 @@ mod tests {
         assert!(!run(READ, &json!({"path": ".git/config"}), &env).await.1);
         let bypass = ToolEnv { permission_mode: PermissionMode::BypassPermissions, ..env };
         assert!(!run(WRITE, &json!({"path": ".git/info/note", "content": "x"}), &bypass).await.1);
+        // .claude is fenced the same way: Claude Code runs its hooks.
+        let claude = |r: (String, bool)| r.1 && r.0.contains("inside a .claude directory");
+        assert!(claude(run(WRITE, &json!({"path": ".claude/settings.json", "content": "{}"}), &env).await));
+        assert!(claude(run(WRITE, &json!({"path": "sub/.claude/agents/x.md", "content": "x"}), &env).await), "any component");
+        assert!(!d.join(".claude").exists());
+        assert!(!run(WRITE, &json!({"path": ".claude/settings.json", "content": "{}"}), &bypass).await.1);
         let _ = std::fs::remove_dir_all(d);
     }
 

@@ -333,7 +333,7 @@
               ]
             },
             "env": {
-              "description": "More environment for the process, e.g. `ANTHROPIC_BASE_URL` for\na router. Literal values: a key belongs in the environment krowk\nruns in, never in a definition.",
+              "description": "More environment for the process, e.g. `ANTHROPIC_BASE_URL` for\na router. Literal values: a key belongs in the environment krowk\nruns in, never in a definition. `CLAUDE_CONFIG_DIR` is not one\nof them — `configDir` is the one way to name it. The ambient\n`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and\n`ANTHROPIC_BASE_URL` reach the process only when named here.",
               "type": "object",
               "additionalProperties": {
                 "type": "string"

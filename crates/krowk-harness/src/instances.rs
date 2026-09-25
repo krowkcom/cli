@@ -186,7 +186,10 @@ pub enum InstanceKind {
         config_dir: Option<String>,
         /// More environment for the process, e.g. `ANTHROPIC_BASE_URL` for
         /// a router. Literal values: a key belongs in the environment krowk
-        /// runs in, never in a definition.
+        /// runs in, never in a definition. `CLAUDE_CONFIG_DIR` is not one
+        /// of them — `configDir` is the one way to name it. The ambient
+        /// `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+        /// `ANTHROPIC_BASE_URL` reach the process only when named here.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         env: BTreeMap<String, String>,
         /// More launch arguments, after krowk's own.
@@ -516,8 +519,9 @@ fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) ->
         InstanceKind::ClaudeCode { binary, config_dir: dir, env: extra, args, effort } => {
             let config_dir = dir.as_deref().filter(|d| !d.trim().is_empty()).map(PathBuf::from);
             // Claude Code's own rule for its directory: CLAUDE_CONFIG_DIR —
-            // the instance's, else the environment's — else ~/.claude.
-            let home = config_dir.clone().or_else(|| extra.get("CLAUDE_CONFIG_DIR").or(Some(&env("CLAUDE_CONFIG_DIR"))).filter(|d| !d.trim().is_empty()).map(PathBuf::from)).or_else(|| {
+            // the instance's `configDir`, else the environment's — else
+            // ~/.claude.
+            let home = config_dir.clone().or_else(|| Some(env("CLAUDE_CONFIG_DIR")).filter(|d| !d.trim().is_empty()).map(PathBuf::from)).or_else(|| {
                 let h = env("HOME");
                 (!h.trim().is_empty()).then(|| PathBuf::from(h).join(".claude"))
             });
@@ -545,6 +549,13 @@ pub fn from_config_json(raw: &serde_json::Value) -> Result<InstancesConfig, Stri
     let mut cfg = InstancesConfig::default();
     if let Some(v) = raw.get("instances") {
         cfg.instances = serde_json::from_value(v.clone()).map_err(|e| format!("\"instances\": {e}"))?;
+        for (name, kind) in &cfg.instances {
+            if let InstanceKind::ClaudeCode { env, .. } = kind
+                && env.contains_key("CLAUDE_CONFIG_DIR")
+            {
+                return Err(format!("\"instances\": {name} sets CLAUDE_CONFIG_DIR in its env — name the directory with \"configDir\" instead, the one place krowk reads it from"));
+            }
+        }
     }
     if let Some(v) = raw.get("defaultModel") {
         cfg.default_model = Some(v.as_str().ok_or("\"defaultModel\" must be a string")?.to_string());
@@ -670,6 +681,8 @@ mod tests {
         assert_eq!((w.config_dir.as_deref(), w.home.as_deref()), (Some(std::path::Path::new("/cfg/work")), Some(std::path::Path::new("/cfg/work"))));
         assert_eq!((w.env["ANTHROPIC_BASE_URL"].as_str(), w.args.clone()), ("https://router.example", vec!["--add-dir".to_string(), "/x".to_string()]), "a router is the same mechanism");
         assert_eq!(reg.get("claude:mine").unwrap().backend.as_ref().unwrap().binary, "/opt/claude/bin/claude");
+        let e = from_config_json(&serde_json::json!({"instances": {"claude:x": {"kind": "claude-code", "env": {"CLAUDE_CONFIG_DIR": "/elsewhere"}}}})).unwrap_err();
+        assert!(e.contains("configDir"), "{e}");
         assert_eq!(reg.parse_model("claude:work/sonnet").unwrap(), ModelRef { instance: "claude:work".into(), model: "sonnet".into() });
         assert_eq!(reg.parse_model("claude/haiku").unwrap().instance, "claude");
         assert_eq!(reg.parse_model("claude-sonnet-4-6").unwrap().instance, "anthropic", "a bare Claude id is still the API's");

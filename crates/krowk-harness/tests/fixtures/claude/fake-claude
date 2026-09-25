@@ -13,6 +13,8 @@
 #   FAKE_CLAUDE_LOG       where every argv, config dir and line in or out is appended
 #   FAKE_CLAUDE_SESSION   the session id of a new session
 #   FAKE_CLAUDE_LOGIN     `fail`: `auth login` gives up, as a person closing the browser would
+#   FAKE_CLAUDE_PERMISSION_MODE  the mode init reports, as a settings file
+#                         could make it; the --permission-mode given otherwise
 #
 # A scenario is turns separated by lines holding `---`. Each user line from
 # krowk plays the next turn: `system/init` first, then each line of the turn:
@@ -23,6 +25,10 @@
 #   @await-interrupt   waits for krowk's interrupt, and acknowledges it
 #   @sleep <seconds>   waits
 #   @exit <code>       exits mid-turn, as a crashed process would
+#   @exit-once <code>  the same, the first time only (a marker in the config dir)
+#   @grandchild        starts a background `sleep`, as a Bash tool call
+#                      would, and logs its pid; `@grandchild-holding` leaves
+#                      it holding stdout open, as a careless one does
 # The turn ends with the scenario's own `result` line.
 
 set -u
@@ -67,17 +73,21 @@ auth)
 esac
 
 MODEL=default
+PMODE=default
 SESSION="${FAKE_CLAUDE_SESSION:-fa4e0000-0000-4000-8000-000000000001}"
 while [ $# -gt 0 ]; do
   case "$1" in
   --model) MODEL="$2"; shift ;;
   --resume) SESSION="$2"; log "resume $2"; shift ;;
+  --permission-mode) PMODE="$2"; log "permission-mode $2"; shift ;;
   esac
   shift
 done
 
+PMODE="${FAKE_CLAUDE_PERMISSION_MODE:-$PMODE}"
 SOURCE=none
 [ -n "${ANTHROPIC_API_KEY:-}" ] && SOURCE=ANTHROPIC_API_KEY
+log "env ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+set} ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}"
 SLUG="${PWD//[^a-zA-Z0-9]/-}"
 TRANSCRIPT="$DIR/projects/$SLUG/$SESSION.jsonl"
 
@@ -181,7 +191,7 @@ await_interrupt() {
 
 turn() {
   mkdir -p "$(dirname "$TRANSCRIPT")" && printf '%s\n' "$1" >>"$TRANSCRIPT"
-  emit '{"type":"system","subtype":"init","cwd":"{{CWD}}","session_id":"{{SESSION}}","tools":["Read","Edit","Bash","mcp__krowk__session_info"],"mcp_servers":[{"name":"krowk","status":"connected","source":"sdk"}],"model":"{{MODEL}}","permissionMode":"default","apiKeySource":"'$SOURCE'","claude_code_version":"2.1.280","capabilities":["interrupt_receipt_v1"]}'
+  emit '{"type":"system","subtype":"init","cwd":"{{CWD}}","session_id":"{{SESSION}}","tools":["Read","Edit","Bash","mcp__krowk__session_info"],"mcp_servers":[{"name":"krowk","status":"connected","source":"sdk"}],"model":"{{MODEL}}","permissionMode":"'$PMODE'","apiKeySource":"'$SOURCE'","claude_code_version":"2.1.280","capabilities":["interrupt_receipt_v1"]}'
   if [ ! -f "$DIR/fake-login" ] && [ "$SOURCE" = none ]; then
     emit '{"type":"assistant","message":{"id":"msg_login","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Not logged in · Please run /login"}]},"parent_tool_use_id":null,"session_id":"{{SESSION}}"}'
     emit '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login","session_id":"{{SESSION}}"}'
@@ -203,6 +213,21 @@ turn() {
     @await-interrupt) await_interrupt ;;
     '@sleep '*) sleep "${l#@sleep }" ;;
     '@exit '*) exit "${l#@exit }" ;;
+    '@exit-once '*)
+      if [ ! -f "$DIR/fake-crashed" ]; then
+        : >"$DIR/fake-crashed"
+        log "crash"
+        exit "${l#@exit-once }"
+      fi
+      ;;
+    @grandchild)
+      sleep 300 >/dev/null 2>&1 </dev/null &
+      log "grandchild $!"
+      ;;
+    @grandchild-holding)
+      sleep 300 &
+      log "grandchild $!"
+      ;;
     *) emit "$l" ;;
     esac
   done

@@ -7,7 +7,8 @@
 //! claude -p --input-format stream-json --output-format stream-json --verbose
 //!        --include-partial-messages --permission-prompt-tool stdio
 //!        --mcp-config '{"mcpServers":{"krowk":{"type":"sdk","name":"krowk"}}}' --strict-mcp-config
-//!        --model <model> [--resume <claude session>] [--effort <level>] [--permission-mode plan]
+//!        --model <model> --permission-mode default|plan
+//!        [--resume <claude session>] [--effort <level>]
 //! ```
 //!
 //! Each prompt is one `user` line on the process's stdin, and its turn is
@@ -25,7 +26,7 @@
 //! | subtype | direction | what krowk does |
 //! |---|---|---|
 //! | `initialize` | krowk → claude | first, on every process; its answer lists the `models`, which is how in-place model switching is detected |
-//! | `can_use_tool` | claude → krowk | answered by krowk's own approval path (`approve`), never by Claude Code's |
+//! | `can_use_tool` | claude → krowk | answered by krowk's own approval path (`approve`) |
 //! | `mcp_message` | claude → krowk | a JSON-RPC message for the `krowk` MCP server, answered by `crate::bridge` |
 //! | `interrupt` | krowk → claude | a `Command::Interrupt`; the turn ends at the next `result` and the process lives on |
 //! | `set_model` | krowk → claude | a turn on another model of the same instance, when `initialize` listed models; otherwise a new process on `--resume` |
@@ -34,6 +35,19 @@
 //! capabilities `system`/`init` announces (`interrupt_receipt_v1` — an
 //! interrupt is acknowledged, so an unacknowledged one is given up on
 //! sooner) and the `initialize` answer.
+//!
+//! **What krowk is asked, and what it is not.** Claude Code decides some
+//! tool calls itself before it asks anyone: an allow rule in the user's or
+//! the project's settings (`permissions.allow`), a `PreToolUse` hook that
+//! approves, an agent's own `permissionMode`, and the read-only calls its
+//! mode never asks about. Those run without krowk's `can_use_tool` — that
+//! is Claude Code behaving as its user configured it, and ticket 09's rules
+//! are where krowk takes them into account. What krowk does hold is the
+//! mode: the process is started `--permission-mode default` (or `plan`),
+//! so a `defaultMode` in settings cannot loosen it, and a turn whose
+//! `system`/`init` reports a mode looser than krowk's is stopped before it
+//! runs anything. Every call Claude Code does ask about is answered by
+//! `approve`.
 //!
 //! **Compliance** (R-BACK-2) is structural: krowk starts the binary as the
 //! user installed it, sends it no system prompt and no headers, sets only
@@ -124,12 +138,12 @@ pub fn args(l: &Launch, extra: &[String]) -> Vec<String> {
     if let Some(e) = l.effort {
         a.extend(["--effort".into(), e.into()]);
     }
-    // Plan mode changes what Claude Code does, not only what it may do, so
-    // it is Claude Code's to know. Every other mode stays krowk's: approvals
-    // are asked of krowk and answered by `approve`.
-    if l.plan {
-        a.extend(["--permission-mode".into(), "plan".into()]);
-    }
+    // The mode is always named: left out, a `defaultMode` in the user's or
+    // the project's settings (acceptEdits, bypassPermissions) would decide
+    // it. Plan changes what Claude Code does, not only what it may do, so it
+    // is Claude Code's to know; every looser krowk mode stays krowk's, and
+    // what Claude Code asks is answered by `approve`.
+    a.extend(["--permission-mode".into(), if l.plan { "plan" } else { "default" }.into()]);
     a.extend(extra.iter().cloned());
     a
 }
@@ -164,22 +178,39 @@ pub fn transcript_path(config_dir: &Path, cwd: &str, session_id: &str) -> PathBu
         .unwrap_or(direct)
 }
 
-/// A tool call's approval, until the permission system lands (ticket 9
-/// replaces this evaluator; the question already comes to krowk). The rule
-/// is the native loop's: reading needs no mode, writing needs
-/// `acceptEdits`, running commands needs `bypassPermissions`, and the file
-/// tools reach only inside the working directory unless permissions are
-/// bypassed. krowk's own bridged tools are always allowed. Anything this
-/// build does not know is treated as running a command.
-pub fn approve(mode: PermissionMode, tool: &str, input: &Value, cwd: &Path) -> Result<(), String> {
+/// A tool call Claude Code asks about, answered until the permission system
+/// lands (ticket 9 replaces this evaluator). Calls Claude Code approves
+/// itself — its settings' allow rules, its hooks — never reach here (see
+/// the module's notes). The rule is the native loop's: reading needs no
+/// mode, writing needs `acceptEdits`, running commands needs
+/// `bypassPermissions`, and the file tools reach only inside the working
+/// directory unless permissions are bypassed. No edit reaches `.git`,
+/// `.claude` or the instance's own config directory (`protected`) unless
+/// permissions are bypassed: Claude Code runs what their settings, hooks
+/// and agents name. krowk's own bridged tools are always allowed. Anything
+/// this build does not know is treated as running a command.
+pub fn approve(mode: PermissionMode, tool: &str, input: &Value, cwd: &Path, protected: &[PathBuf]) -> Result<(), String> {
     let bypass = mode == PermissionMode::BypassPermissions;
     if tool.starts_with(&format!("mcp__{}__", bridge::SERVER)) {
         return Ok(());
     }
-    let scope = crate::tools::Scope { cwd: cwd.to_path_buf(), bypass };
+    let scope = crate::tools::Scope { cwd: cwd.to_path_buf(), bypass, protected: protected.to_vec() };
     let path = ["file_path", "notebook_path", "path"].iter().find_map(|k| input.get(*k).and_then(Value::as_str));
+    // A glob can name where it searches as much as a path can: an absolute
+    // `pattern` (Glob) or `glob` (Grep) is judged by its fixed part.
+    let glob_key = match tool {
+        "Glob" => Some("pattern"),
+        "Grep" => Some("glob"),
+        _ => None,
+    };
+    let globbed = glob_key.and_then(|k| input.get(k).and_then(Value::as_str)).filter(|g| Path::new(g).is_absolute()).map(glob_root);
     match tool {
-        "Read" | "Grep" | "Glob" | "LS" | "NotebookRead" => path.map(|p| scope.path(p).map(drop)).unwrap_or(Ok(())),
+        "Read" | "Grep" | "Glob" | "LS" | "NotebookRead" => {
+            if let Some(g) = &globbed {
+                scope.path(g)?;
+            }
+            path.map(|p| scope.path(p).map(drop)).unwrap_or(Ok(()))
+        }
         "TodoWrite" | "ToolSearch" | "Task" | "Agent" | "EnterPlanMode" | "ExitPlanMode" => Ok(()),
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             if !matches!(mode, PermissionMode::AcceptEdits | PermissionMode::BypassPermissions) {
@@ -191,6 +222,50 @@ pub fn approve(mode: PermissionMode, tool: &str, input: &Value, cwd: &Path) -> R
         _ if bypass => Ok(()),
         _ => Err(format!("{tool} is not allowed in this session: until krowk's permission rules land, it runs only when krowk is started with `--permission-mode bypassPermissions`. Use Read, Grep and Glob, or ask the person to rerun with that flag.")),
     }
+}
+
+/// The fixed part of an absolute glob: the directories before the first
+/// component that holds a wildcard.
+fn glob_root(g: &str) -> String {
+    let mut root = PathBuf::new();
+    for c in Path::new(g).components() {
+        if c.as_os_str().to_string_lossy().contains(['*', '?', '[', '{']) {
+            break;
+        }
+        root.push(c);
+    }
+    root.display().to_string()
+}
+
+/// How loose a Claude Code permission mode is, against krowk's: plan asks
+/// before everything, default asks before edits and commands, acceptEdits
+/// only before commands; auto, bypassPermissions and any mode this build
+/// does not know ask before nothing krowk can count on.
+fn looser_than(claude: &str, krowk: PermissionMode) -> bool {
+    let rank = match claude {
+        "plan" => 0,
+        "default" | "manual" | "dontAsk" => 1,
+        "acceptEdits" => 2,
+        _ => 3,
+    };
+    let allowed = match krowk {
+        PermissionMode::Plan => 0,
+        PermissionMode::Default => 1,
+        PermissionMode::AcceptEdits => 2,
+        PermissionMode::BypassPermissions => 3,
+    };
+    rank > allowed
+}
+
+/// The ambient variables a Claude Code process does not inherit unless its
+/// instance sets them: they are the native `anthropic` instance's key and
+/// base URL, and inherited they would move a subscription account onto an
+/// API key or another server without anyone asking for it.
+pub const NOT_INHERITED: &[&str] = &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
+
+/// What of `NOT_INHERITED` to remove for this instance.
+pub fn cleared(b: &Backend) -> impl Iterator<Item = &'static str> + '_ {
+    NOT_INHERITED.iter().copied().filter(|k| !b.env.contains_key(*k))
 }
 
 /// The engine for one session on one `claude-code` instance. The host keeps
@@ -232,7 +307,15 @@ impl Engine for ClaudeEngine {
                 effort: ctx.effort.map(effort_level),
                 plan: ctx.permission_mode == PermissionMode::Plan,
             };
-            let ask = Answers { session_id: ctx.session_id.clone(), turn_id: ctx.turn_id.clone(), model: ctx.model.clone(), cwd: ctx.cwd.clone(), mode: ctx.permission_mode, krowk_version: self.krowk_version.clone() };
+            let ask = Answers {
+                session_id: ctx.session_id.clone(),
+                turn_id: ctx.turn_id.clone(),
+                model: ctx.model.clone(),
+                cwd: ctx.cwd.clone(),
+                mode: ctx.permission_mode,
+                krowk_version: self.krowk_version.clone(),
+                protected: self.backend().home.iter().cloned().collect(),
+            };
             // The running process serves this turn when its launch still
             // fits; a model it can switch to in place is switched to.
             if let Some(p) = slot.as_mut() {
@@ -279,6 +362,8 @@ struct Answers {
     cwd: PathBuf,
     mode: PermissionMode,
     krowk_version: String,
+    /// The instance's config directory: no edit reaches it.
+    protected: Vec<PathBuf>,
 }
 
 impl Answers {
@@ -290,7 +375,7 @@ impl Answers {
             "can_use_tool" => {
                 let tool = req.get("tool_name").and_then(Value::as_str).unwrap_or_default();
                 let input = req.get("input").cloned().unwrap_or_else(|| json!({}));
-                match approve(self.mode, tool, &input, &self.cwd) {
+                match approve(self.mode, tool, &input, &self.cwd, &self.protected) {
                     Ok(()) => success(json!({"behavior": "allow", "updatedInput": input})),
                     Err(message) => success(json!({"behavior": "deny", "message": message})),
                 }
@@ -318,6 +403,51 @@ struct Proc {
     set_model: bool,
     next: u64,
     exited: bool,
+    /// The process group: Claude Code and whatever it started.
+    pid: Option<u32>,
+    /// The group was stopped and reaped; nothing is left to signal.
+    group_done: bool,
+}
+
+/// How long a stopped process group gets between SIGTERM and SIGKILL.
+const TERM_GRACE: Duration = Duration::from_secs(2);
+/// After Claude Code exits, how long what it already wrote is read.
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+#[cfg(unix)]
+fn signal_group(pid: Option<u32>, sig: i32) {
+    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 0) {
+        // SAFETY: a signal to the group this process made (process_group(0)).
+        unsafe {
+            libc::kill(-pid, sig);
+        }
+    }
+}
+
+impl Drop for Proc {
+    /// A process let go of without `shutdown` — a host dropped mid-turn — is
+    /// killed with everything it started, never left running.
+    fn drop(&mut self) {
+        if !self.group_done {
+            #[cfg(unix)]
+            signal_group(self.pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// The next JSON line, or none at the end of the stream. A line that is not
+/// JSON (a warning a wrapper printed) is skipped.
+async fn next_json(out: &mut Lines<BufReader<ChildStdout>>) -> Option<Value> {
+    loop {
+        match out.next_line().await {
+            Ok(Some(l)) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&l) {
+                    return Some(v);
+                }
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn tail(s: &str) -> String {
@@ -330,6 +460,9 @@ impl Proc {
     async fn spawn(b: &Backend, cwd: &Path, launch: Launch, ask: &Answers) -> Result<Proc, EngineError> {
         let mut cmd = tokio::process::Command::new(b.path.as_deref().unwrap_or(Path::new(&b.binary)));
         cmd.args(args(&launch, &b.args)).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        for k in cleared(b) {
+            cmd.env_remove(k);
+        }
         if let Some(dir) = &b.config_dir {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
         }
@@ -345,6 +478,7 @@ impl Proc {
                 EngineError::new("backend_failed", format!("{} could not be started: {e}", b.binary))
             }
         })?;
+        let pid = child.id();
         let stdin = child.stdin.take();
         let out = BufReader::new(child.stdout.take().expect("piped")).lines();
         let stderr = Arc::new(Mutex::new(String::new()));
@@ -365,7 +499,7 @@ impl Proc {
                 }
             });
         }
-        let mut p = Proc { child, stdin, out, stderr, binary: b.binary.clone(), launch, set_model: false, next: 0, exited: false };
+        let mut p = Proc { child, stdin, out, stderr, binary: b.binary.clone(), launch, set_model: false, next: 0, exited: false, pid, group_done: false };
         let init = p.request(json!({"subtype": "initialize", "hooks": null}), ask, INITIALIZE_TIMEOUT).await?;
         p.set_model = init.get("models").is_some_and(Value::is_array);
         Ok(p)
@@ -393,21 +527,6 @@ impl Proc {
         Ok(())
     }
 
-    /// The next JSON line, or none at the end of the stream. A line that is
-    /// not JSON (a warning a wrapper printed) is skipped.
-    async fn recv(&mut self) -> Option<Value> {
-        loop {
-            match self.out.next_line().await {
-                Ok(Some(l)) => {
-                    if let Ok(v) = serde_json::from_str::<Value>(&l) {
-                        return Some(v);
-                    }
-                }
-                _ => return None,
-            }
-        }
-    }
-
     fn request_id(&mut self) -> String {
         self.next += 1;
         format!("krowk_{}", self.next)
@@ -422,7 +541,7 @@ impl Proc {
         self.send(&json!({"type": "control_request", "request_id": id, "request": req})).await?;
         let wait = async {
             loop {
-                let Some(msg) = self.recv().await else { return Err(self.died(&format!("before it answered {subtype}"))) };
+                let Some(msg) = next_json(&mut self.out).await else { return Err(self.died(&format!("before it answered {subtype}"))) };
                 match msg["type"].as_str() {
                     Some("control_request") => {
                         let answer = ask.answer(msg["request_id"].as_str().unwrap_or_default(), &msg["request"]);
@@ -443,8 +562,7 @@ impl Proc {
         match answered {
             Ok(r) => r,
             Err(_) => {
-                let _ = self.child.start_kill();
-                self.exited = true;
+                self.terminate().await;
                 Err(EngineError::new("backend_unresponsive", format!("{} did not answer {subtype} within {} seconds — is it Claude Code?", self.binary, within.as_secs())))
             }
         }
@@ -471,10 +589,19 @@ impl Proc {
         let mut receipt: Option<String> = None;
         let mut deadline: Option<tokio::time::Instant> = None;
         let mut announced = false;
+        let mut gone = false;
+        let mut drain: Option<tokio::time::Instant> = None;
         let result = loop {
             let d = deadline;
             let until = async move {
                 match d {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let dr = drain;
+            let drained = async move {
+                match dr {
                     Some(d) => tokio::time::sleep_until(d).await,
                     None => std::future::pending().await,
                 }
@@ -491,14 +618,27 @@ impl Proc {
                 _ = until => {
                     // Claude Code did not stop in time: the process goes, the
                     // turn keeps what it made, the session continues on --resume.
-                    let _ = self.child.start_kill();
-                    self.exited = true;
+                    self.terminate().await;
                     let mut out = Vec::new();
                     t.finish(&mut out);
                     forward(events, out).await;
                     return Ok(TurnEnd::Interrupted);
                 }
-                msg = self.recv() => {
+                // Claude Code exited — crashed, or was killed — while
+                // something it started still holds its output open: what it
+                // wrote is read for a moment, then the turn ends.
+                _ = self.child.wait(), if !gone => {
+                    gone = true;
+                    drain = Some(tokio::time::Instant::now() + DRAIN_GRACE);
+                }
+                _ = drained => {
+                    let mut out = Vec::new();
+                    t.finish(&mut out);
+                    forward(events, out).await;
+                    let e = self.died("before the turn finished");
+                    return if interrupted { Ok(TurnEnd::Interrupted) } else { Err(e) };
+                }
+                msg = next_json(&mut self.out) => {
                     let Some(msg) = msg else {
                         let mut out = Vec::new();
                         t.finish(&mut out);
@@ -528,6 +668,19 @@ impl Proc {
                             if !announced && let Some(init) = t.init.clone() {
                                 announced = true;
                                 receipt_required = init.capabilities.iter().any(|c| c == "interrupt_receipt_v1");
+                                // A mode looser than krowk's — a setting, a
+                                // wrapper — is stopped before it runs anything.
+                                if !init.permission_mode.is_empty() && looser_than(&init.permission_mode, ask.mode) {
+                                    self.terminate().await;
+                                    return Err(EngineError::new(
+                                        "backend_permission_mode",
+                                        format!(
+                                            "Claude Code on {instance} came up in its `{}` permission mode, looser than krowk's `{}` for this turn, so krowk stopped it before it ran anything — check `permissions.defaultMode` in its settings and the instance's `args`, or rerun krowk with a mode that allows it",
+                                            init.permission_mode,
+                                            permission_name(ask.mode)
+                                        ),
+                                    ));
+                                }
                                 announce(events, &init, b, instance).await?;
                             }
                             if let Some(o) = t.outcome.take() {
@@ -556,18 +709,45 @@ impl Proc {
         Err(EngineError::new("backend_failed", format!("Claude Code could not finish the turn: {said}")).with_status(result.api_status.unwrap_or(0)))
     }
 
-    async fn kill(mut self) {
+    /// Stops the whole process group — Claude Code and every shell and
+    /// server it started: SIGTERM, a moment to write what it was writing,
+    /// then SIGKILL.
+    async fn terminate(&mut self) {
+        self.exited = true;
+        if self.group_done {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            signal_group(self.pid, libc::SIGTERM);
+            let _ = tokio::time::timeout(TERM_GRACE, self.child.wait()).await;
+            signal_group(self.pid, libc::SIGKILL);
+        }
         let _ = self.child.kill().await;
+        self.group_done = true;
     }
 
-    /// Asks the process to exit by closing its stdin, and stops it if it
-    /// does not.
+    async fn kill(mut self) {
+        self.terminate().await;
+    }
+
+    /// Asks the process to exit by closing its stdin, gives it a moment, and
+    /// then stops what is left of its group, so nothing it started outlives
+    /// the session.
     async fn shutdown(mut self) {
         drop(self.stdin.take());
-        if tokio::time::timeout(EXIT_GRACE, self.child.wait()).await.is_err() {
-            let _ = self.child.kill().await;
-        }
+        let _ = tokio::time::timeout(EXIT_GRACE, self.child.wait()).await;
+        self.terminate().await;
     }
+}
+
+fn permission_name(m: PermissionMode) -> &'static str {
+    PermissionMode::NAMES[match m {
+        PermissionMode::Default => 0,
+        PermissionMode::AcceptEdits => 1,
+        PermissionMode::Plan => 2,
+        PermissionMode::BypassPermissions => 3,
+    }]
 }
 
 async fn forward(events: &Events, out: Vec<EngineEvent>) {
@@ -612,9 +792,12 @@ mod tests {
         let a = args(&l, &["--add-dir".into(), "/x".into()]);
         let s = a.join(" ");
         assert!(s.starts_with("-p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --mcp-config "), "{s}");
-        assert!(s.contains(r#"{"mcpServers":{"krowk":{"name":"krowk","type":"sdk"}}} --strict-mcp-config --model haiku --resume cc-1 --effort high --add-dir /x"#) || s.contains(r#"{"mcpServers":{"krowk":{"type":"sdk","name":"krowk"}}} --strict-mcp-config --model haiku --resume cc-1 --effort high --add-dir /x"#), "{s}");
-        assert!(!s.contains("--permission-mode"), "approvals are krowk's: no mode is handed over but plan");
+        assert!(s.contains(r#"{"mcpServers":{"krowk":{"name":"krowk","type":"sdk"}}} --strict-mcp-config --model haiku --resume cc-1 --effort high --permission-mode default --add-dir /x"#) || s.contains(r#"{"mcpServers":{"krowk":{"type":"sdk","name":"krowk"}}} --strict-mcp-config --model haiku --resume cc-1 --effort high --permission-mode default --add-dir /x"#), "{s}");
+        assert!(s.contains("--permission-mode default --add-dir"), "the mode is always named, so settings cannot loosen it: {s}");
         assert!(args(&Launch { plan: true, resume: None, effort: None, ..l }, &[]).join(" ").ends_with("--model haiku --permission-mode plan"));
+        assert!(looser_than("bypassPermissions", PermissionMode::AcceptEdits) && looser_than("acceptEdits", PermissionMode::Default) && looser_than("auto", PermissionMode::AcceptEdits));
+        assert!(looser_than("default", PermissionMode::Plan) && looser_than("somethingNew", PermissionMode::AcceptEdits));
+        assert!(!looser_than("default", PermissionMode::Default) && !looser_than("plan", PermissionMode::Plan) && !looser_than("bypassPermissions", PermissionMode::BypassPermissions));
         assert_eq!([Effort::None, Effort::Medium, Effort::Max].map(effort_level), ["low", "medium", "max"]);
     }
 
@@ -622,6 +805,8 @@ mod tests {
     fn r_back_1_approvals_follow_krowks_modes_and_its_own_tools_always_run() {
         let cwd = std::env::temp_dir().join(format!("krowk-approve-{}", std::process::id()));
         std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let approve = |m, t: &str, i: &Value, c: &Path| super::approve(m, t, i, c, &[]);
         let d = PermissionMode::Default;
         assert!(approve(d, "mcp__krowk__session_info", &json!({}), &cwd).is_ok());
         assert!(approve(d, "Read", &json!({"file_path": "README.md"}), &cwd).is_ok());
@@ -632,6 +817,23 @@ mod tests {
         assert!(approve(PermissionMode::AcceptEdits, "Bash", &json!({"command": "ls"}), &cwd).unwrap_err().contains("bypassPermissions"));
         assert!(approve(PermissionMode::BypassPermissions, "Bash", &json!({"command": "ls"}), &cwd).is_ok());
         assert!(approve(d, "WebFetch", &json!({"url": "https://x"}), &cwd).is_err(), "an unknown tool is a command");
+        // A glob that names another directory is judged like a path.
+        assert!(approve(d, "Glob", &json!({"pattern": "/etc/**/*.conf"}), &cwd).unwrap_err().contains("outside the working directory"));
+        assert!(approve(d, "Grep", &json!({"pattern": "x", "glob": "/root/*"}), &cwd).unwrap_err().contains("outside the working directory"));
+        assert!(approve(d, "Glob", &json!({"pattern": "**/*.rs"}), &cwd).is_ok() && approve(d, "Grep", &json!({"pattern": "/etc/"}), &cwd).is_ok(), "a relative glob, and grep's regex, are not paths");
+        assert!(approve(d, "Glob", &json!({"pattern": format!("{}/src/**", cwd.display())}), &cwd).is_ok());
+        assert!(approve(PermissionMode::BypassPermissions, "Glob", &json!({"pattern": "/etc/*"}), &cwd).is_ok());
+        // R-BACK-6's other half: an edit that would make Claude Code run
+        // something — its settings, hooks, agents — needs bypassPermissions.
+        let ae = PermissionMode::AcceptEdits;
+        for f in [".claude/settings.json", ".claude/settings.local.json", ".claude/agents/x.md", "sub/.claude/hooks/h.sh"] {
+            assert!(approve(ae, "Write", &json!({"file_path": f}), &cwd).unwrap_err().contains(".claude"), "{f}");
+        }
+        let config = cwd.join("cc-config");
+        std::fs::create_dir_all(&config).unwrap();
+        let err = super::approve(ae, "Edit", &json!({"file_path": config.join("settings.json").display().to_string()}), &cwd, std::slice::from_ref(&config)).unwrap_err();
+        assert!(err.contains("config directory"), "{err}");
+        assert!(super::approve(PermissionMode::BypassPermissions, "Write", &json!({"file_path": ".claude/settings.json"}), &cwd, &[config]).is_ok());
         let _ = std::fs::remove_dir_all(&cwd);
     }
 

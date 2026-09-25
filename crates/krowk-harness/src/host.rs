@@ -65,6 +65,8 @@ pub struct Host {
     /// Each session's backend engine, with the instance it runs on: its
     /// process outlives a turn and serves the session's next one.
     backends: Mutex<HashMap<String, Backend>>,
+    /// How long a session's backend process is kept without a turn.
+    backend_idle: std::time::Duration,
 }
 
 struct Running {
@@ -72,8 +74,18 @@ struct Running {
     steers: Steers,
 }
 
-/// A session's backend engine and the instance it was made for.
-type Backend = (String, Arc<dyn Engine>);
+/// A session's backend engine, the instance it was made for, and when a
+/// turn last finished on it.
+struct Backend {
+    instance: String,
+    engine: Arc<dyn Engine>,
+    used: Instant,
+}
+
+/// A backend process kept this long without a turn is let go: a long-lived
+/// host (the daemon, the TUI) holds many sessions, and an idle `claude` is a
+/// few hundred megabytes. The next turn starts it again on `--resume`.
+pub const BACKEND_IDLE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 fn log_failure(e: LogError) -> EngineError {
     match e {
@@ -85,14 +97,35 @@ fn log_failure(e: LogError) -> EngineError {
 
 impl Host {
     pub fn new(cfg: HostConfig) -> Host {
-        Host { cfg, running: Mutex::new(HashMap::new()), backends: Mutex::new(HashMap::new()) }
+        Host { cfg, running: Mutex::new(HashMap::new()), backends: Mutex::new(HashMap::new()), backend_idle: BACKEND_IDLE }
+    }
+
+    /// Keeps an idle session's backend process this long instead of
+    /// `BACKEND_IDLE`.
+    pub fn with_backend_idle(self, idle: std::time::Duration) -> Host {
+        Host { backend_idle: idle, ..self }
+    }
+
+    /// Lets go of every backend process idle for longer than the host keeps
+    /// one, except a session's with a turn running. Swept when a prompt
+    /// arrives, so an idle host costs nothing to keep tidy.
+    async fn evict_idle(&self) {
+        let running: Vec<String> = self.running.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+        let idle: Vec<Arc<dyn Engine>> = {
+            let mut backends = self.backends.lock().unwrap_or_else(|e| e.into_inner());
+            let stale: Vec<String> = backends.iter().filter(|(id, b)| b.used.elapsed() >= self.backend_idle && !running.contains(id)).map(|(id, _)| id.clone()).collect();
+            stale.iter().filter_map(|id| backends.remove(id)).map(|b| b.engine).collect()
+        };
+        for e in idle {
+            e.shutdown().await;
+        }
     }
 
     /// Lets every backend process go cleanly. A host dropped without this
     /// still stops them (they are killed with their handles), just less
     /// politely.
     pub async fn shutdown(&self) {
-        let engines: Vec<Arc<dyn Engine>> = self.backends.lock().unwrap_or_else(|e| e.into_inner()).drain().map(|(_, (_, e))| e).collect();
+        let engines: Vec<Arc<dyn Engine>> = self.backends.lock().unwrap_or_else(|e| e.into_inner()).drain().map(|(_, b)| b.engine).collect();
         for e in engines {
             e.shutdown().await;
         }
@@ -102,13 +135,15 @@ impl Host {
     /// it, else a new one (and a process started by its first turn).
     fn backend_for(&self, session_id: &str, instance: &Resolved) -> Result<Arc<dyn Engine>, EngineError> {
         let mut backends = self.backends.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((name, e)) = backends.get(session_id)
-            && *name == instance.name
+        if let Some(b) = backends.get(session_id)
+            && b.instance == instance.name
         {
-            return Ok(e.clone());
+            return Ok(b.engine.clone());
         }
+        // A session moved to another instance: the old engine's process is
+        // stopped with it when the last handle goes (its drop kills it).
         let e: Arc<dyn Engine> = Arc::new(ClaudeEngine::new(instance.clone(), &self.cfg.krowk_version)?);
-        backends.insert(session_id.to_string(), (instance.name.clone(), e.clone()));
+        backends.insert(session_id.to_string(), Backend { instance: instance.name.clone(), engine: e.clone(), used: Instant::now() });
         Ok(e)
     }
 
@@ -166,6 +201,7 @@ impl Host {
         out: mpsc::Sender<StreamLine>,
     ) -> Result<RunResult, EngineError> {
         let started = Instant::now();
+        self.evict_idle().await;
         if text.trim().is_empty() {
             return Err(EngineError::new("empty_prompt", "the prompt is empty — pass it as an argument, or on stdin"));
         }
@@ -242,6 +278,9 @@ impl Host {
         // interrupted or failed turn never took goes back on its result.
         let unread_steers = steers.close();
         self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&session_id);
+        if let Some(b) = self.backends.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&session_id) {
+            b.used = Instant::now();
+        }
 
         let (status, error) = match outcome {
             Ok(TurnEnd::Completed) => (TurnStatus::Completed, None),

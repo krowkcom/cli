@@ -39,6 +39,8 @@ pub struct Init {
     pub api_key_source: String,
     /// Each MCP server and its status, e.g. `krowk` / `connected`.
     pub mcp_servers: Vec<(String, String)>,
+    /// The permission mode it runs the turn in, e.g. `default`.
+    pub permission_mode: String,
 }
 
 /// How the turn ended, as `result` says.
@@ -222,6 +224,7 @@ fn init(msg: &Value) -> Init {
         tools: strings("tools"),
         capabilities: strings("capabilities"),
         api_key_source: str_of(msg, "apiKeySource").into(),
+        permission_mode: str_of(msg, "permissionMode").into(),
         mcp_servers: msg
             .get("mcp_servers")
             .and_then(Value::as_array)

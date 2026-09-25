@@ -377,3 +377,129 @@ fn r_inst_3_a_session_is_bound_to_its_instance_and_says_whether_it_bills_a_subsc
     assert_eq!(billed("claude:keyed/sonnet"), ("claude:keyed".to_string(), Some(Billing::ApiKey)));
     rt().block_on(host.shutdown());
 }
+
+/// Whether a process is still there. A zombie waiting for its parent to
+/// read it has already stopped, so it counts as gone.
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only asks whether the process exists.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    !stat.split(") ").nth(1).is_some_and(|rest| rest.starts_with('Z'))
+}
+
+fn gone_soon(pid: i32) -> bool {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < until {
+        if !alive(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+fn grandchild(fake_log: &str) -> i32 {
+    fake_log.lines().find_map(|l| l.strip_prefix("grandchild ")).expect("the fake started one").parse().unwrap()
+}
+
+#[test]
+fn r_back_1_claude_runs_in_krowks_mode_and_a_looser_one_is_stopped_before_it_runs_anything() {
+    let home = Home::new("mode");
+    let dir = home.signed_in("cfg");
+    // A settings file made Claude Code come up in acceptEdits.
+    let mut loose = home.instance(&dir, Some("session_info.jsonl"));
+    if let InstanceKind::ClaudeCode { env, .. } = &mut loose {
+        env.insert("FAKE_CLAUDE_PERMISSION_MODE".into(), "acceptEdits".into());
+    }
+    let host = home.host(vec![("claude", home.instance(&dir, None)), ("claude:loose", loose)], trust::allow_all());
+    rt().block_on(async {
+        let (_, r) = run(&host, prompt(None, "hello", "claude/sonnet", PermissionMode::Default)).await;
+        assert_eq!(r.unwrap().unwrap().status, TurnStatus::Completed);
+        let (_, r) = run(&host, prompt(None, "plan it", "claude/sonnet", PermissionMode::Plan)).await;
+        assert_eq!(r.unwrap().unwrap().status, TurnStatus::Completed);
+        let (lines, r) = run(&host, prompt(None, "what session is this?", "claude:loose/sonnet", PermissionMode::Default)).await;
+        let r = r.unwrap().unwrap();
+        assert_eq!(r.status, TurnStatus::Failed);
+        let e = r.error.unwrap();
+        assert_eq!(e.code, "backend_permission_mode");
+        assert!(e.message.contains("`acceptEdits`") && e.message.contains("`default`") && e.message.contains("permissions.defaultMode"), "{}", e.message);
+        assert!(completed(&lines).iter().all(|i| matches!(i, Item::UserText { .. })), "nothing ran: {:?}", completed(&lines));
+        // krowk in bypassPermissions allows any mode Claude Code reports.
+        let (_, r) = run(&host, prompt(None, "hello", "claude:loose/sonnet", PermissionMode::BypassPermissions)).await;
+        assert_eq!(r.unwrap().unwrap().status, TurnStatus::Completed);
+        host.shutdown().await;
+    });
+    let fake = home.fake_log();
+    let modes: Vec<&str> = fake.lines().filter_map(|l| l.strip_prefix("permission-mode ")).collect();
+    assert_eq!(modes, ["default", "plan", "default", "default"], "the mode is always named, so settings cannot pick it");
+    assert_eq!(fake.matches("\"tool_use_id\":\"toolu_fake_info\",\"type\":\"tool_result\"").count(), 1, "only the bypassPermissions turn got as far as a tool:\n{fake}");
+}
+
+#[test]
+fn r_back_1_what_claude_started_is_stopped_with_it() {
+    let home = Home::new("grandchild");
+    let dir = home.signed_in("cfg");
+    let host = home.host(vec![("claude", home.instance(&dir, Some("grandchild.jsonl")))], trust::allow_all());
+    rt().block_on(async {
+        let (_, r) = run(&host, prompt(None, "start a server", "claude/sonnet", PermissionMode::BypassPermissions)).await;
+        assert_eq!(r.unwrap().unwrap().status, TurnStatus::Completed);
+        let pid = grandchild(&home.fake_log());
+        assert!(alive(pid), "the background process runs while the session does");
+        host.shutdown().await;
+        assert!(gone_soon(pid), "shutdown stopped Claude Code's whole process group");
+    });
+}
+
+#[test]
+fn r_back_5_a_claude_that_crashes_mid_turn_fails_the_turn_and_the_session_resumes() {
+    let home = Home::new("crash");
+    let dir = home.signed_in("cfg");
+    let host = home.host(vec![("claude", home.instance(&dir, Some("crash.jsonl")))], trust::allow_all());
+    rt().block_on(async {
+        // The crash leaves a background process holding Claude Code's
+        // output open: the exit is noticed anyway, and the group stopped.
+        let (_, r) = run(&host, prompt(None, "do the thing", "claude/sonnet", PermissionMode::Default)).await;
+        let first = r.unwrap().unwrap();
+        assert_eq!(first.status, TurnStatus::Failed);
+        let e = first.error.clone().unwrap();
+        assert_eq!(e.code, "backend_exited");
+        assert!(e.message.contains("--resume"), "{}", e.message);
+        assert_eq!(first.result, "Starting on it", "what streamed before the crash is kept");
+        assert!(gone_soon(grandchild(&home.fake_log())), "what the crashed process started is stopped");
+        // The session is kept, and its next turn resumes the Claude session.
+        let (_, r) = run(&host, prompt(Some(&first.session_id), "go on", "claude/sonnet", PermissionMode::Default)).await;
+        let next = r.unwrap().unwrap();
+        assert_eq!((next.status, next.result.as_str()), (TurnStatus::Completed, "Picked up where it stopped."));
+        host.shutdown().await;
+        let turns: Vec<TurnStatus> = home.events(&first.session_id).iter().filter_map(|e| if let LogBody::TurnCompleted { status, .. } = e.body { Some(status) } else { None }).collect();
+        assert_eq!(turns, [TurnStatus::Failed, TurnStatus::Completed]);
+    });
+    let fake = home.fake_log();
+    assert!(fake.contains("crash") && fake.contains(&format!("resume {VENDOR_SESSION}")), "{fake}");
+    assert_eq!(processes(&fake), 2);
+}
+
+#[test]
+fn a_long_lived_host_lets_go_of_an_idle_sessions_claude() {
+    let home = Home::new("idle");
+    let dir = home.signed_in("cfg");
+    let host = home.host(vec![("claude", home.instance(&dir, None))], trust::allow_all()).with_backend_idle(std::time::Duration::ZERO);
+    rt().block_on(async {
+        let (_, r) = run(&host, prompt(None, "first", "claude/sonnet", PermissionMode::Default)).await;
+        let a = r.unwrap().unwrap().session_id;
+        assert_eq!(home.fake_log().lines().filter(|l| *l == "eof").count(), 0, "kept after its turn");
+        // Another session's prompt sweeps the idle one away.
+        let (_, r) = run(&host, prompt(None, "second", "claude/sonnet", PermissionMode::Default)).await;
+        assert_eq!(r.unwrap().unwrap().status, TurnStatus::Completed);
+        assert_eq!(home.fake_log().lines().filter(|l| *l == "eof").count(), 1, "the idle process was let go cleanly");
+        // And the idle session comes back on --resume.
+        let (_, r) = run(&host, prompt(Some(&a), "again", "claude/sonnet", PermissionMode::Default)).await;
+        assert_eq!(r.unwrap().unwrap().status, TurnStatus::Completed);
+        host.shutdown().await;
+    });
+    let fake = home.fake_log();
+    assert_eq!(processes(&fake), 3);
+    assert!(fake.contains(&format!("resume {VENDOR_SESSION}")));
+}

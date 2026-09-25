@@ -4,7 +4,7 @@
 //! a replacement that could land in two places is a guess, and a guess
 //! that lands wrong is worse than a refusal the model reads and fixes.
 
-use super::{open_regular, resolve};
+use super::{Scope, open_regular, write_atomic};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -57,8 +57,11 @@ pub struct SearchReplaceInput {
     pub replace_all: Option<bool>,
 }
 
-pub(super) fn write(i: &WriteInput, cwd: &Path) -> (String, bool) {
-    let path = resolve(cwd, &i.path);
+pub(super) fn write(i: &WriteInput, scope: &Scope) -> (String, bool) {
+    let path = match scope.path(&i.path) {
+        Ok(p) => p,
+        Err(e) => return (e, true),
+    };
     let existed = match std::fs::metadata(&path) {
         Ok(m) if m.is_file() => true,
         Ok(_) => return (format!("{} is not a regular file (a directory, a device or a pipe), which write does not replace", path.display()), true),
@@ -70,7 +73,7 @@ pub(super) fn write(i: &WriteInput, cwd: &Path) -> (String, bool) {
     {
         return (format!("{} could not be created: {e}", parent.display()), true);
     }
-    if let Err(e) = std::fs::write(&path, &i.content) {
+    if let Err(e) = write_atomic(&path, i.content.as_bytes()) {
         return (format!("{} could not be written: {e}", path.display()), true);
     }
     let lines = i.content.lines().count();
@@ -104,8 +107,11 @@ pub(super) fn read_text(path: &Path, tool: &str) -> Result<String, String> {
     String::from_utf8(raw).map_err(|_| format!("{} is not UTF-8 text, which {tool} does not edit — change it with bash instead", path.display()))
 }
 
-pub(super) fn replace(r: &Replace<'_>, cwd: &Path) -> (String, bool) {
-    let path = resolve(cwd, r.path);
+pub(super) fn replace(r: &Replace<'_>, scope: &Scope) -> (String, bool) {
+    let path = match scope.path(r.path) {
+        Ok(p) => p,
+        Err(e) => return (e, true),
+    };
     if r.old.is_empty() {
         return (format!("{} is empty — say which text to replace; to create a file, use write", r.old_name), true);
     }
@@ -148,7 +154,7 @@ pub(super) fn replace(r: &Replace<'_>, cwd: &Path) -> (String, bool) {
     }
     let first_line = line_of(at[0]);
     let updated = if r.replace_all { text.replace(old.as_str(), &new) } else { text.replacen(old.as_str(), &new, 1) };
-    if let Err(e) = std::fs::write(&path, &updated) {
+    if let Err(e) = write_atomic(&path, updated.as_bytes()) {
         return (format!("{} could not be written: {e}", path.display()), true);
     }
     let what = if at.len() == 1 { "1 occurrence".to_string() } else { format!("{} occurrences", at.len()) };

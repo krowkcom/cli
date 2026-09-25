@@ -94,9 +94,15 @@ the versions are the `v*` tags a release is cut from. Entries land under
   and `glob` skip what `.gitignore` excludes and never search binary
   files. `write` and the edit tools run only under `--permission-mode
   acceptEdits` or `bypassPermissions` until permission rules land; in the
-  default mode the model is told it may not. Each turn's `context.jsonl`
+  default mode the model is told it may not. Every file tool — `read`,
+  `grep` and `glob` included — reaches only inside the working directory,
+  judged by where a path really leads (`..`, absolute paths and symlinks
+  that point out are refused), unless krowk runs with `bypassPermissions`.
+  Edits are written to a temporary file and renamed into place, keeping
+  the file's permissions, so a failure never leaves half a file. Each turn's `context.jsonl`
   record now names its `toolset` and estimates the system prompt's and
-  tools' size in tokens (`systemTokens`, `toolsTokens`).
+  tools' size in tokens (`systemTokens`, `toolsTokens`, at four bytes a
+  token).
 - **Native sessions are logs you own, listed beside imported ones.** Each
   session is an append-only JSONL log under
   `~/.local/share/krowk/sessions/<id>/` (with each turn's exact system

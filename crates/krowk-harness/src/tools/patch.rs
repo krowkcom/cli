@@ -27,7 +27,7 @@
 //! elsewhere; the runner takes either shape.
 
 use super::edit::read_text;
-use super::resolve;
+use super::{Scope, commit, stage};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -106,12 +106,15 @@ fn parse(patch: &str) -> Result<Vec<Hunk>, String> {
     let mut hunks = Vec::new();
     let mut i = 0;
     let at = |i: usize| i + 2;
+    // A hunk header is read with the whitespace around it trimmed, as
+    // Codex reads it: a model indents one more often than it means to.
+    let header = |l: &str| [ADD, DELETE, UPDATE].iter().any(|h| l.trim_start().starts_with(h));
     while i < body.len() {
-        let line = body[i];
+        let line = body[i].trim();
         if let Some(path) = line.strip_prefix(ADD) {
             i += 1;
             let mut added = Vec::new();
-            while i < body.len() && !body[i].starts_with("***") {
+            while i < body.len() && !header(body[i]) {
                 match body[i].strip_prefix('+') {
                     Some(l) => added.push(l.to_string()),
                     None => return Err(format!("line {}: every line of an added file starts with `+`, and {:?} does not", at(i), body[i])),
@@ -126,17 +129,17 @@ fn parse(patch: &str) -> Result<Vec<Hunk>, String> {
             let start = i;
             i += 1;
             let mut move_to = None;
-            if let Some(to) = body.get(i).and_then(|l| l.strip_prefix(MOVE)) {
+            if let Some(to) = body.get(i).and_then(|l| l.trim().strip_prefix(MOVE)) {
                 move_to = Some(to.trim().to_string());
                 i += 1;
             }
             let mut chunks: Vec<Chunk> = Vec::new();
-            while i < body.len() && !(body[i].starts_with("***") && body[i] != EOF) {
-                let l = body[i];
+            while i < body.len() && !header(body[i]) {
+                let l = body[i].trim_end_matches('\r');
                 if l == "@@" || l.starts_with("@@ ") {
                     let ctx = l.strip_prefix("@@").unwrap_or_default().trim();
                     chunks.push(Chunk { context: (!ctx.is_empty()).then(|| ctx.to_string()), ..Chunk::default() });
-                } else if l == EOF {
+                } else if l.trim() == EOF {
                     match chunks.last_mut() {
                         Some(c) => c.eof = true,
                         None => return Err(format!("line {}: `{EOF}` before any change", at(i))),
@@ -307,7 +310,7 @@ pub(super) fn input_text(input: &serde_json::Value) -> Result<String, String> {
     }
 }
 
-pub(super) fn apply(patch: &str, cwd: &Path) -> (String, bool) {
+pub(super) fn apply(patch: &str, scope: &Scope) -> (String, bool) {
     let hunks = match parse(patch) {
         Ok(h) => h,
         Err(e) => return (format!("the patch did not parse, so nothing was changed: {e}"), true),
@@ -324,10 +327,16 @@ pub(super) fn apply(patch: &str, cwd: &Path) -> (String, bool) {
         }
     };
     let fail = |e: String| (format!("the patch does not apply, so nothing was changed: {e}"), true);
+    // Every path the patch names, Move targets included, is held to the
+    // same scope as any other file tool.
+    let at = |path: &str| scope.path(path);
     for h in &hunks {
         match h {
             Hunk::Add { path, lines } => {
-                let p = resolve(cwd, path);
+                let p = match at(path) {
+                    Ok(p) => p,
+                    Err(e) => return fail(e),
+                };
                 if files.get(&p).is_some_and(Option::is_some) || (!files.contains_key(&p) && p.exists()) {
                     return fail(format!("{} already exists — change it with `{UPDATE}{path}`", p.display()));
                 }
@@ -335,17 +344,27 @@ pub(super) fn apply(patch: &str, cwd: &Path) -> (String, bool) {
                 summary.push(format!("A {path}"));
             }
             Hunk::Delete { path } => {
-                let p = resolve(cwd, path);
-                match current(&files, &p) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => return fail(format!("{} does not exist, so it cannot be deleted", p.display())),
+                let p = match at(path) {
+                    Ok(p) => p,
                     Err(e) => return fail(e),
+                };
+                // Deleted unread: a binary or a huge file goes as readily as
+                // any other.
+                let exists = match files.get(&p) {
+                    Some(state) => state.is_some(),
+                    None => std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file() || m.file_type().is_symlink()),
+                };
+                if !exists {
+                    return fail(format!("{} does not exist as a file, so it cannot be deleted", p.display()));
                 }
                 files.insert(p, None);
                 summary.push(format!("D {path}"));
             }
             Hunk::Update { path, move_to, chunks } => {
-                let p = resolve(cwd, path);
+                let p = match at(path) {
+                    Ok(p) => p,
+                    Err(e) => return fail(e),
+                };
                 let text = match current(&files, &p) {
                     Ok(Some(t)) => t,
                     Ok(None) => return fail(format!("{} does not exist — create it with `{ADD}{path}`", p.display())),
@@ -358,7 +377,10 @@ pub(super) fn apply(patch: &str, cwd: &Path) -> (String, bool) {
                 };
                 match move_to {
                     Some(to) => {
-                        let dst = resolve(cwd, to);
+                        let dst = match at(to) {
+                            Ok(p) => p,
+                            Err(e) => return fail(e),
+                        };
                         if dst != p && (files.get(&dst).is_some_and(Option::is_some) || (!files.contains_key(&dst) && dst.exists())) {
                             return fail(format!("{} already exists, so {path} cannot be moved there", dst.display()));
                         }
@@ -376,15 +398,35 @@ pub(super) fn apply(patch: &str, cwd: &Path) -> (String, bool) {
     }
     // Written only now that all of it applies. Deletions last, so a move
     // whose write fails leaves the original in place.
+    // Every new content is staged in a temporary file beside its target
+    // first; only when all are staged is each renamed into place, so a full
+    // disk or a read-only directory fails the patch with nothing changed.
     let (writes, deletes): (Vec<_>, Vec<_>) = files.into_iter().partition(|(_, s)| s.is_some());
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let unstage = |staged: &[(PathBuf, PathBuf)]| {
+        for (tmp, _) in staged {
+            let _ = std::fs::remove_file(tmp);
+        }
+    };
     for (p, text) in writes {
         let text = text.expect("partitioned");
         if let Some(parent) = p.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
-            return (format!("{} could not be created: {e}", parent.display()), true);
+            unstage(&staged);
+            return (format!("{} could not be created, so nothing was changed: {e}", parent.display()), true);
         }
-        if let Err(e) = std::fs::write(&p, text) {
+        match stage(&p, text.as_bytes()) {
+            Ok(tmp) => staged.push((tmp, p)),
+            Err(e) => {
+                unstage(&staged);
+                return (format!("{} could not be written, so nothing was changed: {e}", p.display()), true);
+            }
+        }
+    }
+    for (n, (tmp, p)) in staged.iter().enumerate() {
+        if let Err(e) = commit(tmp, p) {
+            unstage(&staged[n + 1..]);
             return (format!("{} could not be written: {e} — the patch is partly applied; read the files it names before patching again", p.display()), true);
         }
     }
@@ -424,6 +466,12 @@ mod tests {
         assert_eq!(chunks[0].old, ["    keep", "    old", ""]);
         assert_eq!(chunks[0].new, ["    keep", "    new", ""]);
         assert!(chunks[1].eof && chunks[1].context.is_none());
+        // Headers indented or trailed by whitespace are still headers, as
+        // Codex reads them.
+        let indented = parse("*** Begin Patch\n  *** Update File: a.rs  \n-x\n+y\n   *** Delete File: b.rs\n *** End Patch").unwrap();
+        assert_eq!(indented.len(), 2);
+        assert!(matches!(&indented[0], Hunk::Update { path, .. } if path == "a.rs"));
+        assert_eq!(indented[1], Hunk::Delete { path: "b.rs".into() });
         // Wrapped in the heredoc a model saw in training, it means the same.
         assert_eq!(parse("apply_patch <<'EOF'\n*** Begin Patch\n*** Delete File: x\n*** End Patch\nEOF").unwrap(), vec![Hunk::Delete { path: "x".into() }]);
         for (bad, says) in [
@@ -458,6 +506,10 @@ mod tests {
         // The @@ context picked the second `let x = 1;`, not the first.
         assert_eq!(std::fs::read_to_string(d.join("b.rs")).unwrap(), "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n\nfn other() {\n    let x = 2;\n}\n");
         assert!(!d.join("a.rs").exists() && !d.join("gone.txt").exists());
+        // A file too binary to edit is still deletable: a Delete never reads it.
+        std::fs::write(d.join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+        let (out, err) = run(APPLY_PATCH, &json!("*** Begin Patch\n*** Delete File: blob.bin\n*** End Patch"), &env(&d)).await;
+        assert!(!err && !d.join("blob.bin").exists(), "{out}");
 
         // The freeform shape: the call's input is the patch itself. Lines
         // that differ only in trailing whitespace and typographic quotes

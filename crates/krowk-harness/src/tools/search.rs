@@ -10,7 +10,7 @@
 //! the output are capped, so a search from `/` costs a bounded wait and a
 //! bounded answer.
 
-use super::{open_regular, resolve};
+use super::{Scope, open_regular};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -67,9 +67,27 @@ struct Walk {
 /// The files under `root` git would show, or every file when `root` is
 /// not in a work tree.
 fn walk(root: &Path, deadline: Instant) -> Walk {
-    let mut w = git_files(root).unwrap_or_else(|| plain_walk(root, deadline));
+    // A directory git ignores, searched by name, is searched whole: asking
+    // for it is the point (ripgrep's rule too).
+    let listed = if ignored(root) { None } else { git_files(root) };
+    let mut w = listed.unwrap_or_else(|| plain_walk(root, deadline));
     w.files.sort();
     w
+}
+
+/// Whether git ignores `root` itself, or a directory it is in.
+fn ignored(root: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("check-ignore")
+        .arg("-q")
+        .arg("--")
+        .arg(root)
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn git_files(root: &Path) -> Option<Walk> {
@@ -135,8 +153,11 @@ fn shown(cwd: &Path, p: &Path) -> String {
 }
 
 /// A search root that must be a directory.
-fn dir_root(cwd: &Path, path: Option<&str>, tool: &str) -> Result<PathBuf, String> {
-    let root = path.map_or_else(|| cwd.to_path_buf(), |p| resolve(cwd, p));
+fn dir_root(scope: &Scope, path: Option<&str>, tool: &str) -> Result<PathBuf, String> {
+    let root = match path {
+        Some(p) => scope.path(p)?,
+        None => scope.cwd.clone(),
+    };
     match std::fs::metadata(&root) {
         Ok(m) if m.is_dir() => Ok(root),
         Ok(_) => Err(format!("{} is not a directory, which {tool} searches", root.display())),
@@ -144,17 +165,28 @@ fn dir_root(cwd: &Path, path: Option<&str>, tool: &str) -> Result<PathBuf, Strin
     }
 }
 
-pub(super) fn glob(i: &GlobInput, cwd: &Path) -> (String, bool) {
+pub(super) fn glob(i: &GlobInput, scope: &Scope) -> (String, bool) {
+    let cwd = scope.cwd.as_path();
     let matcher = match Glob::new(&i.pattern) {
         Ok(m) => m,
         Err(e) => return (e, true),
     };
-    let root = match dir_root(cwd, i.path.as_deref(), "glob") {
+    let root = match dir_root(scope, i.path.as_deref(), "glob") {
         Ok(r) => r,
         Err(e) => return (e, true),
     };
-    let w = walk(&root, Instant::now() + WALK_DEADLINE);
-    let hits: Vec<&PathBuf> = w.files.iter().filter(|f| matcher.matches(f)).collect();
+    let deadline = Instant::now() + WALK_DEADLINE;
+    let mut w = walk(&root, deadline);
+    let mut hits: Vec<&PathBuf> = Vec::new();
+    for f in &w.files {
+        if Instant::now() > deadline {
+            w.truncated = true;
+            break;
+        }
+        if matcher.matches(f) {
+            hits.push(f);
+        }
+    }
     if hits.is_empty() {
         return (format!("no files match {:?} under {}{}", i.pattern, root.display(), if w.truncated { " (the walk stopped at its cap)" } else { "" }), false);
     }
@@ -176,7 +208,8 @@ fn binary(head: &[u8]) -> bool {
     head[..head.len().min(SNIFF)].contains(&0)
 }
 
-pub(super) fn grep(i: &GrepInput, cwd: &Path) -> (String, bool) {
+pub(super) fn grep(i: &GrepInput, scope: &Scope) -> (String, bool) {
+    let cwd = scope.cwd.as_path();
     let re = match regex_lite::RegexBuilder::new(&i.pattern).case_insensitive(i.ignore_case.unwrap_or(false)).build() {
         Ok(r) => r,
         Err(e) => return (format!("the pattern is not a valid regular expression: {e}"), true),
@@ -185,7 +218,10 @@ pub(super) fn grep(i: &GrepInput, cwd: &Path) -> (String, bool) {
         Ok(f) => f,
         Err(e) => return (e, true),
     };
-    let target = i.path.as_deref().map_or_else(|| cwd.to_path_buf(), |p| resolve(cwd, p));
+    let target = match i.path.as_deref().map(|p| scope.path(p)).transpose() {
+        Ok(t) => t.unwrap_or_else(|| cwd.to_path_buf()),
+        Err(e) => return (e, true),
+    };
     let deadline = Instant::now() + WALK_DEADLINE;
     // One named file is searched whatever git thinks of it, and refused
     // when it is binary; a directory is walked.
@@ -211,10 +247,13 @@ pub(super) fn grep(i: &GrepInput, cwd: &Path) -> (String, bool) {
     };
     let mut out = String::new();
     let (mut matches, mut full) = (0usize, false);
-    for rel in files.iter().filter(|f| filter.as_ref().is_none_or(|g| g.matches(f))) {
+    for rel in &files {
         if Instant::now() > deadline {
             truncated = true;
             break;
+        }
+        if filter.as_ref().is_some_and(|g| !g.matches(rel)) {
+            continue;
         }
         let path = root.join(rel);
         let Ok((f, size)) = open_regular(&path) else { continue };
@@ -316,33 +355,73 @@ fn expand(p: &str, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Matches one alternative against a path. `*` and `?` stay within a
-/// segment; `**` spans any number of them, including none.
+/// Matches one alternative against a path, segment by segment: `**` as a
+/// whole segment spans any number of segments, including none; `*` and
+/// `?` stay within one. Both levels backtrack only to the last star, so a
+/// pattern costs at most the product of the two lengths — never the
+/// exponential a recursive matcher pays on `*a*a*a…b`.
 fn glob_match(p: &[char], s: &[char]) -> bool {
-    match p.first() {
-        None => s.is_empty(),
-        Some('*') if p.get(1) == Some(&'*') => {
-            // `**/` matches zero or more whole segments; a trailing `**`
-            // matches everything left.
-            let rest = if p.get(2) == Some(&'/') { &p[3..] } else { &p[2..] };
-            if rest.is_empty() {
-                return true;
-            }
-            if glob_match(rest, s) {
-                return true;
-            }
-            (0..s.len()).any(|i| s[i] == '/' && glob_match(rest, &s[i + 1..]))
+    let pats: Vec<&[char]> = p.split(|c| *c == '/').collect();
+    let segs: Vec<&[char]> = s.split(|c| *c == '/').collect();
+    let (mut pi, mut si) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while si < segs.len() {
+        if pi < pats.len() && pats[pi] == ['*', '*'] {
+            star = Some((pi, si));
+            pi += 1;
+            continue;
         }
-        Some('*') => (0..=s.len()).take_while(|&i| i == 0 || s[i - 1] != '/').any(|i| glob_match(&p[1..], &s[i..])),
-        Some('?') => s.first().is_some_and(|c| *c != '/') && glob_match(&p[1..], &s[1..]),
-        Some('[') => match (class(p), s.first()) {
-            (Some((hit, len)), Some(c)) if *c != '/' => hit(*c) && glob_match(&p[len..], &s[1..]),
-            (Some(_), _) => false,
-            (None, Some('[')) => glob_match(&p[1..], &s[1..]),
-            (None, _) => false,
-        },
-        Some(c) => s.first() == Some(c) && glob_match(&p[1..], &s[1..]),
+        if pi < pats.len() && segment_match(pats[pi], segs[si]) {
+            pi += 1;
+            si += 1;
+            continue;
+        }
+        match star {
+            // The last `**` takes one more segment, and the rest is tried again.
+            Some((sp, ss)) => {
+                star = Some((sp, ss + 1));
+                pi = sp + 1;
+                si = ss + 1;
+            }
+            None => return false,
+        }
     }
+    pats[pi..].iter().all(|p| *p == ['*', '*'])
+}
+
+/// One segment against one pattern segment: `*`, `?`, `[…]` and literals.
+fn segment_match(p: &[char], s: &[char]) -> bool {
+    let (mut pi, mut si) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while si < s.len() {
+        let step = match p.get(pi) {
+            Some('*') => {
+                star = Some((pi, si));
+                pi += 1;
+                continue;
+            }
+            Some('?') => Some(1),
+            Some('[') => match class(&p[pi..]) {
+                Some((hit, len)) => hit(s[si]).then_some(len),
+                None => (s[si] == '[').then_some(1),
+            },
+            Some(c) => (*c == s[si]).then_some(1),
+            None => None,
+        };
+        match (step, star) {
+            (Some(len), _) => {
+                pi += len;
+                si += 1;
+            }
+            (None, Some((sp, ss))) => {
+                star = Some((sp, ss + 1));
+                pi = sp + 1;
+                si = ss + 1;
+            }
+            (None, None) => return false,
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
 }
 
 type ClassFn = Box<dyn Fn(char) -> bool>;
@@ -396,6 +475,24 @@ mod tests {
         assert!(m("file?.txt", "file1.txt") && !m("file?.txt", "file12.txt"));
         assert!(m("[ab]*.md", "b.md") && !m("[!ab]*.md", "a.md") && m("[a-c]x", "cx"));
         assert!(Glob::new("{a,b").is_err() && Glob::new(" ").is_err());
+        assert!(m("a/**/b/**/c.txt", "a/x/b/y/z/c.txt") && !m("a/**/b/**/c.txt", "a/x/c.txt"));
+        assert!(m("*a*b", "xxaxxb") && !m("*a*b", "xxaxxc") && m("**", "any/depth/at/all"));
+    }
+
+    #[test]
+    fn a_pathological_glob_costs_linear_time_not_exponential() {
+        // `*a` ten times then `*b`, against a long name of `a`s with no b: a
+        // recursive matcher takes seconds per file on this.
+        let pattern = format!("{}*b", "*a".repeat(10));
+        let deep = format!("{}/**/{}", "**/".repeat(10).trim_end_matches('/'), pattern);
+        let name = "a".repeat(200);
+        let path = format!("{}/{name}", vec!["d"; 50].join("/"));
+        let started = Instant::now();
+        for _ in 0..100 {
+            assert!(!m(&pattern, &name));
+            assert!(!m(&deep, &path));
+        }
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
     fn git_repo(name: &str) -> Option<PathBuf> {
@@ -444,6 +541,9 @@ mod tests {
         assert_eq!(run(GLOB, &json!({"pattern": "*", "path": "src/nested"}), &e).await.0, "src/nested/.gitignore\nsrc/nested/lib.rs\n");
         assert!(run(GLOB, &json!({"pattern": "*.log"}), &e).await.0.starts_with("no files match"));
         assert!(run(GLOB, &json!({"pattern": "*", "path": "src/main.rs"}), &e).await.0.contains("not a directory"));
+        // A directory git ignores, named outright, is searched whole.
+        assert_eq!(run(GREP, &json!({"pattern": "TODO", "path": "target"}), &e).await.0, "target/out.rs:1:// TODO built\n");
+        assert_eq!(run(GLOB, &json!({"pattern": "*.rs", "path": "target"}), &e).await.0, "target/out.rs\n");
         // An untracked, unignored file is found as soon as it exists.
         std::fs::write(d.join("src/fresh.rs"), "// TODO fresh\n").unwrap();
         assert!(run(GLOB, &json!({"pattern": "src/*.rs"}), &e).await.0.contains("src/fresh.rs"));

@@ -181,7 +181,7 @@ async fn blocking(f: impl FnOnce() -> (String, bool) + Send + 'static) -> (Strin
 /// Runs one call. Returns the output and whether it is an error.
 pub async fn run(name: &str, input: &Value, env: &ToolEnv<'_>) -> (String, bool) {
     let may_edit = matches!(env.permission_mode, PermissionMode::AcceptEdits | PermissionMode::BypassPermissions);
-    let cwd = env.cwd.to_path_buf();
+    let scope = Scope::new(env);
     let is_edit = [WRITE, STR_REPLACE, APPLY_PATCH, SEARCH_REPLACE].contains(&name);
     if is_edit && name != WRITE && name != env.edit.name() {
         return (format!("there is no tool named {name:?} in this session — edit files with {}", env.edit.name()), true);
@@ -191,17 +191,17 @@ pub async fn run(name: &str, input: &Value, env: &ToolEnv<'_>) -> (String, bool)
     }
     match name {
         READ => match parse_input::<ReadInput>(name, input) {
-            Ok(i) => read(&i, env.cwd).await,
+            Ok(i) => read(&i, &scope).await,
             Err(e) => e,
         },
         WRITE => match parse_input::<WriteInput>(name, input) {
-            Ok(i) => blocking(move || edit::write(&i, &cwd)).await,
+            Ok(i) => blocking(move || edit::write(&i, &scope)).await,
             Err(e) => e,
         },
         STR_REPLACE => match parse_input::<StrReplaceInput>(name, input) {
             Ok(i) => blocking(move || {
                 let r = edit::Replace { tool: STR_REPLACE, old_name: "old_str", path: &i.path, old: &i.old_str, new: &i.new_str, replace_all: i.replace_all.unwrap_or(false) };
-                edit::replace(&r, &cwd)
+                edit::replace(&r, &scope)
             })
             .await,
             Err(e) => e,
@@ -209,21 +209,21 @@ pub async fn run(name: &str, input: &Value, env: &ToolEnv<'_>) -> (String, bool)
         SEARCH_REPLACE => match parse_input::<SearchReplaceInput>(name, input) {
             Ok(i) => blocking(move || {
                 let r = edit::Replace { tool: SEARCH_REPLACE, old_name: "old_string", path: &i.file_path, old: &i.old_string, new: &i.new_string, replace_all: i.replace_all.unwrap_or(false) };
-                edit::replace(&r, &cwd)
+                edit::replace(&r, &scope)
             })
             .await,
             Err(e) => e,
         },
         APPLY_PATCH => match patch::input_text(input) {
-            Ok(text) => blocking(move || patch::apply(&text, &cwd)).await,
+            Ok(text) => blocking(move || patch::apply(&text, &scope)).await,
             Err(e) => (format!("invalid input for apply_patch: {e}"), true),
         },
         GREP => match parse_input::<GrepInput>(name, input) {
-            Ok(i) => blocking(move || search::grep(&i, &cwd)).await,
+            Ok(i) => blocking(move || search::grep(&i, &scope)).await,
             Err(e) => e,
         },
         GLOB => match parse_input::<GlobInput>(name, input) {
-            Ok(i) => blocking(move || search::glob(&i, &cwd)).await,
+            Ok(i) => blocking(move || search::glob(&i, &scope)).await,
             Err(e) => e,
         },
         BASH => match parse_input::<BashInput>(name, input) {
@@ -243,14 +243,144 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
 }
 
+/// Where the file tools may reach. Until the permission system lands
+/// (ticket 9 adds more directories, and asking), that is the working
+/// directory and what is under it, unless permissions are bypassed: a path
+/// is judged by where it really leads — `..`, an absolute path, a symlinked
+/// directory or file, a dangling symlink a write would follow — never by
+/// how it is spelled.
+#[derive(Debug, Clone)]
+pub(crate) struct Scope {
+    pub cwd: PathBuf,
+    pub bypass: bool,
+}
+
+/// Symlinks followed at most while resolving one path: a loop is refused,
+/// not followed forever.
+const MAX_LINKS: usize = 40;
+
+impl Scope {
+    fn new(env: &ToolEnv<'_>) -> Scope {
+        Scope { cwd: env.cwd.to_path_buf(), bypass: env.permission_mode == PermissionMode::BypassPermissions }
+    }
+
+    /// The path a tool was given, resolved against the working directory,
+    /// or why the tool may not touch it. The path is returned as spelled
+    /// (joined to the working directory), so messages name what the model
+    /// asked for; the check is on where it leads.
+    pub fn path(&self, path: &str) -> Result<PathBuf, String> {
+        let p = resolve(&self.cwd, path);
+        if self.bypass {
+            return Ok(p);
+        }
+        let root = self.cwd.canonicalize().map_err(|e| format!("the working directory {} cannot be resolved: {e}", self.cwd.display()))?;
+        let real = real_path(&p, 0).map_err(|e| format!("{} cannot be resolved: {e}", p.display()))?;
+        if real.starts_with(&root) {
+            return Ok(p);
+        }
+        let leads = if real == p { String::new() } else { format!(" (it leads to {})", real.display()) };
+        Err(format!(
+            "{}{leads} is outside the working directory {}: until krowk's permission rules land, the file tools reach only inside it unless krowk is started with `--permission-mode bypassPermissions`",
+            p.display(),
+            root.display()
+        ))
+    }
+}
+
+/// Where a path leads once every symlink in it is followed, for a path
+/// that need not exist yet: the nearest part that exists is canonicalized,
+/// and the rest, which cannot hold a symlink, is appended. A dangling
+/// symlink is followed to where it points, since a write through it would
+/// create that.
+fn real_path(p: &Path, links: usize) -> Result<PathBuf, String> {
+    use std::path::Component;
+    if links > MAX_LINKS {
+        return Err("too many levels of symbolic links".into());
+    }
+    if let Ok(c) = p.canonicalize() {
+        return Ok(c);
+    }
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_symlink() => {
+            let target = std::fs::read_link(p).map_err(|e| e.to_string())?;
+            let target = if target.is_absolute() { target } else { p.parent().unwrap_or(Path::new("/")).join(target) };
+            real_path(&target, links + 1)
+        }
+        Ok(_) => Err("it exists but cannot be resolved".into()),
+        Err(_) => {
+            let parent = p.parent().ok_or("no parent directory")?;
+            let base = real_path(parent, links)?;
+            match p.components().next_back() {
+                Some(Component::ParentDir) => Ok(base.parent().map(Path::to_path_buf).unwrap_or(base)),
+                Some(Component::CurDir) | None => Ok(base),
+                Some(c) => Ok(base.join(c.as_os_str())),
+            }
+        }
+    }
+}
+
+/// Replaces a file's content as one step: written to a temporary file
+/// beside it, given the old file's permissions, then renamed over it, so a
+/// crash or a full disk never leaves half a file. A symlink is written
+/// through, as a plain write would be: the link stays a link.
+pub(crate) fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let tmp = stage(path, content)?;
+    commit(&tmp, path)
+}
+
+/// The first half of `write_atomic`: the temporary file, written and
+/// flushed, ready to rename. A patch stages every file before it renames any.
+pub(crate) fn stage(path: &Path, content: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let target = target_of(path);
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.krowk-{}-{}.tmp", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(content)?;
+        if let Ok(m) = std::fs::metadata(&target) {
+            f.set_permissions(m.permissions())?;
+        }
+        f.sync_data()
+    })();
+    match written {
+        Ok(()) => Ok(tmp),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Renames a staged file over its target.
+pub(crate) fn commit(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, target_of(path)).inspect_err(|_| {
+        let _ = std::fs::remove_file(tmp);
+    })
+}
+
+/// The file a write lands in: through a symlink, when the path is one.
+fn target_of(path: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return path.canonicalize().or_else(|_| real_path(path, 0).map_err(std::io::Error::other)).unwrap_or_else(|_| path.to_path_buf());
+    }
+    path.to_path_buf()
+}
+
 /// Read scans at most this much of a file: a line count past it is not worth
 /// the wait, and nothing past it is shown.
 const READ_MAX_SCAN: u64 = 64 << 20;
 
 /// Off the async runtime: a read is blocking file I/O, and the runtime also
 /// has to hear an interrupt while it runs.
-async fn read(i: &ReadInput, cwd: &Path) -> (String, bool) {
-    let path = resolve(cwd, &i.path);
+async fn read(i: &ReadInput, scope: &Scope) -> (String, bool) {
+    let path = match scope.path(&i.path) {
+        Ok(p) => p,
+        Err(e) => return (e, true),
+    };
     // Both come from the model: clamped, so no value overflows the arithmetic.
     let (start, limit) = (i.offset.unwrap_or(1).clamp(1, usize::MAX / 2), i.limit.unwrap_or(READ_DEFAULT_LINES).clamp(1, usize::MAX / 2));
     tokio::task::spawn_blocking(move || read_file(&path, start, limit))
@@ -541,6 +671,79 @@ mod tests {
         assert_eq!(definitions(&toolset("claude", true)), definitions(&toolset("claude", false)));
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn r_tool_1_file_tools_stay_inside_the_working_directory_unless_bypassed() {
+        use std::os::unix::fs::symlink;
+        let base = dir("scope");
+        let (cwd, outside) = (base.join("cwd"), base.join("outside"));
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+        std::fs::write(cwd.join("a.txt"), "a\n").unwrap();
+        symlink(outside.join("secret.txt"), cwd.join("file-link")).unwrap();
+        symlink(&outside, cwd.join("dir-link")).unwrap();
+        symlink(outside.join("not-yet.txt"), cwd.join("dangling")).unwrap();
+        symlink(cwd.join("a.txt"), cwd.join("inside-link")).unwrap();
+        let env = ToolEnv { cwd: &cwd, permission_mode: PermissionMode::AcceptEdits, edit: EditTool::ApplyPatch };
+        let refused = |r: (String, bool)| r.1 && r.0.contains("outside the working directory") && r.0.contains("bypassPermissions");
+        let abs = outside.join("new.txt").display().to_string();
+        for path in ["../outside/new.txt", abs.as_str(), "dir-link/new.txt", "dangling", "file-link", "sub/../../outside/x", "new/../../x"] {
+            assert!(refused(run(WRITE, &json!({"path": path, "content": "x"}), &env).await), "write {path}");
+        }
+        assert!(!outside.join("new.txt").exists() && !outside.join("not-yet.txt").exists() && !base.join("x").exists());
+        assert!(refused(run(READ, &json!({"path": "file-link"}), &env).await), "a symlinked file is judged by its target");
+        assert!(refused(run(READ, &json!({"path": "../outside/secret.txt"}), &env).await));
+        let edit = ToolEnv { edit: EditTool::StrReplace, ..env };
+        assert!(refused(run(STR_REPLACE, &json!({"path": "file-link", "old_str": "secret", "new_str": "x"}), &edit).await));
+        let grok = ToolEnv { edit: EditTool::SearchReplace, ..env };
+        assert!(refused(run(SEARCH_REPLACE, &json!({"file_path": "dir-link/secret.txt", "old_string": "secret", "new_string": "x"}), &grok).await));
+        assert!(refused(run(GREP, &json!({"pattern": "secret", "path": ".."}), &env).await));
+        assert!(refused(run(GREP, &json!({"pattern": "secret", "path": "dir-link"}), &env).await));
+        assert!(refused(run(GLOB, &json!({"pattern": "*", "path": "/"}), &env).await));
+        // A patch whose Add, Update or Move target leads out changes nothing.
+        for patch in [
+            "*** Begin Patch\n*** Add File: ../outside/p.txt\n+x\n*** End Patch",
+            "*** Begin Patch\n*** Update File: a.txt\n*** Move to: dir-link/moved.txt\n-a\n+b\n*** End Patch",
+            "*** Begin Patch\n*** Delete File: file-link/../../outside/secret.txt\n*** End Patch",
+        ] {
+            let r = run(APPLY_PATCH, &json!({ "input": patch }), &env).await;
+            assert!(refused(r.clone()), "{patch}: {r:?}");
+        }
+        assert_eq!(std::fs::read_to_string(outside.join("secret.txt")).unwrap(), "secret\n");
+        assert_eq!(std::fs::read_to_string(cwd.join("a.txt")).unwrap(), "a\n");
+        // Inside is fine however it is spelled, and a symlink inside that
+        // leads inside is written through, staying a link.
+        assert!(!run(WRITE, &json!({"path": "sub/../b.txt", "content": "b"}), &env).await.1);
+        let abs_inside = cwd.join("c.txt").display().to_string();
+        assert!(!run(WRITE, &json!({"path": abs_inside, "content": "c"}), &env).await.1);
+        let (out, err) = run(WRITE, &json!({"path": "inside-link", "content": "through\n"}), &env).await;
+        assert!(!err, "{out}");
+        assert!(std::fs::symlink_metadata(cwd.join("inside-link")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(cwd.join("a.txt")).unwrap(), "through\n");
+        // Bypassed, the working directory is no fence.
+        let bypass = ToolEnv { permission_mode: PermissionMode::BypassPermissions, ..env };
+        assert!(!run(WRITE, &json!({"path": "../outside/new.txt", "content": "x"}), &bypass).await.1);
+        assert_eq!(run(READ, &json!({"path": "file-link"}), &bypass).await.0, "     1\tsecret\n");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_are_atomic_and_keep_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir("atomic");
+        let f = d.join("run.sh");
+        std::fs::write(&f, "old").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o750)).unwrap();
+        write_atomic(&f, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o750);
+        let left: Vec<_> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, ["run.sh"], "no temporary file is left behind");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn only_the_turns_edit_tool_runs() {
         let d = dir("edit-gate");
@@ -582,7 +785,9 @@ mod tests {
         let fifo = d.join("fifo");
         let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
         assert!(made.success());
-        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::Default, edit: EditTool::StrReplace };
+        // Bypassed, so the devices outside the working directory are reached
+        // at all: what is refused here is what they are, not where.
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::BypassPermissions, edit: EditTool::StrReplace };
         for path in [fifo.display().to_string(), "/dev/zero".into(), "/dev/stdin".into(), d.display().to_string()] {
             let r = tokio::time::timeout(Duration::from_secs(2), run(READ, &json!({ "path": path }), &env)).await.expect("read never blocks");
             assert!(r.1 && r.0.contains("not a regular file"), "{path}: {r:?}");

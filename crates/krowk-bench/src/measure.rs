@@ -116,8 +116,10 @@ pub fn log_append(work: &Path, runs: usize) -> Outcome {
 /// the largest over the toolset presets. Each preset is one real `krowk -p
 /// --toolset <preset>` against a local provider that refuses every request
 /// at once — the record is written before the first call, so a refusal
-/// costs nothing but the process. The estimate is deterministic, so one run
-/// each is the number.
+/// costs nothing but the process. The count is krowk's estimate (four
+/// bytes a token), deterministic, so one run each is the number. Run from
+/// `/`: the working directory is the one variable part of the system
+/// prompt, and the number should be the code's, not the checkout path's.
 pub fn context_tokens(bin: &Path, home: &Path) -> Outcome {
     use std::io::{Read, Write};
     if let Err(e) = std::fs::create_dir_all(home) {
@@ -143,6 +145,7 @@ pub fn context_tokens(bin: &Path, home: &Path) -> Outcome {
         let before = sessions(home);
         let run = sandboxed(bin, home)
             .args(["-p", "hello", "--toolset", preset.name, "--output-format", "json"])
+            .current_dir("/")
             .env("ANTHROPIC_API_KEY", "sk-bench")
             .env("ANTHROPIC_BASE_URL", &url)
             .stdout(Stdio::null())

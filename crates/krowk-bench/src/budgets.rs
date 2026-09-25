@@ -173,7 +173,7 @@ pub fn show(unit: Unit, v: f64) -> String {
         Unit::Wakeups => format!("{v:.0} wakeups"),
         Unit::Mb => format!("{v:.1} MB"),
         Unit::Fps => format!("{v:.0} fps"),
-        Unit::Tokens => format!("{v:.0} tokens"),
+        Unit::Tokens => format!("{v:.0} est. tokens"),
     }
 }
 

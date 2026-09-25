@@ -181,7 +181,7 @@
           "type": "string"
         },
         "backend": {
-          "description": "The backend, e.g. `claude-code`.",
+          "description": "The backend, e.g. `claude-code` or `codex-app-server`.",
           "type": "string"
         },
         "vendorSessionId": {
@@ -303,6 +303,11 @@
           "description": "The `claude` binary's stream-json protocol: Claude Code runs the\nloop and krowk drives it. A thinking signature it streams is\nClaude Code's to replay, never sent to the Messages API by krowk.",
           "type": "string",
           "const": "claude-code"
+        },
+        {
+          "description": "`codex app-server`'s JSON-RPC: Codex runs the loop, on its own\nlogin, and krowk drives it. Codex keeps its reasoning to itself, so\nnothing streamed here is ever replayed as a blob.",
+          "type": "string",
+          "const": "codex-app-server"
         }
       ]
     },

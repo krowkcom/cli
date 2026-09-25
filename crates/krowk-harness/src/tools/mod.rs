@@ -254,8 +254,9 @@ pub(crate) struct Scope {
     pub cwd: PathBuf,
     pub bypass: bool,
     /// More directories no edit may reach unless permissions are bypassed,
-    /// beside `.git` and `.claude`: a Claude Code instance's config
-    /// directory, whose settings and hooks it runs.
+    /// beside `.git`, `.claude` and `.codex`: a backend instance's own
+    /// config directory (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), whose settings
+    /// and hooks the vendor runs.
     pub protected: Vec<PathBuf>,
 }
 
@@ -293,13 +294,14 @@ impl Scope {
 
 impl Scope {
     /// `path`, for a tool that changes the file: also never anything inside
-    /// a `.git` or a `.claude` directory, as spelled or as it leads, nor in
-    /// a `protected` one, unless permissions are bypassed. git runs what its
-    /// config names (`core.fsmonitor`, hooks), and Claude Code what its
-    /// settings, hooks and agents name, so a model that could write
-    /// `.git/config` or `.claude/settings.json` could run any command
-    /// without the bash permission. Codex keeps `.git` read-only for the
-    /// same reason.
+    /// a `.git`, a `.claude` or a `.codex` directory, as spelled or as it
+    /// leads, nor in a `protected` one, unless permissions are bypassed. git
+    /// runs what its config names (`core.fsmonitor`, hooks), Claude Code
+    /// what its settings, hooks and agents name, and Codex what its project
+    /// config, rules and hooks name, so a model that could write
+    /// `.git/config`, `.claude/settings.json` or `.codex/config.toml` could
+    /// run any command without the bash permission. Codex keeps `.git`
+    /// read-only for the same reason.
     pub fn edit_path(&self, path: &str) -> Result<PathBuf, String> {
         let p = self.path(path)?;
         if self.bypass {
@@ -310,18 +312,29 @@ impl Scope {
         // dots and spaces Windows drops (`.git.` is `.git`) — on every OS,
         // since a checkout travels between them.
         let fold = |c: &std::ffi::OsStr| c.to_string_lossy().trim_end_matches(['.', ' ']).to_ascii_lowercase();
-        let inside = |q: &Path| q.components().find_map(|c| [".git", ".claude"].into_iter().find(|d| fold(c.as_os_str()) == *d));
+        let inside = |q: &Path| q.components().find_map(|c| [".git", ".claude", ".codex"].into_iter().find(|d| fold(c.as_os_str()) == *d));
         let real = real_path(&p, 0).unwrap_or_else(|_| p.clone());
         let root = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
         let fenced = inside(p.strip_prefix(&self.cwd).unwrap_or(&p)).or_else(|| inside(real.strip_prefix(&root).unwrap_or(&real)));
         if let Some(dir) = fenced {
-            let runs = if dir == ".git" { "git runs what its config and hooks name, so it is left to git itself — use git through bash" } else { "Claude Code runs what its settings, hooks and agents name" };
+            let runs = match dir {
+                ".git" => "git runs what its config and hooks name, so it is left to git itself — use git through bash",
+                ".claude" => "Claude Code runs what its settings, hooks and agents name",
+                _ => "Codex runs what its project config, rules and hooks name",
+            };
             return Err(format!("{} is inside a {dir} directory, which the file tools do not change: {runs}, or ask the person to rerun with `--permission-mode bypassPermissions`", p.display()));
         }
+        // Judged as spelled and as it leads, against the directory as named
+        // and as it leads: a home reached through a symlink, or a link inside
+        // the working directory that points into the home, is caught either way.
         let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
-        if let Some(d) = self.protected.iter().find(|d| lower(&real).starts_with(lower(&d.canonicalize().unwrap_or_else(|_| d.to_path_buf())))) {
+        let within = |q: &Path, d: &Path| {
+            let q = lower(q);
+            q.starts_with(lower(d)) || q.starts_with(lower(&d.canonicalize().unwrap_or_else(|_| d.to_path_buf())))
+        };
+        if let Some(d) = self.protected.iter().find(|d| within(&real, d) || within(&p, d)) {
             return Err(format!(
-                "{} is inside {}, Claude Code's config directory for this session, which the file tools do not change: Claude Code runs what its settings and hooks name — ask the person to rerun with `--permission-mode bypassPermissions`",
+                "{} is inside {}, the backend's own config directory for this session, which the file tools do not change: the vendor runs what its settings and hooks there name — ask the person to rerun with `--permission-mode bypassPermissions`",
                 p.display(),
                 d.display()
             ));
@@ -876,6 +889,43 @@ mod tests {
         assert!(!run(WRITE, &json!({"path": ".claudette/notes.md", "content": "x"}), &env).await.1, "a name that only starts like it is fine");
         assert!(!d.join(".claude").exists());
         assert!(!run(WRITE, &json!({"path": ".claude/settings.json", "content": "{}"}), &bypass).await.1);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Codex runs what `.codex` holds (project config, rules, hooks), and
+    /// what its home holds for every session: both are kept like `.git`,
+    /// in any case a case-insensitive file system would open.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r_back_3_codex_config_and_the_instances_home_are_kept_like_git() {
+        let d = dir("codex-guard");
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::AcceptEdits, edit: EditTool::ApplyPatch };
+        let fenced = |r: (String, bool), dir: &str| r.1 && r.0.contains(&format!("inside a {dir} directory"));
+        assert!(fenced(run(WRITE, &json!({"path": ".codex/config.toml", "content": "x"}), &env).await, ".codex"));
+        assert!(fenced(run(WRITE, &json!({"path": "sub/.Codex/rules/x.rules", "content": "x"}), &env).await, ".codex"), "any component, any case");
+        assert!(fenced(run(WRITE, &json!({"path": ".GIT/config", "content": "x"}), &env).await, ".git"));
+        assert!(fenced(run(WRITE, &json!({"path": ".claude/settings.json", "content": "{}"}), &env).await, ".claude"));
+        assert!(!d.join(".codex").exists() && !d.join("sub").exists());
+        let patch = "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch";
+        assert!(run(APPLY_PATCH, &json!({ "input": patch }), &env).await.1, "a patch is fenced too");
+        // The instance's own home, protected by name.
+        let home = d.join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let scope = Scope { cwd: d.clone(), bypass: false, protected: vec![home.clone()] };
+        assert!(scope.edit_path("codex-home/config.toml").unwrap_err().contains("config directory"));
+        assert!(scope.edit_path(&home.join("sub/x").display().to_string()).is_err());
+        assert!(scope.edit_path("codex-homework.txt").is_ok(), "a sibling that shares the prefix is not inside it");
+        // Named through a link, and spelled as the link: both are the home.
+        #[cfg(unix)]
+        {
+            let alias = d.join("home-alias");
+            std::os::unix::fs::symlink(&home, &alias).unwrap();
+            let via_alias = Scope { cwd: d.clone(), bypass: false, protected: vec![alias.clone()] };
+            assert!(via_alias.edit_path("codex-home/config.toml").is_err(), "the home as it leads");
+            assert!(via_alias.edit_path("home-alias/config.toml").is_err(), "the home as spelled");
+        }
+        assert!(Scope { bypass: true, ..scope }.edit_path("codex-home/config.toml").is_ok());
+        let bypass = ToolEnv { permission_mode: PermissionMode::BypassPermissions, ..env };
+        assert!(!run(WRITE, &json!({"path": ".codex/config.toml", "content": "x"}), &bypass).await.1);
         let _ = std::fs::remove_dir_all(d);
     }
 

@@ -1,9 +1,11 @@
-//! Which repositories a backend may run in (R-BACK-6). `claude -p` skips
-//! Claude Code's own workspace-trust dialog, and still runs the project's
-//! hooks (`.claude/settings.json`) and MCP servers (`.mcp.json`): a
-//! repository someone else wrote can run code the moment a backend starts
-//! in it. So before a backend is spawned, krowk asks its own question — the
-//! one Claude Code would have asked — and remembers the answer here.
+//! Which repositories a backend may run in (R-BACK-6). A vendor's agent
+//! runs what a repository configures it to run — Claude Code its hooks
+//! (`.claude/settings.json`) and MCP servers (`.mcp.json`) without its trust
+//! dialog under `-p`; Codex what its project config layers (a `.codex/`
+//! anywhere from the working directory up to the repository root) name — so
+//! a repository someone else wrote can run code the moment a backend starts
+//! in it. Before a backend is spawned, krowk asks its own question, and
+//! remembers the answer here.
 //!
 //! The unit of trust is the repository: the nearest ancestor of the working
 //! directory holding a `.git`, else the working directory itself. Trust is
@@ -43,7 +45,7 @@ pub fn root(cwd: &Path) -> PathBuf {
     cwd.ancestors().find(|d| d.join(".git").symlink_metadata().is_ok()).map(Path::to_path_buf).unwrap_or(cwd)
 }
 
-/// What `claude -p` would run of the repository's own, found in it: the
+/// What a backend would run of the repository's own, found in it: the
 /// reason the question is asked, shown with it.
 pub fn what_runs(root: &Path) -> Vec<String> {
     let mut found = Vec::new();
@@ -53,6 +55,7 @@ pub fn what_runs(root: &Path) -> Vec<String> {
         (".mcp.json", "its MCP servers"),
         (".claude/commands", "its commands"),
         (".claude/agents", "its agents"),
+        (".codex", "Codex's project config, rules and hooks"),
     ] {
         if root.join(file).symlink_metadata().is_ok() {
             found.push(format!("{file} ({what})"));
@@ -68,7 +71,7 @@ pub fn untrusted(root: &Path, how: &str) -> EngineError {
     EngineError::new(
         "untrusted_directory",
         format!(
-            "{} is not a repository you have trusted, and `claude -p` would run its hooks and MCP servers without asking{found}. {how}",
+            "{} is not a repository you have trusted, and a backend (Claude Code, Codex) runs what a repository configures it to — hooks, MCP servers — once it starts there{found}. {how}",
             root.display()
         ),
     )
@@ -164,15 +167,16 @@ mod tests {
         std::fs::create_dir_all(base.join("repo/.git")).unwrap();
         std::fs::create_dir_all(base.join("repo/src/deep")).unwrap();
         std::fs::create_dir_all(base.join("repo/.claude")).unwrap();
+        std::fs::create_dir_all(base.join("repo/.codex")).unwrap();
         std::fs::write(base.join("repo/.mcp.json"), "{}").unwrap();
         std::fs::write(base.join("repo/.claude/settings.json"), "{}").unwrap();
         let repo = base.join("repo").canonicalize().unwrap();
         assert_eq!(root(&base.join("repo/src/deep")), repo, "the repository, not the subdirectory");
         let runs = what_runs(&repo);
-        assert!(runs.iter().any(|r| r.starts_with(".mcp.json")) && runs.iter().any(|r| r.starts_with(".claude/settings.json")), "{runs:?}");
+        assert!(runs.iter().any(|r| r.starts_with(".mcp.json")) && runs.iter().any(|r| r.starts_with(".claude/settings.json")) && runs.iter().any(|r| r.starts_with(".codex")), "{runs:?}");
         let e = untrusted(&repo, "Pass --trust.");
         assert_eq!(e.code, "untrusted_directory");
-        assert!(e.message.contains("hooks and MCP servers") && e.message.contains(".mcp.json") && e.message.ends_with("Pass --trust."), "{}", e.message);
+        assert!(e.message.contains("hooks, MCP servers") && e.message.contains(".mcp.json") && e.message.ends_with("Pass --trust."), "{}", e.message);
 
         let home = base.join("home");
         std::fs::create_dir_all(home.join(".git")).unwrap();

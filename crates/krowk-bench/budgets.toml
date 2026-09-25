@@ -59,7 +59,11 @@ unit = "bytes"
 # bytes (6.58 MiB) together. Ticket 06's Claude Code backend (the process,
 # the control protocol, the stream translation, the MCP bridge, trust,
 # `providers add claude`; no new crate) adds 183,392 bytes: 7,087,016
-# (6.76 MiB) on x86_64 Linux with both, 253,016 bytes under this.
+# (6.76 MiB) on x86_64 Linux with both, 253,016 bytes under this. Ticket
+# 07's Codex backend (the app-server JSON-RPC client, the stream
+# translation, approvals, `providers add codex`; no new crate) adds 141,408
+# bytes, and its review round 26,824 more: 7,240,840 (6.91 MiB), 99,192
+# bytes under this.
 max = { x86_64-linux = 7_340_032 }
 status = "enforced"
 

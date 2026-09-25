@@ -15,12 +15,16 @@
 //! (`CLAUDE_CONFIG_DIR`), environment variables and launch arguments
 //! (R-INST-1) — so `claude:work` and `claude:personal` are two Claude
 //! accounts on one host, each logged in through Claude's own flow.
+//! `codex-app-server` drives the user's own `codex` as `codex app-server`
+//! (R-BACK-3) the same way, with `CODEX_HOME` a per-account home that keeps
+//! each login separate — `codex:team`, `codex:personal`.
 //!
 //! With nothing configured there is still one instance per provider —
 //! `anthropic`, `openai`, `xai`, `openrouter`, reading the conventional key
 //! variables, so a machine already set up for a provider's own tools works
-//! unconfigured, `supergrok`, which needs only a login, and `claude`, the
-//! `claude` on PATH with Claude's own default config directory.
+//! unconfigured, `supergrok`, which needs only a login, `claude`, the
+//! `claude` on PATH with Claude's own default config directory, and `codex`,
+//! the `codex` on PATH with Codex's own default home.
 
 use crate::protocol::{Effort, ModelRef, WireApi};
 use schemars::JsonSchema;
@@ -205,6 +209,42 @@ pub enum InstanceKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<Effort>,
     },
+    /// The user's own, unmodified `codex` binary, driven as `codex
+    /// app-server` — OpenAI's own interface for third-party clients: it runs
+    /// the loop on its own login, a ChatGPT subscription or an API key, and
+    /// krowk never reads that login (R-BACK-3). Added with `krowk providers
+    /// add codex`.
+    #[serde(rename = "codex-app-server")]
+    CodexAppServer {
+        /// The binary; `codex` on PATH when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binary: Option<String>,
+        /// `CODEX_HOME`: where Codex keeps this account's login, threads and
+        /// state. Codex's own default (`~/.codex`) when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_home: Option<String>,
+        /// More environment for the process, e.g. `OPENAI_BASE_URL` for a
+        /// router. Literal values: a key belongs in the environment krowk
+        /// runs in, never in a definition — name it with `apiKeyEnv`.
+        /// `CODEX_HOME` is not one of them: `codexHome` is the one way to
+        /// name it. The ambient `OPENAI_API_KEY`, `OPENAI_BASE_URL` and
+        /// `CODEX_API_KEY` reach the process only when named here or by
+        /// `apiKeyEnv`.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
+        /// More launch arguments, after `app-server`: a router is a model
+        /// provider named with `-c`, e.g. `-c model_provider=openrouter`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        /// The environment variable krowk reads a key from and hands the
+        /// process under the same name: the one a router's model provider
+        /// reads (its `env_key`). The variable's name is stored, never the
+        /// key. None: Codex signs in with its own login.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+    },
 }
 
 impl InstanceKind {
@@ -218,6 +258,7 @@ impl InstanceKind {
             InstanceKind::OpenaiCompatible { .. } => "openai-compatible",
             InstanceKind::XaiOauth { .. } => "xai-oauth",
             InstanceKind::ClaudeCode { .. } => "claude-code",
+            InstanceKind::CodexAppServer { .. } => "codex-app-server",
         }
     }
 }
@@ -239,8 +280,8 @@ pub enum Auth {
     /// Tokens from the OAuth login, refreshed as they expire.
     OAuth { issuer: String, client_id: Option<String>, scope: String },
     /// The vendor binary's own login, in its config directory. krowk asks
-    /// the binary whether there is one (`claude auth status`) and never
-    /// reads it (R-BACK-2, R-INST-2).
+    /// the binary whether there is one (`claude auth status`, `codex login
+    /// status`) and never reads it (R-BACK-2, R-BACK-3, R-INST-2).
     Vendor,
 }
 
@@ -251,8 +292,8 @@ pub struct Backend {
     pub binary: String,
     /// Where it was found; none when it is not there.
     pub path: Option<PathBuf>,
-    /// `CLAUDE_CONFIG_DIR`, set for the process; none leaves the vendor's
-    /// own default.
+    /// The vendor's config directory (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`),
+    /// set for the process; none leaves the vendor's own default.
     pub config_dir: Option<PathBuf>,
     /// The config directory the process will use, set or not — where its
     /// transcripts are. None when there is no home to find it in.
@@ -260,8 +301,12 @@ pub struct Backend {
     pub env: BTreeMap<String, String>,
     pub args: Vec<String>,
     /// The key read from `apiKeyEnv`, and the variable the process is
-    /// given it as. None when the instance uses Claude Code's own login.
-    pub key: Option<(&'static str, String)>,
+    /// given it as. None when the instance uses the vendor's own login.
+    pub key: Option<(String, String)>,
+    /// Another directory whose config the vendor reads for this instance,
+    /// and no edit may reach: for a Codex account, the person's own Codex
+    /// home, whose configuration the account's home links in.
+    pub shared_home: Option<PathBuf>,
 }
 
 // Hand-written so a key never reaches a log line through `{:?}`.
@@ -342,8 +387,9 @@ impl Resolved {
 
 /// The instances every host has without configuring any: one per provider
 /// with an API-key kind, reading the conventional variable, SuperGrok,
-/// which needs only a login, and `claude`, the Claude Code on PATH with its
-/// own default config directory. A config entry of the same name replaces one.
+/// which needs only a login, `claude`, the Claude Code on PATH with its own
+/// default config directory, and `codex`, the Codex on PATH with its own
+/// default home. A config entry of the same name replaces one.
 pub fn implicit() -> Vec<(&'static str, InstanceKind)> {
     vec![
         ("anthropic", InstanceKind::AnthropicApi { api_key_env: None, base_url: None, thinking: None, max_tokens: None, effort: None }),
@@ -352,6 +398,7 @@ pub fn implicit() -> Vec<(&'static str, InstanceKind)> {
         ("openrouter", InstanceKind::OpenrouterApi { api_key_env: None, base_url: None, effort: None }),
         ("supergrok", InstanceKind::XaiOauth { base_url: None, issuer: None, client_id: None, scope: None, effort: None }),
         ("claude", InstanceKind::ClaudeCode { binary: None, config_dir: None, env: BTreeMap::new(), args: Vec::new(), api_key_env: None, effort: None }),
+        ("codex", InstanceKind::CodexAppServer { binary: None, codex_home: None, env: BTreeMap::new(), args: Vec::new(), api_key_env: None, effort: None }),
     ]
 }
 
@@ -447,6 +494,7 @@ fn clean_url(u: &str) -> String {
 const RESPONSES_OR_CHAT: &[WireApi] = &[WireApi::OpenaiResponses, WireApi::ChatCompletions];
 const CHAT: &[WireApi] = &[WireApi::ChatCompletions];
 const CLAUDE_CODE: &[WireApi] = &[WireApi::ClaudeCode];
+const CODEX_APP_SERVER: &[WireApi] = &[WireApi::CodexAppServer];
 
 fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) -> Resolved {
     // A base URL from config, else (for the instance reading the
@@ -568,9 +616,47 @@ fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) ->
                     home,
                     env: extra.clone(),
                     args: args.clone(),
-                    key: key_env.map(|_| (to, key)),
+                    key: key_env.map(|_| (to.to_string(), key)),
+                    shared_home: None,
                 }),
                 ..template("anthropic", "Claude Code", WireApi::ClaudeCode, CLAUDE_CODE, *effort)
+            }
+        }
+        // Priced and described as OpenAI's models, which it runs; its login
+        // is Codex's own.
+        InstanceKind::CodexAppServer { binary, codex_home, env: extra, args, api_key_env, effort } => {
+            let config_dir = codex_home.as_deref().filter(|d| !d.trim().is_empty()).map(PathBuf::from);
+            // Codex's own rule for its home: CODEX_HOME — the instance's
+            // `codexHome`, else the environment's — else ~/.codex.
+            let own = Some(env("CODEX_HOME")).filter(|d| !d.trim().is_empty()).map(PathBuf::from).or_else(|| {
+                let h = env("HOME");
+                (!h.trim().is_empty()).then(|| PathBuf::from(h).join(".codex"))
+            });
+            let home = config_dir.clone().or_else(|| own.clone());
+            // The person's own home, which an account's links point into:
+            // an edit there is an edit of every account.
+            let shared_home = own.filter(|o| Some(o) != home.as_ref());
+            let binary = binary.clone().filter(|b| !b.trim().is_empty()).unwrap_or_else(|| crate::codex::BINARY.into());
+            // A keyed instance — a router — names the variable its key is
+            // in; the key goes to the process under that same name, which
+            // is the one the router's model provider reads.
+            let key_env = api_key_env.clone().filter(|k| !k.trim().is_empty());
+            let key = key_env.as_ref().map(|k| env(k).trim().to_string()).unwrap_or_default();
+            Resolved {
+                auth: Auth::Vendor,
+                api_key: key.clone(),
+                api_key_env: key_env.clone().unwrap_or_default(),
+                backend: Some(Backend {
+                    path: find_binary(&binary, &env("PATH")),
+                    binary,
+                    config_dir,
+                    home,
+                    env: extra.clone(),
+                    args: args.clone(),
+                    key: key_env.map(|k| (k, key)),
+                    shared_home,
+                }),
+                ..template("openai", "Codex", WireApi::CodexAppServer, CODEX_APP_SERVER, *effort)
             }
         }
     }
@@ -588,6 +674,11 @@ pub fn from_config_json(raw: &serde_json::Value) -> Result<InstancesConfig, Stri
                 && env.contains_key("CLAUDE_CONFIG_DIR")
             {
                 return Err(format!("\"instances\": {name} sets CLAUDE_CONFIG_DIR in its env — name the directory with \"configDir\" instead, the one place krowk reads it from"));
+            }
+            if let InstanceKind::CodexAppServer { env, .. } = kind
+                && env.contains_key("CODEX_HOME")
+            {
+                return Err(format!("\"instances\": {name} sets CODEX_HOME in its env — name the directory with \"codexHome\" instead, the one place krowk reads it from"));
             }
         }
     }
@@ -636,7 +727,7 @@ mod tests {
         assert_eq!(reg.parse_model("claude-x").unwrap().instance, "anthropic");
         assert_eq!(reg.parse_model("router/some/model").unwrap(), ModelRef { instance: "anthropic".into(), model: "router/some/model".into() });
         assert!(reg.parse_model("anthropic/").is_err());
-        assert!(reg.get("nope").unwrap_err().contains("anthropic, anthropic:work, claude, openai"));
+        assert!(reg.get("nope").unwrap_err().contains("anthropic, anthropic:work, claude, codex, openai"));
         assert_eq!(reg.default_model().unwrap().model, DEFAULT_MODEL);
         assert!(from_config_json(&serde_json::json!({"instances": {"x": {"kind": "martian"}}})).is_err());
         // R-TOOL-2: config can pin a toolset, and only one that exists.
@@ -727,7 +818,7 @@ mod tests {
             &env2,
         );
         let router = r.get("claude:router").unwrap();
-        assert_eq!(router.backend.as_ref().unwrap().key, Some(("ANTHROPIC_AUTH_TOKEN", "sk-or-test".to_string())), "a router's bearer token");
+        assert_eq!(router.backend.as_ref().unwrap().key, Some(("ANTHROPIC_AUTH_TOKEN".to_string(), "sk-or-test".to_string())), "a router's bearer token");
         assert_eq!(r.get("claude:console").unwrap().backend.as_ref().unwrap().key.as_ref().unwrap().0, "ANTHROPIC_API_KEY");
         assert!(!format!("{router:?} {:?}", router.backend).contains("sk-or-test"), "a key never prints");
         assert!(r.get("claude:unset").unwrap().missing_key().unwrap().contains("set NOT_SET"));
@@ -741,4 +832,45 @@ mod tests {
         assert!(sh.is_some_and(|p| p.is_absolute()), "a name is found on PATH");
     }
 
+
+    #[test]
+    fn r_inst_1_a_codex_instance_is_a_binary_a_home_an_environment_and_arguments() {
+        let env = |k: &str| match k {
+            "HOME" => "/home/p".to_string(),
+            "PATH" => "/nowhere".to_string(),
+            _ => String::new(),
+        };
+        let cfg = from_config_json(&serde_json::json!({"instances": {
+            "codex:team": {"kind": "codex-app-server", "codexHome": "/data/codex-team"},
+            "codex:personal": {"kind": "codex-app-server", "codexHome": "/data/codex-personal", "binary": "/opt/codex/bin/codex"},
+            "codex:router": {"kind": "codex-app-server", "args": ["-c", "model_provider=openrouter"], "apiKeyEnv": "OPENROUTER_API_KEY", "env": {"RUST_LOG": "warn"}},
+        }}))
+        .unwrap();
+        let reg = Registry::resolve(&cfg, &env);
+        let d = reg.get("codex").unwrap();
+        let b = d.backend.as_ref().unwrap();
+        assert_eq!((d.kind, d.provider.as_str(), d.wire_api, d.auth.clone()), ("codex-app-server", "openai", WireApi::CodexAppServer, Auth::Vendor));
+        assert_eq!((b.binary.as_str(), b.config_dir.as_deref(), b.home.as_deref()), ("codex", None, Some(std::path::Path::new("/home/p/.codex"))), "the default account is Codex's own");
+        assert_eq!(b.path, None, "not on this PATH");
+        assert_eq!(d.missing_key(), None, "its login is Codex's to check");
+        let (t, p) = (reg.get("codex:team").unwrap().backend.clone().unwrap(), reg.get("codex:personal").unwrap().backend.clone().unwrap());
+        assert_eq!((t.config_dir.as_deref(), t.home.as_deref()), (Some(std::path::Path::new("/data/codex-team")), Some(std::path::Path::new("/data/codex-team"))));
+        assert_ne!(t.home, p.home, "two accounts, two homes");
+        assert_eq!(t.shared_home.as_deref(), Some(std::path::Path::new("/home/p/.codex")), "the person's own home is the account's to protect too");
+        assert_eq!(b.shared_home, None, "the default instance's home is the person's own");
+        assert_eq!(p.binary, "/opt/codex/bin/codex");
+        let r = reg.get("codex:router").unwrap().backend.clone().unwrap();
+        assert_eq!((r.args.join(" "), r.env["RUST_LOG"].as_str()), ("-c model_provider=openrouter".to_string(), "warn"), "a router is the same mechanism");
+        assert_eq!(r.key, Some(("OPENROUTER_API_KEY".to_string(), String::new())), "its key, under the name its provider reads");
+        // CODEX_HOME from the environment is the default instance's home.
+        let with_home = |k: &str| if k == "CODEX_HOME" { "/elsewhere/codex".to_string() } else { env(k) };
+        assert_eq!(Registry::resolve(&InstancesConfig::default(), &with_home).get("codex").unwrap().backend.as_ref().unwrap().home.as_deref(), Some(std::path::Path::new("/elsewhere/codex")));
+        let e = from_config_json(&serde_json::json!({"instances": {"codex:x": {"kind": "codex-app-server", "env": {"CODEX_HOME": "/elsewhere"}}}})).unwrap_err();
+        assert!(e.contains("codexHome"), "{e}");
+        assert_eq!(reg.parse_model("codex:team/gpt-5.5").unwrap(), ModelRef { instance: "codex:team".into(), model: "gpt-5.5".into() });
+        assert_eq!(reg.parse_model("codex/gpt-5.5").unwrap().instance, "codex");
+        assert_eq!(reg.parse_model("gpt-5.5").unwrap().instance, "openai", "a bare GPT id is still the API's");
+        let sh = find_binary("sh", &std::env::var("PATH").unwrap_or_default());
+        assert!(sh.is_some_and(|p| p.is_absolute()), "a name is found on PATH");
+    }
 }

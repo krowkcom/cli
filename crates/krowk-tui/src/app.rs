@@ -13,7 +13,7 @@ use crate::editor::Editor;
 use crate::look::{self, SEP};
 use crate::settings::{Item as StatusItem, Settings};
 use krowk_harness::host::Pricer;
-use krowk_harness::protocol::{Delta, ErrorInfo, Item, ItemKind, LiveEvent, LogBody, LogEvent, ModelRef, RunResult, StreamLine, TurnStatus, Usage};
+use krowk_harness::protocol::{Billing, Delta, ErrorInfo, Item, ItemKind, LiveEvent, LogBody, LogEvent, ModelRef, RunResult, StreamLine, TurnStatus, Usage};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::time::{Duration, Instant};
@@ -114,6 +114,12 @@ pub struct App {
     fence: bool,
     /// When the reasoning streaming now began.
     thinking_since: Option<Instant>,
+    /// What a backend reported its session is billed to, and on which
+    /// instance (R-INST-3).
+    billing: Option<(String, Billing)>,
+    /// The instances that run a vendor's backend: their billing is the
+    /// vendor's to report, so none is assumed before it has.
+    pub vendor_instances: Vec<String>,
 }
 
 impl App {
@@ -146,6 +152,8 @@ impl App {
             calls: Vec::new(),
             fence: false,
             thinking_since: None,
+            billing: None,
+            vendor_instances: Vec::new(),
         }
     }
 
@@ -373,6 +381,12 @@ impl App {
             LogBody::SessionStarted { .. } => {
                 self.session_id = Some(ev.session_id.clone());
             }
+            LogBody::BackendSession { billing, .. } => {
+                if let (Some(b), Some(m)) = (billing, &self.model) {
+                    self.billing = Some((m.instance.clone(), *b));
+                    self.dirty = true;
+                }
+            }
             LogBody::TurnStarted { model, provider, permission_mode, .. } => {
                 self.session_id = Some(ev.session_id.clone());
                 self.model = Some(model.clone());
@@ -398,8 +412,6 @@ impl App {
                     }
                 }
             }
-            // The vendor session behind a backend turn: the log's to keep.
-            LogBody::BackendSession { .. } => {}
             LogBody::TurnCompleted { status, usage, duration_ms, error, .. } => {
                 self.turns += 1;
                 self.finish_live();
@@ -621,9 +633,16 @@ impl App {
                         parts.push(m.model.clone());
                     }
                 }
+                // Which instance, and whether it runs on a subscription or
+                // an API key: a backend's as it reported it, a native
+                // instance's key otherwise.
                 StatusItem::Instance => {
                     if let Some(m) = &self.model {
-                        parts.push(format!("{} · api key", m.instance));
+                        match &self.billing {
+                            Some((i, b)) if *i == m.instance => parts.push(format!("{} · {}", m.instance, if *b == Billing::Subscription { "subscription" } else { "api key" })),
+                            _ if self.vendor_instances.contains(&m.instance) => parts.push(m.instance.clone()),
+                            _ => parts.push(format!("{} · api key", m.instance)),
+                        }
                     }
                 }
                 StatusItem::Cost => parts.push(if self.unpriced && self.cost == 0.0 { "$—".into() } else { format!("${:.2}", self.cost) }),
@@ -797,7 +816,7 @@ pub const TICK: Duration = look::SPIN_FRAME;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use krowk_harness::protocol::PermissionMode;
+    use krowk_harness::protocol::{PermissionMode, WireApi};
 
     fn app() -> App {
         App::new(Editor::new(None), 40, Settings::default(), Some(ModelRef { instance: "anthropic".into(), model: "claude-x".into() }), None)
@@ -865,6 +884,22 @@ mod tests {
         let (rows, _) = a.view(Instant::now());
         assert!(!text(&rows).join("\n").contains("no network"));
         assert!(a.status_bar().contains("online"));
+    }
+
+    #[test]
+    fn r_inst_3_the_status_bar_shows_the_instance_and_whether_it_runs_on_a_subscription() {
+        let mut a = App::new(Editor::new(None), 40, Settings { status_bar: true, status_items: vec![StatusItem::Instance] }, Some(ModelRef { instance: "codex:team".into(), model: "gpt-5.5".into() }), None);
+        a.vendor_instances = vec!["codex:team".into(), "codex:personal".into()];
+        assert_eq!(a.status_bar(), "codex:team", "nothing is assumed before Codex says");
+        let turn = |instance: &str| LogBody::TurnStarted { turn_id: "t".into(), model: ModelRef { instance: instance.into(), model: "gpt-5.5".into() }, provider: "openai".into(), wire_api: WireApi::CodexAppServer, permission_mode: PermissionMode::Default, effort: None };
+        let session = |b: Billing| LogBody::BackendSession { turn_id: "t".into(), backend: "codex-app-server".into(), vendor_session_id: "th".into(), transcript_path: None, billing: Some(b) };
+        a.on_line(&log(turn("codex:team")));
+        a.on_line(&log(session(Billing::Subscription)));
+        assert_eq!(a.status_bar(), "codex:team · subscription");
+        a.on_line(&log(turn("codex:personal")));
+        assert_eq!(a.status_bar(), "codex:personal", "another instance's billing is not this one's");
+        a.on_line(&log(session(Billing::ApiKey)));
+        assert_eq!(a.status_bar(), "codex:personal · api key");
     }
 
     #[test]

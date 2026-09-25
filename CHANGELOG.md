@@ -78,10 +78,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `--model <instance>/<model>` picks the model (a bare id runs on the
   `anthropic` instance; `claude-opus-5` by default), `--resume <id>`
   continues a session by the id its result named or its `krowk sessions`
-  id, and Ctrl-C stops a turn and keeps what it made. The agent has two
-  tools, `read` and `bash`; `bash` runs only under `--permission-mode
-  bypassPermissions` until permission rules land, and is refused with a
-  reason the model can read otherwise. Prompt caching is on by default.
+  id, and Ctrl-C stops a turn and keeps what it made. Its `bash` tool runs
+  only under `--permission-mode bypassPermissions` until permission rules
+  land, and is refused with a reason the model can read otherwise (its
+  other tools are below). Prompt caching is on by default.
 - **`krowk -p`'s agent can change files, in the edit format its model was
   trained on.** Beside `read` and `bash` it now has `write`, `grep`, `glob`
   and one edit tool: `str_replace` for Claude models, `apply_patch` (the

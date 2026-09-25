@@ -5,6 +5,7 @@
 use crate::engine::{BoxFuture, Engine, EngineError, EngineEvent, Events, HistoryItem, TurnContext, TurnEnd};
 use crate::protocol::{Effort, Item, ItemKind, ProviderBlob, ToolDefinition, Usage, WireApi};
 use crate::hooks;
+use crate::subagent::SUBAGENT;
 use crate::tools;
 use serde_json::json;
 use crate::toolset::Toolset;
@@ -178,6 +179,26 @@ pub fn tools_tokens(tools: &[ToolDefinition]) -> u64 {
     tools.iter().map(|t| estimate_tokens(&serde_json::to_string(t).expect("a definition serializes"))).sum()
 }
 
+/// Runs every future to its end at once, and answers in their order: a
+/// fan-out of subagents, which borrow the turn and so cannot be spawned.
+async fn join_all<T>(mut futs: Vec<BoxFuture<'_, T>>) -> Vec<T> {
+    let mut done: Vec<Option<T>> = futs.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (f, slot) in futs.iter_mut().zip(done.iter_mut()) {
+            if slot.is_none() {
+                match f.as_mut().poll(cx) {
+                    std::task::Poll::Ready(v) => *slot = Some(v),
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending { std::task::Poll::Pending } else { std::task::Poll::Ready(()) }
+    })
+    .await;
+    done.into_iter().map(|v| v.expect("every future finished")).collect()
+}
+
 impl<C: ModelClient> Engine for NativeEngine<C> {
     fn provider(&self) -> &str {
         self.client.provider()
@@ -197,10 +218,22 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
             // The instructions and the skills' names ride after krowk's own
             // lines: stable for as long as their files are, so the prefix
             // still caches.
-            let system = system_prompt(&ctx.cwd, &toolset) + &ctx.compat.prompt();
-            let mut tool_defs = tools::definitions(&toolset);
-            if !ctx.compat.skills.is_empty() {
+            let mut system = system_prompt(&ctx.cwd, &toolset) + &ctx.compat.prompt();
+            // A turn offers the tools its session may use: a subagent its
+            // definition's allowlist and never `subagent`, a session that
+            // cannot start subagents none (R-SUB-1).
+            let offered = |name: &str| offers(&ctx, name);
+            let mut tool_defs: Vec<ToolDefinition> = tools::definitions(&toolset).into_iter().filter(|d| offered(&d.name)).collect();
+            if let Some(s) = &ctx.subagents
+                && let Some(d) = tool_defs.iter_mut().find(|d| d.name == SUBAGENT)
+            {
+                d.description = s.description();
+            }
+            if !ctx.compat.skills.is_empty() && offered(crate::compat::skills::TOOL) {
                 tool_defs.push(crate::compat::skills::definition());
+            }
+            if let Some(run) = &ctx.agent {
+                system = crate::subagent::system_prompt(&system, run);
             }
             let _ = events.send(EngineEvent::Context { system: system.clone(), tools: tool_defs.clone() }).await;
             let family = ctx.model_info.as_ref().and_then(|i| i.family.clone()).or_else(|| crate::toolset::family_from_id(&ctx.model.model).map(String::from));
@@ -255,6 +288,15 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                     let _ = events.send(EngineEvent::ItemCompleted { item_id: krowk_store::new_id(), item: item.clone() }).await;
                     req.history.push(HistoryItem { item, response: None });
                 }
+                // R-TODO-3: a list left open too long is put in front of
+                // the model again, where the log shows it was.
+                if offers(&ctx, crate::todo::TODO_WRITE)
+                    && let Some(text) = crate::todo::reminder(&req.history)
+                {
+                    let item = Item::UserText { text };
+                    let _ = events.send(EngineEvent::ItemCompleted { item_id: krowk_store::new_id(), item: item.clone() }).await;
+                    req.history.push(HistoryItem { item, response: None });
+                }
                 let resp = self.client.stream(&req, &events, ctx.cancel.clone()).await?;
                 let item_ids: Vec<String> = resp.items.iter().map(|(id, _)| id.clone()).collect();
                 let _ = events
@@ -300,30 +342,53 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                     continue;
                 }
                 let mut interrupted = false;
-                for (call_id, name, input) in calls {
-                    let item_id = krowk_store::new_id();
-                    let _ = events.send(EngineEvent::ItemStarted { item_id: item_id.clone(), kind: ItemKind::ToolResult { call_id: call_id.clone() } }).await;
+                let mut at = 0;
+                while at < calls.len() {
+                    // R-SUB-2: a run of subagent calls starts together and is
+                    // answered in the order it was asked. A subagent is not
+                    // dropped on an interrupt: it hears the parent's and stops
+                    // itself, so its log ends with its turn.
+                    let fan = calls[at..].iter().take_while(|(_, name, _)| name == SUBAGENT && ctx.subagents.is_some()).count();
+                    let batch = &calls[at..at + fan.max(1)];
+                    at += batch.len();
+                    let ids: Vec<String> = batch.iter().map(|_| krowk_store::new_id()).collect();
+                    for ((call_id, _, _), item_id) in batch.iter().zip(&ids) {
+                        let _ = events.send(EngineEvent::ItemStarted { item_id: item_id.clone(), kind: ItemKind::ToolResult { call_id: call_id.clone() } }).await;
+                    }
                     // Every call gets its result, even one never run: a call
                     // with no result cannot be sent back to the provider.
-                    let (output, is_error) = if interrupted {
-                        ("not run: the turn was interrupted".to_string(), true)
+                    let results: Vec<(String, bool)> = if interrupted {
+                        batch.iter().map(|_| ("not run: the turn was interrupted".to_string(), true)).collect()
                     } else if hooks.is_stopped() {
-                        ("not run: a hook stopped the turn".to_string(), true)
+                        batch.iter().map(|_| ("not run: a hook stopped the turn".to_string(), true)).collect()
+                    } else if fan > 0 {
+                        // Each subagent call is its own call — its hooks, its
+                        // verdict — and they run at once. None is dropped on
+                        // an interrupt: a subagent hears the parent's and
+                        // stops itself, so its log ends with its turn.
+                        let runs: Vec<BoxFuture<'_, (String, bool)>> =
+                            batch.iter().map(|(call_id, name, input)| Box::pin(call_tool(&ctx, &hooks, &tool_env, &events, call_id, name, input)) as BoxFuture<'_, (String, bool)>).collect();
+                        let out = join_all(runs).await;
+                        interrupted = *ctx.cancel.borrow();
+                        out
                     } else {
+                        let (call_id, name, input) = &batch[0];
                         let mut cancel = ctx.cancel.clone();
                         let r = tokio::select! {
-                            r = call_tool(&ctx, &hooks, &tool_env, &events, &name, &input) => r,
+                            r = call_tool(&ctx, &hooks, &tool_env, &events, call_id, name, input) => r,
                             _ = crate::engine::cancelled(&mut cancel) => ("interrupted before it finished".to_string(), true),
                         };
                         // An interrupt that landed while the call waited for
                         // a person's say stops the turn as surely as one
                         // that landed while it ran.
                         interrupted = *ctx.cancel.borrow();
-                        r
+                        vec![r]
                     };
-                    let item = Item::ToolResult { call_id, output, is_error };
-                    let _ = events.send(EngineEvent::ItemCompleted { item_id, item: item.clone() }).await;
-                    req.history.push(HistoryItem { item, response: None });
+                    for (((call_id, _, _), item_id), (output, is_error)) in batch.iter().zip(ids).zip(results) {
+                        let item = Item::ToolResult { call_id: call_id.clone(), output, is_error };
+                        let _ = events.send(EngineEvent::ItemCompleted { item_id, item: item.clone() }).await;
+                        req.history.push(HistoryItem { item, response: None });
+                    }
                 }
                 if interrupted {
                     return Ok(TurnEnd::Interrupted);
@@ -429,14 +494,48 @@ fn claude_input(name: &str, input: &serde_json::Value) -> serde_json::Value {
     v
 }
 
-/// One tool call, whole: the skill tool, or a file tool or bash — its
-/// PreToolUse hooks, its permission, the run, its PostToolUse hooks.
-async fn call_tool(ctx: &TurnContext, hooks: &Hooked<'_>, env: &tools::ToolEnv<'_>, events: &Events, name: &str, input: &serde_json::Value) -> (String, bool) {
+/// Whether the turn offers the tool `name`: a subagent only what its
+/// definition allows, never `subagent`; a session `subagent` only when it
+/// may start subagents.
+fn offers(ctx: &TurnContext, name: &str) -> bool {
+    match (&ctx.agent, name) {
+        (Some(run), n) => run.allows(n, ctx.preset.edit.name()),
+        (None, SUBAGENT) => ctx.subagents.is_some(),
+        (None, _) => true,
+    }
+}
+
+/// The session's own tools — `todo_write` and `subagent` — as the
+/// evaluator judges them: they need no mode (a todo list is the session's
+/// own; a subagent is held to these same rules), but a deny rule on
+/// Claude Code's name for them — `TodoWrite`, `Task` or `Task(<agent>)` —
+/// refuses them, and hooks see them under those names.
+fn session_tool(name: &str, input: &serde_json::Value) -> Option<crate::permissions::Call> {
+    let (tool, subject) = match name {
+        crate::todo::TODO_WRITE => ("TodoWrite", None),
+        SUBAGENT => ("Task", Some(input.get("agent").and_then(|a| a.as_str()).filter(|a| !a.trim().is_empty()).unwrap_or("general-purpose").to_string())),
+        _ => return None,
+    };
+    Some(crate::permissions::Call { tool: tool.into(), access: crate::permissions::Access::Free, subject })
+}
+
+/// One tool call, whole: the skill tool, the session's own tools, or a
+/// file tool or bash — its PreToolUse hooks, its permission, the run, its
+/// PostToolUse hooks. A subagent's calls come here like any other's, under
+/// the parent's mode and rules.
+async fn call_tool(ctx: &TurnContext, hooks: &Hooked<'_>, env: &tools::ToolEnv<'_>, events: &Events, call_id: &str, name: &str, input: &serde_json::Value) -> (String, bool) {
+    if !offers(ctx, name) {
+        return (format!("there is no tool named {name:?} in this session — use the tools it offers"), true);
+    }
     // The skill tool is a call like any other: its hooks see it as
     // Claude Code's `Skill`, and `Skill(name)` rules — and a `Read` deny of
     // its file — judge it before its body enters the conversation.
     let skill = name == crate::compat::skills::TOOL && !ctx.compat.skills.is_empty();
-    let (call, claude, tool_input) = if skill {
+    let own = session_tool(name, input);
+    let (call, claude, tool_input) = if let Some(c) = own.clone() {
+        let claude = c.tool.clone();
+        (c, claude, input.clone())
+    } else if skill {
         match crate::compat::skills::call(&ctx.compat.skills, input) {
             Ok((call, skill_name)) => (call, "Skill".to_string(), json!({ "skill": skill_name })),
             Err(e) => return e,
@@ -458,7 +557,22 @@ async fn call_tool(ctx: &TurnContext, hooks: &Hooked<'_>, env: &tools::ToolEnv<'
         Ok(o) => o,
         Err(why) => return (why, true),
     };
-    let (mut output, is_error) = if skill { crate::compat::skills::load(&ctx.compat.skills, input) } else { tools::execute(name, input, env, ctx.gate.scope(opens)).await };
+    let (mut output, is_error) = match own {
+        Some(_) if name == SUBAGENT => match &ctx.subagents {
+            Some(s) => s.run(call_id, input, events).await,
+            None => (format!("{name} is not available in this session"), true),
+        },
+        Some(_) => match crate::todo::parse(input) {
+            Ok(todos) => {
+                let said = crate::todo::summary(&todos);
+                let _ = events.send(EngineEvent::Todos { todos }).await;
+                (said, false)
+            }
+            Err(e) => (e, true),
+        },
+        None if skill => crate::compat::skills::load(&ctx.compat.skills, input),
+        None => tools::execute(name, input, env, ctx.gate.scope(opens)).await,
+    };
     let post = hooks.run(hooks::Event::PostToolUse, Some(&claude), json!({"tool_name": claude, "tool_input": tool_input, "tool_response": {"output": output, "isError": is_error}})).await;
     if let Some(why) = post.block {
         output.push_str(&format!("\n\n(a PostToolUse hook says: {why})"));
@@ -485,6 +599,11 @@ mod tests {
         let max = file[at..].lines().find_map(|l| l.strip_prefix("max = ")).expect("context.tokens has a max");
         max.trim().replace('_', "").parse().expect("a whole number of tokens")
     }
+
+    /// The ceiling for a toolset whose `apply_patch` is a freeform grammar
+    /// tool: the JSON budget plus the grammar (about 125 tokens) with
+    /// headroom. Ticket 10 measured 1,617 with a long working directory.
+    const FREEFORM_CONTEXT_TOKENS: u64 = 1650;
 
     #[test]
     fn r_switch_1_downgraded_reasoning_cannot_close_its_frame() {
@@ -566,7 +685,13 @@ mod tests {
                 let (s, t) = (estimate_tokens(&system), tools_tokens(&tools::definitions(&ts)));
                 println!("R-TOOL-1 context tokens: {} (custom tools {custom_tools}): system {s} + tools {t} = {}", preset.name, s + t);
                 assert!(s < 150, "the system prompt is {s} tokens: keep it a few lines");
-                assert!(s + t <= budget, "{}: system + tools is {} tokens, over the {budget} budget (context.tokens in krowk-bench/budgets.toml)", preset.name, s + t);
+                // The freeform apply_patch carries its Lark grammar, which
+                // only a wire API with grammar tools is sent, and which the
+                // bench — JSON tools on the Messages API — never measures:
+                // it is held to its own ceiling.
+                let freeform = tools::definitions(&ts).iter().any(|d| d.grammar.is_some());
+                let ceiling = if freeform { FREEFORM_CONTEXT_TOKENS } else { budget };
+                assert!(s + t <= ceiling, "{}: system + tools is {} tokens, over the {ceiling} ceiling (context.tokens in krowk-bench/budgets.toml, or FREEFORM_CONTEXT_TOKENS for the grammar form)", preset.name, s + t);
                 assert_eq!(system, system_prompt(cwd, &ts), "nothing volatile: the prompt is the front of the cached prefix");
             }
         }

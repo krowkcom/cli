@@ -14,6 +14,7 @@ use krowk_harness::evidence::{PublishRequest, Publisher};
 use krowk_harness::permissions;
 use krowk_harness::protocol::{BudgetLimits, Effort, PermissionMode, TurnStatus, Usage};
 use std::collections::HashMap;
+use krowk_harness::subagent::{AgentsConfig, Models};
 use krowk_harness::trust;
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
@@ -79,6 +80,7 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
         trust: trust_gate(ctx.f.trust, super::interactive(ctx) && std::io::stdin().is_terminal() && ctx.io.err_tty, home, vendor),
         publisher: Some(publisher(ctx)),
         permissions,
+        agents: agents_config(ctx.io.env),
     };
     let opts = headless::Options { prompt, resume, model, permission_mode, toolset, effort, budget, format };
     let outcome = headless::run(cfg, opts, ctx.io.stdout);
@@ -390,6 +392,32 @@ pub(super) fn catalog(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Cata
         let raw = std::fs::read(pricing::cache_path(&env)?).ok()?;
         krowk_harness::catalog::lookup(&raw, provider, model)
     })
+}
+
+/// R-SUB-1, R-SUB-5: the person's agent definitions — krowk's own in its
+/// config directory, then Claude Code's (`$CLAUDE_CONFIG_DIR`, else
+/// `~/.claude`) — and the models.dev cache's listing, which a subagent's
+/// cheaper tier is chosen from. Read from the cache only, like the catalog.
+pub(super) fn agents_config(env: &dyn Fn(&str) -> String) -> AgentsConfig {
+    let home = env("HOME");
+    let claude = match env("CLAUDE_CONFIG_DIR") {
+        d if std::path::Path::new(&d).is_absolute() => std::path::PathBuf::from(d),
+        _ => std::path::Path::new(&home).join(".claude"),
+    };
+    let mut user_dirs = vec![krowk_api::creds::config_dir().join("agents")];
+    if claude.is_absolute() {
+        user_dirs.push(claude.join("agents"));
+    }
+    let cache = env("XDG_CACHE_HOME");
+    let models: Models = Arc::new(move |provider: &str| {
+        let env = |k: &str| match k {
+            "XDG_CACHE_HOME" => cache.clone(),
+            "HOME" => home.clone(),
+            _ => String::new(),
+        };
+        pricing::cache_path(&env).and_then(|p| std::fs::read(p).ok()).map(|raw| krowk_harness::catalog::models(&raw, provider)).unwrap_or_default()
+    });
+    AgentsConfig { user_dirs, models }
 }
 
 /// An engine failure as krowk's error: the code and its fix, with the HTTP

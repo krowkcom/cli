@@ -965,6 +965,7 @@ impl Proc {
         let _ = events.send(EngineEvent::BackendSession { backend: BACKEND.into(), session_id: thread.clone(), transcript: self.transcript.clone(), billing: self.billing }).await;
         let effort = effort_for(ctx.effort, self.efforts.get(&ctx.model.model).map(Vec::as_slice), ctx.model_info.as_ref(), &ctx.model.model);
         let mut t = Translator::new(&ctx.model.model);
+        let mut subs = stream::SubThreads::default();
         let mut input = vec![prompt];
         let mut interrupted = false;
         loop {
@@ -1077,8 +1078,10 @@ impl Proc {
                             }
                             Msg::Note { method, params } => {
                                 // Another thread's — a subagent Codex runs — is
-                                // its own conversation, which Codex keeps.
-                                if params.get("threadId").and_then(Value::as_str).is_some_and(|th| th != thread) {
+                                // its own conversation, which Codex keeps; what
+                                // its calls cost is the session's spend.
+                                if method == "thread/started" || params.get("threadId").and_then(Value::as_str).is_some_and(|th| th != thread) {
+                                    forward(events, subs.apply(&thread, &method, &params).into_iter().collect()).await;
                                     continue;
                                 }
                                 let of_turn = params.get("turnId").and_then(Value::as_str).or_else(|| params.pointer("/turn/id").and_then(Value::as_str));

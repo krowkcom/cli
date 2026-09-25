@@ -356,12 +356,95 @@ impl Translator {
     }
 }
 
+/// Codex's own subagents: threads other than the session's, which Codex
+/// spawns and keeps. Their items are their conversation, not the
+/// session's, but every model call one makes is the session's spend
+/// (R-SUB-4), so each thread's `thread/tokenUsage/updated` is metered as a
+/// `SubagentResponse`, once per move of that thread's total, and priced by
+/// the model the thread said it runs.
+#[derive(Debug, Default)]
+pub struct SubThreads {
+    /// Each thread seen: its model, and the total last metered.
+    threads: HashMap<String, (String, Option<i64>)>,
+}
+
+impl SubThreads {
+    /// One notification of a thread other than `own`: what to meter.
+    pub fn apply(&mut self, own: &str, method: &str, params: &Value) -> Option<EngineEvent> {
+        match method {
+            "thread/started" => {
+                let th = params.get("thread")?;
+                let id = str_of(th, "id");
+                if id.is_empty() || id == own {
+                    return None;
+                }
+                self.threads.entry(id.into()).or_default().0 = str_of(th, "model").into();
+                None
+            }
+            "model/rerouted" => {
+                let to = str_of(params, "toModel");
+                if !to.is_empty() {
+                    self.threads.entry(str_of(params, "threadId").into()).or_default().0 = to.into();
+                }
+                None
+            }
+            "thread/tokenUsage/updated" => {
+                let entry = self.threads.entry(str_of(params, "threadId").into()).or_default();
+                let total = params.pointer("/tokenUsage/total/totalTokens").and_then(Value::as_i64);
+                if total.is_some() && total == entry.1 {
+                    return None;
+                }
+                entry.1 = total;
+                let last = params.pointer("/tokenUsage/last").cloned().unwrap_or(Value::Null);
+                Some(EngineEvent::SubagentResponse { response_id: None, model: entry.0.clone(), usage: usage(&last) })
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn n(method: &str, params: Value) -> (String, Value) {
         (method.into(), params)
+    }
+
+    #[test]
+    fn r_sub_4_codexs_own_subagent_threads_are_metered_once_per_call_at_their_model() {
+        let mut subs = SubThreads::default();
+        let usage = |total: i64, out: i64| json!({"threadId": "sub-1", "turnId": "x", "tokenUsage": {"last": {"inputTokens": 50, "cachedInputTokens": 20, "outputTokens": out, "reasoningOutputTokens": 0, "totalTokens": 50 + out}, "total": {"totalTokens": total}}});
+        assert_eq!(subs.apply("own", "thread/started", &json!({"thread": {"id": "own", "model": "gpt-5.5"}})), None, "the session's own thread is not a subagent");
+        assert_eq!(subs.apply("own", "thread/started", &json!({"thread": {"id": "sub-1", "model": "gpt-5.4-mini"}})), None);
+        let first = subs.apply("own", "thread/tokenUsage/updated", &usage(60, 10));
+        assert_eq!(
+            first,
+            Some(EngineEvent::SubagentResponse { response_id: None, model: "gpt-5.4-mini".into(), usage: Usage { input_tokens: 30, output_tokens: 10, cache_read_tokens: 20, ..Usage::default() } })
+        );
+        assert_eq!(subs.apply("own", "thread/tokenUsage/updated", &usage(60, 10)), None, "the same total again is the same call");
+        assert!(subs.apply("own", "thread/tokenUsage/updated", &usage(130, 20)).is_some());
+        assert_eq!(subs.apply("own", "item/agentMessage/delta", &json!({"threadId": "sub-1", "delta": "hi"})), None, "its items are its own conversation");
+    }
+
+    /// The pinned schema gives each thread its own `ThreadTokenUsage`, and
+    /// krowk meters a call by its `last`, never by the difference of two
+    /// `total`s — `total` only tells a repeat from a new call. So even a
+    /// Codex whose parent total counted its sub-threads' tokens too would
+    /// not have them counted twice: the parent's call is its `last`.
+    #[test]
+    fn r_sub_4_a_parent_total_that_includes_its_sub_threads_still_meters_each_call_once() {
+        let mut t = Translator::new("gpt-5.5");
+        let mut subs = SubThreads::default();
+        let sub = subs.apply("own", "thread/tokenUsage/updated", &json!({"threadId": "sub-1", "turnId": "x", "tokenUsage": {"last": {"inputTokens": 300, "outputTokens": 7, "totalTokens": 307}, "total": {"totalTokens": 307}}}));
+        // The parent's own call is 100 in and 10 out; its total says 417,
+        // as if it held the sub-thread's 307 as well.
+        let own = t.apply("thread/tokenUsage/updated", &json!({"threadId": "own", "turnId": "y", "tokenUsage": {"last": {"inputTokens": 100, "outputTokens": 10, "totalTokens": 110}, "total": {"totalTokens": 417}}}));
+        let usage_of = |evs: &[EngineEvent]| evs.iter().find_map(|e| match e { EngineEvent::ResponseCompleted { usage, .. } | EngineEvent::SubagentResponse { usage, .. } => Some(*usage), _ => None });
+        let sub = usage_of(&sub.into_iter().collect::<Vec<_>>()).unwrap();
+        let own = usage_of(&own).unwrap();
+        assert_eq!((sub.input_tokens, sub.output_tokens), (300, 7));
+        assert_eq!((own.input_tokens, own.output_tokens), (100, 10), "the parent's call is its last, whatever its total holds");
     }
 
     #[test]

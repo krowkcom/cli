@@ -138,7 +138,7 @@ fn r_budget_1_a_child_sessions_spend_counts_toward_its_parents_budget() {
     // A synthetic subagent under it that has generated 5,000 tokens.
     {
         use krowk_harness::protocol::{LogBody, ModelRef, Usage, WireApi};
-        let (mut child, _) = krowk_harness::log::SessionLog::create_child(&b.sessions(), &b.root.join("repo"), "test", Some(&parent)).unwrap();
+        let (mut child, _) = krowk_harness::log::SessionLog::create_child(&b.sessions(), &b.root.join("repo"), "test", Some(&parent), None).unwrap();
         let model = ModelRef { instance: "anthropic".into(), model: "claude-sonnet-4-6".into() };
         child.append(LogBody::TurnStarted { turn_id: "t".into(), model, provider: "anthropic".into(), wire_api: WireApi::AnthropicMessages, permission_mode: Default::default(), effort: None }).unwrap();
         let usage = Usage { input_tokens: 10, output_tokens: 5000, ..Usage::default() };

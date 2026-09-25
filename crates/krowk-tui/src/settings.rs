@@ -7,10 +7,12 @@
 //! - `statusBar` — false hides the status bar. The "no network
 //!   connectivity" notice is not part of it and shows regardless (R-OFF-1).
 //! - `statusItems` — which items the bar shows, in order: any of `model`,
-//!   `instance`, `cost`, `connectivity`, `session`.
+//!   `instance`, `cost`, `connectivity`, `session`, `todos` and `subagents`
+//!   — the last two only while there is a list, or a subagent running.
 //!
 //! The overlays are toggled from the keyboard rather than configured: `?` on
-//! an empty prompt for the keys, Ctrl-O for the session's details.
+//! an empty prompt for the keys, Ctrl-O for the session's details, Ctrl-T
+//! for the todo list and Ctrl-G for the subagents.
 
 use serde_json::Value;
 
@@ -21,11 +23,22 @@ pub enum Item {
     Cost,
     Connectivity,
     Session,
+    /// `todos 2/5` while the session has a todo list.
+    Todos,
+    /// `2 agents` while subagents run.
+    Subagents,
 }
 
 impl Item {
-    pub const ALL: [(&'static str, Item); 5] =
-        [("model", Item::Model), ("instance", Item::Instance), ("cost", Item::Cost), ("connectivity", Item::Connectivity), ("session", Item::Session)];
+    pub const ALL: [(&'static str, Item); 7] = [
+        ("model", Item::Model),
+        ("instance", Item::Instance),
+        ("cost", Item::Cost),
+        ("connectivity", Item::Connectivity),
+        ("session", Item::Session),
+        ("todos", Item::Todos),
+        ("subagents", Item::Subagents),
+    ];
 
     fn parse(s: &str) -> Option<Item> {
         Item::ALL.iter().find(|(n, _)| *n == s).map(|(_, i)| *i)
@@ -40,7 +53,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { status_bar: true, status_items: vec![Item::Model, Item::Instance, Item::Cost, Item::Connectivity] }
+        Settings { status_bar: true, status_items: vec![Item::Model, Item::Instance, Item::Cost, Item::Todos, Item::Subagents, Item::Connectivity] }
     }
 }
 

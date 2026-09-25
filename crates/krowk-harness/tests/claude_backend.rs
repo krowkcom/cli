@@ -108,6 +108,7 @@ impl Home {
             trust: gate,
             publisher,
             permissions: Default::default(),
+            agents: krowk_harness::subagent::AgentsConfig::none(),
         })
     }
 

@@ -339,6 +339,65 @@ the versions are the `v*` tags a release is cut from. Entries land under
   file changed can mean running its clean filter, and a repository can name
   any command as one. `--dev` publishes to the stand-in registry. Claude Code
   sessions get the same tool as `mcp__krowk__publish`.
+- **krowk's agent can hand work to subagents, several at once.** The
+  model's new `subagent` tool starts a child session with a fresh context
+  — only the prompt it is given — that does one task and hands back only
+  its final summary, so a search or a review that reads fifty files costs
+  the main conversation a paragraph. The subagent calls of one response run
+  in parallel, four at a time (`"subagents": {"maxParallel": N}` in
+  `config.json`), and each runs on a cheaper model by default: the
+  catalog's tier below the session's (Opus to Sonnet, Sonnet to Haiku, a
+  GPT to its mini), or `"subagents": {"model": "…"}`. A subagent runs in
+  the session's permission mode, never a looser one, with the same file
+  fences, on krowk's own loop, and starts no subagents of its own. Its
+  calls are judged by the session's permission rules and hooks like the
+  session's own — a deny rule holds in it, an approval it needs is asked
+  in the TUI under its own line (and refused at once under `krowk -p`),
+  and a session grant covers it. `subagent` and `todo_write` need no mode,
+  but a deny rule on Claude Code's names for them (`Task`,
+  `Task(<agent>)`, `TodoWrite`) refuses them, and hooks see them under
+  those names. Its
+  spend counts toward the session's `--max-usd` and `--max-tokens`: a
+  subagent's calls are held to the parent's limit, and the parent's next
+  call counts what its subagents spent; subagents running at once can
+  together end up to one call each past the limit. A turn's `costUsd`
+  includes its subagents'. In the TUI each subagent is one
+  line — what it is doing, how long, its tokens and cost — and Ctrl-G
+  selects among them: Enter expands a line to what that subagent did last,
+  `x` interrupts that one alone, and its siblings carry on; Ctrl-C still
+  interrupts the whole turn, subagents included. Each subagent is a session of its own in
+  `krowk sessions`, listed under the session that started it, and
+  `krowk sessions rebuild` restores the tree from the logs. `-p
+  --output-format stream-json` now carries the subagents' lines too, each
+  under its own `sessionId`. Codex's own subagent threads are metered into
+  the session's spend as well, as Claude Code's already were.
+- **Agent definitions, krowk's and Claude Code's.** A Markdown file with a
+  `name`, a `description` (when the model should use it), a `model` and a
+  `tools` allowlist, the body being its instructions, in the repository's
+  `.krowk/agents/` or `.claude/agents/`, or your own
+  (`~/.config/krowk/agents/`, `~/.claude/agents/`), is offered to the model
+  by name. Claude Code's files work as they are: `tools: Read, Grep, Bash`
+  maps to krowk's tools (what krowk has no tool for, like `WebFetch`, is
+  left out), and `model: haiku`, `sonnet`, `opus` or `inherit` pick the
+  newest of that family the catalog lists (`krowk pricing refresh` fills
+  it) or the session's own model. A definition only narrows: the
+  permission mode is always the session's. **A repository's definitions
+  can pick a model only on the session's own instance until you trust the
+  repository** (the list `krowk -p` asks about for Claude Code and Codex,
+  or `--trust`); otherwise the subagent runs on the default and you are
+  told. They are never read through a symlink out of the repository, and
+  the agent cannot write `.krowk/` (like `.claude/`) below
+  `bypassPermissions`.
+- **`todo_write`: the agent keeps a todo list.** One tool that replaces the
+  whole list each time (up to 50 items; Claude Code's `activeForm` and
+  similar fields are accepted and dropped), for work of three or more
+  steps; the list is in the
+  session's log, so it survives `--resume` and a switch of model. Ctrl-T
+  shows it in the TUI, and the status bar counts it (`todos 2/5`, and
+  `2 agents` while subagents run; both are `tui.statusItems`). When items
+  have stayed open for ten model calls without an update, the model is
+  reminded of the list — shown in the TUI as krowk's reminder, not as your
+  words.
 - **krowk asks before Claude Code runs in a repository you have not
   trusted.** `claude -p` runs a repository's hooks and MCP servers without
   its usual trust prompt, so krowk shows its own on a terminal — `krowk

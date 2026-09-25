@@ -18,7 +18,11 @@
 //! - `codex` — the Codex backend: the user's own `codex`, driven as `codex
 //!   app-server` over JSON-RPC, with krowk's tools as its dynamic tools.
 //! - `tools` — read, write, the edit tools, bash, grep and glob;
-//!   `evidence` — `publish`, and the session's krowk run.
+//!   `evidence` — `publish`, and the session's krowk run; `todo` —
+//!   `todo_write` and the stale-list reminder.
+//! - `subagent` — the `subagent` tool: child sessions with their own
+//!   context, model and tools, fanned out in parallel; `agents` — the agent
+//!   definitions they run, krowk's and Claude Code's.
 //! - `budget` — what a session may spend, checked before every model call.
 //! - `permissions` — Claude-Code-compatible modes, rules and approvals:
 //!   the one evaluator every call is judged by, native or a backend's.
@@ -35,6 +39,7 @@
 //! Canon `engineering/harness.md` describes all of it for readers who will
 //! not open the code.
 
+pub mod agents;
 pub mod anthropic;
 pub mod bridge;
 pub mod budget;
@@ -60,7 +65,9 @@ pub mod permissions;
 pub mod project;
 pub mod protocol;
 pub mod schema;
+pub mod subagent;
 pub mod sse;
+pub mod todo;
 pub mod tools;
 pub mod toolset;
 pub mod trust;

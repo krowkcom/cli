@@ -55,6 +55,7 @@ pub fn what_runs(root: &Path) -> Vec<String> {
         (".mcp.json", "its MCP servers"),
         (".claude/commands", "its commands"),
         (".claude/agents", "its agents"),
+        (".krowk/agents", "krowk agent definitions"),
         (".codex", "Codex's project config, rules and hooks"),
     ] {
         if root.join(file).symlink_metadata().is_ok() {

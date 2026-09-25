@@ -80,7 +80,16 @@ unit = "bytes"
 # expand key) 20,992, and bare-repository checks 2,272: 7,594,344
 # (7.24 MiB), 7,832 under this — the next
 # harness ticket that grows the build raises it with its own reason.
-max = { x86_64-linux = 7_602_176 }
+# Ticket 10's subagents and todos (no new crate: the subagent tool and
+# child turns on the shared host, agent definitions and their parser, the
+# catalog's tier listing, incremental tree metering, `todo_write` and its
+# reminder, Codex sub-thread metering, the TUI's subagent lines and
+# overlays, and routing all of it through ticket 09's evaluator and hooks)
+# add 151,520 bytes on top of 09: 7,745,864 (7.39 MiB), 143,688 over 7.25
+# MiB. Raised 7.25 -> 7.50 MiB by ticket 10, for 09 and 10 together — no
+# crate is added, the growth is their code — leaving 118,456 bytes for the
+# rest of Harness P0 to justify.
+max = { x86_64-linux = 7_864_320 }
 status = "enforced"
 
 # --- Startup: a new process each run, no daemon ---
@@ -231,11 +240,18 @@ unit = "tokens"
 # apply_patch as a JSON tool; claude 1,165, grok 1,178), and about 1,310 for
 # apply_patch in its freeform form, which only a wire API with grammar tools
 # offers. Ticket 08's `publish` brings them to 1,327 (gpt; claude
-# 1,310, grok 1,323), and about 1,450 in the freeform form. Every model
-# call carries these tokens, so a new tool or a longer description has to
-# fit here or raise this with a reason. The unit test
-# `r_tool_1_the_system_prompt_and_tool_definitions_stay_small` holds every
-# preset in both forms to this same number.
+# 1,310, grok 1,323), and about 1,450 in the freeform form. Ticket 10 adds
+# `todo_write` (R-TOOL-1's list complete) and `subagent`, about 240 tokens
+# between them, and takes about 70 back from the existing definitions — an
+# optional field's schema is its type alone, a nested type is written in
+# place, and a path's field no longer repeats what the system prompt says
+# of relative paths: 1,472 (gpt; claude 1,437, grok 1,450), inside 1,500.
+# The freeform form, which only a wire API with grammar tools is sent and
+# this bench never measures, is held to its own ceiling (1,650) by the
+# unit test. Every model call carries these tokens, so a new tool or a
+# longer description has to fit here or raise this with a reason. The unit
+# test `r_tool_1_the_system_prompt_and_tool_definitions_stay_small` holds
+# every preset's JSON form to this same number.
 max = 1500
 runs = 1
 status = "enforced"

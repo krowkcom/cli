@@ -13,7 +13,7 @@ use crate::editor::Editor;
 use crate::look::{self, SEP};
 use crate::settings::{Item as StatusItem, Settings};
 use krowk_harness::host::Pricer;
-use krowk_harness::protocol::{ApprovalRequest, Billing, Delta, ErrorInfo, Item, ItemKind, LiveEvent, LogBody, LogEvent, ModelRef, RunResult, StreamLine, TurnStatus, Usage};
+use krowk_harness::protocol::{ApprovalRequest, Billing, Delta, ErrorInfo, Item, ItemKind, LiveEvent, LogBody, LogEvent, ModelRef, RunResult, StreamLine, Todo, TodoStatus, TurnStatus, Usage};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::time::{Duration, Instant};
@@ -32,6 +32,78 @@ pub enum Overlay {
     None,
     Keys,
     Details,
+    /// The session's todo list (R-TODO-3).
+    Todos,
+    /// The subagents' lines, selectable: expand one, interrupt one (R-SUB-3).
+    Agents,
+}
+
+/// A subagent of the session, drawn as one line while it runs and
+/// committed to scrollback as one line when its call is answered (R-SUB-3).
+#[derive(Debug)]
+struct Sub {
+    session_id: String,
+    /// The `subagent` call it answers, once the parent's log names it.
+    call_id: Option<String>,
+    description: String,
+    agent: Option<String>,
+    /// How its turn ended; none while it runs.
+    status: Option<TurnStatus>,
+    tokens: i64,
+    calls: u32,
+    /// The host's figure for it, from its `cost` frames.
+    cost: Option<f64>,
+    unpriced: bool,
+    /// What it did last: a tool call, or the first line of what it said.
+    activity: String,
+    started: Instant,
+    took: Option<Duration>,
+    /// Shown with its activity under it.
+    expanded: bool,
+}
+
+impl Sub {
+    fn new(session_id: &str) -> Sub {
+        Sub {
+            session_id: session_id.into(),
+            call_id: None,
+            description: String::new(),
+            agent: None,
+            status: None,
+            tokens: 0,
+            calls: 0,
+            cost: None,
+            unpriced: false,
+            activity: String::new(),
+            started: Instant::now(),
+            took: None,
+            expanded: false,
+        }
+    }
+
+    /// `Agent <description> · <agent> · <state> · N tokens · $x`.
+    fn line(&self, now: Instant) -> String {
+        let mut parts = vec![format!("Agent {}", if self.description.is_empty() { "…" } else { &self.description })];
+        if let Some(a) = &self.agent {
+            parts.push(a.clone());
+        }
+        let took = self.took.unwrap_or_else(|| now.saturating_duration_since(self.started));
+        parts.push(match self.status {
+            None => format!("running {}", look::duration(took)),
+            Some(TurnStatus::Completed) => format!("done in {}", look::duration(took)),
+            Some(TurnStatus::Interrupted) => "interrupted".into(),
+            Some(TurnStatus::Failed) => "failed".into(),
+        });
+        if self.tokens > 0 {
+            parts.push(format!("{} tokens", tokens(self.tokens)));
+        }
+        match (self.cost, self.unpriced) {
+            (_, true) => parts.push("$—".into()),
+            (Some(c), false) => parts.push(format!("${c:.2}")),
+            (None, false) => {}
+        }
+        parts.join(" · ")
+    }
 }
 
 /// The item streaming now.
@@ -134,6 +206,13 @@ pub struct App {
     /// The person printed the whole of the request shown now (`v`): only
     /// then does a request cut to fit take an allow.
     pub approval_expanded: bool,
+    /// The session's subagents whose calls are not answered yet, in the
+    /// order they started.
+    subs: Vec<Sub>,
+    /// The line the Agents overlay has selected.
+    pub agent_sel: usize,
+    /// The todo list, as the log last set it (R-TODO-2).
+    todos: Vec<Todo>,
 }
 
 impl App {
@@ -172,6 +251,9 @@ impl App {
             approvals: Vec::new(),
             approval_shown: None,
             approval_expanded: false,
+            subs: Vec::new(),
+            agent_sel: 0,
+            todos: Vec::new(),
         }
     }
 
@@ -334,6 +416,19 @@ impl App {
 
     /// One frame of the stream.
     pub fn on_line(&mut self, line: &StreamLine) {
+        // A subagent's lines come on the same stream under its own session:
+        // they are its line's, never the conversation's (R-SUB-3).
+        // A notice is the person's whoever it came from (a subagent's
+        // anonymous publish), and a subagent's approval request is answered
+        // like the session's own (under the subagent's session id), so both
+        // are shown as any other.
+        if let Some(sid) = line_session(line)
+            && self.session_id.as_deref().is_some_and(|s| s != sid)
+            && !matches!(line, StreamLine::Live(LiveEvent::Notice { .. } | LiveEvent::ApprovalRequested(_) | LiveEvent::ApprovalResolved { .. }))
+        {
+            self.on_sub_line(sid, line);
+            return;
+        }
         match line {
             StreamLine::Log(ev) => self.on_log(ev, true),
             StreamLine::Live(LiveEvent::ItemStarted { item_id, item, .. }) => {
@@ -427,6 +522,109 @@ impl App {
         self.dirty = true;
     }
 
+    /// A line of a subagent's stream. Its root starts its line, when the
+    /// parent's `subagent.started` has not already.
+    fn on_sub_line(&mut self, sid: &str, line: &StreamLine) {
+        if let StreamLine::Log(LogEvent { body: LogBody::SessionStarted { parent_session_id: Some(p), agent, .. }, .. }) = line
+            && self.session_id.as_deref() == Some(p.as_str())
+        {
+            let s = self.sub(sid);
+            if s.agent.is_none() {
+                s.agent.clone_from(agent);
+            }
+            self.dirty = true;
+            return;
+        }
+        let Some(s) = self.subs.iter_mut().find(|s| s.session_id == sid) else { return };
+        match line {
+            StreamLine::Log(ev) => match &ev.body {
+                LogBody::ItemCompleted { item: Item::ToolCall { name, input, .. }, .. } => {
+                    let (verb, arg) = look::tool_title(name, input);
+                    s.activity = format!("{verb} {arg}").trim().to_string();
+                }
+                LogBody::ItemCompleted { item: Item::AssistantText { text }, .. } => {
+                    if let Some(l) = text.lines().find(|l| !l.trim().is_empty()) {
+                        s.activity = l.trim().to_string();
+                    }
+                }
+                LogBody::ResponseCompleted { usage, .. } => {
+                    s.tokens += usage.total();
+                    s.calls += 1;
+                }
+                LogBody::TurnCompleted { status, duration_ms, .. } => {
+                    s.status = Some(*status);
+                    s.took = Some(Duration::from_millis(*duration_ms));
+                }
+                _ => {}
+            },
+            StreamLine::Live(LiveEvent::Cost { cost_usd, .. }) => match cost_usd {
+                Some(c) => {
+                    s.cost = Some(*c);
+                    s.unpriced = false;
+                }
+                None => s.unpriced = true,
+            },
+            StreamLine::Live(LiveEvent::ItemStarted { item: ItemKind::Reasoning, .. }) => s.activity = "thinking…".into(),
+            _ => return,
+        }
+        self.dirty = true;
+    }
+
+    /// The subagent of this session, a line made for it when it has none.
+    fn sub(&mut self, sid: &str) -> &mut Sub {
+        let at = match self.subs.iter().position(|s| s.session_id == sid) {
+            Some(i) => i,
+            None => {
+                self.subs.push(Sub::new(sid));
+                self.subs.len() - 1
+            }
+        };
+        &mut self.subs[at]
+    }
+
+    /// A subagent's call answered: its line, once, into scrollback — the
+    /// bullet red when it did not finish, with why under it.
+    fn commit_sub(&mut self, s: Sub, output: &str, is_error: bool) {
+        self.gap();
+        let width = usize::from(self.width.max(8));
+        let text = clip(&s.line(Instant::now()), width.saturating_sub(2));
+        self.push_line(Line::from(vec![Span::styled(look::TOOL, if is_error { red() } else { look::success() }), Span::styled(text, bold())]));
+        if is_error {
+            for l in output.lines().filter(|l| !l.trim().is_empty()).take(2) {
+                self.push_line(Line::from(vec![Span::raw("  "), Span::styled(clip(l, width.saturating_sub(2)), red())]));
+            }
+        }
+    }
+
+    /// The subagents still running, in order: what the Agents overlay
+    /// selects among.
+    pub fn agent_count(&self) -> usize {
+        self.subs.len()
+    }
+
+    /// Moves the Agents overlay's selection.
+    pub fn agent_move(&mut self, by: isize) {
+        let n = self.subs.len();
+        if n > 0 {
+            self.agent_sel = (self.agent_sel as isize + by).rem_euclid(n as isize) as usize;
+        }
+        self.dirty = true;
+    }
+
+    /// Expands or collapses the selected subagent's line.
+    pub fn agent_toggle(&mut self) {
+        if let Some(s) = self.subs.get_mut(self.agent_sel) {
+            s.expanded = !s.expanded;
+        }
+        self.dirty = true;
+    }
+
+    /// The selected subagent's session, while it is still running: what
+    /// an interrupt of that one alone is sent to (R-SUB-2).
+    pub fn agent_selected_running(&self) -> Option<String> {
+        self.subs.get(self.agent_sel).filter(|s| s.status.is_none()).map(|s| s.session_id.clone())
+    }
+
     fn on_text(&mut self, item_id: &str, text: &str) {
         let Some(live) = self.live.as_mut().filter(|l| l.id == item_id) else { return };
         match live.kind {
@@ -497,6 +695,15 @@ impl App {
             }
             // The run the session's evidence goes under: the log's to keep.
             LogBody::RunOpened { .. } => {}
+            LogBody::SubagentStarted { call_id, subagent_session_id, description, agent, .. } => {
+                let s = self.sub(subagent_session_id);
+                s.call_id = Some(call_id.clone());
+                s.description.clone_from(description);
+                if agent.is_some() {
+                    s.agent.clone_from(agent);
+                }
+            }
+            LogBody::TodosUpdated { todos, .. } => self.todos.clone_from(todos),
             LogBody::TurnCompleted { status, usage, duration_ms, error, .. } => {
                 self.turns += 1;
                 self.finish_live();
@@ -524,6 +731,12 @@ impl App {
     fn on_item(&mut self, item_id: &str, item: &Item, live: bool) {
         let streamed = self.live.as_ref().is_some_and(|l| l.id == item_id);
         match item {
+            // krowk's own reminder, not the person's words.
+            Item::UserText { text } if text.starts_with(krowk_harness::todo::REMINDER) => {
+                self.finish_live();
+                self.gap();
+                self.push_line(Line::from(vec![Span::styled(look::TOOL, dim()), Span::styled("Reminded the model of its todo list", dim().add_modifier(Modifier::ITALIC))]));
+            }
             Item::UserText { text } => {
                 if let Some(i) = self.steers.iter().position(|s| s == text) {
                     self.steers.remove(i);
@@ -569,11 +782,15 @@ impl App {
                 if let Some(t) = &mut self.turn {
                     t.tool_running = false;
                 }
-                match self.calls.iter().position(|c| &c.call_id == call_id) {
-                    Some(i) => {
-                        let c = self.calls.remove(i);
-                        self.commit_tool(&c.name, &c.input, output, *is_error);
-                    }
+                let call = self.calls.iter().position(|c| &c.call_id == call_id).map(|i| self.calls.remove(i));
+                if let Some(i) = self.subs.iter().position(|s| s.call_id.as_deref() == Some(call_id.as_str())) {
+                    let s = self.subs.remove(i);
+                    self.agent_sel = self.agent_sel.min(self.subs.len().saturating_sub(1));
+                    self.commit_sub(s, output, *is_error);
+                    return;
+                }
+                match call {
+                    Some(c) => self.commit_tool(&c.name, &c.input, output, *is_error),
                     None => self.commit_tool("tool", &serde_json::Value::Null, output, *is_error),
                 }
             }
@@ -637,11 +854,27 @@ impl App {
                 LiveKind::Result => {}
             }
         }
-        // Calls out, their results not back: each as it will be shown.
-        for c in &self.calls {
+        // Calls out, their results not back: each as it will be shown — a
+        // subagent's as its own line, below.
+        for c in self.calls.iter().filter(|c| c.name != "subagent") {
             let (verb, arg) = look::tool_title(&c.name, &c.input);
             let text = clip(&format!("{verb} {arg}"), width.saturating_sub(2));
             rows.push(Line::from(vec![Span::styled(look::TOOL, look::accent()), Span::styled(text, dim())]));
+        }
+        // Each subagent, one line: live status, tokens and cost (R-SUB-3).
+        let frame_at = |since: Duration| look::SPINNER[(since.as_millis() / look::SPIN_FRAME.as_millis()) as usize % look::SPINNER.len()];
+        for (i, s) in self.subs.iter().enumerate() {
+            let selected = self.overlay == Overlay::Agents && i == self.agent_sel;
+            let (glyph, style) = match s.status {
+                None => (format!("{} ", frame_at(now.saturating_duration_since(s.started))), look::accent()),
+                Some(TurnStatus::Completed) => (look::TOOL.to_string(), look::success()),
+                Some(_) => (look::TOOL.to_string(), red()),
+            };
+            let text_style = if selected { dim().add_modifier(Modifier::REVERSED) } else { dim() };
+            rows.push(Line::from(vec![Span::styled(glyph, style), Span::styled(clip(&s.line(now), width.saturating_sub(2)), text_style)]));
+            if s.expanded && !s.activity.is_empty() {
+                rows.push(Line::from(Span::styled(clip(&format!("  └ {}", s.activity), width), dim())));
+            }
         }
         if let Some(t) = &self.turn {
             let since = now.saturating_duration_since(t.started);
@@ -675,12 +908,20 @@ impl App {
             }
         }
         if let Some(req) = self.approvals.first() {
-            rows.extend(approval_rows(req, self.approvals.len(), width, self.approval_ready()));
+            // A subagent's request is answered here like the session's own,
+            // under the subagent's session, and says whose it is.
+            let from = self.subs.iter().find(|s| s.session_id == req.session_id).map(|s| if s.description.is_empty() { "a subagent".to_string() } else { format!("subagent “{}”", s.description) });
+            rows.extend(approval_rows(req, self.approvals.len(), width, self.approval_ready(), from.as_deref()));
         }
         match self.overlay {
             Overlay::None => {}
             Overlay::Keys => rows.extend(self.keys_overlay(width)),
             Overlay::Details => rows.extend(self.details_overlay(width)),
+            Overlay::Todos => rows.extend(self.todos_overlay(width)),
+            Overlay::Agents => {
+                let hint = if self.subs.is_empty() { "no subagents running · esc closes this" } else { "↑ ↓ select · enter expands · x interrupts that one · esc closes this" };
+                rows.push(Line::from(Span::styled(clip(hint, width), Style::new().fg(Color::Blue))));
+            }
         }
         // The prompt, scrolled to keep the caret in view.
         let (input, (crow, ccol)) = self.editor.layout(self.width.saturating_sub(2).max(1));
@@ -750,6 +991,19 @@ impl App {
                         parts.push(id.chars().take(8).collect());
                     }
                 }
+                // Only while there is something to count.
+                StatusItem::Todos => {
+                    if !self.todos.is_empty() {
+                        let done = self.todos.iter().filter(|t| t.status == TodoStatus::Completed).count();
+                        parts.push(format!("todos {done}/{}", self.todos.len()));
+                    }
+                }
+                StatusItem::Subagents => {
+                    let running = self.subs.iter().filter(|s| s.status.is_none()).count();
+                    if running > 0 {
+                        parts.push(format!("{running} agent{}", if running == 1 { "" } else { "s" }));
+                    }
+                }
             }
         }
         parts.join(SEP)
@@ -760,11 +1014,30 @@ impl App {
             "enter send · alt-enter, ctrl-j or \\ then enter: new line",
             "↑ ↓ lines, then history · ctrl-a/e line start/end · ctrl-u/k/w kill",
             "esc or ctrl-c interrupt · type while it runs to steer",
+            "ctrl-t todos · ctrl-g subagents: select, expand, interrupt one",
             "ctrl-o session details · ctrl-d or /exit quit · ? or esc closes this",
         ]
         .iter()
         .map(|l| Line::from(Span::styled(clip(l, width), Style::new().fg(Color::Blue))))
         .collect()
+    }
+
+    fn todos_overlay(&self, width: usize) -> Vec<Line<'static>> {
+        let blue = Style::new().fg(Color::Blue);
+        if self.todos.is_empty() {
+            return vec![Line::from(Span::styled(clip("no todo list in this session yet · esc closes this", width), blue))];
+        }
+        self.todos
+            .iter()
+            .map(|t| {
+                let (mark, style) = match t.status {
+                    TodoStatus::Pending => ("☐ ", blue),
+                    TodoStatus::InProgress => ("◐ ", blue.add_modifier(Modifier::BOLD)),
+                    TodoStatus::Completed => ("☑ ", dim()),
+                };
+                Line::from(Span::styled(clip(&format!("{mark}{}", t.content), width), style))
+            })
+            .collect()
     }
 
     fn details_overlay(&self, width: usize) -> Vec<Line<'static>> {
@@ -807,6 +1080,12 @@ impl App {
     pub fn end_turn_parts(&mut self) -> (Vec<String>, Vec<String>) {
         self.turn = None;
         self.finish_live();
+        // A subagent whose call was never answered is shown as it stood.
+        for s in std::mem::take(&mut self.subs) {
+            self.calls.retain(|c| s.call_id.as_deref() != Some(c.call_id.as_str()));
+            self.commit_sub(s, "no result — the turn stopped first", true);
+        }
+        self.agent_sel = 0;
         self.flush_calls();
         self.dirty = true;
         (std::mem::take(&mut self.steers), std::mem::take(&mut self.unsent_steers))
@@ -826,6 +1105,17 @@ impl App {
             self.dirty = true;
         }
     }
+}
+
+/// The session a frame belongs to.
+fn line_session(line: &StreamLine) -> Option<&str> {
+    Some(match line {
+        StreamLine::Log(ev) => &ev.session_id,
+        StreamLine::Live(LiveEvent::ItemStarted { session_id, .. } | LiveEvent::ItemDelta { session_id, .. } | LiveEvent::Cost { session_id, .. } | LiveEvent::Notice { session_id, .. }) => session_id,
+        StreamLine::Live(LiveEvent::Result(r)) => &r.session_id,
+        StreamLine::Live(LiveEvent::ApprovalRequested(r)) => &r.session_id,
+        StreamLine::Live(LiveEvent::ApprovalResolved { session_id, .. }) => session_id,
+    })
 }
 
 /// Model output is shown, never obeyed: tabs become spaces, and every other
@@ -907,10 +1197,11 @@ pub const TICK: Duration = look::SPIN_FRAME;
 /// An approval request, as it is shown over the prompt: what the call would
 /// do, why it is asked, and the keys that answer it — `s` and `p` only when
 /// the call can be remembered.
-fn approval_rows(req: &ApprovalRequest, waiting: usize, width: usize, ready: bool) -> Vec<Line<'static>> {
+fn approval_rows(req: &ApprovalRequest, waiting: usize, width: usize, ready: bool, from: Option<&str>) -> Vec<Line<'static>> {
     let more = if waiting > 1 { format!(" (1 of {waiting})") } else { String::new() };
     let summary = shown(&req.summary, MAX_APPROVAL_TEXT);
-    let mut rows: Vec<Line<'static>> = wrap(&format!("{}allow {summary}?{more}", look::TOOL), width).into_iter().map(|l| Line::from(Span::styled(l, yellow().add_modifier(Modifier::BOLD)))).collect();
+    let who = from.map(|f| format!("{}: ", shown(f, 80))).unwrap_or_default();
+    let mut rows: Vec<Line<'static>> = wrap(&format!("{}{who}allow {summary}?{more}", look::TOOL), width).into_iter().map(|l| Line::from(Span::styled(l, yellow().add_modifier(Modifier::BOLD)))).collect();
     rows.extend(wrap(&format!("  {}", shown(&req.reason, MAX_APPROVAL_TEXT)), width).into_iter().map(|l| Line::from(Span::styled(l, dim()))));
     let keys = if !ready {
         "  cut to fit — v prints all of it, then y/s/p · n deny".to_string()
@@ -1100,8 +1391,72 @@ mod tests {
         assert_eq!(rows.len(), 1, "only the prompt: {:?}", text(&rows));
         a.overlay = Overlay::Keys;
         let (rows, caret) = a.view(Instant::now());
-        assert_eq!(rows.len(), 5, "the overlay is four rows over the prompt");
-        assert_eq!(caret, (2, 4));
+        assert_eq!(rows.len(), 6, "the overlay is five rows over the prompt");
+        assert_eq!(caret, (2, 5));
+    }
+
+    fn child_log(session: &str, body: LogBody) -> StreamLine {
+        StreamLine::Log(LogEvent { id: "e".into(), parent_id: None, session_id: session.into(), time_ms: 0, body })
+    }
+
+    #[test]
+    fn r_sub_3_each_subagent_is_one_live_line_with_status_tokens_and_cost() {
+        let mut a = App::new(Editor::new(None), 100, Settings::default(), Some(ModelRef { instance: "anthropic".into(), model: "claude-x".into() }), None);
+        a.on_line(&log(LogBody::SessionStarted { cwd: "/r".into(), krowk_version: "t".into(), protocol_version: 1, parent_session_id: None, agent: None }));
+        a.start_turn(Instant::now());
+        let model = ModelRef { instance: "anthropic".into(), model: "claude-haiku".into() };
+        for (call, child, what) in [("c1", "k1", "find the tests"), ("c2", "k2", "read the docs")] {
+            a.on_line(&log(LogBody::ItemCompleted { turn_id: "t".into(), item_id: format!("i{call}"), item: Item::ToolCall { call_id: call.into(), name: "subagent".into(), input: serde_json::json!({"description": what, "prompt": "…"}) } }));
+            // The child's root can arrive before the parent logs the link.
+            a.on_line(&child_log(child, LogBody::SessionStarted { cwd: "/r".into(), krowk_version: "t".into(), protocol_version: 1, parent_session_id: Some("s".into()), agent: Some("explorer".into()) }));
+            a.on_line(&log(LogBody::SubagentStarted { turn_id: "t".into(), call_id: call.into(), subagent_session_id: child.into(), description: what.into(), agent: Some("explorer".into()), model: model.clone() }));
+        }
+        assert_eq!(a.session_id.as_deref(), Some("s"), "a child's root is not the session's");
+        a.on_line(&child_log("k1", LogBody::ItemCompleted { turn_id: "u".into(), item_id: "x".into(), item: Item::ToolCall { call_id: "r".into(), name: "grep".into(), input: serde_json::json!({"pattern": "fn test"}) } }));
+        a.on_line(&child_log("k1", LogBody::ResponseCompleted { turn_id: "u".into(), response_id: None, model: "claude-haiku".into(), usage: Usage { input_tokens: 1500, output_tokens: 500, ..Usage::default() }, stop_reason: None, item_ids: vec![] }));
+        a.on_line(&live(LiveEvent::Cost { session_id: "k1".into(), turn_id: "u".into(), cost_usd: Some(0.02), turn_cost_usd: Some(0.02), generated_tokens: 500 }));
+        a.on_line(&child_log("k2", LogBody::TurnCompleted { turn_id: "v".into(), status: TurnStatus::Interrupted, usage: Usage::default(), duration_ms: 900, error: None, reported_cost_usd: None }));
+        assert!(a.take_pending().is_empty(), "nothing of a child's reaches the conversation");
+        assert_eq!(a.status_bar(), "claude-x │ anthropic · api key │ $0.00 │ 1 agent │ connecting…", "a child's cost frame is its line's, not the session's");
+        let (rows, _) = a.view(Instant::now());
+        let rows = text(&rows);
+        let lines: Vec<&String> = rows.iter().filter(|r| r.contains("Agent ")).collect();
+        assert_eq!(lines.len(), 2, "one line each, and no second line for their calls: {rows:?}");
+        assert!(lines[0].contains("Agent find the tests · explorer · running") && lines[0].ends_with("2.0k tokens · $0.02"), "{}", lines[0]);
+        assert!(lines[1].contains("Agent read the docs · explorer · interrupted"), "{}", lines[1]);
+        // Expanded, a line shows what its subagent did last.
+        a.overlay = Overlay::Agents;
+        assert_eq!(a.agent_selected_running().as_deref(), Some("k1"));
+        a.agent_toggle();
+        a.agent_move(1);
+        assert_eq!(a.agent_selected_running(), None, "the interrupted one has nothing left to interrupt");
+        let (rows, _) = a.view(Instant::now());
+        assert!(text(&rows).iter().any(|r| r == "  └ Search fn test"), "{:?}", text(&rows));
+        // Answered, each goes to scrollback once.
+        a.on_line(&log(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "r1".into(), item: Item::ToolResult { call_id: "c1".into(), output: "found them".into(), is_error: false } }));
+        let done = text(&a.take_pending());
+        assert!(done.iter().any(|l| l.starts_with("◆ Agent find the tests · explorer · running") && l.contains("2.0k tokens")), "{done:?}");
+        a.on_line(&log(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "r2".into(), item: Item::ToolResult { call_id: "c2".into(), output: "the subagent was interrupted".into(), is_error: true } }));
+        let done = text(&a.take_pending());
+        assert!(done.iter().any(|l| l.contains("Agent read the docs · explorer · interrupted")) && done.iter().any(|l| l.contains("the subagent was interrupted")), "{done:?}");
+        let (rows, _) = a.view(Instant::now());
+        assert!(!text(&rows).iter().any(|r| r.contains("Agent ")), "gone from the live region");
+    }
+
+    #[test]
+    fn r_todo_3_the_todo_list_is_an_optional_overlay_and_a_reminder_is_krowks() {
+        let mut a = app();
+        a.settings = Settings { status_bar: true, status_items: vec![StatusItem::Todos] };
+        assert_eq!(a.status_bar(), "", "no list, no item");
+        let todo = |c: &str, s| Todo { content: c.into(), status: s };
+        a.on_line(&log(LogBody::TodosUpdated { turn_id: "t".into(), todos: vec![todo("read", TodoStatus::Completed), todo("fix", TodoStatus::InProgress), todo("test", TodoStatus::Pending)] }));
+        assert_eq!(a.status_bar(), "todos 1/3");
+        a.overlay = Overlay::Todos;
+        let (rows, _) = a.view(Instant::now());
+        assert_eq!(&text(&rows)[..3], ["☑ read", "◐ fix", "☐ test"]);
+        let reminder = format!("{}The todo list has not been updated…</system-reminder>", krowk_harness::todo::REMINDER);
+        a.on_line(&log(LogBody::ItemCompleted { turn_id: "t".into(), item_id: "r".into(), item: Item::UserText { text: reminder } }));
+        assert_eq!(text(&a.take_pending()), ["◆ Reminded the model of its todo list"], "never shown as the person's words");
     }
 
     #[test]

@@ -97,7 +97,10 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
             // krowk.db lists the krowk session, not a second copy of it.
             // So does the run its evidence went to: the registry holds the
             // run, and the tool result that published names it.
-            LogBody::SessionStarted { .. } | LogBody::BackendSession { .. } | LogBody::RunOpened { .. } => {}
+            // A subagent is its own session, projected from its own log and
+            // linked here by its root's parent; the todo list is the log's
+            // (and the calls that set it are messages already).
+            LogBody::SessionStarted { .. } | LogBody::BackendSession { .. } | LogBody::RunOpened { .. } | LogBody::SubagentStarted { .. } | LogBody::TodosUpdated { .. } => {}
             LogBody::TurnStarted { model, provider: p, .. } => {
                 flush(&mut th, &mut pending, &provider, turn);
                 provider.clone_from(p);
@@ -176,6 +179,8 @@ fn event_type(b: &LogBody) -> &'static str {
         LogBody::BackendSession { .. } => "backend.session",
         LogBody::RunOpened { .. } => "run.opened",
         LogBody::SubagentResponse { .. } => "subagent.response",
+        LogBody::SubagentStarted { .. } => "subagent.started",
+        LogBody::TodosUpdated { .. } => "todos.updated",
     }
 }
 
@@ -254,7 +259,7 @@ mod tests {
 
     #[test]
     fn r_log_2_a_turn_that_failed_mid_response_projects_the_same_incrementally_and_on_rebuild() {
-        let mut bodies = vec![LogBody::SessionStarted { cwd: "/nowhere".into(), krowk_version: "t".into(), protocol_version: 1, parent_session_id: None }];
+        let mut bodies = vec![LogBody::SessionStarted { cwd: "/nowhere".into(), krowk_version: "t".into(), protocol_version: 1, parent_session_id: None, agent: None }];
         bodies.extend(turn("t1", "first"));
         // The response streamed a text item, then failed: no response.completed.
         bodies.push(LogBody::ItemCompleted { turn_id: "t1".into(), item_id: "t1-a".into(), item: Item::AssistantText { text: "half an answer".into() } });

@@ -88,6 +88,7 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
         trust,
         publisher: Some(prompt::publisher(ctx)),
         permissions,
+        agents: prompt::agents_config(ctx.io.env),
     };
     let outcome = krowk_tui::run(krowk_tui::Options {
         host,

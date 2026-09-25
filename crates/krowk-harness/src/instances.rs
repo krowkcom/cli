@@ -64,6 +64,34 @@ pub struct InstancesConfig {
     /// instead of the one its family picks. `--toolset` overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolset: Option<String>,
+    /// How subagents run: how many at once, and on which model.
+    #[serde(default, skip_serializing_if = "SubagentsConfig::is_empty")]
+    pub subagents: SubagentsConfig,
+}
+
+/// `subagents` in config.json (R-SUB-1, R-SUB-2).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentsConfig {
+    /// Subagents one turn runs at once; 4 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel: Option<usize>,
+    /// The model a subagent runs on when its definition names none:
+    /// `<instance>/<model>`, a model id, `inherit` or an alias (`haiku`);
+    /// the catalog's cheaper tier below the parent's model when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl SubagentsConfig {
+    pub fn is_empty(&self) -> bool {
+        self.max_parallel.is_none() && self.model.is_none()
+    }
+
+    /// Subagents at once: the config's, at least one.
+    pub fn max_parallel(&self) -> usize {
+        self.max_parallel.unwrap_or(crate::subagent::MAX_PARALLEL).max(1)
+    }
 }
 
 /// What an instance is. Tagged by `kind`. Every API-key kind names the
@@ -410,6 +438,7 @@ pub struct Registry {
     pub default_model: Option<String>,
     /// Config's `toolset`, already known to name a preset.
     pub toolset: Option<String>,
+    pub subagents: SubagentsConfig,
 }
 
 impl Registry {
@@ -423,7 +452,7 @@ impl Registry {
         for (name, kind) in &cfg.instances {
             instances.insert(name.clone(), resolve_one(name, kind, env));
         }
-        Registry { instances, default_model: cfg.default_model.clone(), toolset: cfg.toolset.clone() }
+        Registry { instances, default_model: cfg.default_model.clone(), toolset: cfg.toolset.clone(), subagents: cfg.subagents.clone() }
     }
 
     /// `--model`'s reading: `<instance>/<model>` when the part before the
@@ -692,6 +721,12 @@ pub fn from_config_json(raw: &serde_json::Value) -> Result<InstancesConfig, Stri
         }
         cfg.toolset = Some(name.to_string());
     }
+    if let Some(v) = raw.get("subagents") {
+        cfg.subagents = serde_json::from_value(v.clone()).map_err(|e| format!("\"subagents\": {e}"))?;
+        if cfg.subagents.max_parallel == Some(0) {
+            return Err("\"subagents\": maxParallel must be at least 1".into());
+        }
+    }
     Ok(cfg)
 }
 
@@ -872,5 +907,14 @@ mod tests {
         assert_eq!(reg.parse_model("gpt-5.5").unwrap().instance, "openai", "a bare GPT id is still the API's");
         let sh = find_binary("sh", &std::env::var("PATH").unwrap_or_default());
         assert!(sh.is_some_and(|p| p.is_absolute()), "a name is found on PATH");
+    }
+
+    #[test]
+    fn r_sub_2_subagents_config_is_read_and_a_zero_fan_out_refused() {
+        let cfg = from_config_json(&serde_json::json!({"subagents": {"maxParallel": 2, "model": "inherit"}})).unwrap();
+        assert_eq!((cfg.subagents.max_parallel(), cfg.subagents.model.as_deref()), (2, Some("inherit")));
+        assert_eq!(from_config_json(&serde_json::json!({})).unwrap().subagents.max_parallel(), crate::subagent::MAX_PARALLEL);
+        assert!(from_config_json(&serde_json::json!({"subagents": {"maxParallel": 0}})).unwrap_err().contains("at least 1"));
+        assert!(from_config_json(&serde_json::json!({"subagents": {"maxParalel": 2}})).unwrap_err().contains("subagents"), "a typo is named");
     }
 }

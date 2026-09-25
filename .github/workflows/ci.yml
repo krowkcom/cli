@@ -43,6 +43,12 @@ jobs:
         if: runner.os == 'Linux'
         run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
 
+      # The TUI's scrollback and offline checks read the screen through
+      # tmux, and fail rather than skip under CI on Linux.
+      - name: Ensure tmux
+        if: runner.os == 'Linux'
+        run: command -v tmux || (sudo apt-get update && sudo apt-get install -y tmux)
+
       - name: Lint, unit tests and golden cases
         run: make check
 

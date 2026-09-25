@@ -53,6 +53,9 @@ pub struct Flags {
     pub model: String,
     #[cfg(feature = "harness")]
     pub resume: String,
+    /// `--resume` with no value: pick the session from a list.
+    #[cfg(feature = "harness")]
+    pub resume_pick: bool,
     #[cfg(feature = "harness")]
     pub permission_mode: String,
     #[cfg(feature = "harness")]
@@ -116,6 +119,15 @@ pub fn parse(args: &[String]) -> (Flags, Vec<String>, Result<(), String>) {
                 i += 1;
                 args[i - 1].clone()
             } else {
+                // Last on the line with no value: `krowk --resume`, which
+                // picks the session. Only the TUI takes it; `cli::run`
+                // refuses it everywhere else the way it always was.
+                #[cfg(feature = "harness")]
+                if spec.name == "resume" {
+                    f.resume_pick = true;
+                    f.given.insert(spec.name.to_string());
+                    continue;
+                }
                 return Err(format!("flag needs an argument: -{name}"));
             };
             f.set(spec, &value)?;

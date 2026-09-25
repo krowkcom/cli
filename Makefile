@@ -4,8 +4,8 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v/
 
 .PHONY: build test lint check install mock clean dist release-check golden golden-update bin/devregistry schema lean-deps bench
 
-build: ## Build target/release/krowk (with sessions) and krowk-mcp
-	KROWK_VERSION=$(VERSION) cargo build --release -p krowk --features sessions
+build: ## Build target/release/krowk (the full build) and krowk-mcp
+	KROWK_VERSION=$(VERSION) cargo build --release -p krowk --features harness
 
 # With `harness`, which implies `sessions`: every test either build runs.
 test: ## The unit and integration tests
@@ -45,7 +45,7 @@ schema: ## Regenerate the harness protocol's JSON Schema after a type change
 	KROWK_SCHEMA_UPDATE=1 cargo test -p krowk-harness --test schema
 
 install: ## Install krowk and krowk-mcp into ~/.cargo/bin
-	KROWK_VERSION=$(VERSION) cargo install --locked --path crates/krowk --features sessions
+	KROWK_VERSION=$(VERSION) cargo install --locked --path crates/krowk --features harness
 
 mock: ## Local stand-in for api.krowk.com on :8787
 	cargo run --release -p krowk-devregistry --bin devregistry
@@ -79,9 +79,18 @@ bin/devregistry:
 # stamped with one no release will ever carry.
 GOLDEN_VERSION := 0.0.0-golden
 
+# Two builds. The device build runs every case. The full build, which opens
+# the TUI when a person is at the terminal, runs tests/golden/cases-full:
+# bare `krowk` with no terminal to open it on, recorded from the full build
+# before the TUI existed, so any difference is a behaviour change. The full
+# build goes first and is copied out, so target/release ends as the device
+# build `golden-update` and the default KROWK_BIN expect.
 golden: bin/devregistry ## Hold the build to tests/golden/cases
+	KROWK_VERSION=$(GOLDEN_VERSION) cargo build --release -p krowk --features harness
+	mkdir -p target/golden && rm -f target/golden/krowk-full && cp target/release/krowk target/golden/krowk-full
 	KROWK_VERSION=$(GOLDEN_VERSION) cargo build --release -p krowk --features sessions
 	cargo test -p krowk-golden
+	GOLDEN_CASES=cases-full KROWK_BIN=target/golden/krowk-full cargo test -p krowk-golden
 
 golden-update: bin/devregistry ## Re-record tests/golden/cases after an intended output change
 	KROWK_VERSION=$(GOLDEN_VERSION) cargo build --release -p krowk --features sessions

@@ -61,7 +61,10 @@
 //! 0.0.0-golden, so a version-dependent path is compared like any other.
 //!
 //! `GOLDEN_UPDATE=1` rewrites `expected` instead of checking it, and
-//! `GOLDEN_CASE=substr` runs only the matching cases.
+//! `GOLDEN_CASE=substr` runs only the matching cases. `GOLDEN_CASES=dir`
+//! reads the cases from another directory beside cases/: `cases-full/` holds
+//! what the full build (`--features harness`) must print exactly as it did
+//! before the TUI existed, which `make golden` runs against that build.
 
 use regex::{Captures, Regex};
 use std::collections::HashMap;
@@ -109,7 +112,8 @@ fn golden() {
     let update = std::env::var_os("GOLDEN_UPDATE").is_some();
     let only = std::env::var("GOLDEN_CASE").unwrap_or_default();
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases");
+    let dir = std::env::var("GOLDEN_CASES").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| "cases".into());
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
     let mut cases: Vec<PathBuf> = fs::read_dir(&root).unwrap().map(|e| e.unwrap().path()).filter(|p| p.join("cmd").exists()).collect();
     cases.sort();
     assert!(!cases.is_empty(), "no cases under {}", root.display());

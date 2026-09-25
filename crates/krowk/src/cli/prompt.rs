@@ -105,19 +105,27 @@ fn prompt_text(positionals: &[String]) -> Result<String, Error> {
 /// rest of krowk reads. A file that does not parse is an error: somebody
 /// wrote it meaning something.
 pub(super) fn load_instances() -> Result<instances::InstancesConfig, Error> {
+    instances_from(&config_json()?)
+}
+
+pub(super) fn instances_from(v: &serde_json::Value) -> Result<instances::InstancesConfig, Error> {
+    instances::from_config_json(v).map_err(|e| fail("bad_config", format!("{}: {e}", crate::config::global_path().display())))
+}
+
+/// The global config.json as JSON, or an empty object when there is none.
+pub(super) fn config_json() -> Result<serde_json::Value, Error> {
     let path = crate::config::global_path();
     let raw = match std::fs::read(&path) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(instances::InstancesConfig::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(serde_json::json!({})),
         Err(e) => return Err(fail("bad_config", format!("reading {}: {e}", path.display()))),
     };
-    let v: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| fail("bad_config", format!("{} is not valid JSON: {e}", path.display())))?;
-    instances::from_config_json(&v).map_err(|e| fail("bad_config", format!("{}: {e}", path.display())))
+    serde_json::from_slice(&raw).map_err(|e| fail("bad_config", format!("{} is not valid JSON: {e}", path.display())))
 }
 
 /// `--resume` takes the session id a result names, or anything `krowk
 /// sessions show` takes that resolves to a krowk session.
-fn resolve_resume(ctx: &Ctx, sessions_dir: &std::path::Path, reference: &str) -> Result<String, Error> {
+pub(super) fn resolve_resume(ctx: &Ctx, sessions_dir: &std::path::Path, reference: &str) -> Result<String, Error> {
     let reference = reference.trim();
     if log::valid_id(reference) && sessions_dir.join(reference).join(log::EVENTS_FILE).is_file() {
         return Ok(reference.to_string());
@@ -137,7 +145,7 @@ fn resolve_resume(ctx: &Ctx, sessions_dir: &std::path::Path, reference: &str) ->
 /// Prices a model call from the models.dev cache or the embedded snapshot,
 /// as every figure `krowk sessions` shows is priced. The environment is
 /// captured now: the engine runs on its own thread.
-fn pricer(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Pricer {
+pub(super) fn pricer(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Pricer {
     let (cache, home) = (env("XDG_CACHE_HOME"), env("HOME"));
     Arc::new(move |provider: &str, model: &str, u: &Usage| {
         let env = |k: &str| match k {
@@ -176,6 +184,6 @@ fn catalog(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Catalog {
 /// An engine failure as krowk's error: the code and its fix, with the HTTP
 /// status the provider answered, so the exit code classifies it the way it
 /// classifies a registry failure.
-fn engine_error(code: &str, message: &str, status: u16) -> Error {
+pub(super) fn engine_error(code: &str, message: &str, status: u16) -> Error {
     Error { status, ..fail(code, message) }
 }

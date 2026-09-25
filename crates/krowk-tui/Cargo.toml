@@ -1,0 +1,30 @@
+# The inline terminal UI bare `krowk` opens on a terminal: a client of the
+# harness's in-process protocol and nothing else. Compiled into `krowk` only
+# by the `harness` feature, so the agent build links none of it. Every
+# dependency here pays rent against full.size and the TUI's RSS budgets.
+[package]
+name = "krowk-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[dependencies]
+krowk-harness = { path = "../krowk-harness" }
+# The inline viewport, its diffing buffer and insert_before (R-TUI-1).
+# scrolling-regions: lines go into scrollback through a scroll region
+# rather than by clearing and repainting the viewport, so nothing flickers
+# and nothing already in scrollback is drawn twice. No default features: no
+# widgets beyond the paragraph, no layout cache, no macros.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "scrolling-regions"] }
+# The same crossterm the pickers already link (through inquire), plus its
+# event stream: key presses and resizes wake the loop, nothing polls.
+crossterm = { version = "0.29", default-features = false, features = ["bracketed-paste", "events", "windows", "event-stream"] }
+futures-core = "0.3"
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros", "net"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+unicode-width = "0.2"
+
+[dev-dependencies]
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "scrolling-regions"] }

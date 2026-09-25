@@ -140,10 +140,18 @@ pub fn transport_error(e: &reqwest::Error, peer: Peer<'_>) -> EngineError {
         cause = s.to_string();
         src = s.source();
     }
+    // R-OFF-1: the sentence a person reads first says what is wrong in the
+    // words the TUI's notice uses, never a generic failure.
     if e.is_timeout() {
-        return EngineError::new("network_unreachable", format!("{} stopped answering ({cause}) — check the network, then run the prompt again with --resume", peer.base_url));
+        return EngineError::new(
+            "network_unreachable",
+            format!("no network connectivity: {} stopped answering ({cause}) — check the network, then run the prompt again with --resume", peer.base_url),
+        );
     }
-    EngineError::new("network_unreachable", format!("{} could not be reached ({cause}) — check the network, or the base URL of the {} instance", peer.base_url, peer.instance))
+    EngineError::new(
+        "network_unreachable",
+        format!("no network connectivity: {} could not be reached ({cause}) — check the network, or the base URL of the {} instance", peer.base_url, peer.instance),
+    )
 }
 
 /// One wire API's stream, decoded into items as its events arrive.

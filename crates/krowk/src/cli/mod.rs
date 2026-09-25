@@ -16,6 +16,8 @@ mod prompt;
 mod providers;
 #[cfg(feature = "sessions")]
 mod sessions;
+#[cfg(feature = "harness")]
+mod tui;
 mod upgrade;
 mod workspace;
 
@@ -40,6 +42,8 @@ pub struct Io<'a> {
     pub tty: bool,
     /// Whether stderr is: a string --jq prints raw there could repaint it.
     pub err_tty: bool,
+    /// Whether stdin is: with stdout, whether bare `krowk` opens the TUI.
+    pub stdin_tty: bool,
 }
 
 /// One command's context once the command line has been read.
@@ -94,6 +98,13 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         Err(e) => return report(io, &e, Format::Json, f.quiet, false, None),
     };
     let colour = io.tty;
+    // A bare `--resume` opens the session picker in the TUI; anywhere else
+    // it is the missing value it always was.
+    #[cfg(feature = "harness")]
+    let parsed = parsed.and_then(|()| match f.resume_pick && !tui::wanted(io, &f, format, &positionals, jq_given) {
+        true => Err("flag needs an argument: -resume".to_string()),
+        false => Ok(()),
+    });
     if let Err(why) = parsed {
         return report(io, &fail("bad_flag", format!("{why} — run `krowk --help`")), format, f.quiet, colour, None);
     }
@@ -133,6 +144,20 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     if f.print && !f.help {
         let mut ctx = Ctx { io, f, format, colour, filter };
         return match prompt::run(&mut ctx, &positionals) {
+            Ok(()) => exit::OK,
+            Err(e) => {
+                let quiet = ctx.f.quiet;
+                report(ctx.io, &e, format, quiet, colour, None)
+            }
+        };
+    }
+    // Bare `krowk` with a person at the terminal: the agent (R-PKG-1).
+    // Without one — a pipe, a file, CI capturing output — everything below
+    // runs exactly as it did before the TUI existed.
+    #[cfg(feature = "harness")]
+    if tui::wanted(io, &f, format, &positionals, jq_given) {
+        let mut ctx = Ctx { io, f, format, colour, filter };
+        return match tui::run(&mut ctx) {
             Ok(()) => exit::OK,
             Err(e) => {
                 let quiet = ctx.f.quiet;

@@ -154,9 +154,12 @@ fn p_flags_are_refused_elsewhere_and_bad_values_are_named() {
     assert_eq!(out.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&out.stderr).contains("ANTHROPIC_API_KEY"));
     assert!(!b.root.join("home/.local/share/krowk/sessions").exists(), "a refused prompt leaves no session behind");
-    // Nothing listening: named as unreachable, exit 6.
+    // Nothing listening: named as unreachable, exit 6, and R-OFF-1's words
+    // lead the fix line.
     let out = b.krowk(&["-p", "hi", "--model", "claude-sonnet-4-6"]);
     assert_eq!(out.status.code(), Some(6), "{}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(err.contains("network_unreachable") && err.contains("no network connectivity"), "r_off_1: {err}");
 }
 
 /// R-TOOL-2 through the built binary: the recorded tool definitions carry

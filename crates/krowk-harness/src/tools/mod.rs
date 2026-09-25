@@ -981,7 +981,8 @@ mod tests {
         // restarted by each chunk.
         let started = std::time::Instant::now();
         let (out, err) = run(BASH, &json!({"command": "(while :; do echo x; sleep 0.1; done) & echo ok", "timeout_ms": 10000}), &env).await;
-        assert!(!err && out.starts_with("ok\n"), "{out}");
+        // The loop may print before `echo ok` does: order is the scheduler's.
+        assert!(!err && out.lines().any(|l| l == "ok"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
         let _ = std::fs::remove_dir_all(d);
     }

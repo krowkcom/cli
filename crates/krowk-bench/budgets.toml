@@ -53,10 +53,11 @@ what = "Full build (--features harness): release binary size"
 unit = "bytes"
 # 6,253,544 bytes (5.96 MiB) when this budget was set. The harness is
 # growing: a ticket that adds a dependency raises this in its own PR, with
-# the dependency's cost in the justification. Raised 6.50 -> 6.75 MiB by
-# ticket 04: the TUI (ratatui, crossterm's event stream) on top of ticket
-# 05's three wire clients measured 6,886,824 bytes (6.57 MiB) together.
-max = { x86_64-linux = 7_077_888 }
+# the dependency's cost in the justification. Raised 6.50 -> 7.00 MiB by
+# ticket 04 (the same number ticket 06 sets): the TUI (ratatui, crossterm's
+# event stream) on top of ticket 05's three wire clients measured 6,903,624
+# bytes (6.58 MiB) together.
+max = { x86_64-linux = 7_340_032 }
 status = "enforced"
 
 # --- Startup: a new process each run, no daemon ---

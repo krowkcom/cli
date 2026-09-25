@@ -11,6 +11,7 @@ use krowk_harness::host::HostConfig;
 use krowk_harness::instances::{self, Registry};
 use krowk_harness::log;
 use krowk_harness::evidence::{PublishRequest, Publisher};
+use krowk_harness::permissions;
 use krowk_harness::protocol::{BudgetLimits, Effort, PermissionMode, TurnStatus, Usage};
 use std::collections::HashMap;
 use krowk_harness::trust;
@@ -25,13 +26,10 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
     let format = OutputFormat::parse(&ctx.f.output_format).ok_or_else(|| {
         fail("bad_flag", format!("--output-format {} is not one krowk -p writes — one of {}", ctx.f.output_format, OutputFormat::NAMES.join(", ")))
     })?;
-    let permission_mode = match ctx.f.permission_mode.as_str() {
-        "" => PermissionMode::Default,
-        m => PermissionMode::parse(m)
-            .ok_or_else(|| fail("bad_flag", format!("--permission-mode {m} is not a mode — one of {}", PermissionMode::NAMES.join(", "))))?,
-    };
+    let flag_mode = permission_flag(ctx)?;
     let prompt = prompt_text(positionals)?;
-    let registry = Registry::resolve(&load_instances()?, ctx.io.env);
+    let config = config_json()?;
+    let registry = Registry::resolve(&instances_from(&config)?, ctx.io.env);
     let model = match ctx.f.model.as_str() {
         "" => None,
         m => Some(registry.parse_model(m).map_err(|e| fail("bad_flag", format!("--model: {e}")))?),
@@ -55,6 +53,21 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
         })
     });
     let vendor = vendor_of(model.clone().or(session_model).or_else(|| registry.default_model().ok()).as_ref(), &registry);
+    // R-PERM-1: a repository's own allow rules, directories and hooks count
+    // once it is trusted — the same list, and the same --trust, as a
+    // backend's. Headless, nobody answers an approval: what would be asked
+    // is refused with what would allow it.
+    let home = Some(ctx.env("HOME")).filter(|h| !h.trim().is_empty()).map(std::path::PathBuf::from);
+    let store = trust::Store::new(krowk_api::creds::config_dir().join(trust::FILE), home.clone());
+    let flag_trust = ctx.f.trust;
+    let permissions = permissions_config(ctx, &config, Arc::new(move |root: &std::path::Path| flag_trust || store.trusts(root)), false);
+    let session_cwd = resume.as_ref().and_then(|id| log::read_events(&sessions_dir.join(id).join(log::EVENTS_FILE)).ok()).and_then(|events| {
+        events.first().and_then(|e| match &e.body {
+            krowk_harness::protocol::LogBody::SessionStarted { cwd, .. } => Some(std::path::PathBuf::from(cwd)),
+            _ => None,
+        })
+    });
+    let permission_mode = resolve_mode(flag_mode, &permissions, session_cwd.as_deref().unwrap_or(&cwd))?;
     let cfg = HostConfig {
         sessions_dir,
         cwd,
@@ -63,8 +76,9 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
         pricer: pricer(ctx.io.env),
         catalog: catalog(ctx.io.env),
         credentials: super::providers::credentials_path(),
-        trust: trust_gate(ctx.f.trust, super::interactive(ctx) && std::io::stdin().is_terminal() && ctx.io.err_tty, Some(ctx.env("HOME")).filter(|h| !h.trim().is_empty()).map(std::path::PathBuf::from), vendor),
+        trust: trust_gate(ctx.f.trust, super::interactive(ctx) && std::io::stdin().is_terminal() && ctx.io.err_tty, home, vendor),
         publisher: Some(publisher(ctx)),
+        permissions,
     };
     let opts = headless::Options { prompt, resume, model, permission_mode, toolset, effort, budget, format };
     let outcome = headless::run(cfg, opts, ctx.io.stdout);
@@ -90,6 +104,46 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
             Err(fail("interrupted", format!("the turn was interrupted; what it produced is kept — continue with `krowk -p --resume {} …`", r.session_id)))
         }
         _ => Ok(()),
+    }
+}
+
+/// `--permission-mode`, when given.
+pub(super) fn permission_flag(ctx: &Ctx) -> Result<Option<PermissionMode>, Error> {
+    match ctx.f.permission_mode.as_str() {
+        "" => Ok(None),
+        m => PermissionMode::parse(m)
+            .map(Some)
+            .ok_or_else(|| fail("bad_flag", format!("--permission-mode {m} is not a mode — one of {}", PermissionMode::NAMES.join(", ")))),
+    }
+}
+
+/// The mode a prompt runs in: the flag, else the most specific
+/// `permissions.defaultMode` the settings name (a repository's only once it
+/// is trusted, and never bypassPermissions), else default. A settings file
+/// that does not parse is named here, before anything runs.
+pub(super) fn resolve_mode(flag: Option<PermissionMode>, cfg: &permissions::Config, cwd: &std::path::Path) -> Result<PermissionMode, Error> {
+    if let Some(m) = flag {
+        return Ok(m);
+    }
+    let loaded = permissions::settings::load(cfg, cwd).map_err(|e| fail("bad_settings", format!("{e} — fix the file and run again")))?;
+    Ok(loaded.default_mode.unwrap_or_default())
+}
+
+/// What the harness reads permission rules, instructions, skills and hooks
+/// from: krowk's own config.json, Claude Code's user directory
+/// (`CLAUDE_CONFIG_DIR`, else `~/.claude`), and krowk's config directory,
+/// where remembered grants are kept and which no file tool writes.
+pub(super) fn permissions_config(ctx: &Ctx, config: &serde_json::Value, trusted: permissions::settings::Trusted, approvals: bool) -> permissions::Config {
+    let home = Some(ctx.env("HOME")).filter(|h| !h.trim().is_empty()).map(std::path::PathBuf::from);
+    let claude_dir = Some(ctx.env("CLAUDE_CONFIG_DIR")).filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from);
+    permissions::Config {
+        user: Some(config.clone()),
+        user_path: Some(crate::config::global_path()),
+        home,
+        claude_dir,
+        krowk_dir: Some(krowk_api::creds::config_dir()),
+        trusted: Some(trusted),
+        approvals,
     }
 }
 
@@ -246,6 +300,9 @@ pub(super) fn ask_trust(store: &trust::Store, root: &std::path::Path, vendor: &s
         "Claude Code" => {
             let _ = writeln!(stderr, "Claude Code (`claude -p`) runs a repository's own hooks and MCP servers without asking.");
         }
+        "krowk" => {
+            let _ = writeln!(stderr, "This repository's settings would let krowk run its hooks and follow its allow rules and extra directories — krowk takes them only from a repository you trust.");
+        }
         v => {
             let _ = writeln!(stderr, "{v} runs what a repository configures it to — its project config's hooks and MCP servers — without asking.");
         }
@@ -272,12 +329,19 @@ pub(super) fn ask_trust(store: &trust::Store, root: &std::path::Path, vendor: &s
 /// it will run in — and the gate then answers from that answer and the
 /// trusted list. A no, or a home directory, is refused when the first
 /// prompt is sent, and the TUI shows why.
-pub(super) fn tui_trust_gate(model: Option<&krowk_harness::protocol::ModelRef>, registry: &Registry, cwd: &std::path::Path, home: Option<std::path::PathBuf>) -> trust::Gate {
+///
+/// A native session is asked the same question when the repository's own
+/// settings would widen what krowk may do there (allow rules, directories,
+/// hooks): the returned `Trusted` is what the permission rules consult.
+pub(super) fn tui_trust_gate(model: Option<&krowk_harness::protocol::ModelRef>, registry: &Registry, cwd: &std::path::Path, home: Option<std::path::PathBuf>, widens: bool) -> (trust::Gate, permissions::settings::Trusted) {
     let store = trust::Store::new(krowk_api::creds::config_dir().join(trust::FILE), home);
     let backend = model.and_then(|m| registry.get(&m.instance).ok()).is_some_and(|i| i.backend.is_some());
     let asked = trust::root(cwd);
-    let accepted = backend && !store.trusts(&asked) && store.refuses(&asked).is_none() && ask_trust(&store, &asked, vendor_of(model, registry));
-    Arc::new(move |root: &std::path::Path| {
+    let vendor = if backend { vendor_of(model, registry) } else { "krowk" };
+    let accepted = (backend || widens) && !store.trusts(&asked) && store.refuses(&asked).is_none() && ask_trust(&store, &asked, vendor);
+    let (s2, a2) = (store.clone(), asked.clone());
+    let trusted: permissions::settings::Trusted = Arc::new(move |root: &std::path::Path| s2.trusts(root) || (accepted && root == a2));
+    let gate: trust::Gate = Arc::new(move |root: &std::path::Path| {
         if store.trusts(root) || (accepted && root == asked) {
             return Ok(());
         }
@@ -285,7 +349,8 @@ pub(super) fn tui_trust_gate(model: Option<&krowk_harness::protocol::ModelRef>, 
             return Err(trust::untrusted(root, &format!("It cannot be trusted for good — {why}. Run `krowk -p --trust` there for one run, or start krowk from a repository of its own.")));
         }
         Err(trust::untrusted(root, "Nothing was run — start krowk again there and answer its trust prompt."))
-    })
+    });
+    (gate, trusted)
 }
 
 /// Prices a model call from the models.dev cache or the embedded snapshot,

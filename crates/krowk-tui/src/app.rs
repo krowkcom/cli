@@ -13,7 +13,7 @@ use crate::editor::Editor;
 use crate::look::{self, SEP};
 use crate::settings::{Item as StatusItem, Settings};
 use krowk_harness::host::Pricer;
-use krowk_harness::protocol::{Billing, Delta, ErrorInfo, Item, ItemKind, LiveEvent, LogBody, LogEvent, ModelRef, RunResult, StreamLine, TurnStatus, Usage};
+use krowk_harness::protocol::{ApprovalRequest, Billing, Delta, ErrorInfo, Item, ItemKind, LiveEvent, LogBody, LogEvent, ModelRef, RunResult, StreamLine, TurnStatus, Usage};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::time::{Duration, Instant};
@@ -124,6 +124,13 @@ pub struct App {
     /// The instances that run a vendor's backend: their billing is the
     /// vendor's to report, so none is assumed before it has.
     pub vendor_instances: Vec<String>,
+    /// Tool calls waiting for the person's say, oldest first (R-PERM-2):
+    /// the first is shown over the prompt until it is answered, here or by
+    /// another client.
+    pub approvals: Vec<ApprovalRequest>,
+    /// When the approval shown now came up: keys typed in the moment
+    /// before are not taken as its answer.
+    pub approval_shown: Option<Instant>,
 }
 
 impl App {
@@ -159,6 +166,8 @@ impl App {
             thinking_since: None,
             billing: None,
             vendor_instances: Vec::new(),
+            approvals: Vec::new(),
+            approval_shown: None,
         }
     }
 
@@ -360,8 +369,30 @@ impl App {
             }
             // For the person alone (a claim command): shown, never logged.
             StreamLine::Live(LiveEvent::Notice { text, .. }) => self.notice(text),
-            StreamLine::Live(LiveEvent::Result(r)) => self.on_result(r),
+            StreamLine::Live(LiveEvent::ApprovalRequested(req)) => {
+                if self.approvals.is_empty() {
+                    self.approval_shown = Some(Instant::now());
+                }
+                self.approvals.push(req.clone());
+                self.dirty = true;
+            }
+            StreamLine::Live(LiveEvent::ApprovalResolved { request_id, .. }) => self.answered(request_id),
+            StreamLine::Live(LiveEvent::Result(r)) => {
+                self.approvals.clear();
+                self.on_result(r);
+            }
         }
+    }
+
+    /// A request was answered, here or elsewhere: the next one, if any,
+    /// comes up with its own moment before keys answer it.
+    pub fn answered(&mut self, request_id: &str) {
+        let head = self.approvals.first().is_some_and(|r| r.request_id == request_id);
+        self.approvals.retain(|r| r.request_id != request_id);
+        if head {
+            self.approval_shown = (!self.approvals.is_empty()).then(Instant::now);
+        }
+        self.dirty = true;
     }
 
     fn on_text(&mut self, item_id: &str, text: &str) {
@@ -611,6 +642,9 @@ impl App {
                 rows.push(Line::from(Span::styled(row, yellow().add_modifier(Modifier::BOLD))));
             }
         }
+        if let Some(req) = self.approvals.first() {
+            rows.extend(approval_rows(req, self.approvals.len(), width));
+        }
         match self.overlay {
             Overlay::None => {}
             Overlay::Keys => rows.extend(self.keys_overlay(width)),
@@ -838,6 +872,22 @@ fn tokens(n: i64) -> String {
 /// The spinner's frame, redrawn while a turn runs (never while idle).
 pub const TICK: Duration = look::SPIN_FRAME;
 
+/// An approval request, as it is shown over the prompt: what the call would
+/// do, why it is asked, and the keys that answer it — `s` and `p` only when
+/// the call can be remembered.
+fn approval_rows(req: &ApprovalRequest, waiting: usize, width: usize) -> Vec<Line<'static>> {
+    let more = if waiting > 1 { format!(" (1 of {waiting})") } else { String::new() };
+    let mut rows: Vec<Line<'static>> = wrap(&clean(&format!("{}allow {}?{more}", look::TOOL, req.summary)), width).into_iter().map(|l| Line::from(Span::styled(l, yellow().add_modifier(Modifier::BOLD)))).collect();
+    rows.extend(wrap(&clean(&format!("  {}", req.reason)), width).into_iter().map(|l| Line::from(Span::styled(l, dim()))));
+    let keys = if req.remember.is_empty() {
+        "  y allow once · n deny".to_string()
+    } else {
+        format!("  y allow once · s allow {} for this session · p … for this project · n deny", req.remember.join(", "))
+    };
+    rows.push(Line::from(Span::styled(clip(&keys, width), look::accent())));
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +1024,31 @@ mod tests {
         let (rows, caret) = a.view(Instant::now());
         assert_eq!(rows.len(), 5, "the overlay is four rows over the prompt");
         assert_eq!(caret, (2, 4));
+    }
+
+    #[test]
+    fn r_perm_2_an_approval_request_shows_over_the_prompt_until_any_client_answers_it() {
+        let mut a = app();
+        a.set_width(200);
+        a.start_turn(Instant::now());
+        let req = |id: &str, remember: Vec<String>| ApprovalRequest {
+            session_id: "s".into(),
+            turn_id: "t".into(),
+            request_id: id.into(),
+            tool: "bash".into(),
+            input: serde_json::json!({"command": "npm test"}),
+            summary: "Bash `npm test`".into(),
+            reason: "it runs a command, and no allow rule covers it".into(),
+            remember,
+        };
+        a.on_line(&live(LiveEvent::ApprovalRequested(req("r1", vec!["Bash(npm test)".into()]))));
+        a.on_line(&live(LiveEvent::ApprovalRequested(req("r2", vec![]))));
+        let shown = text(&a.view(Instant::now()).0).join("\n");
+        assert!(shown.contains("allow Bash `npm test`? (1 of 2)") && shown.contains("no allow rule covers it") && shown.contains("s allow Bash(npm test) for this session"), "{shown}");
+        // Answered elsewhere — another client, or an interrupt — it goes.
+        a.on_line(&live(LiveEvent::ApprovalResolved { session_id: "s".into(), turn_id: "t".into(), request_id: "r1".into(), decision: krowk_harness::protocol::ApprovalDecision::Allow }));
+        let shown = text(&a.view(Instant::now()).0).join("\n");
+        assert!(shown.contains("y allow once · n deny") && !shown.contains("1 of 2"), "one that cannot be remembered offers once only: {shown}");
     }
 
     #[test]

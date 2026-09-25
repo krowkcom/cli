@@ -241,7 +241,7 @@ pub(super) fn list(ctx: &mut Ctx) -> Result<(), Error> {
                     Some(Err(e)) => (format!("runs Claude Code: {e}"), false, "unknown"),
                 },
             };
-            json!({
+            let mut row = json!({
                 "instance": r.name,
                 "kind": r.kind,
                 "provider": r.provider,
@@ -251,7 +251,14 @@ pub(super) fn list(ctx: &mut Ctx) -> Result<(), Error> {
                 "ready": ready,
                 "state": if ready { "ready" } else { state },
                 "configured": cfg.instances.contains_key(&r.name),
-            })
+            });
+            // A backend has a binary and a config directory where an API
+            // has a base URL.
+            if let Some(b) = &r.backend {
+                row["binary"] = json!(b.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| b.binary.clone()));
+                row["config_dir"] = json!(b.home.as_ref().map(|p| p.display().to_string()));
+            }
+            row
         })
         .collect();
     if ctx.format != Format::Human {
@@ -263,7 +270,8 @@ pub(super) fn list(ctx: &mut Ctx) -> Result<(), Error> {
     for r in &rows {
         let s = |k: &str| r[k].as_str().unwrap_or_default().to_string();
         let state = s("state");
-        let _ = writeln!(out, "{:<width$}  {:<17}  {:<13}  {}  ({})", s("instance"), s("kind"), state, s("base_url"), s("auth"));
+        let place = if r.get("binary").is_some() { s("binary") } else { s("base_url") };
+        let _ = writeln!(out, "{:<width$}  {:<17}  {:<13}  {place}  ({})", s("instance"), s("kind"), state, s("auth"));
     }
     Ok(())
 }

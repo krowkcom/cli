@@ -26,6 +26,8 @@ serde = { version = "1", features = ["derive"] }
 # raw_value: the models.dev file is parsed without building what it skips.
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 regex-lite = "0.1"
+# DO NOT MERGE: a ~1 MB dependency, to show the budgets job fails.
+regex = "1"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 jaq-core = "3"
 jaq-std = "3"

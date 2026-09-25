@@ -1117,6 +1117,7 @@ dependencies = [
  "krowk-import",
  "krowk-store",
  "libc",
+ "regex",
  "regex-lite",
  "serde",
  "serde_json",

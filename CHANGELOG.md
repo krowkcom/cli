@@ -52,8 +52,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   reports `fetched_at_ms` and `age_days` too. `sessions sync` still
   refreshes prices once they are a day old, now judged by the recorded
   fetch time rather than a file's mtime. Nothing else touches the
-  network, and there is no background timer. A cache that is missing or holds no prices is fetched whole again
-  rather than confirmed by a stale ETag. Audio rates stay unread: no
+  network, and there is no background timer. A cache that is missing or
+  holds no prices is fetched whole again rather than confirmed by a stale
+  ETag. Audio rates stay unread: no
   transcript krowk imports carries audio tokens, and in a provider ledger
   they are priced at the text rate inside input and output — an
   undercount to revisit when one reports audio at all.
@@ -71,8 +72,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   the store has not seen yet, by its Claude or opencode id — and waits
   for a running import rather than answering stale (after 15 s it gives
   up with `import_locked`, exit 6 — which the hook recipe below lets
-  through; test `-ne 0` instead to block on that too). `--max-tokens` holds generated tokens (output
-  and reasoning); input and cache tokens are reported and priced. Within
+  through; test `-ne 0` instead to block on that too). `--max-tokens`
+  holds generated tokens (output and reasoning); input and cache tokens are reported and priced. Within
   its limits it prints the report and exits 0; over one it exits 4 with
   `budget_exceeded` and the report under `error.details` (on stderr). A
   cost krowk cannot price trips `--max-usd`, with the priced part as a

@@ -49,6 +49,13 @@ pub trait Source {
     /// Whether `cursor` says nothing moved since it was taken, so a sync can
     /// leave the transcript unread.
     fn unchanged(&self, env: Env, r: &Ref, cursor: &str) -> bool;
+    /// Which ref id each subagent ref belongs to, for sources that know it
+    /// without reading transcripts; a caller refreshing one session finds
+    /// its children through this.
+    fn parents(&self, _env: Env, refs: &[Ref]) -> std::collections::HashMap<String, String> {
+        let _ = refs;
+        std::collections::HashMap::new()
+    }
 }
 
 /// One transcript a source found.

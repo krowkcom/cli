@@ -42,6 +42,8 @@ pub struct Flags {
     pub worktree: String,
     pub all: bool,
     pub thinking: bool,
+    pub max_usd: String,
+    pub max_tokens: String,
     /// Which flags were typed, by canonical name — a different question from
     /// what they carry: `--jq "$UNSET"` was given and is empty.
     pub given: BTreeSet<String>,
@@ -168,6 +170,8 @@ impl Flags {
             "from" => text(&mut self.from),
             "harness" => text(&mut self.harness),
             "worktree" => text(&mut self.worktree),
+            "max-usd" => text(&mut self.max_usd),
+            "max-tokens" => text(&mut self.max_tokens),
             _ => {
                 let b = parse_bool(name, v)?;
                 *match name {

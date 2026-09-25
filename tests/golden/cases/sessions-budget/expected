@@ -1,0 +1,90 @@
+$ krowk sessions import --from all --quiet --jq '.providers | map({provider, sessions_inserted})'
+stdout:
+[{"provider":"claude","sessions_inserted":4},{"provider":"cursor","sessions_inserted":2},{"provider":"opencode","sessions_inserted":2},{"provider":"ledger","sessions_inserted":0}]
+exit: 0
+
+$ krowk sessions budget ses_parent --max-tokens 1000000
+stdout:
+{
+  "ok": true,
+  "data": {
+    "id": "<uuid_1>",
+    "title": "Parent session",
+    "subagents": 1,
+    "metered": {
+      "input": 9231,
+      "output": 1715,
+      "reasoning": 23,
+      "cache_read": 42496,
+      "cache_write": 120,
+      "generated": 1738,
+      "total": 53585
+    },
+    "cost_usd": 0.012454999999999999,
+    "cost_display": "$0.0125",
+    "limits": {
+      "max_usd": null,
+      "max_tokens": 1000000
+    },
+    "within": true,
+    "as_of_ms": <store_ms_1>,
+    "refreshed": "current"
+  },
+  "summary": "Parent session — within budget"
+}
+exit: 0
+
+$ krowk sessions budget ses_parent --max-tokens 1
+stderr:
+{
+  "ok": false,
+  "error": {
+    "details": {
+      "id": "<uuid_1>",
+      "title": "Parent session",
+      "subagents": 1,
+      "metered": {
+        "input": 9231,
+        "output": 1715,
+        "reasoning": 23,
+        "cache_read": 42496,
+        "cache_write": 120,
+        "generated": 1738,
+        "total": 53585
+      },
+      "cost_usd": 0.012454999999999999,
+      "cost_display": "$0.0125",
+      "limits": {
+        "max_usd": null,
+        "max_tokens": 1
+      },
+      "within": false,
+      "as_of_ms": <store_ms_2>,
+      "refreshed": "current",
+      "tripped": [
+        {
+          "limit": "max_tokens",
+          "generated": 1738,
+          "max": 1
+        }
+      ]
+    },
+    "error": "budget_exceeded",
+    "fix": "session <uuid_1> is over budget: 1738 tokens generated, over --max-tokens 1 — stop the run; krowk cancels nothing, and the provider keeps billing whatever is still running",
+    "retryable": false
+  }
+}
+exit: 4
+
+$ krowk sessions budget ses_parent --max-usd ""
+stderr:
+{
+  "ok": false,
+  "error": {
+    "error": "bad_flag",
+    "fix": "--max-usd was given with no value — pass the limit, or leave the flag out",
+    "retryable": false
+  }
+}
+exit: 1
+

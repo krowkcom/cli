@@ -9,6 +9,8 @@ pub mod exit;
 pub mod flags;
 pub mod help;
 #[cfg(feature = "sessions")]
+mod budget;
+#[cfg(feature = "sessions")]
 mod sessions;
 mod upgrade;
 mod workspace;
@@ -180,6 +182,8 @@ fn dispatch(ctx: &mut Ctx, p: &[String]) -> Result<(), Error> {
         ["sessions"] => sessions::list(ctx),
         #[cfg(feature = "sessions")]
         ["sessions", "show", ..] => sessions::show(ctx, rest(2)),
+        #[cfg(feature = "sessions")]
+        ["sessions", "budget", ..] => budget::budget(ctx, rest(2)),
         #[cfg(feature = "sessions")]
         ["sessions", "import", ..] => sessions::import(ctx),
         #[cfg(feature = "sessions")]

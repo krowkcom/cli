@@ -369,6 +369,28 @@ fn find_or_create_session(
     Ok((id, true))
 }
 
+impl Writer<'_> {
+    /// Links a stored subagent session to its parent, now that both may be
+    /// stored: a source that lists children before parents (opencode ids
+    /// sort newest first) ingests the child while its parent is still
+    /// missing, so an import links again once every transcript is in.
+    pub fn link_parent_later(&self, child: &Binding, parent: &Binding) -> Result<(), StoreError> {
+        let child_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT session_id FROM session_binding WHERE provider = ? AND foreign_session_id = ?",
+                params![child.provider, child.foreign_session_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(e("find child binding"))?;
+        match child_id {
+            Some(id) => link_parent(self.conn, &id, Some(parent)),
+            None => Ok(()),
+        }
+    }
+}
+
 /// A subagent's session points at the one that spawned it, once, and only
 /// when that one is already stored.
 fn link_parent(tx: &Connection, session_id: &str, parent: Option<&Binding>) -> Result<(), StoreError> {

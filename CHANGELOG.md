@@ -37,6 +37,16 @@ the versions are the `v*` tags a release is cut from. Entries land under
   significant digits (`$0.00500`), and a ledger session whose rows all
   sit in transcripts reads `counted elsewhere`. A reported cost of 0 is
   treated as no report — opencode writes 0 for models it cannot price.
+- **Claude usage is counted once per API message.** Claude Code writes one
+  transcript line per content block and repeats the message's usage on
+  each; turns summed every line, overstating tokens and cost (about 1.8×
+  on a real session). Each message now counts once, at its final usage.
+  Claude turns also keep thinking tokens apart from output
+  (`output_tokens_details.thinking_tokens` → reasoning), as opencode and
+  ledger turns already did. opencode subagents are now linked to their
+  parent session even though opencode lists them first. Run `krowk
+  sessions rebuild` to apply all three to sessions already imported —
+  `sync` does not re-read them.
 - **You can see how old the prices are.** `krowk doctor` has a `pricing`
   check naming when models.dev prices were last fetched and how many days
   ago — a warning past 30 days, or when only the snapshot built into
@@ -44,8 +54,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   reports `fetched_at_ms` and `age_days` too. `sessions sync` still
   refreshes prices once they are a day old, now judged by the recorded
   fetch time rather than a file's mtime. Nothing else touches the
-  network, and there is no background timer. A cache that is missing or holds no prices is fetched whole again
-  rather than confirmed by a stale ETag. Audio rates stay unread: no
+  network, and there is no background timer. A cache that is missing or
+  holds no prices is fetched whole again rather than confirmed by a stale
+  ETag. Audio rates stay unread: no
   transcript krowk imports carries audio tokens, and in a provider ledger
   they are priced at the text rate inside input and output — an
   undercount to revisit when one reports audio at all.
@@ -55,6 +66,24 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- **`krowk sessions budget <id> --max-usd N --max-tokens N`** checks a
+  session against a spend limit by what the provider metered, never by the
+  `max_tokens` its requests asked for — providers do not strictly enforce
+  it (a call capped at 1,200 has metered 3,422). It re-reads the session's
+  transcripts, and its subagents', when they moved — importing a session
+  the store has not seen yet, by its Claude or opencode id — and waits
+  for a running import rather than answering stale (after 15 s it gives
+  up with `import_locked`, exit 6 — which the hook recipe below lets
+  through; test `-ne 0` instead to block on that too). `--max-tokens`
+  holds generated tokens (output and reasoning); input and cache tokens are reported and priced. Within
+  its limits it prints the report and exits 0; over one it exits 4 with
+  `budget_exceeded` and the report under `error.details` (on stderr). A
+  cost krowk cannot price trips `--max-usd`, with the priced part as a
+  lower bound. krowk cancels nothing — the hook or wrapper that runs the
+  check stops the run. A Claude Code hook blocks only on exit 2, so block
+  on a trip alone: `krowk sessions budget "$ID" --max-usd 5; [ $? -ne 4 ]
+  || exit 2`. A provider-ledger row nobody saw an answer to is budgeted
+  with its ledger's session: nothing ties it to the run that sent it.
 - **Provider usage ledgers.** A request your agent gave up on — a timeout,
   a killed shell, a Ctrl-C — can still finish and bill on the provider's
   side, and no transcript ever sees it. Drop the provider's per-request

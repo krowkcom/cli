@@ -304,6 +304,18 @@ pub fn catalog(version: &str) -> Catalog {
                         ..cmd("rebuild", "krowk sessions rebuild [--yes]", "Delete the local store and re-import every transcript")
                     },
                     Command {
+                        args: vec![arg("id", "The session id, an unambiguous id prefix of at least 8 chars, or a foreign session id", true)],
+                        flags: vec![
+                            flag("max-usd", STRING, "Trip when the session's metered cost is over this many dollars"),
+                            flag("max-tokens", STRING, "Trip when the session's generated tokens (output and reasoning) are over this many"),
+                        ],
+                        ..cmd(
+                            "budget",
+                            "krowk sessions budget <id> [--max-usd N] [--max-tokens N]",
+                            "Check a session against a spend limit, by what the provider metered",
+                        )
+                    },
+                    Command {
                         flags: vec![flag("no-network", BOOL, "Skip the models.dev price refresh")],
                         ..cmd("sync", "krowk sessions sync [--no-network]", "Import only what changed since the last import, and refresh prices")
                     },
@@ -416,7 +428,7 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
     ("PUSH & PASTE", &["push", "uploads create"]),
     ("RUNS", &["runs start", "runs finish", "runs show", "runs list"]),
     ("UPLOADS", &["uploads list", "uploads show", "uploads attach", "uploads delete", "claim"]),
-    ("SESSIONS", &["sessions", "sessions show", "sessions import", "sessions rebuild", "sessions sync"]),
+    ("SESSIONS", &["sessions", "sessions show", "sessions budget", "sessions import", "sessions rebuild", "sessions sync"]),
     (
         "ACCOUNT & SYSTEM",
         &[

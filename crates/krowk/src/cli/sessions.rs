@@ -25,7 +25,7 @@ const SKIPPED_TYPE_OTHER: &str = "krowk:other";
 const UNSUPPORTED_OS: &str = "sessions is not supported on Windows in v1";
 const PRICING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-fn check_os() -> Result<(), Error> {
+pub(super) fn check_os() -> Result<(), Error> {
     krowk_import::check_os().map_err(|_| fail("unsupported_os", UNSUPPORTED_OS))
 }
 
@@ -47,7 +47,7 @@ fn db_path_string(ctx: &Ctx) -> String {
     krowk_store::db_path(ctx.io.env).map(|p| p.display().to_string()).unwrap_or_default()
 }
 
-fn open_store(ctx: &Ctx) -> Result<Connection, Error> {
+pub(super) fn open_store(ctx: &Ctx) -> Result<Connection, Error> {
     krowk_store::open(ctx.io.env).map_err(|e| store_fail(&e, &db_path_string(ctx)))
 }
 
@@ -106,7 +106,7 @@ pub fn list(ctx: &mut Ctx) -> Result<(), Error> {
     Ok(())
 }
 
-fn emit_data(ctx: &mut Ctx, data: Value, summary: String) -> Result<(), Error> {
+pub(super) fn emit_data(ctx: &mut Ctx, data: Value, summary: String) -> Result<(), Error> {
     let rendered = if ctx.f.quiet {
         output::encode(&data)
     } else {
@@ -115,7 +115,7 @@ fn emit_data(ctx: &mut Ctx, data: Value, summary: String) -> Result<(), Error> {
     ctx.emit(&rendered)
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
@@ -129,30 +129,58 @@ fn now_ms() -> i64 {
 /// session is priced; only when nothing is — a harness that records no
 /// usage at all — do they make the cost unknown.
 #[derive(Debug, Default)]
-struct Priced {
+pub(super) struct Priced {
     usd: f64,
     unpriced: BTreeSet<String>,
     unpriced_empty: BTreeSet<String>,
     known: bool,
     /// Every turn is counted in another session.
     elsewhere: bool,
-    bases: BTreeSet<pricing::Basis>,
+    pub(super) bases: BTreeSet<pricing::Basis>,
     /// The known dollars per (provider, model), unrounded.
     by_model: BTreeMap<String, f64>,
 }
 
 impl Priced {
-    fn total(&self) -> Option<f64> {
+    pub(super) fn total(&self) -> Option<f64> {
         (self.unpriced.is_empty() && (self.known || self.unpriced_empty.is_empty())).then_some(self.usd)
     }
 
     /// The pairs that make the cost unknown.
-    fn missing(&self) -> BTreeSet<String> {
+    pub(super) fn missing(&self) -> BTreeSet<String> {
         let mut out = self.unpriced.clone();
         if !self.known {
             out.extend(self.unpriced_empty.iter().cloned());
         }
         out
+    }
+
+    #[cfg(test)]
+    pub(super) fn add_known(&mut self, usd: f64) {
+        self.add(Some(TurnCost { usd, basis: None }), "p", "m", pricing::Tokens::default());
+    }
+
+    #[cfg(test)]
+    pub(super) fn add_unknown(&mut self, pair: &str) {
+        self.unpriced.insert(pair.into());
+    }
+
+    /// Another session's cost folded into this one: a parent and the
+    /// subagents it spawned spend together.
+    pub(super) fn merge(&mut self, o: Priced) {
+        self.usd += o.usd;
+        self.known |= o.known;
+        self.unpriced.extend(o.unpriced);
+        self.unpriced_empty.extend(o.unpriced_empty);
+        self.bases.extend(o.bases);
+        for (k, v) in o.by_model {
+            *self.by_model.entry(k).or_default() += v;
+        }
+    }
+
+    /// The dollars that could be priced, whatever could not be.
+    pub(super) fn known_usd(&self) -> f64 {
+        self.usd
     }
 
     fn add(&mut self, cost: Option<TurnCost>, provider: &str, model: &str, t: pricing::Tokens) {
@@ -178,7 +206,7 @@ impl Priced {
 /// One figure: dollars, and the price source when krowk priced it rather
 /// than the source reporting it.
 #[derive(Debug, Clone, Copy)]
-struct TurnCost {
+pub(super) struct TurnCost {
     usd: f64,
     basis: Option<pricing::Basis>,
 }
@@ -254,7 +282,7 @@ fn turn_cost(ctx: &Ctx, t: &TurnDetail) -> Option<TurnCost> {
 }
 
 /// A ledger turn counted elsewhere: in a transcript, or an earlier export.
-fn is_observed(t: &TurnDetail) -> bool {
+pub(super) fn is_observed(t: &TurnDetail) -> bool {
     t.status == krowk_store::STATUS_OBSERVED || t.status == krowk_store::STATUS_DUPLICATE
 }
 
@@ -320,7 +348,7 @@ fn format_cost(usd: f64) -> String {
 
 /// `show`'s figures, where one session's split between models is the point:
 /// three significant digits below a dollar, cents above.
-fn format_cost_precise(usd: f64) -> String {
+pub(super) fn format_cost_precise(usd: f64) -> String {
     if usd >= 1.0 || usd <= 0.0 {
         return format!("${usd:.2}");
     }
@@ -360,7 +388,7 @@ fn relative_time(ms: i64, now: i64) -> String {
     }
 }
 
-fn cell(s: &str) -> String {
+pub(super) fn cell(s: &str) -> String {
     termclean::cell(s)
 }
 
@@ -391,7 +419,7 @@ fn pad_left(colour: bool, code: &str, s: &str, w: usize) -> String {
     " ".repeat(w.saturating_sub(width(s))) + &paint(colour, code, s)
 }
 
-fn display_title(t: &str) -> String {
+pub(super) fn display_title(t: &str) -> String {
     if t.is_empty() { "(untitled)".into() } else { t.to_string() }
 }
 
@@ -477,31 +505,144 @@ fn pick_session(rows: &[SessionRow], now: i64) -> Result<String, Error> {
 
 // ---- show -------------------------------------------------------------------
 
-pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
-    check_os()?;
+/// The one session `krowk sessions <verb> <id>` names, read in full.
+pub(super) fn load_detail(ctx: &Ctx, args: &[String], verb: &str) -> Result<SessionDetail, Error> {
+    let conn = open_store(ctx)?;
+    let id = resolve_arg(ctx, &conn, args, verb)?;
+    load_by_id(ctx, &conn, &id)
+}
+
+pub(super) fn load_by_id(ctx: &Ctx, conn: &Connection, id: &str) -> Result<SessionDetail, Error> {
+    match krowk_store::load_session_detail(conn, id) {
+        Ok(d) => Ok(d),
+        Err(StoreError::NotFound(_)) => Err(fail("no_session", format!("no session {id:?}"))),
+        Err(e) => Err(store_fail(&e, &db_path_string(ctx))),
+    }
+}
+
+/// The session id `krowk sessions <verb> <id>` names.
+pub(super) fn resolve_arg(ctx: &Ctx, conn: &Connection, args: &[String], verb: &str) -> Result<String, Error> {
     let Some(reference) = args.first().filter(|a| !a.trim().is_empty()) else {
-        return Err(fail("no_session", "pass the session: `krowk sessions show <id>`"));
+        return Err(fail("no_session", format!("pass the session: `krowk sessions {verb} <id>`")));
     };
     if args.len() > 1 {
-        return Err(fail("bad_flag", format!("`krowk sessions show` takes one session id, got extra {}", args[1..].join(" "))));
+        return Err(fail("bad_flag", format!("`krowk sessions {verb}` takes one session id, got extra {}", args[1..].join(" "))));
     }
-    let conn = open_store(ctx)?;
-    let id = match krowk_store::resolve_session_id(&conn, reference) {
-        Ok(id) => id,
-        Err(StoreError::Ambiguous { message, .. }) => return Err(fail("ambiguous_session", message)),
-        Err(StoreError::NotFound(_)) => {
-            return Err(fail(
-                "no_session",
-                format!("{:?} matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id", reference.trim()),
-            ));
+    match krowk_store::resolve_session_id(conn, reference) {
+        Ok(id) => Ok(id),
+        Err(StoreError::Ambiguous { message, .. }) => Err(fail("ambiguous_session", message)),
+        Err(StoreError::NotFound(_)) => Err(fail(
+            "no_session",
+            format!("{:?} matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id", reference.trim()),
+        )),
+        Err(e) => Err(store_fail(&e, &db_path_string(ctx))),
+    }
+}
+
+/// What `refresh_session` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Refresh {
+    /// Every transcript behind the session was already in the store.
+    Current,
+    /// Something had moved, and was imported.
+    Imported,
+    /// The session's source cannot be re-read one session at a time (a
+    /// Cursor or ledger session, or one with no foreign id).
+    NotRefreshable,
+}
+
+/// How long a check waits for another import to finish before failing.
+const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(15);
+
+/// Re-reads the transcripts behind one or more sessions of one source — by
+/// foreign id, and every subagent under them, however deep, found through
+/// the source's own parent links (so one started since the last import is
+/// included) — when they moved, so a check that must be current is. Nothing
+/// else on the machine is read. What moved is found before the import lock
+/// is taken, so a check with nothing to read never waits; one that must
+/// write waits for another import to finish, and past that gives up with
+/// `import_locked` rather than answer from a stale store.
+pub(super) fn refresh_session(ctx: &Ctx, provider: &str, foreign_ids: &[String]) -> Result<Refresh, Error> {
+    let foreign_ids: Vec<&String> = foreign_ids.iter().filter(|f| !f.is_empty()).collect();
+    let Some(source) = krowk_import::sources().into_iter().find(|s| s.name() == provider) else { return Ok(Refresh::NotRefreshable) };
+    if foreign_ids.is_empty() || matches!(provider, krowk_import::PROVIDER_LEDGER | krowk_import::PROVIDER_CURSOR) {
+        return Ok(Refresh::NotRefreshable);
+    }
+    let store_path = resolve_store_path(ctx)?;
+    let env = ctx.io.env;
+    let refs = source.discover(env).map_err(|e| fail("import_failed", format!("{provider}: {e}")))?;
+    // The sessions and every descendant, to a fixed point over the source's
+    // parent links.
+    let parents = source.parents(env, &refs);
+    let mut ours: std::collections::HashSet<String> = foreign_ids.iter().map(|f| f.to_string()).collect();
+    loop {
+        let before = ours.len();
+        for (child, parent) in &parents {
+            if ours.contains(parent) {
+                ours.insert(child.clone());
+            }
         }
-        Err(e) => return Err(store_fail(&e, &db_path_string(ctx))),
+        if ours.len() == before {
+            break;
+        }
+    }
+    let moved = |conn: &Connection| -> Result<Vec<(Ref, String)>, Error> {
+        let mut out = Vec::new();
+        for r in refs.iter().filter(|r| ours.contains(&r.id)) {
+            let stored = krowk_store::read_import_state(conn, &r.key()).map_err(|e| store_fail(&e, &store_path))?;
+            if stored.is_empty() || !source.unchanged(env, r, &stored) {
+                out.push((r.clone(), stored));
+            }
+        }
+        Ok(out)
     };
-    let d = match krowk_store::load_session_detail(&conn, &id) {
-        Ok(d) => d,
-        Err(StoreError::NotFound(_)) => return Err(fail("no_session", format!("no session {id:?}"))),
-        Err(e) => return Err(store_fail(&e, &db_path_string(ctx))),
-    };
+    if moved(&open_store(ctx)?)?.is_empty() {
+        return Ok(Refresh::Current);
+    }
+    let _lock = lock_store_waiting(&store_path, REFRESH_LOCK_WAIT)?;
+    let conn = open_store(ctx)?;
+    // Asked again under the lock: the import that held it may have done the work.
+    let todo = moved(&conn)?;
+    if todo.is_empty() {
+        return Ok(Refresh::Current);
+    }
+    let writer = krowk_store::Writer::new(&conn);
+    let mut links = Vec::new();
+    for (r, stored) in &todo {
+        let key = r.key();
+        let (thread, next, _) = source.read(env, r, stored).map_err(|e| fail("import_failed", format!("{key}: {e}")))?;
+        writer.ingest_with_cursor(&thread, &key, &next).map_err(|e| store_fail(&e, &store_path))?;
+        if let Some(parent) = &thread.parent {
+            links.push((thread.binding.clone(), parent.clone()));
+        }
+    }
+    for (child, parent) in &links {
+        writer.link_parent_later(child, parent).map_err(|e| store_fail(&e, &store_path))?;
+    }
+    krowk_store::reconcile_ledger(&conn).map_err(|e| store_fail(&e, &store_path))?;
+    Ok(Refresh::Imported)
+}
+
+/// `lock_store`, waiting up to `wait` for an import that holds it.
+fn lock_store_waiting(store_path: &str, wait: Duration) -> Result<std::fs::File, Error> {
+    let started = Instant::now();
+    loop {
+        match try_lock_store(store_path)? {
+            Some(f) => return Ok(f),
+            None if started.elapsed() < wait => std::thread::sleep(Duration::from_millis(100)),
+            None => {
+                return Err(fail(
+                    "import_locked",
+                    format!("another import held the store for {}s, so the session could not be brought up to date — retry once it finishes", wait.as_secs()),
+                ));
+            }
+        }
+    }
+}
+
+pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
+    check_os()?;
+    let d = load_detail(ctx, args, "show")?;
     if ctx.format != Format::Human {
         let (data, summary) = session_show_json(ctx, &d);
         return emit_data(ctx, data, summary);
@@ -513,7 +654,7 @@ pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
 
 /// Each turn priced for display, and the session's total rolled up exactly
 /// as the listing rolls it up: per (provider, model, reported), in that order.
-fn price_turns(ctx: &Ctx, d: &SessionDetail) -> (Vec<Option<TurnCost>>, Priced) {
+pub(super) fn price_turns(ctx: &Ctx, d: &SessionDetail) -> (Vec<Option<TurnCost>>, Priced) {
     let costs: Vec<Option<TurnCost>> = d.turns.iter().map(|t| if is_observed(t) { None } else { turn_cost(ctx, t) }).collect();
     let mut groups: BTreeMap<(String, String, bool), CostGroup> = BTreeMap::new();
     for t in d.turns.iter().filter(|t| !is_observed(t)) {
@@ -1056,6 +1197,7 @@ fn run_source(ctx: &Ctx, conn: Option<&Connection>, store_path: &str, s: &dyn So
         return finish(out);
     };
     let writer = krowk_store::Writer::new(conn);
+    let mut links = Vec::new();
     for r in &refs {
         let key = r.key();
         let stored = match krowk_store::read_import_state(conn, &key) {
@@ -1082,8 +1224,20 @@ fn run_source(ctx: &Ctx, conn: Option<&Connection>, store_path: &str, s: &dyn So
         };
         out.absorb(&res);
         match writer.ingest_with_cursor(&thread, &key, &next) {
-            Ok(ing) => out.count(&ing),
+            Ok(ing) => {
+                out.count(&ing);
+                if let Some(parent) = &thread.parent {
+                    links.push((thread.binding.clone(), parent.clone()));
+                }
+            }
             Err(e) => out.record(format!("{key}: {}", sanitize_store_err(e.message(), store_path))),
+        }
+    }
+    // A child read before its parent (opencode lists newest first) is
+    // linked now that the parent is in.
+    for (child, parent) in &links {
+        if let Err(e) = writer.link_parent_later(child, parent) {
+            out.record(format!("{}: {}", child.foreign_session_id, sanitize_store_err(e.message(), store_path)));
         }
     }
     finish(out)
@@ -1164,6 +1318,21 @@ fn import_summary(r: &ImportReport) -> String {
 /// drops the lock however the process dies, so a killed import leaves a
 /// stale file and no stale lock. Dropping the returned file releases it.
 fn lock_store(store_path: &str) -> Result<std::fs::File, Error> {
+    try_lock_store(store_path)?.ok_or_else(|| {
+        let path = Path::new(store_path).parent().unwrap_or(Path::new(".")).join("import.lock");
+        fail(
+            "import_locked",
+            format!(
+                "another `krowk sessions import` or `rebuild` is running on this store — wait for it to finish, or check {} if you think it is not",
+                path.display()
+            ),
+        )
+    })
+}
+
+/// The lock, or None when somebody else holds it; an error only for a lock
+/// that could not be taken at all.
+fn try_lock_store(store_path: &str) -> Result<Option<std::fs::File>, Error> {
     let dir = Path::new(store_path).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -1171,16 +1340,11 @@ fn lock_store(store_path: &str) -> Result<std::fs::File, Error> {
         .create(&dir)
         .map_err(|e| fail("store_unavailable", e.to_string()))?;
     let path = dir.join("import.lock");
-    lock_file(&path).map_err(|held| match held {
-        None => fail(
-            "import_locked",
-            format!(
-                "another `krowk sessions import` or `rebuild` is running on this store — wait for it to finish, or check {} if you think it is not",
-                path.display()
-            ),
-        ),
-        Some(why) => fail("import_locked", format!("the import lock at {} could not be taken: {why}", path.display())),
-    })
+    match lock_file(&path) {
+        Ok(f) => Ok(Some(f)),
+        Err(None) => Ok(None),
+        Err(Some(why)) => Err(fail("import_locked", format!("the import lock at {} could not be taken: {why}", path.display()))),
+    }
 }
 
 trait PrivateDir {
@@ -1217,7 +1381,8 @@ fn lock_file(path: &Path) -> Result<std::fs::File, Option<String>> {
     }
     match f.try_lock() {
         Ok(()) => Ok(f),
-        Err(_) => Err(None),
+        Err(std::fs::TryLockError::WouldBlock) => Err(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(Some(format!("lock {}: {e}", path.display()))),
     }
 }
 

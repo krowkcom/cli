@@ -445,6 +445,19 @@ pub fn load_session_detail(conn: &Connection, session_id: &str) -> Result<Sessio
     Ok(SessionDetail { session, turns, messages })
 }
 
+/// Every session spawned under this one — subagents, and theirs. Their spend is part of what the parent spent.
+pub fn descendant_session_ids(conn: &Connection, session_id: &str) -> Result<Vec<String>, StoreError> {
+    conn.prepare(
+        // UNION on the id alone: each session once, and a parent loop in
+        // the data ends instead of recursing.
+        "WITH RECURSIVE tree(id) AS (SELECT id FROM session WHERE parent_id = ?1 \
+         UNION SELECT s.id FROM session s JOIN tree t ON s.parent_id = t.id) \
+         SELECT id FROM tree WHERE id != ?1 ORDER BY id",
+    )
+    .and_then(|mut st| st.query_map([session_id], |r| r.get(0))?.collect())
+    .map_err(|e| other("list child sessions", e))
+}
+
 /// The `name` a tool call's data carries.
 pub fn tool_name_of(data: &str) -> String {
     serde_json::from_str::<serde_json::Value>(data).ok().and_then(|v| v.get("name")?.as_str().map(String::from)).unwrap_or_default()

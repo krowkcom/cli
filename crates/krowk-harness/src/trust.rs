@@ -6,11 +6,16 @@
 //! one Claude Code would have asked — and remembers the answer here.
 //!
 //! The unit of trust is the repository: the nearest ancestor of the working
-//! directory holding a `.git`, else the working directory itself. A trusted
-//! directory covers everything under it. The list lives in krowk's config
-//! directory as `trusted.json`, `0600`, replaced by rename; it is a host's
-//! own record and never syncs. The native engine runs nothing of the
-//! repository's, so only backends consult it.
+//! directory holding a `.git`, else the working directory itself. Trust is
+//! that exact directory: a repository cloned inside a trusted one — a
+//! vendored checkout, a test fixture — is its own and is asked about on its
+//! own, since its hooks are someone else's. The home directory and `/` are
+//! never recorded: trusting either would trust every directory without a
+//! `.git` of its own under it (a home kept in git for its dotfiles is the
+//! usual way to get there). The list lives in krowk's config directory as
+//! `trusted.json`, `0600`, replaced by rename; it is a host's own record and
+//! never syncs. The native engine runs nothing of the repository's, so only
+//! backends consult it.
 
 use crate::engine::EngineError;
 use serde::{Deserialize, Serialize};
@@ -75,15 +80,31 @@ struct Listed {
     directories: Vec<String>,
 }
 
+/// Why `root` may not be remembered as trusted, if it may not: it is `/`,
+/// or the home directory.
+pub fn unrecordable(root: &Path, home: Option<&Path>) -> Option<String> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let root = canon(root);
+    if root.parent().is_none() {
+        return Some("/ is every directory on the machine".into());
+    }
+    if home.filter(|h| !h.as_os_str().is_empty()).is_some_and(|h| canon(h) == root) {
+        return Some(format!("{} is your home directory, and trusting it would trust every directory under it that is not a repository of its own", root.display()));
+    }
+    None
+}
+
 /// The trusted-directories file.
 #[derive(Debug, Clone)]
 pub struct Store {
     path: PathBuf,
+    home: Option<PathBuf>,
 }
 
 impl Store {
-    pub fn new(path: PathBuf) -> Store {
-        Store { path }
+    /// The file, and the home directory it will never record.
+    pub fn new(path: PathBuf, home: Option<PathBuf>) -> Store {
+        Store { path, home }
     }
 
     fn read(&self) -> Result<Listed, String> {
@@ -94,15 +115,24 @@ impl Store {
         }
     }
 
-    /// Whether `root`, or a directory above it, was trusted. A file that
-    /// cannot be read trusts nothing.
+    /// Whether `root` itself was trusted — not a directory above it. A file
+    /// that cannot be read trusts nothing, and neither does an entry for
+    /// the home directory or `/`, however it got there.
     pub fn trusts(&self, root: &Path) -> bool {
         let Ok(listed) = self.read() else { return false };
-        listed.directories.iter().any(|d| root.starts_with(Path::new(d)))
+        unrecordable(root, self.home.as_deref()).is_none() && listed.directories.iter().any(|d| Path::new(d) == root)
+    }
+
+    /// Why `root` cannot be remembered, if it cannot.
+    pub fn refuses(&self, root: &Path) -> Option<String> {
+        unrecordable(root, self.home.as_deref())
     }
 
     /// Remembers `root` as trusted.
     pub fn trust(&self, root: &Path) -> Result<(), String> {
+        if let Some(why) = self.refuses(root) {
+            return Err(format!("{} is not remembered as trusted: {why}", root.display()));
+        }
         let mut listed = self.read()?;
         let root = root.display().to_string();
         if listed.directories.contains(&root) {
@@ -144,12 +174,31 @@ mod tests {
         assert_eq!(e.code, "untrusted_directory");
         assert!(e.message.contains("hooks and MCP servers") && e.message.contains(".mcp.json") && e.message.ends_with("Pass --trust."), "{}", e.message);
 
-        let store = Store::new(base.join("config/trusted.json"));
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        std::fs::create_dir_all(home.join("notes")).unwrap();
+        let home = home.canonicalize().unwrap();
+        let store = Store::new(base.join("config/trusted.json"), Some(home.clone()));
         assert!(!store.trusts(&repo));
         store.trust(&repo).unwrap();
         store.trust(&repo).unwrap();
-        assert!(store.trusts(&repo) && store.trusts(&repo.join("src")), "a trusted directory covers what is under it");
-        assert!(!store.trusts(&base), "and nothing above it");
+        assert!(store.trusts(&repo) && store.trusts(&root(&repo.join("src"))), "the repository, from anywhere in it");
+        assert!(!store.trusts(&repo.join("src")) && !store.trusts(&base), "exactly that directory: not one under it spelled as a root, nor one above");
+        // A repository inside a trusted one is its own.
+        std::fs::create_dir_all(base.join("repo/vendor/lib/.git")).unwrap();
+        let nested = root(&base.join("repo/vendor/lib"));
+        assert_eq!(nested, repo.join("vendor/lib"));
+        assert!(!store.trusts(&nested), "a nested repository is asked about on its own");
+        // A home kept in git for its dotfiles: every plain directory in it
+        // resolves to the home, which is never recorded, nor is /.
+        assert_eq!(root(&home.join("notes")), home);
+        assert!(store.trust(&home).unwrap_err().contains("home directory"));
+        assert!(store.trust(Path::new("/")).is_err() && store.refuses(Path::new("/")).is_some());
+        assert!(!store.trusts(&home));
+        // Even an entry for the home written by hand trusts nothing.
+        std::fs::write(base.join("config/trusted.json"), serde_json::json!({"directories": [home, "/"]}).to_string()).unwrap();
+        assert!(!store.trusts(&home) && !store.trusts(Path::new("/")));
+        store.trust(&repo).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

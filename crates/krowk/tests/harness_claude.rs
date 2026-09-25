@@ -152,7 +152,12 @@ fn r_inst_2_two_claude_accounts_sign_in_through_claudes_own_flow_and_each_runs_a
 fn r_back_1_a_tool_using_claude_turn_is_in_the_log_and_in_krowk_sessions() {
     let b = Sandbox::new("tool");
     b.json(&["providers", "add", "claude", "--json"], &[]);
-    let out = b.krowk(&["-p", "what session is this?", "--model", "claude/sonnet", "--trust", "--output-format", "stream-json"], &[("FAKE_CLAUDE_SCENARIO", &scenario("session_info.jsonl"))]);
+    // The native instance's key and base URL are exported, as on a machine
+    // set up for the API: they are not Claude Code's, and stay out of it.
+    let out = b.krowk(
+        &["-p", "what session is this?", "--model", "claude/sonnet", "--trust", "--output-format", "stream-json"],
+        &[("FAKE_CLAUDE_SCENARIO", &scenario("session_info.jsonl")), ("ANTHROPIC_API_KEY", "sk-ant-api-test"), ("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")],
+    );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let lines: Vec<Value> = String::from_utf8_lossy(&out.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     let result = lines.last().unwrap();
@@ -164,7 +169,8 @@ fn r_back_1_a_tool_using_claude_turn_is_in_the_log_and_in_krowk_sessions() {
     // R-BACK-5, R-INST-3: the Claude session and its transcript, and what
     // it is billed to, are on the session's record.
     let backend = lines.iter().find(|l| l["type"] == "backend.session").unwrap();
-    assert_eq!((backend["backend"].as_str(), backend["billing"].as_str()), (Some("claude-code"), Some("subscription")));
+    assert_eq!((backend["backend"].as_str(), backend["billing"].as_str()), (Some("claude-code"), Some("subscription")), "an exported API key does not move the subscription onto it");
+    assert!(b.fake_log().contains("env ANTHROPIC_API_KEY= ANTHROPIC_BASE_URL=\n"), "{}", b.fake_log());
     assert!(Path::new(backend["transcriptPath"].as_str().unwrap()).starts_with(b.root.join("home/.claude/projects")));
     assert_eq!(b.events(session).iter().filter(|e| e["type"] == "turn.completed").count(), 1);
 
@@ -240,6 +246,20 @@ fn r_back_6_headless_refuses_an_untrusted_repository_before_claude_is_spawned() 
     std::fs::create_dir_all(b.root.join("repo/src")).unwrap();
     let out = b.command(&["-p", "hello", "--model", "claude/sonnet", "--output-format", "json"], &[]).current_dir(b.root.join("repo/src")).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // A home kept in git for its dotfiles: a directory in it resolves to
+    // the home, which is never trusted for good — only --trust runs there.
+    std::fs::create_dir_all(b.root.join("home/.git")).unwrap();
+    std::fs::create_dir_all(b.root.join("home/notes")).unwrap();
+    std::fs::write(b.root.join("home/.config/krowk/trusted.json"), serde_json::json!({"directories": [b.root.join("home"), b.root.join("repo")]}).to_string()).unwrap();
+    let out = b.command(&["-p", "hello", "--model", "claude/sonnet"], &[]).current_dir(b.root.join("home/notes")).output().unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("home directory"), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = b.command(&["-p", "hello", "--model", "claude/sonnet", "--trust"], &[]).current_dir(b.root.join("home/notes")).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // A repository inside a trusted one is asked about on its own.
+    std::fs::create_dir_all(b.root.join("repo/vendor/lib/.git")).unwrap();
+    let out = b.command(&["-p", "hello", "--model", "claude/sonnet"], &[]).current_dir(b.root.join("repo/vendor/lib")).output().unwrap();
+    assert_eq!(out.status.code(), Some(4), "{}", String::from_utf8_lossy(&out.stderr));
     // The native engine runs nothing of the repository's and never asks.
     let out = b.krowk(&["sessions", "--trust"], &[]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("only a flag of `krowk -p`"));

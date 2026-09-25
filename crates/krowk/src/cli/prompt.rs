@@ -51,7 +51,7 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
         pricer: pricer(ctx.io.env),
         catalog: catalog(ctx.io.env),
         credentials: super::providers::credentials_path(),
-        trust: trust_gate(ctx.f.trust, super::interactive(ctx) && std::io::stdin().is_terminal() && ctx.io.err_tty),
+        trust: trust_gate(ctx.f.trust, super::interactive(ctx) && std::io::stdin().is_terminal() && ctx.io.err_tty, Some(ctx.env("HOME")).filter(|h| !h.trim().is_empty()).map(std::path::PathBuf::from)),
     };
     let opts = headless::Options { prompt, resume, model, permission_mode, toolset, effort, format };
     let outcome = headless::run(cfg, opts, ctx.io.stdout);
@@ -158,12 +158,17 @@ pub(super) fn resolve_resume(ctx: &Ctx, sessions_dir: &std::path::Path, referenc
 /// the trust dialog Claude Code shows on a terminal, so krowk asks its own
 /// before a backend is spawned. A repository trusted before, or `--trust`,
 /// goes ahead; a person at the terminal is asked, and a yes is remembered;
-/// anything headless is refused. Nothing is spawned until this answers.
-fn trust_gate(flag: bool, ask: bool) -> trust::Gate {
-    let store = trust::Store::new(krowk_api::creds::config_dir().join(trust::FILE));
+/// anything headless is refused. The home directory and `/` are never
+/// offered: only `--trust`, for one run, starts a backend there. Nothing is
+/// spawned until this answers.
+fn trust_gate(flag: bool, ask: bool, home: Option<std::path::PathBuf>) -> trust::Gate {
+    let store = trust::Store::new(krowk_api::creds::config_dir().join(trust::FILE), home);
     Arc::new(move |root: &std::path::Path| {
         if flag || store.trusts(root) {
             return Ok(());
+        }
+        if let Some(why) = store.refuses(root) {
+            return Err(trust::untrusted(root, &format!("It cannot be trusted for good — {why}. Pass --trust to run there this once, or run krowk -p from a repository of its own.")));
         }
         if !ask {
             return Err(trust::untrusted(root, "Look at what it would run, then pass --trust to run it anyway, or run krowk -p there once on a terminal and answer its prompt."));

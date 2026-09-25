@@ -14,13 +14,15 @@ sessions = ["dep:krowk-store", "dep:krowk-import"]
 # krowk's own agent engine: `krowk -p`, the session log, the Anthropic
 # client. Needs the store it projects into, so it implies `sessions`; the
 # agent build links none of it.
-harness = ["sessions", "dep:krowk-harness"]
+# The inline TUI bare `krowk` opens on a terminal comes with it.
+harness = ["sessions", "dep:krowk-harness", "dep:krowk-tui"]
 
 [dependencies]
 krowk-api = { path = "../krowk-api" }
 krowk-store = { path = "../krowk-store", optional = true }
 krowk-import = { path = "../krowk-import", optional = true }
 krowk-harness = { path = "../krowk-harness", optional = true }
+krowk-tui = { path = "../krowk-tui", optional = true }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: a record read back keeps the key order it arrived in.
 # raw_value: the models.dev file is parsed without building what it skips.

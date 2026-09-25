@@ -1,7 +1,9 @@
 name: Dist
 
 # Every release binary, one runner per target, in parallel, then one job that
-# gathers them into the release layout. Called by release.yml (full profile,
+# gathers them into the release layout: per target, the full build of krowk
+# (krowk_…, for people) and the lean one (krowk-lean_…, for CI and containers),
+# each archived with krowk-mcp. Called by release.yml (full profile,
 # the bytes that ship) and packaging.yml (fast profile, the same layout
 # minutes sooner). scripts/dist.sh does the work, so `make dist` builds the
 # same thing locally.

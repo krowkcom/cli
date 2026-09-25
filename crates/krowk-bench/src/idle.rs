@@ -89,7 +89,7 @@ fn request_complete(got: &[u8]) -> bool {
 /// utime + stime from /proc/<pid>/stat: every thread, since the process's
 /// line sums them. The fields are counted after the command name's closing
 /// parenthesis, which may itself contain spaces.
-fn proc_ticks(pid: u32) -> Result<u64, String> {
+pub(crate) fn proc_ticks(pid: u32) -> Result<u64, String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| format!("/proc/{pid}/stat: {e}"))?;
     parse_ticks(&stat).ok_or_else(|| format!("/proc/{pid}/stat: unreadable line {stat:?}"))
 }
@@ -102,7 +102,7 @@ fn parse_ticks(stat: &str) -> Option<u64> {
 }
 
 /// Voluntary and involuntary context switches, per thread id.
-fn proc_switches(pid: u32) -> Result<Switches, String> {
+pub(crate) fn proc_switches(pid: u32) -> Result<Switches, String> {
     let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).map_err(|e| format!("/proc/{pid}/task: {e}"))?;
     let mut per = Switches::new();
     for t in tasks.flatten() {
@@ -114,14 +114,14 @@ fn proc_switches(pid: u32) -> Result<Switches, String> {
     Ok(per)
 }
 
-type Switches = std::collections::BTreeMap<u32, u64>;
+pub(crate) type Switches = std::collections::BTreeMap<u32, u64>;
 
 /// The wakeups between two samples. Only a comparison of the same threads
 /// means anything: a thread that exited mid-window takes its switches out
 /// of the sum, and one that started brings in switches from before the
 /// window, so either is an error rather than a number — and a thread
 /// being started or reaped while idle is not idle anyway.
-fn wakeups_between(before: &Switches, after: &Switches) -> Result<u64, String> {
+pub(crate) fn wakeups_between(before: &Switches, after: &Switches) -> Result<u64, String> {
     if before.keys().ne(after.keys()) {
         return Err(format!("the threads changed during the idle window ({:?} to {:?})", before.keys().collect::<Vec<_>>(), after.keys().collect::<Vec<_>>()));
     }
@@ -133,9 +133,14 @@ fn wakeups_between(before: &Switches, after: &Switches) -> Result<u64, String> {
     Ok(n)
 }
 
-fn proc_rss_kib(pid: u32) -> Result<u64, String> {
+pub(crate) fn proc_rss_kib(pid: u32) -> Result<u64, String> {
+    proc_status_kib(pid, "VmRSS:")
+}
+
+/// A kB field of /proc/<pid>/status: `VmRSS:` now, `VmHWM:` at its peak.
+pub(crate) fn proc_status_kib(pid: u32, key: &str) -> Result<u64, String> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).map_err(|e| format!("/proc/{pid}/status: {e}"))?;
-    status_field(&status, "VmRSS:").ok_or_else(|| format!("/proc/{pid}/status has no VmRSS"))
+    status_field(&status, key).ok_or_else(|| format!("/proc/{pid}/status has no {key}"))
 }
 
 fn status_field(status: &str, key: &str) -> Option<u64> {

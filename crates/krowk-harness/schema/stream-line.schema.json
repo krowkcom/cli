@@ -750,6 +750,13 @@
               "type": "null"
             }
           ]
+        },
+        "unreadSteers": {
+          "description": "Steering the host accepted for this turn and the engine never read —\nthe turn was interrupted or failed first — oldest first, handed back\nso the client that sent it can offer it again. Never set on a\ncompleted turn: a turn does not complete with steering unread.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "required": [

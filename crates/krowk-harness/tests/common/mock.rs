@@ -35,6 +35,9 @@ pub struct Reply {
     pub body: String,
     pub content_type: Option<&'static str>,
     pub headers: Vec<(String, String)>,
+    /// Sent one SSE event at a time with this pause between, rather than
+    /// whole: a model typing at a known rate.
+    pub pace: Option<std::time::Duration>,
 }
 
 impl Reply {
@@ -43,7 +46,7 @@ impl Reply {
     }
 
     pub fn status(status: u16, body: &str) -> Reply {
-        Reply { status, body: body.to_string(), content_type: None, headers: Vec::new() }
+        Reply { status, body: body.to_string(), content_type: None, headers: Vec::new(), pace: None }
     }
 
     pub fn json(status: u16, body: &serde_json::Value) -> Reply {
@@ -53,6 +56,38 @@ impl Reply {
     pub fn redirect(to: &str) -> Reply {
         Reply { headers: vec![("location".into(), to.into())], ..Reply::status(302, "") }
     }
+
+    pub fn paced(body: String, pace: std::time::Duration) -> Reply {
+        Reply { pace: Some(pace), ..Reply::status(200, &body) }
+    }
+}
+
+/// A whole Messages-API stream answering `text`, one `text_delta` per
+/// word-sized piece — roughly one token each — so a paced reply streams at
+/// a known token rate.
+pub fn text_stream(text: &str) -> String {
+    let mut out = String::from(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01Streamed\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n\
+         event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    );
+    let mut pieces = 0;
+    for piece in text.split_inclusive([' ', '\n']) {
+        pieces += 1;
+        let delta = serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": piece}});
+        out.push_str(&format!("event: content_block_delta\ndata: {delta}\n\n"));
+    }
+    out.push_str("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+    out.push_str(&format!(
+        "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":{pieces}}}}}\n\n"
+    ));
+    out.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    out
+}
+
+/// `n` numbered lines of prose, about twelve tokens each: the long answer
+/// the scrollback test streams and then looks for, line by line.
+pub fn numbered_lines(n: usize) -> String {
+    (1..=n).map(|i| format!("line {i:05}: the quick brown fox jumps over the lazy dog again\n")).collect()
 }
 
 pub struct Mock {
@@ -114,8 +149,24 @@ pub fn serve_seen_on(listener: TcpListener, answer: impl Fn(&Seen, usize) -> Rep
             let extra: String = reply.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
             let head = format!("HTTP/1.1 {} X\r\ncontent-type: {kind}\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n", reply.status, reply.body.len());
             let _ = conn.write_all(head.as_bytes());
-            let _ = conn.write_all(reply.body.as_bytes());
-            let _ = conn.flush();
+            match reply.pace {
+                // Its own thread, so a slow stream does not hold up the next
+                // request — a connectivity probe above all.
+                Some(pace) => {
+                    std::thread::spawn(move || {
+                        for event in reply.body.split_inclusive("\n\n") {
+                            if conn.write_all(event.as_bytes()).and_then(|()| conn.flush()).is_err() {
+                                return;
+                            }
+                            std::thread::sleep(pace);
+                        }
+                    });
+                }
+                None => {
+                    let _ = conn.write_all(reply.body.as_bytes());
+                    let _ = conn.flush();
+                }
+            }
         }
     });
     Mock { url, seen }

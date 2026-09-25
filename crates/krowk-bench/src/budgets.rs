@@ -327,8 +327,19 @@ mod tests {
         for req in ["R-PERF-1", "R-PERF-2", "R-PERF-3", "R-PERF-4", "R-PERF-5", "R-PERF-6", "R-PKG-2"] {
             assert!(f.budget.iter().any(|b| b.req == req), "budgets.toml has nothing for {req}");
         }
-        assert_eq!(find("session.replay_rss").owner.as_deref(), Some("04"), "ticket 04 builds the 200k replay; 12 only verifies");
-        for id in ["lean.size", "lean.deps", "log.append", "engine.idle_cpu", "context.tokens"] {
+        for id in [
+            "lean.size",
+            "lean.deps",
+            "log.append",
+            "engine.idle_cpu",
+            "context.tokens",
+            "tui.startup_cold",
+            "tui.idle_cpu",
+            "tui.turn_cpu",
+            "tui.idle_rss",
+            "tui.redraw_fps",
+            "session.replay_rss",
+        ] {
             assert_eq!(find(id).status, Status::Enforced, "{id} is measurable now, so it is enforced");
         }
         let lean = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../krowk/lean-deps.txt")).unwrap();

@@ -1,0 +1,249 @@
+//! The TUI's visual language: glyphs, colours, the spinner, durations, how
+//! a tool call is named, and the light markdown an answer is shown in.
+//!
+//! The vocabulary follows Grok Build's (xAI, Apache-2.0: its
+//! `xai-grok-pager-render` glyphs and "Terminal" theme, its minimal inline
+//! mode's commit rules, its thinking and turn-status blocks): `❯` for what
+//! the person said, `◆` for a tool, a tool shown once with its outcome,
+//! thinking collapsed to "Thought for 4.2s", `Worked for 12s` after a turn,
+//! ` │ ` between status items. Written here from those ideas; no code was
+//! copied (see THIRD-PARTY-NOTICES).
+//!
+//! Colours are the terminal's own sixteen, so a person's theme decides what
+//! they look like and a phone terminal shows them; the diff bands are two
+//! 256-colour indexes that stay red and green where 256 colours degrade.
+
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use std::time::Duration;
+
+pub const PROMPT: &str = "❯ ";
+pub const TOOL: &str = "◆ ";
+pub const WARN: &str = "⚠ ";
+pub const STOPPED: &str = "◌ ";
+pub const STEER: &str = "↳ ";
+pub const SEP: &str = " │ ";
+
+/// Braille spinner, one frame per `SPIN_FRAME` while a turn runs.
+pub const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+pub const SPIN_FRAME: Duration = Duration::from_millis(125);
+
+pub fn dim() -> Style {
+    Style::new().add_modifier(Modifier::DIM)
+}
+
+pub fn bold() -> Style {
+    Style::new().add_modifier(Modifier::BOLD)
+}
+
+pub fn accent() -> Style {
+    Style::new().fg(Color::Magenta)
+}
+
+pub fn success() -> Style {
+    Style::new().fg(Color::Green)
+}
+
+pub fn error() -> Style {
+    Style::new().fg(Color::Red)
+}
+
+pub fn warning() -> Style {
+    Style::new().fg(Color::Yellow)
+}
+
+pub fn path() -> Style {
+    Style::new().fg(Color::Cyan)
+}
+
+pub fn code() -> Style {
+    Style::new().fg(Color::Cyan)
+}
+
+pub fn prompt() -> Style {
+    Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
+}
+
+pub fn insert_band() -> Style {
+    Style::new().bg(Color::Indexed(22))
+}
+
+pub fn delete_band() -> Style {
+    Style::new().bg(Color::Indexed(52))
+}
+
+/// `4.2s`, `12s`, `1m5s`, `1h2m`.
+pub fn duration(d: Duration) -> String {
+    let s = d.as_secs_f64();
+    match d.as_secs() {
+        0..=9 => format!("{s:.1}s"),
+        10..=59 => format!("{}s", d.as_secs()),
+        60..=3599 => format!("{}m{}s", d.as_secs() / 60, d.as_secs() % 60),
+        n => format!("{}h{}m", n / 3600, (n % 3600) / 60),
+    }
+}
+
+/// How a tool call is named: a verb, and what it acts on.
+pub fn tool_title(name: &str, input: &serde_json::Value) -> (String, String) {
+    let s = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let first_line = |t: String| t.lines().next().unwrap_or_default().to_string();
+    match name {
+        "read" => ("Read".into(), s("path")),
+        "write" => ("Write".into(), s("path")),
+        "bash" => ("Run".into(), first_line(s("command"))),
+        "grep" => ("Search".into(), s("pattern")),
+        "glob" => ("Find".into(), s("pattern")),
+        "str_replace" => ("Edit".into(), s("path")),
+        "search_replace" => ("Edit".into(), s("file_path")),
+        "apply_patch" => ("Edit".into(), patch_paths(&s("input")).join(", ")),
+        other => {
+            let arg = ["command", "path", "file_path", "pattern", "url"].iter().map(|k| s(k)).find(|v| !v.is_empty()).unwrap_or_default();
+            (other.to_string(), first_line(arg))
+        }
+    }
+}
+
+fn patch_paths(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|l| ["*** Update File: ", "*** Add File: ", "*** Delete File: "].iter().find_map(|p| l.strip_prefix(p)))
+        .map(|p| p.trim().to_string())
+        .collect()
+}
+
+/// The lines an edit call removes and adds, as the model asked for them:
+/// `old_str`/`new_str`, `old_string`/`new_string`, or a patch's `-` and `+`.
+pub fn edit_lines(name: &str, input: &serde_json::Value) -> Option<(Vec<String>, Vec<String>)> {
+    let s = |k: &str| input.get(k).and_then(|v| v.as_str()).map(String::from);
+    let split = |t: String| t.lines().map(String::from).collect::<Vec<_>>();
+    match name {
+        "str_replace" => Some((split(s("old_str")?), split(s("new_str")?))),
+        "search_replace" => Some((split(s("old_string")?), split(s("new_string")?))),
+        "apply_patch" => {
+            let p = s("input")?;
+            let body = p.lines().filter(|l| !l.starts_with("***") && !l.starts_with("@@"));
+            let (mut del, mut add) = (Vec::new(), Vec::new());
+            for l in body {
+                if let Some(r) = l.strip_prefix('-') {
+                    del.push(r.to_string());
+                } else if let Some(a) = l.strip_prefix('+') {
+                    add.push(a.to_string());
+                }
+            }
+            Some((del, add))
+        }
+        _ => None,
+    }
+}
+
+/// One line of an answer in light markdown: headings bold and coloured,
+/// list markers as `•`, quotes behind a rule, `code` and fenced blocks in
+/// the code colour, `**bold**` bold. Line by line, so it streams: `fence`
+/// carries whether a fenced block is open across lines.
+pub fn markdown_line(text: &str, fence: &mut bool) -> Line<'static> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        *fence = !*fence;
+        return Line::from(Span::styled(text.to_string(), dim()));
+    }
+    if *fence {
+        return Line::from(Span::styled(text.to_string(), code()));
+    }
+    let indent = &text[..text.len() - trimmed.len()];
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
+        let colour = match hashes {
+            1 => Color::Cyan,
+            2 => Color::Blue,
+            _ => Color::Magenta,
+        };
+        return Line::from(Span::styled(trimmed[hashes + 1..].to_string(), bold().fg(colour)));
+    }
+    let mut spans = vec![Span::raw(indent.to_string())];
+    let body = if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")).or_else(|| trimmed.strip_prefix("+ ")) {
+        spans.push(Span::styled("• ", accent()));
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("> ") {
+        spans.push(Span::styled("│ ", dim()));
+        rest
+    } else {
+        trimmed
+    };
+    spans.extend(inline(body));
+    Line::from(spans)
+}
+
+/// `code` and `**bold**` within a line; anything unclosed stays as typed.
+fn inline(text: &str) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    loop {
+        let tick = rest.find('`');
+        let star = rest.find("**");
+        let (at, marker) = match (tick, star) {
+            (Some(t), Some(s)) if s < t => (s, "**"),
+            (Some(t), _) => (t, "`"),
+            (None, Some(s)) => (s, "**"),
+            (None, None) => break,
+        };
+        let Some(close) = rest[at + marker.len()..].find(marker) else { break };
+        let inner = &rest[at + marker.len()..at + marker.len() + close];
+        if inner.is_empty() {
+            break;
+        }
+        if at > 0 {
+            out.push(Span::raw(rest[..at].to_string()));
+        }
+        out.push(Span::styled(inner.to_string(), if marker == "`" { code() } else { bold() }));
+        rest = &rest[at + marker.len() * 2 + close..];
+    }
+    if !rest.is_empty() {
+        out.push(Span::raw(rest.to_string()));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn durations_read_like_a_person_says_them() {
+        assert_eq!(duration(Duration::from_millis(4230)), "4.2s");
+        assert_eq!(duration(Duration::from_secs(12)), "12s");
+        assert_eq!(duration(Duration::from_secs(65)), "1m5s");
+        assert_eq!(duration(Duration::from_secs(3720)), "1h2m");
+    }
+
+    #[test]
+    fn tools_are_named_by_what_they_do() {
+        assert_eq!(tool_title("read", &json!({"path": "README.md"})), ("Read".into(), "README.md".into()));
+        assert_eq!(tool_title("bash", &json!({"command": "cargo test\necho done"})), ("Run".into(), "cargo test".into()));
+        assert_eq!(tool_title("apply_patch", &json!({"input": "*** Begin Patch\n*** Update File: a.rs\n*** Add File: b.rs\n"})), ("Edit".into(), "a.rs, b.rs".into()));
+        let (del, add) = edit_lines("str_replace", &json!({"path": "x", "old_str": "a\nb", "new_str": "c"})).unwrap();
+        assert_eq!((del, add), (vec!["a".to_string(), "b".into()], vec!["c".to_string()]));
+        let (del, add) = edit_lines("apply_patch", &json!({"input": "*** Begin Patch\n*** Update File: x\n@@ ctx\n keep\n-old\n+new\n*** End Patch"})).unwrap();
+        assert_eq!((del, add), (vec!["old".to_string()], vec!["new".to_string()]));
+    }
+
+    #[test]
+    fn markdown_is_shown_line_by_line() {
+        let mut f = false;
+        assert_eq!(text(&markdown_line("## Usage", &mut f)), "Usage");
+        assert_eq!(text(&markdown_line("  - one `two` **three**", &mut f)), "  • one two three");
+        let l = markdown_line("use `krowk push` now", &mut f);
+        assert_eq!(l.spans[2].style, code(), "{:?}", l.spans);
+        assert_eq!(text(&markdown_line("```rust", &mut f)), "```rust");
+        assert!(f, "the fence is open");
+        assert_eq!(text(&markdown_line("- not a list in code", &mut f)), "- not a list in code");
+        markdown_line("```", &mut f);
+        assert!(!f);
+        assert_eq!(text(&markdown_line("a ` lone tick and **unclosed", &mut f)), "a ` lone tick and **unclosed");
+        assert_eq!(text(&markdown_line("line 00001: the quick brown fox", &mut f)), "line 00001: the quick brown fox");
+    }
+}

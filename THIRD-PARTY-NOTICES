@@ -1,0 +1,24 @@
+THIRD-PARTY NOTICES
+
+krowk is MIT-licensed (see LICENSE). This file names the work of others krowk's
+source draws on beyond its declared Cargo dependencies, whose own licenses ship
+with them.
+
+--------------------------------------------------------------------------------
+Grok Build (xAI) — design reference, no code copied
+--------------------------------------------------------------------------------
+Source:    https://github.com/xai-org/grok-build (crates/codegen/xai-ratatui-inline,
+           xai-grok-pager-render, xai-grok-pager-minimal, xai-grok-markdown)
+License:   Apache-2.0
+Copyright: Copyright 2023-2026 SpaceXAI
+
+krowk's inline TUI (crates/krowk-tui) follows Grok Build's visual language and
+two of its rendering ideas: finished output printed into the terminal's own
+scrollback as text the terminal wraps (xai-ratatui-inline's
+emit_to_scrollback), and the glyphs, commit rules and status wording of its
+minimal inline mode — `❯` for the prompt, `◆` for a tool shown once with its
+outcome, thinking collapsed to "Thought for 4.2s", "Worked for 12s", ` │ `
+between status items, edits as removed and added lines on red and green
+bands. krowk's implementation is its own: no Grok Build source file was copied
+or adapted, so no Apache-2.0 obligations attach to krowk's code. The
+acknowledgement is recorded here because the design is theirs.

@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-const DEFAULT_SESSION_LIMIT: usize = 50;
+pub(super) const DEFAULT_SESSION_LIMIT: usize = 50;
 const MAX_REPORTED_ERRORS: usize = 10;
 const MAX_SKIPPED_TYPES: usize = 32;
 const MAX_SKIPPED_TYPE_LEN: usize = 64;
@@ -65,11 +65,11 @@ fn sanitize_store_err(msg: &str, store_path: &str) -> String {
     msg.to_string()
 }
 
-fn store_fail(e: &StoreError, store_path: &str) -> Error {
+pub(super) fn store_fail(e: &StoreError, store_path: &str) -> Error {
     fail("store_unavailable", sanitize_store_err(e.message(), store_path))
 }
 
-fn db_path_string(ctx: &Ctx) -> String {
+pub(super) fn db_path_string(ctx: &Ctx) -> String {
     krowk_store::db_path(ctx.io.env).map(|p| p.display().to_string()).unwrap_or_default()
 }
 
@@ -507,7 +507,7 @@ fn human_sessions_list(rows: &[SessionRow], priced: &[Priced], colour: bool, now
 
 /// The picker offers only rows already in the store, which is what makes it
 /// safe to offer.
-fn pick_session(rows: &[SessionRow], now: i64) -> Result<String, Error> {
+pub(super) fn pick_session(rows: &[SessionRow], now: i64) -> Result<String, Error> {
     let labels: Vec<String> = rows
         .iter()
         .map(|r| {

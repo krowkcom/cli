@@ -11,6 +11,22 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Changed
 
+- **The release ships two builds of krowk, and the installer picks.** The
+  full build — krowk's agent and its TUI, the session store, everything —
+  keeps the archive name every release has used (`krowk_<version>_…`), so
+  links, npm and `krowk upgrade` from an earlier release get it. The lean
+  agent-container build is `krowk-lean_<version>_…` beside it.
+  `curl -fsSL https://krowk.com/install | bash` installs the full build on a
+  workstation and the lean one in CI (`CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, …)
+  and containers (`/.dockerenv`, `/run/.containerenv`, `$container`, a
+  Kubernetes pod, or no terminal at all, as in a Dockerfile `RUN`); a
+  pinned release from before the lean build installs its one build; `bash -s -- --lean` / `--full`, or `KROWK_LEAN=1` / `0`,
+  choose either way. `krowk upgrade` stays on the build it is, and the
+  GitHub Action installs the lean build. **Toolbox and distrobox count as
+  containers: pass `--full` there** for the agent.
+- **Network failures say "no network connectivity".** When the Anthropic
+  API cannot be reached, `krowk -p` now fails with that sentence first,
+  still under `network_unreachable`.
 - **Costs are priced per turn, by the model each turn ran on.** A session
   that switched models mid-way, or a ledger with three models in it, is no
   longer priced entirely at its last model's rates. `sessions show` prints
@@ -66,9 +82,44 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- **Bare `krowk` on a terminal opens krowk's own agent.** An inline prompt
+  at the bottom of the terminal, with the conversation going into the
+  terminal's normal scrollback as it finishes — no alternate screen, so it
+  scrolls, copies and searches like any other output, and works over SSH,
+  in tmux and in phone terminals. Answers stream at up to 60 frames a
+  second, each frame one synchronized update, and an idle prompt uses no
+  CPU at all. Enter sends; Alt-Enter, Ctrl-J or a trailing `\` adds a line,
+  and ↑/↓ walk the prompt history. Esc or Ctrl-C interrupts a turn and
+  keeps what arrived; typing while it runs steers it, and the model reads
+  it before its next step. `krowk --resume` picks a krowk session to
+  continue from a list (`--resume <id>` names one), `--model` and
+  `--permission-mode` work as they do for `-p`. A status bar shows the
+  model, the instance, the session's cost and connectivity — configurable,
+  or off, under `"tui"` in `config.json` (see the README) — and `?` and
+  Ctrl-O toggle the keys and the session's details. When the model's API
+  cannot be reached, a persistent **no network connectivity** notice
+  appears within two seconds and clears when it answers again (behind a
+  proxy — `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` — the proxy is what is
+  checked). Ctrl-Z stops to the shell and `fg` brings the prompt back;
+  SIGTERM and SIGHUP leave the terminal as they found it. Each tool call
+  is shown once, with its outcome (`◆ Read README.md (3 lines)`, an edit's
+  removed and added lines on red and green bands, a command's head and
+  tail), thinking as `◆ Thought for 4.2s`, and answers in light markdown;
+  the look follows xAI's Grok Build. Finished lines are printed as text the
+  terminal wraps, so they rewrap when the window is resized and copy
+  whole. The prompt sits
+  at the bottom of the terminal, what was on screen moved down to meet
+  it, so narrowing the window never leaves a copy of it in scrollback.
+  **Known limits:** krowk takes a terminal to reflow on resize unless it is
+  real xterm (`XTERM_VERSION`) or the Linux console; one that is taken
+  wrongly can leave a copy of the prompt area in scrollback, or blank a
+  few lines above it. A live region that reflows taller than the whole
+  screen (a very narrow window under a long overlay) leaves its top rows in
+  scrollback. Steering an interrupted turn never read comes back into the
+  prompt, and on `-p`'s result as `unreadSteers`. With stdin
+  or stdout not a terminal, bare `krowk` prints exactly what it always has.
 - **`krowk -p "…"` runs krowk's own agent, headless, on the Anthropic API.**
-  Build with `--features harness` (the release and the agent build are
-  unchanged). The prompt comes from the arguments, or from stdin when there
+  The release's full build carries it; the lean agent build does not. The prompt comes from the arguments, or from stdin when there
   are none; the key from `ANTHROPIC_API_KEY`, and `ANTHROPIC_BASE_URL`
   points it at a router or a stand-in. `--output-format text` prints the
   answer, `json` the `result` event, and `stream-json` every event as it

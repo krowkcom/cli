@@ -61,7 +61,10 @@
 //! 0.0.0-golden, so a version-dependent path is compared like any other.
 //!
 //! `GOLDEN_UPDATE=1` rewrites `expected` instead of checking it, and
-//! `GOLDEN_CASE=substr` runs only the matching cases.
+//! `GOLDEN_CASE=substr` runs only the matching cases. `GOLDEN_CASES=dir`
+//! reads the cases from another directory beside cases/: `cases-full/` holds
+//! what the full build (`--features harness`) must print exactly as it did
+//! before the TUI existed, which `make golden` runs against that build.
 
 use regex::{Captures, Regex};
 use std::collections::HashMap;
@@ -109,7 +112,8 @@ fn golden() {
     let update = std::env::var_os("GOLDEN_UPDATE").is_some();
     let only = std::env::var("GOLDEN_CASE").unwrap_or_default();
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases");
+    let dir = std::env::var("GOLDEN_CASES").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| "cases".into());
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
     let mut cases: Vec<PathBuf> = fs::read_dir(&root).unwrap().map(|e| e.unwrap().path()).filter(|p| p.join("cmd").exists()).collect();
     cases.sort();
     assert!(!cases.is_empty(), "no cases under {}", root.display());
@@ -375,6 +379,16 @@ fn run_on_tty(bin: &Path, args: &[String], work: &Path, env: &[(String, String)]
     #[allow(clippy::unnecessary_mut_passed)]
     let ok = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) };
     assert_eq!(ok, 0, "openpty failed");
+    // No \n to \r\n on the way out: `visible` would undo it anyway, and
+    // macOS's pty doubles the \r when a large write fills its buffer
+    // mid-conversion, which reads as a `\r` the binary never printed.
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave, &mut t) == 0 {
+            t.c_oflag &= !libc::ONLCR;
+            libc::tcsetattr(slave, libc::TCSANOW, &t);
+        }
+    }
     let (master, slave) = unsafe { (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave)) };
     let mut child = Command::new(bin)
         .args(args)

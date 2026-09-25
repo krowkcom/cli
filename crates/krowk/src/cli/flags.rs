@@ -77,7 +77,8 @@ pub struct Flags {
     pub client_id: String,
     #[cfg(feature = "harness")]
     pub device: bool,
-    /// `providers add claude`: the binary, and the config directory.
+    /// `providers add claude|codex`: the binary, and the config directory
+    /// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`).
     #[cfg(feature = "harness")]
     pub binary: String,
     #[cfg(feature = "harness")]

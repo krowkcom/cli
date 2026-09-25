@@ -3,20 +3,24 @@
 //! profile with a base URL, `openai:work` — or signs in to SuperGrok and
 //! keeps the tokens in krowk's provider credentials file, or adds a Claude
 //! Code account, `claude:personal`: a config directory of its own, signed in
-//! by `claude auth login` in Anthropic's own flow (R-INST-2). `list` shows
-//! every instance and whether it can run; `remove` takes a definition, and a
-//! login, away.
+//! by `claude auth login` in Anthropic's own flow (R-INST-2), or a Codex
+//! account, `codex:team`: a `CODEX_HOME` of its own that shares the
+//! person's Codex configuration, signed in by `codex login` in OpenAI's own
+//! flow. `list` shows every instance and whether it can run; `remove` takes
+//! a definition, and a login, away.
 //!
 //! A definition names the variable its key is read from and never holds the
 //! key, so config.json stays something that can sync between hosts. A
 //! Claude Code login is Claude Code's: krowk asks `claude auth status`
-//! whether there is one and never reads it (R-BACK-2).
+//! whether there is one and never reads it (R-BACK-2); a Codex login is
+//! Codex's, asked of `codex login status` (R-BACK-3).
 
 use super::{auth, Ctx};
 use crate::config;
 use crate::output::Format;
 use krowk_api::{fail, Error};
 use krowk_harness::claude::auth as claude_auth;
+use krowk_harness::codex::{self, auth as codex_auth};
 use krowk_harness::instances::{self, Auth, InstanceKind, Registry};
 use krowk_harness::oauth::{self, Step, Store};
 use serde_json::{json, Value};
@@ -27,7 +31,7 @@ pub(super) fn credentials_path() -> PathBuf {
     krowk_api::creds::config_dir().join(oauth::CREDENTIALS_FILE)
 }
 
-const PROVIDERS: &[&str] = &["anthropic", "openai", "xai", "openrouter", "openai-compatible", "supergrok", "claude"];
+const PROVIDERS: &[&str] = &["anthropic", "openai", "xai", "openrouter", "openai-compatible", "supergrok", "claude", "codex"];
 
 /// `NAME` in `OPENAI_NAME_API_KEY`: upper case, anything else an underscore.
 fn env_part(s: &str) -> String {
@@ -57,13 +61,13 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         (Some(n), p) => format!("{p}:{n}"),
         (None, p) => p.to_string(),
     };
-    if provider != "claude" && (ctx.f.given.contains("binary") || ctx.f.given.contains("config-dir")) {
-        return Err(fail("bad_flag", "`--binary` and `--config-dir` describe a Claude Code instance: `krowk providers add claude --name work --config-dir …`"));
+    if !matches!(provider.as_str(), "claude" | "codex") && (ctx.f.given.contains("binary") || ctx.f.given.contains("config-dir")) {
+        return Err(fail("bad_flag", "`--binary` and `--config-dir` describe a backend instance: `krowk providers add claude --name work --config-dir …`, or `codex`"));
     }
     // A named profile of a provider reads its own variable, so two
     // profiles never share a key by accident.
     let key_env = opt(&ctx.f.api_key_env).or_else(|| match (&name, provider.as_str()) {
-        (_, "supergrok" | "claude") => None,
+        (_, "supergrok" | "claude" | "codex") => None,
         (Some(n), "openai-compatible") => Some(format!("{}_API_KEY", env_part(n))),
         (Some(n), p) => Some(format!("{}_{}_API_KEY", env_part(p), env_part(n))),
         (None, _) => None,
@@ -90,6 +94,18 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
             binary: opt(&ctx.f.binary),
             config_dir: opt(&ctx.f.config_dir),
             env: base_url.clone().map(|u| [("ANTHROPIC_BASE_URL".to_string(), u)].into()).unwrap_or_default(),
+            args: Vec::new(),
+            api_key_env: opt(&ctx.f.api_key_env),
+            effort: None,
+        },
+        // A router in front of Codex is a model provider in its args; the
+        // base URL goes in its env as OPENAI_BASE_URL, and the key is named
+        // by --api-key-env — krowk reads that variable and hands the key to
+        // the process under the same name.
+        "codex" => InstanceKind::CodexAppServer {
+            binary: opt(&ctx.f.binary),
+            codex_home: opt(&ctx.f.config_dir),
+            env: base_url.clone().map(|u| [("OPENAI_BASE_URL".to_string(), u)].into()).unwrap_or_default(),
             args: Vec::new(),
             api_key_env: opt(&ctx.f.api_key_env),
             effort: None,
@@ -131,6 +147,20 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
             let kind = InstanceKind::ClaudeCode { binary, config_dir, env, args, api_key_env, effort };
             let (status, _) = sign_in_claude(ctx, &instance, &kind)?;
             claude_status = Some(status);
+            kind
+        }
+        k => k,
+    };
+    // A Codex account the same way, in a home of its own that shares the
+    // person's Codex configuration.
+    let mut codex_status = None;
+    let kind = match kind {
+        InstanceKind::CodexAppServer { binary, codex_home, env, args, api_key_env, effort } => {
+            let codex_home = codex_home.or_else(|| {
+                name.as_ref().and_then(|_| krowk_harness::log::sessions_dir(ctx.io.env).and_then(|d| d.parent().map(|p| p.join("codex").join(instance.replace(':', "-")).display().to_string())))
+            });
+            let kind = InstanceKind::CodexAppServer { binary, codex_home, env, args, api_key_env, effort };
+            codex_status = Some(sign_in_codex(ctx, &instance, &kind)?);
             kind
         }
         k => k,
@@ -189,6 +219,11 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
             report["signed_in"] = json!(st.logged_in);
             report["login"] = json!(st.describe());
         }
+        if let Some((st, shared)) = &codex_status {
+            report["signed_in"] = json!(st.logged_in);
+            report["login"] = json!(st.describe());
+            report["shared"] = json!(shared);
+        }
         let summary = format!("added {instance}");
         return super::sessions::emit_data(ctx, report, summary);
     }
@@ -210,11 +245,19 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         let dir = b.config_dir.as_ref().map(|d| format!(" with CLAUDE_CONFIG_DIR={}", d.display())).unwrap_or_default();
         let _ = writeln!(out, "runs Claude Code ({}){dir} — {}", b.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| b.binary.clone()), st.describe());
     }
+    if let (Some((st, shared)), Some(b)) = (&codex_status, &r.backend) {
+        let home = b.config_dir.as_ref().map(|d| format!(" with CODEX_HOME={}", d.display())).unwrap_or_default();
+        let _ = writeln!(out, "runs Codex ({}){home} — {}", b.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| b.binary.clone()), st.describe());
+        if !shared.is_empty() {
+            let _ = writeln!(out, "shares your Codex {} (linked, so an edit shows in every account)", shared.join(", "));
+        }
+    }
     let example = match provider.as_str() {
         "anthropic" => "claude-opus-5-5",
         "openai" => "gpt-5.4",
         "xai" | "supergrok" => "grok-4.7",
         "claude" => "sonnet",
+        "codex" => "gpt-5.5",
         "openrouter" => "openai/gpt-5.4",
         _ => "<model>",
     };
@@ -234,13 +277,14 @@ pub(super) fn list(ctx: &mut Ctx) -> Result<(), Error> {
                 Auth::ApiKey => (format!("api key from ${}", r.api_key_env), !r.api_key.is_empty(), "key not set"),
                 Auth::Keyless => ("no key".to_string(), true, ""),
                 Auth::OAuth { .. } => ("SuperGrok login".to_string(), logins.contains(&r.name), "not signed in"),
-                // Asked of Claude Code, the only thing that may read its login.
+                // Asked of the vendor, the only thing that may read its login.
                 // A keyed instance runs on its key, which is krowk's to check.
-                Auth::Vendor if !r.api_key_env.is_empty() => (format!("runs Claude Code with the key from ${}", r.api_key_env), !r.api_key.is_empty() && r.backend.as_ref().is_some_and(|b| b.path.is_some()), "key not set"),
-                Auth::Vendor => match r.backend.as_ref().filter(|b| b.path.is_some()).map(claude_auth::status) {
-                    None => ("runs Claude Code".to_string(), false, "not installed"),
-                    Some(Ok(st)) => (format!("runs Claude Code: {}", st.describe()), st.logged_in, "not signed in"),
-                    Some(Err(e)) => (format!("runs Claude Code: {e}"), false, "unknown"),
+                Auth::Vendor if !r.api_key_env.is_empty() => (format!("runs {} with the key from ${}", r.vendor, r.api_key_env), !r.api_key.is_empty() && r.backend.as_ref().is_some_and(|b| b.path.is_some()), "key not set"),
+                Auth::Vendor => match r.backend.as_ref().filter(|b| b.path.is_some()).map(|b| vendor_status(r.wire_api, b)) {
+                    None => (format!("runs {}", r.vendor), false, "not installed"),
+                    Some(Ok((true, said))) => (format!("runs {}: {said}", r.vendor), true, ""),
+                    Some(Ok((false, said))) => (format!("runs {}: {said}", r.vendor), false, "not signed in"),
+                    Some(Err(e)) => (format!("runs {}: {e}", r.vendor), false, "unknown"),
                 },
             };
             let mut row = json!({
@@ -299,16 +343,17 @@ pub(super) fn remove(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         let why = if implicit { format!("{instance} is built in and has no definition or login to remove") } else { format!("no instance named {instance} is defined — `krowk providers list` shows them") };
         return Err(fail("no_instance", why));
     }
-    // A Claude Code account's directory holds Claude's own login, which is
-    // Claude Code's to sign out of: krowk leaves it as it is.
+    // A backend account's directory holds the vendor's own login, which is
+    // the vendor's to sign out of: krowk leaves it as it is.
     let kept = match cfg.instances.get(&instance) {
-        Some(InstanceKind::ClaudeCode { config_dir: Some(dir), .. }) => Some(dir.clone()),
+        Some(InstanceKind::ClaudeCode { config_dir: Some(dir), .. }) => Some((dir.clone(), format!("Claude Code's login in it — `CLAUDE_CONFIG_DIR={dir} claude auth logout` signs it out"))),
+        Some(InstanceKind::CodexAppServer { codex_home: Some(dir), .. }) => Some((dir.clone(), format!("Codex's login in it — `CODEX_HOME={dir} codex logout` signs it out"))),
         _ => None,
     };
     if ctx.format != Format::Human {
         let summary = format!("removed {instance}");
         let mut report = json!({ "instance": instance, "removed_definition": defined, "removed_login": forgot });
-        if let Some(dir) = &kept {
+        if let Some((dir, _)) = &kept {
             report["config_dir_kept"] = json!(dir);
         }
         return super::sessions::emit_data(ctx, report, summary);
@@ -319,8 +364,8 @@ pub(super) fn remove(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         _ => "its login",
     };
     let _ = writeln!(ctx.io.stdout, "removed {instance}: {what}");
-    if let Some(dir) = &kept {
-        let _ = writeln!(ctx.io.stdout, "its config directory {dir} is kept, with Claude Code's login in it — `CLAUDE_CONFIG_DIR={dir} claude auth logout` signs it out");
+    if let Some((dir, login)) = &kept {
+        let _ = writeln!(ctx.io.stdout, "its config directory {dir} is kept, with {login}");
     }
     Ok(())
 }
@@ -367,6 +412,61 @@ fn sign_in_claude(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<
         return Err(undo(fail("not_authenticated", format!("`claude auth login` {how}, so {instance} was not added — run `krowk providers add claude{}` again to retry", instance.split_once(':').map(|(_, n)| format!(" --name {n}")).unwrap_or_default()))));
     }
     Ok((status, true))
+}
+
+/// Whether a backend instance is signed in, and how, as its vendor says.
+fn vendor_status(wire: krowk_harness::protocol::WireApi, b: &instances::Backend) -> Result<(bool, String), String> {
+    match wire {
+        krowk_harness::protocol::WireApi::CodexAppServer => codex_auth::status(b).map(|st| (st.logged_in, st.describe())),
+        _ => claude_auth::status(b).map(|st| (st.logged_in, st.describe())),
+    }
+}
+
+/// R-INST-2, with `codex login`: a Codex account is signed in by Codex. Its
+/// home is made (0700) if it is new and given links to the person's own
+/// Codex configuration (`codex::share`), `codex login status` is asked, and
+/// when it says no, `codex login` runs on this terminal in OpenAI's own
+/// flow; then status is asked again. A keyed instance — a router, named by
+/// `--api-key-env` — runs on that key, so no login is run for it. A failure
+/// removes a home this made. What was shared comes back with the status.
+fn sign_in_codex(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<(codex_auth::Status, Vec<String>), Error> {
+    let reg = Registry::resolve(&instances::InstancesConfig { instances: [(instance.to_string(), kind.clone())].into(), ..Default::default() }, ctx.io.env);
+    let backend = reg.get(instance).map_err(|e| fail("bad_config", e))?.backend.clone().expect("a codex instance has a backend");
+    if backend.path.is_none() {
+        return Err(fail("backend_not_found", format!("{} was not found — install Codex (https://developers.openai.com/codex), or name the binary with --binary", backend.binary)));
+    }
+    let made = match &backend.config_dir {
+        Some(dir) if !dir.exists() => {
+            private_dir(dir).map_err(|e| fail("config_unwritable", format!("create {}: {e}", dir.display())))?;
+            Some(dir.clone())
+        }
+        _ => None,
+    };
+    let undo = |e: Error| {
+        if let Some(dir) = &made {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        e
+    };
+    // The person's own Codex home: what a new account's home shares.
+    let own = Some(ctx.env("CODEX_HOME")).filter(|d| !d.trim().is_empty()).map(PathBuf::from).or_else(|| Some(ctx.env("HOME")).filter(|h| !h.trim().is_empty()).map(|h| PathBuf::from(h).join(".codex")));
+    let shared = match (&backend.config_dir, &own) {
+        (Some(dir), Some(own)) => codex::share(dir, own).map_err(|e| undo(fail("config_unwritable", format!("link {} into {}: {e}", own.display(), dir.display()))))?,
+        _ => Vec::new(),
+    };
+    let status = codex_auth::status(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
+    if status.logged_in || backend.key.is_some() {
+        return Ok((status, shared));
+    }
+    let _ = writeln!(ctx.io.stderr, "Signing {instance} in to Codex — what follows is Codex's own login (`codex login`){}:", backend.config_dir.as_ref().map(|d| format!(", kept in {}", d.display())).unwrap_or_default());
+    let _ = ctx.io.stderr.flush();
+    let exit = codex_auth::login(&backend, ctx.f.device).map_err(|e| undo(fail("backend_failed", e)))?;
+    let status = codex_auth::status(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
+    if !status.logged_in {
+        let how = if exit.success() { "finished without signing in".to_string() } else { format!("stopped ({exit})") };
+        return Err(undo(fail("not_authenticated", format!("`codex login` {how}, so {instance} was not added — run `krowk providers add codex{}` again to retry", instance.split_once(':').map(|(_, n)| format!(" --name {n}")).unwrap_or_default()))));
+    }
+    Ok((status, shared))
 }
 
 fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {

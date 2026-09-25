@@ -555,12 +555,13 @@ pub(super) enum Refresh {
 const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(15);
 
 /// Re-reads the transcripts behind one or more sessions of one source — by
-/// foreign id, Claude subagent files under them, and any transcript the
-/// store has never seen (a subagent or session started since the last
-/// import) — when they moved, so a check that must be current is. What moved
-/// is found before the import lock is taken, so a check with nothing to
-/// read never waits; one that must write waits for another import to
-/// finish, and fails closed (`import_locked`) rather than answer stale.
+/// foreign id, and every subagent under them, however deep, found through
+/// the source's own parent links (so one started since the last import is
+/// included) — when they moved, so a check that must be current is. Nothing
+/// else on the machine is read. What moved is found before the import lock
+/// is taken, so a check with nothing to read never waits; one that must
+/// write waits for another import to finish, and past that gives up with
+/// `import_locked` rather than answer from a stale store.
 pub(super) fn refresh_session(ctx: &Ctx, provider: &str, foreign_ids: &[String]) -> Result<Refresh, Error> {
     let foreign_ids: Vec<&String> = foreign_ids.iter().filter(|f| !f.is_empty()).collect();
     let Some(source) = krowk_import::sources().into_iter().find(|s| s.name() == provider) else { return Ok(Refresh::NotRefreshable) };
@@ -570,14 +571,26 @@ pub(super) fn refresh_session(ctx: &Ctx, provider: &str, foreign_ids: &[String])
     let store_path = resolve_store_path(ctx)?;
     let env = ctx.io.env;
     let refs = source.discover(env).map_err(|e| fail("import_failed", format!("{provider}: {e}")))?;
-    let subagents: Vec<String> = foreign_ids.iter().map(|f| format!("/{f}/subagents/")).collect();
+    // The sessions and every descendant, to a fixed point over the source's
+    // parent links.
+    let parents = source.parents(env, &refs);
+    let mut ours: std::collections::HashSet<String> = foreign_ids.iter().map(|f| f.to_string()).collect();
+    loop {
+        let before = ours.len();
+        for (child, parent) in &parents {
+            if ours.contains(parent) {
+                ours.insert(child.clone());
+            }
+        }
+        if ours.len() == before {
+            break;
+        }
+    }
     let moved = |conn: &Connection| -> Result<Vec<(Ref, String)>, Error> {
         let mut out = Vec::new();
-        for r in &refs {
-            let key = r.key();
-            let stored = krowk_store::read_import_state(conn, &key).map_err(|e| store_fail(&e, &store_path))?;
-            let ours = foreign_ids.iter().any(|f| r.id == **f) || subagents.iter().any(|s| r.path.contains(s.as_str()));
-            if (ours || stored.is_empty()) && !(!stored.is_empty() && source.unchanged(env, r, &stored)) {
+        for r in refs.iter().filter(|r| ours.contains(&r.id)) {
+            let stored = krowk_store::read_import_state(conn, &r.key()).map_err(|e| store_fail(&e, &store_path))?;
+            if stored.is_empty() || !source.unchanged(env, r, &stored) {
                 out.push((r.clone(), stored));
             }
         }
@@ -594,10 +607,17 @@ pub(super) fn refresh_session(ctx: &Ctx, provider: &str, foreign_ids: &[String])
         return Ok(Refresh::Current);
     }
     let writer = krowk_store::Writer::new(&conn);
+    let mut links = Vec::new();
     for (r, stored) in &todo {
         let key = r.key();
         let (thread, next, _) = source.read(env, r, stored).map_err(|e| fail("import_failed", format!("{key}: {e}")))?;
         writer.ingest_with_cursor(&thread, &key, &next).map_err(|e| store_fail(&e, &store_path))?;
+        if let Some(parent) = &thread.parent {
+            links.push((thread.binding.clone(), parent.clone()));
+        }
+    }
+    for (child, parent) in &links {
+        writer.link_parent_later(child, parent).map_err(|e| store_fail(&e, &store_path))?;
     }
     krowk_store::reconcile_ledger(&conn).map_err(|e| store_fail(&e, &store_path))?;
     Ok(Refresh::Imported)
@@ -1174,6 +1194,7 @@ fn run_source(ctx: &Ctx, conn: Option<&Connection>, store_path: &str, s: &dyn So
         return finish(out);
     };
     let writer = krowk_store::Writer::new(conn);
+    let mut links = Vec::new();
     for r in &refs {
         let key = r.key();
         let stored = match krowk_store::read_import_state(conn, &key) {
@@ -1200,8 +1221,20 @@ fn run_source(ctx: &Ctx, conn: Option<&Connection>, store_path: &str, s: &dyn So
         };
         out.absorb(&res);
         match writer.ingest_with_cursor(&thread, &key, &next) {
-            Ok(ing) => out.count(&ing),
+            Ok(ing) => {
+                out.count(&ing);
+                if let Some(parent) = &thread.parent {
+                    links.push((thread.binding.clone(), parent.clone()));
+                }
+            }
             Err(e) => out.record(format!("{key}: {}", sanitize_store_err(e.message(), store_path))),
+        }
+    }
+    // A child read before its parent (opencode lists newest first) is
+    // linked now that the parent is in.
+    for (child, parent) in &links {
+        if let Err(e) = writer.link_parent_later(child, parent) {
+            out.record(format!("{}: {}", child.foreign_session_id, sanitize_store_err(e.message(), store_path)));
         }
     }
     finish(out)

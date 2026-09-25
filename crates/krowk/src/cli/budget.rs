@@ -230,7 +230,7 @@ pub fn budget(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         "limits": { "max_usd": l.usd, "max_tokens": l.tokens },
         "within": trips.is_empty(),
         // Now, when the transcripts were just checked; else the last import.
-        "as_of_ms": if refreshed == Refresh::NotRefreshable { s.time_updated } else { sessions::now_ms() },
+        "as_of_ms": if refreshed == Refresh::NotRefreshable { s.time_updated } else { krowk_store::now_ms() },
         "refreshed": match refreshed {
             Refresh::Current => json!("current"),
             Refresh::Imported => json!("imported"),

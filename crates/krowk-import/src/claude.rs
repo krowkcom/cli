@@ -140,6 +140,17 @@ impl Source for Claude {
         Ok((th, encode_cursor(&next), b.acc))
     }
 
+    /// A subagent transcript sits under its session's own directory.
+    fn parents(&self, _env: Env, refs: &[Ref]) -> std::collections::HashMap<String, String> {
+        refs.iter()
+            .filter_map(|r| {
+                let mut parts = Path::new(&r.path).components().rev().map(|c| c.as_os_str().to_string_lossy().into_owned());
+                let (_file, dir, session) = (parts.next()?, parts.next()?, parts.next()?);
+                (dir == SUBAGENTS_DIR).then(|| (r.id.clone(), session))
+            })
+            .collect()
+    }
+
     fn unchanged(&self, env: Env, r: &Ref, cursor: &str) -> bool {
         jsonl_unchanged(env, r, cursor)
     }

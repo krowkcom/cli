@@ -110,6 +110,15 @@ impl Source for Opencode {
         Ok((th, cursor, acc))
     }
 
+    /// session.parent_id, in one read-only query.
+    fn parents(&self, env: Env, _refs: &[Ref]) -> std::collections::HashMap<String, String> {
+        let Ok(path) = home_path(env, DB_REL) else { return Default::default() };
+        let Ok(db) = open_read_only(&path) else { return Default::default() };
+        db.prepare("SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL AND parent_id != ''")
+            .and_then(|mut st| st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+            .unwrap_or_default()
+    }
+
     fn unchanged(&self, env: Env, r: &Ref, cursor: &str) -> bool {
         let Ok(c) = decode_sqlite_cursor(cursor) else { return false };
         c.time_updated > 0 && matches!(changed_since(env, r, c.time_updated), Ok(false))

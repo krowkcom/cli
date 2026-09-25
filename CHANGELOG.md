@@ -57,8 +57,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   it (a call capped at 1,200 has metered 3,422). It re-reads the session's
   transcripts, and its subagents', when they moved — importing a session
   the store has not seen yet, by its Claude or opencode id — and waits
-  for a running import rather than answering stale (after 15 s it fails
-  with `import_locked`). `--max-tokens` holds generated tokens (output
+  for a running import rather than answering stale (after 15 s it gives
+  up with `import_locked`, exit 6 — which the hook recipe below lets
+  through; test `-ne 0` instead to block on that too). `--max-tokens` holds generated tokens (output
   and reasoning); input and cache tokens are reported and priced. Within
   its limits it prints the report and exits 0; over one it exits 4 with
   `budget_exceeded` and the report under `error.details` (on stderr). A

@@ -269,7 +269,11 @@ the versions are the `v*` tags a release is cut from. Entries land under
   token is a secret. Detecting the run's repository and commit runs git with
   the repository's `core.fsmonitor` switched off, in the session's own
   directory, so a repository's config cannot make it run a command — this
-  holds for `krowk push` and krowk-mcp too. `--dev` publishes to the stand-in registry. Claude Code
+  holds for `krowk push` and krowk-mcp too. **`krowk.vcs.dirty` is left
+  out wherever a git filter is configured** (a `filter.<name>` in the
+  repository's or your git config, git-lfs's included): telling whether a
+  file changed can mean running its clean filter, and a repository can name
+  any command as one. `--dev` publishes to the stand-in registry. Claude Code
   sessions get the same tool as `mcp__krowk__publish`.
 - **krowk asks before Claude Code runs in a repository you have not
   trusted.** `claude -p` runs a repository's hooks and MCP servers without

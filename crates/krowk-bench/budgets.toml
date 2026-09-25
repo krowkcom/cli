@@ -60,8 +60,8 @@ unit = "bytes"
 # the control protocol, the stream translation, the MCP bridge, trust,
 # `providers add claude`; no new crate) adds 183,392 bytes: 7,087,016
 # (6.76 MiB) on x86_64 Linux with both, 253,016 bytes under this.
-# Ticket 08's budget and `publish` (no new crate) add 125,728 bytes:
-# 7,212,744 (6.88 MiB), 127,288 under this.
+# Ticket 08's budget and `publish` (no new crate) add 126,656 bytes:
+# 7,213,672 (6.88 MiB), 126,360 under this.
 max = { x86_64-linux = 7_340_032 }
 status = "enforced"
 

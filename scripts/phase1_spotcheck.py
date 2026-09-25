@@ -226,9 +226,10 @@ def finish(res, messages, calls, results):
     res["first_user"], res["last_user"] = (t[0], t[-1]) if t else (None, None)
     res["tool_results"] = len(results)
     res["unlinked"] = sum(1 for r in results if not r or r not in calls)
-    # Which call every result links to, not just how many link: two sides
-    # linking results to different calls must not compare equal.
-    res["result_links"] = Counter(r if r and r in calls else "" for r in results)
+    # Which call every result links to, in transcript order — not how many
+    # link, nor how many point at each call: two results that swapped calls
+    # must not compare equal. Both sides list results in message order.
+    res["result_links"] = [r if r and r in calls else "" for r in results]
     res["call_ids"] = frozenset(calls)
     return res
 
@@ -338,6 +339,19 @@ def claude_index():
         if sub and parent and parent != bid:
             children[parent].add(bid)
     return idx, children
+
+
+def claude_index_all():
+    """Every Claude binding id with a transcript on disk now."""
+    out = set()
+    for f in CLAUDE_ROOT.rglob("*.jsonl"):
+        try:
+            if f.stat().st_size > MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+        out.add(claude_binding(str(f))[0])
+    return out
 
 
 def claude_source(files, n_children):
@@ -870,6 +884,9 @@ def main():
         seen_oc = {r[0] for r in oc.execute("SELECT id FROM session WHERE time_created <= ?", (import_start_ms,))}
     source_ids = {"claude": set(c_idx), "cursor": set(cursor_files) - live_fids["cursor"], "opencode": seen_oc}
     complete = {prov: (len(ids), sorted(ids - bound[prov])) for prov, ids in source_ids.items()}
+    # And the other way: a store session no source stands behind.
+    all_source = {"claude": set(claude_index_all()), "cursor": set(cursor_files), "opencode": set(recency["opencode"])}
+    orphans = {prov: sorted(bound[prov] - all_source[prov]) for prov in PROVIDERS}
 
     # Summary figures.
     times = [k.run("sessions", "--json")[1] for _ in range(5)]
@@ -911,7 +928,8 @@ def main():
         print("- source files unchanged: not checked (run with --rebuild)")
     for prov, (n, missing) in complete.items():
         print(f"- {prov} completeness: {n - len(missing)}/{n} source sessions in the store"
-              + (f" — **missing** {', '.join(m[:12] for m in missing[:10])}" if missing else ""))
+              + (f" — **missing** {', '.join(m[:12] for m in missing[:10])}" if missing else "")
+              + (f"; **{len(orphans[prov])} store session(s) with no source**: {', '.join(o[:12] for o in orphans[prov][:10])}" if orphans[prov] else "; every store session has a source"))
     if notes:
         print("\n### Pick notes\n")
         print("\n".join(f"- {n}" for n in notes))
@@ -919,7 +937,7 @@ def main():
     print("\n".join(mismatches) if mismatches else "none")
 
     failed = bool(mismatches) or store_check.get("status") != "pass" or mode != "0o600" \
-        or any(missing for _, missing in complete.values()) \
+        or any(missing for _, missing in complete.values()) or any(orphans.values()) \
         or (snap and (snap["compare"]["rewritten"] or snap["compare"]["gone"]))
     sys.exit(1 if failed else 0)
 

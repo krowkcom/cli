@@ -158,3 +158,42 @@ fn p_flags_are_refused_elsewhere_and_bad_values_are_named() {
     let out = b.krowk(&["-p", "hi", "--model", "claude-sonnet-4-6"]);
     assert_eq!(out.status.code(), Some(6), "{}", String::from_utf8_lossy(&out.stderr));
 }
+
+#[cfg(unix)]
+#[test]
+fn ctrl_c_interrupts_a_turn_waiting_on_the_model_and_keeps_the_session() {
+    // A model that takes its time: the interrupt has to reach a turn that is
+    // waiting on the network, not one between events.
+    let m = mock::serve(|b, n| {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        mock::readme_script(b, n)
+    });
+    let b = Sandbox::new("interrupt", &m.url);
+    let child = Command::new(env!("CARGO_BIN_EXE_krowk"))
+        .args(["-p", "hi", "--model", "claude-sonnet-4-6", "--output-format", "json"])
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", b.root.join("home"))
+        .env("KROWK_NO_UPDATE_CHECK", "1")
+        .env("ANTHROPIC_API_KEY", "sk-test")
+        .env("ANTHROPIC_BASE_URL", &b.url)
+        .current_dir(b.root.join("repo"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let started = std::time::Instant::now();
+    // SAFETY: SIGINT to the child this test spawned.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "the interrupt did not wait for the model");
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+    assert_eq!(result["status"], "interrupted");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--resume"));
+    let listed = krowk_sessions(&b);
+    assert_eq!(listed[0]["harness"], "krowk", "the interrupted session is kept and listed");
+}

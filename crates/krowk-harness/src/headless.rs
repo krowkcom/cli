@@ -64,14 +64,28 @@ pub fn run(cfg: HostConfig, opts: Options, stdout: &mut dyn Write) -> Outcome {
 async fn drive(host: Host, opts: Options, stdout: &mut dyn Write) -> Outcome {
     let format = opts.format;
     let (tx, mut rx) = mpsc::channel::<StreamLine>(1024);
+    // A resumed session's id is known up front; a new one's arrives with
+    // its root event.
+    let mut session_id: Option<String> = opts.resume.clone();
     let cmd = Command::Prompt { session_id: opts.resume, text: opts.prompt, model: opts.model, permission_mode: opts.permission_mode };
     let exec = host.execute(cmd, tx);
     tokio::pin!(exec);
     let mut done: Option<Result<Option<RunResult>, EngineError>> = None;
-    let mut session_id: Option<String> = None;
+    // One signal stream for the whole run, so a Ctrl-C that lands between
+    // two turns of the loop is queued, not lost.
+    let mut sigint = Interrupts::new();
     let mut interrupts = 0u32;
+    // Asked for and not yet accepted: the turn may not be running yet (the
+    // session is still being opened), so it is asked again until it is.
+    let mut want_interrupt = false;
     loop {
-        let ctrl_c = tokio::signal::ctrl_c();
+        let retry = async {
+            if want_interrupt {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
             biased;
             Some(line) = rx.recv() => {
@@ -84,19 +98,26 @@ async fn drive(host: Host, opts: Options, stdout: &mut dyn Write) -> Outcome {
                 }
             }
             r = &mut exec, if done.is_none() => done = Some(r),
-            _ = ctrl_c, if done.is_none() => {
+            _ = sigint.recv(), if done.is_none() => {
                 interrupts += 1;
                 // The first Ctrl-C asks the turn to stop and keeps what it
                 // made; a second one does not wait.
                 if interrupts > 1 {
                     std::process::exit(130);
                 }
-                if let Some(id) = &session_id {
-                    let (itx, _irx) = mpsc::channel(1);
-                    let _ = host.execute(Command::Interrupt { session_id: id.clone() }, itx).await;
-                }
+                want_interrupt = true;
             }
+            _ = retry, if done.is_none() => {}
             else => break,
+        }
+        if want_interrupt
+            && done.is_none()
+            && let Some(id) = &session_id
+        {
+            let (itx, _irx) = mpsc::channel(1);
+            if host.execute(Command::Interrupt { session_id: id.clone() }, itx).await.is_ok() {
+                want_interrupt = false;
+            }
         }
     }
     match done.expect("the loop ends only once the command has") {
@@ -124,5 +145,34 @@ fn line_session(line: &StreamLine) -> &str {
         StreamLine::Log(ev) => &ev.session_id,
         StreamLine::Live(LiveEvent::ItemStarted { session_id, .. } | LiveEvent::ItemDelta { session_id, .. }) => session_id,
         StreamLine::Live(LiveEvent::Result(r)) => &r.session_id,
+    }
+}
+
+/// SIGINT as a stream: registered once, so none is missed between polls.
+struct Interrupts {
+    #[cfg(unix)]
+    inner: Option<tokio::signal::unix::Signal>,
+}
+
+impl Interrupts {
+    fn new() -> Interrupts {
+        #[cfg(unix)]
+        return Interrupts { inner: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok() };
+        #[cfg(not(unix))]
+        Interrupts {}
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        match &mut self.inner {
+            Some(s) => {
+                if s.recv().await.is_none() {
+                    std::future::pending::<()>().await;
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
     }
 }

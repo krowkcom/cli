@@ -255,6 +255,16 @@ pub const SHARED: &[&str] = &["config.toml", "AGENTS.md", "AGENTS.override.md", 
 /// through a linked `skills` it would write them into the person's.
 const OWN_SKILLS: &[&str] = &[".system"];
 
+/// Removes `to` when it is this module's link to `from` and `from` is gone.
+#[cfg(unix)]
+fn prune(to: &Path, from: &Path) -> std::io::Result<()> {
+    let ours = to.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) && std::fs::read_link(to).ok().as_deref() == Some(from);
+    if ours && from.symlink_metadata().is_err() {
+        std::fs::remove_file(to)?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn link(from: &Path, to: &Path) -> std::io::Result<bool> {
     match to.symlink_metadata() {
@@ -271,8 +281,12 @@ fn link(from: &Path, to: &Path) -> std::io::Result<bool> {
 /// alone anything `home` already has, and says what `home` shares: an
 /// account's own login stays its own (R-INST-1's per-account home). `skills`
 /// is a directory of the account's own holding a link per skill, so what
-/// Codex writes there itself stays in the account. Nothing is linked when
-/// the two are one directory, and nothing at all off unix.
+/// Codex writes there itself stays in the account. A link this made whose
+/// target is gone — a skill or a file the person removed — is removed with
+/// it. Safe to run again at any time: it runs when the account is added and
+/// before each process starts, so a skill added later reaches every
+/// account. Nothing is linked when the two are one directory, and nothing
+/// at all off unix.
 pub fn share(home: &Path, own: &Path) -> std::io::Result<Vec<String>> {
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     if canon(home) == canon(own) {
@@ -283,6 +297,7 @@ pub fn share(home: &Path, own: &Path) -> std::io::Result<Vec<String>> {
     for name in SHARED {
         let (from, to) = (own.join(name), home.join(name));
         if from.symlink_metadata().is_err() {
+            prune(&to, &from)?;
             continue;
         }
         if *name == "skills" && from.is_dir() {
@@ -298,6 +313,9 @@ pub fn share(home: &Path, own: &Path) -> std::io::Result<Vec<String>> {
                 continue;
             }
             let mut any = false;
+            for e in std::fs::read_dir(&to)?.flatten() {
+                prune(&e.path(), &from.join(e.file_name()))?;
+            }
             for e in std::fs::read_dir(&from)?.flatten() {
                 if OWN_SKILLS.iter().any(|o| e.file_name() == *o) {
                     continue;
@@ -432,6 +450,12 @@ impl Engine for CodexEngine {
                 old.shutdown().await;
             }
             if slot.is_none() {
+                // What the person added to, or removed from, their own Codex
+                // configuration since the account was set up reaches it now.
+                // A link that cannot be made is no reason not to run.
+                if let (Some(home), Some(own)) = (&self.backend().config_dir, &self.backend().shared_home) {
+                    let _ = share(home, own);
+                }
                 *slot = Some(Proc::spawn(self.backend(), &ctx.cwd, bypass, &ask, &self.instance.name).await?);
             }
             let p = slot.as_mut().expect("spawned above");
@@ -854,7 +878,9 @@ impl Proc {
         // project's config runs: Codex would start each one — a command —
         // on the thread without asking, as Claude Code's are kept out by
         // --strict-mcp-config. Codex's effective config for this directory
-        // names them, and the thread turns each off.
+        // names them, and the thread turns each off. MCP servers an
+        // installed Codex plugin brings may not be listed there, and are
+        // not reached by this: ticket 09's permission rules are.
         if ctx.permission_mode != PermissionMode::BypassPermissions {
             let config = self.request("config/read", json!({ "cwd": cwd }), ask, INITIALIZE_TIMEOUT).await.map_err(|e| EngineError::new(&e.code, format!("krowk asks Codex which MCP servers its config names, to keep them off, and it did not say: {}", e.message)))?;
             if let Some(off) = mcp_off(&config) {
@@ -1178,6 +1204,16 @@ mod tests {
         assert!(team.join("skills/.system").symlink_metadata().is_err());
         std::fs::create_dir_all(team.join("skills/.system/codex")).unwrap();
         assert!(!own.join("skills/.system/codex").exists(), "what Codex installs in the account stays there");
+        // A skill added later is linked on the next run, one removed is
+        // unlinked, and so is a shared file the person deleted.
+        std::fs::create_dir_all(own.join("skills/deploy")).unwrap();
+        std::fs::remove_dir_all(own.join("skills/review")).unwrap();
+        std::fs::remove_file(own.join("config.toml")).unwrap();
+        share(&team, &own).unwrap();
+        assert_eq!(std::fs::read_link(team.join("skills/deploy")).unwrap(), own.join("skills/deploy"));
+        assert!(team.join("skills/review").symlink_metadata().is_err(), "a dangling skill link is pruned");
+        assert!(team.join("config.toml").symlink_metadata().is_err(), "a dangling config link is pruned");
+        assert!(team.join("skills/.system/codex").exists() && team.join("AGENTS.md").exists(), "the account's own are untouched");
         let _ = std::fs::remove_dir_all(&base);
     }
 

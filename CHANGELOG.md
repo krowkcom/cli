@@ -270,14 +270,17 @@ the versions are the `v*` tags a release is cut from. Entries land under
   a command beyond the sandbox needs `bypassPermissions`, which is Codex's
   full access. **The MCP servers your Codex config names do not run
   outside `bypassPermissions`**: krowk turns each off on the thread, as it
-  keeps Claude Code's out with `--strict-mcp-config`. **What the sandbox lets a command do
+  keeps Claude Code's out with `--strict-mcp-config` (servers an
+  installed Codex plugin brings may not be listed, and are not covered
+  yet). **What the sandbox lets a command do
   without asking — read your disk, not write it — and what your own Codex
   rules allow, still apply first.** `OPENAI_API_KEY`, `OPENAI_BASE_URL`,
   `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `CODEX_SQLITE_HOME` and Codex's
   other identity and endpoint overrides in krowk's environment are not
   passed to Codex. Writes Codex makes to its config (trusting a project)
   land in your own `config.toml`, which the accounts share; its bundled
-  skills stay in each account's home. A router is an instance of its own: `--api-key-env NAME` hands
+  skills stay in each account's home. A skill you add to your own Codex
+  later reaches every account the next time it starts. A router is an instance of its own: `--api-key-env NAME` hands
   that variable's key to Codex under the same name, for the model
   provider its `args` name. krowk's own tools reach Codex as its dynamic
   tools — today `session_info` — and the trust question above covers a

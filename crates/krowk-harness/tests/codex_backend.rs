@@ -197,9 +197,13 @@ fn lines_of(log: &str, prefix: &str) -> Vec<String> {
 fn r_back_3_a_tool_using_turn_on_a_codex_instance_completes_and_is_logged() {
     let h = Home::new("tool-use");
     let home = h.signed_in("codex-team", "chatgpt team@example.com");
+    // A skill the person added to their own Codex after the account was set
+    // up: linked into the account's home before the process starts.
+    std::fs::create_dir_all(h.root.join("home/.codex/skills/later")).unwrap();
     let host = h.host(vec![("codex:team", h.instance(&home, Some("tool_use.jsonl"), &[]))], trust::allow_all());
     rt().block_on(async {
         let (lines, r) = run(&host, prompt(None, "what is here?", "codex:team/gpt-5.5", PermissionMode::Default)).await;
+        assert_eq!(std::fs::read_link(home.join("skills/later")).unwrap(), h.root.join("home/.codex/skills/later"), "a skill added later reaches the account");
         let r = r.unwrap().unwrap();
         assert_eq!((r.status, r.result.as_str(), r.num_model_calls), (TurnStatus::Completed, "There is one file, README.md.", 2), "{r:?}");
         assert_eq!((r.usage.input_tokens, r.usage.cache_read_tokens, r.usage.output_tokens, r.usage.reasoning_tokens), (400, 2200, 32, 40));

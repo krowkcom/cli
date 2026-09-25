@@ -260,12 +260,29 @@ fn looser_than(claude: &str, krowk: PermissionMode) -> bool {
 /// The ambient variables a Claude Code process does not inherit unless its
 /// instance sets them: they are the native `anthropic` instance's key and
 /// base URL, and inherited they would move a subscription account onto an
-/// API key or another server without anyone asking for it.
+/// API key or another server without anyone asking for it. An instance
+/// sets a base URL in its `env` and a key through `apiKeyEnv`, which krowk
+/// reads and hands the process itself.
 pub const NOT_INHERITED: &[&str] = &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
 
 /// What of `NOT_INHERITED` to remove for this instance.
 pub fn cleared(b: &Backend) -> impl Iterator<Item = &'static str> + '_ {
     NOT_INHERITED.iter().copied().filter(|k| !b.env.contains_key(*k))
+}
+
+/// The environment a Claude Code command gets on top of krowk's own: the
+/// inherited key and base URL taken away, the config directory, the
+/// instance's `env`, and its key under the name Claude Code reads.
+pub fn environment(b: &Backend) -> (Vec<&'static str>, Vec<(String, String)>) {
+    let mut set: Vec<(String, String)> = Vec::new();
+    if let Some(dir) = &b.config_dir {
+        set.push(("CLAUDE_CONFIG_DIR".into(), dir.display().to_string()));
+    }
+    set.extend(b.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    if let Some((to, key)) = &b.key {
+        set.push(((*to).into(), key.clone()));
+    }
+    (cleared(b).collect(), set)
 }
 
 /// The engine for one session on one `claude-code` instance. The host keeps
@@ -319,7 +336,13 @@ impl Engine for ClaudeEngine {
             // The running process serves this turn when its launch still
             // fits; a model it can switch to in place is switched to.
             if let Some(p) = slot.as_mut() {
-                let fits = p.alive() && p.launch.plan == want.plan && p.launch.effort == want.effort;
+                // The mode it is in counts too: a plan turn that approved
+                // ExitPlanMode leaves Claude Code in default, which the next
+                // plan turn must not inherit (nor a default turn an
+                // EnterPlanMode's plan). It is launched in one of two modes,
+                // and serves only a turn that wants the one it is in.
+                let mode_fits = p.mode.is_empty() || (want.plan == (p.mode == "plan") && !looser_than(&p.mode, ctx.permission_mode));
+                let fits = p.alive() && mode_fits && p.launch.plan == want.plan && p.launch.effort == want.effort;
                 let switched = fits && (p.launch.model == want.model || (p.set_model && p.set_model(&want.model, &ask).await));
                 if !switched && let Some(old) = slot.take() {
                     old.shutdown().await;
@@ -405,6 +428,8 @@ struct Proc {
     exited: bool,
     /// The process group: Claude Code and whatever it started.
     pid: Option<u32>,
+    /// The permission mode its last turn reported; empty before one has.
+    mode: String,
     /// The group was stopped and reaped; nothing is left to signal.
     group_done: bool,
 }
@@ -460,13 +485,11 @@ impl Proc {
     async fn spawn(b: &Backend, cwd: &Path, launch: Launch, ask: &Answers) -> Result<Proc, EngineError> {
         let mut cmd = tokio::process::Command::new(b.path.as_deref().unwrap_or(Path::new(&b.binary)));
         cmd.args(args(&launch, &b.args)).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-        for k in cleared(b) {
+        let (remove, set) = environment(b);
+        for k in remove {
             cmd.env_remove(k);
         }
-        if let Some(dir) = &b.config_dir {
-            cmd.env("CLAUDE_CONFIG_DIR", dir);
-        }
-        cmd.envs(&b.env);
+        cmd.envs(set);
         // Its own process group: a Ctrl-C at the terminal is krowk's to turn
         // into an interrupt, not a signal that kills Claude Code mid-write.
         #[cfg(unix)]
@@ -499,7 +522,7 @@ impl Proc {
                 }
             });
         }
-        let mut p = Proc { child, stdin, out, stderr, binary: b.binary.clone(), launch, set_model: false, next: 0, exited: false, pid, group_done: false };
+        let mut p = Proc { child, stdin, out, stderr, binary: b.binary.clone(), launch, set_model: false, next: 0, exited: false, pid, group_done: false, mode: String::new() };
         let init = p.request(json!({"subtype": "initialize", "hooks": null}), ask, INITIALIZE_TIMEOUT).await?;
         p.set_model = init.get("models").is_some_and(Value::is_array);
         Ok(p)
@@ -652,6 +675,17 @@ impl Proc {
                     match msg["type"].as_str() {
                         Some("control_request") => {
                             let answer = ask.answer(msg["request_id"].as_str().unwrap_or_default(), &msg["request"]);
+                            // An approved ExitPlanMode or EnterPlanMode moves
+                            // Claude Code to default or plan for what follows.
+                            if msg.pointer("/request/subtype").and_then(Value::as_str) == Some("can_use_tool")
+                                && answer.pointer("/response/response/behavior").and_then(Value::as_str) == Some("allow")
+                            {
+                                match msg.pointer("/request/tool_name").and_then(Value::as_str) {
+                                    Some("ExitPlanMode") => self.mode = "default".into(),
+                                    Some("EnterPlanMode") => self.mode = "plan".into(),
+                                    _ => {}
+                                }
+                            }
                             self.send(&answer).await?;
                         }
                         Some("control_response") => {
@@ -668,6 +702,7 @@ impl Proc {
                             if !announced && let Some(init) = t.init.clone() {
                                 announced = true;
                                 receipt_required = init.capabilities.iter().any(|c| c == "interrupt_receipt_v1");
+                                self.mode.clone_from(&init.permission_mode);
                                 // A mode looser than krowk's — a setting, a
                                 // wrapper — is stopped before it runs anything.
                                 if !init.permission_mode.is_empty() && looser_than(&init.permission_mode, ask.mode) {
@@ -826,13 +861,16 @@ mod tests {
         // R-BACK-6's other half: an edit that would make Claude Code run
         // something — its settings, hooks, agents — needs bypassPermissions.
         let ae = PermissionMode::AcceptEdits;
-        for f in [".claude/settings.json", ".claude/settings.local.json", ".claude/agents/x.md", "sub/.claude/hooks/h.sh"] {
+        for f in [".claude/settings.json", ".claude/settings.local.json", ".claude/agents/x.md", "sub/.claude/hooks/h.sh", ".Claude/settings.json", ".CLAUDE./agents/a.md", ".claude /settings.json"] {
             assert!(approve(ae, "Write", &json!({"file_path": f}), &cwd).unwrap_err().contains(".claude"), "{f}");
         }
         let config = cwd.join("cc-config");
         std::fs::create_dir_all(&config).unwrap();
         let err = super::approve(ae, "Edit", &json!({"file_path": config.join("settings.json").display().to_string()}), &cwd, std::slice::from_ref(&config)).unwrap_err();
         assert!(err.contains("config directory"), "{err}");
+        assert!(approve(ae, "Edit", &json!({"file_path": ".GIT/config"}), &cwd).unwrap_err().contains(".git"));
+        let err = super::approve(ae, "Write", &json!({"file_path": cwd.join("CC-Config/settings.json").display().to_string()}), &cwd, std::slice::from_ref(&config)).unwrap_err();
+        assert!(err.contains("config directory"), "the config directory in another case: {err}");
         assert!(super::approve(PermissionMode::BypassPermissions, "Write", &json!({"file_path": ".claude/settings.json"}), &cwd, &[config]).is_ok());
         let _ = std::fs::remove_dir_all(&cwd);
     }

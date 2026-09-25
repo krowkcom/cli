@@ -195,6 +195,13 @@ pub enum InstanceKind {
         /// More launch arguments, after krowk's own.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
+        /// The environment variable krowk reads a key from and hands the
+        /// process — as `ANTHROPIC_AUTH_TOKEN` when `env` names a base URL
+        /// (a router's bearer token), else as `ANTHROPIC_API_KEY`. The
+        /// variable's name is stored, never the key. None: Claude Code
+        /// signs in with its own login.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<Effort>,
     },
@@ -238,7 +245,7 @@ pub enum Auth {
 }
 
 /// How a backend instance's process is started (R-INST-1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Backend {
     /// The binary, as configured: a path, or a name looked up on PATH.
     pub binary: String,
@@ -252,6 +259,23 @@ pub struct Backend {
     pub home: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
     pub args: Vec<String>,
+    /// The key read from `apiKeyEnv`, and the variable the process is
+    /// given it as. None when the instance uses Claude Code's own login.
+    pub key: Option<(&'static str, String)>,
+}
+
+// Hand-written so a key never reaches a log line through `{:?}`.
+impl std::fmt::Debug for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Backend")
+            .field("binary", &self.binary)
+            .field("path", &self.path)
+            .field("config_dir", &self.config_dir)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("args", &self.args)
+            .field("key", &self.key.as_ref().map(|(to, v)| (to, if v.is_empty() { "<unset>" } else { "<set>" })))
+            .finish()
+    }
 }
 
 /// An instance ready to use: its definition with the secret read.
@@ -309,7 +333,8 @@ impl Resolved {
     /// Why a call cannot be made, before one is: an API-key instance whose
     /// variable is unset.
     pub fn missing_key(&self) -> Option<String> {
-        (self.auth == Auth::ApiKey && self.api_key.is_empty()).then(|| {
+        let keyed = self.auth == Auth::ApiKey || (self.auth == Auth::Vendor && !self.api_key_env.is_empty());
+        (keyed && self.api_key.is_empty()).then(|| {
             format!("no API key for the {} instance — set {} (krowk reads the key from the environment, never from a file)", self.name, self.api_key_env)
         })
     }
@@ -326,7 +351,7 @@ pub fn implicit() -> Vec<(&'static str, InstanceKind)> {
         ("xai", InstanceKind::XaiApi { api_key_env: None, base_url: None, effort: None }),
         ("openrouter", InstanceKind::OpenrouterApi { api_key_env: None, base_url: None, effort: None }),
         ("supergrok", InstanceKind::XaiOauth { base_url: None, issuer: None, client_id: None, scope: None, effort: None }),
-        ("claude", InstanceKind::ClaudeCode { binary: None, config_dir: None, env: BTreeMap::new(), args: Vec::new(), effort: None }),
+        ("claude", InstanceKind::ClaudeCode { binary: None, config_dir: None, env: BTreeMap::new(), args: Vec::new(), api_key_env: None, effort: None }),
     ]
 }
 
@@ -516,7 +541,7 @@ fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) ->
         },
         // Priced and described as Anthropic's models, which it runs; its
         // login is Claude Code's own.
-        InstanceKind::ClaudeCode { binary, config_dir: dir, env: extra, args, effort } => {
+        InstanceKind::ClaudeCode { binary, config_dir: dir, env: extra, args, api_key_env, effort } => {
             let config_dir = dir.as_deref().filter(|d| !d.trim().is_empty()).map(PathBuf::from);
             // Claude Code's own rule for its directory: CLAUDE_CONFIG_DIR —
             // the instance's `configDir`, else the environment's — else
@@ -526,8 +551,16 @@ fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) ->
                 (!h.trim().is_empty()).then(|| PathBuf::from(h).join(".claude"))
             });
             let binary = binary.clone().filter(|b| !b.trim().is_empty()).unwrap_or_else(|| crate::claude::BINARY.into());
+            // A keyed instance — a router, a Console key — names the variable
+            // its key is in; the key goes to the process under the name
+            // Claude Code reads for that kind of server.
+            let key_env = api_key_env.clone().filter(|k| !k.trim().is_empty());
+            let key = key_env.as_ref().map(|k| env(k).trim().to_string()).unwrap_or_default();
+            let to = if extra.contains_key("ANTHROPIC_BASE_URL") { "ANTHROPIC_AUTH_TOKEN" } else { "ANTHROPIC_API_KEY" };
             Resolved {
                 auth: Auth::Vendor,
+                api_key: key.clone(),
+                api_key_env: key_env.clone().unwrap_or_default(),
                 backend: Some(Backend {
                     path: find_binary(&binary, &env("PATH")),
                     binary,
@@ -535,6 +568,7 @@ fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) ->
                     home,
                     env: extra.clone(),
                     args: args.clone(),
+                    key: key_env.map(|_| (to, key)),
                 }),
                 ..template("anthropic", "Claude Code", WireApi::ClaudeCode, CLAUDE_CODE, *effort)
             }
@@ -681,6 +715,23 @@ mod tests {
         assert_eq!((w.config_dir.as_deref(), w.home.as_deref()), (Some(std::path::Path::new("/cfg/work")), Some(std::path::Path::new("/cfg/work"))));
         assert_eq!((w.env["ANTHROPIC_BASE_URL"].as_str(), w.args.clone()), ("https://router.example", vec!["--add-dir".to_string(), "/x".to_string()]), "a router is the same mechanism");
         assert_eq!(reg.get("claude:mine").unwrap().backend.as_ref().unwrap().binary, "/opt/claude/bin/claude");
+        // A router: its base URL in env, its key named, never written.
+        let env2 = |k: &str| if k == "ROUTER_KEY" { "sk-or-test".to_string() } else { env(k) };
+        let r = Registry::resolve(
+            &from_config_json(&serde_json::json!({"instances": {
+                "claude:router": {"kind": "claude-code", "env": {"ANTHROPIC_BASE_URL": "https://openrouter.ai/api"}, "apiKeyEnv": "ROUTER_KEY"},
+                "claude:console": {"kind": "claude-code", "apiKeyEnv": "ROUTER_KEY"},
+                "claude:unset": {"kind": "claude-code", "apiKeyEnv": "NOT_SET"},
+            }}))
+            .unwrap(),
+            &env2,
+        );
+        let router = r.get("claude:router").unwrap();
+        assert_eq!(router.backend.as_ref().unwrap().key, Some(("ANTHROPIC_AUTH_TOKEN", "sk-or-test".to_string())), "a router's bearer token");
+        assert_eq!(r.get("claude:console").unwrap().backend.as_ref().unwrap().key.as_ref().unwrap().0, "ANTHROPIC_API_KEY");
+        assert!(!format!("{router:?} {:?}", router.backend).contains("sk-or-test"), "a key never prints");
+        assert!(r.get("claude:unset").unwrap().missing_key().unwrap().contains("set NOT_SET"));
+        assert_eq!(r.get("claude").unwrap().missing_key(), None, "Claude Code's own login needs no key");
         let e = from_config_json(&serde_json::json!({"instances": {"claude:x": {"kind": "claude-code", "env": {"CLAUDE_CONFIG_DIR": "/elsewhere"}}}})).unwrap_err();
         assert!(e.contains("configDir"), "{e}");
         assert_eq!(reg.parse_model("claude:work/sonnet").unwrap(), ModelRef { instance: "claude:work".into(), model: "sonnet".into() });

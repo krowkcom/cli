@@ -387,7 +387,7 @@ fn providers_command() -> Command {
                 args: vec![arg("provider", PROVIDER_ARG, true)],
                 flags: vec![
                     flag("name", STRING, "Name the instance <provider>:<name> (for openai-compatible, <name> alone); the provider's own name when absent"),
-                    flag("api-key-env", STRING, "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance"),
+                    flag("api-key-env", STRING, "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance. For claude, only when given: the key a router (with --base-url) or a Console account runs on, handed to Claude Code"),
                     flag("base-url", STRING, "Where the API is, for a gateway, a router or a local server — required for openai-compatible"),
                     flag("client-id", STRING, "supergrok: the OAuth client id to sign in as, when xAI's server offers no registration"),
                     flag("device", BOOL, "supergrok: sign in with a code typed into any browser, instead of one opened here"),

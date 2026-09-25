@@ -79,13 +79,14 @@ impl Home {
         if let Some(s) = scenario {
             env.insert("FAKE_CLAUDE_SCENARIO".to_string(), fixture(s).display().to_string());
         }
-        InstanceKind::ClaudeCode { binary: Some(self.root.join("bin/claude").display().to_string()), config_dir: Some(config_dir.display().to_string()), env, args: Vec::new(), effort: None }
+        InstanceKind::ClaudeCode { binary: Some(self.root.join("bin/claude").display().to_string()), config_dir: Some(config_dir.display().to_string()), env, args: Vec::new(), api_key_env: None, effort: None }
     }
 
     fn env(&self) -> impl Fn(&str) -> String + '_ {
         move |k| match k {
             "HOME" => self.root.join("home").display().to_string(),
             "PATH" => std::env::var("PATH").unwrap_or_default(),
+            "ROUTER_KEY" => "sk-or-fake".into(),
             _ => String::new(),
         }
     }
@@ -350,7 +351,7 @@ fn a_missing_login_or_binary_is_named_with_its_fix() {
     assert_eq!(e.code, "not_authenticated");
     assert!(e.message.contains("krowk providers add claude --name personal") && e.message.contains("Claude's own login"), "{}", e.message);
 
-    let missing = InstanceKind::ClaudeCode { binary: Some(home.root.join("bin/nope").display().to_string()), config_dir: None, env: BTreeMap::new(), args: Vec::new(), effort: None };
+    let missing = InstanceKind::ClaudeCode { binary: Some(home.root.join("bin/nope").display().to_string()), config_dir: None, env: BTreeMap::new(), args: Vec::new(), api_key_env: None, effort: None };
     let host = home.host(vec![("claude:gone", missing)], trust::allow_all());
     let err = rt().block_on(async { run(&host, prompt(None, "hello", "claude:gone/sonnet", PermissionMode::Default)).await.1 }).unwrap_err();
     assert_eq!(err.code, "backend_not_found");
@@ -502,4 +503,61 @@ fn a_long_lived_host_lets_go_of_an_idle_sessions_claude() {
     let fake = home.fake_log();
     assert_eq!(processes(&fake), 3);
     assert!(fake.contains(&format!("resume {VENDOR_SESSION}")));
+}
+
+#[test]
+fn r_back_1_a_plan_turn_after_exit_plan_mode_gets_a_process_in_plan_again() {
+    let home = Home::new("plan");
+    let dir = home.signed_in("cfg");
+    let host = home.host(vec![("claude", home.instance(&dir, Some("exit_plan.jsonl")))], trust::allow_all());
+    rt().block_on(async {
+        let (_, r) = run(&host, prompt(None, "plan it", "claude/sonnet", PermissionMode::Plan)).await;
+        let first = r.unwrap().unwrap();
+        assert_eq!((first.status, first.result.as_str()), (TurnStatus::Completed, "Here is the plan."), "{:?}", first.error);
+        // Claude Code now reports default: the next plan turn does not
+        // inherit it, and does not fail on it either.
+        let (_, r) = run(&host, prompt(Some(&first.session_id), "plan the next step", "claude/sonnet", PermissionMode::Plan)).await;
+        let next = r.unwrap().unwrap();
+        assert_eq!(next.status, TurnStatus::Completed, "{:?}", next.error);
+        host.shutdown().await;
+    });
+    let fake = home.fake_log();
+    assert!(fake.contains("mode now default"), "{fake}");
+    assert_eq!(processes(&fake), 2, "a new process, in plan, on --resume");
+    let second = fake.lines().filter(|l| l.starts_with("argv -p ")).nth(1).unwrap();
+    assert!(second.contains(&format!("--resume {VENDOR_SESSION}")) && second.ends_with("--permission-mode plan"), "{second}");
+}
+
+#[test]
+fn r_inst_1_a_router_instance_gets_its_key_from_the_variable_it_names() {
+    let home = Home::new("router");
+    let dir = home.root.join("cfg-router");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut router = home.instance(&dir, None);
+    if let InstanceKind::ClaudeCode { env, api_key_env, .. } = &mut router {
+        env.insert("ANTHROPIC_BASE_URL".into(), "https://router.example/api".into());
+        *api_key_env = Some("ROUTER_KEY".into());
+    }
+    let mut unset = router.clone();
+    if let InstanceKind::ClaudeCode { api_key_env, .. } = &mut unset {
+        *api_key_env = Some("NOT_EXPORTED".into());
+    }
+    let host = home.host(vec![("claude:router", router), ("claude:unset", unset)], trust::allow_all());
+    rt().block_on(async {
+        // No Claude login in its directory: the router's key is what it runs on.
+        let (_, r) = run(&host, prompt(None, "hello", "claude:router/anthropic/claude-sonnet-4.5", PermissionMode::Default)).await;
+        let r = r.unwrap().unwrap();
+        assert_eq!(r.status, TurnStatus::Completed, "{:?}", r.error);
+        let billing = home.events(&r.session_id).iter().find_map(|e| if let LogBody::BackendSession { billing, .. } = &e.body { *billing } else { None });
+        assert_eq!(billing, Some(Billing::ApiKey));
+        // A key variable that is not set is named before anything starts.
+        let err = run(&host, prompt(None, "hello", "claude:unset/sonnet", PermissionMode::Default)).await.1.unwrap_err();
+        assert_eq!(err.code, "not_authenticated");
+        assert!(err.message.contains("NOT_EXPORTED"), "{}", err.message);
+        host.shutdown().await;
+    });
+    let fake = home.fake_log();
+    assert!(fake.contains("env ANTHROPIC_AUTH_TOKEN=sk-or-fake") && fake.contains("ANTHROPIC_BASE_URL=https://router.example/api"), "{fake}");
+    assert!(fake.contains("env ANTHROPIC_API_KEY= "), "the token goes where a router reads it, not as an API key: {fake}");
+    assert_eq!(processes(&fake), 1);
 }

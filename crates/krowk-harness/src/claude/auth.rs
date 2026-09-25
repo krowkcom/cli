@@ -40,13 +40,11 @@ impl Status {
 fn command(b: &Backend, args: &[&str]) -> Command {
     let mut c = Command::new(b.path.as_deref().unwrap_or(std::path::Path::new(&b.binary)));
     c.args(args);
-    for k in crate::claude::cleared(b) {
+    let (remove, set) = crate::claude::environment(b);
+    for k in remove {
         c.env_remove(k);
     }
-    if let Some(dir) = &b.config_dir {
-        c.env("CLAUDE_CONFIG_DIR", dir);
-    }
-    c.envs(&b.env);
+    c.envs(set);
     c
 }
 

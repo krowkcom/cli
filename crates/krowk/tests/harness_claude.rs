@@ -264,3 +264,35 @@ fn r_back_6_headless_refuses_an_untrusted_repository_before_claude_is_spawned() 
     let out = b.krowk(&["sessions", "--trust"], &[]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("only a flag of `krowk -p`"));
 }
+
+#[test]
+fn r_inst_1_providers_add_claude_with_a_router_hands_it_the_named_key_and_nothing_ambient() {
+    let b = Sandbox::new("router");
+    let added = b.json(&["providers", "add", "claude", "--name", "router", "--base-url", "https://router.example/api", "--api-key-env", "ROUTER_KEY", "--json"], &[]);
+    assert_eq!(added["data"]["definition"]["apiKeyEnv"], "ROUTER_KEY", "the variable's name is stored");
+    assert_eq!(added["data"]["definition"]["env"]["ANTHROPIC_BASE_URL"], "https://router.example/api");
+    assert!(!b.fake_log().contains("argv auth login"), "a router signs in with its key, not a Claude login");
+    let cfg = std::fs::read_to_string(b.root.join("home/.config/krowk/config.json")).unwrap();
+    assert!(!cfg.contains("sk-or-"), "never the key");
+
+    let listed = b.json(&["providers", "list", "--json"], &[("ROUTER_KEY", "sk-or-live")]);
+    let row = listed["data"]["instances"].as_array().unwrap().iter().find(|r| r["instance"] == "claude:router").unwrap().clone();
+    assert_eq!((row["state"].as_str(), row["auth"].as_str()), (Some("ready"), Some("runs Claude Code with the key from $ROUTER_KEY")));
+
+    // The ambient native key is exported too, and must not reach Claude Code.
+    let env = [("ROUTER_KEY", "sk-or-live"), ("ANTHROPIC_API_KEY", "sk-ant-api-ambient"), ("ANTHROPIC_AUTH_TOKEN", "ambient-token")];
+    let r = b.json(&["-p", "hello", "--model", "claude:router/anthropic/claude-sonnet-4.5", "--trust", "--output-format", "json"], &env);
+    assert_eq!(r["status"], "completed");
+    let fake = b.fake_log();
+    assert!(fake.contains("env ANTHROPIC_AUTH_TOKEN=sk-or-live\n") && fake.contains("env ANTHROPIC_API_KEY= ANTHROPIC_BASE_URL=https://router.example/api\n"), "{fake}");
+    assert!(!fake.contains("ambient"), "{fake}");
+    // Without the router's variable, it says which one to set.
+    let out = b.krowk(&["-p", "hello", "--model", "claude:router/x", "--trust"], &[]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ROUTER_KEY"));
+    // A plain Claude account never sees the ambient key either.
+    b.json(&["providers", "add", "claude", "--json"], &[]);
+    b.json(&["-p", "hello", "--model", "claude/sonnet", "--trust", "--output-format", "json"], &env);
+    let last = b.fake_log().lines().filter(|l| l.starts_with("env ANTHROPIC_AUTH_TOKEN=")).last().unwrap().to_string();
+    assert_eq!(last, "env ANTHROPIC_AUTH_TOKEN=");
+}

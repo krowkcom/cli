@@ -237,6 +237,9 @@ impl Host {
                         format!("{} was not found — install Claude Code (https://claude.com/claude-code), or name the binary with `krowk providers add claude --binary <path>`", b.binary),
                     ));
                 }
+                if let Some(fix) = instance.missing_key() {
+                    return Err(EngineError::new("not_authenticated", fix));
+                }
                 (self.cfg.trust)(&trust::root(&cwd_before))?;
                 None
             }

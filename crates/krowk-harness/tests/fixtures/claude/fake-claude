@@ -26,6 +26,8 @@
 #   @sleep <seconds>   waits
 #   @exit <code>       exits mid-turn, as a crashed process would
 #   @exit-once <code>  the same, the first time only (a marker in the config dir)
+#   @mode <mode>       the mode later turns report, as an approved
+#                      ExitPlanMode leaves Claude Code in default
 #   @grandchild        starts a background `sleep`, as a Bash tool call
 #                      would, and logs its pid; `@grandchild-holding` leaves
 #                      it holding stdout open, as a careless one does
@@ -87,7 +89,9 @@ done
 PMODE="${FAKE_CLAUDE_PERMISSION_MODE:-$PMODE}"
 SOURCE=none
 [ -n "${ANTHROPIC_API_KEY:-}" ] && SOURCE=ANTHROPIC_API_KEY
+[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] && SOURCE=ANTHROPIC_AUTH_TOKEN
 log "env ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+set} ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}"
+log "env ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:-}"
 SLUG="${PWD//[^a-zA-Z0-9]/-}"
 TRANSCRIPT="$DIR/projects/$SLUG/$SESSION.jsonl"
 
@@ -220,6 +224,7 @@ turn() {
         exit "${l#@exit-once }"
       fi
       ;;
+    '@mode '*) PMODE="${l#@mode }"; log "mode now $PMODE" ;;
     @grandchild)
       sleep 300 >/dev/null 2>&1 </dev/null &
       log "grandchild $!"

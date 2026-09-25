@@ -57,9 +57,6 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         (Some(n), p) => format!("{p}:{n}"),
         (None, p) => p.to_string(),
     };
-    if provider == "claude" && ctx.f.given.contains("api-key-env") {
-        return Err(fail("bad_flag", "a Claude Code instance signs in with Claude's own login — `--api-key-env` is for the API-key providers; Claude Code reads its own environment"));
-    }
     if provider != "claude" && (ctx.f.given.contains("binary") || ctx.f.given.contains("config-dir")) {
         return Err(fail("bad_flag", "`--binary` and `--config-dir` describe a Claude Code instance: `krowk providers add claude --name work --config-dir …`"));
     }
@@ -84,14 +81,17 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
             wire_api: None,
             effort: None,
         },
-        // A router in front of Claude Code is its environment: the base URL
-        // it sends to, and whatever key variable the router wants, which
-        // Claude Code reads from the environment krowk runs in.
+        // A router in front of Claude Code: the base URL it sends to goes in
+        // the instance's env, and the key is named by --api-key-env — krowk
+        // reads that variable and hands the key to the process
+        // (ANTHROPIC_AUTH_TOKEN with a base URL, ANTHROPIC_API_KEY without).
+        // Claude Code inherits neither from krowk's own environment.
         "claude" => InstanceKind::ClaudeCode {
             binary: opt(&ctx.f.binary),
             config_dir: opt(&ctx.f.config_dir),
             env: base_url.clone().map(|u| [("ANTHROPIC_BASE_URL".to_string(), u)].into()).unwrap_or_default(),
             args: Vec::new(),
+            api_key_env: opt(&ctx.f.api_key_env),
             effort: None,
         },
         _ => InstanceKind::XaiOauth { base_url, issuer: None, client_id: opt(&ctx.f.client_id), scope: None, effort: None },
@@ -119,7 +119,7 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
     // login that fails leaves no definition behind.
     let mut claude_status = None;
     let kind = match kind {
-        InstanceKind::ClaudeCode { binary, config_dir, env, args, effort } => {
+        InstanceKind::ClaudeCode { binary, config_dir, env, args, api_key_env, effort } => {
             // A named instance is its own account, so it gets a config
             // directory of its own unless one is named; the unnamed one is
             // Claude Code as the person already uses it.
@@ -128,7 +128,7 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
                     krowk_harness::log::sessions_dir(ctx.io.env).and_then(|d| d.parent().map(|p| p.join("claude").join(instance.replace(':', "-")).display().to_string()))
                 })
             });
-            let kind = InstanceKind::ClaudeCode { binary, config_dir, env, args, effort };
+            let kind = InstanceKind::ClaudeCode { binary, config_dir, env, args, api_key_env, effort };
             let (status, _) = sign_in_claude(ctx, &instance, &kind)?;
             claude_status = Some(status);
             kind
@@ -174,8 +174,8 @@ pub(super) fn add(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
     // What the definition resolves to, as a prompt will read it.
     let resolved = Registry::resolve(&instances::InstancesConfig { instances: [(instance.clone(), kind.clone())].into(), ..Default::default() }, ctx.io.env);
     let r = resolved.get(&instance).map_err(|e| fail("bad_config", e))?;
-    let key_env = (r.auth == Auth::ApiKey).then(|| r.api_key_env.clone());
-    let unset = r.auth == Auth::ApiKey && r.api_key.is_empty();
+    let key_env = (r.auth == Auth::ApiKey || !r.api_key_env.is_empty()).then(|| r.api_key_env.clone());
+    let unset = key_env.is_some() && r.api_key.is_empty();
     if ctx.format != Format::Human {
         let mut report = json!({ "instance": instance, "kind": kind.tag(), "config": path.display().to_string(), "definition": def });
         if let Some(k) = &key_env {
@@ -235,6 +235,8 @@ pub(super) fn list(ctx: &mut Ctx) -> Result<(), Error> {
                 Auth::Keyless => ("no key".to_string(), true, ""),
                 Auth::OAuth { .. } => ("SuperGrok login".to_string(), logins.contains(&r.name), "not signed in"),
                 // Asked of Claude Code, the only thing that may read its login.
+                // A keyed instance runs on its key, which is krowk's to check.
+                Auth::Vendor if !r.api_key_env.is_empty() => (format!("runs Claude Code with the key from ${}", r.api_key_env), !r.api_key.is_empty() && r.backend.as_ref().is_some_and(|b| b.path.is_some()), "key not set"),
                 Auth::Vendor => match r.backend.as_ref().filter(|b| b.path.is_some()).map(claude_auth::status) {
                     None => ("runs Claude Code".to_string(), false, "not installed"),
                     Some(Ok(st)) => (format!("runs Claude Code: {}", st.describe()), st.logged_in, "not signed in"),
@@ -326,9 +328,11 @@ pub(super) fn remove(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
 /// R-INST-2: a Claude Code account is signed in by Claude Code. Its config
 /// directory is made (0700) if it is new, `claude auth status` is asked,
 /// and when it says no, `claude auth login` runs on this terminal in
-/// Anthropic's own flow; then status is asked again. A router instance (a
-/// base URL in its environment) signs in with the router's key, so no
-/// login is run for it. A failure removes a directory this made.
+/// Anthropic's own flow; then status is asked again. A keyed instance — a
+/// router (a base URL in its env) or a Console key, named by
+/// `--api-key-env` — runs on that key, which krowk reads and hands the
+/// process, so no login is run for it. A failure removes a directory this
+/// made.
 fn sign_in_claude(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<(claude_auth::Status, bool), Error> {
     let reg = Registry::resolve(&instances::InstancesConfig { instances: [(instance.to_string(), kind.clone())].into(), ..Default::default() }, ctx.io.env);
     let backend = reg.get(instance).map_err(|e| fail("bad_config", e))?.backend.clone().expect("a claude-code instance has a backend");
@@ -349,7 +353,9 @@ fn sign_in_claude(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<
         e
     };
     let status = claude_auth::status(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
-    if status.logged_in || backend.env.contains_key("ANTHROPIC_BASE_URL") {
+    // A keyed instance — a router, a Console key — signs in with its key,
+    // not a Claude login.
+    if status.logged_in || backend.env.contains_key("ANTHROPIC_BASE_URL") || backend.key.is_some() {
         return Ok((status, false));
     }
     let _ = writeln!(ctx.io.stderr, "Signing {instance} in to Claude Code — what follows is Claude's own login (`claude auth login`){}:", backend.config_dir.as_ref().map(|d| format!(", kept in {}", d.display())).unwrap_or_default());

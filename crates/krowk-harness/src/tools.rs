@@ -125,7 +125,8 @@ const READ_MAX_SCAN: u64 = 64 << 20;
 /// has to hear an interrupt while it runs.
 async fn read(i: &ReadInput, cwd: &Path) -> (String, bool) {
     let path = resolve(cwd, &i.path);
-    let (start, limit) = (i.offset.unwrap_or(1).max(1), i.limit.unwrap_or(READ_DEFAULT_LINES).max(1));
+    // Both come from the model: clamped, so no value overflows the arithmetic.
+    let (start, limit) = (i.offset.unwrap_or(1).clamp(1, usize::MAX / 2), i.limit.unwrap_or(READ_DEFAULT_LINES).clamp(1, usize::MAX / 2));
     tokio::task::spawn_blocking(move || read_file(&path, start, limit))
         .await
         .unwrap_or_else(|e| (format!("read failed: {e}"), true))
@@ -197,7 +198,7 @@ fn read_file(path: &Path, start: usize, limit: usize) -> (String, bool) {
             return (format!("{} is a binary file, which read does not show", path.display()), true);
         }
         total += 1;
-        if total < start || total >= start + limit || full {
+        if total < start || total >= start.saturating_add(limit) || full {
             continue;
         }
         while matches!(line.last(), Some(b'\n' | b'\r')) {
@@ -313,13 +314,16 @@ async fn bash(i: &BashInput, cwd: &Path) -> (String, bool) {
         let (mut so_open, mut se_open) = (true, true);
         let mut status = None;
         let mut held_open = false;
+        // Fixed once, when the shell exits: a background process that keeps
+        // writing must not push the window out chunk by chunk.
+        let mut drain_until: Option<tokio::time::Instant> = None;
         loop {
             if !so_open && !se_open && status.is_some() {
                 break;
             }
             let drained = async {
-                match status {
-                    Some(_) => tokio::time::sleep(BASH_DRAIN_AFTER_EXIT).await,
+                match drain_until {
+                    Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending().await,
                 }
             };
@@ -332,7 +336,10 @@ async fn bash(i: &BashInput, cwd: &Path) -> (String, bool) {
                     Ok(n) if n > 0 => cap.push(&b2[..n]),
                     _ => se_open = false,
                 },
-                s = child.wait(), if status.is_none() => status = Some(s),
+                s = child.wait(), if status.is_none() => {
+                    status = Some(s);
+                    drain_until = Some(tokio::time::Instant::now() + BASH_DRAIN_AFTER_EXIT);
+                }
                 _ = drained => {
                     held_open = true;
                     break;
@@ -399,6 +406,11 @@ mod tests {
         assert!(run(READ, &json!({"path": "missing"}), &env).await.1);
         assert!(run(READ, &json!({"path": "bin"}), &env).await.1);
         assert!(run(READ, &json!({"file": "a.txt"}), &env).await.0.contains("invalid input"));
+        // Offsets and limits the model makes up cannot overflow.
+        let max = usize::MAX as u64;
+        assert_eq!(run(READ, &json!({"path": "a.txt", "offset": 2, "limit": max}), &env).await, ("     2\ttwo\n     3\tthree\n".into(), false));
+        let (out, err) = run(READ, &json!({"path": "a.txt", "offset": max, "limit": max}), &env).await;
+        assert!(err && out.contains("nothing from line"), "{out}");
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -444,6 +456,12 @@ mod tests {
         let (out, err) = run(BASH, &json!({"command": "sleep 5 & echo started"}), &env).await;
         assert!(!err && out.starts_with("started\nexit code 0"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(2));
+        // Even one that keeps writing: the window after exit is fixed, not
+        // restarted by each chunk.
+        let started = std::time::Instant::now();
+        let (out, err) = run(BASH, &json!({"command": "(while :; do echo x; sleep 0.1; done) & echo ok", "timeout_ms": 10000}), &env).await;
+        assert!(!err && out.starts_with("ok\n"), "{out}");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
         let _ = std::fs::remove_dir_all(d);
     }
 

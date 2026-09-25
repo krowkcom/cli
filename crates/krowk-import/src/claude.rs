@@ -430,6 +430,7 @@ impl Builder {
             foreign_id: self.foreign_id(&l.uuid, line_no),
             usage: String::new(),
             raw_json: raw_json(raw),
+            turn_seq: None,
             parts: Vec::new(),
         };
         let mut usage = TokenUsage::default();
@@ -519,6 +520,7 @@ impl Builder {
             foreign_id: self.foreign_id(&l.uuid, line_no),
             usage: String::new(),
             raw_json: raw_json(raw),
+            turn_seq: None,
             parts,
         });
         self.usages.push(TokenUsage::default());
@@ -608,7 +610,11 @@ impl Builder {
             parent,
             turns: self.turns(),
             events: std::mem::take(&mut self.events),
-            messages: std::mem::take(&mut self.messages),
+            messages: {
+                let mut messages = std::mem::take(&mut self.messages);
+                crate::link_turns(&mut messages, &split_turns(&self.candidates));
+                messages
+            },
         }
     }
 

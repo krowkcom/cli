@@ -76,7 +76,10 @@ stdout:
     "duration_ms": <n>,
     "pricing": {
       "status": "no_network"
-    }
+    },
+    "unpriced_models": [
+      "anthropic/claude-opus-5-20260401"
+    ]
   },
   "summary": "8 files, 8 sessions read, 32 messages read, 32 messages new"
 }
@@ -163,7 +166,10 @@ stdout:
     "duration_ms": <n>,
     "pricing": {
       "status": "no_network"
-    }
+    },
+    "unpriced_models": [
+      "anthropic/claude-opus-5-20260401"
+    ]
   },
   "summary": "8 files, 0 sessions read, 0 messages read, 0 messages new"
 }
@@ -247,7 +253,10 @@ stdout:
     "duration_ms": <n>,
     "pricing": {
       "status": "no_network"
-    }
+    },
+    "unpriced_models": [
+      "anthropic/claude-opus-5-20260401"
+    ]
   },
   "summary": "8 files, 1 sessions read, 15 messages read, 1 messages new"
 }
@@ -335,7 +344,10 @@ stdout:
     "pricing": {
       "status": "failed",
       "warning": "prices were not refreshed: models.dev could not be reached or did not answer with a price file — the cache or the snapshot still prices everything"
-    }
+    },
+    "unpriced_models": [
+      "anthropic/claude-opus-5-20260401"
+    ]
   },
   "summary": "8 files, 0 sessions read, 0 messages read, 0 messages new"
 }

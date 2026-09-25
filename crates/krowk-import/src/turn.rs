@@ -38,6 +38,16 @@ pub fn split_turns(candidates: &[TurnCandidate]) -> Vec<TurnSpan> {
     spans
 }
 
+/// Names each message's turn, so the store links the message to its turn
+/// row: message i is candidate i, and belongs to the span holding it.
+pub fn link_turns(messages: &mut [krowk_store::Message], spans: &[TurnSpan]) {
+    for (seq, span) in spans.iter().enumerate() {
+        for m in messages.iter_mut().take(span.end).skip(span.start) {
+            m.turn_seq = Some(seq as i64);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -82,6 +82,9 @@ pub struct Message {
     pub foreign_id: String,
     pub usage: String,
     pub raw_json: Option<String>,
+    /// The seq of the thread turn this message belongs to, when the source
+    /// knows it; the message is then linked to that turn's row.
+    pub turn_seq: Option<i64>,
     pub parts: Vec<Part>,
 }
 
@@ -418,8 +421,8 @@ fn insert_message(tx: &Connection, now: i64, session_id: &str, m: &Message, seq:
     let id = clock::new_id();
     let usage = if m.usage.is_empty() { "{}" } else { &m.usage };
     tx.execute(
-        "INSERT INTO message (id, session_id, turn_id, seq, role, provider, model, foreign_id, usage, raw_json, time_created) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
-        params![id, session_id, seq, m.role.as_str(), m.provider, m.model, none_if_empty(&m.foreign_id), usage, m.raw_json, now],
+        "INSERT INTO message (id, session_id, turn_id, seq, role, provider, model, foreign_id, usage, raw_json, time_created) VALUES (?, ?, (SELECT id FROM turn WHERE session_id = ?2 AND seq = ?), ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![id, session_id, m.turn_seq, seq, m.role.as_str(), m.provider, m.model, none_if_empty(&m.foreign_id), usage, m.raw_json, now],
     )
     .map_err(e("insert message"))?;
     for (i, p) in m.parts.iter().enumerate() {
@@ -480,6 +483,7 @@ mod tests {
                     foreign_id: format!("m{i}"),
                     usage: String::new(),
                     raw_json: None,
+                    turn_seq: None,
                     parts: vec![Part { kind: "text".into(), data: serde_json::json!({ "text": t }).to_string(), ..Part::default() }],
                 })
                 .collect(),

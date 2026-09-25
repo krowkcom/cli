@@ -18,7 +18,8 @@ krowk-store = { path = "../krowk-store", optional = true }
 krowk-import = { path = "../krowk-import", optional = true }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: a record read back keeps the key order it arrived in.
-serde_json = { version = "1", features = ["preserve_order"] }
+# raw_value: the models.dev file is parsed without building what it skips.
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 regex-lite = "0.1"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 jaq-core = "3"

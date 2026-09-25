@@ -77,7 +77,10 @@ stdout:
       "duration_ms": <n>
     }
   ],
-  "duration_ms": <n>
+  "duration_ms": <n>,
+  "unpriced_models": [
+    "anthropic/claude-opus-5-20260401"
+  ]
 }
 exit: 0
 

@@ -504,6 +504,7 @@ impl<'a> Builder<'a> {
             foreign_id: id.to_string(),
             usage: d.usage,
             raw_json: d.raw_json,
+            turn_seq: None,
             parts,
         });
         self.tokens.push(d.tokens);
@@ -643,7 +644,11 @@ impl<'a> Builder<'a> {
             parent: (!self.parent_id.is_empty() && self.parent_id != self.r.id).then(|| binding(&self.parent_id)),
             turns: self.turns(),
             events: Vec::new(),
-            messages: self.messages,
+            messages: {
+                let mut messages = self.messages;
+                crate::link_turns(&mut messages, &split_turns(&self.candidates));
+                messages
+            },
         };
         (th, self.acc)
     }

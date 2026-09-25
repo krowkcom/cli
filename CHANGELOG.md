@@ -9,6 +9,28 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ## [Unreleased]
 
+### Changed
+
+- **Costs are priced per turn, by the model each turn ran on.** A session
+  that switched models mid-way, or a ledger with three models in it, is no
+  longer priced entirely at its last model's rates. `sessions show` prints
+  each turn's cost (and a per-model subtotal when there is more than one),
+  and a turn whose source reported its own dollars — opencode, a provider
+  ledger — shows that figure, marked `reported`. Stores imported before
+  this release price every turn by the session's model until
+  `krowk sessions rebuild` re-reads the transcripts.
+- **A missing price reads —, never $0.** A session with any tokens krowk
+  cannot price shows — for its cost, with `unpriced` naming the models in
+  `--json`, and `sessions import` names every unpriced model once at the
+  end. Every listing and `show` footnotes where the rates came from (the
+  refreshed cache's fetch date, or the snapshot embedded in the build):
+  costs are today's rates, not the ones in force when the tokens were
+  spent. JSON costs are unrounded; costs under a cent print to three
+  significant digits, so $0.00007 and $0.00012 no longer both read $0.0001.
+- `sessions` lists in ~25 ms on a machine whose price cache holds the whole
+  models.dev file (was ~80 ms): the cache is parsed without building the
+  fields pricing never reads.
+
 ### Added
 
 - **Provider usage ledgers.** A request your agent gave up on — a timeout,

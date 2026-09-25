@@ -207,6 +207,7 @@ fn thread(r: &Ref, dir: &str, rows: &[Row]) -> Thread {
                 foreign_id: row.id.clone(),
                 usage: row.usage_json(),
                 raw_json: Some(row.raw.clone()),
+                turn_seq: None,
                 parts: Vec::new(),
             })
             .collect(),

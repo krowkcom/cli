@@ -377,3 +377,53 @@ fn r_compat_1_a_skill_is_judged_by_skill_rules_and_a_read_deny_of_its_file() {
     assert_eq!(letter(&gate(&p, PermissionMode::Default).verdict(&hidden, None)), 'N', "a Read deny of its file");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn r_perm_2_a_path_with_glob_characters_is_allowed_once_never_remembered() {
+    let d = repo("glob-grant");
+    for name in ["a[1].rs", "*.rs", "b{c.rs", "q?.rs"] {
+        std::fs::write(d.join("src").join(name), "").unwrap();
+        for call in [read(d.join("src").join(name)), edit(d.join("src").join(name))] {
+            assert!(remember(&call).is_empty(), "{name}: not offered for the session or project");
+        }
+    }
+    // Were one written by hand, it would not cover its sibling …
+    std::fs::write(d.join("src/a1.rs"), "").unwrap();
+    // … and a rule that would not load is never written at all.
+    let file = d.join("krowk/permissions.json");
+    settings::remember(&file, &d, &["Bash(ok)".into()]).unwrap();
+    let bad = format!("Read(/{}/src/b{{c.rs)", d.display());
+    assert!(settings::remember(&file, &d, &[bad]).unwrap_err().contains("was not remembered"));
+    let cfg = Config { krowk_dir: Some(d.join("krowk")), ..Config::default() };
+    let p = Policy::load(&cfg, &d).expect("later prompts still load their settings");
+    assert_eq!(letter(&gate(&p, PermissionMode::Default).verdict(&bash("ok"), None)), 'Y');
+    let exact = rules::parse(&format!("Read(/{}/src/a[1].rs)", d.display()), "hand", &d).unwrap();
+    let at = rules::Places { cwd: &d, home: None };
+    assert!(rules::matches(&exact, &read(d.join("src/a1.rs")), &at, true), "why it is never offered: as glob text it covers a1.rs too");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn r_perm_2_allowing_a_glob_named_file_for_the_session_does_not_cover_its_sibling() {
+    let d = repo("glob-session");
+    std::fs::create_dir_all(d.join("elsewhere")).unwrap();
+    std::fs::write(d.join("src/a[1].rs"), "").unwrap();
+    std::fs::write(d.join("src/a1.rs"), "").unwrap();
+    let approvals = Approvals::default();
+    let g = Gate::new(Policy::modes_only(&d.join("elsewhere")), PermissionMode::Default, SessionGrants::default(), Some(approvals.clone()), None, "s", "t");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let answering = approvals.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let EngineEvent::Approval(req) = ev {
+                assert!(req.remember.is_empty(), "nothing to remember is offered");
+                answering.answer("s", &req.request_id, ApprovalDecision::AllowSession).unwrap();
+            }
+        }
+    });
+    let (_c, cancel) = watch::channel(false);
+    g.check(&read(d.join("src/a[1].rs")), "read", &json!({}), None, &tx, &cancel).await.unwrap();
+    assert_eq!(letter(&g.verdict(&read(d.join("src/a1.rs")), None)), '?', "the sibling is still asked about");
+    assert_eq!(letter(&g.verdict(&read(d.join("src/a[1].rs")), None)), '?', "and so is the file itself, next time");
+    let _ = std::fs::remove_dir_all(&d);
+}

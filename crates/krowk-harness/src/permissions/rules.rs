@@ -33,8 +33,9 @@
 //!
 //! An allow rule allows a line only when it allows every one of its
 //! commands, never one that writes a file through a redirection (`>`,
-//! `>>`, `>|`, `&>`, `<>`), never git handed config or an alias that can
-//! name a program (`-c`, `--config-env`, `--exec-path`, `alias.*`), and a
+//! `>>`, `>|`, `&>`, `<>`), never a git told to run a program (see
+//! `uncoverable`: `-c`, a `config` write, transport programs, `rebase -x`,
+//! `bisect run`, `submodule foreach`, `difftool -x`, aliases), and a
 //! login shell around one command line (`bash -lc '…'`, as Codex runs
 //! commands) is judged by that line. A deny rule denies the line when it
 //! matches any one command — as written, and again with what only wraps a
@@ -962,16 +963,75 @@ fn allow_units(cmd: &str, depth: usize) -> Option<Vec<Simple>> {
     Some(out)
 }
 
-/// A command no allow rule covers, whatever it says: git handed config on
-/// its command line (`-c`, `--config-env`, `--exec-path`) or setting an
-/// alias, either of which can make it run any program — so `Bash(git:*)`
-/// does not stretch to `git -c core.pager='rm -rf ~' log`.
+/// A command no allow rule covers, whatever it says: a git that is told —
+/// now, or for later — to run a program. `Bash(git:*)` allows git; it does
+/// not stretch to git running whatever it is handed:
+///
+/// - global options that set config or where git's programs are: `-c`,
+///   `--config-env`, `--exec-path=…`;
+/// - `git config` anything but a read (`--get*`, `--list`/`-l`, `get`,
+///   `list`, or one key and no value): a key can name a program (a pager,
+///   an editor, `core.fsmonitor`, `core.hooksPath`, an alias);
+/// - a program for the other end of a transport: `--upload-pack`,
+///   `--receive-pack`, `--exec` (fetch, pull, push, clone, ls-remote,
+///   archive), and `-u` for clone and ls-remote;
+/// - `rebase -x`/`--exec`, `bisect run`, `submodule foreach`, `difftool
+///   -x`/`--extcmd`;
+/// - any argument that names an alias (`alias.*`).
 fn uncoverable(words: &[String]) -> bool {
     let Some(prog) = words.first() else { return false };
     if basename(prog) != "git" {
         return false;
     }
-    words[1..].iter().any(|a| a == "-c" || (a.starts_with("-c") && a.len() > 2 && !a.starts_with("--")) || a.starts_with("--config-env") || a.starts_with("--exec-path") || a.starts_with("alias.") || a.contains(".alias."))
+    let args = &words[1..];
+    if args.iter().any(|a| a.starts_with("alias.") || a.contains(".alias.")) {
+        return true;
+    }
+    // The global options, up to the subcommand.
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        if !a.starts_with('-') {
+            break;
+        }
+        if a == "-c" || (a.starts_with("-c") && !a.starts_with("--")) || a.starts_with("--config-env") || a.starts_with("--exec-path=") {
+            return true;
+        }
+        // These take a value in the next word.
+        i += if matches!(a.as_str(), "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix") { 2 } else { 1 };
+    }
+    let Some(sub) = args.get(i) else { return false };
+    let rest = &args[i + 1..];
+    let has = |names: &[&str]| rest.iter().any(|a| names.iter().any(|n| a == n || (n.starts_with("--") && a.starts_with(&format!("{n}=")))));
+    match sub.as_str() {
+        "config" => {
+            let writes = ["--add", "--replace-all", "--unset", "--unset-all", "--rename-section", "--remove-section", "-e", "--edit"];
+            if has(&writes) {
+                return true;
+            }
+            let reads = ["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color", "--get-colorbool", "--list", "-l"];
+            // What is left once the options are: a subcommand, keys, values.
+            let takes_value = ["-f", "--file", "--blob", "--type", "--default", "--comment"];
+            let mut positional = Vec::new();
+            let mut j = 0;
+            while let Some(a) = rest.get(j) {
+                if a.starts_with('-') {
+                    j += if takes_value.contains(&a.as_str()) { 2 } else { 1 };
+                } else {
+                    positional.push(a.as_str());
+                    j += 1;
+                }
+            }
+            let read = has(&reads) || matches!(positional.first(), Some(&"get") | Some(&"list")) || (positional.len() == 1 && !matches!(positional[0], "set" | "unset" | "rename-section" | "remove-section" | "edit"));
+            !read
+        }
+        "fetch" | "pull" | "push" | "archive" => has(&["--upload-pack", "--receive-pack", "--exec"]),
+        "clone" | "ls-remote" => has(&["--upload-pack", "--receive-pack", "--exec", "-u"]),
+        "rebase" => has(&["-x", "--exec"]) || rest.iter().any(|a| a.starts_with("-x") && a.len() > 2),
+        "bisect" => rest.first().is_some_and(|a| a == "run"),
+        "submodule" => rest.iter().any(|a| a == "foreach"),
+        "difftool" => has(&["-x", "--extcmd"]),
+        _ => false,
+    }
 }
 
 /// A Bash rule against a command line: every simple command (`all`, for
@@ -1176,10 +1236,40 @@ mod tests {
 
     #[test]
     fn r_perm_1_git_told_what_to_run_is_never_covered_by_an_allow_rule() {
-        for cmd in ["git -c core.pager='rm -rf ~' log", "git -ccore.sshCommand=x fetch", "git --config-env=core.editor=E commit", "git --exec-path=/tmp/x status", "git config alias.x '!rm -rf .'", "git config --global alias.st status"] {
+        for cmd in [
+            "git -c core.pager='rm -rf ~' log",
+            "git -ccore.sshCommand=x fetch",
+            "git --config-env=core.editor=E commit",
+            "git --exec-path=/tmp/x status",
+            "git -C sub -c x=y log",
+            "git config alias.x '!rm -rf .'",
+            "git config --global alias.st status",
+            "git config core.hooksPath /tmp/h",
+            "git config core.fsmonitor 'touch x'",
+            "git config set core.pager less",
+            "git config --add core.editor vi",
+            "git config --unset user.name",
+            "git config -e",
+            "git fetch --upload-pack='rm -rf x' origin",
+            "git pull --upload-pack=x",
+            "git push --receive-pack='x' origin",
+            "git clone -u x repo",
+            "git clone --upload-pack x repo",
+            "git ls-remote -u x origin",
+            "git archive --remote=r --exec=x HEAD",
+            "git rebase -x 'make test' main",
+            "git rebase --exec='rm x' main",
+            "git rebase -xmake main",
+            "git bisect run ./script.sh",
+            "git submodule foreach 'rm -rf .'",
+            "git difftool -x 'rm' HEAD",
+            "git difftool --extcmd=x",
+        ] {
             assert!(!bash("Bash(git:*)", cmd, true) && !bash("Bash", cmd, true), "{cmd}");
         }
-        assert!(bash("Bash(git:*)", "git log --oneline -5", true));
+        for cmd in ["git log --oneline -5", "git config --get user.name", "git config user.name", "git config --list", "git config get user.name", "git -C sub status", "git commit -c HEAD", "git push -u origin main", "git fetch origin", "git rebase main", "git bisect good"] {
+            assert!(bash("Bash(git:*)", cmd, true), "{cmd} is still covered");
+        }
     }
 
     #[test]

@@ -304,6 +304,11 @@ fn lock_grants(path: &Path) -> Result<GrantsLock, String> {
 /// Remembers `allow` for the project at `root`: `0600`, under a lock, and
 /// replaced by rename from a temporary file of this process's own.
 pub fn remember(path: &Path, root: &Path, allow: &[String]) -> Result<(), String> {
+    // A rule that would not load is never written: the next session would
+    // refuse the whole file.
+    for r in allow {
+        rules::parse(r, &path.display().to_string(), root).map_err(|e| format!("{} was not remembered: {e}", r))?;
+    }
     let _held = lock_grants(path)?;
     let mut v: Value = match std::fs::read(path) {
         Ok(raw) => serde_json::from_slice(&raw).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?,

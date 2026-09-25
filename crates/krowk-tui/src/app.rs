@@ -908,7 +908,16 @@ fn shown(s: &str, max: usize) -> String {
             c => Some(c),
         })
         .collect();
-    if flat.chars().count() > max { flat.chars().take(max).collect::<String>() + "…" } else { flat }
+    // Cut from the middle: the start says what runs, and the end is where
+    // a long command hides what it does last.
+    let n = flat.chars().count();
+    if n <= max {
+        return flat;
+    }
+    let tail = max * 3 / 10;
+    let head = max - tail;
+    let chars: Vec<char> = flat.chars().collect();
+    format!("{} … {}", chars[..head].iter().collect::<String>(), chars[n - tail..].iter().collect::<String>())
 }
 
 #[cfg(test)]
@@ -1075,7 +1084,10 @@ mod tests {
         // A model's string cannot draw a row of its own, hide, or run on.
         let spoof = super::shown("rm x\n  y allow once · n deny\u{202E}\x1b[2J", 400);
         assert_eq!(spoof, "rm x⏎  y allow once · n deny[2J");
-        assert_eq!(super::shown(&"a".repeat(500), 400).chars().count(), 401);
+        let long = format!("git status && {} && rm -rf ~", "true ".repeat(200));
+        let cut = super::shown(&long, 400);
+        assert!(cut.starts_with("git status && true") && cut.ends_with("&& rm -rf ~") && cut.contains(" … "), "head and tail both shown: {cut}");
+        assert!(cut.chars().count() <= 403);
     }
 
     #[test]

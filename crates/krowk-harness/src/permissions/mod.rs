@@ -156,6 +156,20 @@ pub fn summary(call: &Call) -> String {
 /// decision.
 fn remember(call: &Call) -> Vec<String> {
     let abs = |p: &Path| format!("/{}", p.display());
+    // A grant is a rule, and a path in a rule is glob text: a file named
+    // `a[1].rs` or `*` would grant more than itself. Such a call is allowed
+    // once, never remembered.
+    let globby = |ps: &[PathBuf]| ps.iter().any(|p| p.to_string_lossy().contains(['*', '?', '[', ']', '{', '}']));
+    if let Access::Read(ps) | Access::Edit(ps) | Access::Publish(ps) = &call.access
+        && globby(ps)
+    {
+        return Vec::new();
+    }
+    if let Access::Skill(_) = &call.access
+        && call.subject.as_deref().is_some_and(|s| s.contains(['*', '?', '[', ']', '{', '}', '(', ')']))
+    {
+        return Vec::new();
+    }
     match &call.access {
         Access::Bash(c) => {
             let parsed = rules::split(c);

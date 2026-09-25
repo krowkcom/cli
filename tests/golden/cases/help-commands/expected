@@ -717,7 +717,7 @@ stdout:
           "name": "max-tokens",
           "type": "string",
           "default": "",
-          "usage": "Trip when the session's metered tokens are over this many"
+          "usage": "Trip when the session's generated tokens (output and reasoning) are over this many"
         }
       ]
     },

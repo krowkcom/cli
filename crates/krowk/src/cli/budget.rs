@@ -4,18 +4,25 @@
 //! A request's `max_tokens` is a wish, not a meter: on 2026-09-10 two
 //! qwen3.5-plus calls sent with `max_tokens: 1200` completed 1,379 and 3,422
 //! tokens, and a guard summing the caps would have under-budgeted by up to
-//! 3x. So the guard sums the usage blocks the store holds — every counted
-//! turn's input, output, reasoning and cache tokens, a provider ledger's
-//! unobserved rows included, since a request nobody saw the answer to was
-//! still billed — and prices them the way `sessions show` does.
+//! 3x. So the guard sums the usage blocks the store holds, for the session
+//! and every subagent it spawned, and prices them the way `sessions show`
+//! does. `--max-tokens` counts generated tokens — output and reasoning, the
+//! part a cap is meant to bound and the part that overshoots; input and
+//! cache tokens are reported and priced, not counted against it.
+//!
+//! The check is current: the session's transcripts are re-read first when
+//! they moved (unless another import holds the store, which the report
+//! says). A provider-ledger row nobody saw an answer to is in the ledger's
+//! own session — nothing ties it to the run that sent it — so budget the
+//! ledger session to hold a provider's metered total to a limit.
 //!
 //! krowk runs no model, so it cancels nothing: tripping exits 4 with
 //! `budget_exceeded`, and whatever called the guard (a hook, a wrapper, a
-//! CI step) is what stops the run. Stopping sending is not stopping
-//! billing, which is why a zombie execution still counts here. Costs stay
-//! unrounded from the turn to the comparison; only the text rounds. A cost
-//! krowk cannot price trips a `--max-usd` guard rather than passing it: an
-//! unknown spend is not a spend inside the limit.
+//! CI step) is what stops the run. Priced costs stay unrounded from the
+//! turn to the comparison; a cost the source reported is stored to the
+//! micro-dollar, finer than any provider bills. A cost krowk cannot price
+//! trips a `--max-usd` guard rather than passing it: an unknown spend is
+//! not a spend inside the limit.
 
 use super::sessions::{self, Priced};
 use super::Ctx;
@@ -42,6 +49,8 @@ pub struct Metered {
     pub reasoning: i64,
     pub cache_read: i64,
     pub cache_write: i64,
+    /// Output and reasoning: what `--max-tokens` holds to its limit.
+    pub generated: i64,
     pub total: i64,
 }
 
@@ -53,7 +62,18 @@ impl Metered {
         self.reasoning += n(t.reasoning);
         self.cache_read += n(t.cache_read);
         self.cache_write += n(t.cache_write);
+        self.generated = self.output + self.reasoning;
         self.total = self.input + self.output + self.reasoning + self.cache_read + self.cache_write;
+    }
+
+    fn merge(&mut self, o: Metered) {
+        self.input += o.input;
+        self.output += o.output;
+        self.reasoning += o.reasoning;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+        self.generated += o.generated;
+        self.total += o.total;
     }
 
     /// The turns a session's own cost counts: a ledger row a transcript or an
@@ -72,25 +92,31 @@ impl Metered {
 pub enum Trip {
     Tokens { metered: i64, limit: i64 },
     Usd { cost: f64, limit: f64 },
-    UsdUnknown { unpriced: Vec<String> },
+    /// Some of the cost has no price; `known` is the part that has one, a
+    /// lower bound on the whole.
+    UsdUnknown { unpriced: Vec<String>, known: f64 },
 }
 
 impl Trip {
     fn json(&self) -> Value {
         match self {
-            Trip::Tokens { metered, limit } => json!({ "limit": "max_tokens", "metered": metered, "max": limit }),
+            Trip::Tokens { metered, limit } => json!({ "limit": "max_tokens", "generated": metered, "max": limit }),
             Trip::Usd { cost, limit } => json!({ "limit": "max_usd", "cost_usd": cost, "max": limit }),
-            Trip::UsdUnknown { unpriced } => json!({ "limit": "max_usd", "cost_usd": Value::Null, "unpriced": unpriced }),
+            Trip::UsdUnknown { unpriced, known } => {
+                json!({ "limit": "max_usd", "cost_usd": Value::Null, "cost_usd_at_least": known, "unpriced": unpriced })
+            }
         }
     }
 
     fn sentence(&self) -> String {
         match self {
-            Trip::Tokens { metered, limit } => format!("{metered} tokens metered, over --max-tokens {limit}"),
+            Trip::Tokens { metered, limit } => format!("{metered} tokens generated, over --max-tokens {limit}"),
             Trip::Usd { cost, limit } => {
                 format!("{} metered, over --max-usd {}", sessions::format_cost_precise(*cost), sessions::format_cost_precise(*limit))
             }
-            Trip::UsdUnknown { unpriced } => format!("the cost is unknown — no price for {}", unpriced.join(", ")),
+            Trip::UsdUnknown { unpriced, known } => {
+                format!("the cost is unknown — at least {}, with no price for {}", sessions::format_cost_precise(*known), unpriced.join(", "))
+            }
         }
     }
 }
@@ -100,21 +126,28 @@ impl Trip {
 pub fn check(m: &Metered, cost: &Priced, l: &Limits) -> Vec<Trip> {
     let mut out = Vec::new();
     if let Some(limit) = l.tokens
-        && m.total > limit
+        && m.generated > limit
     {
-        out.push(Trip::Tokens { metered: m.total, limit });
+        out.push(Trip::Tokens { metered: m.generated, limit });
     }
     if let Some(limit) = l.usd {
         match cost.total() {
             Some(c) if c > limit => out.push(Trip::Usd { cost: c, limit }),
             Some(_) => {}
-            None => out.push(Trip::UsdUnknown { unpriced: cost.missing().into_iter().collect() }),
+            None => out.push(Trip::UsdUnknown { unpriced: cost.missing().into_iter().collect(), known: cost.known_usd() }),
         }
     }
     out
 }
 
 fn limits(ctx: &Ctx) -> Result<Limits, Error> {
+    // A limit given blank — `--max-usd "$UNSET"` — is a mistake to name, not
+    // a check to switch off.
+    for (name, v) in [("max-usd", &ctx.f.max_usd), ("max-tokens", &ctx.f.max_tokens)] {
+        if ctx.f.given.contains(name) && v.trim().is_empty() {
+            return Err(fail("bad_flag", format!("--{name} was given with no value — pass the limit, or leave the flag out")));
+        }
+    }
     let usd = match ctx.f.max_usd.trim() {
         "" => None,
         v => Some(v.parse::<f64>().ok().filter(|x| x.is_finite() && *x >= 0.0).ok_or_else(|| {
@@ -136,18 +169,42 @@ fn limits(ctx: &Ctx) -> Result<Limits, Error> {
 pub fn budget(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
     sessions::check_os()?;
     let l = limits(ctx)?;
-    let d = sessions::load_detail(ctx, args, "budget")?;
-    let (_, cost) = sessions::price_turns(ctx, &d);
-    let metered = Metered::of(&d);
+    let (d, refreshed) = {
+        let conn = sessions::open_store(ctx)?;
+        let id = sessions::resolve_arg(ctx, &conn, args, "budget")?;
+        let s = sessions::load_by_id(ctx, &conn, &id)?.session;
+        drop(conn);
+        let refreshed = sessions::refresh_session(ctx, &s.binding_provider, &s.foreign_session_id)?;
+        let conn = sessions::open_store(ctx)?;
+        (sessions::load_by_id(ctx, &conn, &id)?, refreshed)
+    };
+    let (_, mut cost) = sessions::price_turns(ctx, &d);
+    let mut metered = Metered::of(&d);
+    let children = {
+        let conn = sessions::open_store(ctx)?;
+        let ids = krowk_store::descendant_session_ids(&conn, &d.session.id).map_err(|e| fail("store_unavailable", e.message().to_string()))?;
+        let mut n = 0;
+        for id in ids {
+            let child = sessions::load_by_id(ctx, &conn, &id)?;
+            cost.merge(sessions::price_turns(ctx, &child).1);
+            metered.merge(Metered::of(&child));
+            n += 1;
+        }
+        n
+    };
     let trips = check(&metered, &cost, &l);
     let s = &d.session;
     let mut report = json!({
         "id": s.id,
         "title": s.title,
+        "subagents": children,
         "metered": metered,
         "cost_usd": cost.total(),
+        "cost_display": cost.total().map_or("—".to_string(), sessions::format_cost_precise),
         "limits": { "max_usd": l.usd, "max_tokens": l.tokens },
         "within": trips.is_empty(),
+        "as_of_ms": sessions::now_ms(),
+        "refreshed": refreshed,
     });
     if !cost.bases.is_empty() {
         report["priced_with"] = json!(pricing::basis_note(&cost.bases));
@@ -170,12 +227,15 @@ pub fn budget(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         let summary = format!("{} — within budget", sessions::display_title(&sessions::cell(&s.title)));
         return sessions::emit_data(ctx, report, summary);
     }
-    let mut line = format!("within budget  {} tokens", metered.total);
+    let mut line = format!("within budget  {} tokens generated", metered.generated);
     if let Some(t) = l.tokens {
         line += &format!(" of {t}");
     }
     if let (Some(c), Some(u)) = (cost.total(), l.usd) {
         line += &format!("  {} of {}", sessions::format_cost_precise(c), sessions::format_cost_precise(u));
+    }
+    if !refreshed {
+        line += "  (as of the last import: another import is running)";
     }
     let _ = writeln!(ctx.io.stdout, "{line}");
     Ok(())
@@ -204,10 +264,10 @@ mod tests {
         // reasoning. Summing the cap would say 84 + 1200 — inside 2,000.
         let d = SessionDetail { turns: vec![turn(17, 3405, "unobserved"), turn(1379, 0, "observed")], ..SessionDetail::default() };
         let m = Metered::of(&d);
-        assert_eq!((m.output, m.reasoning, m.total), (17, 3405, 84 + 17 + 3405), "the observed row is metered in its transcript");
+        assert_eq!((m.output, m.reasoning, m.generated, m.total), (17, 3405, 3422, 84 + 17 + 3405), "the observed row is metered in its transcript");
         let trips = check(&m, &priced(Some(0.0)), &Limits { tokens: Some(2000), usd: None });
-        assert_eq!(trips, vec![Trip::Tokens { metered: 3506, limit: 2000 }]);
-        assert!(check(&m, &priced(Some(0.0)), &Limits { tokens: Some(3506), usd: None }).is_empty(), "at the limit is inside it");
+        assert_eq!(trips, vec![Trip::Tokens { metered: 3422, limit: 2000 }]);
+        assert!(check(&m, &priced(Some(0.0)), &Limits { tokens: Some(3422), usd: None }).is_empty(), "at the limit is inside it");
     }
 
     #[test]
@@ -223,6 +283,6 @@ mod tests {
         assert!(matches!(check(&Metered::default(), &p, &limits)[..], [Trip::Usd { .. }]), "$0.000123284 is over $0.000123");
         assert!(check(&Metered::default(), &p, &Limits { usd: Some(0.000_124), tokens: None }).is_empty());
         let unknown = check(&Metered::default(), &priced(None), &limits);
-        assert_eq!(unknown, vec![Trip::UsdUnknown { unpriced: vec!["p/m".into()] }]);
+        assert_eq!(unknown, vec![Trip::UsdUnknown { unpriced: vec!["p/m".into()], known: 0.0 }]);
     }
 }

@@ -47,7 +47,7 @@ fn db_path_string(ctx: &Ctx) -> String {
     krowk_store::db_path(ctx.io.env).map(|p| p.display().to_string()).unwrap_or_default()
 }
 
-fn open_store(ctx: &Ctx) -> Result<Connection, Error> {
+pub(super) fn open_store(ctx: &Ctx) -> Result<Connection, Error> {
     krowk_store::open(ctx.io.env).map_err(|e| store_fail(&e, &db_path_string(ctx)))
 }
 
@@ -115,7 +115,7 @@ pub(super) fn emit_data(ctx: &mut Ctx, data: Value, summary: String) -> Result<(
     ctx.emit(&rendered)
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
@@ -163,6 +163,24 @@ impl Priced {
     #[cfg(test)]
     pub(super) fn add_unknown(&mut self, pair: &str) {
         self.unpriced.insert(pair.into());
+    }
+
+    /// Another session's cost folded into this one: a parent and the
+    /// subagents it spawned spend together.
+    pub(super) fn merge(&mut self, o: Priced) {
+        self.usd += o.usd;
+        self.known |= o.known;
+        self.unpriced.extend(o.unpriced);
+        self.unpriced_empty.extend(o.unpriced_empty);
+        self.bases.extend(o.bases);
+        for (k, v) in o.by_model {
+            *self.by_model.entry(k).or_default() += v;
+        }
+    }
+
+    /// The dollars that could be priced, whatever could not be.
+    pub(super) fn known_usd(&self) -> f64 {
+        self.usd
     }
 
     fn add(&mut self, cost: Option<TurnCost>, provider: &str, model: &str, t: pricing::Tokens) {
@@ -489,29 +507,70 @@ fn pick_session(rows: &[SessionRow], now: i64) -> Result<String, Error> {
 
 /// The one session `krowk sessions <verb> <id>` names, read in full.
 pub(super) fn load_detail(ctx: &Ctx, args: &[String], verb: &str) -> Result<SessionDetail, Error> {
+    let conn = open_store(ctx)?;
+    let id = resolve_arg(ctx, &conn, args, verb)?;
+    load_by_id(ctx, &conn, &id)
+}
+
+pub(super) fn load_by_id(ctx: &Ctx, conn: &Connection, id: &str) -> Result<SessionDetail, Error> {
+    match krowk_store::load_session_detail(conn, id) {
+        Ok(d) => Ok(d),
+        Err(StoreError::NotFound(_)) => Err(fail("no_session", format!("no session {id:?}"))),
+        Err(e) => Err(store_fail(&e, &db_path_string(ctx))),
+    }
+}
+
+/// The session id `krowk sessions <verb> <id>` names.
+pub(super) fn resolve_arg(ctx: &Ctx, conn: &Connection, args: &[String], verb: &str) -> Result<String, Error> {
     let Some(reference) = args.first().filter(|a| !a.trim().is_empty()) else {
         return Err(fail("no_session", format!("pass the session: `krowk sessions {verb} <id>`")));
     };
     if args.len() > 1 {
         return Err(fail("bad_flag", format!("`krowk sessions {verb}` takes one session id, got extra {}", args[1..].join(" "))));
     }
-    let conn = open_store(ctx)?;
-    let id = match krowk_store::resolve_session_id(&conn, reference) {
-        Ok(id) => id,
-        Err(StoreError::Ambiguous { message, .. }) => return Err(fail("ambiguous_session", message)),
-        Err(StoreError::NotFound(_)) => {
-            return Err(fail(
-                "no_session",
-                format!("{:?} matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id", reference.trim()),
-            ));
-        }
-        Err(e) => return Err(store_fail(&e, &db_path_string(ctx))),
-    };
-    match krowk_store::load_session_detail(&conn, &id) {
-        Ok(d) => Ok(d),
-        Err(StoreError::NotFound(_)) => Err(fail("no_session", format!("no session {id:?}"))),
+    match krowk_store::resolve_session_id(conn, reference) {
+        Ok(id) => Ok(id),
+        Err(StoreError::Ambiguous { message, .. }) => Err(fail("ambiguous_session", message)),
+        Err(StoreError::NotFound(_)) => Err(fail(
+            "no_session",
+            format!("{:?} matches no session — pass a full id, an id prefix of at least 8 chars, or a foreign session id", reference.trim()),
+        )),
         Err(e) => Err(store_fail(&e, &db_path_string(ctx))),
     }
+}
+
+/// Re-reads the transcripts behind one session — its own and its
+/// subagents' — when they moved since the last import, so a check that must
+/// be current is. Holds the import lock while it writes; with another
+/// import holding it, reads nothing and says so (`Ok(false)`): that import
+/// is bringing the store up to date anyway.
+pub(super) fn refresh_session(ctx: &Ctx, provider: &str, foreign_id: &str) -> Result<bool, Error> {
+    let Some(source) = krowk_import::sources().into_iter().find(|s| s.name() == provider) else { return Ok(true) };
+    if foreign_id.is_empty() {
+        return Ok(true);
+    }
+    let store_path = resolve_store_path(ctx)?;
+    let _lock = match lock_store(&store_path) {
+        Ok(l) => l,
+        Err(e) if e.code() == "import_locked" && e.fix().starts_with("another") => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let conn = open_store(ctx)?;
+    let env = ctx.io.env;
+    let refs = source.discover(env).map_err(|e| fail("import_failed", format!("{provider}: {e}")))?;
+    let subagents = format!("/{foreign_id}/subagents/");
+    let writer = krowk_store::Writer::new(&conn);
+    for r in refs.iter().filter(|r| r.id == foreign_id || r.path.contains(&subagents)) {
+        let key = r.key();
+        let stored = krowk_store::read_import_state(&conn, &key).map_err(|e| store_fail(&e, &store_path))?;
+        if !stored.is_empty() && source.unchanged(env, r, &stored) {
+            continue;
+        }
+        let (thread, next, _) = source.read(env, r, &stored).map_err(|e| fail("import_failed", format!("{key}: {e}")))?;
+        writer.ingest_with_cursor(&thread, &key, &next).map_err(|e| store_fail(&e, &store_path))?;
+    }
+    krowk_store::reconcile_ledger(&conn).map_err(|e| store_fail(&e, &store_path))?;
+    Ok(true)
 }
 
 pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {

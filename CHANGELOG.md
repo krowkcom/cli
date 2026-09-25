@@ -37,10 +37,14 @@ the versions are the `v*` tags a release is cut from. Entries land under
   significant digits (`$0.00500`), and a ledger session whose rows all
   sit in transcripts reads `counted elsewhere`. A reported cost of 0 is
   treated as no report — opencode writes 0 for models it cannot price.
-- Claude turns keep their thinking tokens apart from output
+- **Claude usage is counted once per API message.** Claude Code writes one
+  transcript line per content block and repeats the message's usage on
+  each; turns summed every line, overstating tokens and cost (about 1.8×
+  on a real session). Each message now counts once, at its final usage.
+  Claude turns also keep thinking tokens apart from output
   (`output_tokens_details.thinking_tokens` → reasoning), as opencode and
-  ledger turns already did. Totals and prices are unchanged; `sessions
-  rebuild` applies it to sessions already imported.
+  ledger turns already did. Run `krowk sessions rebuild` to apply both to
+  sessions already imported — `sync` does not re-read them.
 - `sessions` lists in ~25 ms on a machine whose price cache holds the whole
   models.dev file (was ~80 ms): the cache is parsed without building the
   fields pricing never reads.
@@ -48,15 +52,20 @@ the versions are the `v*` tags a release is cut from. Entries land under
 ### Added
 
 - **`krowk sessions budget <id> --max-usd N --max-tokens N`** checks a
-  session against a spend limit by what the provider metered — every
-  input, output, reasoning and cache token in its usage blocks, plus any
-  ledger row nobody saw an answer to — never by the `max_tokens` its
-  requests asked for, which providers do not strictly enforce (a call
-  capped at 1,200 has metered 3,422). Over a limit it exits 4 with
-  `budget_exceeded` and the metered figures in `details`; a cost krowk
-  cannot price trips a `--max-usd` check rather than passing it. krowk
-  cancels nothing: the hook or wrapper that runs the check is what stops
-  the run. Dollars are compared unrounded.
+  session against a spend limit by what the provider metered, never by the
+  `max_tokens` its requests asked for — providers do not strictly enforce
+  it (a call capped at 1,200 has metered 3,422). It re-reads the session's
+  transcripts first when they moved, counts every subagent the session
+  spawned, and holds `--max-tokens` to generated tokens (output and
+  reasoning); input and cache tokens are reported and priced. Within its
+  limits it prints the report and exits 0; over one it exits 4 with
+  `budget_exceeded` and the report under `error.details` (on stderr). A
+  cost krowk cannot price trips `--max-usd`, with the priced part as a
+  lower bound. krowk cancels nothing — the hook or wrapper that runs the
+  check stops the run; a Claude Code hook blocks only on exit 2, so wire
+  it as `… || exit 2`. A provider-ledger row nobody saw an answer to is
+  budgeted with its ledger's session: nothing ties it to the run that
+  sent it.
 - **Provider usage ledgers.** A request your agent gave up on — a timeout,
   a killed shell, a Ctrl-C — can still finish and bill on the provider's
   side, and no transcript ever sees it. Drop the provider's per-request

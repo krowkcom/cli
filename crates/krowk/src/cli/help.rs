@@ -84,8 +84,11 @@ SESSIONS FLAGS
   --all                  On `sessions`, list every session, ignoring --limit
   --thinking             On `sessions show`, show full thinking parts
   --max-usd <n>          On `sessions budget`, trip over this metered cost
-  --max-tokens <n>       On `sessions budget`, trip over this many metered
-                         tokens (input, output, reasoning and cache)
+  --max-tokens <n>       On `sessions budget`, trip over this many generated
+                         tokens (output and reasoning) — the session's and
+                         its subagents'. Over a limit it exits 4; a Claude
+                         Code hook blocks only on exit 2, so wire it as
+                         `krowk sessions budget $ID --max-usd 5 || exit 2`
   --from <source>        On `sessions import`, whose transcripts to read:
                          claude, cursor, opencode, ledger, or all.
                          Required

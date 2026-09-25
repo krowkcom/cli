@@ -307,7 +307,7 @@ pub fn catalog(version: &str) -> Catalog {
                         args: vec![arg("id", "The session id, an unambiguous id prefix of at least 8 chars, or a foreign session id", true)],
                         flags: vec![
                             flag("max-usd", STRING, "Trip when the session's metered cost is over this many dollars"),
-                            flag("max-tokens", STRING, "Trip when the session's metered tokens are over this many"),
+                            flag("max-tokens", STRING, "Trip when the session's generated tokens (output and reasoning) are over this many"),
                         ],
                         ..cmd(
                             "budget",

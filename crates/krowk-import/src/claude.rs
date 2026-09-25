@@ -274,6 +274,8 @@ struct Origin {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ApiMessage {
+    #[serde(default, deserialize_with = "nullable")]
+    id: String,
     #[serde(rename = "role", deserialize_with = "nullable")]
     _role: String,
     #[serde(deserialize_with = "nullable")]
@@ -368,7 +370,8 @@ struct Builder {
     /// Last model named: where the session ended up after any switch.
     model: String,
     messages: Vec<Message>,
-    usages: Vec<TokenUsage>,
+    /// Each message's usage and the API message id it belongs to.
+    usages: Vec<(String, TokenUsage)>,
     candidates: Vec<TurnCandidate>,
     events: Vec<Event>,
 }
@@ -465,7 +468,7 @@ impl Builder {
             ..TurnCandidate::default()
         });
         self.messages.push(msg);
-        self.usages.push(usage);
+        self.usages.push((l.message.as_ref().map(|m| m.id.clone()).unwrap_or_default(), usage));
     }
 
     /// The line's uuid, or one synthesised from the ref and line number. A
@@ -534,7 +537,7 @@ impl Builder {
             turn_seq: None,
             parts,
         });
-        self.usages.push(TokenUsage::default());
+        self.usages.push((String::new(), TokenUsage::default()));
         self.candidates.push(TurnCandidate {
             role: Some(Role::System),
             meta: true,
@@ -640,7 +643,18 @@ impl Builder {
                     status: "done".into(),
                     ..Turn::default()
                 };
-                for u in self.usages.iter().take(span.end).skip(span.start) {
+                // Claude Code writes one line per content block, each
+                // repeating its API message's usage, output growing as it
+                // streams: a message is counted once, at its largest.
+                let mut calls: Vec<(&str, TokenUsage)> = Vec::new();
+                for (id, u) in self.usages.iter().take(span.end).skip(span.start) {
+                    match calls.iter_mut().find(|(seen, _)| !id.is_empty() && *seen == id.as_str()) {
+                        Some((_, best)) if u.output + u.reasoning > best.output + best.reasoning => *best = *u,
+                        Some(_) => {}
+                        None => calls.push((id, *u)),
+                    }
+                }
+                for (_, u) in calls {
                     u.add_to(&mut t);
                 }
                 t
@@ -1555,6 +1569,18 @@ mod tests {
         let links: Vec<(Option<i64>, &str)> = th.messages.iter().map(|m| (m.turn_seq, m.model.as_str())).collect();
         assert_eq!(links, vec![(Some(0), ""), (Some(0), "claude-opus-5"), (Some(1), ""), (Some(1), "claude-sonnet-5"), (Some(1), "<synthetic>")]);
         assert_eq!(th.session.model, "claude-sonnet-5", "a synthetic line names no session model");
+        // msg_2 streams as two more lines of one call: counted once, at its end.
+        let more = [
+            line("assistant", "a4", json!({ "id": "msg_2", "role": "assistant", "model": "claude-sonnet-5", "content": [{ "type": "tool_use", "id": "t1", "name": "Bash", "input": {} }], "usage": { "input_tokens": 1, "output_tokens": 40, "output_tokens_details": { "thinking_tokens": 30 } } })),
+            line("assistant", "a5", json!({ "id": "msg_2", "role": "assistant", "model": "claude-sonnet-5", "content": [{ "type": "text", "text": "x" }], "usage": { "input_tokens": 1, "output_tokens": 40, "output_tokens_details": { "thinking_tokens": 30 } } })),
+        ]
+        .join("\n");
+        let path = slug.join(format!("{sid}.jsonl"));
+        let body = std::fs::read_to_string(&path).unwrap() + &more + "\n";
+        std::fs::write(&path, body).unwrap();
+        let (th, _, _) = Claude.read(&env, &r, "").unwrap();
+        let t = &th.turns[1];
+        assert_eq!((t.cost_input, t.cost_output, t.cost_reasoning), (1 + 1, 1 + 10, 30), "msg_2 once at 40 (30 thinking), msg_3 once");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

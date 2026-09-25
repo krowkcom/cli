@@ -262,7 +262,7 @@ pub fn refresh_within(env: &dyn Fn(&str) -> String, url: &str, timeout: Duration
             if parse_rates(&body).is_none_or(|t| t.is_empty()) {
                 return Ok(Outcome::Unreachable("models.dev answered with something that is not a price file".into()));
             }
-            write_atomic(&path, &body).map_err(|e| e.to_string())?;
+            write_atomic(&path, &body).map_err(|e| format!("pricing: write {}: {e}", path.display()))?;
             stamp_meta(&path, if new_etag.is_empty() { &etag } else { &new_etag }).map_err(|e| format!("pricing: stamp {}: {e}", meta_path(&path).display()))?;
             *LOADED.lock().unwrap_or_else(|e| e.into_inner()) = None;
             Ok(Outcome::Refreshed)

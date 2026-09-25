@@ -964,8 +964,8 @@ fn sync_prices_from(env: &dyn Fn(&str) -> String, no_network: bool, url: &str, n
     if pricing::cache_path(env).is_none() {
         return failed("prices were not refreshed: no cache directory in the environment".into());
     }
-    let day = (PRICING_MAX_AGE.as_millis() as i64) / 86_400_000;
-    if pricing::Freshness::of(env).age_days(now).is_some_and(|d| d < day) {
+    let fetched = pricing::Freshness::of(env).fetched_at_ms().filter(|f| *f <= now);
+    if fetched.is_some_and(|f| now - f < PRICING_MAX_AGE.as_millis() as i64) {
         return SyncPricing { status: "fresh", warning: String::new() };
     }
     match pricing::refresh_within(env, url, Duration::from_secs(3)) {
@@ -1234,7 +1234,7 @@ pub fn pricing_refresh(ctx: &mut Ctx) -> Result<(), Error> {
     let path = pricing::cache_path(ctx.io.env).unwrap_or_default();
     if ctx.format != Format::Human {
         let fresh = pricing::Freshness::of(ctx.io.env);
-        let report = json!({
+        let mut report = json!({
             "meta_path": pricing::meta_path(&path).display().to_string(),
             "path": path.display().to_string(),
             "refreshed": refreshed,
@@ -1248,13 +1248,16 @@ pub fn pricing_refresh(ctx: &mut Ctx) -> Result<(), Error> {
                 pricing::Outcome::Unreachable(_) => "unreachable",
             },
         });
+        if let pricing::Outcome::Unreachable(why) = &outcome {
+            report["warning"] = json!(why);
+        }
         return ctx.emit(&output::encode(&report));
     }
-    if refreshed {
-        let _ = writeln!(ctx.io.stdout, "prices refreshed from {}", pricing::MODELS_URL);
-    } else {
-        let _ = writeln!(ctx.io.stdout, "prices unchanged (snapshot {})", pricing::SNAPSHOT_DATE);
-    }
+    let _ = match &outcome {
+        pricing::Outcome::Refreshed => writeln!(ctx.io.stdout, "prices refreshed from {}", pricing::MODELS_URL),
+        pricing::Outcome::Unchanged => writeln!(ctx.io.stdout, "prices unchanged — models.dev confirmed the cache"),
+        pricing::Outcome::Unreachable(why) => writeln!(ctx.io.stdout, "prices not refreshed: {why}"),
+    };
     let _ = writeln!(ctx.io.stdout, "cache: {}", path.display());
     let _ = writeln!(ctx.io.stdout, "{}", pricing::Freshness::of(ctx.io.env).describe(now_ms()));
     Ok(())
@@ -1374,7 +1377,8 @@ mod tests {
         assert!(seen[1].contains("if-none-match: \"v1\""), "the refresh is conditional: {seen:?}");
         assert!(pricing::Freshness::of(&env).describe(now_ms()).ends_with(", today"));
         assert_eq!(sync_prices_from(&env, true, &url, now).status, "no_network");
-        assert_eq!(pricing::price(&env, "p", "m").map(|r| (r.input, r.output)), Some((1.0, 2.0)), "the stale file was replaced");
+        let got: serde_json::Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+        assert_eq!(got["p"]["models"]["m"]["cost"], serde_json::json!({ "input": 1, "output": 2 }), "the stale file was replaced");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

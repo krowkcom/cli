@@ -245,7 +245,7 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                 if calls.is_empty() {
                     // An answer that crossed a steer in flight is not the
                     // end: the model has not read it yet.
-                    if ctx.steers.is_empty() {
+                    if ctx.steers.close_if_empty() {
                         return Ok(TurnEnd::Completed);
                     }
                     continue;

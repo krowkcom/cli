@@ -92,21 +92,55 @@ pub struct TurnContext {
 /// the host pushes onto and the engine drains between model calls. Shared,
 /// because the host's `execute(Steer)` and the engine's loop run
 /// concurrently; a plain mutex, because neither holds it across an await.
+///
+/// Closing is what makes a steer either read or refused, never lost: the
+/// engine closes the queue in the same locked step as its last check that
+/// it is empty, and the host closes it when the turn is over, so a push that
+/// comes after either is told so instead of being queued for nobody.
 #[derive(Debug, Clone, Default)]
-pub struct Steers(Arc<Mutex<Vec<String>>>);
+pub struct Steers(Arc<Mutex<SteerQueue>>);
+
+#[derive(Debug, Default)]
+struct SteerQueue {
+    waiting: Vec<String>,
+    closed: bool,
+}
 
 impl Steers {
-    pub fn push(&self, text: String) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(text);
+    fn lock(&self) -> std::sync::MutexGuard<'_, SteerQueue> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queues `text`, or hands it back when the turn takes no more.
+    pub fn push(&self, text: String) -> Result<(), String> {
+        let mut q = self.lock();
+        if q.closed {
+            return Err(text);
+        }
+        q.waiting.push(text);
+        Ok(())
     }
 
     /// Everything waiting, oldest first, leaving the queue empty.
     pub fn take(&self) -> Vec<String> {
-        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+        std::mem::take(&mut self.lock().waiting)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    /// Closes the queue if nothing is waiting, and says whether it did: the
+    /// engine's "may this turn end" — false means there is steering to read.
+    pub fn close_if_empty(&self) -> bool {
+        let mut q = self.lock();
+        if q.waiting.is_empty() {
+            q.closed = true;
+        }
+        q.closed
+    }
+
+    /// Closes the queue whatever it holds, and returns what was never taken.
+    pub fn close(&self) -> Vec<String> {
+        let mut q = self.lock();
+        q.closed = true;
+        std::mem::take(&mut q.waiting)
     }
 }
 
@@ -175,5 +209,28 @@ pub trait Engine: Send + Sync {
 pub async fn cancelled(cancel: &mut watch::Receiver<bool>) {
     if cancel.wait_for(|c| *c).await.is_err() {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The race, forced: the engine makes its last "anything to read?" check
+    /// and a steer arrives right after. It must be refused, back to the
+    /// sender, never queued for a turn that has decided to end.
+    #[test]
+    fn r_proto_1_a_steer_after_the_last_check_is_refused_not_lost() {
+        let s = Steers::default();
+        s.push("first".into()).unwrap();
+        assert!(!s.close_if_empty(), "steering waiting: the turn goes on");
+        assert_eq!(s.take(), ["first"]);
+        assert!(s.close_if_empty(), "nothing waiting: the turn may end");
+        assert_eq!(s.push("too late".into()), Err("too late".to_string()), "refused, and handed back");
+        assert!(s.take().is_empty());
+        let t = Steers::default();
+        t.push("never read".into()).unwrap();
+        assert_eq!(t.close(), ["never read"], "a turn that stops early returns what it never took");
+        assert!(t.push("x".into()).is_err());
     }
 }

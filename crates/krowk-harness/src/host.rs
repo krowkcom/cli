@@ -108,10 +108,9 @@ impl Host {
                 }
                 let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
                 match running.get(&session_id) {
-                    Some(r) => {
-                        r.steers.push(text);
-                        Ok(None)
-                    }
+                    Some(r) if r.steers.push(text).is_ok() => Ok(None),
+                    // The turn has taken its last input and is ending.
+                    Some(_) => Err(EngineError::new("turn_ending", format!("the turn in session {session_id} is finishing and reads no more input — send it as the next prompt"))),
                     None => Err(EngineError::new("no_running_turn", format!("session {session_id} has no turn running to steer — send it as a prompt instead"))),
                 }
             }
@@ -179,9 +178,13 @@ impl Host {
         let (cancel_tx, cancel) = watch::channel(false);
         let steers = Steers::default();
         self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), Running { cancel: cancel_tx, steers: steers.clone() });
-        let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, preset, effort, model_info: info, cancel, steers };
+        let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, preset, effort, model_info: info, cancel, steers: steers.clone() };
         let mut tally = Tally::default();
         let outcome = w.drive(engine.as_ref(), ctx, &mut tally, &model, &instance, &self.cfg.pricer).await;
+        // Refused from here on, not queued for a turn that is over. What an
+        // interrupted or failed turn never took, the client that sent it
+        // still has.
+        steers.close();
         self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&session_id);
 
         let (status, error) = match outcome {

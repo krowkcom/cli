@@ -24,7 +24,6 @@ use crate::protocol::{Item, LogBody, LogEvent, TurnStatus, Usage};
 use krowk_import::{encode_cursor, Env, ImportError, JsonlCursor, ReadResult, Ref, Source};
 use krowk_store::{Binding, Message, Part, Role, Session, Thread, Turn};
 use serde_json::json;
-use std::collections::HashMap;
 use std::path::Path;
 
 pub const HARNESS: &str = "krowk";
@@ -80,8 +79,12 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
         },
         ..Thread::default()
     };
-    // Items waiting for the response that claims them.
-    let mut pending: HashMap<&str, (&str, &Item)> = HashMap::new();
+    // Items waiting for the response that claims them. Items no response
+    // claims — a response that failed mid-stream — are flushed when their
+    // turn ends (or the next begins), under that turn: the same message in
+    // the same place whether the log is read after that turn or long after,
+    // so a rebuild and an incremental import agree (R-LOG-2).
+    let mut pending: Vec<(&str, &str, &Item)> = Vec::new();
     let mut provider = String::new();
     let mut turn: Option<i64> = None;
     for ev in &branch {
@@ -89,6 +92,7 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
         match &ev.body {
             LogBody::SessionStarted { .. } => {}
             LogBody::TurnStarted { model, provider: p, .. } => {
+                flush(&mut th, &mut pending, &provider, turn);
                 provider.clone_from(p);
                 th.session.model.clone_from(&model.model);
                 th.session.provider.clone_from(p);
@@ -106,12 +110,15 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
                     "",
                     vec![krowk_import::new_tool_result_text_part(call_id, output, *is_error)],
                 )),
-                _ => {
-                    pending.insert(item_id, (&ev.id, item));
-                }
+                _ => pending.push((item_id, &ev.id, item)),
             },
             LogBody::ResponseCompleted { model, usage, item_ids, .. } => {
-                let parts: Vec<Part> = item_ids.iter().filter_map(|id| pending.remove(id.as_str())).map(|(_, item)| part(item)).collect();
+                let mut parts = Vec::new();
+                for id in item_ids {
+                    if let Some(at) = pending.iter().position(|(i, _, _)| *i == id.as_str()) {
+                        parts.push(part(pending.remove(at).2));
+                    }
+                }
                 let usage_json = serde_json::to_string(usage).expect("usage serializes");
                 th.messages.push(message(Role::Assistant, &provider, model, &ev.id, turn, &usage_json, parts));
                 if let Some(t) = turn.and_then(|t| th.turns.get_mut(t as usize)) {
@@ -119,6 +126,7 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
                 }
             }
             LogBody::TurnCompleted { status, .. } => {
+                flush(&mut th, &mut pending, &provider, turn);
                 if let Some(t) = turn.and_then(|t| th.turns.get_mut(t as usize)) {
                     t.status = match status {
                         TurnStatus::Completed => "done",
@@ -130,14 +138,18 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
             }
         }
     }
-    // Items no response claimed — a log cut off mid-response — still say
-    // what was produced.
-    let mut orphans: Vec<(&str, &Item)> = pending.into_values().collect();
-    orphans.sort_by_key(|(id, _)| *id);
-    for (id, item) in orphans {
-        th.messages.push(message(Role::Assistant, &provider, &th.session.model.clone(), id, turn, "", vec![part(item)]));
-    }
+    // A log that ends mid-turn: its items still say what was produced.
+    flush(&mut th, &mut pending, &provider, turn);
     Some(th)
+}
+
+/// Each unclaimed item as an assistant message of its own, in log order,
+/// keyed by its log event.
+fn flush(th: &mut Thread, pending: &mut Vec<(&str, &str, &Item)>, provider: &str, turn: Option<i64>) {
+    let model = th.session.model.clone();
+    for (_, event_id, item) in pending.drain(..) {
+        th.messages.push(message(Role::Assistant, provider, &model, event_id, turn, "", vec![part(item)]));
+    }
 }
 
 fn event_type(b: &LogBody) -> &'static str {
@@ -181,4 +193,76 @@ fn add_usage(t: &mut Turn, u: &Usage) {
     t.cost_cache_read += u.cache_read_tokens;
     t.cost_cache_write += u.cache_write_tokens;
     t.cost_total += u.total();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ModelRef, PermissionMode, WireApi};
+
+    /// A log as the host writes it: each event hangs from the one before.
+    fn log(bodies: Vec<LogBody>) -> Vec<LogEvent> {
+        let session = krowk_store::new_id();
+        let mut out: Vec<LogEvent> = Vec::new();
+        for (i, body) in bodies.into_iter().enumerate() {
+            let id = if i == 0 { session.clone() } else { krowk_store::new_id() };
+            out.push(LogEvent { id, parent_id: out.last().map(|e| e.id.clone()), session_id: session.clone(), time_ms: 0, body });
+        }
+        out
+    }
+
+    fn turn(t: &str, prompt: &str) -> Vec<LogBody> {
+        vec![
+            LogBody::TurnStarted {
+                turn_id: t.into(),
+                model: ModelRef { instance: "anthropic".into(), model: "m".into() },
+                provider: "anthropic".into(),
+                wire_api: WireApi::AnthropicMessages,
+                permission_mode: PermissionMode::Default,
+            },
+            LogBody::ItemCompleted { turn_id: t.into(), item_id: format!("{t}-p"), item: Item::UserText { text: prompt.into() } },
+        ]
+    }
+
+    fn rows(env: &dyn Fn(&str) -> String, th: &Thread) -> Vec<String> {
+        let conn = krowk_store::open(env).unwrap();
+        krowk_store::Writer::new(&conn).ingest(th).unwrap();
+        let id = krowk_store::list_sessions(&conn, "", "", 5).unwrap()[0].id.clone();
+        let d = krowk_store::load_session_detail(&conn, &id).unwrap();
+        let turns = d.turns.iter().map(|t| format!("turn {} {}", t.seq, t.status));
+        let msgs = d.messages.iter().map(|m| format!("{} {} [{}]", m.seq, m.role, m.parts.iter().map(|p| p.data.clone()).collect::<Vec<_>>().join(", ")));
+        turns.chain(msgs).collect()
+    }
+
+    #[test]
+    fn r_log_2_a_turn_that_failed_mid_response_projects_the_same_incrementally_and_on_rebuild() {
+        let mut bodies = vec![LogBody::SessionStarted { cwd: "/nowhere".into(), krowk_version: "t".into(), protocol_version: 1 }];
+        bodies.extend(turn("t1", "first"));
+        // The response streamed a text item, then failed: no response.completed.
+        bodies.push(LogBody::ItemCompleted { turn_id: "t1".into(), item_id: "t1-a".into(), item: Item::AssistantText { text: "half an answer".into() } });
+        bodies.push(LogBody::TurnCompleted { turn_id: "t1".into(), status: TurnStatus::Failed, usage: Usage::default(), duration_ms: 1, error: None });
+        let after_first = bodies.len();
+        bodies.extend(turn("t2", "second"));
+        bodies.push(LogBody::ItemCompleted { turn_id: "t2".into(), item_id: "t2-a".into(), item: Item::AssistantText { text: "done".into() } });
+        bodies.push(LogBody::ResponseCompleted { turn_id: "t2".into(), response_id: None, model: "m".into(), usage: Usage::default(), stop_reason: None, item_ids: vec!["t2-a".into()] });
+        bodies.push(LogBody::TurnCompleted { turn_id: "t2".into(), status: TurnStatus::Completed, usage: Usage::default(), duration_ms: 1, error: None });
+        let events = log(bodies);
+
+        let home = std::env::temp_dir().join(format!("krowk-harness-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let h = home.display().to_string();
+        let env = move |k: &str| if k == "HOME" { h.clone() } else { String::new() };
+        let project = |evs: &[LogEvent]| thread(evs, &mut ReadResult::default()).unwrap();
+
+        // Incremental: projected after the failed turn, then after the next.
+        rows(&env, &project(&events[..after_first]));
+        let incremental = rows(&env, &project(&events));
+        // Rebuild: the whole log into a fresh store.
+        std::fs::remove_file(krowk_store::db_path(&env).unwrap()).unwrap();
+        let rebuilt = rows(&env, &project(&events));
+        assert_eq!(incremental, rebuilt);
+        assert!(rebuilt.iter().any(|r| r.contains("half an answer")), "{rebuilt:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

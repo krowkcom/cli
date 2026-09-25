@@ -275,6 +275,19 @@ impl Tmux {
         None
     }
 
+    /// As `wait_for`, over the whole history: a fast stream scrolls a line
+    /// past the screen before a poll of the screen alone can see it.
+    fn wait_in_history(&self, needle: &str, timeout: Duration) -> Option<Duration> {
+        let t0 = Instant::now();
+        while t0.elapsed() < timeout {
+            if self.history().contains(needle) {
+                return Some(t0.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        None
+    }
+
     fn wait_gone(&self, needle: &str, timeout: Duration) -> Option<Duration> {
         let t0 = Instant::now();
         while t0.elapsed() < timeout {
@@ -342,7 +355,7 @@ fn r_tui_3_a_resize_mid_stream_never_repeats_a_line_or_leaves_the_live_region_be
     let Some(tm) = Tmux::start("resize", 100, 30, &b.root.join("repo"), &b.env(&m.url), &[]) else { return };
     assert!(tm.wait_for("ask anything", Duration::from_secs(10)).is_some(), "{}", tm.screen());
     tm.keys(&["go", "Enter"]);
-    assert!(tm.wait_for("line 00020", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    assert!(tm.wait_in_history("line 00020", Duration::from_secs(30)).is_some(), "{}", tm.screen());
     tm.tmux(&["resize-window", "-t", "t", "-x", "70", "-y", "20"]);
     assert!(tm.wait_for("tokens", Duration::from_secs(60)).is_some(), "{}", tm.screen());
     tm.tmux(&["resize-window", "-t", "t", "-x", "120", "-y", "40"]);
@@ -357,8 +370,10 @@ fn r_tui_3_a_resize_mid_stream_never_repeats_a_line_or_leaves_the_live_region_be
     let mut sorted = seen.clone();
     sorted.dedup();
     assert_eq!(sorted, seen, "a line twice, or out of order:\n{history}");
-    assert!((40..=300).all(|n| seen.contains(&n)), "a line after the resize is missing:\n{history}");
-    assert!(seen.len() >= 295, "more than a frame's worth lost at the resize: {} of 300", seen.len());
+    // At most the one line in flight at each of the two resizes.
+    let missing: Vec<u32> = (1..=300).filter(|n| !seen.contains(n)).collect();
+    assert!(missing.len() <= 2, "more than a line lost per resize: {missing:?}\n{history}");
+    assert!(seen.contains(&300), "the end of the answer is there:\n{history}");
     for live in ["esc to interrupt", "type to steer"] {
         assert!(!history.contains(live), "the old live region was left in scrollback:\n{history}");
     }
@@ -534,7 +549,7 @@ fn r_off_1_a_cut_network_shows_the_notice_within_two_seconds_and_nothing_hangs()
     let Some(tm) = Tmux::start("offline", 100, 30, &b.root.join("repo"), &b.env(&relay.url()), &[]) else { return };
     assert!(tm.wait_for("online", Duration::from_secs(10)).is_some(), "{}", tm.screen());
     tm.keys(&["tell me everything", "Enter"]);
-    assert!(tm.wait_for("line 00003", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    assert!(tm.wait_in_history("line 00003", Duration::from_secs(10)).is_some(), "{}", tm.screen());
 
     relay.cut.store(true, Ordering::SeqCst);
     let shown = tm.wait_for("no network connectivity", Duration::from_secs(5)).unwrap_or_else(|| panic!("no notice:\n{}", tm.screen()));

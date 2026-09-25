@@ -239,13 +239,70 @@ impl Hangups {
     }
 }
 
-/// Where the terminal says the cursor is. Stopping the key reader leaves
-/// its wake-up pending when it was not mid-read, and that wake-up would fail
-/// the ask at once — so a zero-timeout poll takes it first, without asking
-/// the terminal anything. A second ask covers the race where it could not.
+/// Where the terminal says the cursor is, asked after the key reader has
+/// stopped (a resize, a job stop).
+///
+/// Not through crossterm's `cursor::position`: that fails at once when the
+/// reader's wake-up is still pending, and the answer to the query it had
+/// already written then waits in crossterm's queue, where the next ask —
+/// at the next resize — takes it for the answer to its own, one resize
+/// stale. So the reader is let settle (a zero-length wait for an event
+/// takes the wake-up, and returns once nothing else holds the terminal's
+/// input), and the query is written and its answer read here, on the
+/// terminal itself, one query and one answer.
+#[cfg(unix)]
+fn cursor_row() -> Option<u16> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let _ = crossterm::event::poll(Duration::from_millis(20));
+    let mut tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").ok()?;
+    tty.write_all(b"\x1b[6n").ok()?;
+    tty.flush().ok()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut got = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        if let Some(row) = parse_cursor_report(&got) {
+            return Some(row);
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() || got.len() > 4096 {
+            return None;
+        }
+        let mut pfd = libc::pollfd { fd: tty.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one pollfd, owned here, for the length of the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, left.as_millis().min(1000) as i32) };
+        if ready <= 0 {
+            continue;
+        }
+        match tty.read(&mut buf) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
+#[cfg(not(unix))]
 fn cursor_row() -> Option<u16> {
     let _ = crossterm::event::poll(Duration::ZERO);
     (0..2).find_map(|_| crossterm::cursor::position().ok()).map(|(_, y)| y)
+}
+
+/// The row of the first `ESC [ row ; col R` in `bytes`, zero-based.
+fn parse_cursor_report(bytes: &[u8]) -> Option<u16> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut rest = text.as_ref();
+    while let Some(i) = rest.find("\x1b[") {
+        let tail = &rest[i + 2..];
+        if let Some(end) = tail.find('R')
+            && let Some((row, col)) = tail[..end].split_once(';')
+            && let (Ok(row), Ok(_)) = (row.parse::<u16>(), col.parse::<u16>())
+        {
+            return Some(row.saturating_sub(1));
+        }
+        rest = tail;
+    }
+    None
 }
 
 /// The next of an optional stream, or never.
@@ -673,5 +730,15 @@ impl<'h> Ui<'h> {
         }
         self.prompt(app, text);
         app.offline.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_cursor_report_is_read_past_whatever_came_before_it() {
+        assert_eq!(super::parse_cursor_report(b"\x1b[12;40R"), Some(11));
+        assert_eq!(super::parse_cursor_report(b"ab\x1b[A\x1b[3;1R"), Some(2), "a key typed meanwhile is skipped");
+        assert_eq!(super::parse_cursor_report(b"\x1b[3;1"), None, "not whole yet");
     }
 }

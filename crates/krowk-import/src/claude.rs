@@ -766,7 +766,7 @@ fn clean(p: &Path) -> PathBuf {
 /// whatever is on PATH per session and answer by the user's config. The walk
 /// only stats names, bounded by the root. No `.git` above is not an error:
 /// the directory is its own worktree, with vcs `none`.
-fn worktree_of(dir: &str) -> (String, &'static str) {
+pub(crate) fn worktree_of(dir: &str) -> (String, &'static str) {
     if dir.is_empty() {
         return (String::new(), VCS_NONE);
     }
@@ -795,7 +795,7 @@ fn fallback_worktree(transcript_dir: &str) -> (String, &'static str) {
 }
 
 /// The worktree's display name; an empty path has none.
-fn base_name(path: &str) -> String {
+pub(crate) fn base_name(path: &str) -> String {
     if path.is_empty() {
         return String::new();
     }

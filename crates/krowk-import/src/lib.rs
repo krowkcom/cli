@@ -32,6 +32,14 @@ pub const PROVIDER_CURSOR: &str = "cursor";
 pub const PROVIDER_OPENCODE: &str = "opencode";
 pub const PROVIDER_LEDGER: &str = "ledger";
 
+/// The worktree a session that ran in `dir` belongs to: the nearest
+/// ancestor holding a `.git`, else the directory itself with vcs `none` —
+/// the rule the Claude importer applies, for sources that record a cwd.
+pub fn worktree_for(dir: &str) -> krowk_store::Worktree {
+    let (path, vcs) = claude::worktree_of(dir);
+    krowk_store::Worktree { name: claude::base_name(&path), path, vcs: vcs.into() }
+}
+
 /// Every source, in the order `--from all` reads them: the transcripts,
 /// then the provider ledgers they are reconciled against.
 pub fn sources() -> Vec<Box<dyn Source>> {

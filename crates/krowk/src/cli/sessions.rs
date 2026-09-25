@@ -539,38 +539,85 @@ pub(super) fn resolve_arg(ctx: &Ctx, conn: &Connection, args: &[String], verb: &
     }
 }
 
-/// Re-reads the transcripts behind one session — its own and its
-/// subagents' — when they moved since the last import, so a check that must
-/// be current is. Holds the import lock while it writes; with another
-/// import holding it, reads nothing and says so (`Ok(false)`): that import
-/// is bringing the store up to date anyway.
-pub(super) fn refresh_session(ctx: &Ctx, provider: &str, foreign_id: &str) -> Result<bool, Error> {
-    let Some(source) = krowk_import::sources().into_iter().find(|s| s.name() == provider) else { return Ok(true) };
-    if foreign_id.is_empty() {
-        return Ok(true);
+/// What `refresh_session` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Refresh {
+    /// Every transcript behind the session was already in the store.
+    Current,
+    /// Something had moved, and was imported.
+    Imported,
+    /// The session's source cannot be re-read one session at a time (a
+    /// Cursor or ledger session, or one with no foreign id).
+    NotRefreshable,
+}
+
+/// How long a check waits for another import to finish before failing.
+const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(15);
+
+/// Re-reads the transcripts behind one or more sessions of one source — by
+/// foreign id, Claude subagent files under them, and any transcript the
+/// store has never seen (a subagent or session started since the last
+/// import) — when they moved, so a check that must be current is. What moved
+/// is found before the import lock is taken, so a check with nothing to
+/// read never waits; one that must write waits for another import to
+/// finish, and fails closed (`import_locked`) rather than answer stale.
+pub(super) fn refresh_session(ctx: &Ctx, provider: &str, foreign_ids: &[String]) -> Result<Refresh, Error> {
+    let foreign_ids: Vec<&String> = foreign_ids.iter().filter(|f| !f.is_empty()).collect();
+    let Some(source) = krowk_import::sources().into_iter().find(|s| s.name() == provider) else { return Ok(Refresh::NotRefreshable) };
+    if foreign_ids.is_empty() || matches!(provider, krowk_import::PROVIDER_LEDGER | krowk_import::PROVIDER_CURSOR) {
+        return Ok(Refresh::NotRefreshable);
     }
     let store_path = resolve_store_path(ctx)?;
-    let _lock = match lock_store(&store_path) {
-        Ok(l) => l,
-        Err(e) if e.code() == "import_locked" && e.fix().starts_with("another") => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    let conn = open_store(ctx)?;
     let env = ctx.io.env;
     let refs = source.discover(env).map_err(|e| fail("import_failed", format!("{provider}: {e}")))?;
-    let subagents = format!("/{foreign_id}/subagents/");
-    let writer = krowk_store::Writer::new(&conn);
-    for r in refs.iter().filter(|r| r.id == foreign_id || r.path.contains(&subagents)) {
-        let key = r.key();
-        let stored = krowk_store::read_import_state(&conn, &key).map_err(|e| store_fail(&e, &store_path))?;
-        if !stored.is_empty() && source.unchanged(env, r, &stored) {
-            continue;
+    let subagents: Vec<String> = foreign_ids.iter().map(|f| format!("/{f}/subagents/")).collect();
+    let moved = |conn: &Connection| -> Result<Vec<(Ref, String)>, Error> {
+        let mut out = Vec::new();
+        for r in &refs {
+            let key = r.key();
+            let stored = krowk_store::read_import_state(conn, &key).map_err(|e| store_fail(&e, &store_path))?;
+            let ours = foreign_ids.iter().any(|f| r.id == **f) || subagents.iter().any(|s| r.path.contains(s.as_str()));
+            if (ours || stored.is_empty()) && !(!stored.is_empty() && source.unchanged(env, r, &stored)) {
+                out.push((r.clone(), stored));
+            }
         }
-        let (thread, next, _) = source.read(env, r, &stored).map_err(|e| fail("import_failed", format!("{key}: {e}")))?;
+        Ok(out)
+    };
+    if moved(&open_store(ctx)?)?.is_empty() {
+        return Ok(Refresh::Current);
+    }
+    let _lock = lock_store_waiting(&store_path, REFRESH_LOCK_WAIT)?;
+    let conn = open_store(ctx)?;
+    // Asked again under the lock: the import that held it may have done the work.
+    let todo = moved(&conn)?;
+    if todo.is_empty() {
+        return Ok(Refresh::Current);
+    }
+    let writer = krowk_store::Writer::new(&conn);
+    for (r, stored) in &todo {
+        let key = r.key();
+        let (thread, next, _) = source.read(env, r, stored).map_err(|e| fail("import_failed", format!("{key}: {e}")))?;
         writer.ingest_with_cursor(&thread, &key, &next).map_err(|e| store_fail(&e, &store_path))?;
     }
     krowk_store::reconcile_ledger(&conn).map_err(|e| store_fail(&e, &store_path))?;
-    Ok(true)
+    Ok(Refresh::Imported)
+}
+
+/// `lock_store`, waiting up to `wait` for an import that holds it.
+fn lock_store_waiting(store_path: &str, wait: Duration) -> Result<std::fs::File, Error> {
+    let started = Instant::now();
+    loop {
+        match try_lock_store(store_path)? {
+            Some(f) => return Ok(f),
+            None if started.elapsed() < wait => std::thread::sleep(Duration::from_millis(100)),
+            None => {
+                return Err(fail(
+                    "import_locked",
+                    format!("another import held the store for {}s, so the session could not be brought up to date — retry once it finishes", wait.as_secs()),
+                ));
+            }
+        }
+    }
 }
 
 pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
@@ -1235,6 +1282,21 @@ fn import_summary(r: &ImportReport) -> String {
 /// drops the lock however the process dies, so a killed import leaves a
 /// stale file and no stale lock. Dropping the returned file releases it.
 fn lock_store(store_path: &str) -> Result<std::fs::File, Error> {
+    try_lock_store(store_path)?.ok_or_else(|| {
+        let path = Path::new(store_path).parent().unwrap_or(Path::new(".")).join("import.lock");
+        fail(
+            "import_locked",
+            format!(
+                "another `krowk sessions import` or `rebuild` is running on this store — wait for it to finish, or check {} if you think it is not",
+                path.display()
+            ),
+        )
+    })
+}
+
+/// The lock, or None when somebody else holds it; an error only for a lock
+/// that could not be taken at all.
+fn try_lock_store(store_path: &str) -> Result<Option<std::fs::File>, Error> {
     let dir = Path::new(store_path).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -1242,16 +1304,11 @@ fn lock_store(store_path: &str) -> Result<std::fs::File, Error> {
         .create(&dir)
         .map_err(|e| fail("store_unavailable", e.to_string()))?;
     let path = dir.join("import.lock");
-    lock_file(&path).map_err(|held| match held {
-        None => fail(
-            "import_locked",
-            format!(
-                "another `krowk sessions import` or `rebuild` is running on this store — wait for it to finish, or check {} if you think it is not",
-                path.display()
-            ),
-        ),
-        Some(why) => fail("import_locked", format!("the import lock at {} could not be taken: {why}", path.display())),
-    })
+    match lock_file(&path) {
+        Ok(f) => Ok(Some(f)),
+        Err(None) => Ok(None),
+        Err(Some(why)) => Err(fail("import_locked", format!("the import lock at {} could not be taken: {why}", path.display()))),
+    }
 }
 
 trait PrivateDir {
@@ -1288,7 +1345,8 @@ fn lock_file(path: &Path) -> Result<std::fs::File, Option<String>> {
     }
     match f.try_lock() {
         Ok(()) => Ok(f),
-        Err(_) => Err(None),
+        Err(std::fs::TryLockError::WouldBlock) => Err(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(Some(format!("lock {}: {e}", path.display()))),
     }
 }
 

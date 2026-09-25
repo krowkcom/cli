@@ -24,7 +24,7 @@
 //! trips a `--max-usd` guard rather than passing it: an unknown spend is
 //! not a spend inside the limit.
 
-use super::sessions::{self, Priced};
+use super::sessions::{self, Priced, Refresh};
 use super::Ctx;
 use crate::output::Format;
 use crate::pricing;
@@ -140,6 +140,43 @@ pub fn check(m: &Metered, cost: &Priced, l: &Limits) -> Vec<Trip> {
     out
 }
 
+fn descendants(conn: &krowk_store::Connection, id: &str) -> Result<Vec<String>, Error> {
+    krowk_store::descendant_session_ids(conn, id).map_err(|e| fail("store_unavailable", e.message().to_string()))
+}
+
+/// The session the argument names, with its transcripts — and every
+/// subagent's — brought up to date first. A session the store has never
+/// seen is looked for by its agent's own id (a Claude or opencode session
+/// id), so a hook's first check in a fresh session answers instead of
+/// failing.
+fn current_session(ctx: &Ctx, args: &[String]) -> Result<(String, Refresh), Error> {
+    let conn = sessions::open_store(ctx)?;
+    let mut imported = false;
+    let id = match sessions::resolve_arg(ctx, &conn, args, "budget") {
+        Ok(id) => id,
+        Err(e) if e.code() == "no_session" && !args.is_empty() => {
+            drop(conn);
+            let reference = args[0].trim().to_string();
+            for provider in [krowk_import::PROVIDER_CLAUDE, krowk_import::PROVIDER_OPENCODE] {
+                imported |= sessions::refresh_session(ctx, provider, std::slice::from_ref(&reference))? == Refresh::Imported;
+            }
+            sessions::resolve_arg(ctx, &sessions::open_store(ctx)?, args, "budget")?
+        }
+        Err(e) => return Err(e),
+    };
+    let conn = sessions::open_store(ctx)?;
+    let s = sessions::load_by_id(ctx, &conn, &id)?.session;
+    let mut ids = vec![s.foreign_session_id.clone()];
+    for child in descendants(&conn, &id)? {
+        ids.push(sessions::load_by_id(ctx, &conn, &child)?.session.foreign_session_id);
+    }
+    drop(conn);
+    match sessions::refresh_session(ctx, &s.binding_provider, &ids)? {
+        Refresh::Current if imported => Ok((id, Refresh::Imported)),
+        r => Ok((id, r)),
+    }
+}
+
 fn limits(ctx: &Ctx) -> Result<Limits, Error> {
     // A limit given blank — `--max-usd "$UNSET"` — is a mistake to name, not
     // a check to switch off.
@@ -169,29 +206,18 @@ fn limits(ctx: &Ctx) -> Result<Limits, Error> {
 pub fn budget(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
     sessions::check_os()?;
     let l = limits(ctx)?;
-    let (d, refreshed) = {
-        let conn = sessions::open_store(ctx)?;
-        let id = sessions::resolve_arg(ctx, &conn, args, "budget")?;
-        let s = sessions::load_by_id(ctx, &conn, &id)?.session;
-        drop(conn);
-        let refreshed = sessions::refresh_session(ctx, &s.binding_provider, &s.foreign_session_id)?;
-        let conn = sessions::open_store(ctx)?;
-        (sessions::load_by_id(ctx, &conn, &id)?, refreshed)
-    };
+    let (id, refreshed) = current_session(ctx, args)?;
+    let conn = sessions::open_store(ctx)?;
+    let d = sessions::load_by_id(ctx, &conn, &id)?;
     let (_, mut cost) = sessions::price_turns(ctx, &d);
     let mut metered = Metered::of(&d);
-    let children = {
-        let conn = sessions::open_store(ctx)?;
-        let ids = krowk_store::descendant_session_ids(&conn, &d.session.id).map_err(|e| fail("store_unavailable", e.message().to_string()))?;
-        let mut n = 0;
-        for id in ids {
-            let child = sessions::load_by_id(ctx, &conn, &id)?;
-            cost.merge(sessions::price_turns(ctx, &child).1);
-            metered.merge(Metered::of(&child));
-            n += 1;
-        }
-        n
-    };
+    let children = descendants(&conn, &id)?;
+    for child in &children {
+        let child = sessions::load_by_id(ctx, &conn, child)?;
+        cost.merge(sessions::price_turns(ctx, &child).1);
+        metered.merge(Metered::of(&child));
+    }
+    let children = children.len();
     let trips = check(&metered, &cost, &l);
     let s = &d.session;
     let mut report = json!({
@@ -203,8 +229,13 @@ pub fn budget(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         "cost_display": cost.total().map_or("—".to_string(), sessions::format_cost_precise),
         "limits": { "max_usd": l.usd, "max_tokens": l.tokens },
         "within": trips.is_empty(),
-        "as_of_ms": sessions::now_ms(),
-        "refreshed": refreshed,
+        // Now, when the transcripts were just checked; else the last import.
+        "as_of_ms": if refreshed == Refresh::NotRefreshable { s.time_updated } else { sessions::now_ms() },
+        "refreshed": match refreshed {
+            Refresh::Current => json!("current"),
+            Refresh::Imported => json!("imported"),
+            Refresh::NotRefreshable => Value::Null,
+        },
     });
     if !cost.bases.is_empty() {
         report["priced_with"] = json!(pricing::basis_note(&cost.bases));
@@ -234,8 +265,8 @@ pub fn budget(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
     if let (Some(c), Some(u)) = (cost.total(), l.usd) {
         line += &format!("  {} of {}", sessions::format_cost_precise(c), sessions::format_cost_precise(u));
     }
-    if !refreshed {
-        line += "  (as of the last import: another import is running)";
+    if refreshed == Refresh::NotRefreshable {
+        line += "  (as of the last import: this source is not re-read per session)";
     }
     let _ = writeln!(ctx.io.stdout, "{line}");
     Ok(())

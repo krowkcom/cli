@@ -87,8 +87,10 @@ SESSIONS FLAGS
   --max-tokens <n>       On `sessions budget`, trip over this many generated
                          tokens (output and reasoning) — the session's and
                          its subagents'. Over a limit it exits 4; a Claude
-                         Code hook blocks only on exit 2, so wire it as
-                         `krowk sessions budget $ID --max-usd 5 || exit 2`
+                         Code hook blocks only on exit 2, so block on a trip
+                         alone: `krowk sessions budget "$ID" --max-usd 5;
+                         [ $? -ne 4 ] || exit 2` — any other failure then
+                         warns without stopping the agent
   --from <source>        On `sessions import`, whose transcripts to read:
                          claude, cursor, opencode, ledger, or all.
                          Required

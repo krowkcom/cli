@@ -55,17 +55,19 @@ the versions are the `v*` tags a release is cut from. Entries land under
   session against a spend limit by what the provider metered, never by the
   `max_tokens` its requests asked for — providers do not strictly enforce
   it (a call capped at 1,200 has metered 3,422). It re-reads the session's
-  transcripts first when they moved, counts every subagent the session
-  spawned, and holds `--max-tokens` to generated tokens (output and
-  reasoning); input and cache tokens are reported and priced. Within its
-  limits it prints the report and exits 0; over one it exits 4 with
+  transcripts, and its subagents', when they moved — importing a session
+  the store has not seen yet, by its Claude or opencode id — and waits
+  for a running import rather than answering stale (after 15 s it fails
+  with `import_locked`). `--max-tokens` holds generated tokens (output
+  and reasoning); input and cache tokens are reported and priced. Within
+  its limits it prints the report and exits 0; over one it exits 4 with
   `budget_exceeded` and the report under `error.details` (on stderr). A
   cost krowk cannot price trips `--max-usd`, with the priced part as a
   lower bound. krowk cancels nothing — the hook or wrapper that runs the
-  check stops the run; a Claude Code hook blocks only on exit 2, so wire
-  it as `… || exit 2`. A provider-ledger row nobody saw an answer to is
-  budgeted with its ledger's session: nothing ties it to the run that
-  sent it.
+  check stops the run. A Claude Code hook blocks only on exit 2, so block
+  on a trip alone: `krowk sessions budget "$ID" --max-usd 5; [ $? -ne 4 ]
+  || exit 2`. A provider-ledger row nobody saw an answer to is budgeted
+  with its ledger's session: nothing ties it to the run that sent it.
 - **Provider usage ledgers.** A request your agent gave up on — a timeout,
   a killed shell, a Ctrl-C — can still finish and bill on the provider's
   side, and no transcript ever sees it. Drop the provider's per-request

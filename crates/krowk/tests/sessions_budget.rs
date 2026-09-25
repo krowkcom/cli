@@ -20,7 +20,11 @@ fn a_runaway_reasoning_run_trips_the_guard_on_metered_tokens() {
     let user = json!({ "type": "user", "uuid": "u1", "sessionId": SID, "cwd": cwd, "message": { "role": "user", "content": "one word: what is zen?" } });
     let asst = assistant("a1", "msg_1", 3422, 3405);
     std::fs::write(dir.join(format!("{SID}.jsonl")), format!("{user}\n{asst}\n")).unwrap();
-    assert_eq!(run(h, &["sessions", "import", "--from", "claude", "--json"]).0, 0);
+    // Never imported: the first check in a fresh session finds it by the
+    // agent's own id instead of failing with no_session.
+    let (code, out) = run(h, &["sessions", "budget", SID, "--max-tokens", "100000", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["data"]["refreshed"], "imported", "{out}");
 
     // The cap it was sent with (1200) is inside 2,000; what was generated is not.
     let (code, out) = run(h, &["sessions", "budget", SID, "--max-tokens", "2000", "--json"]);
@@ -46,16 +50,33 @@ fn a_runaway_reasoning_run_trips_the_guard_on_metered_tokens() {
     let (code, out) = run(h, &["sessions", "budget", SID, "--max-tokens", "8000", "--json"]);
     assert_eq!(code, 4, "the new turn is metered: {out}");
 
+    // A check that has to write waits out an import holding the store, then
+    // answers current — it never passes on what was there before.
+    let more = format!("{}\n", assistant("a3", "msg_3", 100, 0));
+    std::fs::OpenOptions::new().append(true).open(dir.join(format!("{SID}.jsonl"))).unwrap().write_all(more.as_bytes()).unwrap();
+    let lock = std::fs::OpenOptions::new().read(true).write(true).open(h.join(".local/share/krowk/import.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        drop(lock);
+    });
+    let started = std::time::Instant::now();
+    let (code, out) = run(h, &["sessions", "budget", SID, "--max-tokens", "100000", "--json"]);
+    holder.join().unwrap();
+    assert_eq!(code, 0, "{out}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(700), "it waited for the lock");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["data"]["metered"]["generated"], 3422 + 5000 + 100, "{out}");
+
     // A subagent's spend is its parent's.
     let agent = dir.join(SID).join("subagents");
     std::fs::create_dir_all(&agent).unwrap();
     let sub = json!({ "type": "assistant", "uuid": "s1", "sessionId": SID, "agentId": "a77", "isSidechain": true, "cwd": cwd,
         "message": { "id": "msg_s1", "role": "assistant", "model": "claude-sonnet-4-6", "content": [{ "type": "text", "text": "done" }], "usage": { "input_tokens": 1, "output_tokens": 600 } } });
     std::fs::write(agent.join("agent-a77.jsonl"), format!("{sub}\n")).unwrap();
-    let (code, out) = run(h, &["sessions", "budget", SID, "--max-tokens", "9000", "--json"]);
+    let (code, out) = run(h, &["sessions", "budget", SID, "--max-tokens", "9100", "--json"]);
     assert_eq!(code, 4, "{out}");
     let err: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!((err["error"]["details"]["subagents"].as_i64(), err["error"]["details"]["metered"]["generated"].as_i64()), (Some(1), Some(3422 + 5000 + 600)), "{err}");
+    assert_eq!((err["error"]["details"]["subagents"].as_i64(), err["error"]["details"]["metered"]["generated"].as_i64()), (Some(1), Some(3422 + 5000 + 100 + 600)), "{err}");
 
     // A limit given blank is a mistake, not a switched-off check; none at all too.
     assert_eq!(run(h, &["sessions", "budget", SID, "--max-usd", "", "--max-tokens", "1"]).0, 1);

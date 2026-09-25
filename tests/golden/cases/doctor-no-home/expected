@@ -19,6 +19,12 @@ stdout:
     "message": "no home directory in environment, so krowk.db has nowhere to live",
     "hint": "set HOME (or XDG_DATA_HOME to an absolute path) so krowk.db has a place to live"
   },
+  "pricing": {
+    "name": "pricing",
+    "status": "warn",
+    "message": "no price cache — prices come from the models.dev snapshot 2026-09-10 embedded in this build",
+    "hint": "run `krowk pricing refresh`, or `krowk sessions sync`, which refreshes prices once a day"
+  },
   "context": {}
 }
 exit: 0

@@ -29,6 +29,7 @@ pub(crate) fn doctor(ctx: &mut Ctx) -> Result<(), krowk_api::Error> {
     report.insert("credentials".into(), json!(creds::credentials_path().display().to_string()));
     report.insert("config".into(), json!(config_summary()));
     report.insert("store".into(), store_check(ctx));
+    report.insert("pricing".into(), pricing_check(ctx));
     report.insert("context".into(), serde_json::to_value(crate::runctx::detect(ctx.io.env)).expect("context serializes"));
 
     if ctx.format != Format::Human {
@@ -42,7 +43,7 @@ pub(crate) fn doctor(ctx: &mut Ctx) -> Result<(), krowk_api::Error> {
         };
         let _ = writeln!(ctx.io.stdout, "{k:<15} {v}");
     }
-    for k in ["store", "context"] {
+    for k in ["store", "pricing", "context"] {
         let _ = writeln!(ctx.io.stdout, "{k:<15} {}", report[k]);
     }
     Ok(())
@@ -58,6 +59,31 @@ fn store_check(ctx: &Ctx) -> Value {
 #[cfg(not(feature = "sessions"))]
 fn store_check(_: &Ctx) -> Value {
     json!({ "name": "store", "status": "skip", "message": "this build carries no session store" })
+}
+
+/// How old the prices are, read from the cache's sidecar — never fetched:
+/// doctor has no business on the network for this. Over 30 days old, or no
+/// cache at all, is a warning with the command that fixes it.
+#[cfg(feature = "sessions")]
+fn pricing_check(ctx: &Ctx) -> Value {
+    const STALE_DAYS: i64 = 30;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+    let fresh = crate::pricing::Freshness::of(ctx.io.env);
+    let status = match fresh.age_days(now) {
+        Some(d) if d <= STALE_DAYS => "pass",
+        _ => "warn",
+    };
+    let hint = if status == "pass" { "" } else { "run `krowk pricing refresh`, or `krowk sessions sync`, which refreshes prices once a day" };
+    let mut v = json!({ "name": "pricing", "status": status, "message": fresh.describe(now), "hint": hint });
+    if let Some(d) = fresh.age_days(now) {
+        v["age_days"] = json!(d);
+    }
+    v
+}
+
+#[cfg(not(feature = "sessions"))]
+fn pricing_check(_: &Ctx) -> Value {
+    json!({ "name": "pricing", "status": "skip", "message": "this build carries no prices" })
 }
 
 fn registry_mode(ctx: &Ctx, client: &Client) -> &'static str {

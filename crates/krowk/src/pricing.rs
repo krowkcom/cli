@@ -2,6 +2,20 @@
 //! lookup: the snapshot embedded at build time always works offline, and the
 //! cache `pricing refresh` writes is preferred when it holds the pair. Tokens
 //! are stored per turn and priced at read time, so a refresh reprices history.
+//!
+//! Freshness has one recurring path and no machinery: `sessions sync`
+//! refreshes the cache when its last fetch is a day old, and `doctor` and
+//! `pricing refresh` say how old it is. Nothing on a read path — list, show,
+//! import, doctor — touches the network, and there is no timer: prices move
+//! monthly, and a scheduler would outlive its value.
+//!
+//! Audio rates (`input_audio`, `output_audio`) are read by nobody, on
+//! purpose: no transcript krowk imports reports audio tokens apart from
+//! text — Claude, Cursor and opencode have none, and an OpenAI-shaped usage
+//! block folds them into prompt and completion tokens — so a rate would
+//! have nothing to multiply. They stay in the cache file as models.dev
+//! wrote it; the day an importer yields audio tokens, reading them is a
+//! field here and a column there, not a re-fetch.
 
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
@@ -234,6 +248,37 @@ pub fn refresh_within(env: &dyn Fn(&str) -> String, url: &str, timeout: Duration
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+/// How old the prices are: the cache's last fetch (a 304 counts — it
+/// confirmed the prices), or none when only the snapshot answers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Freshness {
+    pub cache: Option<PathBuf>,
+    pub fetched_at_ms: Option<i64>,
+}
+
+impl Freshness {
+    pub fn of(env: &dyn Fn(&str) -> String) -> Freshness {
+        let cache = cache_path(env);
+        let fetched_at_ms = cache.as_deref().filter(|p| p.exists()).and_then(fetched_at_ms);
+        Freshness { cache, fetched_at_ms }
+    }
+
+    /// Whole days since the last fetch, 0 for one in the future.
+    pub fn age_days(&self, now_ms: i64) -> Option<i64> {
+        self.fetched_at_ms.map(|f| (now_ms - f).max(0) / 86_400_000)
+    }
+
+    /// "fetched 2026-09-10, 15 days ago", or what answers instead.
+    pub fn describe(&self, now_ms: i64) -> String {
+        match (self.fetched_at_ms, self.age_days(now_ms)) {
+            (Some(ms), Some(0)) => format!("models.dev prices fetched {}, today", date_of(ms)),
+            (Some(ms), Some(1)) => format!("models.dev prices fetched {}, 1 day ago", date_of(ms)),
+            (Some(ms), Some(d)) => format!("models.dev prices fetched {}, {d} days ago", date_of(ms)),
+            _ => format!("no price cache — prices come from the models.dev snapshot {SNAPSHOT_DATE} embedded in this build"),
+        }
     }
 }
 

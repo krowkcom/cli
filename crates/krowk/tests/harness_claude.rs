@@ -311,8 +311,10 @@ fn r_back_6_the_tui_asks_before_claude_runs_in_an_untrusted_repository() {
         let b = Sandbox::new(if yes { "tui-yes" } else { "tui-no" });
         b.json(&["providers", "add", "claude", "--json"], &[]);
         let cmd = b.command(&["--model", "claude/sonnet"], &[("TERM", "xterm-256color")]);
-        let mut t = pty::Pty::spawn(cmd, 100, 30);
-        assert!(t.wait_for("and run Claude Code in it?", std::time::Duration::from_secs(10)).is_some(), "no trust prompt: {:?}", t.text());
+        // Wide enough that a long temporary path does not wrap the question.
+        let mut t = pty::Pty::spawn(cmd, 400, 30);
+        assert!(t.wait_for("(y/N)", std::time::Duration::from_secs(10)).is_some(), "no trust prompt: {:?}", t.text());
+        assert!(t.text().contains("Trust ") && t.text().contains("run Claude Code in it?"), "{:?}", t.text());
         assert!(!b.fake_log().contains("argv -p"), "nothing spawned before the answer");
         t.write(if yes { b"y\r" } else { b"n\r" });
         assert!(t.wait_for("ask anything", std::time::Duration::from_secs(10)).is_some(), "the TUI opens: {:?}", t.text());

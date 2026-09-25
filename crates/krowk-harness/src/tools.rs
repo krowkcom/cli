@@ -447,8 +447,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3), "the whole group was killed");
         let (out, _) = run(BASH, &json!({"command": "head -c 40000 /dev/zero | tr '\\0' x"}), &env).await;
         assert!(out.contains("bytes cut") && out.len() < 31_000);
-        // Output is bounded however much there is, not buffered whole.
-        let (out, _) = run(BASH, &json!({"command": "timeout 1 yes"}), &env).await;
+        // Output is bounded however much there is, not buffered whole: 200 MB
+        // of it. (`yes | head`, not `timeout 1 yes`: macOS has no timeout.)
+        let (out, _) = run(BASH, &json!({"command": "yes | head -c 200000000"}), &env).await;
         assert!(out.contains("bytes cut") && out.len() < 31_000, "{}", out.len());
         // A process left in the background holds the pipes; the call still
         // ends when the shell does.

@@ -66,7 +66,7 @@ impl Source for Krowk {
 pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
     let head = events.last()?.id.clone();
     let branch = log::branch(events, &head);
-    let LogBody::SessionStarted { cwd, .. } = &branch.first()?.body else { return None };
+    let LogBody::SessionStarted { cwd, parent_session_id, .. } = &branch.first()?.body else { return None };
     let session_id = branch[0].session_id.clone();
     let mut th = Thread {
         worktree: krowk_import::worktree_for(cwd),
@@ -77,6 +77,9 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
             foreign_session_id: session_id.clone(),
             resume_cmd: format!("krowk -p --resume {session_id}"),
         },
+        // A subagent names the session that spawned it, so krowk.db's
+        // session tree — and `krowk sessions budget` — counts its spend there.
+        parent: parent_session_id.as_ref().map(|p| Binding { provider: HARNESS.into(), harness: HARNESS.into(), foreign_session_id: p.clone(), resume_cmd: String::new() }),
         ..Thread::default()
     };
     // Items waiting for the response that claims them. Items no response
@@ -92,7 +95,9 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
         match &ev.body {
             // The vendor's own record of a backend session stays in the log:
             // krowk.db lists the krowk session, not a second copy of it.
-            LogBody::SessionStarted { .. } | LogBody::BackendSession { .. } => {}
+            // So does the run its evidence went to: the registry holds the
+            // run, and the tool result that published names it.
+            LogBody::SessionStarted { .. } | LogBody::BackendSession { .. } | LogBody::RunOpened { .. } => {}
             LogBody::TurnStarted { model, provider: p, .. } => {
                 flush(&mut th, &mut pending, &provider, turn);
                 provider.clone_from(p);
@@ -162,6 +167,7 @@ fn event_type(b: &LogBody) -> &'static str {
         LogBody::ResponseCompleted { .. } => "response.completed",
         LogBody::TurnCompleted { .. } => "turn.completed",
         LogBody::BackendSession { .. } => "backend.session",
+        LogBody::RunOpened { .. } => "run.opened",
     }
 }
 
@@ -240,7 +246,7 @@ mod tests {
 
     #[test]
     fn r_log_2_a_turn_that_failed_mid_response_projects_the_same_incrementally_and_on_rebuild() {
-        let mut bodies = vec![LogBody::SessionStarted { cwd: "/nowhere".into(), krowk_version: "t".into(), protocol_version: 1 }];
+        let mut bodies = vec![LogBody::SessionStarted { cwd: "/nowhere".into(), krowk_version: "t".into(), protocol_version: 1, parent_session_id: None }];
         bodies.extend(turn("t1", "first"));
         // The response streamed a text item, then failed: no response.completed.
         bodies.push(LogBody::ItemCompleted { turn_id: "t1".into(), item_id: "t1-a".into(), item: Item::AssistantText { text: "half an answer".into() } });

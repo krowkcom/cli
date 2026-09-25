@@ -44,6 +44,8 @@ pub struct Options {
     pub toolset: Option<String>,
     /// `--effort`: the reasoning effort for this prompt, on krowk's ladder.
     pub effort: Option<crate::protocol::Effort>,
+    /// `--max-usd` and `--max-tokens`: what the session may spend.
+    pub budget: Option<crate::protocol::BudgetLimits>,
     pub format: OutputFormat,
 }
 
@@ -71,7 +73,7 @@ async fn drive(host: Host, opts: Options, stdout: &mut dyn Write) -> Outcome {
     // A resumed session's id is known up front; a new one's arrives with
     // its root event.
     let mut session_id: Option<String> = opts.resume.clone();
-    let cmd = Command::Prompt { session_id: opts.resume, text: opts.prompt, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, effort: opts.effort };
+    let cmd = Command::Prompt { session_id: opts.resume, text: opts.prompt, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, effort: opts.effort, budget: opts.budget };
     let exec = host.execute(cmd, tx);
     tokio::pin!(exec);
     let mut done: Option<Result<Option<RunResult>, EngineError>> = None;
@@ -151,6 +153,7 @@ fn line_session(line: &StreamLine) -> &str {
     match line {
         StreamLine::Log(ev) => &ev.session_id,
         StreamLine::Live(LiveEvent::ItemStarted { session_id, .. } | LiveEvent::ItemDelta { session_id, .. }) => session_id,
+        StreamLine::Live(LiveEvent::Cost { session_id, .. }) => session_id,
         StreamLine::Live(LiveEvent::Result(r)) => &r.session_id,
     }
 }

@@ -49,6 +49,17 @@
             }
           ]
         },
+        "budget": {
+          "description": "The spend this session, with its subagents, may reach: the engine\nrefuses the model call that would go past it (R-BUDGET-1). No\nlimit when absent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BudgetLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "type": {
           "type": "string",
           "const": "prompt"
@@ -206,6 +217,28 @@
         "xhigh",
         "max"
       ]
+    },
+    "BudgetLimits": {
+      "description": "What a session may spend, counted over the session and every subagent\nit spawned, from the usage the provider metered — never from what a\nrequest asked for.",
+      "type": "object",
+      "properties": {
+        "maxUsd": {
+          "description": "US dollars, priced from models.dev: `--max-usd`.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "maxTokens": {
+          "description": "Generated tokens — output and reasoning, the part that overshoots a\nrequest's cap: `--max-tokens`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
     },
     "ApprovalDecision": {
       "description": "An answer to a permission request.",

@@ -185,6 +185,10 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
         self.client.wire_api()
     }
 
+    fn checks_budget(&self) -> bool {
+        true
+    }
+
     fn run_turn<'a>(&'a self, ctx: TurnContext, events: Events) -> BoxFuture<'a, Result<TurnEnd, EngineError>> {
         Box::pin(async move {
             let toolset = Toolset { preset: ctx.preset, custom_tools: self.client.custom_tools(&ctx.model.model) };
@@ -205,11 +209,16 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
             // Response indexes continue from the history's, so a replayed
             // turn and this one never share an index.
             let first_response = req.history.iter().filter_map(|h| h.response).max().map_or(0, |m| m + 1);
-            let tool_env = tools::ToolEnv { cwd: &ctx.cwd, permission_mode: ctx.permission_mode, edit: ctx.preset.edit };
-            for response in (first_response..).take(MAX_STEPS) {
+            let tool_env = tools::ToolEnv { cwd: &ctx.cwd, permission_mode: ctx.permission_mode, edit: ctx.preset.edit, evidence: ctx.evidence.as_ref().map(|e| (e, &events)) };
+            for (made, response) in (first_response..).take(MAX_STEPS).enumerate() {
                 if *ctx.cancel.borrow() {
                     return Ok(TurnEnd::Interrupted);
                 }
+                // R-BUDGET-1: the call that would take the session past its
+                // budget is never made. Asked after the calls before it are
+                // metered, and before steering is taken, so a refused call
+                // leaves the steering unread and handed back.
+                ctx.budget.admit(made as u64).await?;
                 // Steering sent since the last step joins the history here,
                 // after the tool results it arrived during: the model reads
                 // it on this call.

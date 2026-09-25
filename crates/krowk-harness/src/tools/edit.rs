@@ -191,7 +191,7 @@ mod tests {
     use serde_json::json;
 
     fn env(d: &Path, edit: EditTool) -> ToolEnv<'_> {
-        ToolEnv { cwd: d, permission_mode: PermissionMode::AcceptEdits, edit }
+        ToolEnv { cwd: d, permission_mode: PermissionMode::AcceptEdits, edit, evidence: None }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -206,7 +206,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(d.join("src/new.txt")).unwrap(), "c");
         assert!(run(WRITE, &json!({"path": "src", "content": "x"}), &e).await.0.contains("not a regular file"));
         for mode in [PermissionMode::Default, PermissionMode::Plan] {
-            let refused = run(WRITE, &json!({"path": "x", "content": "x"}), &ToolEnv { cwd: &d, permission_mode: mode, edit: EditTool::StrReplace }).await;
+            let refused = run(WRITE, &json!({"path": "x", "content": "x"}), &ToolEnv { cwd: &d, permission_mode: mode, edit: EditTool::StrReplace, evidence: None }).await;
             assert!(refused.1 && refused.0.contains("acceptEdits"), "{refused:?}");
         }
         assert!(!d.join("x").exists());

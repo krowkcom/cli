@@ -46,6 +46,14 @@
           "format": "uint32",
           "minimum": 0
         },
+        "parentSessionId": {
+          "description": "The session that spawned this one, for a subagent: its spend is\npart of what that session spent, and a budget counts it there.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
         "type": {
           "type": "string",
           "const": "session.started"
@@ -216,6 +224,28 @@
         "turnId",
         "backend",
         "vendorSessionId"
+      ]
+    },
+    {
+      "description": "The krowk run this session's evidence is grouped under, opened by\nits first `publish` (R-EVID-1). Logged once; every later publish, and\na resumed session's, attaches to it.",
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string"
+        },
+        "run": {
+          "description": "The run's slug, e.g. `run_…`.",
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "run.opened"
+        }
+      },
+      "required": [
+        "type",
+        "turnId",
+        "run"
       ]
     },
     {

@@ -332,6 +332,7 @@ impl Engine for ClaudeEngine {
                 mode: ctx.permission_mode,
                 krowk_version: self.krowk_version.clone(),
                 protected: self.backend().home.iter().cloned().collect(),
+                evidence: ctx.evidence.clone(),
             };
             // The running process serves this turn when its launch still
             // fits; a model it can switch to in place is switched to.
@@ -387,11 +388,17 @@ struct Answers {
     krowk_version: String,
     /// The instance's config directory: no edit reaches it.
     protected: Vec<PathBuf>,
+    /// Where a bridged `publish` sends files.
+    evidence: Option<crate::evidence::Evidence>,
 }
 
 impl Answers {
-    /// The answer to one of Claude Code's control requests.
-    fn answer(&self, request_id: &str, req: &Value) -> Value {
+    /// The answer to one of Claude Code's control requests. A bridged tool
+    /// call can take a while — `publish` uploads — and Claude Code waits for
+    /// its answer before it goes on, so it is awaited here.
+    /// `events` is none while a process is being set up, before a turn
+    /// has anywhere to report to; nothing is published then.
+    async fn answer(&self, request_id: &str, req: &Value, events: Option<&Events>) -> Value {
         let subtype = req.get("subtype").and_then(Value::as_str).unwrap_or_default();
         let success = |response: Value| json!({"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": response}});
         match subtype {
@@ -404,8 +411,16 @@ impl Answers {
                 }
             }
             "mcp_message" if req.get("server_name").and_then(Value::as_str) == Some(bridge::SERVER) => {
-                let env = BridgeEnv { session_id: &self.session_id, turn_id: &self.turn_id, model: &self.model, cwd: &self.cwd, backend: BACKEND, krowk_version: &self.krowk_version };
-                success(json!({"mcp_response": bridge::handle(req.get("message").unwrap_or(&Value::Null), &env)}))
+                let env = BridgeEnv {
+                    session_id: &self.session_id,
+                    turn_id: &self.turn_id,
+                    model: &self.model,
+                    cwd: &self.cwd,
+                    backend: BACKEND,
+                    krowk_version: &self.krowk_version,
+                    evidence: self.evidence.as_ref().zip(events),
+                };
+                success(json!({"mcp_response": bridge::handle(req.get("message").unwrap_or(&Value::Null), &env).await}))
             }
             // No hooks are registered, so none should be called back.
             "hook_callback" => success(json!({})),
@@ -567,7 +582,7 @@ impl Proc {
                 let Some(msg) = next_json(&mut self.out).await else { return Err(self.died(&format!("before it answered {subtype}"))) };
                 match msg["type"].as_str() {
                     Some("control_request") => {
-                        let answer = ask.answer(msg["request_id"].as_str().unwrap_or_default(), &msg["request"]);
+                        let answer = ask.answer(msg["request_id"].as_str().unwrap_or_default(), &msg["request"], None).await;
                         self.send(&answer).await?;
                     }
                     Some("control_response") if msg.pointer("/response/request_id").and_then(Value::as_str) == Some(id.as_str()) => {
@@ -674,7 +689,7 @@ impl Proc {
                     };
                     match msg["type"].as_str() {
                         Some("control_request") => {
-                            let answer = ask.answer(msg["request_id"].as_str().unwrap_or_default(), &msg["request"]);
+                            let answer = ask.answer(msg["request_id"].as_str().unwrap_or_default(), &msg["request"], Some(events)).await;
                             // An approved ExitPlanMode or EnterPlanMode moves
                             // Claude Code to default or plan for what follows.
                             if msg.pointer("/request/subtype").and_then(Value::as_str) == Some("can_use_tool")

@@ -1,8 +1,7 @@
 //! The tool bridge: krowk's own tools, offered to a vendor backend over MCP
 //! (R-BACK-1). A backend runs its own loop with its own tools; what it
-//! cannot have without krowk — `publish` once ticket 8 lands, the subagent
-//! bridge later, and today the one trivial `session_info` that proves the
-//! path — is injected as one MCP server named `krowk`, so the backend's
+//! cannot have without krowk — `publish`, the subagent bridge later, and the
+//! trivial `session_info` that proved the path — is injected as one MCP server named `krowk`, so the backend's
 //! model calls it as `mcp__krowk__<tool>`.
 //!
 //! The bridge is transport-free: `handle` answers one JSON-RPC message with
@@ -17,6 +16,8 @@
 //! those: a tool is exposed by being listed there, with its input a Rust
 //! type its schema is derived from, as the native tools' are.
 
+use crate::engine::{BoxFuture, Events};
+use crate::evidence::{self, Evidence};
 use crate::protocol::{ModelRef, ToolDefinition};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -38,6 +39,9 @@ pub struct BridgeEnv<'a> {
     /// The backend running the session, e.g. `claude-code`.
     pub backend: &'a str,
     pub krowk_version: &'a str,
+    /// Where `publish` sends files, and where a run it opens is reported;
+    /// none when the host publishes nothing.
+    pub evidence: Option<(&'a Evidence, &'a Events)>,
 }
 
 /// A krowk tool offered to backends.
@@ -46,16 +50,30 @@ pub struct Exposed {
     pub description: &'static str,
     pub input_schema: fn() -> Value,
     /// Runs one call: the output text, and whether it is an error.
-    pub run: fn(&BridgeEnv<'_>, &Value) -> (String, bool),
+    pub run: for<'a> fn(&'a BridgeEnv<'a>, &'a Value) -> BoxFuture<'a, (String, bool)>,
 }
 
 /// Every tool a backend is offered, in the order it lists them.
-pub const EXPOSED: &[Exposed] = &[Exposed {
-    name: "session_info",
-    description: "What krowk knows about this session: its krowk session id, the turn, the instance and model it runs on, and its working directory. Takes no input.",
-    input_schema: crate::tools::input_schema::<SessionInfoInput>,
-    run: session_info,
-}];
+pub const EXPOSED: &[Exposed] = &[
+    Exposed {
+        name: "session_info",
+        description: "What krowk knows about this session: its krowk session id, the turn, the instance and model it runs on, and its working directory. Takes no input.",
+        input_schema: crate::tools::input_schema::<SessionInfoInput>,
+        run: |env, input| Box::pin(std::future::ready(session_info(env, input))),
+    },
+    // The native `publish`, the same call: a backend's evidence lands under
+    // the same run, tagged with the same krowk session.
+    Exposed { name: evidence::PUBLISH, description: evidence::DESCRIPTION, input_schema: crate::tools::input_schema::<evidence::PublishInput>, run: publish },
+];
+
+fn publish<'a>(env: &'a BridgeEnv<'a>, input: &'a Value) -> BoxFuture<'a, (String, bool)> {
+    Box::pin(async move {
+        match env.evidence {
+            Some((ev, events)) => ev.publish(env.cwd, input, events).await,
+            None => (evidence::UNAVAILABLE.into(), true),
+        }
+    })
+}
 
 /// session_info takes nothing.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -90,7 +108,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
 /// Answers one JSON-RPC message from the backend's MCP client. A
 /// notification is acknowledged with an empty result, which is what a
 /// control channel that expects an answer to every request is sent.
-pub fn handle(msg: &Value, env: &BridgeEnv<'_>) -> Value {
+pub async fn handle(msg: &Value, env: &BridgeEnv<'_>) -> Value {
     let id = msg.get("id").cloned();
     let method = msg.get("method").and_then(Value::as_str).unwrap_or_default();
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -108,7 +126,7 @@ pub fn handle(msg: &Value, env: &BridgeEnv<'_>) -> Value {
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
             match EXPOSED.iter().find(|t| t.name == name) {
                 Some(t) => {
-                    let (text, is_error) = (t.run)(env, &args);
+                    let (text, is_error) = (t.run)(env, &args).await;
                     Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
                 }
                 // An unknown tool is answered as a tool error the model can
@@ -141,25 +159,47 @@ mod tests {
     #[test]
     fn r_back_1_the_bridge_lists_and_runs_session_info_and_refuses_what_it_lacks() {
         let model = ModelRef { instance: "claude:work".into(), model: "haiku".into() };
-        let env = BridgeEnv { session_id: "s-1", turn_id: "t-1", model: &model, cwd: Path::new("/repo"), backend: "claude-code", krowk_version: "test" };
-        let init = handle(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}), &env);
+        let env = BridgeEnv { session_id: "s-1", turn_id: "t-1", model: &model, cwd: Path::new("/repo"), backend: "claude-code", krowk_version: "test", evidence: None };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let handle = |msg: &Value| rt.block_on(handle(msg, &env));
+        let init = handle(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}));
         assert_eq!(init["id"], 0);
         assert_eq!(init["result"]["protocolVersion"], "2025-11-25", "the client's revision is answered");
         assert_eq!(init["result"]["serverInfo"]["name"], "krowk");
-        let list = handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), &env);
+        let list = handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}));
         assert_eq!(list["result"]["tools"][0]["name"], "session_info");
         assert_eq!(list["result"]["tools"][0]["inputSchema"]["type"], "object");
-        let call = handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "session_info", "arguments": {}}}), &env);
+        let call = handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "session_info", "arguments": {}}}));
         let text = call["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("krowk session: s-1") && text.contains("instance: claude:work") && text.contains("backend: claude-code"), "{text}");
         assert_eq!(call["result"]["isError"], false);
-        let bad = handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "session_info", "arguments": {"x": 1}}}), &env);
+        let bad = handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "session_info", "arguments": {"x": 1}}}));
         assert_eq!(bad["result"]["isError"], true);
-        let missing = handle(&json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "nope"}}), &env);
-        assert!(missing["result"]["content"][0]["text"].as_str().unwrap().contains("offers session_info"));
-        let note = handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), &env);
+        let missing = handle(&json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "nope"}}));
+        assert!(missing["result"]["content"][0]["text"].as_str().unwrap().contains("offers session_info, publish"));
+        let note = handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         assert!(note.get("id").is_none() && note["result"] == json!({}));
-        assert_eq!(handle(&json!({"jsonrpc": "2.0", "id": 5, "method": "resources/list"}), &env)["error"]["code"], -32601);
+        assert_eq!(handle(&json!({"jsonrpc": "2.0", "id": 5, "method": "resources/list"}))["error"]["code"], -32601);
         assert_eq!(definitions()[0].name, "mcp__krowk__session_info");
+    }
+
+    #[test]
+    fn r_evid_1_publish_is_exposed_to_backends_and_runs_the_sessions_publisher() {
+        let model = ModelRef { instance: "claude".into(), model: "haiku".into() };
+        let publisher: evidence::Publisher = std::sync::Arc::new(|r: &evidence::PublishRequest| {
+            Ok(evidence::Published { text: format!("{} from {} for {}", r.files.join(","), r.root.display(), r.session_id), run: Some("run_x".into()) })
+        });
+        let ev = Evidence::new(publisher, "s-1", None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let env = BridgeEnv { session_id: "s-1", turn_id: "t-1", model: &model, cwd: Path::new("/repo"), backend: "claude-code", krowk_version: "test", evidence: Some((&ev, &tx)) };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let list = rt.block_on(handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), &env));
+        assert_eq!(list["result"]["tools"][1]["name"], "publish");
+        assert_eq!(list["result"]["tools"][1]["inputSchema"]["required"], json!(["files"]));
+        let call = rt.block_on(handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "publish", "arguments": {"files": ["shot.png"]}}}), &env));
+        assert_eq!(call["result"]["content"][0]["text"], "shot.png from /repo for s-1");
+        assert_eq!(call["result"]["isError"], false);
+        assert_eq!(rx.try_recv().unwrap(), crate::engine::EngineEvent::RunOpened { run: "run_x".into() });
+        assert_eq!(definitions()[1].name, "mcp__krowk__publish");
     }
 }

@@ -53,6 +53,38 @@ impl std::fmt::Display for ModelRef {
 pub enum WireApi {
     #[serde(rename = "anthropic-messages")]
     AnthropicMessages,
+    /// OpenAI's Responses API, run stateless (`store: false`).
+    #[serde(rename = "openai-responses")]
+    OpenaiResponses,
+    /// Chat Completions: xAI, OpenRouter, and any server that speaks it.
+    #[serde(rename = "chat-completions")]
+    ChatCompletions,
+}
+
+impl WireApi {
+    /// The name the config and the log use.
+    pub fn name(self) -> &'static str {
+        match self {
+            WireApi::AnthropicMessages => "anthropic-messages",
+            WireApi::OpenaiResponses => "openai-responses",
+            WireApi::ChatCompletions => "chat-completions",
+        }
+    }
+}
+
+/// How hard a model thinks, on one ladder for every provider (R-PROV-2).
+/// Each model takes some of these rungs under its own names; the rung asked
+/// for is mapped onto the nearest one the model takes (`crate::effort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
 }
 
 /// State a provider needs back verbatim and nobody else may read: a thinking
@@ -237,6 +269,10 @@ pub enum Command {
         /// config's, else the one the model's family picks, when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         toolset: Option<String>,
+        /// The reasoning effort for this turn, on krowk's ladder; the
+        /// instance's, else the provider's default, when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
     },
     /// Stop the running turn, keeping what it produced so far.
     Interrupt { session_id: String },
@@ -284,7 +320,17 @@ pub enum LogBody {
     /// and tools it ran with are in the session's `context.jsonl` under
     /// this `turnId` (R-LOG-4).
     #[serde(rename = "turn.started")]
-    TurnStarted { turn_id: String, model: ModelRef, provider: String, wire_api: WireApi, permission_mode: PermissionMode },
+    TurnStarted {
+        turn_id: String,
+        model: ModelRef,
+        provider: String,
+        wire_api: WireApi,
+        permission_mode: PermissionMode,
+        /// The effort asked for, on krowk's ladder, when one was; what the
+        /// model was sent is that rung mapped onto the ones it takes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+    },
     /// One item, whole. `itemId` is the id its live frames carried.
     #[serde(rename = "item.completed")]
     ItemCompleted { turn_id: String, item_id: String, item: Item },

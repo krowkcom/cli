@@ -12,6 +12,8 @@ pub mod help;
 mod budget;
 #[cfg(feature = "harness")]
 mod prompt;
+#[cfg(feature = "harness")]
+mod providers;
 #[cfg(feature = "sessions")]
 mod sessions;
 mod upgrade;
@@ -206,6 +208,12 @@ fn dispatch(ctx: &mut Ctx, p: &[String]) -> Result<(), Error> {
         ["sessions", "sync", ..] => sessions::sync(ctx),
         #[cfg(feature = "sessions")]
         ["pricing", "refresh", ..] => sessions::pricing_refresh(ctx),
+        #[cfg(feature = "harness")]
+        ["providers", "add", ..] => providers::add(ctx, rest(2)),
+        #[cfg(feature = "harness")]
+        ["providers"] | ["providers", "list", ..] => providers::list(ctx),
+        #[cfg(feature = "harness")]
+        ["providers", "remove", ..] => providers::remove(ctx, rest(2)),
         _ if catalog::catalog(VERSION).leaves().iter().any(|l| p.starts_with(&l.name.split(' ').map(String::from).collect::<Vec<_>>())) => Err(fail(
             "not_in_build",
             format!(
@@ -306,9 +314,17 @@ fn reject_misplaced_sessions_flags(f: &Flags, p: &[String]) -> Result<(), Error>
         ("no-network", "`krowk sessions sync`", sync),
     ];
     #[cfg(feature = "harness")]
-    for name in ["output-format", "model", "resume", "permission-mode", "toolset"] {
-        if f.given.contains(name) && !f.print {
-            return Err(fail("bad_flag", format!("`--{name}` is only a flag of `krowk -p`")));
+    {
+        for name in ["output-format", "model", "resume", "permission-mode", "toolset", "effort"] {
+            if f.given.contains(name) && !f.print {
+                return Err(fail("bad_flag", format!("`--{name}` is only a flag of `krowk -p`")));
+            }
+        }
+        let add = words.starts_with(&["providers", "add"]);
+        for name in ["name", "api-key-env", "base-url", "client-id", "device"] {
+            if f.given.contains(name) && !add {
+                return Err(fail("bad_flag", format!("`--{name}` is only a flag of `krowk providers add`")));
+            }
         }
     }
     for (name, owner, allowed) in owners {

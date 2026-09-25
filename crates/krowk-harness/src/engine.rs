@@ -32,7 +32,8 @@
 //!   stops at the next point it can, and returns `TurnEnd::Interrupted`.
 
 use crate::toolset::Preset;
-use crate::protocol::{Delta, ErrorInfo, Item, ItemKind, ModelRef, PermissionMode, ToolDefinition, Usage, WireApi};
+use crate::catalog::ModelInfo;
+use crate::protocol::{Delta, Effort, ErrorInfo, Item, ItemKind, ModelRef, PermissionMode, ToolDefinition, Usage, WireApi};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -70,6 +71,11 @@ pub struct TurnContext {
     pub permission_mode: PermissionMode,
     /// The toolset preset the host chose for this turn's model.
     pub preset: &'static Preset,
+    /// The effort asked for, on krowk's ladder; the engine maps it onto the
+    /// rungs the model takes.
+    pub effort: Option<Effort>,
+    /// What the catalog knows of the model, when it knows it.
+    pub model_info: Option<ModelInfo>,
     /// Flips to true when the turn is to stop.
     pub cancel: watch::Receiver<bool>,
 }

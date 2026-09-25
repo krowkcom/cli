@@ -160,7 +160,8 @@ fn global_flag() -> Flag {
 
 pub fn catalog(version: &str) -> Catalog {
     let file = Arg { repeated: true, ..arg("file", "Path to upload", true) };
-    Catalog {
+    #[allow(unused_mut)]
+    let mut c = Catalog {
         name: "krowk",
         version: version.into(),
         summary: "permalinks for agent output",
@@ -349,7 +350,10 @@ pub fn catalog(version: &str) -> Catalog {
             EnvVar { name: "KROWK_AGENT", usage: "Agent name to report", default: "" },
             EnvVar { name: "KROWK_NO_UPDATE_CHECK", usage: "1/true/yes/on — never check for or mention new releases", default: "" },
         ],
-    }
+    };
+    #[cfg(feature = "harness")]
+    c.commands.push(providers_command());
+    c
 }
 
 pub fn global_flags() -> Vec<Flag> {
@@ -370,6 +374,39 @@ pub fn global_flags() -> Vec<Flag> {
     #[cfg(feature = "harness")]
     let flags = [flags, prompt_flags()].concat();
     flags
+}
+
+/// `krowk providers`: the native engine's instances — API-key profiles,
+/// compatible servers, and the SuperGrok login. The harness build's only.
+#[cfg(feature = "harness")]
+fn providers_command() -> Command {
+    const PROVIDER_ARG: &str = "anthropic, openai, xai, openrouter, openai-compatible, or supergrok (xAI with a SuperGrok or X Premium subscription)";
+    Command {
+        subcommands: vec![
+            Command {
+                args: vec![arg("provider", PROVIDER_ARG, true)],
+                flags: vec![
+                    flag("name", STRING, "Name the instance <provider>:<name> (for openai-compatible, <name> alone); the provider's own name when absent"),
+                    flag("api-key-env", STRING, "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance"),
+                    flag("base-url", STRING, "Where the API is, for a gateway, a router or a local server — required for openai-compatible"),
+                    flag("client-id", STRING, "supergrok: the OAuth client id to sign in as, when xAI's server offers no registration"),
+                    flag("device", BOOL, "supergrok: sign in with a code typed into any browser, instead of one opened here"),
+                    flag("no-browser", BOOL, "supergrok: print the sign-in link instead of opening a browser"),
+                ],
+                ..cmd(
+                    "add",
+                    "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device]",
+                    "Add an instance for the native engine, or sign in to SuperGrok",
+                )
+            },
+            cmd("list", "krowk providers list", "List every instance the native engine can use, and whether it has its key or login"),
+            Command {
+                args: vec![arg("instance", "The instance to remove, e.g. openai:work", true)],
+                ..cmd("remove", "krowk providers remove <instance>", "Remove an instance's definition, and forget its login")
+            },
+        ],
+        ..cmd("providers", "", "The native engine's provider instances")
+    }
 }
 
 /// `krowk -p "…"`: the harness build's headless agent. Flags rather than a
@@ -396,6 +433,11 @@ fn prompt_flags() -> Vec<Flag> {
             "toolset",
             STRING,
             "With -p: the tools' preset — claude (str_replace), gpt (apply_patch) or grok (search_replace). The model's family picks one when absent",
+        ),
+        flag(
+            "effort",
+            STRING,
+            "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent",
         ),
     ]
 }
@@ -460,6 +502,9 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
     ("RUNS", &["runs start", "runs finish", "runs show", "runs list"]),
     ("UPLOADS", &["uploads list", "uploads show", "uploads attach", "uploads delete", "claim"]),
     ("SESSIONS", &["sessions", "sessions show", "sessions budget", "sessions import", "sessions rebuild", "sessions sync"]),
+    // The harness build's own commands.
+    #[cfg(feature = "harness")]
+    ("AGENT", &["providers add", "providers list", "providers remove"]),
     (
         "ACCOUNT & SYSTEM",
         &[

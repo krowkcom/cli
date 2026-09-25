@@ -5,6 +5,7 @@
 #[path = "common/mock.rs"]
 mod mock;
 
+use krowk_harness::catalog::ModelInfo;
 use krowk_harness::headless::{self, OutputFormat};
 use krowk_harness::host::HostConfig;
 use krowk_harness::instances::{InstancesConfig, Registry};
@@ -58,7 +59,8 @@ impl Home {
             }),
             // A catalog that knows one model a router serves under a name
             // that says nothing of its family.
-            families: Arc::new(|_, model| (model == "house-coder").then(|| "grok-build".to_string())),
+            catalog: Arc::new(|_, model| (model == "house-coder").then(|| ModelInfo { family: Some("grok-build".into()), ..ModelInfo::default() })),
+            credentials: self.root.join("home/.config/krowk/providers/credentials.json"),
         }
     }
 
@@ -79,6 +81,7 @@ impl Home {
             model: Some(reg.parse_model(model).unwrap()),
             permission_mode,
             toolset: toolset.map(String::from),
+            effort: None,
             format: OutputFormat::StreamJson,
         };
         let outcome = headless::run(self.config(), opts, &mut out);
@@ -206,16 +209,16 @@ fn r_tool_2_the_recorded_tools_carry_each_model_familys_edit_tool_and_toolset_ov
     let home = Home::new("toolset", &m.url);
     let cases = [
         ("claude-sonnet-4-6", None, "claude", "str_replace"),
-        ("gpt-5.1-codex", None, "gpt", "apply_patch"),
-        ("openai/gpt-5", None, "gpt", "apply_patch"),
-        ("grok-code-fast-1", None, "grok", "search_replace"),
+        ("anthropic/gpt-5.1-codex", None, "gpt", "apply_patch"),
+        ("anthropic/openai/gpt-5", None, "gpt", "apply_patch"),
+        ("anthropic/grok-code-fast-1", None, "grok", "search_replace"),
         // Known to the catalog only, as a grok-build.
         ("house-coder", None, "grok", "search_replace"),
         // An unknown family gets the plain JSON edit tool.
         ("llama-4-maverick", None, "claude", "str_replace"),
         // --toolset wins over the family, either way round.
         ("claude-sonnet-4-6", Some("gpt"), "gpt", "apply_patch"),
-        ("gpt-5", Some("grok"), "grok", "search_replace"),
+        ("anthropic/gpt-5", Some("grok"), "grok", "search_replace"),
     ];
     for (n, (model, toolset, preset, edit)) in cases.iter().enumerate() {
         let (_, r) = home.run_on("hello", None, model, *toolset);
@@ -239,6 +242,7 @@ fn r_tool_2_the_recorded_tools_carry_each_model_familys_edit_tool_and_toolset_ov
         model: None,
         permission_mode: PermissionMode::Default,
         toolset: Some("vim".into()),
+        effort: None,
         format: OutputFormat::Json,
     };
     let outcome = headless::run(home.config(), opts, &mut out);
@@ -255,7 +259,7 @@ fn r_tool_2_each_edit_format_runs_through_the_loop() {
     let m = mock::serve(mock::edit_script);
     let home = Home::new("edit-loop", &m.url);
     let readme = home.repo().join("README.md");
-    for (model, edit) in [("claude-sonnet-4-6", "str_replace"), ("gpt-5.1-codex", "apply_patch"), ("grok-code-fast-1", "search_replace")] {
+    for (model, edit) in [("claude-sonnet-4-6", "str_replace"), ("anthropic/gpt-5.1-codex", "apply_patch"), ("anthropic/grok-code-fast-1", "search_replace")] {
         std::fs::write(&readme, "# krowk\n\nPermalinks for agent output.\n").unwrap();
         let (lines, r) = home.run_as("reword the README", None, model, None, PermissionMode::AcceptEdits);
         assert_eq!(r.status, TurnStatus::Completed, "{model}");
@@ -271,7 +275,7 @@ fn r_tool_2_each_edit_format_runs_through_the_loop() {
     }
     // In the default mode the edit is refused, and the model is told why.
     std::fs::write(&readme, "# krowk\n\nPermalinks for agent output.\n").unwrap();
-    let (lines, _) = home.run_as("reword the README", None, "gpt-5", None, PermissionMode::Default);
+    let (lines, _) = home.run_as("reword the README", None, "anthropic/gpt-5", None, PermissionMode::Default);
     let refused = lines.iter().any(|l| {
         matches!(l, StreamLine::Log(LogEvent { body: LogBody::ItemCompleted { item: Item::ToolResult { output, is_error: true, .. }, .. }, .. }) if output.contains("acceptEdits"))
     });

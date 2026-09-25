@@ -10,13 +10,17 @@
 //! log does not have.
 
 use crate::anthropic::AnthropicClient;
+use crate::catalog::ModelInfo;
+use crate::chat::{ChatClient, Credential};
 use crate::engine::{Engine, EngineError, EngineEvent, HistoryItem, TurnContext, TurnEnd};
-use crate::instances::{Registry, Resolved};
+use crate::instances::{Auth, Registry, Resolved};
+use crate::oauth;
+use crate::openai::ResponsesClient;
 use crate::log::{self, LogError, SessionLog};
 use crate::native::{self, NativeEngine};
 use crate::toolset;
 use crate::protocol::{
-    Command, ContextRecord, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus, Usage, WireApi,
+    Command, ContextRecord, Effort, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus, Usage, WireApi,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,10 +32,12 @@ use tokio::sync::{mpsc, watch};
 /// model has no price. Supplied by the caller, which owns the price cache.
 pub type Pricer = Arc<dyn Fn(&str, &str, &Usage) -> Option<f64> + Send + Sync>;
 
-/// A model's family in the catalog: (provider, model) to e.g. `gpt-codex`,
-/// or none when the catalog does not know it. It picks the toolset preset.
-/// Supplied by the caller, which owns the models.dev cache.
-pub type Families = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
+/// What the catalog knows of a model: (provider, model) to its family,
+/// limits, efforts and wire API, or none when the catalog does not know it.
+/// The family picks the toolset preset, the wire API the client, and the
+/// efforts what the ladder maps onto. Supplied by the caller, which owns the
+/// models.dev cache.
+pub type Catalog = Arc<dyn Fn(&str, &str) -> Option<ModelInfo> + Send + Sync>;
 
 pub struct HostConfig {
     /// Where session logs live: `log::sessions_dir`.
@@ -42,7 +48,9 @@ pub struct HostConfig {
     pub registry: Registry,
     pub krowk_version: String,
     pub pricer: Pricer,
-    pub families: Families,
+    pub catalog: Catalog,
+    /// krowk's provider credentials file, where OAuth logins live.
+    pub credentials: PathBuf,
 }
 
 pub struct Host {
@@ -73,8 +81,8 @@ impl Host {
     /// `isError`. An error here means no turn ran.
     pub async fn execute(&self, cmd: Command, out: mpsc::Sender<StreamLine>) -> Result<Option<RunResult>, EngineError> {
         match cmd {
-            Command::Prompt { session_id, text, model, permission_mode, toolset } => {
-                self.prompt(session_id.as_deref(), text, model, permission_mode, toolset.as_deref(), out).await.map(Some)
+            Command::Prompt { session_id, text, model, permission_mode, toolset, effort } => {
+                self.prompt(session_id.as_deref(), text, model, permission_mode, toolset.as_deref(), effort, out).await.map(Some)
             }
             Command::Interrupt { session_id } => {
                 let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
@@ -92,6 +100,7 @@ impl Host {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn prompt(
         &self,
         session_id: Option<&str>,
@@ -99,6 +108,7 @@ impl Host {
         model: Option<ModelRef>,
         permission_mode: PermissionMode,
         toolset: Option<&str>,
+        effort: Option<Effort>,
         out: mpsc::Sender<StreamLine>,
     ) -> Result<RunResult, EngineError> {
         let started = Instant::now();
@@ -120,9 +130,12 @@ impl Host {
             },
         };
         let instance = self.cfg.registry.get(&model.instance).map_err(|e| EngineError::new("no_instance", e))?.clone();
-        let family = (self.cfg.families)(instance.provider, &model.model);
+        let info = (self.cfg.catalog)(&instance.provider, &model.model);
+        let family = info.as_ref().and_then(|i| i.family.clone());
         let (preset, _) = toolset::choose(toolset, self.cfg.registry.toolset.as_deref(), family.as_deref(), &model.model).map_err(|e| EngineError::new("bad_toolset", e))?;
-        let engine = engine_for(&instance, &self.cfg.krowk_version)?;
+        let wire = instance.wire_for(info.as_ref().and_then(|i| i.wire_api));
+        let engine = engine_for(&instance, wire, &self.cfg.credentials, &self.cfg.krowk_version)?;
+        let effort = effort.or(instance.effort);
         let mut log = match opened {
             Some((log, _)) => log,
             None => {
@@ -135,8 +148,8 @@ impl Host {
         let cwd = past.cwd.clone().unwrap_or_else(|| self.cfg.cwd.clone());
 
         let turn_id = krowk_store::new_id();
-        let mut w = Writer { log: &mut log, out: &out, turn_id: turn_id.clone(), preset };
-        w.log(LogBody::TurnStarted { turn_id: turn_id.clone(), model: model.clone(), provider: engine.provider().into(), wire_api: engine.wire_api(), permission_mode }).await?;
+        let mut w = Writer { log: &mut log, out: &out, turn_id: turn_id.clone(), preset, wire };
+        w.log(LogBody::TurnStarted { turn_id: turn_id.clone(), model: model.clone(), provider: engine.provider().into(), wire_api: engine.wire_api(), permission_mode, effort }).await?;
         let prompt_item = Item::UserText { text };
         w.log(LogBody::ItemCompleted { turn_id: turn_id.clone(), item_id: krowk_store::new_id(), item: prompt_item.clone() }).await?;
         let mut history = past.items;
@@ -144,7 +157,7 @@ impl Host {
 
         let (cancel_tx, cancel) = watch::channel(false);
         self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), cancel_tx);
-        let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, preset, cancel };
+        let ctx = TurnContext { session_id: session_id.clone(), turn_id: turn_id.clone(), model: model.clone(), history, cwd, permission_mode, preset, effort, model_info: info, cancel };
         let mut tally = Tally::default();
         let outcome = w.drive(engine.as_ref(), ctx, &mut tally, &model, &instance, &self.cfg.pricer).await;
         self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&session_id);
@@ -175,16 +188,22 @@ impl Host {
     }
 }
 
-/// The engine an instance runs on.
-fn engine_for(instance: &Resolved, krowk_version: &str) -> Result<Box<dyn Engine>, EngineError> {
-    if instance.api_key.is_empty() {
-        return Err(EngineError::new(
-            "not_authenticated",
-            format!("no API key for the {} instance — set {} (krowk reads the key from the environment, never from a file)", instance.name, instance.api_key_env),
-        ));
+/// The engine an instance runs a model on, over the wire API chosen for
+/// it. A credential that is missing is refused here, before a session is
+/// created for a turn that could not run.
+fn engine_for(instance: &Resolved, wire: WireApi, credentials: &std::path::Path, krowk_version: &str) -> Result<Box<dyn Engine>, EngineError> {
+    if let Some(fix) = instance.missing_key() {
+        return Err(EngineError::new("not_authenticated", fix));
     }
-    match instance.wire_api {
+    let credential = match &instance.auth {
+        Auth::ApiKey => Credential::Key(instance.api_key.clone()),
+        Auth::Keyless => Credential::None,
+        Auth::OAuth { .. } => Credential::OAuth(Arc::new(oauth::Tokens::open(oauth::Store::new(credentials.to_path_buf()), &instance.name)?)),
+    };
+    match wire {
         WireApi::AnthropicMessages => Ok(Box::new(NativeEngine { client: AnthropicClient::new(instance.clone(), krowk_version)? })),
+        WireApi::OpenaiResponses => Ok(Box::new(NativeEngine { client: ResponsesClient::new(instance.clone(), krowk_version)? })),
+        WireApi::ChatCompletions => Ok(Box::new(NativeEngine { client: ChatClient::new(instance.clone(), credential, krowk_version)? })),
     }
 }
 
@@ -239,6 +258,7 @@ struct Writer<'a> {
     out: &'a mpsc::Sender<StreamLine>,
     turn_id: String,
     preset: &'static toolset::Preset,
+    wire: WireApi,
 }
 
 impl Writer<'_> {
@@ -283,8 +303,8 @@ impl Writer<'_> {
                     turn_id,
                     time_ms: krowk_store::now_ms(),
                     model: model.clone(),
-                    provider: instance.provider.into(),
-                    wire_api: instance.wire_api,
+                    provider: instance.provider.clone(),
+                    wire_api: self.wire,
                     toolset: self.preset.name.into(),
                     system_tokens: native::estimate_tokens(&system),
                     tools_tokens: native::tools_tokens(&tools),
@@ -310,7 +330,7 @@ impl Writer<'_> {
                 tally.usage += usage;
                 // Priced by the id the request named; the answering model's
                 // id is the fallback, since a provider may name a snapshot.
-                match pricer(instance.provider, &model.model, &usage).or_else(|| pricer(instance.provider, &answered, &usage)) {
+                match pricer(&instance.provider, &model.model, &usage).or_else(|| pricer(&instance.provider, &answered, &usage)) {
                     Some(usd) => tally.cost += usd,
                     None => tally.unpriced = true,
                 }

@@ -96,7 +96,7 @@ fn r_log_3_a_thinking_signature_round_trips_through_the_log_byte_identical() {
     let mut history = vec![HistoryItem { item: Item::UserText { text: "read README.md and summarise it in one line".into() }, response: None }];
     history.extend(read_back.into_iter().map(|item| HistoryItem { item, response: Some(0) }));
     history.push(HistoryItem { item: Item::ToolResult { call_id: "toolu_01ReadReadme".into(), output: "# krowk".into(), is_error: false }, response: None });
-    let req = ModelRequest { model: "claude-sonnet-4-6".into(), system: "s".into(), tools: vec![], history };
+    let req = ModelRequest { model: "claude-sonnet-4-6".into(), system: "s".into(), tools: vec![], history, ..ModelRequest::default() };
     let body = request_body(&req, &instance());
     let assistant = &body["messages"][1];
     assert_eq!(assistant["role"], "assistant");
@@ -113,8 +113,9 @@ fn r_log_3_a_thinking_signature_round_trips_through_the_log_byte_identical() {
     }
     assert_eq!(request_body(&failed, &instance())["messages"][1]["content"][0]["signature"], SIGNATURE);
 
-    // Another provider's blob never replays here, and its reasoning is not
-    // passed off as something the model said.
+    // Another provider's blob never replays here (R-SWITCH-1): its reasoning
+    // is downgraded to plain text, framed as an earlier model's, so it is
+    // never passed off as something this model said.
     let mut foreign = req.clone();
     for h in foreign.history.iter_mut() {
         if let Item::Reasoning { blob: Some(b), .. } = &mut h.item {
@@ -123,9 +124,9 @@ fn r_log_3_a_thinking_signature_round_trips_through_the_log_byte_identical() {
     }
     let body = request_body(&foreign, &instance());
     assert!(!body.to_string().contains(SIGNATURE));
-    assert!(!body.to_string().contains(THINKING), "reasoning never becomes assistant text");
-    assert_eq!(body["messages"][1]["content"][0]["type"], "text");
-    assert_eq!(body["messages"][1]["content"][0]["text"], "I'll read the README.");
+    assert!(!body.to_string().contains("\"type\":\"thinking\""), "no thinking block for a foreign blob");
+    assert_eq!(body["messages"][1]["content"][0], json!({ "type": "text", "text": format!("<reasoning from an earlier model>\n{THINKING}\n</reasoning>") }));
+    assert_eq!(body["messages"][1]["content"][1]["text"], "I'll read the README.");
 }
 
 #[test]
@@ -141,7 +142,7 @@ fn r_log_3_redacted_thinking_is_kept_opaque_and_replayed_as_it_came() {
         HistoryItem { item: d.items[1].1.clone(), response: Some(0) },
         HistoryItem { item: Item::UserText { text: "again".into() }, response: None },
     ];
-    let body = request_body(&ModelRequest { model: "m".into(), system: "s".into(), tools: vec![], history }, &instance());
+    let body = request_body(&ModelRequest { model: "m".into(), system: "s".into(), tools: vec![], history, ..ModelRequest::default() }, &instance());
     assert_eq!(body["messages"][1]["content"][0], json!({ "type": "redacted_thinking", "data": data }));
 }
 
@@ -151,7 +152,7 @@ fn r_prov_3_cache_breakpoints_sit_on_the_stable_prefix_and_the_growing_tail() {
     let turn = |text: &str| HistoryItem { item: Item::UserText { text: text.into() }, response: None };
     let said = |text: &str, r: usize| HistoryItem { item: Item::AssistantText { text: text.into() }, response: Some(r) };
     let history = vec![turn("one"), said("a", 0), turn("two"), said("b", 1), turn("three")];
-    let body = request_body(&ModelRequest { model: "m".into(), system: "sys".into(), tools, history }, &instance());
+    let body = request_body(&ModelRequest { model: "m".into(), system: "sys".into(), tools, history, ..ModelRequest::default() }, &instance());
     assert_eq!(body["system"][0]["cache_control"], json!({ "type": "ephemeral" }), "tools and system, cached together");
     let marked: Vec<(usize, usize)> = body["messages"]
         .as_array()
@@ -174,7 +175,7 @@ fn an_interrupted_tool_call_is_answered_before_it_is_sent_back() {
         HistoryItem { item: Item::ToolCall { call_id: "toolu_x".into(), name: "read".into(), input: json!({}) }, response: Some(0) },
         HistoryItem { item: Item::UserText { text: "next".into() }, response: None },
     ];
-    let body = request_body(&ModelRequest { model: "m".into(), system: "s".into(), tools: vec![], history }, &instance());
+    let body = request_body(&ModelRequest { model: "m".into(), system: "s".into(), tools: vec![], history, ..ModelRequest::default() }, &instance());
     let next = &body["messages"][2]["content"];
     assert_eq!(next[0]["type"], "tool_result");
     assert_eq!(next[0]["tool_use_id"], "toolu_x");
@@ -183,7 +184,7 @@ fn an_interrupted_tool_call_is_answered_before_it_is_sent_back() {
 
 fn run_stream(mock_reply: mock::Reply) -> Result<krowk_harness::native::ModelResponse, krowk_harness::engine::EngineError> {
     let reply = std::sync::Mutex::new(Some(mock_reply));
-    let m = mock::serve(move |_, _| reply.lock().unwrap().take().unwrap_or(mock::Reply { status: 500, body: "{}".into() }));
+    let m = mock::serve(move |_, _| reply.lock().unwrap().take().unwrap_or(mock::Reply::status(500, "{}")));
     let mut inst = instance();
     inst.base_url = m.url.clone();
     let client = AnthropicClient::new(inst, "test").unwrap();
@@ -191,7 +192,7 @@ fn run_stream(mock_reply: mock::Reply) -> Result<krowk_harness::native::ModelRes
     rt.block_on(async {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
         let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
-        let req = ModelRequest { model: "claude-sonnet-4-6".into(), system: "s".into(), tools: vec![], history: vec![] };
+        let req = ModelRequest { model: "claude-sonnet-4-6".into(), system: "s".into(), tools: vec![], history: vec![], ..ModelRequest::default() };
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let r = client.stream(&req, &tx, cancel).await;
         drop(tx);
@@ -213,7 +214,19 @@ fn r_prov_1_the_client_streams_over_http_and_names_what_went_wrong() {
     assert!(matches!(&ok.items[0].1, Item::AssistantText { text } if text.ends_with("paste anywhere.")));
     let err = run_stream(mock::Reply::sse(&mock::fixture("overloaded.sse"))).unwrap_err();
     assert_eq!(err.code, "provider_unavailable");
-    let err = run_stream(mock::Reply { status: 401, body: json!({"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}).to_string() }).unwrap_err();
+    let err = run_stream(mock::Reply::status(401, &json!({"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}).to_string())).unwrap_err();
     assert_eq!(err.code, "provider_auth");
     assert!(err.message.contains("ANTHROPIC_API_KEY") && err.message.contains("invalid x-api-key"), "{}", err.message);
+}
+
+#[test]
+fn r_prov_2_effort_none_is_thinking_off_and_any_other_rung_is_the_apis_effort() {
+    use krowk_harness::protocol::Effort;
+    let req = |effort| ModelRequest { model: "claude-opus-5".into(), system: "s".into(), effort, ..ModelRequest::default() };
+    let off = request_body(&req(Some(Effort::None)), &instance());
+    assert!(off.get("thinking").is_none() && off.get("output_config").is_none(), "{off}");
+    let high = request_body(&req(Some(Effort::High)), &instance());
+    assert_eq!((high["thinking"]["type"].as_str(), high["output_config"]["effort"].as_str()), (Some("adaptive"), Some("high")));
+    let default = request_body(&req(None), &instance());
+    assert!(default.get("thinking").is_some() && default.get("output_config").is_none());
 }

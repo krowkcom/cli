@@ -90,6 +90,32 @@ pub fn family_from_id(model: &str) -> Option<&'static str> {
     None
 }
 
+/// The major version a `gpt-N…` part of a model id names: 5 for `gpt-5.4`,
+/// `openai/gpt-5-mini` or `gpt-5o`.
+fn gpt_major(model: &str) -> Option<u32> {
+    let model = model.to_ascii_lowercase();
+    model.split(['/', ':', '@']).find_map(|part| {
+        let rest = part.strip_prefix("gpt-")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    })
+}
+
+/// A model OpenAI trained on freeform (custom, grammar) tools: GPT-5 and
+/// every GPT after it, and the Codex models. Only these are offered
+/// `apply_patch` as a freeform tool; the rest get its JSON form.
+pub fn takes_custom_tools(model: &str) -> bool {
+    family_from_id(model) == Some("codex") || model.to_ascii_lowercase().contains("codex") || gpt_major(model).is_some_and(|n| n >= 5)
+}
+
+/// Whether a model the catalog does not know reasons, read off its id:
+/// the o-series, the Codex models and GPT-5 on. It decides whether an
+/// OpenAI request asks for encrypted reasoning back, which a model that
+/// does not reason refuses.
+pub fn reasons(model: &str) -> bool {
+    matches!(family_from_id(model), Some("o")) || takes_custom_tools(model)
+}
+
 /// Where a turn's preset came from, strongest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -178,5 +204,18 @@ mod tests {
         assert_eq!(edit(Some("grok"), Some("gpt"), Some("claude-opus"), "claude-opus-5"), (by_name("grok").unwrap(), Source::Prompt));
         assert!(choose(Some("vim"), None, None, "gpt-5").unwrap_err().contains("claude, gpt, grok"));
         assert!(choose(None, Some("vim"), None, "gpt-5").unwrap_err().contains("config toolset"));
+    }
+
+    #[test]
+    fn r_prov_1_freeform_tools_and_reasoning_are_read_off_openai_model_ids() {
+        for m in ["gpt-5", "gpt-5.4", "openai/gpt-5-mini", "gpt-6-sol", "gpt-5.3-codex", "codex-mini-latest"] {
+            assert!(takes_custom_tools(m), "{m}");
+            assert!(reasons(m), "{m}");
+        }
+        for m in ["gpt-4.1", "gpt-4o", "o3", "claude-opus-5", "grok-4.7"] {
+            assert!(!takes_custom_tools(m), "{m}");
+        }
+        assert!(reasons("o3") && reasons("o4-mini"));
+        assert!(!reasons("gpt-4.1") && !reasons("grok-4.7"));
     }
 }

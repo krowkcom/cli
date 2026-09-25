@@ -79,9 +79,23 @@
     },
     "WireApi": {
       "description": "The wire API a provider speaks. An opaque blob is replayed only to the\nsame provider on the same wire API (R-LOG-3), so this travels with it.",
-      "type": "string",
-      "enum": [
-        "anthropic-messages"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "anthropic-messages"
+          ]
+        },
+        {
+          "description": "OpenAI's Responses API, run stateless (`store: false`).",
+          "type": "string",
+          "const": "openai-responses"
+        },
+        {
+          "description": "Chat Completions: xAI, OpenRouter, and any server that speaks it.",
+          "type": "string",
+          "const": "chat-completions"
+        }
       ]
     },
     "ToolDefinition": {

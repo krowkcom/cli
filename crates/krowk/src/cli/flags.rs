@@ -57,6 +57,20 @@ pub struct Flags {
     pub permission_mode: String,
     #[cfg(feature = "harness")]
     pub toolset: String,
+    #[cfg(feature = "harness")]
+    pub effort: String,
+    /// `providers add`: the instance's name, its key's variable, its base
+    /// URL, and how SuperGrok signs in.
+    #[cfg(feature = "harness")]
+    pub name: String,
+    #[cfg(feature = "harness")]
+    pub api_key_env: String,
+    #[cfg(feature = "harness")]
+    pub base_url: String,
+    #[cfg(feature = "harness")]
+    pub client_id: String,
+    #[cfg(feature = "harness")]
+    pub device: bool,
     /// Which flags were typed, by canonical name — a different question from
     /// what they carry: `--jq "$UNSET"` was given and is empty.
     pub given: BTreeSet<String>,
@@ -195,6 +209,16 @@ impl Flags {
             "permission-mode" => text(&mut self.permission_mode),
             #[cfg(feature = "harness")]
             "toolset" => text(&mut self.toolset),
+            #[cfg(feature = "harness")]
+            "effort" => text(&mut self.effort),
+            #[cfg(feature = "harness")]
+            "name" => text(&mut self.name),
+            #[cfg(feature = "harness")]
+            "api-key-env" => text(&mut self.api_key_env),
+            #[cfg(feature = "harness")]
+            "base-url" => text(&mut self.base_url),
+            #[cfg(feature = "harness")]
+            "client-id" => text(&mut self.client_id),
             _ => {
                 let b = parse_bool(name, v)?;
                 *match name {
@@ -213,6 +237,8 @@ impl Flags {
                     "thinking" => &mut self.thinking,
                     #[cfg(feature = "harness")]
                     "print" => &mut self.print,
+                    #[cfg(feature = "harness")]
+                    "device" => &mut self.device,
                     other => unreachable!("catalog flag {other} has no field"),
                 } = b;
             }

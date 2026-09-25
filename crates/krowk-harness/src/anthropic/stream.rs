@@ -61,6 +61,31 @@ fn str_of<'a>(v: &'a Value, k: &str) -> &'a str {
     v.get(k).and_then(Value::as_str).unwrap_or_default()
 }
 
+impl crate::http::Decode for Decoder {
+    fn apply(&mut self, ev: &SseEvent) -> Result<Vec<EngineEvent>, EngineError> {
+        Decoder::apply(self, ev)
+    }
+
+    fn done(&self) -> bool {
+        self.done
+    }
+
+    fn interrupt(&mut self) -> Vec<EngineEvent> {
+        Decoder::interrupt(self)
+    }
+
+    fn finish(self, requested_model: &str, interrupted: bool) -> crate::native::ModelResponse {
+        crate::native::ModelResponse {
+            response_id: self.response_id,
+            model: if self.model.is_empty() { requested_model.to_string() } else { self.model },
+            usage: self.usage,
+            stop_reason: self.stop_reason,
+            items: self.items,
+            interrupted,
+        }
+    }
+}
+
 impl Decoder {
     /// Folds one event in; returns what the client should be told.
     pub fn apply(&mut self, ev: &SseEvent) -> Result<Vec<EngineEvent>, EngineError> {

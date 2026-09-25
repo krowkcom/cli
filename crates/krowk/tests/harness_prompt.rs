@@ -185,10 +185,10 @@ fn r_tool_2_krowk_p_records_each_familys_edit_tool_and_toolset_overrides_it() {
     };
     let pair = |p: &str, e: &str| (p.to_string(), e.to_string());
     assert_eq!(edit(&["--model", "claude-sonnet-4-6"]), pair("claude", "str_replace"));
-    assert_eq!(edit(&["--model", "gpt-5.1-codex"]), pair("gpt", "apply_patch"));
-    assert_eq!(edit(&["--model", "grok-code-fast-1"]), pair("grok", "search_replace"));
+    assert_eq!(edit(&["--model", "anthropic/gpt-5.1-codex"]), pair("gpt", "apply_patch"));
+    assert_eq!(edit(&["--model", "anthropic/grok-code-fast-1"]), pair("grok", "search_replace"));
     assert_eq!(edit(&["--model", "house-coder"]), pair("grok", "search_replace"), "the catalog's family");
-    assert_eq!(edit(&["--model", "gpt-5.1-codex", "--toolset", "claude"]), pair("claude", "str_replace"));
+    assert_eq!(edit(&["--model", "anthropic/gpt-5.1-codex", "--toolset", "claude"]), pair("claude", "str_replace"));
     // Config pins one for every model; --toolset still wins.
     let config = b.root.join("home/.config/krowk");
     std::fs::create_dir_all(&config).unwrap();

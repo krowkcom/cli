@@ -12,6 +12,12 @@
 //! | `PreToolUse` | a tool call, before its permission is judged | the tool, by Claude Code's name | the call is not run; the model reads stderr |
 //! | `PostToolUse` | a tool call, after it ran | the tool | the model reads stderr beside the result |
 //! | `Stop` | the model is done | — | the turn goes on; the model reads stderr |
+//! | `SubagentStop` | a subagent is done (its turn fires neither `Stop` nor `UserPromptSubmit`) | — | the subagent goes on; it reads stderr |
+//!
+//! A subagent's hooks are given its parent's `session_id` and
+//! `transcript_path`, as Claude Code gives them, and its own beside them:
+//! `agent_session_id`, `agent_transcript_path`, and `agent_type` when it
+//! runs a definition.
 //!
 //! A hook is `sh -c <command>` in the session's directory, in its own
 //! process group, with the event as JSON on stdin (`session_id`,
@@ -49,6 +55,9 @@ pub enum Event {
     PreToolUse,
     PostToolUse,
     Stop,
+    /// A subagent is done: Claude Code's `SubagentStop`, which blocks as
+    /// `Stop` does — the subagent goes on.
+    SubagentStop,
 }
 
 impl Event {
@@ -59,6 +68,7 @@ impl Event {
             Event::PreToolUse => "PreToolUse",
             Event::PostToolUse => "PostToolUse",
             Event::Stop => "Stop",
+            Event::SubagentStop => "SubagentStop",
         }
     }
 
@@ -69,6 +79,7 @@ impl Event {
             "PreToolUse" => Event::PreToolUse,
             "PostToolUse" => Event::PostToolUse,
             "Stop" => Event::Stop,
+            "SubagentStop" => Event::SubagentStop,
             _ => return None,
         })
     }
@@ -117,7 +128,7 @@ impl Hooks {
 }
 
 /// Reads a settings file's `hooks`. Events krowk does not run
-/// (`Notification`, `SubagentStop`, `PreCompact`, …) and hook types other
+/// (`Notification`, `PreCompact`, …) and hook types other
 /// than `command` are skipped: a file written for a newer Claude Code still
 /// loads.
 pub fn parse(v: &Value, source: &str) -> Result<Hooks, String> {

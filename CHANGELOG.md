@@ -354,9 +354,11 @@ the versions are the `v*` tags a release is cut from. Entries land under
   session's own — a deny rule holds in it, an approval it needs is asked
   in the TUI under its own line (and refused at once under `krowk -p`),
   and a session grant covers it. `subagent` and `todo_write` need no mode,
-  but a deny rule on Claude Code's names for them (`Task`,
-  `Task(<agent>)`, `TodoWrite`) refuses them, and hooks see them under
-  those names. Its
+  but a deny or ask rule on Claude Code's names for them (`Task`,
+  `Task(<agent>)`, `TodoWrite`) refuses or asks, and hooks see them under
+  those names. As in Claude Code, a subagent fires `SubagentStop` when it
+  is done — not `Stop` or `UserPromptSubmit` — and its hooks get the
+  parent's `session_id`, with the subagent's as `agent_session_id`. Its
   spend counts toward the session's `--max-usd` and `--max-tokens`: a
   subagent's calls are held to the parent's limit, and the parent's next
   call counts what its subagents spent; subagents running at once can

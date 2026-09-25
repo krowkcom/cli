@@ -80,6 +80,11 @@ pub struct AgentRun {
     /// The tools it may use, krowk's names with the edit tool as `edit`;
     /// none is every tool but `subagent`.
     pub tools: Option<Vec<String>>,
+    /// The session that started it, and its log: what a hook is told the
+    /// session is, as Claude Code tells a subagent's hooks — the
+    /// subagent's own id rides beside it as `agent_session_id`.
+    pub parent_session: String,
+    pub parent_transcript: String,
 }
 
 impl AgentRun {
@@ -162,6 +167,8 @@ pub const MAX_LISTED: usize = 20;
 /// Characters of a definition's description listed, at most: its first
 /// paragraph, cut here.
 pub const MAX_DESCRIPTION: usize = 200;
+/// Definitions named in it at all, the described ones included.
+pub const MAX_NAMED: usize = 200;
 
 /// The `subagent` tool's description with the definitions listed after
 /// it, each its first paragraph cut to `MAX_DESCRIPTION` characters, the
@@ -178,8 +185,14 @@ pub fn describe(defs: &[AgentDef]) -> String {
         let more = if cut.len() < first.len() { "…" } else { "" };
         s.push_str(&format!("\n- {}: {cut}{more}", d.name));
     }
+    // The rest by name alone, so each can still be called — up to a bound
+    // of its own: a name is short, a thousand of them are not.
     if defs.len() > MAX_LISTED {
-        s.push_str(&format!("\n(and {} more, by name)", defs.len() - MAX_LISTED));
+        let rest: Vec<&str> = defs[MAX_LISTED..].iter().take(MAX_NAMED - MAX_LISTED).map(|d| d.name.as_str()).collect();
+        s.push_str(&format!("\nAlso: {}", rest.join(", ")));
+        if defs.len() > MAX_NAMED {
+            s.push_str(&format!(" (and {} more)", defs.len() - MAX_NAMED));
+        }
     }
     s
 }
@@ -237,6 +250,22 @@ impl Subagents {
         *self.0.spent.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The definition a call's `agent` names, found the one way the
+    /// permission rules judge it too: trimmed, and regardless of case, so
+    /// ` Reviewer ` is the `reviewer` a `Task(reviewer)` rule names. None
+    /// for a general subagent; a name no definition has is refused.
+    pub fn resolve(&self, agent: Option<&str>) -> Result<Option<&AgentDef>, String> {
+        let Some(name) = agent.map(str::trim).filter(|a| !a.is_empty()) else { return Ok(None) };
+        match self.0.defs.iter().find(|d| d.name.eq_ignore_ascii_case(name)) {
+            Some(d) => Ok(Some(d)),
+            None => {
+                let names: Vec<&str> = self.0.defs.iter().map(|d| d.name.as_str()).collect();
+                let there = if names.is_empty() { "there are no agent definitions".to_string() } else { format!("the agents are {}", names.join(", ")) };
+                Err(format!("there is no agent named {name:?} — {there}; leave `agent` out for a general subagent"))
+            }
+        }
+    }
+
     /// The tool's description, listing the agent definitions there are.
     pub fn description(&self) -> String {
         describe(&self.0.defs)
@@ -251,16 +280,9 @@ impl Subagents {
         if input.prompt.trim().is_empty() {
             return ("subagent needs a prompt: the whole task, since the subagent sees nothing else".into(), true);
         }
-        let def = match input.agent.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
-            None => None,
-            Some(name) => match self.0.defs.iter().find(|d| d.name == name) {
-                Some(d) => Some(d),
-                None => {
-                    let names: Vec<&str> = self.0.defs.iter().map(|d| d.name.as_str()).collect();
-                    let there = if names.is_empty() { "there are no agent definitions".to_string() } else { format!("the agents are {}", names.join(", ")) };
-                    return (format!("there is no agent named {name:?} — {there}; leave `agent` out for a general subagent"), true);
-                }
-            },
+        let def = match self.resolve(input.agent.as_deref()) {
+            Ok(d) => d,
+            Err(why) => return (why, true),
         };
         let host = &self.0.host;
         let cfg = &host.cfg;
@@ -296,7 +318,13 @@ impl Subagents {
             }
             _ => model,
         };
-        let run = AgentRun { name: def.map(|d| d.name.clone()), instructions: def.map(|d| d.instructions.clone()).unwrap_or_default(), tools: def.and_then(|d| d.tools.clone()) };
+        let run = AgentRun {
+            name: def.map(|d| d.name.clone()),
+            instructions: def.map(|d| d.instructions.clone()).unwrap_or_default(),
+            tools: def.and_then(|d| d.tools.clone()),
+            parent_session: p.session_id.clone(),
+            parent_transcript: p.compat.transcript.clone(),
+        };
         // Waits its turn behind the fan-out limit, unless the parent is
         // interrupted first.
         let mut cancel = p.cancel.clone();
@@ -366,11 +394,15 @@ mod tests {
         let many: Vec<AgentDef> = (0..50).map(|i| def(i, long.clone())).collect();
         let text = describe(&many);
         let per = MAX_DESCRIPTION + "\n- agent-00: …".len();
-        assert!(text.len() <= DESCRIPTION.len() + 64 + MAX_LISTED * per, "{} bytes", text.len());
-        assert!(text.contains("agent-19") && !text.contains("agent-20") && text.ends_with("(and 30 more, by name)"));
+        assert!(text.len() <= DESCRIPTION.len() + 64 + MAX_LISTED * per + 30 * "agent-00, ".len(), "{} bytes", text.len());
+        assert!(text.contains("- agent-19:") && !text.contains("- agent-20:"), "twenty described");
+        assert!(text.ends_with(&format!("\nAlso: {}", (20..50).map(|i| format!("agent-{i:02}")).collect::<Vec<_>>().join(", "))), "the rest by name: {text}");
         assert!(!text.contains("second paragraph"));
         assert_eq!(describe(&[def(0, "Reviews diffs.\nUse after edits.".into())]), format!("{DESCRIPTION}\nAgents (name them in `agent`):\n- agent-00: Reviews diffs. Use after edits."));
         assert_eq!(describe(&[]), DESCRIPTION);
+        let huge: Vec<AgentDef> = (0..1000).map(|i| AgentDef { name: format!("a{i:04}"), ..def(0, String::new()) }).collect();
+        let text = describe(&huge);
+        assert!(text.contains("a0199") && !text.contains("a0200") && text.ends_with(" (and 800 more)"), "named up to {MAX_NAMED}");
     }
 
     #[test]

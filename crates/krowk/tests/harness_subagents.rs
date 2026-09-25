@@ -662,8 +662,11 @@ fn r_sub_6_a_run_a_subagent_opens_is_the_parents_and_a_resume_reuses_it() {
 fn child_runs_bash(first: &'static str) -> impl Fn(&Value, usize) -> mock::Reply + Send + 'static {
     move |body, _| {
         if is_child(body) {
-            if answered(body) {
-                let (_, out, err) = results(body).remove(0);
+            // Once it has its command's result, it only reports — sent back
+            // to work by a hook, it reports again.
+            let result = body["messages"].as_array().unwrap().iter().filter_map(|m| m["content"].as_array()).flatten().find(|c| c["type"] == "tool_result").cloned();
+            if let Some(r) = result {
+                let (out, err) = (match &r["content"] { Value::String(s) => s.clone(), o => o.to_string() }, r["is_error"].as_bool().unwrap_or(false));
                 return mock::Reply::sse(&mock::text_stream(&format!("CHILD-SAW error={err} {}", out.replace('\n', " "))));
             }
             return mock::Reply::sse(&mock::tool_use("toolu_sh", "bash", &json!({"command": "echo from-the-child"})));
@@ -784,4 +787,113 @@ fn r_sub_2_a_subagents_approval_request_is_answered_under_its_own_session() {
     let child = children_of(&b, &r.session_id).remove(0);
     assert_eq!(req.session_id, child, "asked under the subagent's own session");
     assert!(parent_result(&b, &r.session_id).0.starts_with("CHILD-SAW error=false from-the-child"), "approved, it ran");
+}
+
+/// The parent starts one subagent, naming `agent`; the subagent answers
+/// at once.
+fn names_agent(agent: &'static str) -> impl Fn(&Value, usize) -> mock::Reply + Send + 'static {
+    move |body, _| {
+        if is_child(body) {
+            return mock::Reply::sse(&mock::text_stream("CHILD-DONE"));
+        }
+        if answered(body) {
+            return mock::Reply::sse(&mock::fixture("turn2_answer.sse"));
+        }
+        let mut input = json!({"description": "review it", "prompt": "TASK-R"});
+        if !agent.is_empty() {
+            input["agent"] = json!(agent);
+        }
+        mock::Reply::sse(&tool_calls(&[("toolu_rv", "subagent", input)]))
+    }
+}
+
+#[test]
+fn r_sub_5_every_spelling_of_a_denied_agent_is_denied_and_an_unknown_one_refused_first() {
+    for spelled in ["reviewer", " reviewer ", "Reviewer", "\treviewer\n", "REVIEWER"] {
+        let m = mock::serve(names_agent(spelled));
+        let b = Sandbox::new("deny-spelling", &m.url);
+        std::fs::create_dir_all(b.root.join("repo/.krowk/agents")).unwrap();
+        std::fs::write(b.root.join("repo/.krowk/agents/reviewer.md"), "---\nname: reviewer\ndescription: reviews\n---\n").unwrap();
+        let seen = b.root.join("pre.json");
+        let hook = json!({"permissions": {"deny": ["Task(reviewer)"]}, "hooks": {"PreToolUse": [{"matcher": "Task", "hooks": [{"type": "command", "command": format!("cat > '{}'", seen.display())}]}]}});
+        let r = run_in_process(&b, b.host_with(hook, false), None, "review it", PermissionMode::BypassPermissions);
+        let (out, err) = parent_result(&b, &r.session_id);
+        assert!(err && out.contains("denied by the rule `Task(reviewer)`"), "{spelled:?}: {out}");
+        assert!(children_of(&b, &r.session_id).is_empty(), "{spelled:?} started no subagent");
+        // The hook saw the call as Task, its agent as the definition names it.
+        let input: Value = serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+        assert_eq!(input["tool_name"], "Task");
+    }
+    // A name no definition has is refused before hooks and rules see it.
+    let m = mock::serve(names_agent("nobody"));
+    let b = Sandbox::new("unknown-agent", &m.url);
+    let seen = b.root.join("pre.json");
+    let hook = json!({"hooks": {"PreToolUse": [{"matcher": "Task", "hooks": [{"type": "command", "command": format!("cat > '{}'", seen.display())}]}]}});
+    let r = run_in_process(&b, b.host_with(hook, false), None, "review it", PermissionMode::BypassPermissions);
+    let (out, err) = parent_result(&b, &r.session_id);
+    assert!(err && out.contains("there is no agent named \"nobody\""), "{out}");
+    assert!(!seen.exists(), "no hook ran for it");
+    assert!(children_of(&b, &r.session_id).is_empty());
+}
+
+#[test]
+fn r_sub_1_an_ask_rule_or_a_hooks_ask_holds_subagent_and_todo_write_and_headless_refuses() {
+    let asks = [
+        json!({"permissions": {"ask": ["Task"]}}),
+        json!({"permissions": {"ask": ["Task(general-purpose)"]}}),
+        json!({"hooks": {"PreToolUse": [{"matcher": "Task", "hooks": [{"type": "command", "command": "echo '{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"ask\"}}'"}]}]}}),
+    ];
+    for user in asks {
+        let m = mock::serve(names_agent(""));
+        let b = Sandbox::new("task-ask", &m.url);
+        // bypassPermissions does not answer an ask.
+        let r = run_in_process(&b, b.host_with(user.clone(), false), None, "review it", PermissionMode::BypassPermissions);
+        let (out, err) = parent_result(&b, &r.session_id);
+        assert!(err && out.contains("needs approval") && out.contains("nobody is here to give it"), "{user}: {out}");
+        assert!(children_of(&b, &r.session_id).is_empty(), "{user}");
+    }
+    let m = mock::serve(child_runs_bash("todo"));
+    let b = Sandbox::new("todo-ask", &m.url);
+    let r = run_in_process(&b, b.host_with(json!({"permissions": {"ask": ["TodoWrite"]}}), false), None, "plan it", PermissionMode::Default);
+    let (out, err) = parent_result(&b, &r.session_id);
+    assert!(err && out.contains("needs approval"), "{out}");
+    assert!(!b.log(&r.session_id).iter().any(|e| e["type"] == "todos.updated"));
+}
+
+#[test]
+fn r_sub_1_a_subagent_fires_subagent_stop_not_stop_or_user_prompt_submit_and_hooks_see_its_parent() {
+    let m = mock::serve(child_runs_bash("subagent"));
+    let b = Sandbox::new("subagent-stop", &m.url);
+    let log = b.root.join("hooks.jsonl");
+    let record = format!("input=$(cat); printf '%s\\n' \"$input\" >> '{}'", log.display());
+    // SubagentStop blocks once: the subagent goes on, reading why.
+    let block_once = format!("{record}; case \"$input\" in *'\"hook_event_name\":\"SubagentStop\"'*'\"stop_hook_active\":false'*) echo 'check your work' >&2; exit 2;; esac");
+    let hooks = json!({"hooks": {
+        "UserPromptSubmit": [{"hooks": [{"type": "command", "command": record}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": record}]}],
+        "SubagentStop": [{"hooks": [{"type": "command", "command": block_once}]}],
+        "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": record}]}],
+    }});
+    let r = run_in_process(&b, b.host_with(hooks, false), None, "run it in a subagent", PermissionMode::BypassPermissions);
+    assert_eq!(r.status, TurnStatus::Completed, "{:?}", r.error);
+    let child = children_of(&b, &r.session_id).remove(0);
+    let fired: Vec<Value> = std::fs::read_to_string(&log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let events: Vec<(String, String)> = fired.iter().map(|f| (f["hook_event_name"].as_str().unwrap().to_string(), f["session_id"].as_str().unwrap().to_string())).collect();
+    let parent = r.session_id.clone();
+    assert_eq!(
+        events,
+        [("UserPromptSubmit".into(), parent.clone()), ("PreToolUse".into(), parent.clone()), ("SubagentStop".into(), parent.clone()), ("SubagentStop".into(), parent.clone()), ("Stop".into(), parent.clone())],
+        "the parent's prompt, the child's bash, the child's end twice (blocked once), the parent's end — every one under the parent's session"
+    );
+    for f in &fired[1..4] {
+        assert_eq!(f["agent_session_id"], child.as_str(), "the subagent's own id beside it: {f}");
+        assert!(f["agent_transcript_path"].as_str().unwrap().contains(&child));
+        assert!(f["transcript_path"].as_str().unwrap().contains(&parent));
+    }
+    assert!(fired[0].get("agent_session_id").is_none() && fired[4].get("agent_session_id").is_none());
+    assert_eq!((fired[2]["stop_hook_active"].as_bool(), fired[3]["stop_hook_active"].as_bool()), (Some(false), Some(true)));
+    // Blocked, the subagent read why and made one more call.
+    let seen = m.seen.lock().unwrap();
+    let last_child = seen.iter().map(|s| &s.body).rfind(|b| is_child(b)).unwrap();
+    assert!(last_child.to_string().contains("check your work"), "{last_child}");
 }

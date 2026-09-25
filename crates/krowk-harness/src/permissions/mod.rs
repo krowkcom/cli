@@ -143,7 +143,7 @@ pub fn summary(call: &Call) -> String {
         Access::Fetch(u) => format!("WebFetch {u}"),
         Access::Mcp { server, tool } => format!("the MCP tool {tool} of {server}"),
         Access::Skill(_) => format!("the skill {}", call.subject.as_deref().unwrap_or("?")),
-        Access::Free | Access::Other => match &call.subject {
+        Access::Free | Access::Other | Access::Session => match &call.subject {
             Some(s) => format!("{} {s}", call.tool),
             None => call.tool.clone(),
         },
@@ -187,6 +187,10 @@ fn remember(call: &Call) -> Vec<String> {
         Access::Mcp { server, tool } => vec![format!("mcp__{server}__{tool}")],
         Access::Skill(_) => call.subject.iter().map(|s| format!("Skill({s})")).collect(),
         Access::Free | Access::Other => vec![call.tool.clone()],
+        Access::Session => vec![match &call.subject {
+            Some(s) if !s.contains(['*', '?', '[', ']', '{', '}', '(', ')']) => format!("{}({s})", call.tool),
+            _ => call.tool.clone(),
+        }],
     }
 }
 
@@ -370,6 +374,18 @@ impl Gate {
         if call.access == Access::Free {
             return Verdict::Allow(Opens::default());
         }
+        // krowk's own session tools: no mode, plan's included, holds them,
+        // but an ask rule or a hook's ask does — in bypassPermissions too,
+        // as for any call.
+        if call.access == Access::Session {
+            if let Some((_, r)) = p.loaded.rules.iter().find(|(k, r)| *k == Kind::Ask && rules::matches(r, call, &at, false)) {
+                return Verdict::Ask { reason: format!("the rule `{}` in {} asks first", r.text, r.source), remember: remember(call) };
+            }
+            if hook == Some(hooks::Decision::Ask) {
+                return Verdict::Ask { reason: "a PreToolUse hook asks for it to be approved".into(), remember: Vec::new() };
+            }
+            return Verdict::Allow(Opens::default());
+        }
         let mode = self.0.mode;
         if mode == PermissionMode::Plan && !matches!(call.access, Access::Read(_) | Access::Fetch(_) | Access::Skill(_)) {
             return Verdict::Deny(format!("{what} is not run in plan mode, which reads and plans but changes nothing. Say what you would do instead; the person leaves plan mode to have it done."));
@@ -416,7 +432,7 @@ impl Gate {
             Access::Mcp { .. } => "it calls an MCP tool no allow rule covers".into(),
             // Loading a skill reads its own file: what reading needs.
             Access::Skill(_) => return Verdict::Allow(Opens::default()),
-            Access::Free | Access::Other => format!("no allow rule covers {}", call.tool),
+            Access::Free | Access::Other | Access::Session => format!("no allow rule covers {}", call.tool),
         };
         Verdict::Ask { reason, remember: remember(call) }
     }
@@ -484,6 +500,11 @@ impl Gate {
     /// The refusal for a call that would be asked about when nobody can
     /// answer: what it needed, and what would allow it.
     fn nobody_to_ask(&self, call: &Call, what: &str, reason: &str, remember: &[String]) -> String {
+        // A session tool is asked about only by an ask rule or a hook, which
+        // no mode and no allow rule gets past.
+        if call.access == Access::Session {
+            return format!("{what} needs approval — {reason} — and nobody is here to give it: this session cannot ask. Run it where someone can answer (bare `krowk`), or remove what asks.");
+        }
         let at = self.0.policy.places();
         let untrusted = self.0.policy.loaded.ignored_allow.iter().find(|r| rules::matches(r, call, &at, true));
         let (outside, fenced) = self.reach(call);

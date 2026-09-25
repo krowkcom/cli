@@ -260,12 +260,17 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                 Some(Item::UserText { text }) => text.clone(),
                 _ => String::new(),
             };
-            let o = hooks.run(hooks::Event::UserPromptSubmit, None, json!({"prompt": prompt})).await;
-            if let Some(why) = o.block {
-                return Err(EngineError::new("prompt_blocked", format!("a UserPromptSubmit hook refused the prompt: {why}")));
+            // A subagent's prompt is its parent's model's words, not the
+            // person's: Claude Code fires no UserPromptSubmit for one, and
+            // neither does krowk.
+            if ctx.agent.is_none() {
+                let o = hooks.run(hooks::Event::UserPromptSubmit, None, json!({"prompt": prompt})).await;
+                if let Some(why) = o.block {
+                    return Err(EngineError::new("prompt_blocked", format!("a UserPromptSubmit hook refused the prompt: {why}")));
+                }
+                add_context(&events, &mut req, "UserPromptSubmit", o.context).await;
+                hooks.stopped()?;
             }
-            add_context(&events, &mut req, "UserPromptSubmit", o.context).await;
-            hooks.stopped()?;
             let mut stops = 0usize;
             // Response indexes continue from the history's, so a replayed
             // turn and this one never share an index.
@@ -325,12 +330,14 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                     // A Stop hook that blocks keeps the turn going, its
                     // reason the model's next input — a few times at most, so
                     // a hook that always blocks cannot hold the turn forever.
-                    if stops < MAX_STOP_HOOK_CONTINUES && ctx.compat.hooks.has(hooks::Event::Stop) {
-                        let o = hooks.run(hooks::Event::Stop, None, json!({"stop_hook_active": stops > 0})).await;
+                    // A subagent's end is SubagentStop, as in Claude Code.
+                    let stop = if ctx.agent.is_some() { hooks::Event::SubagentStop } else { hooks::Event::Stop };
+                    if stops < MAX_STOP_HOOK_CONTINUES && ctx.compat.hooks.has(stop) {
+                        let o = hooks.run(stop, None, json!({"stop_hook_active": stops > 0})).await;
                         hooks.stopped()?;
                         if let Some(why) = o.block {
                             stops += 1;
-                            add_context(&events, &mut req, "Stop", vec![why]).await;
+                            add_context(&events, &mut req, stop.name(), vec![why]).await;
                             continue;
                         }
                     }
@@ -446,7 +453,24 @@ impl<'a> Hooked<'a> {
         if !c.hooks.has(event) {
             return hooks::Outcome::default();
         }
-        let base = hooks::Base { session_id: &self.ctx.session_id, transcript_path: &c.transcript, cwd: &self.ctx.cwd, project_dir: &c.project_dir, permission_mode: self.mode };
+        // A subagent's hooks are told the session is its parent's, as
+        // Claude Code tells them, with the subagent's own session and log
+        // beside it.
+        let (session_id, transcript_path, fields) = match &self.ctx.agent {
+            Some(run) => {
+                let mut f = fields;
+                if let Some(m) = f.as_object_mut() {
+                    m.insert("agent_session_id".into(), json!(self.ctx.session_id));
+                    m.insert("agent_transcript_path".into(), json!(c.transcript));
+                    if let Some(name) = &run.name {
+                        m.insert("agent_type".into(), json!(name));
+                    }
+                }
+                (run.parent_session.as_str(), run.parent_transcript.as_str(), f)
+            }
+            None => (self.ctx.session_id.as_str(), c.transcript.as_str(), fields),
+        };
+        let base = hooks::Base { session_id, transcript_path, cwd: &self.ctx.cwd, project_dir: &c.project_dir, permission_mode: self.mode };
         let o = hooks::run(&c.hooks, event, subject, &base, fields, &self.ctx.cancel).await;
         // A hook's systemMessage is the person's: a notice, never logged,
         // never read by the model.
@@ -506,17 +530,31 @@ fn offers(ctx: &TurnContext, name: &str) -> bool {
 }
 
 /// The session's own tools — `todo_write` and `subagent` — as the
-/// evaluator judges them: they need no mode (a todo list is the session's
-/// own; a subagent is held to these same rules), but a deny rule on
-/// Claude Code's name for them — `TodoWrite`, `Task` or `Task(<agent>)` —
-/// refuses them, and hooks see them under those names.
-fn session_tool(name: &str, input: &serde_json::Value) -> Option<crate::permissions::Call> {
+/// evaluator judges them: no mode governs them (a todo list is the
+/// session's own; a subagent is held to these same rules), but a deny rule,
+/// an ask rule or a hook's `ask` on Claude Code's name for them —
+/// `TodoWrite`, `Task` or `Task(<agent>)` — does, and hooks see them under
+/// those names. A subagent's agent is judged as the definition it resolves
+/// to — the name as the definition spells it — so no spelling of a denied
+/// agent slips past its rule; a name no definition has is refused here,
+/// before hooks or rules see it. `None` for any other tool.
+fn session_tool(ctx: &TurnContext, name: &str, input: &serde_json::Value) -> Option<Result<crate::permissions::Call, String>> {
     let (tool, subject) = match name {
         crate::todo::TODO_WRITE => ("TodoWrite", None),
-        SUBAGENT => ("Task", Some(input.get("agent").and_then(|a| a.as_str()).filter(|a| !a.trim().is_empty()).unwrap_or("general-purpose").to_string())),
+        SUBAGENT => {
+            let asked = input.get("agent").and_then(|a| a.as_str());
+            let resolved = match &ctx.subagents {
+                Some(s) => s.resolve(asked).map(|d| d.map(|d| d.name.clone())),
+                None => Ok(None),
+            };
+            match resolved {
+                Ok(agent) => ("Task", Some(agent.unwrap_or_else(|| "general-purpose".into()))),
+                Err(why) => return Some(Err(why)),
+            }
+        }
         _ => return None,
     };
-    Some(crate::permissions::Call { tool: tool.into(), access: crate::permissions::Access::Free, subject })
+    Some(Ok(crate::permissions::Call { tool: tool.into(), access: crate::permissions::Access::Session, subject }))
 }
 
 /// One tool call, whole: the skill tool, the session's own tools, or a
@@ -531,7 +569,11 @@ async fn call_tool(ctx: &TurnContext, hooks: &Hooked<'_>, env: &tools::ToolEnv<'
     // Claude Code's `Skill`, and `Skill(name)` rules — and a `Read` deny of
     // its file — judge it before its body enters the conversation.
     let skill = name == crate::compat::skills::TOOL && !ctx.compat.skills.is_empty();
-    let own = session_tool(name, input);
+    let own = match session_tool(ctx, name, input) {
+        Some(Err(why)) => return (why, true),
+        Some(Ok(c)) => Some(c),
+        None => None,
+    };
     let (call, claude, tool_input) = if let Some(c) = own.clone() {
         let claude = c.tool.clone();
         (c, claude, input.clone())

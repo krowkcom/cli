@@ -427,3 +427,25 @@ async fn r_perm_2_allowing_a_glob_named_file_for_the_session_does_not_cover_its_
     assert_eq!(letter(&g.verdict(&read(d.join("src/a[1].rs")), None)), '?', "and so is the file itself, next time");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn r_sub_1_krowks_session_tools_need_no_mode_but_deny_and_ask_rules_and_a_hooks_ask_hold_them() {
+    let cwd = repo("session-tools");
+    let task = |agent: &str| Call { tool: "Task".into(), access: Access::Session, subject: Some(agent.into()) };
+    let todo = Call { tool: "TodoWrite".into(), access: Access::Session, subject: None };
+    let none = policy(&cwd, &[]);
+    for mode in [PermissionMode::Default, PermissionMode::AcceptEdits, PermissionMode::Plan, PermissionMode::BypassPermissions] {
+        assert_eq!(letter(&gate(&none, mode).verdict(&task("reviewer"), None)), 'Y', "{mode:?}: no mode holds it, plan's included");
+        assert_eq!(letter(&gate(&none, mode).verdict(&todo, None)), 'Y', "{mode:?}");
+        assert_eq!(letter(&gate(&none, mode).verdict(&task("reviewer"), Some(crate::hooks::Decision::Ask))), '?', "{mode:?}: a hook's ask asks");
+    }
+    let ask = policy(&cwd, &[(Kind::Ask, "Task(reviewer)"), (Kind::Deny, "TodoWrite")]);
+    let bypass = gate(&ask, PermissionMode::BypassPermissions);
+    assert_eq!(letter(&bypass.verdict(&task("reviewer"), None)), '?', "an ask rule asks, bypass or not");
+    assert_eq!(letter(&bypass.verdict(&task("writer"), None)), 'Y', "another agent is not that rule's");
+    assert_eq!(letter(&bypass.verdict(&todo, None)), 'N');
+    match bypass.verdict(&task("reviewer"), None) {
+        Verdict::Ask { remember, .. } => assert_eq!(remember, ["Task(reviewer)"]),
+        v => panic!("{v:?}"),
+    }
+}

@@ -305,7 +305,12 @@ impl Scope {
         if self.bypass {
             return Ok(p);
         }
-        let inside = |q: &Path| q.components().find_map(|c| [".git", ".claude"].into_iter().find(|d| c.as_os_str() == *d));
+        // Compared the way the file system may: case-insensitively (macOS
+        // and Windows open `.Claude` as `.claude`), and with the trailing
+        // dots and spaces Windows drops (`.git.` is `.git`) — on every OS,
+        // since a checkout travels between them.
+        let fold = |c: &std::ffi::OsStr| c.to_string_lossy().trim_end_matches(['.', ' ']).to_ascii_lowercase();
+        let inside = |q: &Path| q.components().find_map(|c| [".git", ".claude"].into_iter().find(|d| fold(c.as_os_str()) == *d));
         let real = real_path(&p, 0).unwrap_or_else(|_| p.clone());
         let root = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
         let fenced = inside(p.strip_prefix(&self.cwd).unwrap_or(&p)).or_else(|| inside(real.strip_prefix(&root).unwrap_or(&real)));
@@ -313,7 +318,8 @@ impl Scope {
             let runs = if dir == ".git" { "git runs what its config and hooks name, so it is left to git itself — use git through bash" } else { "Claude Code runs what its settings, hooks and agents name" };
             return Err(format!("{} is inside a {dir} directory, which the file tools do not change: {runs}, or ask the person to rerun with `--permission-mode bypassPermissions`", p.display()));
         }
-        if let Some(d) = self.protected.iter().find(|d| real.starts_with(d.canonicalize().unwrap_or_else(|_| d.to_path_buf()))) {
+        let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+        if let Some(d) = self.protected.iter().find(|d| lower(&real).starts_with(lower(&d.canonicalize().unwrap_or_else(|_| d.to_path_buf())))) {
             return Err(format!(
                 "{} is inside {}, Claude Code's config directory for this session, which the file tools do not change: Claude Code runs what its settings and hooks name — ask the person to rerun with `--permission-mode bypassPermissions`",
                 p.display(),
@@ -860,6 +866,14 @@ mod tests {
         let claude = |r: (String, bool)| r.1 && r.0.contains("inside a .claude directory");
         assert!(claude(run(WRITE, &json!({"path": ".claude/settings.json", "content": "{}"}), &env).await));
         assert!(claude(run(WRITE, &json!({"path": "sub/.claude/agents/x.md", "content": "x"}), &env).await), "any component");
+        // However a case-insensitive or a Windows file system would open it.
+        for p in [".Claude/settings.json", ".CLAUDE/hooks/h.sh", ".claude./settings.json", ".claude /agents/a.md", "sub/.ClAuDe/settings.local.json"] {
+            assert!(claude(run(WRITE, &json!({"path": p, "content": "{}"}), &env).await), "{p}");
+        }
+        for p in [".GIT/config", ".Git/hooks/pre-commit", ".git./config", ".git /hooks/x"] {
+            assert!(refused(run(WRITE, &json!({"path": p, "content": "x"}), &env).await), "{p}");
+        }
+        assert!(!run(WRITE, &json!({"path": ".claudette/notes.md", "content": "x"}), &env).await.1, "a name that only starts like it is fine");
         assert!(!d.join(".claude").exists());
         assert!(!run(WRITE, &json!({"path": ".claude/settings.json", "content": "{}"}), &bypass).await.1);
         let _ = std::fs::remove_dir_all(d);

@@ -205,16 +205,32 @@ the versions are the `v*` tags a release is cut from. Entries land under
   as native ones, Ctrl-C interrupts the turn and keeps the session, `-p
   --resume` continues it on `claude --resume`, and the log records the
   Claude session id, its transcript's path and whether it ran on the
-  subscription or an API key (`backend.session`). Claude Code's tool
-  approvals are answered by krowk's `--permission-mode` (edits need
-  `acceptEdits`, Bash needs `bypassPermissions`), and krowk's own tools
-  reach Claude Code as the `krowk` MCP server — today `session_info`.
+  subscription or an API key (`backend.session`). Claude Code runs in
+  its `default` mode (`plan` under `--permission-mode plan`) whatever its
+  settings' `defaultMode` says, and a turn it reports in a looser mode is
+  stopped before it runs anything. Tool calls Claude Code asks about are
+  answered by krowk's `--permission-mode` (edits need `acceptEdits` and
+  never reach `.git`, `.claude` or the account's config directory; Bash
+  and anything else need `bypassPermissions`). **Claude Code's own allow
+  rules (`permissions.allow` in your or the project's settings) and its
+  hooks still apply first**: what they approve runs without krowk being
+  asked, as it does when you run `claude` yourself. `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` set for krowk's native
+  engine are not passed to Claude Code (an instance's `env` can set them),
+  so an exported key never moves a subscription account onto it. Stopping
+  a session stops everything Claude Code started with it, and a host that
+  keeps sessions lets an idle one's process go after 15 minutes. krowk's
+  own tools reach Claude Code as the `krowk` MCP server — today
+  `session_info`.
 - **`-p` asks before Claude Code runs in a repository you have not
   trusted.** `claude -p` runs a repository's hooks and MCP servers without
   its usual trust prompt, so krowk shows its own on a terminal and
-  remembers a yes in `~/.config/krowk/trusted.json`; without a terminal it
-  refuses (exit 4, `untrusted_directory`) unless you pass `--trust`, which
-  lasts for that run. Native `-p` runs nothing of the repository's and
+  remembers a yes in `~/.config/krowk/trusted.json` for that repository
+  alone (not for repositories inside it); without a terminal it refuses
+  (exit 4, `untrusted_directory`) unless you pass `--trust`, which lasts
+  for that run. Your home directory and `/` are never trusted for good —
+  in a home kept in git, every plain directory is part of that repository
+  — so only `--trust` runs Claude Code there. Native `-p` runs nothing of the repository's and
   never asks.
 - **Native sessions are logs you own, listed beside imported ones.** Each
   session is an append-only JSONL log under

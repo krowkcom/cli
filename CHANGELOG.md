@@ -66,6 +66,35 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- **`krowk -p "…"` runs krowk's own agent, headless, on the Anthropic API.**
+  Build with `--features harness` (the release and the agent build are
+  unchanged). The prompt comes from the arguments, or from stdin when there
+  are none; the key from `ANTHROPIC_API_KEY`, and `ANTHROPIC_BASE_URL`
+  points it at a router or a stand-in. `--output-format text` prints the
+  answer, `json` the `result` event, and `stream-json` every event as it
+  happens — `item.started`/`item.delta`/`item.completed` per item, then a
+  `result` with usage (input, output, cache read, cache write, reasoning),
+  the cost at models.dev prices, the duration and the session id.
+  `--model <instance>/<model>` picks the model (a bare id runs on the
+  `anthropic` instance; `claude-opus-5` by default), `--resume <id>`
+  continues a session by the id its result named or its `krowk sessions`
+  id, and Ctrl-C stops a turn and keeps what it made. The agent has two
+  tools, `read` and `bash`; `bash` runs only under `--permission-mode
+  bypassPermissions` until permission rules land, and is refused with a
+  reason the model can read otherwise. Prompt caching is on by default.
+- **Native sessions are logs you own, listed beside imported ones.** Each
+  session is an append-only JSONL log under
+  `~/.local/share/krowk/sessions/<id>/` (with each turn's exact system
+  prompt and tool definitions beside it in `context.jsonl`), and it lists
+  in `krowk sessions` as harness `krowk` next to Claude, Cursor and
+  opencode sessions. `krowk sessions rebuild` re-derives them from the logs
+  like any other transcript, and `sessions import --from krowk` reads them
+  alone. The event format is generated as JSON Schema in
+  `crates/krowk-harness/schema/`.
+- **Instances in `config.json`.** An `"instances"` map names provider
+  accounts — `{"anthropic:work": {"kind": "anthropic-api", "apiKeyEnv":
+  "WORK_ANTHROPIC_KEY"}}` — and `"defaultModel"` the model `-p` uses. A key
+  is never stored in the file, only the variable it is read from.
 - **`krowk sessions budget <id> --max-usd N --max-tokens N`** checks a
   session against a spend limit by what the provider metered, never by the
   `max_tokens` its requests asked for — providers do not strictly enforce

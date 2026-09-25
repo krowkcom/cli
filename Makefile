@@ -2,21 +2,30 @@
 # A checkout and a release should not disagree about what version this is.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
 
-.PHONY: build test lint check install mock clean dist release-check golden golden-update bin/devregistry
+.PHONY: build test lint check install mock clean dist release-check golden golden-update bin/devregistry schema lean-deps
 
 build: ## Build target/release/krowk (with sessions) and krowk-mcp
 	KROWK_VERSION=$(VERSION) cargo build --release -p krowk --features sessions
 
+# With `harness`, which implies `sessions`: every test either build runs.
 test: ## The unit and integration tests
-	cargo test --workspace --exclude krowk-golden --features krowk/sessions
+	cargo test --workspace --exclude krowk-golden --features krowk/harness
 
 # Both builds: the agent build (no sessions) is the one a container compiles
 # from source, and a cfg that only one of them sees is a lint only one catches.
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --workspace --all-targets --features krowk/sessions -- -D warnings
+	cargo clippy --workspace --all-targets --features krowk/harness -- -D warnings
 
-check: lint test golden ## Everything CI runs
+check: lint lean-deps test golden ## Everything CI runs
+
+# R-PKG-2: the agent build links exactly the crates crates/krowk/lean-deps.txt lists, on every target.
+lean-deps: ## Hold the agent build to its dependency list
+	scripts/lean_deps_check.sh
+
+schema: ## Regenerate the harness protocol's JSON Schema after a type change
+	KROWK_SCHEMA_UPDATE=1 cargo test -p krowk-harness --test schema
 
 install: ## Install krowk and krowk-mcp into ~/.cargo/bin
 	KROWK_VERSION=$(VERSION) cargo install --locked --path crates/krowk --features sessions

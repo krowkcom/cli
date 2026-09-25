@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Command",
+  "description": "What a client asks of the engine. `prompt` and `interrupt` are served\ntoday; the rest are typed now so every client is written against the\nwhole vocabulary, and are refused with `not_implemented` until their\ntickets land.",
+  "oneOf": [
+    {
+      "description": "Start a turn: in `sessionId` when given, else in a new session.",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "model": {
+          "description": "The model for this turn; the session's last one when absent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "permissionMode": {
+          "$ref": "#/$defs/PermissionMode",
+          "default": "default"
+        },
+        "type": {
+          "type": "string",
+          "const": "prompt"
+        }
+      },
+      "required": [
+        "type",
+        "text"
+      ]
+    },
+    {
+      "description": "Stop the running turn, keeping what it produced so far.",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "interrupt"
+        }
+      },
+      "required": [
+        "type",
+        "sessionId"
+      ]
+    },
+    {
+      "description": "Add input to the running turn without stopping it.",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "steer"
+        }
+      },
+      "required": [
+        "type",
+        "sessionId",
+        "text"
+      ]
+    },
+    {
+      "description": "Answer a permission request.",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/$defs/ApprovalDecision"
+        },
+        "type": {
+          "type": "string",
+          "const": "approve"
+        }
+      },
+      "required": [
+        "type",
+        "sessionId",
+        "requestId",
+        "decision"
+      ]
+    },
+    {
+      "description": "Continue the session on another model.",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelRef"
+        },
+        "type": {
+          "type": "string",
+          "const": "switchModel"
+        }
+      },
+      "required": [
+        "type",
+        "sessionId",
+        "model"
+      ]
+    },
+    {
+      "description": "Branch the session at an event: the new branch's first event names\nit as its parent.",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "fromEventId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "fork"
+        }
+      },
+      "required": [
+        "type",
+        "sessionId",
+        "fromEventId"
+      ]
+    }
+  ],
+  "$defs": {
+    "ModelRef": {
+      "description": "A model, named as the instance that serves it and the provider's own id\nfor it: `{\"instance\": \"anthropic\", \"model\": \"claude-opus-5\"}`.",
+      "type": "object",
+      "properties": {
+        "instance": {
+          "description": "A name from the instance registry, e.g. `anthropic` or `anthropic:work`.",
+          "type": "string"
+        },
+        "model": {
+          "description": "The provider's model id, e.g. `claude-opus-5`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instance",
+        "model"
+      ]
+    },
+    "PermissionMode": {
+      "description": "Claude-Code-compatible permission modes. Until the permission system\nlands, only `bypassPermissions` changes anything: it is the one mode in\nwhich `bash` runs.",
+      "type": "string",
+      "enum": [
+        "default",
+        "acceptEdits",
+        "plan",
+        "bypassPermissions"
+      ]
+    },
+    "ApprovalDecision": {
+      "description": "An answer to a permission request.",
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    }
+  }
+}

@@ -353,7 +353,7 @@ pub fn catalog(version: &str) -> Catalog {
 }
 
 pub fn global_flags() -> Vec<Flag> {
-    vec![
+    let flags = vec![
         flag("workspace", STRING, "Use this workspace's stored key for this one command — outranks KROWK_WORKSPACE and every config file"),
         flag("dev", BOOL, format!("Talk to a local registry at {}", krowk_api::DEV_BASE_URL)),
         flag("format", STRING, "human | json | markdown | url (default: human on a TTY, json when piped)"),
@@ -366,6 +366,32 @@ pub fn global_flags() -> Vec<Flag> {
         ),
         Flag { aliases: vec!["h"], ..flag("help", BOOL, "Show the help") },
         Flag { aliases: vec!["v"], ..flag("version", BOOL, "Print the version") },
+    ];
+    #[cfg(feature = "harness")]
+    let flags = [flags, prompt_flags()].concat();
+    flags
+}
+
+/// `krowk -p "…"`: the harness build's headless agent. Flags rather than a
+/// command, because that is how every agent CLI spells it.
+#[cfg(feature = "harness")]
+fn prompt_flags() -> Vec<Flag> {
+    vec![
+        Flag {
+            aliases: vec!["p"],
+            ..flag("print", BOOL, "Run the prompt given as the arguments (or on stdin) headless: krowk's own agent answers it, then exits")
+        },
+        with_default(flag("output-format", STRING, "With -p: text (the answer), json (the result event) or stream-json (every event, one per line)"), "text"),
+        flag("model", STRING, "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5"),
+        flag("resume", STRING, "With -p: continue this krowk session — the sessionId a result names, or its krowk.db id"),
+        with_default(
+            flag(
+                "permission-mode",
+                STRING,
+                "With -p: default, acceptEdits, plan or bypassPermissions. Until permission rules land, bash runs only under bypassPermissions",
+            ),
+            "default",
+        ),
     ]
 }
 

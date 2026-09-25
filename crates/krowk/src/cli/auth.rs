@@ -261,7 +261,7 @@ fn browsable_url(raw: &str, registry: &Client) -> Result<String, Error> {
 
 /// Nowhere to open a browser: over SSH, on CI, or on a unix session with no
 /// display server.
-fn headless(ctx: &Ctx) -> bool {
+pub(super) fn headless(ctx: &Ctx) -> bool {
     if ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"].iter().any(|k| !ctx.env(k).is_empty()) || in_ci(ctx) {
         return true;
     }
@@ -277,7 +277,7 @@ fn in_ci(ctx: &Ctx) -> bool {
 
 /// Hands the page to the desktop, started rather than waited on — `xdg-open`
 /// may exec a browser in the foreground. The URL is one argument, no shell.
-fn open_browser(target: &str) -> bool {
+pub(super) fn open_browser(target: &str) -> bool {
     let mut cmd = if cfg!(target_os = "macos") {
         std::process::Command::new("open")
     } else if cfg!(windows) {

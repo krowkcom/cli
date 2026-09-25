@@ -10,7 +10,7 @@ use krowk_harness::headless::{self, OutputFormat};
 use krowk_harness::host::HostConfig;
 use krowk_harness::instances::{self, Registry};
 use krowk_harness::log;
-use krowk_harness::protocol::{PermissionMode, TurnStatus, Usage};
+use krowk_harness::protocol::{Effort, PermissionMode, TurnStatus, Usage};
 use std::io::{IsTerminal, Read};
 use std::sync::Arc;
 
@@ -45,8 +45,20 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
         t if krowk_harness::toolset::by_name(t).is_some() => Some(t.to_string()),
         t => return Err(fail("bad_flag", format!("--toolset {t} is not a toolset — one of {}", krowk_harness::toolset::names().join(", ")))),
     };
-    let cfg = HostConfig { sessions_dir, cwd, registry, krowk_version: super::VERSION.into(), pricer: pricer(ctx.io.env), families: families(ctx.io.env) };
-    let opts = headless::Options { prompt, resume, model, permission_mode, toolset, format };
+    let effort = match ctx.f.effort.trim() {
+        "" => None,
+        e => Some(Effort::parse(e).ok_or_else(|| fail("bad_flag", format!("--effort {e} is not a rung of the ladder — one of {}", Effort::names().join(", "))))?),
+    };
+    let cfg = HostConfig {
+        sessions_dir,
+        cwd,
+        registry,
+        krowk_version: super::VERSION.into(),
+        pricer: pricer(ctx.io.env),
+        catalog: catalog(ctx.io.env),
+        credentials: super::providers::credentials_path(),
+    };
+    let opts = headless::Options { prompt, resume, model, permission_mode, toolset, effort, format };
     let outcome = headless::run(cfg, opts, ctx.io.stdout);
     let _ = ctx.io.stdout.flush();
 
@@ -92,7 +104,7 @@ fn prompt_text(positionals: &[String]) -> Result<String, Error> {
 /// The harness's part of the global config.json, whose `workspace` key the
 /// rest of krowk reads. A file that does not parse is an error: somebody
 /// wrote it meaning something.
-fn load_instances() -> Result<instances::InstancesConfig, Error> {
+pub(super) fn load_instances() -> Result<instances::InstancesConfig, Error> {
     let path = crate::config::global_path();
     let raw = match std::fs::read(&path) {
         Ok(raw) => raw,
@@ -144,9 +156,11 @@ fn pricer(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Pricer {
     })
 }
 
-/// A model's family from the models.dev cache, which picks its toolset
-/// preset. Captured like the pricer's environment.
-fn families(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Families {
+/// What the models.dev cache says of a model — its family, limits,
+/// efforts and wire API (R-PROV-2). Read from the cache only: the embedded
+/// snapshot is trimmed to prices, and a model it would miss is read for its
+/// family off its id instead. Captured like the pricer's environment.
+fn catalog(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Catalog {
     let (cache, home) = (env("XDG_CACHE_HOME"), env("HOME"));
     Arc::new(move |provider: &str, model: &str| {
         let env = |k: &str| match k {
@@ -154,7 +168,8 @@ fn families(env: &dyn Fn(&str) -> String) -> krowk_harness::host::Families {
             "HOME" => home.clone(),
             _ => String::new(),
         };
-        pricing::family(&env, provider, model)
+        let raw = std::fs::read(pricing::cache_path(&env)?).ok()?;
+        krowk_harness::catalog::lookup(&raw, provider, model)
     })
 }
 

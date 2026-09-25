@@ -1,6 +1,8 @@
-//! A stand-in for the Anthropic Messages API: an HTTP/1.1 server on a
-//! loopback port that answers each request with a recorded SSE body, and
-//! keeps every request it was sent so a test can pin what krowk asked.
+//! Stand-ins for the provider APIs: an HTTP/1.1 server on a loopback port
+//! that answers each request with a recorded SSE body (or JSON, or a
+//! redirect), and keeps every request it was sent so a test can pin what
+//! krowk asked. The Anthropic Messages scripts are here; the OpenAI
+//! Responses, Chat Completions and OAuth ones are in `providers.rs`.
 //! Standard library only, and a thread per server, so the harness tests,
 //! the CLI's tests and the evidence example all run the same one.
 #![allow(dead_code)]
@@ -12,9 +14,12 @@ use std::sync::{Arc, Mutex};
 /// One request as it arrived.
 #[derive(Debug, Clone)]
 pub struct Seen {
+    pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: serde_json::Value,
+    /// The body as sent, for a form.
+    pub raw: String,
 }
 
 impl Seen {
@@ -23,15 +28,30 @@ impl Seen {
     }
 }
 
-/// What the server answers a request with.
+/// What the server answers a request with. A 200 is an event stream unless
+/// `content_type` says otherwise; anything else is JSON.
 pub struct Reply {
     pub status: u16,
     pub body: String,
+    pub content_type: Option<&'static str>,
+    pub headers: Vec<(String, String)>,
 }
 
 impl Reply {
     pub fn sse(body: &str) -> Reply {
-        Reply { status: 200, body: body.to_string() }
+        Reply::status(200, body)
+    }
+
+    pub fn status(status: u16, body: &str) -> Reply {
+        Reply { status, body: body.to_string(), content_type: None, headers: Vec::new() }
+    }
+
+    pub fn json(status: u16, body: &serde_json::Value) -> Reply {
+        Reply { content_type: Some("application/json"), ..Reply::status(status, &body.to_string()) }
+    }
+
+    pub fn redirect(to: &str) -> Reply {
+        Reply { headers: vec![("location".into(), to.into())], ..Reply::status(302, "") }
     }
 }
 
@@ -47,6 +67,15 @@ pub fn serve(answer: impl Fn(&serde_json::Value, usize) -> Reply + Send + 'stati
 }
 
 pub fn serve_on(listener: TcpListener, answer: impl Fn(&serde_json::Value, usize) -> Reply + Send + 'static) -> Mock {
+    serve_seen_on(listener, move |seen, n| answer(&seen.body, n))
+}
+
+/// Serves `answer(request, n)`, handing it the whole request.
+pub fn serve_seen(answer: impl Fn(&Seen, usize) -> Reply + Send + 'static) -> Mock {
+    serve_seen_on(TcpListener::bind("127.0.0.1:0").expect("bind a loopback port"), answer)
+}
+
+pub fn serve_seen_on(listener: TcpListener, answer: impl Fn(&Seen, usize) -> Reply + Send + 'static) -> Mock {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
     let log = seen.clone();
@@ -58,6 +87,7 @@ pub fn serve_on(listener: TcpListener, answer: impl Fn(&serde_json::Value, usize
             if reader.read_line(&mut line).is_err() {
                 continue;
             }
+            let method = line.split_whitespace().next().unwrap_or_default().to_string();
             let path = line.split_whitespace().nth(1).unwrap_or_default().to_string();
             let mut headers = Vec::new();
             let mut length = 0usize;
@@ -75,11 +105,14 @@ pub fn serve_on(listener: TcpListener, answer: impl Fn(&serde_json::Value, usize
             }
             let mut body = vec![0u8; length];
             let _ = reader.read_exact(&mut body);
+            let raw = String::from_utf8_lossy(&body).into_owned();
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-            let reply = answer(&body, n);
-            log.lock().unwrap().push(Seen { path, headers, body });
-            let kind = if reply.status == 200 { "text/event-stream" } else { "application/json" };
-            let head = format!("HTTP/1.1 {} X\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", reply.status, reply.body.len());
+            let seen = Seen { method, path, headers, body, raw };
+            let reply = answer(&seen, n);
+            log.lock().unwrap().push(seen);
+            let kind = reply.content_type.unwrap_or(if reply.status == 200 { "text/event-stream" } else { "application/json" });
+            let extra: String = reply.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+            let head = format!("HTTP/1.1 {} X\r\ncontent-type: {kind}\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n", reply.status, reply.body.len());
             let _ = conn.write_all(head.as_bytes());
             let _ = conn.write_all(reply.body.as_bytes());
             let _ = conn.flush();

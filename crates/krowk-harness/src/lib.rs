@@ -4,8 +4,13 @@
 //!   speaks; the JSON Schema in `schema/` is generated from it.
 //! - `engine` — the `Engine` trait native providers and vendor backends
 //!   implement, and the `EngineEvent`s they report.
-//! - `native` — krowk's own loop over a `ModelClient`; `anthropic` is the
-//!   first client, for the Messages API.
+//! - `native` — krowk's own loop over a `ModelClient`, one per wire API:
+//!   `anthropic` (Messages), `openai` (Responses), `chat` (Chat
+//!   Completions: xAI, OpenRouter and anything compatible). `http` and
+//!   `sse` are what the three share.
+//! - `catalog` — what the models.dev cache says of a model; `effort` — the
+//!   one reasoning-effort ladder, mapped per model.
+//! - `oauth` — the SuperGrok login and its tokens.
 //! - `tools` — read, write, the edit tools, bash, grep and glob.
 //! - `toolset` — the preset registry: which edit tool a model is offered.
 //! - `host` — executes commands, writes the log, prices the turn.
@@ -19,14 +24,21 @@
 //! not open the code.
 
 pub mod anthropic;
+pub mod catalog;
+pub mod chat;
+pub mod effort;
 pub mod engine;
 pub mod headless;
 pub mod host;
+pub mod http;
 pub mod instances;
 pub mod log;
 pub mod native;
+pub mod oauth;
+pub mod openai;
 pub mod project;
 pub mod protocol;
 pub mod schema;
+pub mod sse;
 pub mod tools;
 pub mod toolset;

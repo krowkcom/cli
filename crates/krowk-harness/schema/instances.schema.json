@@ -28,7 +28,7 @@
   },
   "$defs": {
     "InstanceKind": {
-      "description": "What an instance is. Tagged by `kind`.",
+      "description": "What an instance is. Tagged by `kind`. Every API-key kind names the\nenvironment variable its key is read from, never the key.",
       "oneOf": [
         {
           "description": "The Anthropic Messages API with an API key.",
@@ -68,9 +68,246 @@
               "format": "uint32",
               "minimum": 0
             },
+            "effort": {
+              "description": "The reasoning effort every turn asks for unless `--effort` says\notherwise; the provider's default when absent.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Effort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "kind": {
               "type": "string",
               "const": "anthropic-api"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "OpenAI with an API key: the Responses API, or Chat Completions for a\nmodel the catalog says is served there.",
+          "type": "object",
+          "properties": {
+            "apiKeyEnv": {
+              "description": "`OPENAI_API_KEY` when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "baseUrl": {
+              "description": "`https://api.openai.com/v1` when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "wireApi": {
+              "description": "Pins one wire API for every model, instead of the catalog's.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WireApi"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "effort": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Effort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "openai-api"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "xAI with an API key, over Chat Completions.",
+          "type": "object",
+          "properties": {
+            "apiKeyEnv": {
+              "description": "`XAI_API_KEY` when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "baseUrl": {
+              "description": "`https://api.x.ai/v1` when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "effort": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Effort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "xai-api"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "OpenRouter with an API key, over Chat Completions.",
+          "type": "object",
+          "properties": {
+            "apiKeyEnv": {
+              "description": "`OPENROUTER_API_KEY` when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "baseUrl": {
+              "description": "`https://openrouter.ai/api/v1` when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "effort": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Effort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "openrouter-api"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Any server that speaks Chat Completions (or the Responses API) at a\nbase URL: a local model, a gateway, a provider krowk has no kind for.",
+          "type": "object",
+          "properties": {
+            "baseUrl": {
+              "description": "Where the API is, e.g. `http://127.0.0.1:11434/v1`. Required.",
+              "type": "string"
+            },
+            "apiKeyEnv": {
+              "description": "The environment variable holding the key; none is sent when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider": {
+              "description": "The models.dev provider id its models are priced and described\nunder; `openai-compatible` when absent, which prices nothing.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "wireApi": {
+              "description": "`chat-completions` (the default) or `openai-responses`.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WireApi"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "effort": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Effort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "openai-compatible"
+            }
+          },
+          "required": [
+            "kind",
+            "baseUrl"
+          ]
+        },
+        {
+          "description": "xAI with a SuperGrok (or X Premium) subscription, signed in with\nOAuth by `krowk providers add supergrok`. The tokens live in krowk's\nprovider credentials file, never here.",
+          "type": "object",
+          "properties": {
+            "baseUrl": {
+              "description": "`https://api.x.ai/v1` when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "issuer": {
+              "description": "The authorization server; `https://auth.x.ai` when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "clientId": {
+              "description": "The OAuth client krowk signs in as. When absent, krowk registers\nitself where the server offers dynamic registration.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scope": {
+              "description": "The scopes asked for; `openid offline_access` when absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "effort": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Effort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "xai-oauth"
             }
           },
           "required": [
@@ -84,6 +321,40 @@
       "enum": [
         "adaptive",
         "off"
+      ]
+    },
+    "Effort": {
+      "description": "How hard a model thinks, on one ladder for every provider (R-PROV-2).\nEach model takes some of these rungs under its own names; the rung asked\nfor is mapped onto the nearest one the model takes (`crate::effort`).",
+      "type": "string",
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "WireApi": {
+      "description": "The wire API a provider speaks. An opaque blob is replayed only to the\nsame provider on the same wire API (R-LOG-3), so this travels with it.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "anthropic-messages"
+          ]
+        },
+        {
+          "description": "OpenAI's Responses API, run stateless (`store: false`).",
+          "type": "string",
+          "const": "openai-responses"
+        },
+        {
+          "description": "Chat Completions: xAI, OpenRouter, and any server that speaks it.",
+          "type": "string",
+          "const": "chat-completions"
+        }
       ]
     }
   }

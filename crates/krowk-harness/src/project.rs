@@ -219,6 +219,7 @@ mod tests {
                 provider: "anthropic".into(),
                 wire_api: WireApi::AnthropicMessages,
                 permission_mode: PermissionMode::Default,
+                effort: None,
             },
             LogBody::ItemCompleted { turn_id: t.into(), item_id: format!("{t}-p"), item: Item::UserText { text: prompt.into() } },
         ]

@@ -88,6 +88,17 @@
             "permissionMode": {
               "$ref": "#/$defs/PermissionMode"
             },
+            "effort": {
+              "description": "The effort asked for, on krowk's ladder, when one was; what the\nmodel was sent is that rung mapped onto the ones it takes.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Effort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "turn.started"
@@ -237,9 +248,23 @@
     },
     "WireApi": {
       "description": "The wire API a provider speaks. An opaque blob is replayed only to the\nsame provider on the same wire API (R-LOG-3), so this travels with it.",
-      "type": "string",
-      "enum": [
-        "anthropic-messages"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "anthropic-messages"
+          ]
+        },
+        {
+          "description": "OpenAI's Responses API, run stateless (`store: false`).",
+          "type": "string",
+          "const": "openai-responses"
+        },
+        {
+          "description": "Chat Completions: xAI, OpenRouter, and any server that speaks it.",
+          "type": "string",
+          "const": "chat-completions"
+        }
       ]
     },
     "PermissionMode": {
@@ -250,6 +275,19 @@
         "acceptEdits",
         "plan",
         "bypassPermissions"
+      ]
+    },
+    "Effort": {
+      "description": "How hard a model thinks, on one ladder for every provider (R-PROV-2).\nEach model takes some of these rungs under its own names; the rung asked\nfor is mapped onto the nearest one the model takes (`crate::effort`).",
+      "type": "string",
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
       ]
     },
     "Item": {

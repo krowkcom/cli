@@ -1171,12 +1171,14 @@ dependencies = [
 name = "krowk-harness"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "jsonschema",
  "krowk-import",
  "krowk-store",
  "libc",
  "regex-lite",
  "reqwest",
+ "ring",
  "rustls",
  "rustls-platform-verifier",
  "schemars",
@@ -1184,6 +1186,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "url",
 ]
 
 [[package]]

@@ -3,7 +3,7 @@
 //! no tool, the turn is interrupted, or the step cap is hit.
 
 use crate::engine::{BoxFuture, Engine, EngineError, EngineEvent, Events, HistoryItem, TurnContext, TurnEnd};
-use crate::protocol::{Item, ItemKind, ToolDefinition, Usage, WireApi};
+use crate::protocol::{Effort, Item, ItemKind, ProviderBlob, ToolDefinition, Usage, WireApi};
 use crate::tools;
 use crate::toolset::Toolset;
 use tokio::sync::watch;
@@ -13,12 +13,41 @@ use tokio::sync::watch;
 const MAX_STEPS: usize = 200;
 
 /// One model call, provider-neutral.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelRequest {
     pub model: String,
     pub system: String,
     pub tools: Vec<ToolDefinition>,
     pub history: Vec<HistoryItem>,
+    /// The session's id. It keys the provider's prompt cache where the
+    /// provider takes a key (OpenAI's `prompt_cache_key`, xAI's
+    /// conversation id), so every call of a session lands where its prefix
+    /// is cached (R-PROV-3).
+    pub session_id: String,
+    /// The effort the model is sent, already mapped onto the rungs it takes;
+    /// none sends nothing, and the provider's default applies.
+    pub effort: Option<Effort>,
+    /// The model reasons: the catalog's word, else its family's.
+    pub reasoning: bool,
+}
+
+/// Whether a reasoning blob replays to this client: its own provider and
+/// wire API only (R-LOG-3), decided by the blob and never by where its item
+/// sits.
+pub fn replays<'a>(blob: &'a Option<ProviderBlob>, provider: &str, wire: WireApi) -> Option<&'a ProviderBlob> {
+    blob.as_ref().filter(|b| b.provider == provider && b.wire_api == wire)
+}
+
+/// Reasoning another provider (or another wire API) produced, as it
+/// crosses to this one (R-SWITCH-1): its blob cannot be read here, so it is
+/// downgraded to plain text — the loss the spec accepts. The text goes back
+/// inside the assistant message it belonged to, framed as reasoning from an
+/// earlier model, so it is never passed off as something this model said.
+/// Reasoning with no readable text (encrypted or redacted only) has nothing
+/// to downgrade and is left out.
+pub fn downgraded(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| format!("<reasoning from an earlier model>\n{text}\n</reasoning>"))
 }
 
 /// What one call produced.
@@ -97,7 +126,17 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
             let system = system_prompt(&ctx.cwd, &toolset);
             let tool_defs = tools::definitions(&toolset);
             let _ = events.send(EngineEvent::Context { system: system.clone(), tools: tool_defs.clone() }).await;
-            let mut req = ModelRequest { model: ctx.model.model.clone(), system, tools: tool_defs, history: ctx.history.clone() };
+            let family = ctx.model_info.as_ref().and_then(|i| i.family.clone()).or_else(|| crate::toolset::family_from_id(&ctx.model.model).map(String::from));
+            let takes = crate::effort::supported(ctx.model_info.as_ref(), family.as_deref());
+            let mut req = ModelRequest {
+                model: ctx.model.model.clone(),
+                system,
+                tools: tool_defs,
+                history: ctx.history.clone(),
+                session_id: ctx.session_id.clone(),
+                effort: ctx.effort.and_then(|e| crate::effort::map(e, &takes)),
+                reasoning: ctx.model_info.as_ref().map_or_else(|| crate::toolset::reasons(&ctx.model.model), |i| i.reasoning),
+            };
             // Response indexes continue from the history's, so a replayed
             // turn and this one never share an index.
             let first_response = req.history.iter().filter_map(|h| h.response).max().map_or(0, |m| m + 1);

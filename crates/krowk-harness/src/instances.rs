@@ -1,19 +1,23 @@
 //! The instance registry: named provider instances in krowk's own config
 //! (`config.json`, key `instances`), each one account or configuration of a
-//! provider on this host — `anthropic`, `anthropic:work`. A model is always
-//! chosen as an instance and a model id (`ModelRef`).
+//! provider on this host — `anthropic`, `openai:work`, `supergrok`. A model
+//! is always chosen as an instance and a model id (`ModelRef`).
 //!
 //! A definition holds nothing secret: an API-key instance names the
-//! environment variable its key is read from, never the key, so definitions
-//! can sync between hosts and keys cannot (R-INST-5). Only the Anthropic
-//! API-key kind exists so far; later kinds (other native providers, the
-//! vendor backends) are more variants of `InstanceKind`.
+//! environment variable its key is read from, never the key, and an OAuth
+//! instance's tokens live in krowk's provider credentials file, so
+//! definitions can sync between hosts and keys cannot (R-INST-5). The kinds
+//! are the native providers' (R-PROV-4): `anthropic-api`, `openai-api`,
+//! `xai-api`, `openrouter-api`, `openai-compatible` for anything else that
+//! speaks Chat Completions, and `xai-oauth` for a SuperGrok subscription.
+//! The vendor backends will be more variants of `InstanceKind`.
 //!
-//! With nothing configured there is still one instance, `anthropic`, reading
-//! `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` — the conventional names, so
-//! a machine already set up for Anthropic's tools works unconfigured.
+//! With nothing configured there is still one instance per provider —
+//! `anthropic`, `openai`, `xai`, `openrouter`, reading the conventional key
+//! variables, so a machine already set up for a provider's own tools works
+//! unconfigured, and `supergrok`, which needs only a login.
 
-use crate::protocol::{ModelRef, WireApi};
+use crate::protocol::{Effort, ModelRef, WireApi};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -23,8 +27,18 @@ pub const DEFAULT_INSTANCE: &str = "anthropic";
 /// nor the config names one.
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com";
+pub const OPENAI_API_URL: &str = "https://api.openai.com/v1";
+pub const XAI_API_URL: &str = "https://api.x.ai/v1";
+pub const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
+/// xAI's authorization server, whose metadata names the endpoints the
+/// SuperGrok login uses.
+pub const XAI_ISSUER: &str = "https://auth.x.ai";
 const ANTHROPIC_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const ANTHROPIC_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
+const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
+const XAI_KEY_ENV: &str = "XAI_API_KEY";
+const OPENROUTER_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
 /// The harness's part of `config.json`. Keys it does not know are kept by
 /// whoever rewrites the file, and ignored here.
@@ -42,7 +56,8 @@ pub struct InstancesConfig {
     pub toolset: Option<String>,
 }
 
-/// What an instance is. Tagged by `kind`.
+/// What an instance is. Tagged by `kind`. Every API-key kind names the
+/// environment variable its key is read from, never the key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all_fields = "camelCase")]
 pub enum InstanceKind {
@@ -64,7 +79,105 @@ pub enum InstanceKind {
         /// The output cap per model call; 32000 when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_tokens: Option<u32>,
+        /// The reasoning effort every turn asks for unless `--effort` says
+        /// otherwise; the provider's default when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
     },
+    /// OpenAI with an API key: the Responses API, or Chat Completions for a
+    /// model the catalog says is served there.
+    #[serde(rename = "openai-api")]
+    OpenaiApi {
+        /// `OPENAI_API_KEY` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
+        /// `https://api.openai.com/v1` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        /// Pins one wire API for every model, instead of the catalog's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wire_api: Option<WireApi>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+    },
+    /// xAI with an API key, over Chat Completions.
+    #[serde(rename = "xai-api")]
+    XaiApi {
+        /// `XAI_API_KEY` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
+        /// `https://api.x.ai/v1` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+    },
+    /// OpenRouter with an API key, over Chat Completions.
+    #[serde(rename = "openrouter-api")]
+    OpenrouterApi {
+        /// `OPENROUTER_API_KEY` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
+        /// `https://openrouter.ai/api/v1` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+    },
+    /// Any server that speaks Chat Completions (or the Responses API) at a
+    /// base URL: a local model, a gateway, a provider krowk has no kind for.
+    #[serde(rename = "openai-compatible")]
+    OpenaiCompatible {
+        /// Where the API is, e.g. `http://127.0.0.1:11434/v1`. Required.
+        base_url: String,
+        /// The environment variable holding the key; none is sent when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_env: Option<String>,
+        /// The models.dev provider id its models are priced and described
+        /// under; `openai-compatible` when absent, which prices nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// `chat-completions` (the default) or `openai-responses`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wire_api: Option<WireApi>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+    },
+    /// xAI with a SuperGrok (or X Premium) subscription, signed in with
+    /// OAuth by `krowk providers add supergrok`. The tokens live in krowk's
+    /// provider credentials file, never here.
+    #[serde(rename = "xai-oauth")]
+    XaiOauth {
+        /// `https://api.x.ai/v1` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        /// The authorization server; `https://auth.x.ai` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issuer: Option<String>,
+        /// The OAuth client krowk signs in as. When absent, krowk registers
+        /// itself where the server offers dynamic registration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        /// The scopes asked for; `openid offline_access` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+    },
+}
+
+impl InstanceKind {
+    /// The `kind` tag, as config spells it.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            InstanceKind::AnthropicApi { .. } => "anthropic-api",
+            InstanceKind::OpenaiApi { .. } => "openai-api",
+            InstanceKind::XaiApi { .. } => "xai-api",
+            InstanceKind::OpenrouterApi { .. } => "openrouter-api",
+            InstanceKind::OpenaiCompatible { .. } => "openai-compatible",
+            InstanceKind::XaiOauth { .. } => "xai-oauth",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -74,12 +187,35 @@ pub enum Thinking {
     Off,
 }
 
+/// How an instance's calls are authorized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Auth {
+    /// A key from the environment variable `api_key_env`.
+    ApiKey,
+    /// Nothing: a local server that wants no key.
+    Keyless,
+    /// Tokens from the OAuth login, refreshed as they expire.
+    OAuth { issuer: String, client_id: Option<String>, scope: String },
+}
+
 /// An instance ready to use: its definition with the secret read.
 #[derive(Clone, PartialEq)]
 pub struct Resolved {
     pub name: String,
-    pub provider: &'static str,
+    /// The `kind` it was defined as.
+    pub kind: &'static str,
+    /// The models.dev provider id its models are priced and described
+    /// under, and the provider its reasoning blobs replay to.
+    pub provider: String,
+    /// The provider as a person names it, for the words of a failure.
+    pub vendor: &'static str,
+    /// The wire API a model is served on when the catalog does not say.
     pub wire_api: WireApi,
+    /// The wire APIs it can serve a model on; the catalog picks among them
+    /// unless the definition pins one.
+    pub wires: &'static [WireApi],
+    pub wire_pinned: bool,
+    pub auth: Auth,
     pub api_key: String,
     /// Which variable the key was, or should have been, read from — named in
     /// the fix when it is missing.
@@ -87,6 +223,7 @@ pub struct Resolved {
     pub base_url: String,
     pub thinking: Thinking,
     pub max_tokens: u32,
+    pub effort: Option<Effort>,
 }
 
 // Hand-written so a key never reaches a log line through `{:?}`.
@@ -94,10 +231,43 @@ impl std::fmt::Debug for Resolved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Resolved")
             .field("name", &self.name)
+            .field("kind", &self.kind)
             .field("base_url", &self.base_url)
             .field("api_key", &if self.api_key.is_empty() { "<unset>" } else { "<set>" })
             .finish()
     }
+}
+
+impl Resolved {
+    /// The wire API a model runs on: the catalog's when this instance can
+    /// speak it and does not pin one, else the instance's own.
+    pub fn wire_for(&self, catalog: Option<WireApi>) -> WireApi {
+        match catalog {
+            Some(w) if !self.wire_pinned && self.wires.contains(&w) => w,
+            _ => self.wire_api,
+        }
+    }
+
+    /// Why a call cannot be made, before one is: an API-key instance whose
+    /// variable is unset.
+    pub fn missing_key(&self) -> Option<String> {
+        (self.auth == Auth::ApiKey && self.api_key.is_empty()).then(|| {
+            format!("no API key for the {} instance — set {} (krowk reads the key from the environment, never from a file)", self.name, self.api_key_env)
+        })
+    }
+}
+
+/// The instances every host has without configuring any: one per provider
+/// with an API-key kind, reading the conventional variable, and SuperGrok,
+/// which needs only a login. A config entry of the same name replaces one.
+pub fn implicit() -> Vec<(&'static str, InstanceKind)> {
+    vec![
+        ("anthropic", InstanceKind::AnthropicApi { api_key_env: None, base_url: None, thinking: None, max_tokens: None, effort: None }),
+        ("openai", InstanceKind::OpenaiApi { api_key_env: None, base_url: None, wire_api: None, effort: None }),
+        ("xai", InstanceKind::XaiApi { api_key_env: None, base_url: None, effort: None }),
+        ("openrouter", InstanceKind::OpenrouterApi { api_key_env: None, base_url: None, effort: None }),
+        ("supergrok", InstanceKind::XaiOauth { base_url: None, issuer: None, client_id: None, scope: None, effort: None }),
+    ]
 }
 
 /// Every instance this host has, resolved against the environment once, up
@@ -111,21 +281,24 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// The config's instances, plus the implicit `anthropic` one when the
-    /// config does not define an instance of that name.
+    /// The config's instances, plus the implicit ones the config does not
+    /// define an instance of that name for.
     pub fn resolve(cfg: &InstancesConfig, env: &dyn Fn(&str) -> String) -> Registry {
         let mut instances = BTreeMap::new();
-        let implicit = InstanceKind::AnthropicApi { api_key_env: None, base_url: None, thinking: None, max_tokens: None };
-        let defined = cfg.instances.iter().map(|(n, k)| (n.as_str(), k));
-        for (name, kind) in std::iter::once((DEFAULT_INSTANCE, &implicit)).chain(defined) {
-            instances.insert(name.to_string(), resolve_one(name, kind, env));
+        for (name, kind) in implicit() {
+            instances.insert(name.to_string(), resolve_one(name, &kind, env));
+        }
+        for (name, kind) in &cfg.instances {
+            instances.insert(name.clone(), resolve_one(name, kind, env));
         }
         Registry { instances, default_model: cfg.default_model.clone(), toolset: cfg.toolset.clone() }
     }
 
     /// `--model`'s reading: `<instance>/<model>` when the part before the
-    /// first `/` names an instance, else the whole string is a model id on
-    /// the default instance — a router's model ids have slashes of their own.
+    /// first `/` names an instance — a router's model ids have slashes of
+    /// their own. A bare id with no `/` goes to the implicit instance of the
+    /// provider its family names (`gpt-…`, `o3`, `codex-…` to `openai`,
+    /// `grok-…` to `xai`), and anything else to `anthropic`.
     pub fn parse_model(&self, s: &str) -> Result<ModelRef, String> {
         let s = s.trim();
         if s.is_empty() {
@@ -139,7 +312,13 @@ impl Registry {
             }
             return Ok(ModelRef { instance: instance.into(), model: model.into() });
         }
-        Ok(ModelRef { instance: DEFAULT_INSTANCE.into(), model: s.into() })
+        let by_family = match (s.contains('/'), crate::toolset::family_from_id(s)) {
+            (false, Some("gpt" | "o" | "codex")) => "openai",
+            (false, Some("grok")) => "xai",
+            _ => DEFAULT_INSTANCE,
+        };
+        let instance = if self.instances.contains_key(by_family) { by_family } else { DEFAULT_INSTANCE };
+        Ok(ModelRef { instance: instance.into(), model: s.into() })
     }
 
     /// The configured default, else krowk's.
@@ -153,32 +332,105 @@ impl Registry {
     pub fn get(&self, name: &str) -> Result<&Resolved, String> {
         self.instances.get(name).ok_or_else(|| {
             let known: Vec<&str> = self.instances.keys().map(String::as_str).collect();
-            format!("no instance named {name:?} — this host has {}; add one under \"instances\" in krowk's config.json", known.join(", "))
+            format!("no instance named {name:?} — this host has {}; add one with `krowk providers add`", known.join(", "))
         })
     }
 }
 
+fn clean_url(u: &str) -> String {
+    u.trim().trim_end_matches('/').to_string()
+}
+
+const RESPONSES_OR_CHAT: &[WireApi] = &[WireApi::OpenaiResponses, WireApi::ChatCompletions];
+const CHAT: &[WireApi] = &[WireApi::ChatCompletions];
+
 fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) -> Resolved {
+    // A base URL from config, else (for the instance reading the
+    // conventional key only) the conventional variable, else the default.
+    let base = |configured: &Option<String>, key_env: &str, conventional: (&str, &str), default: &str| -> String {
+        let from_env = if key_env == conventional.0 && !conventional.1.is_empty() { env(conventional.1) } else { String::new() };
+        let url = configured.clone().filter(|b| !b.trim().is_empty()).unwrap_or(if from_env.trim().is_empty() { default.to_string() } else { from_env });
+        clean_url(&url)
+    };
+    let api = |key_env: &Option<String>, conventional: &str| -> (String, String) {
+        let key_env = key_env.clone().filter(|k| !k.trim().is_empty()).unwrap_or_else(|| conventional.into());
+        (env(&key_env).trim().to_string(), key_env)
+    };
+    let template = |provider: &str, vendor: &'static str, wire: WireApi, wires: &'static [WireApi], effort: Option<Effort>| Resolved {
+        name: name.into(),
+        kind: kind.tag(),
+        provider: provider.into(),
+        vendor,
+        wire_api: wire,
+        wires,
+        wire_pinned: false,
+        auth: Auth::ApiKey,
+        api_key: String::new(),
+        api_key_env: String::new(),
+        base_url: String::new(),
+        thinking: Thinking::Adaptive,
+        max_tokens: 32_000,
+        effort,
+    };
     match kind {
-        InstanceKind::AnthropicApi { api_key_env, base_url, thinking, max_tokens } => {
-            let key_env = api_key_env.clone().unwrap_or_else(|| ANTHROPIC_KEY_ENV.into());
-            // The conventional base-URL variable only speaks for the
-            // instance that reads the conventional key.
-            let base = base_url.clone().filter(|b| !b.trim().is_empty()).unwrap_or_else(|| {
-                let from_env = if key_env == ANTHROPIC_KEY_ENV { env(ANTHROPIC_BASE_URL_ENV) } else { String::new() };
-                if from_env.trim().is_empty() { ANTHROPIC_API_URL.into() } else { from_env }
-            });
+        InstanceKind::AnthropicApi { api_key_env, base_url, thinking, max_tokens, effort } => {
+            let (api_key, key_env) = api(api_key_env, ANTHROPIC_KEY_ENV);
             Resolved {
-                name: name.into(),
-                provider: "anthropic",
-                wire_api: WireApi::AnthropicMessages,
-                api_key: env(&key_env).trim().to_string(),
+                base_url: base(base_url, &key_env, (ANTHROPIC_KEY_ENV, ANTHROPIC_BASE_URL_ENV), ANTHROPIC_API_URL),
+                api_key,
                 api_key_env: key_env,
-                base_url: base.trim().trim_end_matches('/').to_string(),
                 thinking: thinking.unwrap_or(Thinking::Adaptive),
                 max_tokens: max_tokens.unwrap_or(32_000),
+                ..template("anthropic", "Anthropic", WireApi::AnthropicMessages, &[WireApi::AnthropicMessages], *effort)
             }
         }
+        InstanceKind::OpenaiApi { api_key_env, base_url, wire_api, effort } => {
+            let (api_key, key_env) = api(api_key_env, OPENAI_KEY_ENV);
+            let wire = wire_api.filter(|w| RESPONSES_OR_CHAT.contains(w));
+            Resolved {
+                base_url: base(base_url, &key_env, (OPENAI_KEY_ENV, OPENAI_BASE_URL_ENV), OPENAI_API_URL),
+                api_key,
+                api_key_env: key_env,
+                wire_pinned: wire.is_some(),
+                ..template("openai", "OpenAI", wire.unwrap_or(WireApi::OpenaiResponses), RESPONSES_OR_CHAT, *effort)
+            }
+        }
+        InstanceKind::XaiApi { api_key_env, base_url, effort } => {
+            let (api_key, key_env) = api(api_key_env, XAI_KEY_ENV);
+            Resolved { base_url: base(base_url, &key_env, ("", ""), XAI_API_URL), api_key, api_key_env: key_env, ..template("xai", "xAI", WireApi::ChatCompletions, CHAT, *effort) }
+        }
+        InstanceKind::OpenrouterApi { api_key_env, base_url, effort } => {
+            let (api_key, key_env) = api(api_key_env, OPENROUTER_KEY_ENV);
+            Resolved {
+                base_url: base(base_url, &key_env, ("", ""), OPENROUTER_API_URL),
+                api_key,
+                api_key_env: key_env,
+                ..template("openrouter", "OpenRouter", WireApi::ChatCompletions, CHAT, *effort)
+            }
+        }
+        InstanceKind::OpenaiCompatible { base_url, api_key_env, provider, wire_api, effort } => {
+            let keyed = api_key_env.as_ref().is_some_and(|k| !k.trim().is_empty());
+            let (api_key, key_env) = if keyed { api(api_key_env, "") } else { (String::new(), String::new()) };
+            let provider = provider.clone().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "openai-compatible".into());
+            let wire = wire_api.filter(|w| RESPONSES_OR_CHAT.contains(w));
+            Resolved {
+                base_url: clean_url(base_url),
+                api_key,
+                api_key_env: key_env,
+                auth: if keyed { Auth::ApiKey } else { Auth::Keyless },
+                wire_pinned: wire.is_some(),
+                ..template(&provider, "the server", wire.unwrap_or(WireApi::ChatCompletions), RESPONSES_OR_CHAT, *effort)
+            }
+        }
+        InstanceKind::XaiOauth { base_url, issuer, client_id, scope, effort } => Resolved {
+            base_url: base(base_url, "", ("", ""), XAI_API_URL),
+            auth: Auth::OAuth {
+                issuer: clean_url(issuer.as_deref().filter(|i| !i.trim().is_empty()).unwrap_or(XAI_ISSUER)),
+                client_id: client_id.clone().filter(|c| !c.trim().is_empty()),
+                scope: scope.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "openid offline_access".into()),
+            },
+            ..template("xai", "xAI", WireApi::ChatCompletions, CHAT, *effort)
+        },
     }
 }
 
@@ -207,14 +459,19 @@ pub fn from_config_json(raw: &serde_json::Value) -> Result<InstancesConfig, Stri
 mod tests {
     use super::*;
 
-    #[test]
-    fn r_inst_a_bare_config_still_has_the_anthropic_instance_and_models_parse_either_way() {
-        let env = |k: &str| match k {
+    fn env(k: &str) -> String {
+        match k {
             "ANTHROPIC_API_KEY" => "sk-test".into(),
             "ANTHROPIC_BASE_URL" => "http://127.0.0.1:9/".into(),
+            "OPENAI_API_KEY" => "sk-openai".into(),
+            "OPENAI_BASE_URL" => "http://127.0.0.1:8/v1/".into(),
             "WORK_KEY" => "sk-work".into(),
             _ => String::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn r_inst_a_bare_config_still_has_the_anthropic_instance_and_models_parse_either_way() {
         let cfg = from_config_json(&serde_json::json!({
             "workspace": "ws_x",
             "instances": {"anthropic:work": {"kind": "anthropic-api", "apiKeyEnv": "WORK_KEY"}},
@@ -228,13 +485,56 @@ mod tests {
         assert!(!format!("{w:?}").contains("sk-work"), "a key never prints");
         assert_eq!(reg.parse_model("anthropic:work/claude-x").unwrap(), ModelRef { instance: "anthropic:work".into(), model: "claude-x".into() });
         assert_eq!(reg.parse_model("claude-x").unwrap().instance, "anthropic");
-        assert_eq!(reg.parse_model("openrouter/some/model").unwrap(), ModelRef { instance: "anthropic".into(), model: "openrouter/some/model".into() });
+        assert_eq!(reg.parse_model("router/some/model").unwrap(), ModelRef { instance: "anthropic".into(), model: "router/some/model".into() });
         assert!(reg.parse_model("anthropic/").is_err());
-        assert!(reg.get("nope").unwrap_err().contains("anthropic, anthropic:work"));
+        assert!(reg.get("nope").unwrap_err().contains("anthropic, anthropic:work, openai"));
         assert_eq!(reg.default_model().unwrap().model, DEFAULT_MODEL);
         assert!(from_config_json(&serde_json::json!({"instances": {"x": {"kind": "martian"}}})).is_err());
         // R-TOOL-2: config can pin a toolset, and only one that exists.
         assert_eq!(Registry::resolve(&from_config_json(&serde_json::json!({"toolset": "grok"})).unwrap(), &env).toolset.as_deref(), Some("grok"));
         assert!(from_config_json(&serde_json::json!({"toolset": "vim"})).unwrap_err().contains("claude, gpt, grok"));
+    }
+
+    #[test]
+    fn r_prov_4_every_native_provider_has_an_instance_keyed_from_the_environment_or_a_login() {
+        let cfg = from_config_json(&serde_json::json!({"instances": {
+            "openai:work": {"kind": "openai-api", "apiKeyEnv": "WORK_KEY", "baseUrl": "https://gw.example/v1/", "effort": "high"},
+            "local": {"kind": "openai-compatible", "baseUrl": "http://127.0.0.1:11434/v1"},
+            "vivgrid": {"kind": "openai-compatible", "baseUrl": "https://api.vivgrid.com/v1", "apiKeyEnv": "WORK_KEY", "provider": "vivgrid"},
+            "grok:team": {"kind": "xai-oauth", "clientId": "krowk-test", "issuer": "http://127.0.0.1:7/"},
+            "pinned": {"kind": "openai-api", "wireApi": "chat-completions"},
+        }}))
+        .unwrap();
+        let reg = Registry::resolve(&cfg, &env);
+        let o = reg.get("openai").unwrap();
+        assert_eq!((o.provider.as_str(), o.api_key.as_str(), o.base_url.as_str(), o.wire_api), ("openai", "sk-openai", "http://127.0.0.1:8/v1", WireApi::OpenaiResponses));
+        let w = reg.get("openai:work").unwrap();
+        assert_eq!((w.api_key.as_str(), w.base_url.as_str(), w.effort), ("sk-work", "https://gw.example/v1", Some(Effort::High)), "OPENAI_BASE_URL is the default instance's only");
+        let x = reg.get("xai").unwrap();
+        assert_eq!((x.provider.as_str(), x.api_key_env.as_str(), x.base_url.as_str(), x.wire_api), ("xai", "XAI_API_KEY", XAI_API_URL, WireApi::ChatCompletions));
+        assert!(x.missing_key().unwrap().contains("set XAI_API_KEY"));
+        assert_eq!(reg.get("openrouter").unwrap().base_url, OPENROUTER_API_URL);
+        let l = reg.get("local").unwrap();
+        assert_eq!((l.auth.clone(), l.provider.as_str(), l.missing_key()), (Auth::Keyless, "openai-compatible", None));
+        assert_eq!(reg.get("vivgrid").unwrap().provider, "vivgrid");
+        let g = reg.get("grok:team").unwrap();
+        assert_eq!(g.auth, Auth::OAuth { issuer: "http://127.0.0.1:7".into(), client_id: Some("krowk-test".into()), scope: "openid offline_access".into() });
+        assert_eq!(g.missing_key(), None, "an OAuth instance's credential is the login's to check");
+        assert_eq!(reg.get("supergrok").unwrap().auth, Auth::OAuth { issuer: XAI_ISSUER.into(), client_id: None, scope: "openid offline_access".into() });
+        // The catalog picks the wire API among the ones the instance speaks,
+        // unless the definition pins one.
+        assert_eq!(o.wire_for(Some(WireApi::ChatCompletions)), WireApi::ChatCompletions);
+        assert_eq!(o.wire_for(Some(WireApi::AnthropicMessages)), WireApi::OpenaiResponses);
+        assert_eq!(o.wire_for(None), WireApi::OpenaiResponses);
+        assert_eq!(x.wire_for(Some(WireApi::OpenaiResponses)), WireApi::ChatCompletions);
+        assert_eq!(reg.get("pinned").unwrap().wire_for(Some(WireApi::OpenaiResponses)), WireApi::ChatCompletions);
+        // Models: an instance by name, a bare id by its family.
+        assert_eq!(reg.parse_model("openai/gpt-5.4").unwrap(), ModelRef { instance: "openai".into(), model: "gpt-5.4".into() });
+        assert_eq!(reg.parse_model("openrouter/x-ai/grok-4").unwrap(), ModelRef { instance: "openrouter".into(), model: "x-ai/grok-4".into() });
+        assert_eq!(reg.parse_model("gpt-5.4").unwrap().instance, "openai");
+        assert_eq!(reg.parse_model("o3").unwrap().instance, "openai");
+        assert_eq!(reg.parse_model("grok-4.7").unwrap().instance, "xai");
+        assert_eq!(reg.parse_model("supergrok/grok-4.7").unwrap().instance, "supergrok");
+        assert!(from_config_json(&serde_json::json!({"instances": {"x": {"kind": "openai-compatible"}}})).is_err(), "a compatible server needs its base URL");
     }
 }

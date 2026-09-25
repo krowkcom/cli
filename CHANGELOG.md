@@ -75,8 +75,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   happens — `item.started`/`item.delta`/`item.completed` per item, then a
   `result` with usage (input, output, cache read, cache write, reasoning),
   the cost at models.dev prices, the duration and the session id.
-  `--model <instance>/<model>` picks the model (a bare id runs on the
-  `anthropic` instance; `claude-opus-5` by default), `--resume <id>`
+  `--model <instance>/<model>` picks the model (a bare Claude id runs on
+  the `anthropic` instance; `claude-opus-5` by default), `--resume <id>`
   continues a session by the id its result named or its `krowk sessions`
   id, and Ctrl-C stops a turn and keeps what it made. Its `bash` tool runs
   only under `--permission-mode bypassPermissions` until permission rules
@@ -107,6 +107,40 @@ the versions are the `v*` tags a release is cut from. Entries land under
   record now names its `toolset` and estimates the system prompt's and
   tools' size in tokens (`systemTokens`, `toolsTokens`, at four bytes a
   token).
+- **`krowk -p` runs on OpenAI, xAI, OpenRouter and any Chat Completions
+  server, and on a SuperGrok subscription.** `--model openai/gpt-5.4`
+  reads `OPENAI_API_KEY` (and `OPENAI_BASE_URL`), `xai/…` reads
+  `XAI_API_KEY`, `openrouter/…` reads `OPENROUTER_API_KEY`, and a bare
+  `gpt-…`, `o3` or `grok-…` id now runs on `openai` or `xai` rather than
+  `anthropic` — pass `anthropic/<id>` for a router that serves them there.
+  GPT models go through OpenAI's Responses API, stateless (`store:
+  false`): their encrypted reasoning is kept in the session log and sent
+  back as it came, every call carries the session as `prompt_cache_key` so
+  a second turn reads the cache, and `apply_patch` is offered to GPT-5 and
+  Codex models as a freeform tool, in their own patch format. xAI,
+  OpenRouter and compatible servers go through Chat Completions, with each
+  vendor's reasoning fields (`reasoning_content`, `reasoning_details`) sent
+  back to it unmodified. Which API a model is served on, and which
+  reasoning efforts it takes, come from the models.dev cache. Reasoning
+  another provider produced is passed to the next model as plain text,
+  marked as an earlier model's, never as its own words.
+- **`--effort none|minimal|low|medium|high|xhigh|max`** sets how hard the
+  model thinks, on one ladder for every provider: the rung is mapped onto
+  the nearest one the model takes (`max` on a model that tops out at
+  `xhigh` sends `xhigh`), and a model that takes none is sent none.
+  `"effort"` on an instance in `config.json` sets it for every prompt.
+- **`krowk providers add|list|remove`** manages the engine's instances
+  (in the `harness` build). `krowk providers add openai --name work
+  --base-url https://gateway.example/v1` writes an `openai:work` instance
+  that reads its key from `$OPENAI_WORK_API_KEY` — the variable's name is
+  stored, never the key. `openai-compatible --name local --base-url …`
+  adds any Chat Completions server. `krowk providers add supergrok` signs
+  in to xAI with a SuperGrok or X Premium subscription in the browser
+  (`--device` prints a code to enter anywhere instead) and keeps the
+  tokens in `~/.config/krowk/providers/credentials.json`, created `0600`
+  and refreshed as they expire; `krowk -p --model supergrok/grok-4.7`
+  then runs on the subscription. `list` shows which instances have their
+  key or login; `remove` takes a definition and its login away.
 - **Native sessions are logs you own, listed beside imported ones.** Each
   session is an append-only JSONL log under
   `~/.local/share/krowk/sessions/<id>/` (with each turn's exact system

@@ -430,6 +430,7 @@ impl Builder {
             foreign_id: self.foreign_id(&l.uuid, line_no),
             usage: String::new(),
             raw_json: raw_json(raw),
+            turn_seq: None,
             parts: Vec::new(),
         };
         let mut usage = TokenUsage::default();
@@ -519,6 +520,7 @@ impl Builder {
             foreign_id: self.foreign_id(&l.uuid, line_no),
             usage: String::new(),
             raw_json: raw_json(raw),
+            turn_seq: None,
             parts,
         });
         self.usages.push(TokenUsage::default());

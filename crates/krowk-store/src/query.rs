@@ -377,6 +377,7 @@ mod tests {
                 foreign_id: "x".into(),
                 usage: String::new(),
                 raw_json: None,
+                turn_seq: None,
                 parts: vec![
                     Part { kind: "tool_call".into(), tool_call_id: "c1".into(), data: r#"{"name":"Bash"}"#.into(), ..Part::default() },
                     Part { kind: "tool_result".into(), tool_call_id: "c1".into(), ..Part::default() },

@@ -539,6 +539,15 @@ struct SyncPricing {
     warning: String,
 }
 
+/// What reconciling the provider ledgers found: rows a transcript accounts
+/// for, and rows only the provider saw — billed executions the client never
+/// received an answer for.
+#[derive(Debug, Serialize)]
+struct LedgerReport {
+    observed: usize,
+    unobserved: usize,
+}
+
 #[derive(Debug, Default, Serialize)]
 struct ImportReport {
     dry_run: bool,
@@ -549,6 +558,8 @@ struct ImportReport {
     removed: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pricing: Option<SyncPricing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ledger: Option<LedgerReport>,
 }
 
 impl ProviderReport {
@@ -727,6 +738,15 @@ fn import_into(ctx: &mut Ctx, conn: Option<&Connection>, store_path: &str, sourc
         }
         report.providers.push(row);
     }
+    // After every source, whichever were read: a transcript imported after
+    // its ledger row is what turns that row observed.
+    if let Some(conn) = conn {
+        match krowk_store::reconcile_ledger(conn) {
+            Ok(r) if r.observed + r.unobserved > 0 => report.ledger = Some(LedgerReport { observed: r.observed, unobserved: r.unobserved }),
+            Ok(_) => {}
+            Err(e) => broken.push(format!("the provider ledgers could not be reconciled: {}", sanitize_store_err(e.message(), store_path))),
+        }
+    }
     report.duration_ms = started.elapsed().as_millis();
     emit_import_report(ctx, &report)?;
     if !broken.is_empty() {
@@ -814,6 +834,9 @@ fn emit_import_report(ctx: &mut Ctx, report: &ImportReport) -> Result<(), Error>
         if p.errors_truncated > 0 {
             out += &format!("  ! ... and {} more not shown\n", p.errors_truncated);
         }
+    }
+    if let Some(l) = &report.ledger {
+        out += &format!("reconciled {} ledger rows a transcript saw, {} only the provider saw\n", l.observed, l.unobserved);
     }
     let _ = write!(ctx.io.stdout, "{out}");
     Ok(())

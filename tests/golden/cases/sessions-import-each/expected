@@ -99,7 +99,7 @@ stderr:
   "ok": false,
   "error": {
     "error": "bad_flag",
-    "fix": "--from nope is not a source krowk can read — one of claude|cursor|opencode|all",
+    "fix": "--from nope is not a source krowk can read — one of claude|cursor|opencode|ledger|all",
     "retryable": false
   }
 }
@@ -111,7 +111,7 @@ stderr:
   "ok": false,
   "error": {
     "error": "bad_flag",
-    "fix": "`krowk sessions import` needs --from <claude|cursor|opencode|all> — it says which agent's transcripts to read",
+    "fix": "`krowk sessions import` needs --from <claude|cursor|opencode|ledger|all> — it says which agent's transcripts to read",
     "retryable": false
   }
 }

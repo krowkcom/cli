@@ -82,6 +82,22 @@ stdout:
         "files_unchanged": 0,
         "errors_truncated": 0,
         "duration_ms": <n>
+      },
+      {
+        "provider": "ledger",
+        "files": 0,
+        "sessions_seen": 0,
+        "messages_seen": 0,
+        "parts_seen": 0,
+        "sessions_inserted": 0,
+        "messages_inserted": 0,
+        "parts_inserted": 0,
+        "skipped_by_type": {},
+        "skipped_lines": 0,
+        "files_failed": 0,
+        "files_unchanged": 0,
+        "errors_truncated": 0,
+        "duration_ms": <n>
       }
     ],
     "duration_ms": <n>,

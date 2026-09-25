@@ -504,6 +504,7 @@ impl<'a> Builder<'a> {
             foreign_id: id.to_string(),
             usage: d.usage,
             raw_json: d.raw_json,
+            turn_seq: None,
             parts,
         });
         self.tokens.push(d.tokens);

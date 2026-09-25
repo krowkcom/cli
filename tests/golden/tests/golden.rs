@@ -379,6 +379,16 @@ fn run_on_tty(bin: &Path, args: &[String], work: &Path, env: &[(String, String)]
     #[allow(clippy::unnecessary_mut_passed)]
     let ok = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) };
     assert_eq!(ok, 0, "openpty failed");
+    // No \n to \r\n on the way out: `visible` would undo it anyway, and
+    // macOS's pty doubles the \r when a large write fills its buffer
+    // mid-conversion, which reads as a `\r` the binary never printed.
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave, &mut t) == 0 {
+            t.c_oflag &= !libc::ONLCR;
+            libc::tcsetattr(slave, libc::TCSANOW, &t);
+        }
+    }
     let (master, slave) = unsafe { (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave)) };
     let mut child = Command::new(bin)
         .args(args)

@@ -63,6 +63,8 @@ TTY_DEVICE="${KROWK_INSTALL_TTY:-/dev/tty}"
 # what this machine is, before anything is downloaded.
 BUILD=""
 BUILD_REASON=""
+# yes once the installed krowk is found to carry the agent (`krowk -p`).
+HAS_AGENT=""
 CURL_SCHANNEL_FALLBACK_FLAG=""
 # Both of these are files rather than variables, and main fills them in. See
 # curl_run for why.
@@ -525,6 +527,11 @@ verify_install() {
   if installed=$("${BIN_DIR}/krowk${suffix}" --version 2>"$err_file"); then
     rm -f "$err_file"
     info "krowk ${installed} works"
+    # Asked of the binary itself rather than read off the build asked for: a
+    # release from before the agent, or the fallback for one, has none.
+    if "${BIN_DIR}/krowk${suffix}" -p --help >/dev/null 2>&1; then
+      HAS_AGENT=yes
+    fi
     return 0
   fi
 
@@ -845,7 +852,7 @@ install_skill() {
 next_steps() {
   echo ""
   echo "  Next:"
-  if [[ "$BUILD" == full ]]; then
+  if [[ "$HAS_AGENT" == yes ]]; then
     echo "    $(bold "krowk")                         Open krowk's agent in this terminal"
   fi
   echo "    $(bold "krowk push screenshot.png")     Upload without a key — the link is live, and lasts a day"

@@ -264,6 +264,8 @@ pass "both binaries landed in $BIN"
 cmp -s "$BIN/krowk" "$WORK/full/krowk" || { cat "$WORK/install.log"; fail "R-PKG-3: a workstation install did not get the full build"; }
 grep -q "(full build)" "$WORK/install.log" || fail "the installer did not say which build it installed"
 pass "R-PKG-3: a workstation install gets the full build"
+grep -q "Open krowk's agent" "$WORK/install.log" || { cat "$WORK/install.log"; fail "a full install did not say bare krowk opens the agent"; }
+pass "a full install says bare krowk opens the agent"
 
 "$BIN/krowk" --version >/dev/null || fail "the installed krowk does not run"
 pass "the installed krowk runs"
@@ -557,19 +559,23 @@ env -i PATH="$PATH" HOME="$WORK/home" NO_COLOR=1 KROWK_SKIP_SKILL=1 KROWK_INSTAL
 grep -q "no terminal, so no person" "$WORK/notty.log" || { cat "$WORK/notty.log"; fail "a terminal-less install did not say why it is lean"; }
 pass "no controlling terminal (a Dockerfile RUN under BuildKit): the lean build, and why"
 
-# A release from before the lean build: one archive, one checksum. A lean
-# install of it must install that, not 404 on krowk-lean_….
+# A release from before the lean build: one archive, one checksum, and a
+# krowk with no agent in it — stood in for by the lean binaries under the
+# old name. A lean install of it must install that, not 404 on
+# krowk-lean_…, and must not advertise an agent the binary does not have.
 OLD_REL="$RELEASE/old"
 mkdir -p "$OLD_REL"
-cp "$RELEASE/$ARCHIVE" "$RELEASE/SKILL.md" "$OLD_REL/"
+tar -czf "$OLD_REL/$ARCHIVE" -C "$WORK/lean" krowk krowk-mcp
+cp "$RELEASE/SKILL.md" "$OLD_REL/"
 (cd "$OLD_REL" && "${SHA256_CMD[@]}" "$ARCHIVE" >checksums.txt)
 rm -rf "$BUILD_BIN"
 env -i PATH="$PATH" HOME="$WORK/home" NO_COLOR=1 KROWK_SKIP_SKILL=1 CI=true \
   KROWK_INSTALL_BASE_URL="$BASE/old" KROWK_VERSION="$VERSION" KROWK_BIN_DIR="$BUILD_BIN" \
   bash "$REPO_ROOT/scripts/install.sh" --lean >"$WORK/old-release.log" 2>&1 \
   || { cat "$WORK/old-release.log"; fail "a lean install of a release that predates the lean build failed"; }
-cmp -s "$BUILD_BIN/krowk" "$WORK/full/krowk" || fail "a release without a lean build installed something other than its one build"
+cmp -s "$BUILD_BIN/krowk" "$WORK/lean/krowk" || fail "a release without a lean build installed something other than its one build"
 grep -q "predates the lean build" "$WORK/old-release.log" || { cat "$WORK/old-release.log"; fail "the fallback to an old release's one build was not said"; }
+if grep -q "Open krowk's agent" "$WORK/old-release.log"; then cat "$WORK/old-release.log"; fail "the next steps advertised an agent the installed krowk does not have"; fi
 pass "a release that predates the lean build installs its one build, and says so"
 
 if env -i PATH="$PATH" HOME="$WORK/home" NO_COLOR=1 KROWK_LEAN=maybe \

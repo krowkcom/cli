@@ -50,9 +50,12 @@
 //! interpreter — `python -c 'import os; os.remove(…)'`, `perl -e`), a
 //! program reached through an alias or function defined in the same line,
 //! `PATH` pointed elsewhere before an ordinary-looking name, and writes a
-//! program makes itself (`cp`, `tee`, `sed -i`) — a command's own writes
-//! are not judged against `Edit` deny rules, only its redirections are
-//! refused an allow. A deny rule is the policy; the sandbox is the boundary.
+//! program makes itself (`cp`, `tee`, `sed -i`, and covered git
+//! subcommands that write work-tree files — `mv`, `apply`, `checkout` or
+//! `restore` from a source, `stash apply` — which can put content in
+//! `.claude/` or `.krowk/`, outside the file tools' fences) — a command's
+//! own writes are not judged against `Edit` deny rules, only its
+//! redirections are refused an allow. A deny rule is the policy; the sandbox is the boundary.
 
 use std::path::{Path, PathBuf};
 
@@ -214,7 +217,7 @@ pub struct Places<'a> {
 /// one simple command of a command line.
 pub fn matches(r: &Rule, call: &Call, at: &Places<'_>, all: bool) -> bool {
     match &call.access {
-        Access::Bash(cmd) => r.tool == "Bash" && bash_matches(r.spec.as_deref(), cmd, all),
+        Access::Bash(cmd) => r.tool == "Bash" && bash_matches(r.spec.as_deref(), cmd, all, at.cwd),
         Access::Skill(file) => {
             let by_name = r.tool == "Skill" && r.spec.as_deref().is_none_or(|s| call.subject.as_deref().is_some_and(|n| wildcard(s, n)));
             let read = Call { tool: "Read".into(), access: Access::Read(file.iter().cloned().collect()), subject: None };
@@ -941,14 +944,14 @@ fn spec_matches(spec: Option<&str>, words: &[String]) -> bool {
 /// command line. A login shell wrapped around one command line — what Codex
 /// asks about, `bash -lc 'git status'` — is its command line, read by the
 /// same splitter.
-fn allow_units(cmd: &str, depth: usize) -> Option<Vec<Simple>> {
+fn allow_units(cmd: &str, depth: usize, cwd: &Path) -> Option<Vec<Simple>> {
     let parsed = split(cmd);
     if parsed.opaque || parsed.commands.is_empty() || depth > MAX_NESTING {
         return None;
     }
     let mut out = Vec::new();
     for c in parsed.commands {
-        if c.writes || uncoverable(&c.words) {
+        if c.writes || uncoverable(&c.words, cwd) {
             return None;
         }
         let shell = c.words.len() == 3
@@ -957,10 +960,16 @@ fn allow_units(cmd: &str, depth: usize) -> Option<Vec<Simple>> {
             && c.words[1][1..].chars().all(|f| matches!(f, 'l' | 'c'))
             && c.words[1].contains('c');
         if shell && !c.dynamic[2] {
-            out.extend(allow_units(&c.words[2], depth + 1)?);
+            out.extend(allow_units(&c.words[2], depth + 1, cwd)?);
         } else {
             out.push(c);
         }
+    }
+    // A git after a `cd` runs somewhere krowk did not judge: the line's
+    // directories are not followed, so the pair is not covered.
+    let prog = |c: &Simple| c.words.iter().find(|w| !(w.contains('=') && !w.starts_with('='))).map(|w| basename(w).to_string()).unwrap_or_default();
+    if out.iter().any(|c| matches!(prog(c).as_str(), "cd" | "pushd" | "popd")) && out.iter().any(|c| prog(c) == "git") {
+        return None;
     }
     Some(out)
 }
@@ -981,13 +990,18 @@ fn allow_units(cmd: &str, depth: usize) -> Option<Vec<Simple>> {
 ///   `help`), every option is on that subcommand's short safe list; some
 ///   (`filter-branch`, `send-email`, `instaweb`, `daemon`) are never
 ///   covered;
-/// - no argument names an alias (`alias.*`).
+/// - no argument names an alias (`alias.*`);
+/// - git runs on a repository whose config is fenced: `--git-dir`,
+///   `--work-tree`, `--bare`, `init --bare` and `clone --bare`/`--mirror`
+///   are never covered, `-C <dir>` only inside the working directory and
+///   where walking up from it meets a `.git` before a bare layout, and a
+///   line that `cd`s is not covered for its git (see `plain_repo_dir`).
 ///
 /// An option is known only as spelled in a list: git also takes a unique
 /// prefix of a long option (`--up` for `--upload-pack`), and a prefix is
 /// not on any list, so it fails closed. A bundle of short flags (`-ax`) is
 /// read letter by letter, and a letter that takes a value takes the rest.
-fn uncoverable(words: &[String]) -> bool {
+fn uncoverable(words: &[String], cwd: &Path) -> bool {
     let Some(prog) = words.first() else { return false };
     if basename(prog) != "git" {
         return false;
@@ -997,15 +1011,28 @@ fn uncoverable(words: &[String]) -> bool {
         return true;
     }
     let mut i = 0;
+    // Where git will run: the working directory, moved by each `-C`.
+    let mut dir = cwd.to_path_buf();
     while let Some(a) = args.get(i) {
         if !a.starts_with('-') {
             break;
+        }
+        // `-C <dir>` or `-C<dir>`, never in a bundle: it moves git.
+        if let Some(v) = a.strip_prefix("-C") {
+            let (to, step) = if v.is_empty() { (args.get(i + 1), 2) } else { (Some(a), 1) };
+            let Some(to) = to else { return true };
+            dir = dir.join(if v.is_empty() { to.as_str() } else { v });
+            i += step;
+            continue;
         }
         match known(a, GLOBAL) {
             Some(Takes::Next) => i += 2,
             Some(_) => i += 1,
             None => return true,
         }
+    }
+    if !plain_repo_dir(&dir, cwd) {
+        return true;
     }
     let Some(sub) = args.get(i) else { return false };
     let rest = &args[i + 1..];
@@ -1043,6 +1070,34 @@ fn uncoverable(words: &[String]) -> bool {
     }
 }
 
+/// Whether git run in `dir` finds only a repository whose config the file
+/// tools fence: `dir` is inside the working directory, and walking up from
+/// it to the working directory's root git meets a `.git` (fenced, in any
+/// case) before any bare repository layout — a `HEAD` file beside
+/// `objects/` or `refs/`. A bare repository the model made (with its own
+/// tools, or by writing the files) has a `config` in no fenced directory,
+/// which it could then fill with a pager or an fsmonitor for git to run.
+fn plain_repo_dir(dir: &Path, cwd: &Path) -> bool {
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let Ok(mut at) = crate::tools::real_path(dir, 0) else { return false };
+    if !at.starts_with(&root) {
+        return false;
+    }
+    let bare = |d: &Path| d.join("HEAD").is_file() && (d.join("objects").is_dir() || d.join("refs").is_dir());
+    loop {
+        let named_git = at.file_name().is_some_and(|n| n.to_string_lossy().trim_end_matches(['.', ' ']).eq_ignore_ascii_case(".git"));
+        if named_git || at.join(".git").symlink_metadata().is_ok() {
+            return true;
+        }
+        if bare(&at) {
+            return false;
+        }
+        if at == root || !at.pop() || !at.starts_with(&root) {
+            return true;
+        }
+    }
+}
+
 /// What a known option takes.
 #[derive(Clone, Copy, PartialEq)]
 enum Takes {
@@ -1067,19 +1122,19 @@ struct Safe {
 
 const GLOBAL: &Safe = &Safe {
     flags: "pPv",
-    valued: "C",
-    long: &["--no-pager", "--paginate", "--bare", "--no-replace-objects", "--no-lazy-fetch", "--no-optional-locks", "--no-advice", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--version", "--help", "--html-path", "--man-path", "--info-path"],
-    long_valued: &["--git-dir", "--work-tree", "--namespace", "--super-prefix", "--attr-source", "--list-cmds"],
+    valued: "",
+    long: &["--no-pager", "--paginate", "--no-replace-objects", "--no-lazy-fetch", "--no-optional-locks", "--no-advice", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--version", "--help", "--html-path", "--man-path", "--info-path"],
+    long_valued: &["--namespace", "--super-prefix", "--attr-source", "--list-cmds"],
     long_optional: &[],
 };
 const CLONE: &Safe = &Safe {
     flags: "qvnsl",
     valued: "bo",
-    long: &["--quiet", "--verbose", "--progress", "--no-progress", "--no-checkout", "--bare", "--mirror", "--single-branch", "--no-single-branch", "--no-tags", "--sparse", "--reject-shallow", "--no-reject-shallow", "--local", "--no-hardlinks", "--shared", "--dissociate"],
+    long: &["--quiet", "--verbose", "--progress", "--no-progress", "--no-checkout", "--single-branch", "--no-single-branch", "--no-tags", "--sparse", "--reject-shallow", "--no-reject-shallow", "--local", "--no-hardlinks", "--shared", "--dissociate"],
     long_valued: &["--depth", "--shallow-since", "--shallow-exclude", "--branch", "--origin", "--filter", "--revision", "--bundle-uri"],
     long_optional: &[],
 };
-const INIT: &Safe = &Safe { flags: "q", valued: "b", long: &["--quiet", "--bare"], long_valued: &["--initial-branch", "--object-format", "--ref-format"], long_optional: &[] };
+const INIT: &Safe = &Safe { flags: "q", valued: "b", long: &["--quiet"], long_valued: &["--initial-branch", "--object-format", "--ref-format"], long_optional: &[] };
 const FETCH: &Safe = &Safe {
     flags: "qvpPtnfa",
     valued: "j",
@@ -1187,9 +1242,9 @@ fn options(rest: &[String], s: &Safe) -> Option<Vec<String>> {
 
 /// A Bash rule against a command line: every simple command (`all`, for
 /// allow and ask) or any one of them in any of its forms (deny).
-fn bash_matches(spec: Option<&str>, cmd: &str, all: bool) -> bool {
+fn bash_matches(spec: Option<&str>, cmd: &str, all: bool, cwd: &Path) -> bool {
     if all {
-        return allow_units(cmd, 0).is_some_and(|units| units.iter().all(|c| spec_matches(spec, &c.words)));
+        return allow_units(cmd, 0, cwd).is_some_and(|units| units.iter().all(|c| spec_matches(spec, &c.words)));
     }
     if spec.is_none() {
         return true;
@@ -1204,8 +1259,8 @@ fn bash_matches(spec: Option<&str>, cmd: &str, all: bool) -> bool {
 /// Whether every simple command of a line is covered by one of `rules`,
 /// for allow rules spread over several rules (`git status && npm test`
 /// under `Bash(git status)` and `Bash(npm test)`).
-pub fn bash_covered(rules: &[&Rule], cmd: &str) -> bool {
-    allow_units(cmd, 0).is_some_and(|units| units.iter().all(|c| rules.iter().any(|r| r.tool == "Bash" && spec_matches(r.spec.as_deref(), &c.words))))
+pub fn bash_covered(rules: &[&Rule], cmd: &str, cwd: &Path) -> bool {
+    allow_units(cmd, 0, cwd).is_some_and(|units| units.iter().all(|c| rules.iter().any(|r| r.tool == "Bash" && spec_matches(r.spec.as_deref(), &c.words))))
 }
 
 #[cfg(test)]
@@ -1267,8 +1322,8 @@ mod tests {
         assert!(bash("Bash(echo:*)", "echo hi > /dev/null 2>&1", true));
         assert!(!bash("Bash(echo:*)", "echo 'unterminated", true));
         let both = [rule("Bash(git status)"), rule("Bash(npm test)")];
-        assert!(bash_covered(&both.iter().collect::<Vec<_>>(), "git status && npm test"));
-        assert!(!bash_covered(&both.iter().collect::<Vec<_>>(), "git status && npm publish"));
+        assert!(bash_covered(&both.iter().collect::<Vec<_>>(), "git status && npm test", Path::new("/proj")));
+        assert!(!bash_covered(&both.iter().collect::<Vec<_>>(), "git status && npm publish", Path::new("/proj")));
     }
 
     #[test]
@@ -1487,6 +1542,59 @@ mod tests {
         ] {
             assert!(bash("Bash(git:*)", cmd, true), "{cmd} is still covered");
         }
+    }
+
+    #[test]
+    fn r_perm_1_git_in_a_bare_repository_the_model_could_have_made_is_not_covered() {
+        let d = std::env::temp_dir().join(format!("krowk-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for p in [".git/objects", "sub/deep", "b/objects", "b/refs", "nested/inner"] {
+            std::fs::create_dir_all(d.join(p)).unwrap();
+        }
+        std::fs::write(d.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        // A bare layout, as `git init --bare b` or a model writing the
+        // files would leave it: HEAD beside objects/ and refs/, its config
+        // in no fenced directory.
+        std::fs::write(d.join("b/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(d.join("b/config"), "[core]\n\tpager = touch pwned\n").unwrap();
+        std::fs::create_dir_all(d.join("b/hooks")).unwrap();
+        let d = d.canonicalize().unwrap();
+        let at = Places { cwd: &d, home: None };
+        let covered = |cmd: &str| matches(&rule("Bash(git:*)"), &Call { tool: "Bash".into(), access: Access::Bash(cmd.into()), subject: None }, &at, true);
+        for cmd in [
+            "git -C b log",
+            "git -Cb log",
+            "git -C b/hooks log",
+            "git -C sub -C ../b log",
+            "git --git-dir=b log",
+            "git --git-dir b log",
+            "git --work-tree=. --git-dir=b status",
+            "git --bare log",
+            "git -C /tmp log",
+            "git -C .. log",
+            "git -pC b log",
+            "git init --bare b2",
+            "git clone --bare https://x/y",
+            "git clone --mirror https://x/y",
+            "cd b && git log",
+            "(cd b; git status)",
+            "pushd b && git log",
+        ] {
+            assert!(!covered(cmd), "{cmd}");
+        }
+        for cmd in ["git -C sub status", "git -C sub/deep log", "git log", "git -C .git log", "git init nested/inner"] {
+            assert!(covered(cmd), "{cmd} is still covered");
+        }
+        // The working directory itself laid out bare, with no .git: git would
+        // use it as the repository.
+        let plain = d.join("nested/inner");
+        std::fs::write(plain.join("HEAD"), "x").unwrap();
+        std::fs::create_dir_all(plain.join("refs")).unwrap();
+        let inner = Places { cwd: &plain, home: None };
+        for cmd in ["git log", "git -C . log"] {
+            assert!(!matches(&rule("Bash(git:*)"), &Call { tool: "Bash".into(), access: Access::Bash(cmd.into()), subject: None }, &inner, true), "{cmd}: the bare layout is met before any .git");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

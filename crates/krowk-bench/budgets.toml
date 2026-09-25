@@ -77,7 +77,8 @@ unit = "bytes"
 # quoting, opaque program names, anchored path rules, skill and hook
 # fields) 26,880 more, and round 2 (git's program-running forms, glob-safe
 # grants) 5,600, and the final review (git's safe-option lists, the TUI's
-# expand key) 20,992: 7,592,072 (7.24 MiB), 10,104 under this — the next
+# expand key) 20,992, and bare-repository checks 2,272: 7,594,344
+# (7.24 MiB), 7,832 under this — the next
 # harness ticket that grows the build raises it with its own reason.
 max = { x86_64-linux = 7_602_176 }
 status = "enforced"

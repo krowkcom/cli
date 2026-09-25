@@ -341,7 +341,7 @@ impl Gate {
         let grants = self.0.grants.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let allow: Vec<&Rule> = self.0.policy.loaded.rules.iter().filter(|(k, _)| *k == Kind::Allow).map(|(_, r)| r).chain(grants.iter()).collect();
         match &call.access {
-            Access::Bash(cmd) => rules::bash_covered(&allow, cmd),
+            Access::Bash(cmd) => rules::bash_covered(&allow, cmd, &self.0.policy.cwd),
             Access::Read(ps) | Access::Edit(ps) | Access::Publish(ps) => {
                 !ps.is_empty() && ps.iter().all(|p| {
                     let one = Call {

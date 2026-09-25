@@ -109,7 +109,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   …), are all on a known-safe list — anything else, abbreviated or
   bundled, is asked about. `git log`, `git status`, `git commit -m`,
   `git push -u origin main`, `git clone <url>`, `git grep x` and
-  `git config --get` are still covered. A command whose program name the shell computes (`$X`,
+  `git config --get` are still covered; `--git-dir`, `--work-tree`, bare
+  repositories, and a git after `cd` are not. A command whose program name the shell computes (`$X`,
   `$(printf rm)`, `r{m,}`) is asked about whenever a `Bash` deny rule
   applies, even under `bypassPermissions`, and refused by `krowk -p`. Plan mode
   refuses every edit and command. `bash` now runs in `default` and

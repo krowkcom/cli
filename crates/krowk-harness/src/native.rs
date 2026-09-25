@@ -173,18 +173,22 @@ mod tests {
     use crate::toolset::PRESETS;
 
     /// The ceiling on the system prompt plus tool definitions, in estimated
-    /// tokens, for every preset in either tool form. Every model call pays
-    /// for these, so growth has to be a decision: a new tool or a longer
-    /// description that crosses it moves the number here, with a reason.
-    /// Measured at ticket 03: 1,178 for `claude`, 1,191 for `grok`, 1,195
-    /// for `gpt` as a JSON tool and 1,320 with its freeform grammar — the
-    /// largest, since the grammar rides along with the description.
-    const CONTEXT_TOKENS_BUDGET: u64 = 1_500;
+    /// tokens: the `context.tokens` budget in krowk-bench's budgets.toml,
+    /// where `make bench` holds the built binary to it. Read from there so
+    /// the two cannot disagree; this holds every preset in both tool forms,
+    /// including apply_patch's freeform one no wire API reaches yet.
+    fn context_tokens_budget() -> u64 {
+        let file = include_str!("../../krowk-bench/budgets.toml");
+        let at = file.find("id = \"context.tokens\"").expect("budgets.toml has context.tokens");
+        let max = file[at..].lines().find_map(|l| l.strip_prefix("max = ")).expect("context.tokens has a max");
+        max.trim().replace('_', "").parse().expect("a whole number of tokens")
+    }
 
     #[test]
     fn r_tool_1_the_system_prompt_and_tool_definitions_stay_small() {
         // A long, realistic working directory: it is the one variable part.
         let cwd = std::path::Path::new("/home/someone/Repositories/a-project-with-a-long-name");
+        let budget = context_tokens_budget();
         for preset in PRESETS {
             for custom_tools in [false, true] {
                 let ts = Toolset { preset, custom_tools };
@@ -192,7 +196,7 @@ mod tests {
                 let (s, t) = (estimate_tokens(&system), tools_tokens(&tools::definitions(&ts)));
                 println!("R-TOOL-1 context tokens: {} (custom tools {custom_tools}): system {s} + tools {t} = {}", preset.name, s + t);
                 assert!(s < 150, "the system prompt is {s} tokens: keep it a few lines");
-                assert!(s + t <= CONTEXT_TOKENS_BUDGET, "{}: system + tools is {} tokens, over the {CONTEXT_TOKENS_BUDGET} budget", preset.name, s + t);
+                assert!(s + t <= budget, "{}: system + tools is {} tokens, over the {budget} budget (context.tokens in krowk-bench/budgets.toml)", preset.name, s + t);
                 assert_eq!(system, system_prompt(cwd, &ts), "nothing volatile: the prompt is the front of the cached prefix");
             }
         }

@@ -88,6 +88,7 @@ fn main() {
                     "startup.version" => measure::startup(&lean, &["--version"], runs, &measure::fresh_dir(&work, "startup-version")),
                     "startup.sessions" => measure::startup(&full, &["sessions"], runs, &measure::fresh_dir(&work, "startup-sessions")),
                     "log.append" => measure::log_append(&measure::fresh_dir(&work, "log"), runs),
+                    "context.tokens" => measure::context_tokens(&full, &measure::fresh_dir(&work, "context-tokens")),
                     "engine.idle_cpu" | "engine.idle_wakeups" | "engine.idle_rss" => {
                         let window = Duration::from_secs(b.window_s.unwrap_or(10));
                         let sample = idle.get_or_insert_with(|| engine_idle(&full, &measure::fresh_dir(&work, "engine-idle"), window));

@@ -11,6 +11,14 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Changed
 
+- **Edits into `.git`, `.claude`, `.codex` and `.krowk` are asked about
+  instead of refused**, and so is anything in krowk's own config directory
+  or a backend's: the TUI shows the request, and `krowk -p` still refuses
+  it. No allow rule or remembered grant opens those directories — only a
+  yes for that one call, or `bypassPermissions`. Reading outside the
+  working directory is asked about the same way, where it used to be
+  refused.
+
 - **The release ships two builds of krowk, and the installer picks.** The
   full build — krowk's agent and its TUI, the session store, everything —
   keeps the archive name every release has used (`krowk_<version>_…`), so
@@ -81,6 +89,49 @@ the versions are the `v*` tags a release is cut from. Entries land under
   fields pricing never reads.
 
 ### Added
+
+- **krowk's agent follows Claude Code's permission rules, so a repository
+  set up for Claude Code needs nothing new.** `permissions.allow`, `ask`
+  and `deny` are read in Claude Code's syntax — `Bash(git:*)`,
+  `Bash(npm test)`, `Read(./secrets/**)`, `Edit(src/**)`,
+  `WebFetch(domain:docs.rs)`, `Mcp(github:create_issue)` — from
+  `.claude/settings.json` and `.claude/settings.local.json`, your own
+  `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`), the `permissions` key
+  of krowk's `config.json`, and a repository's `.krowk/config.json`, along
+  with `defaultMode` and `additionalDirectories`. **A deny rule wins in every
+  mode, `bypassPermissions` included**, and a command line is judged the way
+  the shell runs it: `git status && rm -rf x` is two commands, `sudo rm`,
+  `bash -c 'rm …'` and `find -delete` still meet `Bash(rm:*)`, and an allow
+  rule never covers a line that writes a file through `>`. Plan mode
+  refuses every edit and command. `bash` now runs in `default` and
+  `acceptEdits` when a rule allows the command. Claude Code backends are
+  started with your deny rules as `--disallowedTools`, and Codex's
+  commands and patches are judged by the same rules. **A repository's own
+  allow rules, extra directories, `defaultMode` and hooks count only once
+  you trust it** (the same trust list and `--trust` as a backend's); its
+  deny and ask rules always count. A settings file that does not parse
+  stops the prompt and names the file.
+- **The TUI asks before a call its rules do not allow.** A command, an
+  edit in the default mode, or anything reaching outside the working
+  directory shows over the prompt with why it is asked: `y` allows it once,
+  `s` for the rest of the session, `p` for this project from now on
+  (remembered in krowk's own `permissions.json`), `n` or Esc refuses it.
+  The request is part of krowk's protocol (`approval.requested`, answered
+  by `approve`), so any client can answer it — the phone, once the daemon
+  lands. **`krowk -p` never waits on a question**: the call is refused, and
+  the model is told which allow rule or `--permission-mode` would have
+  allowed it.
+- **Instructions, skills and hooks from Claude Code, Codex and Cursor load
+  as they are.** krowk's agent reads `AGENTS.md`, then `CLAUDE.md` and
+  `CLAUDE.local.md`, then `.cursor/rules` and `.cursorrules`, in every
+  directory from the repository root down to where it runs (deeper files
+  win), after your own `~/.claude/CLAUDE.md`. Claude-format skills
+  (`SKILL.md` in `.claude/skills`, `~/.claude/skills` or krowk's config
+  directory) are listed by their description, and a skill's full text is
+  loaded only when the model uses it. Claude-format command hooks run for
+  `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse` and
+  `Stop`, with Claude Code's JSON on stdin; a hook that exits 2 blocks, and
+  the model reads its reason.
 
 - **Bare `krowk` on a terminal opens krowk's own agent.** An inline prompt
   at the bottom of the terminal, with the conversation going into the

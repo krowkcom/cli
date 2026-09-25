@@ -98,7 +98,10 @@ pub fn list(ctx: &mut Ctx) -> Result<(), Error> {
     let _ = write!(ctx.io.stdout, "{table}");
     if !rows.is_empty() {
         let _ = writeln!(ctx.io.stdout);
-        let _ = writeln!(ctx.io.stdout, "{}", paint(ctx.colour, "2", &cost_footnote(&bases)));
+        let note = cost_footnote(&bases, priced.iter().any(|p| p.total().is_none()));
+        if !note.is_empty() {
+            let _ = writeln!(ctx.io.stdout, "{}", paint(ctx.colour, "2", &note));
+        }
     }
     Ok(())
 }
@@ -257,9 +260,15 @@ fn is_observed(t: &TurnDetail) -> bool {
 
 /// The footnote under every priced listing: where the rates came from, and
 /// what — means.
-fn cost_footnote(bases: &BTreeSet<pricing::Basis>) -> String {
+fn cost_footnote(bases: &BTreeSet<pricing::Basis>, dashes: bool) -> String {
     let note = pricing::basis_note(bases);
-    if note.is_empty() { "— has no price for its model".into() } else { format!("costs {note}; — has no price for its model") }
+    let dash = "— has no price for its model";
+    match (note.is_empty(), dashes) {
+        (true, true) => dash.into(),
+        (true, false) => String::new(),
+        (false, true) => format!("costs {note}; {dash}"),
+        (false, false) => format!("costs {note}"),
+    }
 }
 
 fn session_row_json(r: &SessionRow, p: &Priced, now: i64) -> Value {
@@ -286,11 +295,13 @@ fn session_row_json(r: &SessionRow, p: &Priced, now: i64) -> Value {
     if p.total().is_none() {
         v["unpriced"] = json!(p.missing());
     }
+    if p.elsewhere {
+        v["cost_counted_elsewhere"] = json!(true);
+    }
     v
 }
 
-/// Cents from a cent up; below that, three significant digits, so $0.00007
-/// and $0.00012 do not both read as $0.0001. Rounded here, once, at display.
+/// A session's cost as text: the figure, —, or where it was counted.
 fn cost_display(p: &Priced) -> String {
     if p.elsewhere {
         return "counted elsewhere".into();
@@ -298,6 +309,8 @@ fn cost_display(p: &Priced) -> String {
     p.total().map_or("—".to_string(), format_cost)
 }
 
+/// Cents from a cent up; below that, three significant digits, so $0.00007
+/// and $0.00012 do not both read as $0.0001. Rounded here, once, at display.
 fn format_cost(usd: f64) -> String {
     if usd >= 0.01 || usd <= 0.0 {
         return format!("${usd:.2}");
@@ -498,8 +511,6 @@ pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
-/// A shown session's turns priced one by one, and their sum. A turn a
-/// transcript accounts for (an observed ledger row) is counted there, not here.
 /// Each turn priced for display, and the session's total rolled up exactly
 /// as the listing rolls it up: per (provider, model, reported), in that order.
 fn price_turns(ctx: &Ctx, d: &SessionDetail) -> (Vec<Option<TurnCost>>, Priced) {
@@ -625,6 +636,9 @@ fn session_show_json(ctx: &Ctx, d: &SessionDetail) -> (Value, String) {
     out.insert("messages".into(), Value::Array(messages));
     out.insert("cost_usd".into(), json!(total.total()));
     out.insert("cost_display".into(), json!(cost_display(&total)));
+    if total.elsewhere {
+        out.insert("cost_counted_elsewhere".into(), json!(true));
+    }
     if total.total().is_none() {
         out.insert("unpriced".into(), json!(total.missing()));
     }
@@ -680,7 +694,11 @@ fn human_session_show(ctx: &Ctx, d: &SessionDetail, show_thinking: bool, now: i6
         b += &format!("\nby model  {}\n", parts.join("  ·  "));
     }
     if !d.turns.is_empty() {
-        b += &format!("\n{}\n", paint(ctx.colour, "2", &cost_footnote(&total.bases)));
+        let dashes = total.total().is_none() || costs.iter().zip(&d.turns).any(|(c, t)| c.is_none() && !is_observed(t));
+        let note = cost_footnote(&total.bases, dashes);
+        if !note.is_empty() {
+            b += &format!("\n{}\n", paint(ctx.colour, "2", &note));
+        }
     }
     for m in &d.messages {
         b += &format!("\n[{}]\n", cell(&m.role));

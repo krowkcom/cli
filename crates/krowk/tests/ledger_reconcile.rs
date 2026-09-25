@@ -75,6 +75,19 @@ fn a_request_killed_client_side_is_still_counted_from_the_provider_ledger() {
     assert_eq!((turns[1]["input_tokens"].as_i64(), turns[1]["output_tokens"].as_i64()), (Some(84), Some(17)), "reasoning is split out of output");
     assert_eq!(turns[1]["cost_usd_micros"], 4106, "the provider's stated cost is kept");
 
+    // With the ghost gone, every row is in a transcript: the ledger session
+    // costs nothing here, and says where its cost was counted.
+    std::fs::write(&ledger, std::fs::read_to_string(&ledger).unwrap().lines().next().unwrap().to_string() + "\n").unwrap();
+    let solo = home.join(".local/share/krowk/ledger/solo.jsonl");
+    std::fs::copy(&ledger, &solo).unwrap();
+    std::fs::remove_file(&ledger).unwrap();
+    krowk(&home, &["sessions", "import", "--from", "all"]);
+    let listed = krowk(&home, &["sessions", "--harness", "ledger"]);
+    let solo_row = listed["data"]["sessions"].as_array().unwrap().iter().find(|s| s["title"].as_str().unwrap().contains("(solo)")).unwrap().clone();
+    assert_eq!((solo_row["cost_display"].as_str(), solo_row["cost_counted_elsewhere"].as_bool()), (Some("counted elsewhere"), Some(true)), "{listed}");
+    let shown = krowk(&home, &["sessions", "show", solo_row["id"].as_str().unwrap()]);
+    assert_eq!((shown["data"]["cost_display"].as_str(), shown["data"]["cost_usd"].as_f64()), (Some("counted elsewhere"), Some(0.0)));
+
     // A second import converges on the same rows.
     let again = krowk(&home, &["sessions", "import", "--from", "all"]);
     let ledger_row = again["data"]["providers"].as_array().unwrap().iter().find(|p| p["provider"] == "ledger").unwrap();

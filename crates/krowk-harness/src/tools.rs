@@ -16,7 +16,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 
 pub const READ: &str = "read";
 pub const BASH: &str = "bash";
@@ -70,7 +69,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: BASH.into(),
-            description: "Run a shell command with `bash -c` in the working directory and return its combined stdout and stderr, followed by the exit code. Output beyond 30000 characters is cut from the middle. Commands time out after 120 seconds unless `timeout_ms` says otherwise.".into(),
+            description: "Run a shell command with `bash -c` in the working directory and return its combined stdout and stderr, followed by the exit code. Output beyond 30000 bytes is cut from the middle. Commands time out after 120 seconds unless `timeout_ms` says otherwise.".into(),
             input_schema: input_schema::<BashInput>(),
         },
     ]
@@ -98,7 +97,7 @@ pub struct ToolEnv<'a> {
 pub async fn run(name: &str, input: &Value, env: &ToolEnv<'_>) -> (String, bool) {
     match name {
         READ => match ReadInput::deserialize(input) {
-            Ok(i) => read(&i, env.cwd),
+            Ok(i) => read(&i, env.cwd).await,
             Err(e) => (format!("invalid input for read: {e}"), true),
         },
         BASH => match BashInput::deserialize(input) {
@@ -118,110 +117,250 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
 }
 
-fn read(i: &ReadInput, cwd: &Path) -> (String, bool) {
+/// Read scans at most this much of a file: a line count past it is not worth
+/// the wait, and nothing past it is shown.
+const READ_MAX_SCAN: u64 = 64 << 20;
+
+/// Off the async runtime: a read is blocking file I/O, and the runtime also
+/// has to hear an interrupt while it runs.
+async fn read(i: &ReadInput, cwd: &Path) -> (String, bool) {
     let path = resolve(cwd, &i.path);
-    let data = match std::fs::read(&path) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (format!("{} does not exist", path.display()), true),
-        Err(e) => return (format!("{} could not be read: {e}", path.display()), true),
-    };
-    if data.contains(&0) {
-        return (format!("{} is a binary file, which read does not show", path.display()), true);
+    let (start, limit) = (i.offset.unwrap_or(1).max(1), i.limit.unwrap_or(READ_DEFAULT_LINES).max(1));
+    tokio::task::spawn_blocking(move || read_file(&path, start, limit))
+        .await
+        .unwrap_or_else(|e| (format!("read failed: {e}"), true))
+}
+
+/// Opens only a regular file, and never blocks opening it: a FIFO, a device
+/// or `/dev/stdin` put where a file was expected is refused, not waited on
+/// or read forever. The check is repeated on the open handle, so a path
+/// swapped between the two cannot slip one through.
+fn open_regular(path: &Path) -> Result<(std::fs::File, u64), String> {
+    let not_regular = || format!("{} is not a regular file (a directory, a device or a pipe), which read does not open", path.display());
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(not_regular()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(format!("{} does not exist", path.display())),
+        Err(e) => return Err(format!("{} could not be read: {e}", path.display())),
     }
-    let text = String::from_utf8_lossy(&data);
-    let start = i.offset.unwrap_or(1).max(1);
-    let limit = i.limit.unwrap_or(READ_DEFAULT_LINES).max(1);
-    let total = text.lines().count();
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NONBLOCK);
+    let f = o.open(path).map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+    let meta = f.metadata().map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(not_regular());
+    }
+    Ok((f, meta.len()))
+}
+
+fn read_file(path: &Path, start: usize, limit: usize) -> (String, bool) {
+    use std::io::{BufRead, Read};
+    let (file, size) = match open_regular(path) {
+        Ok(f) => f,
+        Err(e) => return (e, true),
+    };
+    let mut r = std::io::BufReader::with_capacity(64 << 10, file.take(READ_MAX_SCAN));
+    let (mut out, mut total, mut last, mut full) = (String::new(), 0usize, start - 1, false);
+    let mut line = Vec::new();
+    loop {
+        // One line, keeping at most what a shown line can use: a minified
+        // file's one line costs its first few kilobytes of memory, not all of it.
+        line.clear();
+        let mut consumed = 0usize;
+        loop {
+            let buf = match r.fill_buf() {
+                Ok(b) => b,
+                Err(e) => return (format!("{} could not be read: {e}", path.display()), true),
+            };
+            if buf.is_empty() {
+                break;
+            }
+            let (chunk, done) = match buf.iter().position(|b| *b == b'\n') {
+                Some(i) => (&buf[..=i], true),
+                None => (buf, false),
+            };
+            let keep = (READ_MAX_LINE * 4).saturating_sub(line.len()).min(chunk.len());
+            line.extend_from_slice(&chunk[..keep]);
+            let n = chunk.len();
+            consumed += n;
+            r.consume(n);
+            if done {
+                break;
+            }
+        }
+        if consumed == 0 {
+            break;
+        }
+        if line.contains(&0) {
+            return (format!("{} is a binary file, which read does not show", path.display()), true);
+        }
+        total += 1;
+        if total < start || total >= start + limit || full {
+            continue;
+        }
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = if text.chars().count() > READ_MAX_LINE { text.chars().take(READ_MAX_LINE).collect::<String>() + "…" } else { text.into_owned() };
+        let row = format!("{total:>6}\t{text}\n");
+        if out.len() + row.len() > READ_MAX_BYTES {
+            full = true;
+            continue;
+        }
+        out += &row;
+        last = total;
+    }
+    let scanned_all = size <= READ_MAX_SCAN;
+    let count = if scanned_all { format!("{total} lines") } else { format!("more than {total} lines (read scans the first {} MB)", READ_MAX_SCAN >> 20) };
     if total == 0 {
         return (format!("{} is empty", path.display()), false);
     }
     if start > total {
-        return (format!("{} has {total} lines, so there is nothing from line {start}", path.display()), true);
+        return (format!("{} has {count}, so there is nothing from line {start}", path.display()), true);
     }
-    let mut out = String::new();
-    let mut last = start - 1;
-    for (n, line) in text.lines().enumerate().skip(start - 1).take(limit) {
-        let line = if line.chars().count() > READ_MAX_LINE { line.chars().take(READ_MAX_LINE).collect::<String>() + "…" } else { line.to_string() };
-        let row = format!("{:>6}\t{line}\n", n + 1);
-        if out.len() + row.len() > READ_MAX_BYTES {
-            break;
-        }
-        out += &row;
-        last = n + 1;
-    }
-    if last < total {
-        out += &format!("\n({} has {total} lines; this is {start}–{last}. Read on with offset {}.)\n", path.display(), last + 1);
+    if last < total || !scanned_all {
+        out += &format!("\n({} has {count}; this is {start}–{last}. Read on with offset {}.)\n", path.display(), last + 1);
     }
     (out, false)
 }
 
+/// How long the output is still read once the shell has exited: long enough
+/// for what it wrote last, short enough that a process it left in the
+/// background — which holds the pipes open — does not hold the call.
+const BASH_DRAIN_AFTER_EXIT: Duration = Duration::from_millis(250);
+
+/// A bounded capture of a stream: the first half of the budget kept whole,
+/// the last half as a ring, and a count of what fell in between — so a
+/// command that prints gigabytes costs 30 KB.
+struct Capture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    dropped: u64,
+    half: usize,
+}
+
+impl Capture {
+    fn new(max: usize) -> Capture {
+        Capture { head: Vec::new(), tail: std::collections::VecDeque::new(), dropped: 0, half: max / 2 }
+    }
+
+    fn push(&mut self, mut b: &[u8]) {
+        let room = self.half - self.head.len();
+        if room > 0 {
+            let n = room.min(b.len());
+            self.head.extend_from_slice(&b[..n]);
+            b = &b[n..];
+        }
+        self.tail.extend(b);
+        while self.tail.len() > self.half {
+            let over = self.tail.len() - self.half;
+            self.tail.drain(..over);
+            self.dropped += over as u64;
+        }
+    }
+
+    fn render(&self) -> String {
+        let (a, b) = self.tail.as_slices();
+        let tail: Vec<u8> = [a, b].concat();
+        if self.dropped == 0 {
+            return String::from_utf8_lossy(&[self.head.as_slice(), &tail].concat()).into_owned();
+        }
+        format!("{}\n… {} bytes cut …\n{}", String::from_utf8_lossy(&self.head), self.dropped, String::from_utf8_lossy(&tail))
+    }
+}
+
+/// Kills the command's whole process group when dropped armed: on a timeout,
+/// and when the turn is interrupted and the call's future is dropped — so
+/// what the command started dies with it, not just the shell.
+struct GroupKill(Option<u32>);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0 {
+            // SAFETY: kill(2) on the group this call created; a group that
+            // already exited is ESRCH, which is fine.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
 async fn bash(i: &BashInput, cwd: &Path) -> (String, bool) {
+    use tokio::io::AsyncReadExt;
     let timeout = i.timeout_ms.map_or(BASH_DEFAULT_TIMEOUT, Duration::from_millis).min(BASH_MAX_TIMEOUT);
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-c").arg(&i.command).current_dir(cwd);
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
-    // Its own process group, so a timeout kills what the command started
-    // too, not just the shell.
+    // Its own process group, so a timeout or an interrupt kills what the
+    // command started too, not just the shell.
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (format!("bash could not be started: {e}"), true),
     };
+    let mut group = GroupKill(child.id());
     let (mut so, mut se) = (child.stdout.take().expect("piped"), child.stderr.take().expect("piped"));
-    let pid = child.id();
+    let mut cap = Capture::new(BASH_MAX_OUTPUT);
     let run = async {
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let (a, b, status) = tokio::join!(so.read_to_end(&mut out), se.read_to_end(&mut err), child.wait());
-        let _ = (a, b);
-        (out, err, status)
+        let (mut b1, mut b2) = ([0u8; 8192], [0u8; 8192]);
+        let (mut so_open, mut se_open) = (true, true);
+        let mut status = None;
+        let mut held_open = false;
+        loop {
+            if !so_open && !se_open && status.is_some() {
+                break;
+            }
+            let drained = async {
+                match status {
+                    Some(_) => tokio::time::sleep(BASH_DRAIN_AFTER_EXIT).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                r = so.read(&mut b1), if so_open => match r {
+                    Ok(n) if n > 0 => cap.push(&b1[..n]),
+                    _ => so_open = false,
+                },
+                r = se.read(&mut b2), if se_open => match r {
+                    Ok(n) if n > 0 => cap.push(&b2[..n]),
+                    _ => se_open = false,
+                },
+                s = child.wait(), if status.is_none() => status = Some(s),
+                _ = drained => {
+                    held_open = true;
+                    break;
+                }
+            }
+        }
+        (status.and_then(|s| s.ok()).and_then(|s| s.code()), held_open)
     };
     match tokio::time::timeout(timeout, run).await {
-        Ok((out, err, status)) => {
-            let mut text = String::from_utf8_lossy(&out).into_owned();
-            if !err.is_empty() {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                text += &String::from_utf8_lossy(&err);
-            }
-            let code = status.ok().and_then(|s| s.code());
-            let text = cut_middle(&text, BASH_MAX_OUTPUT);
-            let tail = match code {
+        Ok((code, held_open)) => {
+            // Finished: what it left in the background is its business.
+            group.0 = None;
+            let text = cap.render();
+            let mut tail = match code {
                 Some(c) => format!("exit code {c}"),
                 None => "killed by a signal".into(),
             };
+            if held_open {
+                tail += " (a process it started in the background still holds its output; krowk stopped reading when the shell exited)";
+            }
             let body = if text.is_empty() { tail.clone() } else { format!("{}\n{tail}", text.trim_end_matches('\n')) };
             (body, code != Some(0))
         }
         Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                // SAFETY: kill(2) on the group this call created; a group
-                // that already exited is ESRCH, which is fine.
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                }
-            }
-            let _ = pid;
+            drop(group);
             (format!("the command timed out after {} ms and was killed", timeout.as_millis()), true)
         }
     }
-}
-
-fn cut_middle(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let chars: Vec<char> = s.chars().collect();
-    let half = max / 2;
-    let cut = chars.len() - 2 * half;
-    format!(
-        "{}\n… {cut} characters cut …\n{}",
-        chars[..half].iter().collect::<String>(),
-        chars[chars.len() - half..].iter().collect::<String>()
-    )
 }
 
 #[cfg(test)]
@@ -263,6 +402,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_refuses_what_is_not_a_regular_file_without_blocking_or_reading_it_whole() {
+        let d = dir("read-special");
+        let fifo = d.join("fifo");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::Default };
+        for path in [fifo.display().to_string(), "/dev/zero".into(), "/dev/stdin".into(), d.display().to_string()] {
+            let r = tokio::time::timeout(Duration::from_secs(2), run(READ, &json!({ "path": path }), &env)).await.expect("read never blocks");
+            assert!(r.1 && r.0.contains("not a regular file"), "{path}: {r:?}");
+        }
+        // A long line costs its shown part, and the page stays capped.
+        std::fs::write(d.join("wide"), "x".repeat(5 << 20) + "\nsecond\n").unwrap();
+        let (out, err) = run(READ, &json!({"path": "wide"}), &env).await;
+        assert!(!err && out.len() < 10_000 && out.contains("     2\tsecond"), "{}", out.len());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn bash_runs_only_when_permissions_are_bypassed_and_is_bounded() {
         let d = dir("bash");
@@ -276,7 +434,39 @@ mod tests {
         assert!(err && out.contains("timed out"), "{out}");
         assert!(started.elapsed() < Duration::from_secs(3), "the whole group was killed");
         let (out, _) = run(BASH, &json!({"command": "head -c 40000 /dev/zero | tr '\\0' x"}), &env).await;
-        assert!(out.contains("characters cut") && out.len() < 31_000);
+        assert!(out.contains("bytes cut") && out.len() < 31_000);
+        // Output is bounded however much there is, not buffered whole.
+        let (out, _) = run(BASH, &json!({"command": "timeout 1 yes"}), &env).await;
+        assert!(out.contains("bytes cut") && out.len() < 31_000, "{}", out.len());
+        // A process left in the background holds the pipes; the call still
+        // ends when the shell does.
+        let started = std::time::Instant::now();
+        let (out, err) = run(BASH, &json!({"command": "sleep 5 & echo started"}), &env).await;
+        assert!(!err && out.starts_with("started\nexit code 0"), "{out}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_interrupted_bash_call_kills_what_the_command_started() {
+        let d = dir("bash-cancel");
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::BypassPermissions };
+        let input = json!({"command": "sleep 30 & echo $! > grandchild; wait"});
+        let call = run(BASH, &input, &env);
+        // Dropped mid-run, as the loop drops a call when the turn is interrupted.
+        assert!(tokio::time::timeout(Duration::from_millis(500), call).await.is_err());
+        let pid: i32 = std::fs::read_to_string(d.join("grandchild")).unwrap().trim().parse().unwrap();
+        let mut alive = true;
+        for _ in 0..40 {
+            // SAFETY: signal 0 only asks whether the process exists.
+            alive = unsafe { libc::kill(pid, 0) } == 0 && !std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "));
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive, "the backgrounded sleep {pid} outlived the interrupted call");
         let _ = std::fs::remove_dir_all(d);
     }
 }

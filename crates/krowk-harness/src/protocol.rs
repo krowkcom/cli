@@ -1,0 +1,381 @@
+//! The client protocol and the session log, as types. Everything a client
+//! sends (`Command`), everything it is told (`StreamLine`: a logged
+//! `LogEvent` or an ephemeral `LiveEvent`), and every line of a session's
+//! log (`LogEvent`) is declared here, once. The JSON Schema in `schema/` is
+//! generated from these types, never written beside them (R-PROTO-2), and a
+//! test fails when the checked-in copy is stale.
+//!
+//! The shape is session → turn → item. A session is one conversation; a turn
+//! is one prompt and everything the engine did to answer it; an item is one
+//! thing inside a turn — the prompt text, a reply, reasoning, a tool call, a
+//! tool result. An item streams as `item.started`, any number of
+//! `item.delta`, then `item.completed`, all under one stable `itemId`.
+//!
+//! What is persisted and what is not is the lag rule (R-LAG-1): deltas are
+//! live frames and never touch the log; the completed item, and the
+//! structure around it, are the log. A client that attaches late reads the
+//! log and misses nothing but the typing.
+//!
+//! Wire names are camelCase, and every id is a UUIDv7 in canonical lowercase
+//! form, the same ids krowk.db mints.
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Bumped on any change a client written against the previous version
+/// would misread. Additive fields are not such a change.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// A canonical lowercase UUIDv7, as the schema pins every event id.
+pub const UUID7_PATTERN: &str = "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
+
+/// A model, named as the instance that serves it and the provider's own id
+/// for it: `{"instance": "anthropic", "model": "claude-opus-5"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRef {
+    /// A name from the instance registry, e.g. `anthropic` or `anthropic:work`.
+    pub instance: String,
+    /// The provider's model id, e.g. `claude-opus-5`.
+    pub model: String,
+}
+
+impl std::fmt::Display for ModelRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.instance, self.model)
+    }
+}
+
+/// The wire API a provider speaks. An opaque blob is replayed only to the
+/// same provider on the same wire API (R-LOG-3), so this travels with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum WireApi {
+    #[serde(rename = "anthropic-messages")]
+    AnthropicMessages,
+}
+
+/// State a provider needs back verbatim and nobody else may read: a thinking
+/// signature, redacted thinking, encrypted reasoning. Stored as the provider
+/// sent it and replayed unmodified, only to the provider and wire API named
+/// here; anywhere else it is dropped and the item's neutral text stands in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderBlob {
+    /// The provider that produced it, e.g. `anthropic`.
+    pub provider: String,
+    pub wire_api: WireApi,
+    /// Opaque to everything but that provider's client.
+    pub data: Value,
+}
+
+/// One thing inside a turn, provider-neutral. `reasoning` carries what can
+/// be shown, and the provider's own state in `blob`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum Item {
+    /// What the person asked.
+    UserText { text: String },
+    /// What the model answered, as text.
+    AssistantText { text: String },
+    /// The model's reasoning: its readable text (often a summary, or empty
+    /// when the provider withholds it) and the blob that lets it be replayed.
+    Reasoning {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blob: Option<ProviderBlob>,
+    },
+    /// A tool the model asked krowk to run. `callId` is the provider's id,
+    /// which the matching result repeats.
+    ToolCall { call_id: String, name: String, input: Value },
+    /// What running it produced. A refusal or a failure is a result too,
+    /// with `isError`, so the model can read why.
+    ToolResult { call_id: String, output: String, is_error: bool },
+}
+
+/// What an item is, before any of it has arrived.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ItemKind {
+    UserText,
+    AssistantText,
+    Reasoning,
+    ToolCall { call_id: String, name: String },
+    ToolResult { call_id: String },
+}
+
+impl Item {
+    pub fn kind(&self) -> ItemKind {
+        match self {
+            Item::UserText { .. } => ItemKind::UserText,
+            Item::AssistantText { .. } => ItemKind::AssistantText,
+            Item::Reasoning { .. } => ItemKind::Reasoning,
+            Item::ToolCall { call_id, name, .. } => ItemKind::ToolCall { call_id: call_id.clone(), name: name.clone() },
+            Item::ToolResult { call_id, .. } => ItemKind::ToolResult { call_id: call_id.clone() },
+        }
+    }
+}
+
+/// A piece of an item as it streams.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum Delta {
+    /// More text, for assistant text and reasoning alike.
+    Text { text: String },
+    /// More of a tool call's input, as a fragment of its JSON.
+    ToolInput { partial_json: String },
+}
+
+/// Tokens, split the five ways they are priced. `outputTokens` excludes
+/// `reasoningTokens` when the provider reports the split; a provider that
+/// does not counts reasoning inside output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Usage {
+    /// Input read at the full rate: what came after the last cache hit.
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reasoning_tokens: i64,
+}
+
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, o: Usage) {
+        self.input_tokens += o.input_tokens;
+        self.output_tokens += o.output_tokens;
+        self.cache_read_tokens += o.cache_read_tokens;
+        self.cache_write_tokens += o.cache_write_tokens;
+        self.reasoning_tokens += o.reasoning_tokens;
+    }
+}
+
+impl Usage {
+    pub fn total(&self) -> i64 {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens + self.reasoning_tokens
+    }
+}
+
+/// How a turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnStatus {
+    Completed,
+    /// Stopped by an `interrupt`: what arrived before it is kept.
+    Interrupted,
+    /// The engine could not finish: `error` says why.
+    Failed,
+}
+
+/// Why something failed, as a code a script branches on and a sentence that
+/// names the next action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorInfo {
+    pub code: String,
+    pub message: String,
+    /// The HTTP status the provider answered with, when the failure was an
+    /// answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+/// Claude-Code-compatible permission modes. Until the permission system
+/// lands, only `bypassPermissions` changes anything: it is the one mode in
+/// which `bash` runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionMode {
+    #[default]
+    Default,
+    AcceptEdits,
+    Plan,
+    BypassPermissions,
+}
+
+impl PermissionMode {
+    pub const NAMES: [&'static str; 4] = ["default", "acceptEdits", "plan", "bypassPermissions"];
+
+    pub fn parse(s: &str) -> Option<PermissionMode> {
+        Some(match s {
+            "default" => PermissionMode::Default,
+            "acceptEdits" => PermissionMode::AcceptEdits,
+            "plan" => PermissionMode::Plan,
+            "bypassPermissions" => PermissionMode::BypassPermissions,
+            _ => return None,
+        })
+    }
+}
+
+/// An answer to a permission request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ApprovalDecision {
+    Allow,
+    Deny,
+}
+
+/// What a client asks of the engine. `prompt` and `interrupt` are served
+/// today; the rest are typed now so every client is written against the
+/// whole vocabulary, and are refused with `not_implemented` until their
+/// tickets land.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum Command {
+    /// Start a turn: in `sessionId` when given, else in a new session.
+    Prompt {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        text: String,
+        /// The model for this turn; the session's last one when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelRef>,
+        #[serde(default)]
+        permission_mode: PermissionMode,
+    },
+    /// Stop the running turn, keeping what it produced so far.
+    Interrupt { session_id: String },
+    /// Add input to the running turn without stopping it.
+    Steer { session_id: String, text: String },
+    /// Answer a permission request.
+    Approve { session_id: String, request_id: String, decision: ApprovalDecision },
+    /// Continue the session on another model.
+    SwitchModel { session_id: String, model: ModelRef },
+    /// Branch the session at an event: the new branch's first event names
+    /// it as its parent.
+    Fork { session_id: String, from_event_id: String },
+}
+
+/// One line of a session's log: typed, with a UUIDv7 `id`, and a `parentId`
+/// naming the event before it on the same branch — so a fork or a rewind is
+/// a second child of some earlier event, and the log is a tree (R-LOG-1).
+/// Only the root, `session.started`, has no parent, and its id is the
+/// session's id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEvent {
+    #[schemars(regex(pattern = UUID7_PATTERN))]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = UUID7_PATTERN))]
+    pub parent_id: Option<String>,
+    #[schemars(regex(pattern = UUID7_PATTERN))]
+    pub session_id: String,
+    /// Milliseconds since the Unix epoch, UTC. Order is the parent chain,
+    /// never this.
+    pub time_ms: i64,
+    #[serde(flatten)]
+    pub body: LogBody,
+}
+
+/// What a log event records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all_fields = "camelCase")]
+pub enum LogBody {
+    /// The root of every session.
+    #[serde(rename = "session.started")]
+    SessionStarted { cwd: String, krowk_version: String, protocol_version: u32 },
+    /// A prompt arrived; the turn runs on `model`. The exact system prompt
+    /// and tools it ran with are in the session's `context.jsonl` under
+    /// this `turnId` (R-LOG-4).
+    #[serde(rename = "turn.started")]
+    TurnStarted { turn_id: String, model: ModelRef, provider: String, wire_api: WireApi, permission_mode: PermissionMode },
+    /// One item, whole. `itemId` is the id its live frames carried.
+    #[serde(rename = "item.completed")]
+    ItemCompleted { turn_id: String, item_id: String, item: Item },
+    /// One model call finished: what it cost, and which items it produced,
+    /// in order — the items that were one message on the provider's wire.
+    #[serde(rename = "response.completed")]
+    ResponseCompleted {
+        turn_id: String,
+        /// The provider's id for the response, e.g. Anthropic's `msg_…`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        /// The model the provider says answered.
+        model: String,
+        usage: Usage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+        item_ids: Vec<String>,
+    },
+    /// The turn is over.
+    #[serde(rename = "turn.completed")]
+    TurnCompleted {
+        turn_id: String,
+        status: TurnStatus,
+        /// Every model call in the turn, summed.
+        usage: Usage,
+        duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ErrorInfo>,
+    },
+}
+
+/// A frame that is never logged: the typing, and the answer to a command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all_fields = "camelCase")]
+pub enum LiveEvent {
+    #[serde(rename = "item.started")]
+    ItemStarted { session_id: String, turn_id: String, item_id: String, item: ItemKind },
+    #[serde(rename = "item.delta")]
+    ItemDelta { session_id: String, turn_id: String, item_id: String, delta: Delta },
+    /// How a `prompt` came out: the last thing a headless run prints.
+    #[serde(rename = "result")]
+    Result(RunResult),
+}
+
+/// The outcome of one `prompt`, with what it cost.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RunResult {
+    pub session_id: String,
+    pub turn_id: String,
+    pub status: TurnStatus,
+    pub is_error: bool,
+    /// The turn's final answer: its last assistant text.
+    pub result: String,
+    pub model: ModelRef,
+    pub usage: Usage,
+    /// USD at current models.dev prices; null when the model has no price.
+    pub cost_usd: Option<f64>,
+    pub duration_ms: u64,
+    pub num_model_calls: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorInfo>,
+}
+
+/// One line of `--output-format stream-json`, and of anything else that
+/// carries the event stream: a logged event exactly as the log has it, or a
+/// live frame. The two never share a `type`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum StreamLine {
+    Log(LogEvent),
+    Live(LiveEvent),
+}
+
+/// A tool as the model is shown it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the tool's input.
+    pub input_schema: Value,
+}
+
+/// One line of a session's `context.jsonl`: the exact system prompt and
+/// tool definitions a turn ran with, for debugging and cache analysis
+/// (R-LOG-4). Kept beside the log rather than in it, so the log stays small
+/// and a change of prompt shows up as a diff between two lines here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextRecord {
+    pub turn_id: String,
+    pub time_ms: i64,
+    pub model: ModelRef,
+    pub provider: String,
+    pub wire_api: WireApi,
+    pub system: String,
+    pub tools: Vec<ToolDefinition>,
+}

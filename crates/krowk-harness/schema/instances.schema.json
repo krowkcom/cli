@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InstancesConfig",
+  "description": "The harness's part of `config.json`. Keys it does not know are kept by\nwhoever rewrites the file, and ignored here.",
+  "type": "object",
+  "properties": {
+    "instances": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/InstanceKind"
+      },
+      "default": {}
+    },
+    "defaultModel": {
+      "description": "`<instance>/<model>`, or a bare model id on the default instance.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "$defs": {
+    "InstanceKind": {
+      "description": "What an instance is. Tagged by `kind`.",
+      "oneOf": [
+        {
+          "description": "The Anthropic Messages API with an API key.",
+          "type": "object",
+          "properties": {
+            "apiKeyEnv": {
+              "description": "The environment variable holding the key; `ANTHROPIC_API_KEY`\nwhen absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "baseUrl": {
+              "description": "Where the API is; `https://api.anthropic.com` when absent. A\nrouter speaking the same wire API goes here.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "thinking": {
+              "description": "`adaptive` (the default) or `off`. Off omits the parameter, for\nmodels that take no thinking configuration.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Thinking"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "maxTokens": {
+              "description": "The output cap per model call; 32000 when absent.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "anthropic-api"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "Thinking": {
+      "type": "string",
+      "enum": [
+        "adaptive",
+        "off"
+      ]
+    }
+  }
+}

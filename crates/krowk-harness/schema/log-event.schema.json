@@ -1,0 +1,461 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LogEvent",
+  "description": "One line of a session's log: typed, with a UUIDv7 `id`, and a `parentId`\nnaming the event before it on the same branch — so a fork or a rewind is\na second child of some earlier event, and the log is a tree (R-LOG-1).\nOnly the root, `session.started`, has no parent, and its id is the\nsession's id.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "parentId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sessionId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "timeMs": {
+      "description": "Milliseconds since the Unix epoch, UTC. Order is the parent chain,\nnever this.",
+      "type": "integer",
+      "format": "int64"
+    }
+  },
+  "required": [
+    "id",
+    "sessionId",
+    "timeMs"
+  ],
+  "oneOf": [
+    {
+      "description": "The root of every session.",
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "krowkVersion": {
+          "type": "string"
+        },
+        "protocolVersion": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "type": {
+          "type": "string",
+          "const": "session.started"
+        }
+      },
+      "required": [
+        "type",
+        "cwd",
+        "krowkVersion",
+        "protocolVersion"
+      ]
+    },
+    {
+      "description": "A prompt arrived; the turn runs on `model`. The exact system prompt\nand tools it ran with are in the session's `context.jsonl` under\nthis `turnId` (R-LOG-4).",
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelRef"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "wireApi": {
+          "$ref": "#/$defs/WireApi"
+        },
+        "permissionMode": {
+          "$ref": "#/$defs/PermissionMode"
+        },
+        "type": {
+          "type": "string",
+          "const": "turn.started"
+        }
+      },
+      "required": [
+        "type",
+        "turnId",
+        "model",
+        "provider",
+        "wireApi",
+        "permissionMode"
+      ]
+    },
+    {
+      "description": "One item, whole. `itemId` is the id its live frames carried.",
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "item": {
+          "$ref": "#/$defs/Item"
+        },
+        "type": {
+          "type": "string",
+          "const": "item.completed"
+        }
+      },
+      "required": [
+        "type",
+        "turnId",
+        "itemId",
+        "item"
+      ]
+    },
+    {
+      "description": "One model call finished: what it cost, and which items it produced,\nin order — the items that were one message on the provider's wire.",
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string"
+        },
+        "responseId": {
+          "description": "The provider's id for the response, e.g. Anthropic's `msg_…`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The model the provider says answered.",
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/Usage"
+        },
+        "stopReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "itemIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "type": {
+          "type": "string",
+          "const": "response.completed"
+        }
+      },
+      "required": [
+        "type",
+        "turnId",
+        "model",
+        "usage",
+        "itemIds"
+      ]
+    },
+    {
+      "description": "The turn is over.",
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/TurnStatus"
+        },
+        "usage": {
+          "description": "Every model call in the turn, summed.",
+          "$ref": "#/$defs/Usage"
+        },
+        "durationMs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "turn.completed"
+        }
+      },
+      "required": [
+        "type",
+        "turnId",
+        "status",
+        "usage",
+        "durationMs"
+      ]
+    }
+  ],
+  "$defs": {
+    "ModelRef": {
+      "description": "A model, named as the instance that serves it and the provider's own id\nfor it: `{\"instance\": \"anthropic\", \"model\": \"claude-opus-5\"}`.",
+      "type": "object",
+      "properties": {
+        "instance": {
+          "description": "A name from the instance registry, e.g. `anthropic` or `anthropic:work`.",
+          "type": "string"
+        },
+        "model": {
+          "description": "The provider's model id, e.g. `claude-opus-5`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instance",
+        "model"
+      ]
+    },
+    "WireApi": {
+      "description": "The wire API a provider speaks. An opaque blob is replayed only to the\nsame provider on the same wire API (R-LOG-3), so this travels with it.",
+      "type": "string",
+      "enum": [
+        "anthropic-messages"
+      ]
+    },
+    "PermissionMode": {
+      "description": "Claude-Code-compatible permission modes. Until the permission system\nlands, only `bypassPermissions` changes anything: it is the one mode in\nwhich `bash` runs.",
+      "type": "string",
+      "enum": [
+        "default",
+        "acceptEdits",
+        "plan",
+        "bypassPermissions"
+      ]
+    },
+    "Item": {
+      "description": "One thing inside a turn, provider-neutral. `reasoning` carries what can\nbe shown, and the provider's own state in `blob`.",
+      "oneOf": [
+        {
+          "description": "What the person asked.",
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "userText"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ]
+        },
+        {
+          "description": "What the model answered, as text.",
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "assistantText"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ]
+        },
+        {
+          "description": "The model's reasoning: its readable text (often a summary, or empty\nwhen the provider withholds it) and the blob that lets it be replayed.",
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "blob": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProviderBlob"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "reasoning"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ]
+        },
+        {
+          "description": "A tool the model asked krowk to run. `callId` is the provider's id,\nwhich the matching result repeats.",
+          "type": "object",
+          "properties": {
+            "callId": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "input": true,
+            "kind": {
+              "type": "string",
+              "const": "toolCall"
+            }
+          },
+          "required": [
+            "kind",
+            "callId",
+            "name",
+            "input"
+          ]
+        },
+        {
+          "description": "What running it produced. A refusal or a failure is a result too,\nwith `isError`, so the model can read why.",
+          "type": "object",
+          "properties": {
+            "callId": {
+              "type": "string"
+            },
+            "output": {
+              "type": "string"
+            },
+            "isError": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "toolResult"
+            }
+          },
+          "required": [
+            "kind",
+            "callId",
+            "output",
+            "isError"
+          ]
+        }
+      ]
+    },
+    "ProviderBlob": {
+      "description": "State a provider needs back verbatim and nobody else may read: a thinking\nsignature, redacted thinking, encrypted reasoning. Stored as the provider\nsent it and replayed unmodified, only to the provider and wire API named\nhere; anywhere else it is dropped and the item's neutral text stands in.",
+      "type": "object",
+      "properties": {
+        "provider": {
+          "description": "The provider that produced it, e.g. `anthropic`.",
+          "type": "string"
+        },
+        "wireApi": {
+          "$ref": "#/$defs/WireApi"
+        },
+        "data": {
+          "description": "Opaque to everything but that provider's client."
+        }
+      },
+      "required": [
+        "provider",
+        "wireApi",
+        "data"
+      ]
+    },
+    "Usage": {
+      "description": "Tokens, split the five ways they are priced. `outputTokens` excludes\n`reasoningTokens` when the provider reports the split; a provider that\ndoes not counts reasoning inside output.",
+      "type": "object",
+      "properties": {
+        "inputTokens": {
+          "description": "Input read at the full rate: what came after the last cache hit.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "outputTokens": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "cacheReadTokens": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "cacheWriteTokens": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "reasoningTokens": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+        "reasoningTokens"
+      ]
+    },
+    "TurnStatus": {
+      "description": "How a turn ended.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "completed"
+          ]
+        },
+        {
+          "description": "Stopped by an `interrupt`: what arrived before it is kept.",
+          "type": "string",
+          "const": "interrupted"
+        },
+        {
+          "description": "The engine could not finish: `error` says why.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    },
+    "ErrorInfo": {
+      "description": "Why something failed, as a code a script branches on and a sentence that\nnames the next action.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "httpStatus": {
+          "description": "The HTTP status the provider answered with, when the failure was an\nanswer.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    }
+  }
+}

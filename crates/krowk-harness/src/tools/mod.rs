@@ -1093,7 +1093,8 @@ mod tests {
         assert!(err && out.contains("publish is not available"), "a host with no publisher says so: {out}");
         for mode in [PermissionMode::Default, PermissionMode::Plan] {
             let (out, err) = run(crate::evidence::PUBLISH, &json!({"files": ["a.txt"]}), &ToolEnv { permission_mode: mode, ..env }).await;
-            assert!(err && out.contains("--permission-mode acceptEdits"), "{mode:?}: publish is held to what an edit is: {out}");
+            let why = if mode == PermissionMode::Plan { "plan mode" } else { "--permission-mode acceptEdits" };
+            assert!(err && out.contains(why), "{mode:?}: publish is held to what an edit is: {out}");
         }
         let _ = std::fs::remove_dir_all(d);
     }

@@ -109,8 +109,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   commands and patches are judged by the same rules. **A repository's own
   allow rules, extra directories, `defaultMode` and hooks count only once
   you trust it** (the same trust list and `--trust` as a backend's); its
-  deny and ask rules always count. A settings file that does not parse
-  stops the prompt and names the file.
+  deny and ask rules always count. `publish` is judged by the same rules:
+  it runs where an edit does, and a file a `Read` deny rule covers is never
+  uploaded. A settings file that does not parse stops the prompt and names
+  the file.
 - **The TUI asks before a call its rules do not allow.** A command, an
   edit in the default mode, or anything reaching outside the working
   directory shows over the prompt with why it is asked: `y` allows it once,

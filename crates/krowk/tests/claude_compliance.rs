@@ -74,6 +74,12 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         if matches!(name.to_str(), Some("target" | ".git" | "node_modules" | "dist" | "bin")) {
             continue;
         }
+        // The schema of `codex app-server`, pinned byte for byte from Codex
+        // (scripts/codex_schema.sh): Codex's own words for its own options,
+        // one of them a login store krowk never uses — not krowk's source.
+        if name == "codex" && dir.file_name().is_some_and(|d| d == "schema") {
+            continue;
+        }
         if p.is_dir() {
             walk(&p, out);
         } else if matches!(p.extension().and_then(|x| x.to_str()), Some("rs" | "sh" | "toml" | "js" | "mjs" | "py" | "json" | "jsonl" | "md")) || name == "fake-claude" {

@@ -22,10 +22,15 @@ fn r_proto_2_the_checked_in_schema_is_generated_from_the_types_and_current() {
             stale.push(name);
         }
     }
-    // No file in the directory that the generator does not write.
+    // No file in the directory that the generator does not write — save
+    // `codex/`, the schema of the protocol krowk speaks to Codex, which is
+    // Codex's own, pinned by scripts/codex_schema.sh.
     let generated: Vec<&str> = krowk_harness::schema::files().iter().map(|(n, _)| *n).collect();
     for entry in std::fs::read_dir(dir()).unwrap() {
         let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if name == "codex" {
+            continue;
+        }
         assert!(generated.contains(&name.as_str()), "schema/{name} is not generated from any type — remove it");
     }
     assert!(stale.is_empty(), "schema/{stale:?} no longer match the Rust types — run `make schema` and commit the result");

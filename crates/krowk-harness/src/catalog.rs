@@ -105,6 +105,12 @@ pub fn wire_of(npm: Option<&str>, shape: Option<&str>) -> Option<WireApi> {
 /// the same id under any provider, so a router serving `gpt-5` finds
 /// OpenAI's entry. Every field but the few above is skipped unread: the
 /// file is megabytes.
+///
+/// The wire API is only ever the instance's own provider's word. How some
+/// reseller serves the same id says nothing of how this instance's server
+/// does — `openai/gpt-4o-mini` is on the Responses API at one gateway and on
+/// Chat Completions at the next — so a borrowed entry lends its family,
+/// limits and efforts, and no wire API.
 pub fn lookup(raw: &[u8], provider: &str, model: &str) -> Option<ModelInfo> {
     let top: HashMap<String, &RawValue> = serde_json::from_slice(raw).ok()?;
     let of = |p: &RawValue| -> Option<ModelInfo> {
@@ -136,7 +142,7 @@ pub fn lookup(raw: &[u8], provider: &str, model: &str) -> Option<ModelInfo> {
     // on hash order.
     let mut names: Vec<&String> = top.keys().collect();
     names.sort();
-    names.into_iter().find_map(|n| of(top[n]))
+    names.into_iter().find_map(|n| of(top[n])).map(|info| ModelInfo { wire_api: None, ..info })
 }
 
 #[cfg(test)]
@@ -176,8 +182,12 @@ mod tests {
         assert_eq!(lookup(DOC, "neon", "gpt-5-4-mini").unwrap().wire_api, Some(WireApi::OpenaiResponses));
         assert_eq!(lookup(DOC, "router", "house").unwrap().family, None, "an empty family is none");
         assert_eq!(lookup(DOC, "google", "gemini-3").unwrap().wire_api, None, "a wire API krowk does not speak");
-        // The same id under any provider, when its own does not list it.
-        assert_eq!(lookup(DOC, "openrouter", "grok-4.7").unwrap().family.as_deref(), Some("grok"));
+        // The same id under any provider, when its own does not list it —
+        // its family and efforts, never its wire API.
+        let borrowed = lookup(DOC, "openrouter", "grok-4.7").unwrap();
+        assert_eq!((borrowed.family.as_deref(), borrowed.efforts.len(), borrowed.wire_api), (Some("grok"), 4, None));
+        let reseller = lookup(DOC, "some-gateway", "gpt-5-4-mini").unwrap();
+        assert_eq!((reseller.family.as_deref(), reseller.wire_api), (Some("gpt-mini"), None), "neon's Responses shape is neon's, not this gateway's");
         assert_eq!(lookup(DOC, "openai", "nope"), None);
         assert_eq!(lookup(b"not json", "openai", "gpt-5.4"), None);
         assert_eq!(wire_of(Some("@ai-sdk/google-vertex/anthropic"), None), Some(WireApi::AnthropicMessages));

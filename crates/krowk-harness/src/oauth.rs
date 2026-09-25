@@ -45,6 +45,13 @@ pub const CREDENTIALS_FILE: &str = "providers/credentials.json";
 const EXPIRY_MARGIN_MS: i64 = 60_000;
 /// How long a login waits for the browser, or the device code, at most.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(600);
+/// A request to the authorization server — metadata, a token — answers
+/// within this or fails: the client's own read timeout is the five minutes
+/// a model stream may sit silent, far too long for a token.
+const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a refresh waits for another krowk's refresh to finish.
+const LOCK_WAIT: Duration = Duration::from_secs(45);
+const LOCK_POLL: Duration = Duration::from_millis(50);
 
 fn fail(message: impl Into<String>) -> EngineError {
     EngineError::new("oauth_failed", message)
@@ -128,15 +135,25 @@ impl Store {
         Ok(self.read()?.instances.remove(instance))
     }
 
+    /// Stores a login, under the store's lock: a login and a refresh in
+    /// another krowk never interleave their read and their write.
     pub fn save(&self, instance: &str, stored: &Stored) -> Result<(), EngineError> {
+        let _lock = self.lock_blocking()?;
+        self.save_locked(instance, stored)
+    }
+
+    /// `save`, for a caller already holding the lock.
+    fn save_locked(&self, instance: &str, stored: &Stored) -> Result<(), EngineError> {
         let mut f = self.read()?;
         f.version = 1;
         f.instances.insert(instance.into(), stored.clone());
         self.write(&f)
     }
 
-    /// Forgets an instance's login. Whether there was one.
+    /// Forgets an instance's login, under the store's lock. Whether there
+    /// was one.
     pub fn remove(&self, instance: &str) -> Result<bool, EngineError> {
+        let _lock = self.lock_blocking()?;
         let mut f = self.read()?;
         let had = f.instances.remove(instance).is_some();
         if had {
@@ -173,9 +190,10 @@ impl Store {
         result.map_err(io)
     }
 
-    /// Holds the store's lock until dropped: one refresh at a time across
-    /// every krowk on the host.
-    fn lock(&self) -> Result<Lock, EngineError> {
+    /// The store's lock, if nobody holds it: one writer at a time across
+    /// every krowk on the host. Never blocks — the async side polls it, so a
+    /// runtime waiting on another krowk's refresh still hears Ctrl-C.
+    fn try_lock(&self) -> Result<Option<Lock>, EngineError> {
         let dir = self.path.parent().unwrap_or(Path::new("."));
         private_dir(dir).map_err(|e| fail(format!("{} could not be created: {e}", dir.display())))?;
         let path = self.path.with_extension("lock");
@@ -189,11 +207,47 @@ impl Store {
             use std::os::fd::AsRawFd;
             // SAFETY: flock on a descriptor this function owns; released
             // when the file is closed.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(fail(format!("{} could not be locked: {}", path.display(), std::io::Error::last_os_error())));
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
+                return Err(fail(format!("{} could not be locked: {e}", path.display())));
             }
         }
-        Ok(Lock { _file: file })
+        Ok(Some(Lock { _file: file }))
+    }
+
+    fn busy(&self) -> EngineError {
+        fail(format!("another krowk held {} for {} seconds — run the command again", self.path.display(), LOCK_WAIT.as_secs()))
+    }
+
+    /// The lock, waited for — from blocking code: a login or a remove.
+    fn lock_blocking(&self) -> Result<Lock, EngineError> {
+        let until = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            if let Some(l) = self.try_lock()? {
+                return Ok(l);
+            }
+            if std::time::Instant::now() > until {
+                return Err(self.busy());
+            }
+            std::thread::sleep(LOCK_POLL);
+        }
+    }
+
+    /// The lock, waited for on the runtime without blocking it.
+    async fn lock_async(&self) -> Result<Lock, EngineError> {
+        let until = tokio::time::Instant::now() + LOCK_WAIT;
+        loop {
+            if let Some(l) = self.try_lock()? {
+                return Ok(l);
+            }
+            if tokio::time::Instant::now() > until {
+                return Err(self.busy());
+            }
+            tokio::time::sleep(LOCK_POLL).await;
+        }
     }
 }
 
@@ -263,7 +317,7 @@ fn trusted(url: &str) -> Result<url::Url, EngineError> {
 }
 
 async fn get_json(http: &reqwest::Client, url: &str) -> Result<Option<Value>, EngineError> {
-    let r = http.get(url).header("accept", "application/json").send().await.map_err(|e| fail(format!("{url} could not be reached: {e}")))?;
+    let r = http.get(url).header("accept", "application/json").timeout(AUTH_REQUEST_TIMEOUT).send().await.map_err(|e| fail(format!("{url} could not be reached: {e}")))?;
     if !r.status().is_success() {
         return Ok(None);
     }
@@ -283,6 +337,13 @@ pub async fn discover(http: &reqwest::Client, issuer: &str) -> Result<Endpoints,
     }
     let meta = meta.ok_or_else(|| fail(format!("{issuer} publishes no OAuth metadata (/.well-known/oauth-authorization-server or /.well-known/openid-configuration) — check the instance's issuer")))?;
     let s = |k: &str| meta.get(k).and_then(Value::as_str).map(String::from);
+    // RFC 8414 §3.3: the metadata must name the issuer it was fetched for,
+    // or it is someone else's, and its endpoints are not to be trusted
+    // with a login.
+    let named = s("issuer").unwrap_or_default();
+    if named.trim_end_matches('/') != issuer {
+        return Err(fail(format!("{issuer}'s metadata names the issuer {named:?}, not itself — refusing to sign in against it; check the instance's issuer")));
+    }
     let token = s("token_endpoint").ok_or_else(|| fail(format!("{issuer}'s metadata names no token endpoint")))?;
     trusted(&token)?;
     let e = Endpoints { issuer: issuer.into(), authorization: s("authorization_endpoint"), token, device_authorization: s("device_authorization_endpoint"), registration: s("registration_endpoint") };
@@ -304,6 +365,7 @@ async fn post_form(http: &reqwest::Client, url: &str, form: &[(&str, &str)]) -> 
         .post(url)
         .header("content-type", "application/x-www-form-urlencoded")
         .header("accept", "application/json")
+        .timeout(AUTH_REQUEST_TIMEOUT)
         .body(body)
         .send()
         .await
@@ -567,7 +629,7 @@ impl Tokens {
         if !refused && cur.fresh(now_ms()) {
             return Ok(cur.access_token.clone());
         }
-        let _lock = self.store.lock()?;
+        let _lock = self.store.lock_async().await?;
         // Another krowk may have refreshed while this one waited: its token
         // is the one to use, and its refresh token the only live one.
         if let Some(disk) = self.store.load(&self.instance)?
@@ -586,9 +648,10 @@ impl Tokens {
             return Err(self.sign_in_again(&format!("xAI refused to refresh it (HTTP {status} {err})")).with_status(if status == 400 { 401 } else { status }));
         }
         let e = Endpoints { issuer: cur.issuer.clone(), token: cur.token_endpoint.clone(), ..Endpoints::default() };
-        let next = stored_from(&v, &e, &cur.client_id, &cur.scope, Some(refresh))?;
-        self.store.save(&self.instance, &next)?;
-        *cur = next;
+        // Memory first: the old refresh token is spent now, and a save that
+        // fails must not leave this session holding it.
+        *cur = stored_from(&v, &e, &cur.client_id, &cur.scope, Some(refresh))?;
+        self.store.save_locked(&self.instance, &cur)?;
         Ok(cur.access_token.clone())
     }
 

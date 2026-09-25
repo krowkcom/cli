@@ -124,3 +124,30 @@ fn r_prov_3_the_history_renders_as_one_prefix_and_every_call_is_answered() {
     // OpenAI's Chat Completions takes the session as prompt_cache_key.
     assert_eq!(request_body(&req(&items), "openai")["prompt_cache_key"], "sess-1");
 }
+
+#[test]
+fn r_prov_1_a_reused_tool_call_index_with_a_new_id_is_a_new_call() {
+    // Some servers stream every call at index 0, one after another, and some
+    // send a call's name only after its id.
+    let chunk = |tc: serde_json::Value| format!("data: {}\n\n", json!({"id": "c", "model": "m", "choices": [{"index": 0, "delta": {"tool_calls": [tc]}, "finish_reason": null}]}));
+    let raw = [
+        chunk(json!({"index": 0, "id": "call_a", "type": "function", "function": {"name": "read", "arguments": "{\"path\":"}})),
+        chunk(json!({"index": 0, "function": {"arguments": "\"a.txt\"}"}})),
+        chunk(json!({"index": 0, "id": "call_b", "type": "function", "function": {"arguments": ""}})),
+        chunk(json!({"index": 0, "function": {"name": "glob", "arguments": "{\"pattern\":\"*.rs\"}"}})),
+        "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+    let mut d = Decoder::new("xai");
+    for ev in SseParser::default().push(raw.as_bytes()) {
+        d.apply(&ev).unwrap();
+    }
+    let calls: Vec<&Item> = d.items.iter().map(|(_, i)| i).collect();
+    assert_eq!(
+        calls,
+        [
+            &Item::ToolCall { call_id: "call_a".into(), name: "read".into(), input: json!({"path": "a.txt"}) },
+            &Item::ToolCall { call_id: "call_b".into(), name: "glob".into(), input: json!({"pattern": "*.rs"}) },
+        ]
+    );
+}

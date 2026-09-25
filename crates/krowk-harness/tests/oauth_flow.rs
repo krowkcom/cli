@@ -142,3 +142,51 @@ async fn r_prov_4_an_expired_token_is_refreshed_once_across_processes_and_rotati
     assert!(Tokens::open(store.clone(), "grok:team").unwrap_err().message.contains("krowk providers add supergrok --name grok:team"));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Two krowk processes whose token expired at once: their refreshes contend
+/// for the store's lock, the loser waits (on its runtime, never blocking it)
+/// and then uses the winner's token — exactly one refresh, so neither spends
+/// a refresh token the other already rotated away.
+#[test]
+fn r_prov_4_two_processes_refreshing_at_once_make_exactly_one_refresh() {
+    let auth = providers::auth_server(3600);
+    auth.state.lock().unwrap().refresh_delay_ms = 400;
+    let d = dir("race");
+    let store = Store::new(d.join(oauth::CREDENTIALS_FILE));
+    let rt = || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let http = krowk_harness::http::client().unwrap();
+    let mut first = rt().block_on(oauth::login_device(&http, &login(&auth.mock.url), &mut |_| {})).unwrap();
+    first.expires_at_ms = Some(0);
+    store.save("supergrok", &first).unwrap();
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let racers: Vec<_> = (0..2)
+        .map(|_| {
+            let (store, start) = (store.clone(), start.clone());
+            std::thread::spawn(move || {
+                let tokens = Tokens::open(store, "supergrok").unwrap();
+                let http = krowk_harness::http::client().unwrap();
+                start.wait();
+                rt().block_on(tokens.bearer(&http, false)).unwrap()
+            })
+        })
+        .collect();
+    let got: Vec<String> = racers.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(got, ["xai-at-2", "xai-at-2"], "the loser used the winner's token");
+    assert_eq!(auth.state.lock().unwrap().refreshes, 1, "exactly one refresh");
+    assert_eq!(store.load("supergrok").unwrap().unwrap().refresh_token.as_deref(), Some("xai-rt-2"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[tokio::test]
+async fn r_prov_4_metadata_naming_another_issuer_is_refused() {
+    let auth = providers::auth_server(3600);
+    auth.state.lock().unwrap().issuer_override = Some("https://evil.example".into());
+    let http = krowk_harness::http::client().unwrap();
+    let e = oauth::discover(&http, &auth.mock.url).await.unwrap_err();
+    assert!(e.message.contains("names the issuer \"https://evil.example\""), "{}", e.message);
+    // The configured issuer with a trailing slash, or metadata naming it
+    // with one, is the same issuer.
+    auth.state.lock().unwrap().issuer_override = Some(format!("{}/", auth.mock.url));
+    assert!(oauth::discover(&http, &format!("{}/", auth.mock.url)).await.is_ok());
+    assert!(auth.mock.seen.lock().unwrap().iter().all(|s| s.path.starts_with("/.well-known/")), "nothing but metadata was asked of it");
+}

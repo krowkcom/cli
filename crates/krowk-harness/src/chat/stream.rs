@@ -11,9 +11,10 @@ use crate::native::ModelResponse;
 use crate::protocol::{Delta, Item, ItemKind, ProviderBlob, Usage, WireApi};
 use crate::sse::SseEvent;
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
 
 struct Call {
+    /// The `tool_calls` index it streams under.
+    index: u64,
     id: String,
     call_id: String,
     name: String,
@@ -27,7 +28,10 @@ pub struct Decoder {
     /// The vendor's reasoning fields, under its own names, as they grew.
     vendor: Map<String, Value>,
     text: Option<(String, String)>,
-    calls: BTreeMap<u64, Call>,
+    /// In the order the model made them. An index names the call being
+    /// streamed, not one call forever: a server may reuse index 0 for each
+    /// call in turn, and a new `id` there is a new call.
+    calls: Vec<Call>,
     pub items: Vec<(String, Item)>,
     pub response_id: Option<String>,
     pub model: String,
@@ -73,7 +77,7 @@ impl Decoder {
             reasoning: None,
             vendor: Map::new(),
             text: None,
-            calls: BTreeMap::new(),
+            calls: Vec::new(),
             items: Vec::new(),
             response_id: None,
             model: String::new(),
@@ -175,12 +179,25 @@ impl Decoder {
         }
         for tc in d.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
             let index = tc.get("index").and_then(Value::as_u64).unwrap_or(self.calls.len() as u64);
-            let call = self.calls.entry(index).or_insert_with(|| {
-                let (call_id, name) = (str_of(tc, "id").to_string(), tc.pointer("/function/name").and_then(Value::as_str).unwrap_or_default().to_string());
-                let id = krowk_store::new_id();
-                out.push(EngineEvent::ItemStarted { item_id: id.clone(), kind: ItemKind::ToolCall { call_id: call_id.clone(), name: name.clone() } });
-                Call { id, call_id, name, args: String::new() }
-            });
+            let (call_id, name) = (str_of(tc, "id"), tc.pointer("/function/name").and_then(Value::as_str).unwrap_or_default());
+            let current = self.calls.iter().rposition(|c| c.index == index).filter(|&at| call_id.is_empty() || self.calls[at].call_id.is_empty() || self.calls[at].call_id == call_id);
+            let at = match current {
+                Some(at) => at,
+                None => {
+                    let id = krowk_store::new_id();
+                    out.push(EngineEvent::ItemStarted { item_id: id.clone(), kind: ItemKind::ToolCall { call_id: call_id.into(), name: name.into() } });
+                    self.calls.push(Call { index, id, call_id: call_id.into(), name: name.into(), args: String::new() });
+                    self.calls.len() - 1
+                }
+            };
+            let call = &mut self.calls[at];
+            // An id or a name that arrives after the call's first fragment.
+            if call.call_id.is_empty() {
+                call.call_id = call_id.into();
+            }
+            if call.name.is_empty() {
+                call.name = name.into();
+            }
             if let Some(a) = tc.pointer("/function/arguments").and_then(Value::as_str).filter(|a| !a.is_empty()) {
                 call.args.push_str(a);
                 out.push(EngineEvent::ItemDelta { item_id: call.id.clone(), delta: Delta::ToolInput { partial_json: a.into() } });
@@ -211,7 +228,7 @@ impl Decoder {
         if let Some((id, text)) = self.text.take() {
             self.push(&mut out, id, Item::AssistantText { text });
         }
-        for (_, c) in std::mem::take(&mut self.calls) {
+        for c in std::mem::take(&mut self.calls) {
             let input = if c.args.trim().is_empty() {
                 json!({})
             } else {

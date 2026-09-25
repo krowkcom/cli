@@ -70,6 +70,10 @@ pub struct AuthState {
     pub codes: HashMap<String, (String, String)>,
     /// Offer dynamic registration in the metadata.
     pub registration: bool,
+    /// The issuer the metadata names, when not the server's own URL.
+    pub issuer_override: Option<String>,
+    /// How long a refresh takes to answer, so two can overlap.
+    pub refresh_delay_ms: u64,
 }
 
 pub struct AuthServer {
@@ -129,6 +133,10 @@ pub fn auth_server(expires_in: i64) -> AuthServer {
     let base = url.clone();
     let m = mock::serve_seen(move |seen: &Seen, _| {
         let issuer = base.lock().unwrap().clone();
+        let delay = st.lock().unwrap().refresh_delay_ms;
+        if delay > 0 && seen.raw.contains("grant_type=refresh_token") {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
         let mut s = st.lock().unwrap();
         let (path, query) = seen.path.split_once('?').unwrap_or((&seen.path, ""));
         let f = form(if seen.method == "GET" { query } else { &seen.raw });
@@ -136,7 +144,7 @@ pub fn auth_server(expires_in: i64) -> AuthServer {
         match (seen.method.as_str(), path) {
             ("GET", "/.well-known/oauth-authorization-server") => {
                 let mut meta = json!({
-                    "issuer": issuer,
+                    "issuer": s.issuer_override.clone().unwrap_or_else(|| issuer.clone()),
                     "authorization_endpoint": format!("{issuer}/oauth2/auth"),
                     "token_endpoint": format!("{issuer}/oauth2/token"),
                     "device_authorization_endpoint": format!("{issuer}/oauth2/device/code"),

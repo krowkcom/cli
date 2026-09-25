@@ -317,8 +317,7 @@ impl Registry {
             (false, Some("grok")) => "xai",
             _ => DEFAULT_INSTANCE,
         };
-        let instance = if self.instances.contains_key(by_family) { by_family } else { DEFAULT_INSTANCE };
-        Ok(ModelRef { instance: instance.into(), model: s.into() })
+        Ok(ModelRef { instance: by_family.into(), model: s.into() })
     }
 
     /// The configured default, else krowk's.
@@ -413,12 +412,15 @@ fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) ->
             let (api_key, key_env) = if keyed { api(api_key_env, "") } else { (String::new(), String::new()) };
             let provider = provider.clone().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "openai-compatible".into());
             let wire = wire_api.filter(|w| RESPONSES_OR_CHAT.contains(w));
+            // A server krowk knows nothing of speaks Chat Completions unless
+            // its definition says otherwise: the catalog describes providers,
+            // not this server.
             Resolved {
                 base_url: clean_url(base_url),
                 api_key,
                 api_key_env: key_env,
                 auth: if keyed { Auth::ApiKey } else { Auth::Keyless },
-                wire_pinned: wire.is_some(),
+                wire_pinned: true,
                 ..template(&provider, "the server", wire.unwrap_or(WireApi::ChatCompletions), RESPONSES_OR_CHAT, *effort)
             }
         }
@@ -528,6 +530,11 @@ mod tests {
         assert_eq!(o.wire_for(None), WireApi::OpenaiResponses);
         assert_eq!(x.wire_for(Some(WireApi::OpenaiResponses)), WireApi::ChatCompletions);
         assert_eq!(reg.get("pinned").unwrap().wire_for(Some(WireApi::OpenaiResponses)), WireApi::ChatCompletions);
+        // A compatible server is Chat Completions whatever a catalog entry
+        // says, unless its definition names the Responses API.
+        assert_eq!(reg.get("vivgrid").unwrap().wire_for(Some(WireApi::OpenaiResponses)), WireApi::ChatCompletions);
+        let responses = Registry::resolve(&from_config_json(&serde_json::json!({"instances": {"r": {"kind": "openai-compatible", "baseUrl": "http://x/v1", "wireApi": "openai-responses"}}})).unwrap(), &env);
+        assert_eq!(responses.get("r").unwrap().wire_for(Some(WireApi::ChatCompletions)), WireApi::OpenaiResponses);
         // Models: an instance by name, a bare id by its family.
         assert_eq!(reg.parse_model("openai/gpt-5.4").unwrap(), ModelRef { instance: "openai".into(), model: "gpt-5.4".into() });
         assert_eq!(reg.parse_model("openrouter/x-ai/grok-4").unwrap(), ModelRef { instance: "openrouter".into(), model: "x-ai/grok-4".into() });

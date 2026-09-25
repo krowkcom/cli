@@ -89,6 +89,10 @@ struct Backend {
 /// again on the vendor's resume.
 pub const BACKEND_IDLE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// How long letting go of one backend may take: its own polite stop (stdin
+/// closed, five seconds, then its group stopped) and a margin.
+pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn log_failure(e: LogError) -> EngineError {
     match e {
         LogError::NotFound(m) => EngineError::new("no_session", m),
@@ -126,10 +130,18 @@ impl Host {
     /// Lets every backend process go cleanly. A host dropped without this
     /// still stops them (they are killed with their handles), just less
     /// politely.
+    ///
+    /// Bounded: an engine that cannot be let go of in `SHUTDOWN_GRACE` — its
+    /// lock held by a turn nobody polls any more — has its process group
+    /// killed instead, so a host going away never waits on one.
     pub async fn shutdown(&self) {
         let engines: Vec<Arc<dyn Engine>> = self.backends.lock().unwrap_or_else(|e| e.into_inner()).drain().map(|(_, b)| b.engine).collect();
+        let mut stuck = false;
         for e in engines {
-            e.shutdown().await;
+            stuck |= tokio::time::timeout(SHUTDOWN_GRACE, e.shutdown()).await.is_err();
+        }
+        if stuck {
+            crate::group::kill_all();
         }
     }
 

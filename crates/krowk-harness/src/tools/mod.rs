@@ -324,8 +324,15 @@ impl Scope {
             };
             return Err(format!("{} is inside a {dir} directory, which the file tools do not change: {runs}, or ask the person to rerun with `--permission-mode bypassPermissions`", p.display()));
         }
+        // Judged as spelled and as it leads, against the directory as named
+        // and as it leads: a home reached through a symlink, or a link inside
+        // the working directory that points into the home, is caught either way.
         let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
-        if let Some(d) = self.protected.iter().find(|d| lower(&real).starts_with(lower(&d.canonicalize().unwrap_or_else(|_| d.to_path_buf())))) {
+        let within = |q: &Path, d: &Path| {
+            let q = lower(q);
+            q.starts_with(lower(d)) || q.starts_with(lower(&d.canonicalize().unwrap_or_else(|_| d.to_path_buf())))
+        };
+        if let Some(d) = self.protected.iter().find(|d| within(&real, d) || within(&p, d)) {
             return Err(format!(
                 "{} is inside {}, the backend's own config directory for this session, which the file tools do not change: the vendor runs what its settings and hooks there name — ask the person to rerun with `--permission-mode bypassPermissions`",
                 p.display(),
@@ -907,6 +914,15 @@ mod tests {
         assert!(scope.edit_path("codex-home/config.toml").unwrap_err().contains("config directory"));
         assert!(scope.edit_path(&home.join("sub/x").display().to_string()).is_err());
         assert!(scope.edit_path("codex-homework.txt").is_ok(), "a sibling that shares the prefix is not inside it");
+        // Named through a link, and spelled as the link: both are the home.
+        #[cfg(unix)]
+        {
+            let alias = d.join("home-alias");
+            std::os::unix::fs::symlink(&home, &alias).unwrap();
+            let via_alias = Scope { cwd: d.clone(), bypass: false, protected: vec![alias.clone()] };
+            assert!(via_alias.edit_path("codex-home/config.toml").is_err(), "the home as it leads");
+            assert!(via_alias.edit_path("home-alias/config.toml").is_err(), "the home as spelled");
+        }
         assert!(Scope { bypass: true, ..scope }.edit_path("codex-home/config.toml").is_ok());
         let bypass = ToolEnv { permission_mode: PermissionMode::BypassPermissions, ..env };
         assert!(!run(WRITE, &json!({"path": ".codex/config.toml", "content": "x"}), &bypass).await.1);

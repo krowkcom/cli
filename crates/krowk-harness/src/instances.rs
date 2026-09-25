@@ -303,6 +303,10 @@ pub struct Backend {
     /// The key read from `apiKeyEnv`, and the variable the process is
     /// given it as. None when the instance uses the vendor's own login.
     pub key: Option<(String, String)>,
+    /// Another directory whose config the vendor reads for this instance,
+    /// and no edit may reach: for a Codex account, the person's own Codex
+    /// home, whose configuration the account's home links in.
+    pub shared_home: Option<PathBuf>,
 }
 
 // Hand-written so a key never reaches a log line through `{:?}`.
@@ -613,6 +617,7 @@ fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) ->
                     env: extra.clone(),
                     args: args.clone(),
                     key: key_env.map(|_| (to.to_string(), key)),
+                    shared_home: None,
                 }),
                 ..template("anthropic", "Claude Code", WireApi::ClaudeCode, CLAUDE_CODE, *effort)
             }
@@ -623,10 +628,14 @@ fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) ->
             let config_dir = codex_home.as_deref().filter(|d| !d.trim().is_empty()).map(PathBuf::from);
             // Codex's own rule for its home: CODEX_HOME — the instance's
             // `codexHome`, else the environment's — else ~/.codex.
-            let home = config_dir.clone().or_else(|| Some(env("CODEX_HOME")).filter(|d| !d.trim().is_empty()).map(PathBuf::from)).or_else(|| {
+            let own = Some(env("CODEX_HOME")).filter(|d| !d.trim().is_empty()).map(PathBuf::from).or_else(|| {
                 let h = env("HOME");
                 (!h.trim().is_empty()).then(|| PathBuf::from(h).join(".codex"))
             });
+            let home = config_dir.clone().or_else(|| own.clone());
+            // The person's own home, which an account's links point into:
+            // an edit there is an edit of every account.
+            let shared_home = own.filter(|o| Some(o) != home.as_ref());
             let binary = binary.clone().filter(|b| !b.trim().is_empty()).unwrap_or_else(|| crate::codex::BINARY.into());
             // A keyed instance — a router — names the variable its key is
             // in; the key goes to the process under that same name, which
@@ -645,6 +654,7 @@ fn resolve_one(name: &str, kind: &InstanceKind, env: &dyn Fn(&str) -> String) ->
                     env: extra.clone(),
                     args: args.clone(),
                     key: key_env.map(|k| (k, key)),
+                    shared_home,
                 }),
                 ..template("openai", "Codex", WireApi::CodexAppServer, CODEX_APP_SERVER, *effort)
             }
@@ -846,6 +856,8 @@ mod tests {
         let (t, p) = (reg.get("codex:team").unwrap().backend.clone().unwrap(), reg.get("codex:personal").unwrap().backend.clone().unwrap());
         assert_eq!((t.config_dir.as_deref(), t.home.as_deref()), (Some(std::path::Path::new("/data/codex-team")), Some(std::path::Path::new("/data/codex-team"))));
         assert_ne!(t.home, p.home, "two accounts, two homes");
+        assert_eq!(t.shared_home.as_deref(), Some(std::path::Path::new("/home/p/.codex")), "the person's own home is the account's to protect too");
+        assert_eq!(b.shared_home, None, "the default instance's home is the person's own");
         assert_eq!(p.binary, "/opt/codex/bin/codex");
         let r = reg.get("codex:router").unwrap().backend.clone().unwrap();
         assert_eq!((r.args.join(" "), r.env["RUST_LOG"].as_str()), ("-c model_provider=openrouter".to_string(), "warn"), "a router is the same mechanism");

@@ -178,9 +178,19 @@ async fn session(opts: Options) -> Outcome {
     let host = Host::new(opts.host);
     let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, effort: opts.effort, target, keys: None, turn: None, rx: None, abandoned: false };
     let result = ui.run(&mut app, &mut term).await;
-    // A backend's process (Claude Code) is let go cleanly, and whatever it
-    // started with it, before the terminal is handed back.
-    host.shutdown().await;
+    // A turn still running is let go first: its future holds its backend's
+    // lock, and would hold a shutdown waiting on it forever.
+    ui.turn = None;
+    ui.rx = None;
+    // A backend's process (Claude Code, Codex) is let go cleanly, and
+    // whatever it started with it, before the terminal is handed back —
+    // unless the person left without waiting (a second Ctrl-C, SIGTERM),
+    // when every backend's process group is killed at once instead.
+    if ui.abandoned {
+        krowk_harness::group::kill_all();
+    } else {
+        host.shutdown().await;
+    }
     let _ = term.finish();
     let mut out = term.into_inner();
     if let Some(id) = &app.session_id {

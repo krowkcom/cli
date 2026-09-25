@@ -1,0 +1,5 @@
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg-h1","text":""},"threadId":"{{THREAD}}","turnId":"{{TURN}}","startedAtMs":1}}
+{"method":"item/agentMessage/delta","params":{"itemId":"msg-h1","delta":"Working on it","threadId":"{{THREAD}}","turnId":"{{TURN}}"}}
+@grandchild
+@sleep 60
+{"method":"turn/completed","params":{"threadId":"{{THREAD}}","turn":{"id":"{{TURN}}","items":[],"status":"completed","error":null}}}

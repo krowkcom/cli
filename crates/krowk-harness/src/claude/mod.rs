@@ -456,6 +456,7 @@ impl Drop for Proc {
         if !self.group_done {
             #[cfg(unix)]
             signal_group(self.pid, libc::SIGKILL);
+            crate::group::release(self.pid);
         }
     }
 }
@@ -502,6 +503,7 @@ impl Proc {
             }
         })?;
         let pid = child.id();
+        crate::group::register(pid);
         let stdin = child.stdin.take();
         let out = BufReader::new(child.stdout.take().expect("piped")).lines();
         let stderr = Arc::new(Mutex::new(String::new()));
@@ -760,6 +762,7 @@ impl Proc {
         }
         let _ = self.child.kill().await;
         self.group_done = true;
+        crate::group::release(self.pid);
     }
 
     async fn kill(mut self) {

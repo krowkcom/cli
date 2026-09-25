@@ -61,7 +61,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use stream::Translator;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
 /// The binary a `codex-app-server` instance runs when its definition names none.
@@ -93,11 +93,42 @@ const STDERR_TAIL: usize = 4096;
 pub const SYSTEM_NOTE: &str = "(Codex's own system prompt: krowk sends none and does not see it)";
 
 /// The ambient variables a Codex process does not inherit unless its
-/// instance names them (`env`, `apiKeyEnv`): they are the native `openai`
-/// instance's key and base URL, and Codex's own key variable, and inherited
-/// they would move a ChatGPT account onto an API key or another server
-/// without anyone asking for it.
-pub const NOT_INHERITED: &[&str] = &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY"];
+/// instance names them (`env`, `apiKeyEnv`). Inherited, each would change
+/// whose account, which server or whose state the instance runs on without
+/// anyone asking for it: the native `openai` instance's key, base URL and
+/// organization; Codex's own key, access token, workload identity and
+/// connector tokens; the sign-in and token endpoints and the client Codex
+/// signs in as; its originator; where it keeps its state database outside
+/// `CODEX_HOME`; and the ids of a Codex session krowk itself may be running
+/// inside. Read off the variables codex 0.154.0 names; everything else
+/// (proxies, certificates, the sandbox's own) is the person's environment,
+/// as when they start `codex` by hand.
+pub const NOT_INHERITED: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORGANIZATION",
+    "OPENAI_CLUSTER",
+    "OPENAI_IDENTITY_TOKEN_FILE",
+    "OPENAI_FEDERATION_RULE_ID",
+    "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_CONNECTORS_TOKEN",
+    "CODEX_GITHUB_PERSONAL_ACCESS_TOKEN",
+    "CODEX_AUTHAPI_BASE_URL",
+    "CODEX_AGENT_IDENTITY_AUTHAPI_BASE_URL",
+    "CODEX_AGENT_IDENTITY_JWKS_BASE_URL",
+    "CODEX_APP_SERVER_CHATGPT_BASE_URL",
+    "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+    "CODEX_APP_SERVER_LOGIN_ISSUER",
+    "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+    "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+    "CODEX_SQLITE_HOME",
+    "CODEX_ROLLOUT_TRACE_ROOT",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+];
 
 /// What of `NOT_INHERITED` to remove for this instance.
 pub fn cleared(b: &Backend) -> impl Iterator<Item = &'static str> + '_ {
@@ -214,38 +245,83 @@ pub fn approve_file_change(mode: PermissionMode, paths: Option<&[String]>, grant
 /// What a Codex account's home shares with the person's own Codex home:
 /// the configuration — settings, instructions, prompts, skills, rules —
 /// never the login, the threads or Codex's state. Each is a symlink, so an
-/// edit in one shows in every account.
+/// edit in one shows in every account — and a write Codex makes to its
+/// config (`config/value/write`, a project it is told to trust) lands in
+/// the person's own `config.toml`, which is the point of sharing it.
 pub const SHARED: &[&str] = &["config.toml", "AGENTS.md", "AGENTS.override.md", "prompts", "skills", "rules"];
+
+/// What of the person's `skills` is not shared: Codex installs its own
+/// bundled skills into `skills/.system` of whatever home it runs in, and
+/// through a linked `skills` it would write them into the person's.
+const OWN_SKILLS: &[&str] = &[".system"];
+
+#[cfg(unix)]
+fn link(from: &Path, to: &Path) -> std::io::Result<bool> {
+    match to.symlink_metadata() {
+        Err(_) => {
+            std::os::unix::fs::symlink(from, to)?;
+            Ok(true)
+        }
+        // Linked here already: still shared. Anything else is the account's own.
+        Ok(m) => Ok(m.file_type().is_symlink() && std::fs::read_link(to).ok().as_deref() == Some(from)),
+    }
+}
 
 /// Links what `own` has of `SHARED` into the account's `home`, leaving
 /// alone anything `home` already has, and says what `home` shares: an
-/// account's own login stays its own (R-INST-1's per-account home). Nothing
-/// is linked when the two are one directory.
+/// account's own login stays its own (R-INST-1's per-account home). `skills`
+/// is a directory of the account's own holding a link per skill, so what
+/// Codex writes there itself stays in the account. Nothing is linked when
+/// the two are one directory, and nothing at all off unix.
 pub fn share(home: &Path, own: &Path) -> std::io::Result<Vec<String>> {
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     if canon(home) == canon(own) {
         return Ok(Vec::new());
     }
     let mut shared = Vec::new();
+    #[cfg(unix)]
     for name in SHARED {
         let (from, to) = (own.join(name), home.join(name));
         if from.symlink_metadata().is_err() {
             continue;
         }
-        match to.symlink_metadata() {
-            Err(_) => {
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(&from, &to)?;
-                #[cfg(not(unix))]
+        if *name == "skills" && from.is_dir() {
+            // An account added before skills had a directory of its own
+            // linked the whole of them: that link is replaced.
+            if to.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) && std::fs::read_link(&to).ok().as_deref() == Some(from.as_path()) {
+                std::fs::remove_file(&to)?;
+            }
+            if to.symlink_metadata().is_err() {
+                std::fs::create_dir(&to)?;
+            }
+            if !to.symlink_metadata()?.is_dir() {
                 continue;
             }
-            // Already this account's own, or already linked elsewhere.
-            Ok(m) if !m.file_type().is_symlink() || std::fs::read_link(&to).ok().as_deref() != Some(from.as_path()) => continue,
-            Ok(_) => {}
+            let mut any = false;
+            for e in std::fs::read_dir(&from)?.flatten() {
+                if OWN_SKILLS.iter().any(|o| e.file_name() == *o) {
+                    continue;
+                }
+                any |= link(&e.path(), &to.join(e.file_name()))?;
+            }
+            if any {
+                shared.push(name.to_string());
+            }
+            continue;
         }
-        shared.push(name.to_string());
+        if link(&from, &to)? {
+            shared.push(name.to_string());
+        }
     }
     Ok(shared)
+}
+
+/// The thread config that turns off every MCP server `config/read` names:
+/// `{"mcp_servers": {"<name>": {"enabled": false}}}`, none when it names none.
+pub fn mcp_off(config_read: &Value) -> Option<Value> {
+    let servers = config_read.pointer("/config/mcp_servers").and_then(Value::as_object).filter(|m| !m.is_empty())?;
+    let off: serde_json::Map<String, Value> = servers.keys().map(|k| (k.clone(), json!({"enabled": false}))).collect();
+    Some(json!({ "mcp_servers": off }))
 }
 
 /// A JSON-RPC message from Codex.
@@ -344,7 +420,7 @@ impl Engine for CodexEngine {
                 cwd: ctx.cwd.clone(),
                 mode: ctx.permission_mode,
                 krowk_version: self.krowk_version.clone(),
-                protected: self.backend().home.iter().cloned().collect(),
+                protected: self.backend().home.iter().chain(&self.backend().shared_home).cloned().collect(),
             };
             // The running process serves this turn when it is alive and in
             // the same sandbox; another mode is another thread setting,
@@ -443,7 +519,7 @@ impl Answers {
             // The requests of Codex's first protocol, for a Codex that
             // still sends them.
             "applyPatchApproval" => {
-                let paths: Vec<String> = params.get("fileChanges").and_then(Value::as_object).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+                let paths = params.get("fileChanges").map(stream::change_paths).unwrap_or_default();
                 let verdict = approve_file_change(self.mode, Some(&paths), params.get("grantRoot").and_then(Value::as_str), &self.cwd, &self.protected);
                 Ok(json!({"decision": if verdict.is_ok() { "approved" } else { "denied" }}))
             }
@@ -479,7 +555,7 @@ enum Pending {
 struct Proc {
     child: Child,
     stdin: Option<ChildStdin>,
-    out: Lines<BufReader<ChildStdout>>,
+    out: LineReader<BufReader<ChildStdout>>,
     stderr: Arc<Mutex<String>>,
     binary: String,
     /// Started in `danger-full-access` (krowk's bypassPermissions).
@@ -516,21 +592,85 @@ impl Drop for Proc {
         if !self.group_done {
             #[cfg(unix)]
             signal_group(self.pid, libc::SIGKILL);
+            crate::group::release(self.pid);
         }
     }
 }
 
+/// The longest line read from Codex: a resumed thread or a big tool output
+/// is megabytes; a line past this is skipped whole rather than held.
+const MAX_LINE: usize = 64 << 20;
+
+/// Raw lines from a stream, at most `cap` bytes each. Its partial line
+/// lives in the reader, not in the future reading it, so a read cancelled
+/// in a `select!` loses nothing.
+struct LineReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+    /// The line being read is longer than the cap, and is being skipped.
+    over: bool,
+    cap: usize,
+}
+
+/// One line, or a line too long to keep.
+#[derive(Debug, PartialEq)]
+enum Line {
+    Bytes(Vec<u8>),
+    TooLong,
+}
+
+impl<R: AsyncBufRead + Unpin> LineReader<R> {
+    fn new(inner: R) -> LineReader<R> {
+        LineReader { inner, buf: Vec::new(), over: false, cap: MAX_LINE }
+    }
+
+    /// The next line without its newline, or none at the end of the stream.
+    async fn next(&mut self) -> Option<Line> {
+        loop {
+            let avail = self.inner.fill_buf().await.ok()?;
+            if avail.is_empty() {
+                // The end: a last line with no newline is still a line.
+                if self.buf.is_empty() && !self.over {
+                    return None;
+                }
+                return Some(self.take());
+            }
+            let (chunk, done) = match avail.iter().position(|b| *b == b'\n') {
+                Some(i) => (i, true),
+                None => (avail.len(), false),
+            };
+            if !self.over && self.buf.len() + chunk <= self.cap {
+                self.buf.extend_from_slice(&avail[..chunk]);
+            } else {
+                self.over = true;
+                self.buf.clear();
+            }
+            self.inner.consume(if done { chunk + 1 } else { chunk });
+            if done {
+                return Some(self.take());
+            }
+        }
+    }
+
+    fn take(&mut self) -> Line {
+        let over = std::mem::take(&mut self.over);
+        let buf = std::mem::take(&mut self.buf);
+        if over { Line::TooLong } else { Line::Bytes(buf) }
+    }
+}
+
 /// The next JSON-RPC message, or none at the end of the stream. A line that
-/// is not JSON (a warning a wrapper printed) is skipped.
-async fn next_msg(out: &mut Lines<BufReader<ChildStdout>>) -> Option<Msg> {
+/// is not JSON — a warning a wrapper printed, bytes that are not UTF-8, a
+/// line past `MAX_LINE` — is skipped, never the end of the session.
+async fn next_msg<R: AsyncBufRead + Unpin>(out: &mut LineReader<R>) -> Option<Msg> {
     loop {
-        match out.next_line().await {
-            Ok(Some(l)) => {
-                if let Some(m) = serde_json::from_str::<Value>(&l).ok().and_then(classify) {
+        match out.next().await? {
+            Line::Bytes(l) => {
+                if let Some(m) = serde_json::from_slice::<Value>(&l).ok().and_then(classify) {
                     return Some(m);
                 }
             }
-            _ => return None,
+            Line::TooLong => {}
         }
     }
 }
@@ -580,8 +720,9 @@ impl Proc {
             }
         })?;
         let pid = child.id();
+        crate::group::register(pid);
         let stdin = child.stdin.take();
-        let out = BufReader::new(child.stdout.take().expect("piped")).lines();
+        let out = LineReader::new(BufReader::new(child.stdout.take().expect("piped")));
         let stderr = Arc::new(Mutex::new(String::new()));
         if let Some(mut err) = child.stderr.take() {
             let keep = stderr.clone();
@@ -705,10 +846,21 @@ impl Proc {
     async fn open_thread(&mut self, resume: Option<&str>, ctx: &TurnContext, ask: &Answers, instance: &str) -> Result<(), EngineError> {
         let pol = policy(ctx.permission_mode);
         let cwd = ctx.cwd.display().to_string();
-        let (method, params) = match resume {
+        let (method, mut params) = match resume {
             Some(thread) => ("thread/resume", json!({"threadId": thread, "model": ctx.model.model, "cwd": cwd, "approvalPolicy": pol.approval, "approvalsReviewer": "user", "sandbox": pol.sandbox, "excludeTurns": true})),
             None => ("thread/start", json!({"model": ctx.model.model, "cwd": cwd, "approvalPolicy": pol.approval, "approvalsReviewer": "user", "sandbox": pol.sandbox, "dynamicTools": dynamic_tools()})),
         };
+        // Outside bypassPermissions no MCP server of the person's or the
+        // project's config runs: Codex would start each one — a command —
+        // on the thread without asking, as Claude Code's are kept out by
+        // --strict-mcp-config. Codex's effective config for this directory
+        // names them, and the thread turns each off.
+        if ctx.permission_mode != PermissionMode::BypassPermissions {
+            let config = self.request("config/read", json!({ "cwd": cwd }), ask, INITIALIZE_TIMEOUT).await.map_err(|e| EngineError::new(&e.code, format!("krowk asks Codex which MCP servers its config names, to keep them off, and it did not say: {}", e.message)))?;
+            if let Some(off) = mcp_off(&config) {
+                params["config"] = off;
+            }
+        }
         let r = match self.request(method, params, ask, THREAD_TIMEOUT).await {
             Ok(r) => r,
             Err(e) if resume.is_some() && e.code == "backend_failed" => {
@@ -938,6 +1090,7 @@ impl Proc {
         }
         let _ = self.child.kill().await;
         self.group_done = true;
+        crate::group::release(self.pid);
     }
 
     async fn kill(mut self) {
@@ -981,12 +1134,15 @@ mod tests {
         assert_eq!((tools[0]["type"].as_str(), tools[0]["name"].as_str(), tools[0]["tools"][0]["name"].as_str()), (Some("namespace"), Some("krowk"), Some("session_info")));
         // The environment: the native openai instance's key never reaches a
         // ChatGPT account, unless the instance names it.
-        let mut b = Backend { binary: "codex".into(), path: None, config_dir: Some("/data/codex-team".into()), home: None, env: Default::default(), args: vec![], key: None };
+        let mut b = Backend { binary: "codex".into(), path: None, config_dir: Some("/data/codex-team".into()), home: None, env: Default::default(), args: vec![], key: None, shared_home: None };
         assert_eq!(cleared(&b).collect::<Vec<_>>(), NOT_INHERITED);
         b.key = Some(("OPENAI_API_KEY".into(), "sk-router".into()));
         b.env.insert("OPENAI_BASE_URL".into(), "https://router.example/v1".into());
         let (remove, set) = environment(&b);
-        assert_eq!(remove, ["CODEX_API_KEY"]);
+        assert!(!remove.contains(&"OPENAI_API_KEY") && !remove.contains(&"OPENAI_BASE_URL") && remove.contains(&"CODEX_API_KEY"), "{remove:?}");
+        for identity in ["CODEX_ACCESS_TOKEN", "CODEX_SQLITE_HOME", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "CODEX_APP_SERVER_LOGIN_ISSUER", "CODEX_THREAD_ID"] {
+            assert!(remove.contains(&identity), "{identity} reaches Codex");
+        }
         assert_eq!(set, [("CODEX_HOME".to_string(), "/data/codex-team".to_string()), ("OPENAI_BASE_URL".into(), "https://router.example/v1".into()), ("OPENAI_API_KEY".into(), "sk-router".into())]);
     }
 
@@ -996,7 +1152,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("krowk-codex-share-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (own, team) = (base.join("own"), base.join("team"));
-        std::fs::create_dir_all(own.join("skills")).unwrap();
+        std::fs::create_dir_all(own.join("skills/lint")).unwrap();
         std::fs::create_dir_all(&team).unwrap();
         std::fs::write(own.join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
         std::fs::write(own.join("AGENTS.md"), "be brief\n").unwrap();
@@ -1012,7 +1168,47 @@ mod tests {
         assert!(team.join(&login).symlink_metadata().is_err() && team.join("sessions").symlink_metadata().is_err(), "the login and the threads are not shared");
         assert_eq!(share(&team, &own).unwrap(), shared, "adding the account again changes nothing");
         assert!(share(&own, &own).unwrap().is_empty());
+        // Skills: the account's own directory, a link per skill, and never
+        // Codex's bundled `.system` — which it writes into the home it runs in.
+        std::fs::create_dir_all(own.join("skills/review")).unwrap();
+        std::fs::create_dir_all(own.join("skills/.system/bundled")).unwrap();
+        share(&team, &own).unwrap();
+        assert!(team.join("skills").symlink_metadata().unwrap().is_dir(), "a directory of the account's own");
+        assert_eq!(std::fs::read_link(team.join("skills/review")).unwrap(), own.join("skills/review"));
+        assert!(team.join("skills/.system").symlink_metadata().is_err());
+        std::fs::create_dir_all(team.join("skills/.system/codex")).unwrap();
+        assert!(!own.join("skills/.system/codex").exists(), "what Codex installs in the account stays there");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn r_back_3_the_mcp_servers_codexs_config_names_are_turned_off() {
+        let read = json!({"config": {"model": "gpt-5.5", "mcp_servers": {"tripwire": {"command": "/bin/sh", "enabled": true}, "docs.search": {"url": "https://x"}}}, "origins": {}});
+        assert_eq!(mcp_off(&read), Some(json!({"mcp_servers": {"tripwire": {"enabled": false}, "docs.search": {"enabled": false}}})), "a name with a dot stays one name");
+        assert_eq!(mcp_off(&json!({"config": {}, "origins": {}})), None);
+        assert_eq!(mcp_off(&json!({"config": {"mcp_servers": {}}, "origins": {}})), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r_back_3_a_line_that_is_not_json_utf8_or_short_is_skipped_not_the_end() {
+        let mut raw: Vec<u8> = b"not json\n\xff\xfe{\"broken\n".to_vec();
+        raw.extend_from_slice(b"{\"method\":\"turn/started\",\"params\":{}}\n");
+        raw.extend_from_slice(&[b'x'; 64]);
+        raw.extend_from_slice(b"\n{\"id\":1,\"result\":{}}");
+        let mut r = LineReader::new(BufReader::new(&raw[..]));
+        r.cap = 48;
+        assert!(matches!(next_msg(&mut r).await, Some(Msg::Note { method, .. }) if method == "turn/started"), "invalid UTF-8 is skipped");
+        assert!(matches!(next_msg(&mut r).await, Some(Msg::Response { .. })), "a line past the cap is skipped, and a last line without a newline read");
+        assert!(next_msg(&mut r).await.is_none());
+        // Line by line: the long one is reported, not kept.
+        let mut r = LineReader::new(BufReader::new(&raw[..]));
+        r.cap = 48;
+        let mut lines = Vec::new();
+        while let Some(l) = r.next().await {
+            lines.push(l);
+        }
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[3], Line::TooLong);
     }
 
     #[test]
@@ -1042,6 +1238,12 @@ mod tests {
         }
         assert!(approve_file_change(ae, Some(&f("a.txt")), Some("/"), &cwd, &[]).unwrap_err().contains("rest of the session"));
         assert!(approve_file_change(ae, None, None, &cwd, &[]).is_err(), "a patch whose files krowk did not see is not approved blind");
+        // A move is judged by where it lands too, in both protocols.
+        let moved = stream::change_paths(&json!([{"path": cwd.join("a.txt"), "kind": {"type": "update", "move_path": cwd.join(".git/hooks/pre-commit")}, "diff": ""}]));
+        assert_eq!(moved.len(), 2);
+        assert!(approve_file_change(ae, Some(&moved), None, &cwd, &[]).unwrap_err().contains(".git"));
+        let legacy = stream::change_paths(&json!({ cwd.join("a.txt").display().to_string(): {"type": "update", "unified_diff": "", "move_path": "/etc/cron.d/x"} }));
+        assert!(approve_file_change(ae, Some(&legacy), None, &cwd, &[]).unwrap_err().contains("outside the working directory"));
         let home = cwd.join("codex-home");
         std::fs::create_dir_all(&home).unwrap();
         assert!(approve_file_change(ae, Some(&f("codex-home/config.toml")), None, &cwd, std::slice::from_ref(&home)).unwrap_err().contains("config directory"));

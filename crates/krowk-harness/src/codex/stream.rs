@@ -100,6 +100,30 @@ fn capped(s: &str) -> String {
     format!("{}\n… [{} more bytes in Codex's transcript]", &s[..cut], s.len() - cut)
 }
 
+/// Every file a patch writes: each change's path, and where an update moves
+/// it to (`kind.move_path`) — a move writes its destination, so an approval
+/// that judged only the source would let a patch move a file into `.git`.
+/// Takes the thread item's `changes` array, or the first protocol's
+/// `fileChanges` map (path → change, the move in the change's `move_path`).
+pub fn change_paths(changes: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut add = |path: &str, change: &Value| {
+        if !path.is_empty() {
+            out.push(path.to_string());
+        }
+        let to = change.pointer("/kind/move_path").or_else(|| change.get("move_path")).and_then(Value::as_str).filter(|t| !t.is_empty());
+        if let Some(to) = to {
+            out.push(to.to_string());
+        }
+    };
+    match changes {
+        Value::Array(a) => a.iter().for_each(|c| add(str_of(c, "path"), c)),
+        Value::Object(m) => m.iter().for_each(|(p, c)| add(p, c)),
+        _ => {}
+    }
+    out
+}
+
 /// The text of MCP-style content: its text parts, one per line.
 fn content_text(parts: Option<&Value>) -> String {
     parts
@@ -119,7 +143,21 @@ impl Translator {
         Some(match str_of(item, "type") {
             "commandExecution" => ("shell".into(), json!({"command": str_of(item, "command"), "cwd": str_of(item, "cwd")})),
             "fileChange" => {
-                let changes: Vec<Value> = item.get("changes").and_then(Value::as_array).map(|c| c.iter().map(|c| json!({"path": str_of(c, "path"), "kind": c.pointer("/kind/type").cloned().unwrap_or(Value::Null)})).collect()).unwrap_or_default();
+                let changes: Vec<Value> = item
+                    .get("changes")
+                    .and_then(Value::as_array)
+                    .map(|c| {
+                        c.iter()
+                            .map(|c| {
+                                let mut v = json!({"path": str_of(c, "path"), "kind": c.pointer("/kind/type").cloned().unwrap_or(Value::Null)});
+                                if let Some(to) = c.pointer("/kind/move_path").and_then(Value::as_str) {
+                                    v["movePath"] = json!(to);
+                                }
+                                v
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 ("apply_patch".into(), json!({ "changes": changes }))
             }
             "mcpToolCall" => (format!("mcp__{}__{}", str_of(item, "server"), str_of(item, "tool")), args()),
@@ -202,8 +240,8 @@ impl Translator {
     }
 
     fn note_changes(&mut self, codex_id: &str, item: &Value) {
-        if let Some(c) = item.get("changes").and_then(Value::as_array).filter(|c| !c.is_empty()) {
-            self.changes.insert(codex_id.to_string(), c.iter().map(|c| str_of(c, "path").to_string()).collect());
+        if let Some(c) = item.get("changes").filter(|c| c.as_array().is_some_and(|a| !a.is_empty())) {
+            self.changes.insert(codex_id.to_string(), change_paths(c));
         }
     }
 

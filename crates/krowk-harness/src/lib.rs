@@ -37,6 +37,7 @@ pub mod claude;
 pub mod codex;
 pub mod effort;
 pub mod engine;
+pub mod group;
 pub mod headless;
 pub mod host;
 pub mod http;

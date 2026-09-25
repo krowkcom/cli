@@ -14,6 +14,9 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+#[path = "common/pty.rs"]
+mod pty;
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../krowk-harness/tests/fixtures/codex").join(name)
 }
@@ -233,4 +236,87 @@ fn r_back_3_ctrl_c_interrupts_a_codex_turn_and_the_session_resumes() {
     let out = b.json(&["-p", "go on", "--resume", &session, "--trust", "--output-format", "json"], &[("FAKE_CODEX_SCENARIO", &scenario("interrupt.jsonl"))]);
     assert_eq!(out["result"], "Picking up where we left off.");
     assert!(b.fake_log().lines().any(|l| l.starts_with("resume ")));
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only asks whether the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Whether `pid` is gone within a couple of seconds.
+fn gone(pid: i32) -> bool {
+    (0..100).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        !alive(pid)
+    })
+}
+
+fn logged_pid(log: &str, prefix: &str) -> i32 {
+    log.lines().rev().find_map(|l| l.strip_prefix(prefix)).unwrap_or_else(|| panic!("no {prefix:?} in {log}")).trim().parse().unwrap()
+}
+
+/// A second Ctrl-C leaves at once — and takes the backend's whole process
+/// group with it, the app-server and what it started, headless or not.
+#[test]
+fn r_back_3_a_second_ctrl_c_leaves_at_once_and_kills_codexs_process_group() {
+    let b = Sandbox::new("ctrlc2");
+    b.json(&["providers", "add", "codex", "--name", "team", "--json"], &[]);
+    let mut child = b
+        .command(&["-p", "work for a long time", "--model", "codex:team/gpt-5.5", "--trust", "--output-format", "stream-json"], &[("FAKE_CODEX_SCENARIO", &scenario("hang.jsonl"))])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    for line in lines.by_ref() {
+        if line.unwrap().contains(r#""type":"item.delta""#) {
+            break;
+        }
+    }
+    // The grandchild is started right after the delta.
+    let log = (0..100).find_map(|_| {
+        let l = b.fake_log();
+        if l.contains("grandchild ") { Some(l) } else { std::thread::sleep(std::time::Duration::from_millis(20)); None }
+    }).expect("the fake started its command");
+    let (server, grandchild) = (logged_pid(&log, "pid "), logged_pid(&log, "grandchild "));
+    for _ in 0..2 {
+        // SAFETY: a signal to the child this test started.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGINT);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let started = std::time::Instant::now();
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(130), "{status}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "it waited {:?}", started.elapsed());
+    assert!(gone(server), "codex app-server ({server}) outlived krowk");
+    assert!(gone(grandchild), "what Codex started ({grandchild}) outlived krowk");
+}
+
+/// The same from the TUI: a second Ctrl-C during a Codex turn does not wait
+/// on the turn's backend, and the process group goes with it.
+#[test]
+fn r_back_3_a_second_ctrl_c_in_the_tui_during_a_codex_turn_leaves_at_once() {
+    let b = Sandbox::new("tui-ctrlc2");
+    b.json(&["providers", "add", "codex", "--name", "team", "--json"], &[]);
+    let trusted = b.root.join("home/.config/krowk/trusted.json");
+    std::fs::create_dir_all(trusted.parent().unwrap()).unwrap();
+    std::fs::write(&trusted, serde_json::json!({"directories": [b.root.join("repo")]}).to_string()).unwrap();
+    let cmd = b.command(&["--model", "codex:team/gpt-5.5"], &[("TERM", "xterm-256color"), ("FAKE_CODEX_SCENARIO", &scenario("hang.jsonl"))]);
+    let mut t = pty::Pty::spawn(cmd, 200, 30);
+    assert!(t.wait_for("ask anything", std::time::Duration::from_secs(10)).is_some(), "{:?}", t.text());
+    t.write(b"work for a long time\r");
+    assert!(t.wait_for("Responding", std::time::Duration::from_secs(10)).is_some(), "the answer streams: {:?}", t.text());
+    let log = (0..100).find_map(|_| {
+        let l = b.fake_log();
+        if l.contains("grandchild ") { Some(l) } else { std::thread::sleep(std::time::Duration::from_millis(20)); None }
+    }).expect("the fake started its command");
+    let (server, grandchild) = (logged_pid(&log, "pid "), logged_pid(&log, "grandchild "));
+    t.write(b"\x03");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    t.write(b"\x03");
+    let st = t.wait(std::time::Duration::from_secs(5)).expect("krowk leaves on the second Ctrl-C, not after the backend");
+    assert_eq!(st.code(), Some(130), "{st}");
+    assert!(gone(server) && gone(grandchild), "the backend's group outlived the TUI");
 }

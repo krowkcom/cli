@@ -291,6 +291,9 @@ fn r_back_5_a_new_host_resumes_the_codex_thread_the_log_names() {
     assert!(resume.contains(r#""sandbox":"read-only""#) && resume.contains(r#""approvalsReviewer":"user""#), "a resumed thread is put back in krowk's mode: {resume}");
 }
 
+/// An MCP server the person's config names, as `config/read` reports one.
+const MCP: &str = r#"{"tripwire":{"command":"/bin/sh","args":["-c","touch ran"],"enabled":true}}"#;
+
 #[test]
 fn r_back_3_codexs_approval_requests_are_answered_by_krowks_modes() {
     let h = Home::new("approvals");
@@ -298,27 +301,33 @@ fn r_back_3_codexs_approval_requests_are_answered_by_krowks_modes() {
     for (mode, patch, why) in [(PermissionMode::Default, "decline", "does not allow edits"), (PermissionMode::AcceptEdits, "accept", "inside a .codex directory")] {
         let _ = std::fs::remove_file(home.join("fake-turns"));
         let _ = std::fs::remove_file(h.log_file());
-        let host = h.host(vec![("codex:team", h.instance(&home, Some("approvals.jsonl"), &[]))], trust::allow_all());
+        let host = h.host(vec![("codex:team", h.instance(&home, Some("approvals.jsonl"), &[("FAKE_CODEX_MCP", MCP)]))], trust::allow_all());
         rt().block_on(async {
             let (_, r) = run(&host, prompt(None, "tidy up", "codex:team/gpt-5.5", mode)).await;
             let r = r.unwrap().unwrap();
             assert_eq!(r.status, TurnStatus::Completed);
             let answers: Vec<String> = lines_of(&h.fake_log(), "in ").into_iter().filter(|l| l.starts_with(r#"{"id":"srv-"#)).collect();
-            assert_eq!(answers.len(), 3, "{answers:?}");
+            assert_eq!(answers.len(), 4, "{answers:?}");
+            // The person's MCP servers are off on the thread outside bypass.
+            let start = lines_of(&h.fake_log(), "in ").into_iter().find(|l| l.contains("thread/start")).unwrap();
+            assert!(start.contains(r#""config":{"mcp_servers":{"tripwire":{"enabled":false}}}"#), "{start}");
             assert!(answers[0].contains(r#""decision":"decline""#), "a command beyond the sandbox needs bypassPermissions: {}", answers[0]);
             assert!(answers[1].contains(&format!(r#""decision":"{patch}""#)), "{mode:?}: {}", answers[1]);
             assert!(answers[2].contains(r#""decision":"decline""#), "never .codex, whatever the mode: {}", answers[2]);
+            assert!(answers[3].contains(r#""decision":"decline""#), "a move into .git is judged by where it lands: {}", answers[3]);
             // The log keeps krowk's reason where Codex told the model only
             // that it was declined.
             let results: Vec<(String, bool)> = items(&h.events(&r.session_id)).into_iter().filter_map(|i| if let Item::ToolResult { output, is_error, .. } = i { Some((output, is_error)) } else { None }).collect();
             assert!(results[0].1 && results[0].0.contains("bypassPermissions"), "{:?}", results[0]);
             assert!(results[2].1 && results[2].0.contains(why), "{:?}", results[2]);
+            let move_why = if mode == PermissionMode::AcceptEdits { "inside a .git directory" } else { why };
+            assert!(results[3].1 && results[3].0.contains(move_why), "{:?}", results[3]);
             host.shutdown().await;
         });
     }
     // bypassPermissions is Codex's full access, asked about nothing.
     let _ = std::fs::remove_file(h.log_file());
-    let host = h.host(vec![("codex:team", h.instance(&home, None, &[]))], trust::allow_all());
+    let host = h.host(vec![("codex:team", h.instance(&home, None, &[("FAKE_CODEX_MCP", MCP)]))], trust::allow_all());
     rt().block_on(async {
         let (_, r) = run(&host, prompt(None, "go", "codex:team/gpt-5.5", PermissionMode::BypassPermissions)).await;
         assert_eq!(r.unwrap().unwrap().status, TurnStatus::Completed);
@@ -326,6 +335,7 @@ fn r_back_3_codexs_approval_requests_are_answered_by_krowks_modes() {
     });
     let start = lines_of(&h.fake_log(), "in ").into_iter().find(|l| l.contains("thread/start")).unwrap();
     assert!(start.contains(r#""sandbox":"danger-full-access""#) && start.contains(r#""approvalPolicy":"never""#), "{start}");
+    assert!(!start.contains(r#""config""#) && !h.fake_log().contains("config-read"), "bypassPermissions leaves Codex's MCP servers on: {start}");
 }
 
 #[test]
@@ -520,6 +530,7 @@ fn response_type(method: &str) -> Option<&'static str> {
         "model/list" => "v2/ModelListResponse",
         "thread/start" => "v2/ThreadStartResponse",
         "thread/resume" => "v2/ThreadResumeResponse",
+        "config/read" => "v2/ConfigReadResponse",
         "turn/start" => "v2/TurnStartResponse",
         "turn/steer" => "v2/TurnSteerResponse",
         "turn/interrupt" => "v2/TurnInterruptResponse",
@@ -538,7 +549,7 @@ fn r_back_3_every_message_krowk_sends_and_codex_answers_matches_the_pinned_schem
     rt().block_on(async {
         for (scenario, mode) in [("tool_use.jsonl", PermissionMode::Default), ("approvals.jsonl", PermissionMode::AcceptEdits), ("interrupt.jsonl", PermissionMode::Default)] {
             let _ = std::fs::remove_file(home.join("fake-turns"));
-            let host = h.host(vec![("codex:team", h.instance(&home, Some(scenario), &[]))], trust::allow_all());
+            let host = h.host(vec![("codex:team", h.instance(&home, Some(scenario), &[("FAKE_CODEX_MCP", MCP)]))], trust::allow_all());
             let (_, r) = run_with(&host, prompt(None, "hi", "codex:team/gpt-5.5", mode), async |host: &Host, session: &str, n: usize| {
                 if scenario == "interrupt.jsonl" && n == 1 {
                     let (tx, _rx) = mpsc::channel(8);

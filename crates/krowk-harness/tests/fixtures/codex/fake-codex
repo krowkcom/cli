@@ -19,6 +19,7 @@
 #   FAKE_CODEX_SANDBOX   the sandbox thread/start reports, as a managed config could force it
 #   FAKE_CODEX_REVIEWER  the approvals reviewer it reports, the same way
 #   FAKE_CODEX_RESUME    `fail`: thread/resume finds no such thread
+#   FAKE_CODEX_MCP       the `mcp_servers` table config/read reports, as JSON
 #
 # The marker `fake-login` holds the account: `chatgpt <email>` or `apiKey`.
 # A scenario is turns separated by lines holding `---`; each turn/start
@@ -44,6 +45,7 @@ HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
 log() { printf '%s\n' "$*" >>"$LOG"; }
 log "argv $*"
 log "home ${CODEX_HOME:-<unset>}"
+log "pid $$"
 log "env OPENAI_API_KEY=${OPENAI_API_KEY:-<unset>} ROUTER_KEY=${ROUTER_KEY:-<unset>}"
 
 case "${1:-}" in
@@ -267,6 +269,12 @@ while IFS= read -r line <&3; do
     ;;
   model/list)
     say "{\"id\":$id,\"result\":{\"data\":[{\"id\":\"gpt-5.5\",\"model\":\"gpt-5.5\",\"displayName\":\"GPT-5.5\",\"description\":\"\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"\"},{\"reasoningEffort\":\"medium\",\"description\":\"\"},{\"reasoningEffort\":\"high\",\"description\":\"\"},{\"reasoningEffort\":\"xhigh\",\"description\":\"\"}],\"defaultReasoningEffort\":\"medium\",\"inputModalities\":[\"text\"],\"supportsPersonality\":false,\"isDefault\":true}],\"nextCursor\":null}}"
+    ;;
+  config/read)
+    log "config-read"
+    mcp="${FAKE_CODEX_MCP:-}"
+    [ -n "$mcp" ] || mcp='{}'
+    say "{\"id\":$id,\"result\":{\"config\":{\"model\":\"gpt-5.5\",\"mcp_servers\":$mcp},\"origins\":{}}}"
     ;;
   thread/start | thread/resume)
     m="$(field "$line" model)"

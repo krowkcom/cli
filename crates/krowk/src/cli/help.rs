@@ -83,6 +83,9 @@ SESSIONS FLAGS
   --limit <n>            On `sessions`, list at most this many (default 50)
   --all                  On `sessions`, list every session, ignoring --limit
   --thinking             On `sessions show`, show full thinking parts
+  --max-usd <n>          On `sessions budget`, trip over this metered cost
+  --max-tokens <n>       On `sessions budget`, trip over this many metered
+                         tokens (input, output, reasoning and cache)
   --from <source>        On `sessions import`, whose transcripts to read:
                          claude, cursor, opencode, ledger, or all.
                          Required
@@ -131,7 +134,7 @@ EXIT CODES
      claim token where that is the only authority (a claim token the registry
      does not recognise is 2, since it answers that as no such record)
   4  refused by the registry on the request or the state of things — retrying
-     unchanged answers the same
+     unchanged answers the same; also a session over its `sessions budget`
   5  rate limited — wait and retry
   6  the bytes did not move — the registry or object storage could not be reached
   7  the registry failed on its side, or answered something unreadable — or a

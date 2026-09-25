@@ -669,6 +669,32 @@ stdout:
           ]
         },
         {
+          "name": "budget",
+          "usage": "krowk sessions budget <id> [--max-usd N] [--max-tokens N]",
+          "summary": "Check a session against a spend limit, by what the provider metered",
+          "args": [
+            {
+              "name": "id",
+              "summary": "The session id, an unambiguous id prefix of at least 8 chars, or a foreign session id",
+              "required": true
+            }
+          ],
+          "flags": [
+            {
+              "name": "max-usd",
+              "type": "string",
+              "default": "",
+              "usage": "Trip when the session's metered cost is over this many dollars"
+            },
+            {
+              "name": "max-tokens",
+              "type": "string",
+              "default": "",
+              "usage": "Trip when the session's metered tokens are over this many"
+            }
+          ]
+        },
+        {
           "name": "sync",
           "usage": "krowk sessions sync [--no-network]",
           "summary": "Import only what changed since the last import, and refresh prices",
@@ -1469,6 +1495,32 @@ stdout:
           ]
         },
         {
+          "name": "budget",
+          "usage": "krowk sessions budget <id> [--max-usd N] [--max-tokens N]",
+          "summary": "Check a session against a spend limit, by what the provider metered",
+          "args": [
+            {
+              "name": "id",
+              "summary": "The session id, an unambiguous id prefix of at least 8 chars, or a foreign session id",
+              "required": true
+            }
+          ],
+          "flags": [
+            {
+              "name": "max-usd",
+              "type": "string",
+              "default": "",
+              "usage": "Trip when the session's metered cost is over this many dollars"
+            },
+            {
+              "name": "max-tokens",
+              "type": "string",
+              "default": "",
+              "usage": "Trip when the session's metered tokens are over this many"
+            }
+          ]
+        },
+        {
           "name": "sync",
           "usage": "krowk sessions sync [--no-network]",
           "summary": "Import only what changed since the last import, and refresh prices",
@@ -2265,6 +2317,32 @@ stdout:
               "type": "bool",
               "default": "false",
               "usage": "Delete without asking — required when nobody is at a terminal to confirm"
+            }
+          ]
+        },
+        {
+          "name": "budget",
+          "usage": "krowk sessions budget <id> [--max-usd N] [--max-tokens N]",
+          "summary": "Check a session against a spend limit, by what the provider metered",
+          "args": [
+            {
+              "name": "id",
+              "summary": "The session id, an unambiguous id prefix of at least 8 chars, or a foreign session id",
+              "required": true
+            }
+          ],
+          "flags": [
+            {
+              "name": "max-usd",
+              "type": "string",
+              "default": "",
+              "usage": "Trip when the session's metered cost is over this many dollars"
+            },
+            {
+              "name": "max-tokens",
+              "type": "string",
+              "default": "",
+              "usage": "Trip when the session's metered tokens are over this many"
             }
           ]
         },

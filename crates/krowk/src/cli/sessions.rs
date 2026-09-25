@@ -25,7 +25,7 @@ const SKIPPED_TYPE_OTHER: &str = "krowk:other";
 const UNSUPPORTED_OS: &str = "sessions is not supported on Windows in v1";
 const PRICING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-fn check_os() -> Result<(), Error> {
+pub(super) fn check_os() -> Result<(), Error> {
     krowk_import::check_os().map_err(|_| fail("unsupported_os", UNSUPPORTED_OS))
 }
 
@@ -106,7 +106,7 @@ pub fn list(ctx: &mut Ctx) -> Result<(), Error> {
     Ok(())
 }
 
-fn emit_data(ctx: &mut Ctx, data: Value, summary: String) -> Result<(), Error> {
+pub(super) fn emit_data(ctx: &mut Ctx, data: Value, summary: String) -> Result<(), Error> {
     let rendered = if ctx.f.quiet {
         output::encode(&data)
     } else {
@@ -129,30 +129,40 @@ fn now_ms() -> i64 {
 /// session is priced; only when nothing is — a harness that records no
 /// usage at all — do they make the cost unknown.
 #[derive(Debug, Default)]
-struct Priced {
+pub(super) struct Priced {
     usd: f64,
     unpriced: BTreeSet<String>,
     unpriced_empty: BTreeSet<String>,
     known: bool,
     /// Every turn is counted in another session.
     elsewhere: bool,
-    bases: BTreeSet<pricing::Basis>,
+    pub(super) bases: BTreeSet<pricing::Basis>,
     /// The known dollars per (provider, model), unrounded.
     by_model: BTreeMap<String, f64>,
 }
 
 impl Priced {
-    fn total(&self) -> Option<f64> {
+    pub(super) fn total(&self) -> Option<f64> {
         (self.unpriced.is_empty() && (self.known || self.unpriced_empty.is_empty())).then_some(self.usd)
     }
 
     /// The pairs that make the cost unknown.
-    fn missing(&self) -> BTreeSet<String> {
+    pub(super) fn missing(&self) -> BTreeSet<String> {
         let mut out = self.unpriced.clone();
         if !self.known {
             out.extend(self.unpriced_empty.iter().cloned());
         }
         out
+    }
+
+    #[cfg(test)]
+    pub(super) fn add_known(&mut self, usd: f64) {
+        self.add(Some(TurnCost { usd, basis: None }), "p", "m", pricing::Tokens::default());
+    }
+
+    #[cfg(test)]
+    pub(super) fn add_unknown(&mut self, pair: &str) {
+        self.unpriced.insert(pair.into());
     }
 
     fn add(&mut self, cost: Option<TurnCost>, provider: &str, model: &str, t: pricing::Tokens) {
@@ -178,7 +188,7 @@ impl Priced {
 /// One figure: dollars, and the price source when krowk priced it rather
 /// than the source reporting it.
 #[derive(Debug, Clone, Copy)]
-struct TurnCost {
+pub(super) struct TurnCost {
     usd: f64,
     basis: Option<pricing::Basis>,
 }
@@ -254,7 +264,7 @@ fn turn_cost(ctx: &Ctx, t: &TurnDetail) -> Option<TurnCost> {
 }
 
 /// A ledger turn counted elsewhere: in a transcript, or an earlier export.
-fn is_observed(t: &TurnDetail) -> bool {
+pub(super) fn is_observed(t: &TurnDetail) -> bool {
     t.status == krowk_store::STATUS_OBSERVED || t.status == krowk_store::STATUS_DUPLICATE
 }
 
@@ -320,7 +330,7 @@ fn format_cost(usd: f64) -> String {
 
 /// `show`'s figures, where one session's split between models is the point:
 /// three significant digits below a dollar, cents above.
-fn format_cost_precise(usd: f64) -> String {
+pub(super) fn format_cost_precise(usd: f64) -> String {
     if usd >= 1.0 || usd <= 0.0 {
         return format!("${usd:.2}");
     }
@@ -360,7 +370,7 @@ fn relative_time(ms: i64, now: i64) -> String {
     }
 }
 
-fn cell(s: &str) -> String {
+pub(super) fn cell(s: &str) -> String {
     termclean::cell(s)
 }
 
@@ -391,7 +401,7 @@ fn pad_left(colour: bool, code: &str, s: &str, w: usize) -> String {
     " ".repeat(w.saturating_sub(width(s))) + &paint(colour, code, s)
 }
 
-fn display_title(t: &str) -> String {
+pub(super) fn display_title(t: &str) -> String {
     if t.is_empty() { "(untitled)".into() } else { t.to_string() }
 }
 
@@ -477,13 +487,13 @@ fn pick_session(rows: &[SessionRow], now: i64) -> Result<String, Error> {
 
 // ---- show -------------------------------------------------------------------
 
-pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
-    check_os()?;
+/// The one session `krowk sessions <verb> <id>` names, read in full.
+pub(super) fn load_detail(ctx: &Ctx, args: &[String], verb: &str) -> Result<SessionDetail, Error> {
     let Some(reference) = args.first().filter(|a| !a.trim().is_empty()) else {
-        return Err(fail("no_session", "pass the session: `krowk sessions show <id>`"));
+        return Err(fail("no_session", format!("pass the session: `krowk sessions {verb} <id>`")));
     };
     if args.len() > 1 {
-        return Err(fail("bad_flag", format!("`krowk sessions show` takes one session id, got extra {}", args[1..].join(" "))));
+        return Err(fail("bad_flag", format!("`krowk sessions {verb}` takes one session id, got extra {}", args[1..].join(" "))));
     }
     let conn = open_store(ctx)?;
     let id = match krowk_store::resolve_session_id(&conn, reference) {
@@ -497,11 +507,16 @@ pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
         }
         Err(e) => return Err(store_fail(&e, &db_path_string(ctx))),
     };
-    let d = match krowk_store::load_session_detail(&conn, &id) {
-        Ok(d) => d,
-        Err(StoreError::NotFound(_)) => return Err(fail("no_session", format!("no session {id:?}"))),
-        Err(e) => return Err(store_fail(&e, &db_path_string(ctx))),
-    };
+    match krowk_store::load_session_detail(&conn, &id) {
+        Ok(d) => Ok(d),
+        Err(StoreError::NotFound(_)) => Err(fail("no_session", format!("no session {id:?}"))),
+        Err(e) => Err(store_fail(&e, &db_path_string(ctx))),
+    }
+}
+
+pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
+    check_os()?;
+    let d = load_detail(ctx, args, "show")?;
     if ctx.format != Format::Human {
         let (data, summary) = session_show_json(ctx, &d);
         return emit_data(ctx, data, summary);
@@ -513,7 +528,7 @@ pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
 
 /// Each turn priced for display, and the session's total rolled up exactly
 /// as the listing rolls it up: per (provider, model, reported), in that order.
-fn price_turns(ctx: &Ctx, d: &SessionDetail) -> (Vec<Option<TurnCost>>, Priced) {
+pub(super) fn price_turns(ctx: &Ctx, d: &SessionDetail) -> (Vec<Option<TurnCost>>, Priced) {
     let costs: Vec<Option<TurnCost>> = d.turns.iter().map(|t| if is_observed(t) { None } else { turn_cost(ctx, t) }).collect();
     let mut groups: BTreeMap<(String, String, bool), CostGroup> = BTreeMap::new();
     for t in d.turns.iter().filter(|t| !is_observed(t)) {

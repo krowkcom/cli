@@ -37,12 +37,26 @@ the versions are the `v*` tags a release is cut from. Entries land under
   significant digits (`$0.00500`), and a ledger session whose rows all
   sit in transcripts reads `counted elsewhere`. A reported cost of 0 is
   treated as no report — opencode writes 0 for models it cannot price.
+- Claude turns keep their thinking tokens apart from output
+  (`output_tokens_details.thinking_tokens` → reasoning), as opencode and
+  ledger turns already did. Totals and prices are unchanged; `sessions
+  rebuild` applies it to sessions already imported.
 - `sessions` lists in ~25 ms on a machine whose price cache holds the whole
   models.dev file (was ~80 ms): the cache is parsed without building the
   fields pricing never reads.
 
 ### Added
 
+- **`krowk sessions budget <id> --max-usd N --max-tokens N`** checks a
+  session against a spend limit by what the provider metered — every
+  input, output, reasoning and cache token in its usage blocks, plus any
+  ledger row nobody saw an answer to — never by the `max_tokens` its
+  requests asked for, which providers do not strictly enforce (a call
+  capped at 1,200 has metered 3,422). Over a limit it exits 4 with
+  `budget_exceeded` and the metered figures in `details`; a cost krowk
+  cannot price trips a `--max-usd` check rather than passing it. krowk
+  cancels nothing: the hook or wrapper that runs the check is what stops
+  the run. Dollars are compared unrounded.
 - **Provider usage ledgers.** A request your agent gave up on — a timeout,
   a killed shell, a Ctrl-C — can still finish and bill on the provider's
   side, and no transcript ever sees it. Drop the provider's per-request

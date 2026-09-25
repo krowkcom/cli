@@ -60,6 +60,7 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 | `krowk doctor` | Report version, connectivity, auth and detected run context |
 | `krowk sessions` | List every agent thread on this machine, newest first (`--harness`, `--worktree`, `--limit N`, `--all`) — picks from a list on a terminal |
 | `krowk sessions show <id>` | Read one session back, with its turns, messages and parts (`--thinking`) |
+| `krowk sessions budget <id> --max-usd 5` | Exit 4 when a session's metered cost or tokens (`--max-tokens N`) are over a limit — for a hook or wrapper to stop the run |
 | `krowk sessions import --from all` | Read Claude, Cursor and opencode transcripts on this machine into the local store, and reconcile provider usage ledgers against them (`--dry-run`, `--limit N`) |
 | `krowk sessions sync` | Import only what changed since the last import, and refresh prices if they are a day old (`--no-network`) |
 | `krowk sessions rebuild` | Delete the local store and re-import every transcript — the fix when the store's schema version does not match (`--yes` off a terminal) |

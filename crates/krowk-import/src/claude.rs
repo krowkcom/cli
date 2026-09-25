@@ -312,29 +312,39 @@ struct ContentBlock {
 struct TokenUsage {
     input: i64,
     output: i64,
+    reasoning: i64,
     cache_read: i64,
     cache_write: i64,
 }
 
 impl TokenUsage {
+    /// Anthropic counts thinking inside `output_tokens` and says how much of
+    /// it was thinking in `output_tokens_details.thinking_tokens`; the split
+    /// is kept, as every importer keeps it, so a model that ever prices
+    /// reasoning apart needs no re-import. Both still price at the output
+    /// rate today.
     fn from(v: &Value) -> TokenUsage {
         let n = |k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(0);
+        let output = n("output_tokens");
+        let thinking = v.pointer("/output_tokens_details/thinking_tokens").and_then(Value::as_i64).unwrap_or(0).clamp(0, output.max(0));
         TokenUsage {
             input: n("input_tokens"),
-            output: n("output_tokens"),
+            output: output - thinking,
+            reasoning: thinking,
             cache_read: n("cache_read_input_tokens"),
             cache_write: n("cache_creation_input_tokens"),
         }
     }
 
-    /// Total is the sum of the four: Anthropic reports none, and a reader
+    /// Total is every token billed: Anthropic reports none, and a reader
     /// adding the columns must get the number the column holds.
     fn add_to(self, t: &mut Turn) {
         t.cost_input += self.input;
         t.cost_output += self.output;
+        t.cost_reasoning += self.reasoning;
         t.cost_cache_read += self.cache_read;
         t.cost_cache_write += self.cache_write;
-        t.cost_total += self.input + self.output + self.cache_read + self.cache_write;
+        t.cost_total += self.input + self.output + self.reasoning + self.cache_read + self.cache_write;
     }
 }
 
@@ -1089,7 +1099,7 @@ mod tests {
             assert_eq!((t.cost_reasoning, t.cost_usd_micros), (0, None));
             assert_eq!(
                 t.cost_total,
-                t.cost_input + t.cost_output + t.cost_cache_read + t.cost_cache_write
+                t.cost_input + t.cost_output + t.cost_reasoning + t.cost_cache_read + t.cost_cache_write
             );
             (got.input, got.output, got.cache_read, got.cache_write) = (
                 got.input + t.cost_input,

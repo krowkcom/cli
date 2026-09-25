@@ -84,6 +84,12 @@ pub fn parse(text: &str) -> Result<File, String> {
             return Err(format!("pending budget {} names no owner ticket to turn it on", b.id));
         }
     }
+    // The idle budgets are read off one idle process, so they share one
+    // window; a row printing a window it was not measured over would lie.
+    let windows: std::collections::BTreeSet<Option<u64>> = f.budget.iter().filter(|b| b.id.starts_with("engine.idle_")).map(|b| b.window_s).collect();
+    if windows.len() > 1 {
+        return Err(format!("the engine.idle_* budgets share one idle process, so they need one window_s (found {windows:?})"));
+    }
     Ok(f)
 }
 
@@ -285,6 +291,14 @@ mod tests {
         assert!(parse(pending).unwrap_err().contains("no owner"));
     }
 
+    #[test]
+    fn r_perf_2_idle_budgets_with_different_windows_are_refused() {
+        let row = |id: &str, w: u64| format!("[[budget]]\nid = \"{id}\"\nreq = \"R-PERF-2\"\nwhat = \"w\"\nunit = \"ticks\"\nmax = 0\nwindow_s = {w}\nstatus = \"enforced\"\n");
+        assert!(parse(&format!("{}{}", row("engine.idle_cpu", 10), row("engine.idle_wakeups", 10))).is_ok());
+        let e = parse(&format!("{}{}", row("engine.idle_cpu", 10), row("engine.idle_wakeups", 5))).unwrap_err();
+        assert!(e.contains("one window_s"), "{e}");
+    }
+
     /// The file in the repository: every R-PERF item the spec states a
     /// number for is in it, with that number, and R-PKG-2 is enforced.
     #[test]
@@ -310,6 +324,7 @@ mod tests {
         for req in ["R-PERF-1", "R-PERF-2", "R-PERF-3", "R-PERF-4", "R-PERF-5", "R-PERF-6", "R-PKG-2"] {
             assert!(f.budget.iter().any(|b| b.req == req), "budgets.toml has nothing for {req}");
         }
+        assert_eq!(find("session.replay_rss").owner.as_deref(), Some("04"), "ticket 04 builds the 200k replay; 12 only verifies");
         for id in ["lean.size", "lean.deps", "log.append", "engine.idle_cpu"] {
             assert_eq!(find(id).status, Status::Enforced, "{id} is measurable now, so it is enforced");
         }

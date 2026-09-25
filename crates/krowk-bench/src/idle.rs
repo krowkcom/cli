@@ -70,7 +70,8 @@ pub fn engine_idle(bin: &Path, home: &Path, window: Duration) -> Result<Idle, St
         if let Ok(Some(st)) = child.try_wait() {
             return Err(format!("`krowk -p` exited {st} while it should have been waiting"));
         }
-        Ok(Idle { ticks: t1.saturating_sub(t0), wakeups: w1.saturating_sub(w0), rss_mb })
+        let ticks = t1.checked_sub(t0).ok_or_else(|| format!("CPU ticks went backwards ({t0} to {t1})"))?;
+        Ok(Idle { ticks, wakeups: wakeups_between(&w0, &w1)?, rss_mb })
     })();
     let _ = child.kill();
     let _ = child.wait();
@@ -100,13 +101,34 @@ fn parse_ticks(stat: &str) -> Option<u64> {
     Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
 }
 
-/// Voluntary and involuntary context switches, summed over every thread.
-fn proc_switches(pid: u32) -> Result<u64, String> {
+/// Voluntary and involuntary context switches, per thread id.
+fn proc_switches(pid: u32) -> Result<Switches, String> {
     let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).map_err(|e| format!("/proc/{pid}/task: {e}"))?;
-    let mut n = 0;
+    let mut per = Switches::new();
     for t in tasks.flatten() {
-        let status = std::fs::read_to_string(t.path().join("status")).unwrap_or_default();
-        n += status_field(&status, "voluntary_ctxt_switches:").unwrap_or(0) + status_field(&status, "nonvoluntary_ctxt_switches:").unwrap_or(0);
+        let Some(tid) = t.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let status = std::fs::read_to_string(t.path().join("status")).map_err(|e| format!("/proc/{pid}/task/{tid}/status: {e}"))?;
+        let n = status_field(&status, "voluntary_ctxt_switches:").unwrap_or(0) + status_field(&status, "nonvoluntary_ctxt_switches:").unwrap_or(0);
+        per.insert(tid, n);
+    }
+    Ok(per)
+}
+
+type Switches = std::collections::BTreeMap<u32, u64>;
+
+/// The wakeups between two samples. Only a comparison of the same threads
+/// means anything: a thread that exited mid-window takes its switches out
+/// of the sum, and one that started brings in switches from before the
+/// window, so either is an error rather than a number — and a thread
+/// being started or reaped while idle is not idle anyway.
+fn wakeups_between(before: &Switches, after: &Switches) -> Result<u64, String> {
+    if before.keys().ne(after.keys()) {
+        return Err(format!("the threads changed during the idle window ({:?} to {:?})", before.keys().collect::<Vec<_>>(), after.keys().collect::<Vec<_>>()));
+    }
+    let mut n = 0;
+    for (tid, b) in before {
+        let a = after[tid];
+        n += a.checked_sub(*b).ok_or_else(|| format!("thread {tid}'s context switches went backwards ({b} to {a})"))?;
     }
     Ok(n)
 }
@@ -136,6 +158,20 @@ mod tests {
         assert_eq!(status_field(status, "VmRSS:"), Some(7148));
         assert_eq!(status_field(status, "voluntary_ctxt_switches:"), Some(5));
         assert_eq!(status_field(status, "nonvoluntary_ctxt_switches:"), Some(2));
+    }
+
+    #[test]
+    fn r_perf_2_wakeups_compare_the_same_threads_only() {
+        let s = |xs: &[(u32, u64)]| xs.iter().copied().collect::<Switches>();
+        assert_eq!(wakeups_between(&s(&[(1, 5), (2, 7)]), &s(&[(1, 5), (2, 9)])), Ok(2));
+        // A thread that exits mid-window would lower the sum and hide the
+        // wakeups of the rest; one that starts is not idle either.
+        let exited = wakeups_between(&s(&[(1, 5), (2, 7)]), &s(&[(1, 9)])).unwrap_err();
+        assert!(exited.contains("threads changed"), "{exited}");
+        let started = wakeups_between(&s(&[(1, 5)]), &s(&[(1, 5), (3, 0)])).unwrap_err();
+        assert!(started.contains("threads changed"), "{started}");
+        let back = wakeups_between(&s(&[(1, 5)]), &s(&[(1, 4)])).unwrap_err();
+        assert!(back.contains("went backwards"), "{back}");
     }
 
     #[test]

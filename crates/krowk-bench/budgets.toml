@@ -159,7 +159,7 @@ what = "TUI plus engine replaying a synthetic 200k-token session: peak resident 
 unit = "MB"
 max = 100
 status = "pending"
-owner = "12"
+owner = "04"
 
 # --- The session log ---
 

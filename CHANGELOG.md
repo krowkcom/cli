@@ -101,7 +101,13 @@ the versions are the `v*` tags a release is cut from. Entries land under
   appears within two seconds and clears when it answers again (behind a
   proxy — `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` — the proxy is what is
   checked). Ctrl-Z stops to the shell and `fg` brings the prompt back;
-  SIGTERM and SIGHUP leave the terminal as they found it. The prompt sits
+  SIGTERM and SIGHUP leave the terminal as they found it. Each tool call
+  is shown once, with its outcome (`◆ Read README.md (3 lines)`, an edit's
+  removed and added lines on red and green bands, a command's head and
+  tail), thinking as `◆ Thought for 4.2s`, and answers in light markdown;
+  the look follows xAI's Grok Build. Finished lines are printed as text the
+  terminal wraps, so they rewrap when the window is resized and copy
+  whole. The prompt sits
   at the bottom of the terminal, what was on screen moved down to meet
   it, so narrowing the window never leaves a copy of it in scrollback.
   **Known limits:** krowk takes a terminal to reflow on resize unless it is

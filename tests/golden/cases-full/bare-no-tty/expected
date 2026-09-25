@@ -885,7 +885,7 @@ stdout:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5"
     },
     {
       "name": "resume",
@@ -1829,7 +1829,7 @@ stdout:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5"
     },
     {
       "name": "resume",
@@ -2787,7 +2787,7 @@ stdout:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5"
     },
     {
       "name": "resume",
@@ -3745,7 +3745,7 @@ tty:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5"
     },
     {
       "name": "resume",

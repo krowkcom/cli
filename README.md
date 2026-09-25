@@ -79,6 +79,8 @@ In the full build, bare `krowk` on a terminal opens krowk's own agent: an inline
 | `krowk --resume` / `--resume <id>` | Continue a krowk session — picked from a list, or named |
 | `krowk -p "…"` | One prompt, headless (`--output-format text\|json\|stream-json`, `--resume`, `--model`) |
 
+What you see: `❯` before what you asked; the answer as it streams, in light markdown (headings, `•` lists, `code` and fenced blocks coloured), wrapped by the terminal itself so it rewraps when you resize; each tool call once, with its outcome — `◆ Read README.md (3 lines)`, `◆ Run cargo test` with the head and tail of its output, `◆ Edit src/main.rs +3/-1` with the removed and added lines on red and green bands, a red `◆` when it failed; thinking collapsed to `◆ Thought for 4.2s`; and `Worked for 12s · 6.2k tokens` when the turn is done. While a turn runs, one line says what it is doing (`⠋ Thinking… 3.2s │ esc to interrupt`). The visual language follows xAI's Grok Build (see THIRD-PARTY-NOTICES).
+
 Enter sends; Alt-Enter, Ctrl-J or a trailing `\` starts a new line, and ↑/↓ walk the prompt history. Esc or Ctrl-C interrupts the running turn, keeping what arrived; typing while it runs steers it — the model reads it before its next step. `?` on an empty prompt shows the keys, Ctrl-O the session's details (tokens, log path), Ctrl-D or `/exit` quits. When the model's API cannot be reached, a persistent **no network connectivity** notice says so within two seconds, and clears when the API answers again; nothing hangs waiting for it.
 
 Wherever a command takes `<artifact>`, `<run>` or `--run`, it takes the link as readily as the slug: paste `https://krowk.com/a/art_…` or the CDN URL under it, and the slug is read out of it.

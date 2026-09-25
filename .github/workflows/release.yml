@@ -1,15 +1,13 @@
 name: Release
 
 # A tag is the whole trigger. `git tag -a v0.1.0 -m ... && git push origin v0.1.0`
-# builds both binaries for five platforms, opens the GitHub Release with the
-# archives and checksums on it, and publishes the seven npm packages.
-#
-# macOS, because the darwin builds link Security.framework and only the macOS
-# SDK carries it; zig cross-compiles the Linux and Windows builds from there.
+# checks the tag, builds both binaries for five platforms in parallel
+# (dist.yml), opens the GitHub Release with the archives and checksums on it,
+# and publishes the seven npm packages.
 #
 # Three components, deliberately: the moving major tag this workflow pushes at
-# the end is also `v*`, and a release run for `v0` would ask GoReleaser to cut
-# a release of version "0" and npm to publish it.
+# the end is also `v*`, and a release run for `v0` would cut a release of
+# version "0" and ask npm to publish it.
 on:
   push:
     tags: ["v[0-9]*.[0-9]*.[0-9]*"]
@@ -18,43 +16,118 @@ permissions:
   contents: read
 
 jobs:
-  release:
-    runs-on: macos-latest
-    permissions:
-      # GoReleaser creates the release and uploads the archives to it.
-      contents: write
-      # Kept for the caches the setup actions write; without it they end in
-      # "cache write denied: token has no writable scopes".
-      actions: write
+  # The same gate as a pull request. A tag that cannot pass it should not
+  # become bytes anyone downloads. The release notes are checked here too, so
+  # a tag with no CHANGELOG.md section stops before anything is built.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
-          # GoReleaser reads the tag and the commits since the last one to build
-          # the changelog, so a shallow clone gives it nothing to work with.
-          fetch-depth: 0
           persist-credentials: false
+
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # The release notes are the tag's CHANGELOG.md section, written for the
+      # people upgrading, rather than a list of every commit.
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          grep -q '[^[:space:]]' release-notes.md \
+            || { echo "::error::CHANGELOG.md has no section for $VERSION" >&2; exit 1; }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: release-notes.md
 
       - name: Set up Rust
         run: |
-          rustup toolchain install 1.97 --profile minimal --component clippy \
-            --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-pc-windows-gnu
+          rustup toolchain install 1.97 --profile minimal --component clippy
           rustup default 1.97
 
-      - name: Set up zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
+      # The opencode fixture is built from SQL at case time.
+      - name: Ensure sqlite3
+        run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
 
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild@0.23.4
-
-      # The same gate as a pull request. A tag that cannot pass it should not
-      # become bytes anyone downloads.
       - name: Check
         run: make check
+
+  dist:
+    needs: check
+    uses: ./.github/workflows/dist.yml
+    with:
+      version: ${{ needs.check.outputs.version }}
+
+  publish:
+    needs: [check, dist]
+    runs-on: ubuntu-latest
+    permissions:
+      # Creates the release and uploads the archives to it.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+
+      # A tag like v0.1.0-rc1 becomes a GitHub pre-release, and npm publishes
+      # it under the `next` dist-tag rather than `latest`. Re-running on a tag
+      # whose release already exists replaces its assets, so a half-finished
+      # release — npm published, upload interrupted, or the other way round —
+      # is finished by re-running the workflow rather than by deleting it.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          cat >> release-notes.md <<EOF
+
+          ## Install
+
+          \`\`\`bash
+          # npm — the bare \`krowk\` name is blocked by npm's typosquat filter
+          npx @krowk/cli push screenshot.png
+
+          # Direct download — no runtime, no package manager
+          curl -sSfL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/krowk_${VERSION}_\$(uname -s | tr A-Z a-z)_\$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz \\
+            | tar -xz -C /usr/local/bin krowk krowk-mcp
+
+          # From source
+          cargo install --locked --git https://github.com/$GITHUB_REPOSITORY --tag $tag --features sessions krowk
+          \`\`\`
+
+          \`checksums.txt\` covers every archive on this release.
+          EOF
+          assets=(dist/*.tar.gz dist/*.zip dist/checksums.txt)
+          prerelease=()
+          case "$tag" in *-*) prerelease=(--prerelease) ;; esac
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+            gh release edit "$tag" --notes-file release-notes.md
+          else
+            gh release create "$tag" "${assets[@]}" --title "$tag" --notes-file release-notes.md --verify-tag "${prerelease[@]}"
+          fi
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -62,34 +135,7 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      # The release notes are the tag's CHANGELOG.md section, written for the
-      # people upgrading, rather than GoReleaser's list of every commit. A tag
-      # with no section of its own stops here: a release nobody described is
-      # one to go back and describe.
-      - name: Release notes from CHANGELOG.md
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          awk -v v="$version" '
-            $0 ~ "^## \\[" v "\\]" { found = 1; next }
-            found && /^## \[/ { exit }
-            found { print }
-          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
-          grep -q '[^[:space:]]' "$RUNNER_TEMP/release-notes.md" \
-            || { echo "::error::CHANGELOG.md has no section for $version" >&2; exit 1; }
-
-      - name: Build the release
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          # One build at a time: two cargo-zigbuild runs for the same target
-          # race to create the same linker wrapper.
-          args: release --clean --parallelism 1 --release-notes ${{ runner.temp }}/release-notes.md
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Reads the binaries GoReleaser just built out of dist/, so the npm
+      # Reads the binaries the build above wrote out of dist/, so the npm
       # packages carry the same bytes the checksums cover.
       - name: Assemble the npm packages
         run: node npm/build.mjs

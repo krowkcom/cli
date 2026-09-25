@@ -1,4 +1,4 @@
-# The leading v comes off, because GoReleaser drops it and npm will not take it.
+# The leading v comes off, because the release drops it and npm will not take it.
 # A checkout and a release should not disagree about what version this is.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
 
@@ -24,17 +24,17 @@ install: ## Install krowk and krowk-mcp into ~/.cargo/bin
 mock: ## Local stand-in for api.krowk.com on :8787
 	cargo run --release -p krowk-devregistry --bin devregistry
 
-release-check: ## Validate .goreleaser.yaml, the npm launchers and the installer, offline
-	goreleaser check
+release-check: ## Validate the release layout, the npm launchers and the installer, offline
+	bash -n scripts/dist.sh
 	node --check npm/krowk/bin/krowk.js
 	node --check npm/mcp/bin/krowk-mcp.js
 	# The installer downloads what this file produces, so it belongs to the
-	# release pipeline rather than to `check`: it needs goreleaser and python3,
+	# release pipeline rather than to `check`: it needs python3,
 	# which a plain test run has no business requiring.
 	scripts/install_test.sh
 
 dist: ## The whole release, locally: every binary, the archives, the npm packages (needs zig + cargo-zigbuild, on macOS)
-	goreleaser release --snapshot --clean --skip=publish --parallelism 1
+	scripts/dist.sh all $(VERSION)
 	node npm/build.mjs
 
 clean:

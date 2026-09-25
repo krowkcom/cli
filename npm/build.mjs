@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Assemble the npm packages from the binaries GoReleaser just built.
+// Assemble the npm packages from the binaries scripts/dist.sh just built.
 //
 // Seven packages come out of one release: five that carry nothing but the two
 // binaries for one platform, and the two launchers people actually name —
@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "..");
 
-// The one platform table. .goreleaser.yaml's matrix and the launchers' own
+// The one platform table. scripts/dist.sh's targets and the launchers' own
 // tables are checked against it below, so adding a platform in one place and
 // forgetting the others fails the build instead of the release.
 const PLATFORMS = [
@@ -33,7 +33,7 @@ const PLATFORMS = [
   { npm: "@krowk/cli-win32-x64", goos: "windows", goarch: "amd64", os: "win32", cpu: "x64" },
 ];
 
-// GoReleaser build ids, which are also the binary names.
+// The binary names, which are also the artifact ids scripts/dist.sh records.
 const BINARIES = ["krowk", "krowk-mcp"];
 
 // The launchers, in the repo. Their versions and optionalDependencies are
@@ -62,11 +62,11 @@ function readJSON(file) {
     return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch (err) {
     die("cannot read " + path.relative(repo, file) + ": " + err.message +
-      "\n  Run `goreleaser release --snapshot --clean` first, or point --dist at a finished build.");
+      "\n  Run `make dist` first, or point --dist at a finished build.");
   }
 }
 
-// GoReleaser records what it built and at which version. Taking both from there
+// scripts/dist.sh records what it built and at which version. Taking both from there
 // means the npm version is the released version by construction — there is no
 // second place to get it wrong.
 const metadata = readJSON(path.join(distDir, "metadata.json"));
@@ -75,7 +75,7 @@ const version = metadata.version;
 
 if (!version) die("no version in " + path.join(distDir, "metadata.json"));
 
-// npm has no opinion about a leading v; a tag does. GoReleaser strips it, and
+// npm has no opinion about a leading v; a tag does. scripts/dist.sh strips it, and
 // this is the assertion that it stayed stripped.
 if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/.test(version)) {
   die("version " + JSON.stringify(version) + " is not a version npm will accept");
@@ -91,8 +91,8 @@ const extra = new Set(
   built.map((a) => a.goos + "/" + a.goarch).filter((k) => !wanted.has(k)),
 );
 if (extra.size > 0) {
-  die("GoReleaser built " + [...extra].sort().join(", ") +
-    ", which no npm package covers.\n  Add it to PLATFORMS here and to PACKAGES in both launchers, or drop it from .goreleaser.yaml.");
+  die("scripts/dist.sh built " + [...extra].sort().join(", ") +
+    ", which no npm package covers.\n  Add it to PLATFORMS here and to PACKAGES in both launchers, or drop it from scripts/dist.sh.");
 }
 
 for (const launcher of LAUNCHERS) {
@@ -135,7 +135,7 @@ for (const platform of PLATFORMS) {
       (a) => a.extra?.ID === binary && a.goos === platform.goos && a.goarch === platform.goarch,
     );
     if (!artifact) {
-      die("GoReleaser built no " + binary + " for " + platform.goos + "/" + platform.goarch);
+      die("scripts/dist.sh built no " + binary + " for " + platform.goos + "/" + platform.goarch);
     }
     const ext = platform.os === "win32" ? ".exe" : "";
     const to = path.join(dir, "bin", binary + ext);

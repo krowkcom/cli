@@ -2,12 +2,11 @@
 # a clean checkout without a global default set. Rust matches the workspace's
 # rust-version.
 #
-# goreleaser, zig and node are one step further out: they are what turns a tag
-# into downloadable bytes (zig is the cross C toolchain cargo-zigbuild drives),
-# so `make release-check` and `make dist` work on a clean checkout too. None is
-# needed for `make check`.
+# zig and node are one step further out: they are what turns a tag into
+# downloadable bytes (zig is the cross C toolchain cargo-zigbuild drives, and
+# node assembles the npm packages), so `make release-check` and `make dist`
+# work on a clean checkout too. Neither is needed for `make check`.
 [tools]
 rust = "1.97"
-goreleaser = "2"
 zig = "0.16.0"
 node = "22"

@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://krowk.com/install | bash
 #
-# Both binaries come down together because .goreleaser.yaml ships them in one
+# Both binaries come down together because scripts/dist.sh ships them in one
 # archive: an agent container that wants krowk usually wants krowk-mcp too, and
 # one download is one thing to get wrong.
 #
@@ -106,7 +106,7 @@ default_bin_dir() {
 }
 
 # detect_platform names the archive, so it may only answer with combinations
-# .goreleaser.yaml actually builds. Anything else fails here with the reason,
+# scripts/dist.sh actually builds. Anything else fails here with the reason,
 # rather than 404ing on a download and looking like a network problem.
 detect_platform() {
   local os arch
@@ -261,7 +261,7 @@ verify_checksum() {
     error "checksums.txt would not download from ${base_url}${why:+ (${why})}. Nothing is installed: an archive nobody can check is not one to run."
   fi
 
-  # GoReleaser writes `<digest>  <name>`; a binary-mode digest writes `*<name>`.
+  # scripts/dist.sh writes `<digest>  <name>`; a binary-mode digest writes `*<name>`.
   expected=$(awk -v f="$archive" '$2 == f || $2 == ("*" f) {print $1; exit}' "${tmp_dir}/checksums.txt")
   if [[ -z "$expected" ]]; then
     error "checksums.txt does not mention ${archive}, so there is nothing to check it against. Report this at https://github.com/${REPO}/issues"
@@ -285,7 +285,7 @@ download_binaries() {
     suffix=".exe"
   fi
 
-  # The name .goreleaser.yaml builds: krowk_<version>_<os>_<arch>.<ext>.
+  # The name scripts/dist.sh builds: krowk_<version>_<os>_<arch>.<ext>.
   archive="krowk_${version}_${platform}.${ext}"
   base_url=$(release_base_url "$version")
 

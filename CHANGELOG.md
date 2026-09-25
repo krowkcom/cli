@@ -76,7 +76,7 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `result` with usage (input, output, cache read, cache write, reasoning),
   the cost at models.dev prices, the duration and the session id.
   `--model <instance>/<model>` picks the model (a bare Claude id runs on
-  the `anthropic` instance; `claude-opus-5` by default), `--resume <id>`
+  the `anthropic` instance; `claude-opus-5-5` by default), `--resume <id>`
   continues a session by the id its result named or its `krowk sessions`
   id, and Ctrl-C stops a turn and keeps what it made. Its `bash` tool runs
   only under `--permission-mode bypassPermissions` until permission rules

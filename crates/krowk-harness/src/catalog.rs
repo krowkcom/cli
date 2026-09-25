@@ -160,7 +160,7 @@ mod tests {
             "grok-4.7": {"family": "grok", "reasoning": true, "tool_call": true,
                 "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh"]}], "limit": {"context": 500000, "output": 500000}}
         }},
-        "anthropic": {"npm": "@ai-sdk/anthropic", "models": {"claude-opus-5": {"family": "claude-opus", "reasoning": true,
+        "anthropic": {"npm": "@ai-sdk/anthropic", "models": {"claude-opus-5-5": {"family": "claude-opus", "reasoning": true,
             "reasoning_options": [{"type": "effort", "values": ["low", "max", "banana"]}, {"type": "budget_tokens", "min": 1024}]}}},
         "neon": {"npm": "@ai-sdk/openai-compatible", "models": {"gpt-5-4-mini": {"family": "gpt-mini", "provider": {"npm": "@ai-sdk/openai", "shape": "responses"}}}},
         "router": {"npm": "@openrouter/ai-sdk-provider", "models": {"house": {"family": ""}}},
@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(g.wire_api, Some(WireApi::OpenaiResponses));
         assert!(!lookup(DOC, "openai", "gpt-4.1").unwrap().reasoning);
         assert_eq!(lookup(DOC, "xai", "grok-4.7").unwrap().wire_api, Some(WireApi::ChatCompletions));
-        let c = lookup(DOC, "anthropic", "claude-opus-5").unwrap();
+        let c = lookup(DOC, "anthropic", "claude-opus-5-5").unwrap();
         assert_eq!((c.wire_api, c.efforts.clone()), (Some(WireApi::AnthropicMessages), vec![Effort::Low, Effort::Max]), "an unknown value is skipped, the rest kept in ladder order");
         // A model's own package and shape outrank its provider's.
         assert_eq!(lookup(DOC, "neon", "gpt-5-4-mini").unwrap().wire_api, Some(WireApi::OpenaiResponses));

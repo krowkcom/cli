@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(for_family("opus"), None);
         // Ids the catalog does not know, read for their family.
         for (model, preset) in [
-            ("claude-opus-5", "claude"),
+            ("claude-opus-5-5", "claude"),
             ("us.anthropic.claude-haiku-4-5-20251001-v1:0", "claude"),
             ("gpt-5.1-codex", "gpt"),
             ("openai/gpt-5", "gpt"),
@@ -200,8 +200,8 @@ mod tests {
         // The catalog outranks the id; config outranks the catalog; the
         // prompt outranks everything.
         assert_eq!(edit(None, None, Some("grok"), "gpt-5").0.name, "grok");
-        assert_eq!(edit(None, Some("gpt"), Some("claude-opus"), "claude-opus-5"), (by_name("gpt").unwrap(), Source::Config));
-        assert_eq!(edit(Some("grok"), Some("gpt"), Some("claude-opus"), "claude-opus-5"), (by_name("grok").unwrap(), Source::Prompt));
+        assert_eq!(edit(None, Some("gpt"), Some("claude-opus"), "claude-opus-5-5"), (by_name("gpt").unwrap(), Source::Config));
+        assert_eq!(edit(Some("grok"), Some("gpt"), Some("claude-opus"), "claude-opus-5-5"), (by_name("grok").unwrap(), Source::Prompt));
         assert!(choose(Some("vim"), None, None, "gpt-5").unwrap_err().contains("claude, gpt, grok"));
         assert!(choose(None, Some("vim"), None, "gpt-5").unwrap_err().contains("config toolset"));
     }
@@ -212,7 +212,7 @@ mod tests {
             assert!(takes_custom_tools(m), "{m}");
             assert!(reasons(m), "{m}");
         }
-        for m in ["gpt-4.1", "gpt-4o", "o3", "claude-opus-5", "grok-4.7"] {
+        for m in ["gpt-4.1", "gpt-4o", "o3", "claude-opus-5-5", "grok-4.7"] {
             assert!(!takes_custom_tools(m), "{m}");
         }
         assert!(reasons("o3") && reasons("o4-mini"));

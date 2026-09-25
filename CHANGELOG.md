@@ -37,6 +37,18 @@ the versions are the `v*` tags a release is cut from. Entries land under
   significant digits (`$0.00500`), and a ledger session whose rows all
   sit in transcripts reads `counted elsewhere`. A reported cost of 0 is
   treated as no report — opencode writes 0 for models it cannot price.
+- **You can see how old the prices are.** `krowk doctor` has a `pricing`
+  check naming when models.dev prices were last fetched and how many days
+  ago — a warning past 30 days, or when only the snapshot built into
+  krowk answers — with the command that fixes it; `pricing refresh`
+  reports `fetched_at_ms` and `age_days` too. `sessions sync` still
+  refreshes prices once they are a day old, now judged by the recorded
+  fetch time rather than a file's mtime. Nothing else touches the
+  network, and there is no background timer. A cache that is missing or holds no prices is fetched whole again
+  rather than confirmed by a stale ETag. Audio rates stay unread: no
+  transcript krowk imports carries audio tokens, and in a provider ledger
+  they are priced at the text rate inside input and output — an
+  undercount to revisit when one reports audio at all.
 - `sessions` lists in ~25 ms on a machine whose price cache holds the whole
   models.dev file (was ~80 ms): the cache is parsed without building the
   fields pricing never reads.

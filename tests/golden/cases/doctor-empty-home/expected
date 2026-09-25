@@ -18,6 +18,12 @@ stdout:
     "status": "pass",
     "message": "healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"
   },
+  "pricing": {
+    "name": "pricing",
+    "status": "warn",
+    "message": "no price cache — prices come from the models.dev snapshot 2026-09-10 embedded in this build",
+    "hint": "run `krowk pricing refresh`, or `krowk sessions sync`, which refreshes prices once a day"
+  },
   "context": {}
 }
 exit: 0
@@ -37,6 +43,7 @@ runs_available  false
 credentials     <scratch>/home/.config/krowk/credentials.json
 config          global <scratch>/home/.config/krowk/config.json (absent)
 store           {"name":"store","status":"pass","message":"healthy (<scratch>/home/.local/share/krowk/krowk.db, schema v1, wal)"}
+pricing         {"name":"pricing","status":"warn","message":"no price cache — prices come from the models.dev snapshot 2026-09-10 embedded in this build","hint":"run `krowk pricing refresh`, or `krowk sessions sync`, which refreshes prices once a day"}
 context         {}
 exit: 0
 

@@ -15,6 +15,8 @@
 //!   driven over stream-json and its control protocol; `bridge` — krowk's
 //!   tools offered to a backend as an MCP server; `trust` — which
 //!   repositories a backend may run in.
+//! - `codex` — the Codex backend: the user's own `codex`, driven as `codex
+//!   app-server` over JSON-RPC, with krowk's tools as its dynamic tools.
 //! - `tools` — read, write, the edit tools, bash, grep and glob.
 //! - `toolset` — the preset registry: which edit tool a model is offered.
 //! - `host` — executes commands, writes the log, prices the turn.
@@ -32,6 +34,7 @@ pub mod bridge;
 pub mod catalog;
 pub mod chat;
 pub mod claude;
+pub mod codex;
 pub mod effort;
 pub mod engine;
 pub mod headless;

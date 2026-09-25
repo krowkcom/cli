@@ -1,0 +1,9 @@
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg-c1","text":""},"threadId":"{{THREAD}}","turnId":"{{TURN}}","startedAtMs":1}}
+{"method":"item/agentMessage/delta","params":{"itemId":"msg-c1","delta":"Halfway through","threadId":"{{THREAD}}","turnId":"{{TURN}}"}}
+@grandchild
+@exit-once 139
+---
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg-c2","text":""},"threadId":"{{THREAD}}","turnId":"{{TURN}}","startedAtMs":2}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-c2","text":"Back again."},"threadId":"{{THREAD}}","turnId":"{{TURN}}","completedAtMs":3}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"{{THREAD}}","turnId":"{{TURN}}","tokenUsage":{"last":{"inputTokens":30,"cachedInputTokens":0,"outputTokens":3,"reasoningOutputTokens":0,"totalTokens":33},"total":{"inputTokens":30,"cachedInputTokens":0,"outputTokens":3,"reasoningOutputTokens":0,"totalTokens":33}}}}
+{"method":"turn/completed","params":{"threadId":"{{THREAD}}","turn":{"id":"{{TURN}}","items":[],"status":"completed","error":null}}}

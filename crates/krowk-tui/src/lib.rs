@@ -165,6 +165,7 @@ async fn session(opts: Options) -> Outcome {
     let shown = opts.model.clone().or_else(|| app.model.clone()).or_else(|| opts.host.registry.default_model().ok());
     let target = shown.as_ref().and_then(|m| opts.host.registry.get(&m.instance).ok()).and_then(|i| Target::for_url(&i.base_url, &|k| std::env::var(k).unwrap_or_default()));
     app.model = shown;
+    app.vendor_instances = opts.host.registry.instances.values().filter(|i| i.backend.is_some()).map(|i| i.name.clone()).collect();
 
     let initial_height = app.view(Instant::now().into_std()).0.len() as u16;
     let mut term = match Term::new(stdout, size, top, initial_height) {

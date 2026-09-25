@@ -23,6 +23,7 @@ use crate::protocol::{
     Billing, Command, ContextRecord, Effort, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus, Usage, WireApi,
 };
 use crate::claude::ClaudeEngine;
+use crate::codex::CodexEngine;
 use crate::trust;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -83,8 +84,9 @@ struct Backend {
 }
 
 /// A backend process kept this long without a turn is let go: a long-lived
-/// host (the daemon, the TUI) holds many sessions, and an idle `claude` is a
-/// few hundred megabytes. The next turn starts it again on `--resume`.
+/// host (the daemon, the TUI) holds many sessions, and an idle `claude` or
+/// `codex app-server` is a few hundred megabytes. The next turn starts it
+/// again on the vendor's resume.
 pub const BACKEND_IDLE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 fn log_failure(e: LogError) -> EngineError {
@@ -142,7 +144,10 @@ impl Host {
         }
         // A session moved to another instance: the old engine's process is
         // stopped with it when the last handle goes (its drop kills it).
-        let e: Arc<dyn Engine> = Arc::new(ClaudeEngine::new(instance.clone(), &self.cfg.krowk_version)?);
+        let e: Arc<dyn Engine> = match instance.wire_api {
+            WireApi::CodexAppServer => Arc::new(CodexEngine::new(instance.clone(), &self.cfg.krowk_version)?),
+            _ => Arc::new(ClaudeEngine::new(instance.clone(), &self.cfg.krowk_version)?),
+        };
         backends.insert(session_id.to_string(), Backend { instance: instance.name.clone(), engine: e.clone(), used: Instant::now() });
         Ok(e)
     }
@@ -232,10 +237,11 @@ impl Host {
             // not there is named before a session exists for it.
             Some(b) => {
                 if b.path.is_none() {
-                    return Err(EngineError::new(
-                        "backend_not_found",
-                        format!("{} was not found — install Claude Code (https://claude.com/claude-code), or name the binary with `krowk providers add claude --binary <path>`", b.binary),
-                    ));
+                    let (install, add) = match instance.wire_api {
+                        WireApi::CodexAppServer => ("Codex (https://developers.openai.com/codex)", "codex"),
+                        _ => ("Claude Code (https://claude.com/claude-code)", "claude"),
+                    };
+                    return Err(EngineError::new("backend_not_found", format!("{} was not found — install {install}, or name the binary with `krowk providers add {add} --binary <path>`", b.binary)));
                 }
                 if let Some(fix) = instance.missing_key() {
                     return Err(EngineError::new("not_authenticated", fix));
@@ -259,8 +265,9 @@ impl Host {
             Some(e) => Arc::from(e),
             None => self.backend_for(&session_id, &instance)?,
         };
-        // The Claude session to resume: the branch's last, if it ran on this
-        // instance — another account's config directory does not have it.
+        // The vendor session to resume (Claude Code's session, Codex's
+        // thread): the branch's last, if it ran on this instance — another
+        // account's config directory does not have it.
         let backend_session = past.backend.as_ref().filter(|b| b.instance == model.instance).map(|b| b.session_id.clone());
 
         let turn_id = krowk_store::new_id();
@@ -329,6 +336,7 @@ fn engine_for(instance: &Resolved, wire: WireApi, credentials: &std::path::Path,
         WireApi::OpenaiResponses => Ok(Box::new(NativeEngine { client: ResponsesClient::new(instance.clone(), krowk_version)? })),
         WireApi::ChatCompletions => Ok(Box::new(NativeEngine { client: ChatClient::new(instance.clone(), credential, krowk_version)? })),
         WireApi::ClaudeCode => Err(EngineError::new("bad_config", format!("{} runs Claude Code as a backend, not a native wire API", instance.name))),
+        WireApi::CodexAppServer => Err(EngineError::new("bad_config", format!("{} runs Codex as a backend, not a native wire API", instance.name))),
     }
 }
 
@@ -453,7 +461,11 @@ impl Writer<'_> {
                     provider: instance.provider.clone(),
                     wire_api: self.wire,
                     // A backend brings its own tools; the preset is krowk's.
-                    toolset: if self.wire == WireApi::ClaudeCode { crate::claude::BACKEND.into() } else { self.preset.name.into() },
+                    toolset: match self.wire {
+                        WireApi::ClaudeCode => crate::claude::BACKEND.into(),
+                        WireApi::CodexAppServer => crate::codex::BACKEND.into(),
+                        _ => self.preset.name.into(),
+                    },
                     system_tokens: native::estimate_tokens(&system),
                     tools_tokens: native::tools_tokens(&tools),
                     system,

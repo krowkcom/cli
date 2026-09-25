@@ -280,7 +280,7 @@ pub fn environment(b: &Backend) -> (Vec<&'static str>, Vec<(String, String)>) {
     }
     set.extend(b.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     if let Some((to, key)) = &b.key {
-        set.push(((*to).into(), key.clone()));
+        set.push((to.clone(), key.clone()));
     }
     (cleared(b).collect(), set)
 }

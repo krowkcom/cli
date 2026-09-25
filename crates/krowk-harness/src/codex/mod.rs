@@ -1,0 +1,1094 @@
+//! The Codex backend (R-BACK-3): krowk drives the user's own, unmodified
+//! `codex` binary as `codex app-server` — the JSON-RPC interface OpenAI
+//! built for third-party clients, and the sanctioned way to use a ChatGPT
+//! subscription from one — as one long-lived process per session:
+//!
+//! ```text
+//! codex app-server --listen stdio:// [the instance's args]
+//! ```
+//!
+//! with `CODEX_HOME` set to the instance's home. One JSON object per line
+//! each way; requests carry an `id` and are answered under it, both ways.
+//! What krowk speaks, checked against the schema `codex app-server
+//! generate-json-schema --experimental` writes for the pinned Codex
+//! (`schema/codex/`, kept fresh by `scripts/codex_schema.sh`):
+//!
+//! | message | direction | what krowk does |
+//! |---|---|---|
+//! | `initialize`, `initialized` | krowk → codex | first on every process, as client `krowk`, opting into the experimental API for dynamic tools |
+//! | `account/read` | krowk → codex | whether the instance is signed in, and to what: a ChatGPT plan is a subscription, an API key a key (R-INST-3) |
+//! | `model/list` | krowk → codex | the efforts each model takes, so `--effort` lands on one it does |
+//! | `thread/start`, `thread/resume` | krowk → codex | the session's thread, in krowk's mode, with krowk's tools; resumed by the id the log's `backend.session` holds |
+//! | `turn/start` | krowk → codex | a prompt; the turn is everything up to its `turn/completed` |
+//! | `turn/steer` | krowk → codex | `Command::Steer`, into the running turn |
+//! | `turn/interrupt` | krowk → codex | `Command::Interrupt`; the process lives on for the next turn |
+//! | `item/*`, `thread/tokenUsage/updated` | codex → krowk | translated into krowk's events by `stream` (R-BACK-5) |
+//! | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, … | codex → krowk | answered by krowk's approval path (`approve_command`, `approve_file_change`) |
+//! | `item/tool/call` | codex → krowk | a call of krowk's own tools, answered by `crate::bridge` |
+//!
+//! **The mode.** Every mode but `bypassPermissions` runs Codex in its
+//! `read-only` sandbox with approvals `on-request` and krowk as the
+//! reviewer, so every edit and every command that needs more than reading
+//! is asked about, and `approve_*` answers it by krowk's rule;
+//! `bypassPermissions` is `danger-full-access` with no approvals. The mode
+//! is named on `thread/start` and `thread/resume`, so a default in Codex's
+//! config cannot loosen it, and a thread Codex reports in a looser sandbox,
+//! or with another reviewer, is stopped before a turn runs. What Codex's
+//! sandbox lets a command do without asking — read the disk, not write it
+//! — and what the user's own Codex rules allow by themselves, is Codex's to
+//! decide: the vendor behaving as its user set it up, as with every
+//! backend, and ticket 09's rules are where krowk takes that into account.
+//!
+//! **Compliance** (R-BACK-3) is structural: krowk starts the binary as the
+//! user installed it, as itself (client `krowk`), sends it no system
+//! prompt, never uses Codex's OAuth client and never opens Codex's login
+//! file — the login is Codex's, made by `codex login` and reported by
+//! `codex login status` and `account/read` (`auth`). A compliance test
+//! holds every source file and every run to that.
+
+pub mod auth;
+pub mod stream;
+
+use crate::bridge::{self, BridgeEnv};
+use crate::catalog::ModelInfo;
+use crate::engine::{cancelled, BoxFuture, Engine, EngineError, EngineEvent, Events, TurnContext, TurnEnd};
+use crate::instances::{Backend, Resolved};
+use crate::protocol::{Billing, Effort, Item, ItemKind, ModelRef, PermissionMode, WireApi};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use stream::Translator;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+
+/// The binary a `codex-app-server` instance runs when its definition names none.
+pub const BINARY: &str = "codex";
+/// The backend's name in the log.
+pub const BACKEND: &str = "codex-app-server";
+
+/// How long the process has to answer `initialize`: a cold start, not a
+/// binary that is not Codex.
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long `thread/start` may take: Codex starts the thread's MCP servers.
+const THREAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// After an interrupt, how long the turn waits for Codex's `turn/completed`
+/// before the process is stopped; the session continues on `thread/resume`.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(10);
+/// How long a process asked to exit (stdin closed) gets.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+/// How long a stopped process group gets between SIGTERM and SIGKILL.
+const TERM_GRACE: Duration = Duration::from_secs(2);
+/// After Codex exits, how long what it already wrote is read.
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
+/// How often a running turn looks for steering to pass on.
+const STEER_POLL: Duration = Duration::from_millis(100);
+/// The end of stderr kept for a failure's words.
+const STDERR_TAIL: usize = 4096;
+
+/// What a turn's context record says of the system prompt: it is Codex's,
+/// and krowk neither sees nor changes it.
+pub const SYSTEM_NOTE: &str = "(Codex's own system prompt: krowk sends none and does not see it)";
+
+/// The ambient variables a Codex process does not inherit unless its
+/// instance names them (`env`, `apiKeyEnv`): they are the native `openai`
+/// instance's key and base URL, and Codex's own key variable, and inherited
+/// they would move a ChatGPT account onto an API key or another server
+/// without anyone asking for it.
+pub const NOT_INHERITED: &[&str] = &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY"];
+
+/// What of `NOT_INHERITED` to remove for this instance.
+pub fn cleared(b: &Backend) -> impl Iterator<Item = &'static str> + '_ {
+    NOT_INHERITED.iter().copied().filter(|k| !b.env.contains_key(*k) && b.key.as_ref().is_none_or(|(to, _)| to != k))
+}
+
+/// The environment a Codex command gets on top of krowk's own: the
+/// inherited keys and base URL taken away, the home, the instance's `env`,
+/// and its key under the name its model provider reads.
+pub fn environment(b: &Backend) -> (Vec<&'static str>, Vec<(String, String)>) {
+    let mut set: Vec<(String, String)> = Vec::new();
+    if let Some(dir) = &b.config_dir {
+        set.push(("CODEX_HOME".into(), dir.display().to_string()));
+    }
+    set.extend(b.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    if let Some((to, key)) = &b.key {
+        set.push((to.clone(), key.clone()));
+    }
+    (cleared(b).collect(), set)
+}
+
+/// The whole argument list: `app-server` on stdio, then the instance's own.
+pub fn args(extra: &[String]) -> Vec<String> {
+    let mut a: Vec<String> = ["app-server", "--listen", "stdio://"].iter().map(|s| s.to_string()).collect();
+    a.extend(extra.iter().cloned());
+    a
+}
+
+/// Codex's approval policy and sandbox for a krowk mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Policy {
+    pub approval: &'static str,
+    pub sandbox: &'static str,
+}
+
+pub fn policy(mode: PermissionMode) -> Policy {
+    match mode {
+        PermissionMode::BypassPermissions => Policy { approval: "never", sandbox: "danger-full-access" },
+        _ => Policy { approval: "on-request", sandbox: "read-only" },
+    }
+}
+
+/// How much a sandbox Codex reports lets through, against the one asked
+/// for: read-only lets nothing be written, and anything this build does not
+/// know is taken for full access.
+fn sandbox_rank(kind: &str) -> u8 {
+    match kind {
+        "readOnly" | "read-only" => 0,
+        "workspaceWrite" | "workspace-write" => 1,
+        _ => 2,
+    }
+}
+
+/// `initialize`'s parameters: krowk as itself, never as a Codex client.
+pub fn initialize_params(krowk_version: &str) -> Value {
+    json!({"clientInfo": {"name": "krowk", "title": "krowk", "version": krowk_version}, "capabilities": {"experimentalApi": true}})
+}
+
+/// krowk's tools, as the thread's dynamic tools: one `krowk` namespace
+/// holding every tool the bridge exposes.
+pub fn dynamic_tools() -> Value {
+    let tools: Vec<Value> = bridge::EXPOSED.iter().map(|t| json!({"type": "function", "name": t.name, "description": t.description, "inputSchema": (t.input_schema)()})).collect();
+    json!([{"type": "namespace", "name": bridge::SERVER, "description": "krowk's own tools: what krowk knows about this session, and what it can do beyond this agent.", "tools": tools}])
+}
+
+/// The effort a turn is sent: the rung asked for, mapped onto the ones
+/// Codex's `model/list` says the model takes — else the catalog's or the
+/// family's — else sent as it is, for Codex to judge.
+pub fn effort_for(want: Option<Effort>, codex: Option<&[String]>, info: Option<&ModelInfo>, model: &str) -> Option<String> {
+    let want = want?;
+    let takes: Vec<Effort> = match codex {
+        Some(listed) => listed.iter().filter_map(|e| Effort::parse(e)).collect(),
+        None => crate::effort::supported(info, crate::toolset::family_from_id(model)),
+    };
+    if takes.is_empty() {
+        return Some(want.name().into());
+    }
+    crate::effort::map(want, &takes).map(|e| e.name().to_string())
+}
+
+/// A command Codex asks to run outside its read-only sandbox, answered
+/// until the permission system lands (ticket 9 replaces this evaluator): as
+/// in the native loop, running a command needs `bypassPermissions`.
+pub fn approve_command(mode: PermissionMode) -> Result<(), String> {
+    if mode == PermissionMode::BypassPermissions {
+        return Ok(());
+    }
+    Err("krowk declined the command: until krowk's permission rules land, commands beyond Codex's read-only sandbox run only when krowk is started with `--permission-mode bypassPermissions`".into())
+}
+
+/// A patch Codex asks to apply, by the files it names: the native loop's
+/// rule — edits need `acceptEdits`, reach only inside the working
+/// directory, and never into `.git`, `.codex`, `.claude` or the instance's
+/// own home (`protected`) — unless permissions are bypassed. A patch that
+/// asks for a whole root for the rest of the session is not granted one.
+pub fn approve_file_change(mode: PermissionMode, paths: Option<&[String]>, grant_root: Option<&str>, cwd: &Path, protected: &[PathBuf]) -> Result<(), String> {
+    if mode == PermissionMode::BypassPermissions {
+        return Ok(());
+    }
+    if mode != PermissionMode::AcceptEdits {
+        return Err("krowk declined the change: this session does not allow edits — until krowk's permission rules land, they run only when krowk is started with `--permission-mode acceptEdits` or `bypassPermissions`. Say what you would change instead.".into());
+    }
+    if let Some(root) = grant_root.filter(|r| !r.is_empty()) {
+        return Err(format!("krowk declined the change: it asked to write anywhere under {root} for the rest of the session, and krowk approves each change by its files"));
+    }
+    let paths = paths.filter(|p| !p.is_empty()).ok_or("krowk declined the change: it did not see which files the patch changes")?;
+    let scope = crate::tools::Scope { cwd: cwd.to_path_buf(), bypass: false, protected: protected.to_vec() };
+    for p in paths {
+        scope.edit_path(p).map_err(|e| format!("krowk declined the change: {e}"))?;
+    }
+    Ok(())
+}
+
+/// What a Codex account's home shares with the person's own Codex home:
+/// the configuration — settings, instructions, prompts, skills, rules —
+/// never the login, the threads or Codex's state. Each is a symlink, so an
+/// edit in one shows in every account.
+pub const SHARED: &[&str] = &["config.toml", "AGENTS.md", "AGENTS.override.md", "prompts", "skills", "rules"];
+
+/// Links what `own` has of `SHARED` into the account's `home`, leaving
+/// alone anything `home` already has, and says what `home` shares: an
+/// account's own login stays its own (R-INST-1's per-account home). Nothing
+/// is linked when the two are one directory.
+pub fn share(home: &Path, own: &Path) -> std::io::Result<Vec<String>> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if canon(home) == canon(own) {
+        return Ok(Vec::new());
+    }
+    let mut shared = Vec::new();
+    for name in SHARED {
+        let (from, to) = (own.join(name), home.join(name));
+        if from.symlink_metadata().is_err() {
+            continue;
+        }
+        match to.symlink_metadata() {
+            Err(_) => {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&from, &to)?;
+                #[cfg(not(unix))]
+                continue;
+            }
+            // Already this account's own, or already linked elsewhere.
+            Ok(m) if !m.file_type().is_symlink() || std::fs::read_link(&to).ok().as_deref() != Some(from.as_path()) => continue,
+            Ok(_) => {}
+        }
+        shared.push(name.to_string());
+    }
+    Ok(shared)
+}
+
+/// A JSON-RPC message from Codex.
+#[derive(Debug)]
+enum Msg {
+    Response { id: Value, result: Result<Value, String> },
+    Request { id: Value, method: String, params: Value },
+    Note { method: String, params: Value },
+}
+
+fn classify(mut v: Value) -> Option<Msg> {
+    let method = v.get("method").and_then(Value::as_str).map(String::from);
+    let params = v.get_mut("params").map(Value::take).unwrap_or(Value::Null);
+    match (method, v.get("id").cloned()) {
+        (Some(method), Some(id)) => Some(Msg::Request { id, method, params }),
+        (Some(method), None) => Some(Msg::Note { method, params }),
+        (None, Some(id)) => {
+            let result = match v.get("error") {
+                Some(e) => Err(e.get("message").and_then(Value::as_str).unwrap_or("no reason given").to_string()),
+                None => Ok(v.get_mut("result").map(Value::take).unwrap_or(Value::Null)),
+            };
+            Some(Msg::Response { id, result })
+        }
+        (None, None) => None,
+    }
+}
+
+fn str_of<'a>(v: &'a Value, k: &str) -> &'a str {
+    v.get(k).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// The fix for an instance with no login.
+fn sign_in_fix(instance: &str) -> String {
+    match instance.split_once(':') {
+        Some((_, name)) => format!("krowk providers add codex --name {name}"),
+        None => "krowk providers add codex".into(),
+    }
+}
+
+/// A turn Codex ended in failure, as krowk's error. A login gone stale is
+/// named as one, with the command that renews it.
+fn failure(err: &Value, instance: &str) -> EngineError {
+    let message = err.get("message").and_then(Value::as_str).unwrap_or("no reason given").trim().to_string();
+    let info = err.get("codexErrorInfo").cloned().unwrap_or(Value::Null);
+    let kind = info.as_str().map(String::from).or_else(|| info.as_object().and_then(|o| o.keys().next().cloned())).unwrap_or_default();
+    let status = info.as_object().and_then(|o| o.values().next()).and_then(|v| v.get("httpStatusCode")).and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()).unwrap_or(0);
+    if kind == "unauthorized" || status == 401 || message.contains("401 Unauthorized") {
+        return EngineError::new("not_authenticated", format!("Codex is not signed in for the {instance} instance ({message}) — sign in with `{}`, which runs Codex's own login", sign_in_fix(instance))).with_status(401);
+    }
+    match kind.as_str() {
+        "usageLimitExceeded" => EngineError::new("usage_limit", format!("the account behind {instance} has reached its Codex usage limit: {message}")).with_status(status),
+        "contextWindowExceeded" => EngineError::new("context_window_exceeded", format!("the conversation no longer fits the model's context window: {message}")),
+        _ => EngineError::new("backend_failed", format!("Codex could not finish the turn: {message}")).with_status(status),
+    }
+}
+
+/// The engine for one session on one `codex-app-server` instance. The host
+/// keeps it between turns, so the process it starts serves the whole
+/// session.
+pub struct CodexEngine {
+    instance: Resolved,
+    krowk_version: String,
+    proc: tokio::sync::Mutex<Option<Proc>>,
+}
+
+impl CodexEngine {
+    pub fn new(instance: Resolved, krowk_version: &str) -> Result<CodexEngine, EngineError> {
+        if instance.backend.is_none() {
+            return Err(EngineError::new("bad_config", format!("{} is not a Codex instance", instance.name)));
+        }
+        Ok(CodexEngine { instance, krowk_version: krowk_version.into(), proc: tokio::sync::Mutex::new(None) })
+    }
+
+    fn backend(&self) -> &Backend {
+        self.instance.backend.as_ref().expect("checked in new")
+    }
+}
+
+impl Engine for CodexEngine {
+    fn provider(&self) -> &str {
+        &self.instance.provider
+    }
+
+    fn wire_api(&self) -> WireApi {
+        WireApi::CodexAppServer
+    }
+
+    fn run_turn<'a>(&'a self, mut ctx: TurnContext, events: Events) -> BoxFuture<'a, Result<TurnEnd, EngineError>> {
+        Box::pin(async move {
+            let mut slot = self.proc.lock().await;
+            let bypass = ctx.permission_mode == PermissionMode::BypassPermissions;
+            let ask = Answers {
+                session_id: ctx.session_id.clone(),
+                turn_id: ctx.turn_id.clone(),
+                model: ctx.model.clone(),
+                cwd: ctx.cwd.clone(),
+                mode: ctx.permission_mode,
+                krowk_version: self.krowk_version.clone(),
+                protected: self.backend().home.iter().cloned().collect(),
+            };
+            // The running process serves this turn when it is alive and in
+            // the same sandbox; another mode is another thread setting,
+            // taken by a new process on `thread/resume`.
+            if let Some(p) = slot.as_mut()
+                && (!p.alive() || p.bypass != bypass)
+                && let Some(old) = slot.take()
+            {
+                old.shutdown().await;
+            }
+            if slot.is_none() {
+                *slot = Some(Proc::spawn(self.backend(), &ctx.cwd, bypass, &ask, &self.instance.name).await?);
+            }
+            let p = slot.as_mut().expect("spawned above");
+            let outcome = async {
+                // The thread: the one this process has open, else the
+                // session's to resume, else a new one.
+                let want = ctx.backend_session.clone();
+                if p.thread.is_none() || (want.is_some() && want != p.thread) {
+                    p.open_thread(want.as_deref(), &ctx, &ask, &self.instance.name).await?;
+                }
+                let prompt = match ctx.history.last().map(|h| &h.item) {
+                    Some(Item::UserText { text }) => text.clone(),
+                    _ => return Err(EngineError::new("empty_prompt", "a backend turn needs the prompt as its last item")),
+                };
+                p.turn(prompt, &mut ctx, &ask, &events, &self.instance.name).await
+            }
+            .await;
+            // A process that died, or a turn that failed partway, is not
+            // trusted with the next turn: that one starts clean on resume.
+            if (outcome.is_err() || !p.alive())
+                && let Some(old) = slot.take()
+            {
+                old.kill().await;
+            }
+            outcome
+        })
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(p) = self.proc.lock().await.take() {
+                p.shutdown().await;
+            }
+        })
+    }
+}
+
+/// What a request from Codex is answered with: the turn it arrived in.
+struct Answers {
+    session_id: String,
+    turn_id: String,
+    model: ModelRef,
+    cwd: PathBuf,
+    mode: PermissionMode,
+    krowk_version: String,
+    /// The instance's home: no edit reaches it.
+    protected: Vec<PathBuf>,
+}
+
+impl Answers {
+    /// The answer to one of Codex's requests: a result, or a JSON-RPC error.
+    fn answer(&self, method: &str, params: &Value, t: &mut Translator) -> Result<Value, (i64, String)> {
+        let item = str_of(params, "itemId").to_string();
+        // A decline's reason is kept for the call's result: Codex tells the
+        // model only that it was declined.
+        let decide = |t: &mut Translator, verdict: Result<(), String>| -> Value {
+            match verdict {
+                Ok(()) => json!({"decision": "accept"}),
+                Err(why) => {
+                    t.declined.insert(item.clone(), why);
+                    json!({"decision": "decline"})
+                }
+            }
+        };
+        match method {
+            "item/commandExecution/requestApproval" => Ok(decide(t, approve_command(self.mode))),
+            "item/fileChange/requestApproval" => {
+                let paths = t.changes.get(&item).cloned();
+                let verdict = approve_file_change(self.mode, paths.as_deref(), params.get("grantRoot").and_then(Value::as_str), &self.cwd, &self.protected);
+                Ok(decide(t, verdict))
+            }
+            // More sandbox for the rest of the turn: none is granted — what
+            // needs it is asked about call by call.
+            "item/permissions/requestApproval" => Ok(json!({"permissions": {}, "scope": "turn"})),
+            "item/tool/requestUserInput" => {
+                let answers: serde_json::Map<String, Value> = params
+                    .get("questions")
+                    .and_then(Value::as_array)
+                    .map(|qs| qs.iter().map(|q| (str_of(q, "id").to_string(), json!({"answers": ["krowk is running this turn without a person to ask: decide, say what you assumed, and carry on."]}))).collect())
+                    .unwrap_or_default();
+                Ok(json!({ "answers": answers }))
+            }
+            "mcpServer/elicitation/request" => Ok(json!({"action": "decline"})),
+            "item/tool/call" => Ok(self.tool_call(params)),
+            // The requests of Codex's first protocol, for a Codex that
+            // still sends them.
+            "applyPatchApproval" => {
+                let paths: Vec<String> = params.get("fileChanges").and_then(Value::as_object).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+                let verdict = approve_file_change(self.mode, Some(&paths), params.get("grantRoot").and_then(Value::as_str), &self.cwd, &self.protected);
+                Ok(json!({"decision": if verdict.is_ok() { "approved" } else { "denied" }}))
+            }
+            "execCommandApproval" => Ok(json!({"decision": if approve_command(self.mode).is_ok() { "approved" } else { "denied" }})),
+            m => Err((-32601, format!("krowk does not answer {m:?}"))),
+        }
+    }
+
+    /// A call of one of krowk's tools, run by the bridge as a `tools/call`.
+    fn tool_call(&self, params: &Value) -> Value {
+        let namespace = params.get("namespace").and_then(Value::as_str).unwrap_or_default();
+        let tool = str_of(params, "tool");
+        if namespace != bridge::SERVER {
+            return json!({"contentItems": [{"type": "inputText", "text": format!("krowk has no tool {tool:?} in the namespace {namespace:?} — its tools are in {:?}", bridge::SERVER)}], "success": false});
+        }
+        let env = BridgeEnv { session_id: &self.session_id, turn_id: &self.turn_id, model: &self.model, cwd: &self.cwd, backend: BACKEND, krowk_version: &self.krowk_version };
+        let call = json!({"jsonrpc": "2.0", "id": 0, "method": "tools/call", "params": {"name": tool, "arguments": params.get("arguments").cloned().unwrap_or(Value::Null)}});
+        let answer = bridge::handle(&call, &env);
+        let text = answer.pointer("/result/content").and_then(Value::as_array).map(|a| a.iter().filter_map(|c| c.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+        let failed = answer.pointer("/result/isError").and_then(Value::as_bool).unwrap_or(true);
+        json!({"contentItems": [{"type": "inputText", "text": text}], "success": !failed})
+    }
+}
+
+/// What a request krowk sent during a turn was.
+enum Pending {
+    TurnStart,
+    Steer(String),
+    Interrupt,
+}
+
+/// One running `codex app-server`.
+struct Proc {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    out: Lines<BufReader<ChildStdout>>,
+    stderr: Arc<Mutex<String>>,
+    binary: String,
+    /// Started in `danger-full-access` (krowk's bypassPermissions).
+    bypass: bool,
+    next: u64,
+    exited: bool,
+    /// The process group: Codex and whatever it started.
+    pid: Option<u32>,
+    /// The group was stopped and reaped; nothing is left to signal.
+    group_done: bool,
+    /// What `account/read` said the instance is billed to.
+    billing: Option<Billing>,
+    /// The efforts each model takes, from `model/list`.
+    efforts: HashMap<String, Vec<String>>,
+    /// The thread this process has open, and its transcript.
+    thread: Option<String>,
+    transcript: Option<String>,
+}
+
+#[cfg(unix)]
+fn signal_group(pid: Option<u32>, sig: i32) {
+    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 0) {
+        // SAFETY: a signal to the group this process made (process_group(0)).
+        unsafe {
+            libc::kill(-pid, sig);
+        }
+    }
+}
+
+impl Drop for Proc {
+    /// A process let go of without `shutdown` — a host dropped mid-turn — is
+    /// killed with everything it started, never left running.
+    fn drop(&mut self) {
+        if !self.group_done {
+            #[cfg(unix)]
+            signal_group(self.pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// The next JSON-RPC message, or none at the end of the stream. A line that
+/// is not JSON (a warning a wrapper printed) is skipped.
+async fn next_msg(out: &mut Lines<BufReader<ChildStdout>>) -> Option<Msg> {
+    loop {
+        match out.next_line().await {
+            Ok(Some(l)) => {
+                if let Some(m) = serde_json::from_str::<Value>(&l).ok().and_then(classify) {
+                    return Some(m);
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn tail(s: &str) -> String {
+    let s = s.trim();
+    let cut = s.char_indices().rev().nth(STDERR_TAIL).map(|(i, _)| i).unwrap_or(0);
+    s[cut..].to_string()
+}
+
+async fn forward(events: &Events, out: Vec<EngineEvent>) {
+    for ev in out {
+        let _ = events.send(ev).await;
+    }
+}
+
+/// A steer Codex took, as the `userText` item the log shows it as, where it
+/// landed.
+async fn steered(events: &Events, text: String) {
+    let id = krowk_store::new_id();
+    let _ = events.send(EngineEvent::ItemStarted { item_id: id.clone(), kind: ItemKind::UserText }).await;
+    let _ = events.send(EngineEvent::ItemCompleted { item_id: id, item: Item::UserText { text } }).await;
+}
+
+fn text_input(texts: &[String]) -> Value {
+    Value::Array(texts.iter().map(|t| json!({"type": "text", "text": t, "text_elements": []})).collect())
+}
+
+impl Proc {
+    async fn spawn(b: &Backend, cwd: &Path, bypass: bool, ask: &Answers, instance: &str) -> Result<Proc, EngineError> {
+        let mut cmd = tokio::process::Command::new(b.path.as_deref().unwrap_or(Path::new(&b.binary)));
+        cmd.args(args(&b.args)).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        let (remove, set) = environment(b);
+        for k in remove {
+            cmd.env_remove(k);
+        }
+        cmd.envs(set);
+        // Its own process group: a Ctrl-C at the terminal is krowk's to turn
+        // into an interrupt, not a signal that kills Codex mid-write.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                EngineError::new("backend_not_found", format!("{} was not found — install Codex (https://developers.openai.com/codex), or name the binary with `krowk providers add codex --binary <path>`", b.binary))
+            } else {
+                EngineError::new("backend_failed", format!("{} could not be started: {e}", b.binary))
+            }
+        })?;
+        let pid = child.id();
+        let stdin = child.stdin.take();
+        let out = BufReader::new(child.stdout.take().expect("piped")).lines();
+        let stderr = Arc::new(Mutex::new(String::new()));
+        if let Some(mut err) = child.stderr.take() {
+            let keep = stderr.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = err.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let mut s = keep.lock().unwrap_or_else(|e| e.into_inner());
+                    s.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if s.len() > 4 * STDERR_TAIL {
+                        let t = tail(&s);
+                        *s = t;
+                    }
+                }
+            });
+        }
+        let mut p = Proc { child, stdin, out, stderr, binary: b.binary.clone(), bypass, next: 0, exited: false, pid, group_done: false, billing: None, efforts: HashMap::new(), thread: None, transcript: None };
+        p.request("initialize", initialize_params(&ask.krowk_version), ask, INITIALIZE_TIMEOUT).await?;
+        p.notify("initialized").await?;
+        // Signed in, and to what, asked before a thread exists for a turn
+        // that could not run.
+        let account = p.request("account/read", json!({"refreshToken": false}), ask, INITIALIZE_TIMEOUT).await?;
+        p.billing = match account.pointer("/account/type").and_then(Value::as_str) {
+            Some("chatgpt") => Some(Billing::Subscription),
+            Some(_) => Some(Billing::ApiKey),
+            None => None,
+        };
+        if account.get("account").is_none_or(Value::is_null) && account.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(true) {
+            p.terminate().await;
+            return Err(EngineError::new("not_authenticated", format!("Codex is not signed in for the {instance} instance — sign in with `{}`, which runs Codex's own login", sign_in_fix(instance))).with_status(401));
+        }
+        // What each model takes; a Codex that cannot list them still runs.
+        if let Ok(list) = p.request("model/list", json!({}), ask, INITIALIZE_TIMEOUT).await {
+            for m in list.get("data").and_then(Value::as_array).into_iter().flatten() {
+                let efforts: Vec<String> = m.get("supportedReasoningEfforts").and_then(Value::as_array).map(|a| a.iter().map(|e| str_of(e, "reasoningEffort").to_string()).collect()).unwrap_or_default();
+                for key in [str_of(m, "id"), str_of(m, "model")] {
+                    if !key.is_empty() {
+                        p.efforts.insert(key.to_string(), efforts.clone());
+                    }
+                }
+            }
+        }
+        Ok(p)
+    }
+
+    fn alive(&mut self) -> bool {
+        !self.exited && matches!(self.child.try_wait(), Ok(None))
+    }
+
+    fn died(&mut self, while_doing: &str) -> EngineError {
+        self.exited = true;
+        let status = self.child.try_wait().ok().flatten().map(|s| format!(" ({s})")).unwrap_or_default();
+        let said = tail(&self.stderr.lock().unwrap_or_else(|e| e.into_inner()));
+        let said = if said.is_empty() { String::new() } else { format!(": {said}") };
+        EngineError::new("backend_exited", format!("codex app-server exited{status} {while_doing}{said} — the session is kept; continue it with --resume"))
+    }
+
+    async fn send(&mut self, v: &Value) -> Result<(), EngineError> {
+        let mut line = v.to_string();
+        line.push('\n');
+        let Some(stdin) = self.stdin.as_mut() else { return Err(self.died("before krowk could write to it")) };
+        if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+            return Err(self.died("while krowk was writing to it"));
+        }
+        Ok(())
+    }
+
+    /// Sends a request and returns its id.
+    async fn call(&mut self, method: &str, params: Value) -> Result<u64, EngineError> {
+        self.next += 1;
+        let id = self.next;
+        self.send(&json!({"id": id, "method": method, "params": params})).await?;
+        Ok(id)
+    }
+
+    async fn notify(&mut self, method: &str) -> Result<(), EngineError> {
+        self.send(&json!({ "method": method })).await
+    }
+
+    async fn reply(&mut self, id: Value, answer: Result<Value, (i64, String)>) -> Result<(), EngineError> {
+        match answer {
+            Ok(result) => self.send(&json!({"id": id, "result": result})).await,
+            Err((code, message)) => self.send(&json!({"id": id, "error": {"code": code, "message": message}})).await,
+        }
+    }
+
+    /// Sends a request and waits for its answer, answering Codex's own
+    /// requests meanwhile. Notifications before a turn are not the turn's.
+    async fn request(&mut self, method: &str, params: Value, ask: &Answers, within: Duration) -> Result<Value, EngineError> {
+        let id = self.call(method, params).await?;
+        let mut scratch = Translator::default();
+        let wait = async {
+            loop {
+                let Some(msg) = next_msg(&mut self.out).await else { return Err(self.died(&format!("before it answered {method}"))) };
+                match msg {
+                    Msg::Request { id, method, params } => {
+                        let answer = ask.answer(&method, &params, &mut scratch);
+                        self.reply(id, answer).await?;
+                    }
+                    Msg::Response { id: got, result } if got.as_u64() == Some(id) => {
+                        return result.map_err(|e| EngineError::new("backend_failed", format!("Codex refused {method}: {e}")));
+                    }
+                    _ => {}
+                }
+            }
+        };
+        match tokio::time::timeout(within, wait).await {
+            Ok(r) => r,
+            Err(_) => {
+                self.terminate().await;
+                Err(EngineError::new("backend_unresponsive", format!("{} did not answer {method} within {} seconds — is it Codex?", self.binary, within.as_secs())))
+            }
+        }
+    }
+
+    /// Starts the session's thread, or resumes the one the log names, in
+    /// krowk's mode and with krowk's tools; a thread Codex reports in a
+    /// looser sandbox, or with another reviewer than krowk, is refused.
+    async fn open_thread(&mut self, resume: Option<&str>, ctx: &TurnContext, ask: &Answers, instance: &str) -> Result<(), EngineError> {
+        let pol = policy(ctx.permission_mode);
+        let cwd = ctx.cwd.display().to_string();
+        let (method, params) = match resume {
+            Some(thread) => ("thread/resume", json!({"threadId": thread, "model": ctx.model.model, "cwd": cwd, "approvalPolicy": pol.approval, "approvalsReviewer": "user", "sandbox": pol.sandbox, "excludeTurns": true})),
+            None => ("thread/start", json!({"model": ctx.model.model, "cwd": cwd, "approvalPolicy": pol.approval, "approvalsReviewer": "user", "sandbox": pol.sandbox, "dynamicTools": dynamic_tools()})),
+        };
+        let r = match self.request(method, params, ask, THREAD_TIMEOUT).await {
+            Ok(r) => r,
+            Err(e) if resume.is_some() && e.code == "backend_failed" => {
+                return Err(EngineError::new("backend_resume_failed", format!("Codex on {instance} could not resume its thread {} ({}) — its home may have moved; start a new session", resume.unwrap_or_default(), e.message)));
+            }
+            Err(e) => return Err(e),
+        };
+        let sandbox = r.pointer("/sandbox/type").and_then(Value::as_str).unwrap_or_default();
+        let reviewer = str_of(&r, "approvalsReviewer");
+        if sandbox_rank(sandbox) > sandbox_rank(pol.sandbox) || (!reviewer.is_empty() && reviewer != "user") {
+            self.terminate().await;
+            return Err(EngineError::new(
+                "backend_permission_mode",
+                format!(
+                    "Codex on {instance} opened the thread in its `{sandbox}` sandbox with `{reviewer}` reviewing approvals, looser than krowk's `{}` for this turn, so krowk stopped it before it ran anything — check `sandbox_mode`, `approvals_reviewer` and any managed requirements in its config, and the instance's `args`",
+                    permission_name(ctx.permission_mode)
+                ),
+            ));
+        }
+        let thread = r.get("thread").cloned().unwrap_or(Value::Null);
+        let id = str_of(&thread, "id");
+        if id.is_empty() {
+            self.terminate().await;
+            return Err(EngineError::new("backend_failed", format!("Codex answered {method} without a thread id")));
+        }
+        self.thread = Some(id.to_string());
+        self.transcript = thread.get("path").and_then(Value::as_str).filter(|p| !p.is_empty()).map(String::from);
+        Ok(())
+    }
+
+    /// Runs one krowk turn: the prompt as a Codex turn, steering passed in
+    /// as it arrives, until Codex completes it with nothing left unread.
+    async fn turn(&mut self, prompt: String, ctx: &mut TurnContext, ask: &Answers, events: &Events, instance: &str) -> Result<TurnEnd, EngineError> {
+        let thread = self.thread.clone().expect("opened before a turn");
+        let _ = events.send(EngineEvent::Context { system: SYSTEM_NOTE.into(), tools: bridge::definitions() }).await;
+        let _ = events.send(EngineEvent::BackendSession { backend: BACKEND.into(), session_id: thread.clone(), transcript: self.transcript.clone(), billing: self.billing }).await;
+        let effort = effort_for(ctx.effort, self.efforts.get(&ctx.model.model).map(Vec::as_slice), ctx.model_info.as_ref(), &ctx.model.model);
+        let mut t = Translator::new(&ctx.model.model);
+        let mut input = vec![prompt];
+        let mut interrupted = false;
+        loop {
+            let mut params = json!({"threadId": thread, "input": text_input(&input), "model": ctx.model.model});
+            if let Some(e) = &effort {
+                params["effort"] = json!(e);
+            }
+            let mut pending: HashMap<u64, Pending> = HashMap::new();
+            pending.insert(self.call("turn/start", params).await?, Pending::TurnStart);
+            let mut codex_turn: Option<String> = None;
+            let mut want_interrupt = false;
+            let mut deadline: Option<tokio::time::Instant> = None;
+            let mut gone = false;
+            let mut drain: Option<tokio::time::Instant> = None;
+            let mut refused: Vec<String> = Vec::new();
+            let mut completed: Option<Value> = None;
+            let mut poll = tokio::time::interval(STEER_POLL);
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            while completed.is_none() || pending.values().any(|p| matches!(p, Pending::Steer(_))) {
+                let d = deadline;
+                let until = async move {
+                    match d {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let dr = drain;
+                let drained = async move {
+                    match dr {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let steering = codex_turn.is_some() && !interrupted && completed.is_none();
+                tokio::select! {
+                    biased;
+                    _ = cancelled(&mut ctx.cancel), if !interrupted => {
+                        interrupted = true;
+                        match codex_turn.clone() {
+                            Some(turn) => {
+                                pending.insert(self.call("turn/interrupt", json!({"threadId": thread, "turnId": turn})).await?, Pending::Interrupt);
+                            }
+                            None => want_interrupt = true,
+                        }
+                        deadline = Some(tokio::time::Instant::now() + INTERRUPT_GRACE);
+                    }
+                    _ = until => {
+                        // Codex did not stop in time: the process goes, the
+                        // turn keeps what it made, the session continues on
+                        // `thread/resume`.
+                        self.terminate().await;
+                        let mut out = Vec::new();
+                        t.finish(&mut out);
+                        forward(events, out).await;
+                        return Ok(TurnEnd::Interrupted);
+                    }
+                    // Codex exited — crashed, or was killed — while something
+                    // it started still holds its output open: what it wrote
+                    // is read for a moment, then the turn ends.
+                    _ = self.child.wait(), if !gone => {
+                        gone = true;
+                        drain = Some(tokio::time::Instant::now() + DRAIN_GRACE);
+                    }
+                    _ = drained => {
+                        let mut out = Vec::new();
+                        t.finish(&mut out);
+                        forward(events, out).await;
+                        let e = self.died("before the turn finished");
+                        return if interrupted { Ok(TurnEnd::Interrupted) } else { Err(e) };
+                    }
+                    _ = poll.tick(), if steering => {
+                        let turn = codex_turn.clone().expect("steering only once the turn has an id");
+                        for text in ctx.steers.take() {
+                            let id = self.call("turn/steer", json!({"threadId": thread, "expectedTurnId": turn, "input": text_input(std::slice::from_ref(&text))})).await?;
+                            pending.insert(id, Pending::Steer(text));
+                        }
+                    }
+                    msg = next_msg(&mut self.out) => {
+                        let Some(msg) = msg else {
+                            let mut out = Vec::new();
+                            t.finish(&mut out);
+                            forward(events, out).await;
+                            let e = self.died("before the turn finished");
+                            return if interrupted { Ok(TurnEnd::Interrupted) } else { Err(e) };
+                        };
+                        match msg {
+                            Msg::Response { id, result } => match id.as_u64().and_then(|id| pending.remove(&id)) {
+                                Some(Pending::TurnStart) => {
+                                    let r = result.map_err(|e| EngineError::new("backend_failed", format!("Codex refused the turn: {e}")))?;
+                                    if codex_turn.is_none() {
+                                        codex_turn = r.pointer("/turn/id").and_then(Value::as_str).map(String::from);
+                                    }
+                                    if want_interrupt && let Some(turn) = codex_turn.clone() {
+                                        want_interrupt = false;
+                                        pending.insert(self.call("turn/interrupt", json!({"threadId": thread, "turnId": turn})).await?, Pending::Interrupt);
+                                    }
+                                }
+                                // Taken into the running turn: logged where it
+                                // landed. Refused — the turn was ending — it is
+                                // the next Codex turn's input instead.
+                                Some(Pending::Steer(text)) => match result {
+                                    Ok(_) => steered(events, text).await,
+                                    Err(_) => refused.push(text),
+                                },
+                                Some(Pending::Interrupt) | None => {}
+                            },
+                            Msg::Request { id, method, params } => {
+                                let answer = ask.answer(&method, &params, &mut t);
+                                self.reply(id, answer).await?;
+                            }
+                            Msg::Note { method, params } => {
+                                // Another thread's — a subagent Codex runs — is
+                                // its own conversation, which Codex keeps.
+                                if params.get("threadId").and_then(Value::as_str).is_some_and(|th| th != thread) {
+                                    continue;
+                                }
+                                let of_turn = params.get("turnId").and_then(Value::as_str).or_else(|| params.pointer("/turn/id").and_then(Value::as_str));
+                                if let (Some(mine), Some(theirs)) = (&codex_turn, of_turn)
+                                    && mine != theirs
+                                {
+                                    continue;
+                                }
+                                match method.as_str() {
+                                    "turn/started" if codex_turn.is_none() => codex_turn = of_turn.map(String::from),
+                                    "turn/completed" => completed = Some(params.get("turn").cloned().unwrap_or(Value::Null)),
+                                    _ => forward(events, t.apply(&method, &params)).await,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let turn = completed.unwrap_or(Value::Null);
+            match str_of(&turn, "status") {
+                _ if interrupted => {
+                    let mut out = Vec::new();
+                    t.finish(&mut out);
+                    forward(events, out).await;
+                    return Ok(TurnEnd::Interrupted);
+                }
+                "interrupted" => {
+                    let mut out = Vec::new();
+                    t.finish(&mut out);
+                    forward(events, out).await;
+                    return Ok(TurnEnd::Interrupted);
+                }
+                "failed" => {
+                    let mut out = Vec::new();
+                    t.finish(&mut out);
+                    forward(events, out).await;
+                    let err = turn.get("error").filter(|e| !e.is_null()).cloned().or_else(|| t.error.clone()).unwrap_or_else(|| json!({"message": "no reason given"}));
+                    return Err(failure(&err, instance));
+                }
+                _ => {}
+            }
+            // Codex finished its turn. Steering it refused, and any that
+            // arrived since, is read by another Codex turn in this one; the
+            // turn ends only once nothing is waiting.
+            let mut more = refused;
+            more.extend(ctx.steers.take());
+            if more.is_empty() {
+                if ctx.steers.close_if_empty() {
+                    let mut out = Vec::new();
+                    t.finish(&mut out);
+                    forward(events, out).await;
+                    return Ok(TurnEnd::Completed);
+                }
+                more = ctx.steers.take();
+            }
+            for text in &more {
+                steered(events, text.clone()).await;
+            }
+            input = more;
+        }
+    }
+
+    /// Stops the whole process group — Codex and every shell and server it
+    /// started: SIGTERM, a moment to write what it was writing, then SIGKILL.
+    async fn terminate(&mut self) {
+        self.exited = true;
+        if self.group_done {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            signal_group(self.pid, libc::SIGTERM);
+            let _ = tokio::time::timeout(TERM_GRACE, self.child.wait()).await;
+            signal_group(self.pid, libc::SIGKILL);
+        }
+        let _ = self.child.kill().await;
+        self.group_done = true;
+    }
+
+    async fn kill(mut self) {
+        self.terminate().await;
+    }
+
+    /// Asks the process to exit by closing its stdin, gives it a moment, and
+    /// then stops what is left of its group, so nothing it started outlives
+    /// the session.
+    async fn shutdown(mut self) {
+        drop(self.stdin.take());
+        let _ = tokio::time::timeout(EXIT_GRACE, self.child.wait()).await;
+        self.terminate().await;
+    }
+}
+
+fn permission_name(m: PermissionMode) -> &'static str {
+    PermissionMode::NAMES[match m {
+        PermissionMode::Default => 0,
+        PermissionMode::AcceptEdits => 1,
+        PermissionMode::Plan => 2,
+        PermissionMode::BypassPermissions => 3,
+    }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r_back_3_the_process_is_app_server_on_stdio_in_krowks_mode() {
+        assert_eq!(args(&["-c".into(), "model_provider=openrouter".into()]).join(" "), "app-server --listen stdio:// -c model_provider=openrouter");
+        for m in [PermissionMode::Default, PermissionMode::Plan, PermissionMode::AcceptEdits] {
+            assert_eq!(policy(m), Policy { approval: "on-request", sandbox: "read-only" }, "every edit and command beyond reading is asked about");
+        }
+        assert_eq!(policy(PermissionMode::BypassPermissions), Policy { approval: "never", sandbox: "danger-full-access" });
+        assert!(sandbox_rank("workspaceWrite") > sandbox_rank("read-only") && sandbox_rank("dangerFullAccess") > sandbox_rank("workspace-write") && sandbox_rank("somethingNew") == sandbox_rank("danger-full-access"));
+        let init = initialize_params("1.2.3");
+        assert_eq!((init["clientInfo"]["name"].as_str(), init["capabilities"]["experimentalApi"].as_bool()), (Some("krowk"), Some(true)), "krowk as itself");
+        let tools = dynamic_tools();
+        assert_eq!((tools[0]["type"].as_str(), tools[0]["name"].as_str(), tools[0]["tools"][0]["name"].as_str()), (Some("namespace"), Some("krowk"), Some("session_info")));
+        // The environment: the native openai instance's key never reaches a
+        // ChatGPT account, unless the instance names it.
+        let mut b = Backend { binary: "codex".into(), path: None, config_dir: Some("/data/codex-team".into()), home: None, env: Default::default(), args: vec![], key: None };
+        assert_eq!(cleared(&b).collect::<Vec<_>>(), NOT_INHERITED);
+        b.key = Some(("OPENAI_API_KEY".into(), "sk-router".into()));
+        b.env.insert("OPENAI_BASE_URL".into(), "https://router.example/v1".into());
+        let (remove, set) = environment(&b);
+        assert_eq!(remove, ["CODEX_API_KEY"]);
+        assert_eq!(set, [("CODEX_HOME".to_string(), "/data/codex-team".to_string()), ("OPENAI_BASE_URL".into(), "https://router.example/v1".into()), ("OPENAI_API_KEY".into(), "sk-router".into())]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r_inst_1_an_accounts_home_shares_the_configuration_and_keeps_its_login() {
+        let base = std::env::temp_dir().join(format!("krowk-codex-share-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (own, team) = (base.join("own"), base.join("team"));
+        std::fs::create_dir_all(own.join("skills")).unwrap();
+        std::fs::create_dir_all(&team).unwrap();
+        std::fs::write(own.join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
+        std::fs::write(own.join("AGENTS.md"), "be brief\n").unwrap();
+        // The person's login and threads, which are theirs alone.
+        let login = ["auth", ".json"].concat();
+        std::fs::write(own.join(&login), "").unwrap();
+        std::fs::create_dir_all(own.join("sessions")).unwrap();
+        std::fs::write(team.join("AGENTS.md"), "the team's own\n").unwrap();
+        let shared = share(&team, &own).unwrap();
+        assert_eq!(shared, ["config.toml", "skills"], "what the account does not have of its own");
+        assert_eq!(std::fs::read_to_string(team.join("config.toml")).unwrap(), "model = \"gpt-5.5\"\n");
+        assert_eq!(std::fs::read_to_string(team.join("AGENTS.md")).unwrap(), "the team's own\n", "never replaced");
+        assert!(team.join(&login).symlink_metadata().is_err() && team.join("sessions").symlink_metadata().is_err(), "the login and the threads are not shared");
+        assert_eq!(share(&team, &own).unwrap(), shared, "adding the account again changes nothing");
+        assert!(share(&own, &own).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn r_back_3_effort_lands_on_a_rung_codex_says_the_model_takes() {
+        let listed: Vec<String> = ["low", "medium", "high", "xhigh"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(effort_for(Some(Effort::Max), Some(&listed), None, "gpt-5.5").as_deref(), Some("xhigh"));
+        assert_eq!(effort_for(Some(Effort::Minimal), Some(&listed), None, "gpt-5.5").as_deref(), Some("low"));
+        assert_eq!(effort_for(None, Some(&listed), None, "gpt-5.5"), None, "none asked, none sent: the thread's default");
+        assert_eq!(effort_for(Some(Effort::High), None, None, "mystery").as_deref(), Some("high"), "a model nobody lists is sent the rung as it is");
+    }
+
+    #[test]
+    fn r_back_3_approvals_follow_krowks_modes() {
+        let cwd = std::env::temp_dir().join(format!("krowk-codex-approve-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let f = |p: &str| vec![cwd.join(p).display().to_string()];
+        assert!(approve_command(PermissionMode::AcceptEdits).unwrap_err().contains("bypassPermissions"));
+        assert!(approve_command(PermissionMode::BypassPermissions).is_ok());
+        let ae = PermissionMode::AcceptEdits;
+        assert!(approve_file_change(PermissionMode::Default, Some(&f("a.txt")), None, &cwd, &[]).unwrap_err().contains("acceptEdits"));
+        assert!(approve_file_change(PermissionMode::Plan, Some(&f("a.txt")), None, &cwd, &[]).is_err());
+        assert!(approve_file_change(ae, Some(&f("a.txt")), None, &cwd, &[]).is_ok());
+        assert!(approve_file_change(ae, Some(&["/etc/passwd".to_string()]), None, &cwd, &[]).unwrap_err().contains("outside the working directory"));
+        for p in [".codex/config.toml", ".git/hooks/pre-commit", "sub/.CODEX/rules/x.rules", ".claude/settings.json"] {
+            assert!(approve_file_change(ae, Some(&f(p)), None, &cwd, &[]).is_err(), "{p}");
+        }
+        assert!(approve_file_change(ae, Some(&f("a.txt")), Some("/"), &cwd, &[]).unwrap_err().contains("rest of the session"));
+        assert!(approve_file_change(ae, None, None, &cwd, &[]).is_err(), "a patch whose files krowk did not see is not approved blind");
+        let home = cwd.join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(approve_file_change(ae, Some(&f("codex-home/config.toml")), None, &cwd, std::slice::from_ref(&home)).unwrap_err().contains("config directory"));
+        assert!(approve_file_change(PermissionMode::BypassPermissions, Some(&f(".codex/config.toml")), Some("/"), &cwd, &[home]).is_ok());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn r_back_3_codex_requests_are_answered_and_krowks_tools_run_through_the_bridge() {
+        let ask = Answers {
+            session_id: "s-1".into(),
+            turn_id: "t-1".into(),
+            model: ModelRef { instance: "codex:team".into(), model: "gpt-5.5".into() },
+            cwd: PathBuf::from("/repo"),
+            mode: PermissionMode::Default,
+            krowk_version: "test".into(),
+            protected: vec![],
+        };
+        let mut t = Translator::default();
+        let a = ask.answer("item/tool/call", &json!({"threadId": "th", "turnId": "tu", "callId": "c", "namespace": "krowk", "tool": "session_info", "arguments": {}}), &mut t).unwrap();
+        assert_eq!(a["success"], true);
+        let text = a["contentItems"][0]["text"].as_str().unwrap();
+        assert!(text.contains("krowk session: s-1") && text.contains("instance: codex:team") && text.contains("backend: codex-app-server"), "{text}");
+        assert_eq!(ask.answer("item/tool/call", &json!({"namespace": "other", "tool": "x", "arguments": {}}), &mut t).unwrap()["success"], false);
+        assert_eq!(ask.answer("item/commandExecution/requestApproval", &json!({"itemId": "c1"}), &mut t).unwrap()["decision"], "decline");
+        assert!(t.declined["c1"].contains("bypassPermissions"), "the reason is kept for the call's result");
+        assert_eq!(ask.answer("item/fileChange/requestApproval", &json!({"itemId": "f1"}), &mut t).unwrap()["decision"], "decline");
+        assert_eq!(ask.answer("item/permissions/requestApproval", &json!({"itemId": "p1"}), &mut t).unwrap(), json!({"permissions": {}, "scope": "turn"}));
+        assert_eq!(ask.answer("mcpServer/elicitation/request", &json!({}), &mut t).unwrap()["action"], "decline");
+        let q = ask.answer("item/tool/requestUserInput", &json!({"questions": [{"id": "q1", "header": "h", "question": "which?"}]}), &mut t).unwrap();
+        assert!(q["answers"]["q1"]["answers"][0].as_str().unwrap().contains("decide"));
+        assert_eq!(ask.answer("execCommandApproval", &json!({}), &mut t).unwrap()["decision"], "denied");
+        assert_eq!(ask.answer("account/chatgptAuthTokens/refresh", &json!({}), &mut t).unwrap_err().0, -32601, "krowk never handles Codex's tokens");
+    }
+
+    #[test]
+    fn r_back_3_a_failed_turn_names_a_stale_login_as_one() {
+        let e = failure(&json!({"message": "unexpected status 401 Unauthorized: Missing bearer", "codexErrorInfo": "other"}), "codex:team");
+        assert_eq!((e.code.as_str(), e.status), ("not_authenticated", 401));
+        assert!(e.message.contains("krowk providers add codex --name team"), "{}", e.message);
+        let e = failure(&json!({"message": "slow down", "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": 429}}}), "codex");
+        assert_eq!((e.code.as_str(), e.status), ("backend_failed", 429));
+        assert_eq!(failure(&json!({"message": "limit", "codexErrorInfo": "usageLimitExceeded"}), "codex").code, "usage_limit");
+        let m = |s: &str| classify(serde_json::from_str(s).unwrap()).unwrap();
+        assert!(matches!(m(r#"{"id":1,"result":{"ok":true}}"#), Msg::Response { result: Ok(_), .. }));
+        assert!(matches!(m(r#"{"id":2,"error":{"code":-32600,"message":"bad"}}"#), Msg::Response { result: Err(e), .. } if e == "bad"));
+        assert!(matches!(m(r#"{"id":0,"method":"item/tool/call","params":{}}"#), Msg::Request { .. }));
+        assert!(matches!(m(r#"{"method":"turn/started","params":{}}"#), Msg::Note { .. }));
+    }
+}

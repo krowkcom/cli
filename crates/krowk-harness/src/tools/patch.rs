@@ -106,9 +106,11 @@ fn parse(patch: &str) -> Result<Vec<Hunk>, String> {
     let mut hunks = Vec::new();
     let mut i = 0;
     let at = |i: usize| i + 2;
-    // A hunk header is read with the whitespace around it trimmed, as
-    // Codex reads it: a model indents one more often than it means to.
-    let header = |l: &str| [ADD, DELETE, UPDATE].iter().any(|h| l.trim_start().starts_with(h));
+    // A hunk's body ends at the first line whose first character is `*`,
+    // as in Codex: a context line starts with a space, so ` *** Add File:`
+    // is text in the file, never a header. The header line itself is read
+    // with the whitespace around it trimmed.
+    let header = |l: &str| l.starts_with('*') && l.trim() != EOF;
     while i < body.len() {
         let line = body[i].trim();
         if let Some(path) = line.strip_prefix(ADD) {
@@ -329,7 +331,7 @@ pub(super) fn apply(patch: &str, scope: &Scope) -> (String, bool) {
     let fail = |e: String| (format!("the patch does not apply, so nothing was changed: {e}"), true);
     // Every path the patch names, Move targets included, is held to the
     // same scope as any other file tool.
-    let at = |path: &str| scope.path(path);
+    let at = |path: &str| scope.edit_path(path);
     for h in &hunks {
         match h {
             Hunk::Add { path, lines } => {
@@ -466,12 +468,17 @@ mod tests {
         assert_eq!(chunks[0].old, ["    keep", "    old", ""]);
         assert_eq!(chunks[0].new, ["    keep", "    new", ""]);
         assert!(chunks[1].eof && chunks[1].context.is_none());
-        // Headers indented or trailed by whitespace are still headers, as
-        // Codex reads them.
-        let indented = parse("*** Begin Patch\n  *** Update File: a.rs  \n-x\n+y\n   *** Delete File: b.rs\n *** End Patch").unwrap();
-        assert_eq!(indented.len(), 2);
+        // A header line indented or trailed by whitespace is still a header,
+        // as Codex reads it; inside a hunk's body only a line starting `*`
+        // ends it, so an indented `*** …` there is a context line.
+        let indented = parse("*** Begin Patch\n  *** Update File: a.rs  \n-x\n+y\n*** Delete File: b.rs  \n  *** Add File: c.txt\n+c\n *** End Patch").unwrap();
+        assert_eq!(indented.len(), 3);
         assert!(matches!(&indented[0], Hunk::Update { path, .. } if path == "a.rs"));
         assert_eq!(indented[1], Hunk::Delete { path: "b.rs".into() });
+        assert_eq!(indented[2], Hunk::Add { path: "c.txt".into(), lines: vec!["c".into()] });
+        let context = parse("*** Begin Patch\n*** Update File: notes.md\n *** Add File: x\n-old\n+new\n*** End Patch").unwrap();
+        let Hunk::Update { chunks, .. } = &context[0] else { panic!() };
+        assert_eq!(chunks[0].old, ["*** Add File: x", "old"], "a context line that looks like a header is context");
         // Wrapped in the heredoc a model saw in training, it means the same.
         assert_eq!(parse("apply_patch <<'EOF'\n*** Begin Patch\n*** Delete File: x\n*** End Patch\nEOF").unwrap(), vec![Hunk::Delete { path: "x".into() }]);
         for (bad, says) in [
@@ -506,6 +513,11 @@ mod tests {
         // The @@ context picked the second `let x = 1;`, not the first.
         assert_eq!(std::fs::read_to_string(d.join("b.rs")).unwrap(), "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n\nfn other() {\n    let x = 2;\n}\n");
         assert!(!d.join("a.rs").exists() && !d.join("gone.txt").exists());
+        // A file whose text looks like a patch header is patched like any other.
+        std::fs::write(d.join("notes.md"), "*** Add File: x\nold\n").unwrap();
+        let (out, err) = run(APPLY_PATCH, &json!("*** Begin Patch\n*** Update File: notes.md\n *** Add File: x\n-old\n+new\n*** End Patch"), &env(&d)).await;
+        assert!(!err, "{out}");
+        assert_eq!(std::fs::read_to_string(d.join("notes.md")).unwrap(), "*** Add File: x\nnew\n");
         // A file too binary to edit is still deletable: a Delete never reads it.
         std::fs::write(d.join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
         let (out, err) = run(APPLY_PATCH, &json!("*** Begin Patch\n*** Delete File: blob.bin\n*** End Patch"), &env(&d)).await;

@@ -287,6 +287,31 @@ impl Scope {
     }
 }
 
+impl Scope {
+    /// `path`, for a tool that changes the file: also never anything inside
+    /// a `.git` directory, as spelled or as it leads, unless permissions are
+    /// bypassed. git runs what its config names (`core.fsmonitor`, hooks),
+    /// so a model that could write `.git/config` could run any command
+    /// without the bash permission. Codex keeps `.git` read-only for the
+    /// same reason.
+    pub fn edit_path(&self, path: &str) -> Result<PathBuf, String> {
+        let p = self.path(path)?;
+        if self.bypass {
+            return Ok(p);
+        }
+        let in_git = |q: &Path| q.components().any(|c| c.as_os_str() == ".git");
+        let real = real_path(&p, 0).unwrap_or_else(|_| p.clone());
+        let root = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+        if in_git(p.strip_prefix(&self.cwd).unwrap_or(&p)) || in_git(real.strip_prefix(&root).unwrap_or(&real)) {
+            return Err(format!(
+                "{} is inside a .git directory, which the file tools do not change: git runs what its config and hooks name, so it is left to git itself — use git through bash, or ask the person to rerun with `--permission-mode bypassPermissions`",
+                p.display()
+            ));
+        }
+        Ok(p)
+    }
+}
+
 /// Where a path leads once every symlink in it is followed, for a path
 /// that need not exist yet: the nearest part that exists is canonicalized,
 /// and the rest, which cannot hold a symlink, is appended. A dangling
@@ -335,6 +360,11 @@ pub(crate) fn stage(path: &Path, content: &[u8]) -> std::io::Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let target = target_of(path);
+    // A rename would replace a read-only file as readily as any other; the
+    // mode says it is not to be written, so it is not.
+    if std::fs::metadata(&target).is_ok_and(|m| m.permissions().readonly()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the file is read-only"));
+    }
     let dir = target.parent().unwrap_or(Path::new("."));
     let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = dir.join(format!(".{name}.krowk-{}-{}.tmp", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
@@ -552,7 +582,20 @@ async fn bash(i: &BashInput, cwd: &Path) -> (String, bool) {
     let timeout = i.timeout_ms.map_or(BASH_DEFAULT_TIMEOUT, Duration::from_millis).min(BASH_MAX_TIMEOUT);
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-c").arg(&i.command).current_dir(cwd);
-    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
+    // One pipe for both streams, as a terminal would have it: the model
+    // reads what the command printed in the order it printed it, which two
+    // pipes merged by whichever wakes first cannot promise.
+    #[cfg(unix)]
+    let merged = match std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w))) {
+        Ok((r, w1, w2)) => {
+            cmd.stdout(w1).stderr(w2);
+            r
+        }
+        Err(e) => return (format!("bash could not be started: {e}"), true),
+    };
+    #[cfg(not(unix))]
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
     // Its own process group, so a timeout or an interrupt kills what the
     // command started too, not just the shell.
@@ -563,11 +606,23 @@ async fn bash(i: &BashInput, cwd: &Path) -> (String, bool) {
         Err(e) => return (format!("bash could not be started: {e}"), true),
     };
     let mut group = GroupKill(child.id());
-    let (mut so, mut se) = (child.stdout.take().expect("piped"), child.stderr.take().expect("piped"));
+    // The command's copies of the write end go with it, so the pipe closes
+    // when the shell and what it started are done.
+    drop(cmd);
+    #[cfg(unix)]
+    let (mut so, mut se): (_, Option<tokio::process::ChildStderr>) = {
+        let std_out = std::process::ChildStdout::from(std::os::fd::OwnedFd::from(merged));
+        match tokio::process::ChildStdout::from_std(std_out) {
+            Ok(so) => (so, None),
+            Err(e) => return (format!("bash's output could not be read: {e}"), true),
+        }
+    };
+    #[cfg(not(unix))]
+    let (mut so, mut se) = (child.stdout.take().expect("piped"), child.stderr.take());
     let mut cap = Capture::new(BASH_MAX_OUTPUT);
     let run = async {
         let (mut b1, mut b2) = ([0u8; 8192], [0u8; 8192]);
-        let (mut so_open, mut se_open) = (true, true);
+        let (mut so_open, mut se_open) = (true, se.is_some());
         let mut status = None;
         let mut held_open = false;
         // Fixed once, when the shell exits: a background process that keeps
@@ -588,7 +643,12 @@ async fn bash(i: &BashInput, cwd: &Path) -> (String, bool) {
                     Ok(n) if n > 0 => cap.push(&b1[..n]),
                     _ => so_open = false,
                 },
-                r = se.read(&mut b2), if se_open => match r {
+                r = async {
+                    match se.as_mut() {
+                        Some(se) => se.read(&mut b2).await,
+                        None => std::future::pending().await,
+                    }
+                }, if se_open => match r {
                     Ok(n) if n > 0 => cap.push(&b2[..n]),
                     _ => se_open = false,
                 },
@@ -745,6 +805,76 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn nothing_inside_git_is_changed_and_git_runs_nothing_from_its_config() {
+        let d = dir("git-guard");
+        let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&d).status().is_ok_and(|s| s.success());
+        if !git(&["init", "-q"]) {
+            eprintln!("git is not installed: skipping");
+            return;
+        }
+        std::fs::write(d.join("a.txt"), "needle\n").unwrap();
+        // A hostile config: git would run this on ls-files and check-ignore.
+        let marker = d.join("fsmonitor-ran");
+        let config = std::fs::read_to_string(d.join(".git/config")).unwrap();
+        std::fs::write(d.join(".git/config"), format!("{config}[core]\n\tfsmonitor = \"touch '{}'; false\"\n", marker.display())).unwrap();
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::AcceptEdits, edit: EditTool::ApplyPatch };
+        assert_eq!(run(GREP, &json!({"pattern": "needle"}), &env).await, ("a.txt:1:needle\n".into(), false));
+        assert_eq!(run(GLOB, &json!({"pattern": "*.txt"}), &env).await, ("a.txt\n".into(), false));
+        assert!(!marker.exists(), "the repository's fsmonitor ran");
+
+        // And the model cannot write one: nothing under .git is changed.
+        let refused = |r: (String, bool)| r.1 && r.0.contains("inside a .git directory");
+        let before = std::fs::read_to_string(d.join(".git/config")).unwrap();
+        assert!(refused(run(WRITE, &json!({"path": ".git/config", "content": "[core]\n"}), &env).await));
+        assert!(refused(run(WRITE, &json!({"path": ".git/hooks/pre-commit", "content": "#!/bin/sh\n"}), &env).await));
+        assert!(refused(run(WRITE, &json!({"path": "sub/../.git/config", "content": "x"}), &env).await));
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n*** Move to: .git/moved\n-needle\n+x\n*** End Patch";
+        assert!(refused(run(APPLY_PATCH, &json!({ "input": patch }), &env).await));
+        let edit = ToolEnv { edit: EditTool::StrReplace, ..env };
+        assert!(refused(run(STR_REPLACE, &json!({"path": ".git/config", "old_str": "[core]", "new_str": "[x]"}), &edit).await));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(d.join(".git"), d.join("gitlink")).unwrap();
+            assert!(refused(run(WRITE, &json!({"path": "gitlink/config", "content": "x"}), &env).await), "judged by where it leads");
+        }
+        assert_eq!(std::fs::read_to_string(d.join(".git/config")).unwrap(), before);
+        assert!(!d.join(".git/hooks/pre-commit").exists() && !d.join(".git/moved").exists());
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "needle\n");
+        // Reading it is fine, and bypassed the fence is gone.
+        assert!(!run(READ, &json!({"path": ".git/config"}), &env).await.1);
+        let bypass = ToolEnv { permission_mode: PermissionMode::BypassPermissions, ..env };
+        assert!(!run(WRITE, &json!({"path": ".git/info/note", "content": "x"}), &bypass).await.1);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_read_only_file_is_not_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir("read-only");
+        let f = d.join("locked.txt");
+        std::fs::write(&f, "keep\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::BypassPermissions, edit: EditTool::StrReplace };
+        for (tool, input) in [
+            (WRITE, json!({"path": "locked.txt", "content": "gone"})),
+            (STR_REPLACE, json!({"path": "locked.txt", "old_str": "keep", "new_str": "gone"})),
+        ] {
+            let (out, err) = run(tool, &input, &env).await;
+            assert!(err && out.contains("read-only"), "{tool}: {out}");
+        }
+        let patch = ToolEnv { edit: EditTool::ApplyPatch, ..env };
+        let (out, err) = run(APPLY_PATCH, &json!("*** Begin Patch\n*** Add File: new.txt\n+n\n*** Update File: locked.txt\n-keep\n+gone\n*** End Patch"), &patch).await;
+        assert!(err && out.contains("read-only") && out.contains("nothing was changed"), "{out}");
+        assert!(!d.join("new.txt").exists(), "the staged Add was not renamed into place");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "keep\n");
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o444);
+        let left: Vec<_> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, ["locked.txt"], "no temporary file is left behind");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn only_the_turns_edit_tool_runs() {
         let d = dir("edit-gate");
         std::fs::write(d.join("a.txt"), "x\n").unwrap();
@@ -806,6 +936,12 @@ mod tests {
         assert!(refused.1 && refused.0.contains("bypassPermissions"), "{refused:?}");
         let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::BypassPermissions, edit: EditTool::StrReplace };
         assert_eq!(run(BASH, &json!({"command": "echo hi; echo oops >&2"}), &env).await, ("hi\noops\nexit code 0".into(), false));
+        // One pipe: stdout and stderr arrive in the order they were written.
+        let interleaved = "for i in 1 2 3 4 5 6 7 8; do echo out$i; echo err$i >&2; done";
+        let want = (1..=8).map(|i| format!("out{i}\nerr{i}\n")).collect::<String>() + "exit code 0";
+        for _ in 0..20 {
+            assert_eq!(run(BASH, &json!({ "command": interleaved }), &env).await, (want.clone(), false));
+        }
         assert_eq!(run(BASH, &json!({"command": "exit 3"}), &env).await, ("exit code 3".into(), true));
         let started = std::time::Instant::now();
         let (out, err) = run(BASH, &json!({"command": "sleep 5 & sleep 5", "timeout_ms": 200}), &env).await;

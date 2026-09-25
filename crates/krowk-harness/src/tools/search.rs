@@ -75,15 +75,23 @@ fn walk(root: &Path, deadline: Instant) -> Walk {
     w
 }
 
+/// git, run so that nothing in the repository's config runs with it:
+/// `core.fsmonitor` names a command git executes on `ls-files` and
+/// `check-ignore`, and a repository is a directory the model may have been
+/// handed. No optional locks either: a search never writes the index.
+fn git(root: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new("git");
+    c.args(["-c", "core.fsmonitor=false", "--no-optional-locks"]).current_dir(root).stdin(std::process::Stdio::null());
+    c
+}
+
 /// Whether git ignores `root` itself, or a directory it is in.
 fn ignored(root: &Path) -> bool {
-    std::process::Command::new("git")
+    git(root)
         .arg("check-ignore")
         .arg("-q")
         .arg("--")
         .arg(root)
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -91,10 +99,8 @@ fn ignored(root: &Path) -> bool {
 }
 
 fn git_files(root: &Path) -> Option<Walk> {
-    let out = std::process::Command::new("git")
+    let out = git(root)
         .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;

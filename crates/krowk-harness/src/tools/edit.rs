@@ -58,7 +58,7 @@ pub struct SearchReplaceInput {
 }
 
 pub(super) fn write(i: &WriteInput, scope: &Scope) -> (String, bool) {
-    let path = match scope.path(&i.path) {
+    let path = match scope.edit_path(&i.path) {
         Ok(p) => p,
         Err(e) => return (e, true),
     };
@@ -108,7 +108,7 @@ pub(super) fn read_text(path: &Path, tool: &str) -> Result<String, String> {
 }
 
 pub(super) fn replace(r: &Replace<'_>, scope: &Scope) -> (String, bool) {
-    let path = match scope.path(r.path) {
+    let path = match scope.edit_path(r.path) {
         Ok(p) => p,
         Err(e) => return (e, true),
     };

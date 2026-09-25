@@ -81,7 +81,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   id, and Ctrl-C stops a turn and keeps what it made. Its `bash` tool runs
   only under `--permission-mode bypassPermissions` until permission rules
   land, and is refused with a reason the model can read otherwise (its
-  other tools are below). Prompt caching is on by default.
+  other tools are below). Its output is the command's stdout and stderr
+  through one pipe, in the order they were written. Prompt caching is on by default.
 - **`krowk -p`'s agent can change files, in the edit format its model was
   trained on.** Beside `read` and `bash` it now has `write`, `grep`, `glob`
   and one edit tool: `str_replace` for Claude models, `apply_patch` (the
@@ -98,8 +99,11 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `grep` and `glob` included — reaches only inside the working directory,
   judged by where a path really leads (`..`, absolute paths and symlinks
   that point out are refused), unless krowk runs with `bypassPermissions`.
-  Edits are written to a temporary file and renamed into place, keeping
-  the file's permissions, so a failure never leaves half a file. Each turn's `context.jsonl`
+  Nothing inside a `.git` directory is changed by them either (git runs
+  what its config and hooks name), and a read-only file is refused rather
+  than replaced. Edits are written to a temporary file and renamed into
+  place, keeping the file's permissions, so a failure never leaves half a
+  file. Each turn's `context.jsonl`
   record now names its `toolset` and estimates the system prompt's and
   tools' size in tokens (`systemTokens`, `toolsTokens`, at four bytes a
   token).

@@ -97,7 +97,9 @@ fn retry_delay(r: &reqwest::Response, attempt: u32) -> Duration {
 /// `{"error": "…"}`, or `{"message": "…"}` — else the body's start.
 pub async fn refusal(r: reqwest::Response) -> (u16, String) {
     let status = r.status().as_u16();
-    let body = r.text().await.unwrap_or_default();
+    // An error body is a sentence, not a stream: one that does not arrive
+    // promptly is not worth holding the turn (or an interrupt) for.
+    let body = tokio::time::timeout(Duration::from_secs(10), r.text()).await.ok().and_then(Result::ok).unwrap_or_default();
     let said = serde_json::from_str::<Value>(&body).ok().and_then(|v| {
         let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(String::from);
         let (kind, message) = match v.get("error") {

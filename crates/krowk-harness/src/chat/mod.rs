@@ -226,7 +226,15 @@ impl ModelClient for ChatClient {
             // An OAuth token the server refuses is refreshed once, whatever
             // its expiry said: the server's clock and ours may disagree.
             for refresh in [false, true] {
-                let token = self.token(refresh).await?;
+                // Getting a token can wait on another krowk's refresh and on
+                // the token endpoint: an interrupt ends that wait too.
+                let mut cancel_wait = cancel.clone();
+                let token = tokio::select! {
+                    t = self.token(refresh) => t?,
+                    _ = crate::engine::cancelled(&mut cancel_wait) => {
+                        return Ok(ModelResponse { model: req.model.clone(), interrupted: true, ..ModelResponse::default() });
+                    }
+                };
                 let build = || {
                     let mut r = self
                         .http

@@ -190,3 +190,67 @@ async fn r_prov_4_metadata_naming_another_issuer_is_refused() {
     assert!(oauth::discover(&http, &format!("{}/", auth.mock.url)).await.is_ok());
     assert!(auth.mock.seen.lock().unwrap().iter().all(|s| s.path.starts_with("/.well-known/")), "nothing but metadata was asked of it");
 }
+
+/// An interrupt lands while a SuperGrok call is still getting its token —
+/// waiting on another krowk's refresh, or on a slow token endpoint — and
+/// the call returns interrupted at once rather than after the wait.
+#[test]
+fn r_prov_4_an_interrupt_during_a_slow_refresh_returns_promptly() {
+    use krowk_harness::chat::{ChatClient, Credential};
+    use krowk_harness::instances::{InstanceKind, InstancesConfig, Registry};
+    use krowk_harness::native::{ModelClient, ModelRequest};
+    use std::time::{Duration, Instant};
+
+    let auth = providers::auth_server(3600);
+    let d = dir("interrupt");
+    let store = Store::new(d.join(oauth::CREDENTIALS_FILE));
+    let rt = || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let http = krowk_harness::http::client().unwrap();
+    let mut first = rt().block_on(oauth::login_device(&http, &login(&auth.mock.url), &mut |_| {})).unwrap();
+    first.expires_at_ms = Some(0);
+    store.save("supergrok", &first).unwrap();
+    auth.state.lock().unwrap().refresh_delay_ms = 3000;
+
+    let cfg = InstancesConfig {
+        instances: [("supergrok".to_string(), InstanceKind::XaiOauth { base_url: Some("http://127.0.0.1:9".into()), issuer: Some(auth.mock.url.clone()), client_id: None, scope: None, effort: None })].into(),
+        ..InstancesConfig::default()
+    };
+    let instance = Registry::resolve(&cfg, &|_| String::new()).get("supergrok").unwrap().clone();
+    let interrupted_after = |label: &str| {
+        let client = ChatClient::new(instance.clone(), Credential::OAuth(std::sync::Arc::new(Tokens::open(store.clone(), "supergrok").unwrap())), "test").unwrap();
+        let req = ModelRequest { model: "grok-4.7".into(), system: "s".into(), ..ModelRequest::default() };
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let flip = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = cancel_tx.send(true);
+            cancel_tx
+        });
+        let started = Instant::now();
+        let resp = rt().block_on(client.stream(&req, &tx, cancel)).unwrap();
+        let took = started.elapsed();
+        drop(flip.join());
+        assert!(resp.interrupted, "{label}: the call reports the interrupt");
+        assert!(took < Duration::from_millis(1500), "{label}: returned {took:?} after starting, not after the wait");
+    };
+
+    // Another krowk is refreshing, and holds the store's lock for 3 s.
+    let other = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            let tokens = Tokens::open(store, "supergrok").unwrap();
+            let http = krowk_harness::http::client().unwrap();
+            rt().block_on(tokens.bearer(&http, false)).unwrap()
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    interrupted_after("waiting on the lock");
+    assert_eq!(other.join().unwrap(), "xai-at-2");
+
+    // This session's own refresh is the slow one.
+    let mut expired = store.load("supergrok").unwrap().unwrap();
+    expired.expires_at_ms = Some(0);
+    store.save("supergrok", &expired).unwrap();
+    interrupted_after("waiting on the token endpoint");
+    let _ = std::fs::remove_dir_all(&d);
+}

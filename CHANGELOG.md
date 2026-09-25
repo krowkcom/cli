@@ -102,11 +102,14 @@ the versions are the `v*` tags a release is cut from. Entries land under
   mode, `bypassPermissions` included**, and a command line is judged the way
   the shell runs it: `git status && rm -rf x` is two commands, `sudo rm`,
   `bash -c 'rm …'` and `find -delete` still meet `Bash(rm:*)`, and an allow
-  rule never covers a line that writes a file through `>`, nor a git
-  told to run a program (`git -c …`, a `git config` that sets anything,
-  `--upload-pack`/`--receive-pack`/`--exec`, `rebase -x`, `bisect run`,
-  `submodule foreach`, `difftool -x`) — `Bash(git:*)` still covers
-  `git log` and `git config --get`. A command whose program name the shell computes (`$X`,
+  rule never covers a line that writes a file through `>`. **Git is
+  allowed fail-closed**: `Bash(git:*)` covers a git command only when its
+  global options, and the options of any subcommand that can run a program
+  or install hooks (`clone`, `fetch`, `push`, `rebase`, `grep`, `config`,
+  …), are all on a known-safe list — anything else, abbreviated or
+  bundled, is asked about. `git log`, `git status`, `git commit -m`,
+  `git push -u origin main`, `git clone <url>`, `git grep x` and
+  `git config --get` are still covered. A command whose program name the shell computes (`$X`,
   `$(printf rm)`, `r{m,}`) is asked about whenever a `Bash` deny rule
   applies, even under `bypassPermissions`, and refused by `krowk -p`. Plan mode
   refuses every edit and command. `bash` now runs in `default` and
@@ -121,7 +124,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   the file.
 - **The TUI asks before a call its rules do not allow.** A command, an
   edit in the default mode, or anything reaching outside the working
-  directory shows over the prompt with why it is asked: `y` allows it once,
+  directory shows over the prompt with why it is asked (a long one cut to
+  fit is printed whole with `v` before it can be allowed): `y` allows it once,
   `s` for the rest of the session, `p` for this project from now on
   (remembered in krowk's own `permissions.json`), `n` or Esc refuses it.
   The request is part of krowk's protocol (`approval.requested`, answered

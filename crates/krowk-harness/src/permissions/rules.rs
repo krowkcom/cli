@@ -33,9 +33,11 @@
 //!
 //! An allow rule allows a line only when it allows every one of its
 //! commands, never one that writes a file through a redirection (`>`,
-//! `>>`, `>|`, `&>`, `<>`), never a git told to run a program (see
-//! `uncoverable`: `-c`, a `config` write, transport programs, `rebase -x`,
-//! `bisect run`, `submodule foreach`, `difftool -x`, aliases), and a
+//! `>>`, `>|`, `&>`, `<>`), and git only in forms known to run nothing:
+//! git is judged fail-closed (see `uncoverable`) — its global options, and
+//! the options of every subcommand that can run a program or install hooks,
+//! must be on a known-safe list, so an option krowk does not know, however
+//! abbreviated or bundled, keeps an allow rule from covering it. A
 //! login shell around one command line (`bash -lc '…'`, as Codex runs
 //! commands) is judged by that line. A deny rule denies the line when it
 //! matches any one command — as written, and again with what only wraps a
@@ -963,21 +965,28 @@ fn allow_units(cmd: &str, depth: usize) -> Option<Vec<Simple>> {
     Some(out)
 }
 
-/// A command no allow rule covers, whatever it says: a git that is told —
-/// now, or for later — to run a program. `Bash(git:*)` allows git; it does
-/// not stretch to git running whatever it is handed:
+/// A command no allow rule covers, whatever it says. Today that is git,
+/// judged **fail-closed**: git has many ways to be told to run a program —
+/// config on its command line, a remote-side program, an exec step, a
+/// pager, a template directory of hooks — and new ones arrive with new
+/// versions, so rather than list the dangerous forms, krowk lists the safe
+/// ones. `Bash(git:*)` covers a git line only when
 ///
-/// - global options that set config or where git's programs are: `-c`,
-///   `--config-env`, `--exec-path=…`;
-/// - `git config` anything but a read (`--get*`, `--list`/`-l`, `get`,
-///   `list`, or one key and no value): a key can name a program (a pager,
-///   an editor, `core.fsmonitor`, `core.hooksPath`, an alias);
-/// - a program for the other end of a transport: `--upload-pack`,
-///   `--receive-pack`, `--exec` (fetch, pull, push, clone, ls-remote,
-///   archive), and `-u` for clone and ls-remote;
-/// - `rebase -x`/`--exec`, `bisect run`, `submodule foreach`, `difftool
-///   -x`/`--extcmd`;
-/// - any argument that names an alias (`alias.*`).
+/// - every global option before the subcommand is one git defines as
+///   harmless (`-C <dir>`, `--no-pager`, `--git-dir=…`, …) — so `-c`,
+///   `--config-env`, `--exec-path` and anything krowk does not know are not;
+/// - for a subcommand that can run a program or install hooks (`clone`,
+///   `init`, `fetch`, `pull`, `push`, `ls-remote`, `archive`, `rebase`,
+///   `grep`, `difftool`, `mergetool`, `config`, `am`, `bisect`, `submodule`,
+///   `help`), every option is on that subcommand's short safe list; some
+///   (`filter-branch`, `send-email`, `instaweb`, `daemon`) are never
+///   covered;
+/// - no argument names an alias (`alias.*`).
+///
+/// An option is known only as spelled in a list: git also takes a unique
+/// prefix of a long option (`--up` for `--upload-pack`), and a prefix is
+/// not on any list, so it fails closed. A bundle of short flags (`-ax`) is
+/// read letter by letter, and a letter that takes a value takes the rest.
 fn uncoverable(words: &[String]) -> bool {
     let Some(prog) = words.first() else { return false };
     if basename(prog) != "git" {
@@ -987,51 +996,193 @@ fn uncoverable(words: &[String]) -> bool {
     if args.iter().any(|a| a.starts_with("alias.") || a.contains(".alias.")) {
         return true;
     }
-    // The global options, up to the subcommand.
     let mut i = 0;
     while let Some(a) = args.get(i) {
         if !a.starts_with('-') {
             break;
         }
-        if a == "-c" || (a.starts_with("-c") && !a.starts_with("--")) || a.starts_with("--config-env") || a.starts_with("--exec-path=") {
-            return true;
+        match known(a, GLOBAL) {
+            Some(Takes::Next) => i += 2,
+            Some(_) => i += 1,
+            None => return true,
         }
-        // These take a value in the next word.
-        i += if matches!(a.as_str(), "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix") { 2 } else { 1 };
     }
     let Some(sub) = args.get(i) else { return false };
     let rest = &args[i + 1..];
-    let has = |names: &[&str]| rest.iter().any(|a| names.iter().any(|n| a == n || (n.starts_with("--") && a.starts_with(&format!("{n}=")))));
+    let opts = match sub.as_str() {
+        "filter-branch" | "send-email" | "instaweb" | "daemon" | "cvsserver" | "shell" | "upload-pack" | "receive-pack" | "upload-archive" | "remote-ext" | "web--browse" => return true,
+        "clone" => CLONE,
+        "init" => INIT,
+        "fetch" => FETCH,
+        "pull" => PULL,
+        "push" => PUSH,
+        "ls-remote" => LS_REMOTE,
+        "archive" => ARCHIVE,
+        "rebase" => REBASE,
+        "grep" => GREP,
+        "difftool" | "mergetool" => TOOL,
+        "config" => CONFIG,
+        "am" => AM,
+        "bisect" => BISECT,
+        "submodule" => SUBMODULE,
+        "help" => HELP,
+        // Everything else runs no program krowk's model could name.
+        _ => return false,
+    };
+    let Some(positional) = options(rest, opts) else { return true };
     match sub.as_str() {
+        // Only reads: `--get*`/`--list`, `get`/`list`, or one key alone.
         "config" => {
-            let writes = ["--add", "--replace-all", "--unset", "--unset-all", "--rename-section", "--remove-section", "-e", "--edit"];
-            if has(&writes) {
-                return true;
-            }
-            let reads = ["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color", "--get-colorbool", "--list", "-l"];
-            // What is left once the options are: a subcommand, keys, values.
-            let takes_value = ["-f", "--file", "--blob", "--type", "--default", "--comment"];
-            let mut positional = Vec::new();
-            let mut j = 0;
-            while let Some(a) = rest.get(j) {
-                if a.starts_with('-') {
-                    j += if takes_value.contains(&a.as_str()) { 2 } else { 1 };
-                } else {
-                    positional.push(a.as_str());
-                    j += 1;
-                }
-            }
-            let read = has(&reads) || matches!(positional.first(), Some(&"get") | Some(&"list")) || (positional.len() == 1 && !matches!(positional[0], "set" | "unset" | "rename-section" | "remove-section" | "edit"));
+            let read_flag = rest.iter().any(|a| a.starts_with("--get") || a == "--list" || a == "-l");
+            let read = read_flag || matches!(positional.first().map(String::as_str), Some("get" | "list")) || (positional.len() == 1 && !matches!(positional[0].as_str(), "set" | "unset" | "rename-section" | "remove-section" | "edit"));
             !read
         }
-        "fetch" | "pull" | "push" | "archive" => has(&["--upload-pack", "--receive-pack", "--exec"]),
-        "clone" | "ls-remote" => has(&["--upload-pack", "--receive-pack", "--exec", "-u"]),
-        "rebase" => has(&["-x", "--exec"]) || rest.iter().any(|a| a.starts_with("-x") && a.len() > 2),
-        "bisect" => rest.first().is_some_and(|a| a == "run"),
-        "submodule" => rest.iter().any(|a| a == "foreach"),
-        "difftool" => has(&["-x", "--extcmd"]),
+        "bisect" => !matches!(positional.first().map(String::as_str), None | Some("start" | "good" | "bad" | "new" | "old" | "skip" | "reset" | "log" | "terms")),
+        "submodule" => !matches!(positional.first().map(String::as_str), None | Some("status" | "init" | "deinit" | "update" | "sync" | "summary" | "absorbgitdirs" | "set-branch" | "set-url" | "add")),
         _ => false,
     }
+}
+
+/// What a known option takes.
+#[derive(Clone, Copy, PartialEq)]
+enum Takes {
+    Nothing,
+    /// A value, in the next word or after `=` (long) or in the same word
+    /// (short).
+    Next,
+    /// A value after `=` only, or none (`--rebase`, `--rebase=merges`).
+    Optional,
+}
+
+/// A subcommand's safe options: short letters taking nothing, short
+/// letters taking a value, long options taking nothing, taking a value,
+/// taking one optionally.
+struct Safe {
+    flags: &'static str,
+    valued: &'static str,
+    long: &'static [&'static str],
+    long_valued: &'static [&'static str],
+    long_optional: &'static [&'static str],
+}
+
+const GLOBAL: &Safe = &Safe {
+    flags: "pPv",
+    valued: "C",
+    long: &["--no-pager", "--paginate", "--bare", "--no-replace-objects", "--no-lazy-fetch", "--no-optional-locks", "--no-advice", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--version", "--help", "--html-path", "--man-path", "--info-path"],
+    long_valued: &["--git-dir", "--work-tree", "--namespace", "--super-prefix", "--attr-source", "--list-cmds"],
+    long_optional: &[],
+};
+const CLONE: &Safe = &Safe {
+    flags: "qvnsl",
+    valued: "bo",
+    long: &["--quiet", "--verbose", "--progress", "--no-progress", "--no-checkout", "--bare", "--mirror", "--single-branch", "--no-single-branch", "--no-tags", "--sparse", "--reject-shallow", "--no-reject-shallow", "--local", "--no-hardlinks", "--shared", "--dissociate"],
+    long_valued: &["--depth", "--shallow-since", "--shallow-exclude", "--branch", "--origin", "--filter", "--revision", "--bundle-uri"],
+    long_optional: &[],
+};
+const INIT: &Safe = &Safe { flags: "q", valued: "b", long: &["--quiet", "--bare"], long_valued: &["--initial-branch", "--object-format", "--ref-format"], long_optional: &[] };
+const FETCH: &Safe = &Safe {
+    flags: "qvpPtnfa",
+    valued: "j",
+    long: &["--quiet", "--verbose", "--all", "--prune", "--no-prune", "--prune-tags", "--tags", "--no-tags", "--unshallow", "--dry-run", "--force", "--atomic", "--append", "--progress", "--no-progress", "--multiple", "--set-upstream", "--no-recurse-submodules", "--no-write-fetch-head", "--write-fetch-head", "--porcelain"],
+    long_valued: &["--depth", "--deepen", "--shallow-since", "--shallow-exclude", "--jobs", "--filter", "--refmap"],
+    long_optional: &[],
+};
+const PULL: &Safe = &Safe {
+    flags: "qvrpt",
+    valued: "j",
+    long: &["--quiet", "--verbose", "--no-rebase", "--ff", "--no-ff", "--ff-only", "--squash", "--no-squash", "--commit", "--no-commit", "--stat", "--no-stat", "--autostash", "--no-autostash", "--all", "--prune", "--tags", "--no-tags", "--unshallow", "--progress", "--no-progress", "--dry-run", "--no-recurse-submodules"],
+    long_valued: &["--depth", "--deepen", "--shallow-since", "--jobs"],
+    long_optional: &["--rebase"],
+};
+const PUSH: &Safe = &Safe {
+    flags: "ufdnqv",
+    valued: "o",
+    long: &["--set-upstream", "--force", "--force-if-includes", "--tags", "--follow-tags", "--no-follow-tags", "--all", "--branches", "--mirror", "--delete", "--dry-run", "--porcelain", "--quiet", "--verbose", "--progress", "--no-progress", "--atomic", "--no-atomic", "--no-verify", "--verify", "--prune"],
+    long_valued: &["--push-option"],
+    long_optional: &["--force-with-lease"],
+};
+const LS_REMOTE: &Safe = &Safe { flags: "tq", valued: "", long: &["--heads", "--branches", "--tags", "--refs", "--quiet", "--exit-code", "--get-url", "--symref"], long_valued: &["--sort"], long_optional: &[] };
+const ARCHIVE: &Safe = &Safe { flags: "lv0123456789", valued: "", long: &["--list", "--verbose", "--worktree-attributes"], long_valued: &["--format", "--prefix"], long_optional: &[] };
+const REBASE: &Safe = &Safe {
+    flags: "qvfr",
+    valued: "",
+    long: &["--continue", "--abort", "--skip", "--quit", "--quiet", "--verbose", "--stat", "--no-stat", "--autostash", "--no-autostash", "--keep-empty", "--no-keep-empty", "--fork-point", "--no-fork-point", "--root", "--update-refs", "--no-update-refs", "--committer-date-is-author-date", "--reset-author-date", "--signoff", "--force-rebase", "--no-verify", "--verify", "--no-rebase-merges", "--apply", "--merge", "--show-current-patch"],
+    long_valued: &["--onto", "--empty"],
+    long_optional: &["--rebase-merges"],
+};
+const GREP: &Safe = &Safe {
+    flags: "iIwvnlLcEFGPhHrazoqWp",
+    valued: "eABCmf",
+    long: &["--ignore-case", "--word-regexp", "--invert-match", "--line-number", "--files-with-matches", "--files-without-match", "--count", "--extended-regexp", "--fixed-strings", "--basic-regexp", "--perl-regexp", "--cached", "--no-index", "--untracked", "--recursive", "--no-recursive", "--text", "--only-matching", "--quiet", "--name-only", "--null", "--and", "--or", "--not", "--all-match", "--heading", "--break", "--no-color", "--column", "--exclude-standard", "--no-exclude-standard", "--full-name", "--function-context", "--show-function", "--recurse-submodules"],
+    long_valued: &["--max-depth", "--threads", "--context", "--after-context", "--before-context", "--max-count"],
+    long_optional: &["--color"],
+};
+const TOOL: &Safe = &Safe { flags: "yd", valued: "", long: &["--no-prompt", "--prompt", "--cached", "--staged", "--dir-diff", "--tool-help"], long_valued: &[], long_optional: &[] };
+const CONFIG: &Safe = &Safe {
+    flags: "lz",
+    valued: "f",
+    long: &["--global", "--system", "--local", "--worktree", "--show-origin", "--show-scope", "--name-only", "--null", "--includes", "--no-includes", "--bool", "--int", "--bool-or-int", "--path", "--expiry-date", "--list", "--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color", "--get-colorbool", "--all", "--fixed-value"],
+    long_valued: &["--file", "--blob", "--type", "--default", "--regexp", "--value", "--url"],
+    long_optional: &[],
+};
+const AM: &Safe = &Safe { flags: "3skqm", valued: "", long: &["--3way", "--signoff", "--keep", "--quiet", "--abort", "--continue", "--skip", "--quit", "--keep-cr", "--no-keep-cr", "--message-id", "--show-current-patch"], long_valued: &[], long_optional: &[] };
+const BISECT: &Safe = &Safe { flags: "", valued: "", long: &["--no-checkout", "--first-parent"], long_valued: &["--term-old", "--term-new", "--term-good", "--term-bad"], long_optional: &[] };
+const SUBMODULE: &Safe = &Safe { flags: "qfNj", valued: "jb", long: &["--quiet", "--recursive", "--init", "--remote", "--force", "--cached", "--all", "--no-fetch", "--checkout", "--recommend-shallow", "--no-recommend-shallow"], long_valued: &["--depth", "--jobs", "--branch", "--name"], long_optional: &[] };
+const HELP: &Safe = &Safe { flags: "ag", valued: "", long: &["--all", "--guides", "--config", "--user-interfaces", "--developer-interfaces"], long_valued: &[], long_optional: &[] };
+
+/// What the option word `a` is, if `s` knows it.
+fn known(a: &str, s: &Safe) -> Option<Takes> {
+    if let Some(long) = a.strip_prefix("--") {
+        let (name, value) = match long.split_once('=') {
+            Some((n, _)) => (format!("--{n}"), true),
+            None => (a.to_string(), false),
+        };
+        let n = name.as_str();
+        return if s.long.contains(&n) && !value {
+            Some(Takes::Nothing)
+        } else if s.long_valued.contains(&n) {
+            Some(if value { Takes::Nothing } else { Takes::Next })
+        } else if s.long_optional.contains(&n) {
+            Some(Takes::Optional)
+        } else {
+            None
+        };
+    }
+    // A bundle of short flags, letter by letter; a letter that takes a
+    // value takes the rest of the word, or the next word.
+    let letters: Vec<char> = a.strip_prefix('-')?.chars().collect();
+    if letters.is_empty() {
+        return None;
+    }
+    for (k, c) in letters.iter().enumerate() {
+        if s.valued.contains(*c) {
+            return Some(if k + 1 == letters.len() { Takes::Next } else { Takes::Nothing });
+        }
+        if !s.flags.contains(*c) {
+            return None;
+        }
+    }
+    Some(Takes::Nothing)
+}
+
+/// The positional arguments of `rest`, or none when an option is not on
+/// the subcommand's safe list.
+fn options(rest: &[String], s: &Safe) -> Option<Vec<String>> {
+    let mut positional = Vec::new();
+    let mut i = 0;
+    while let Some(a) = rest.get(i) {
+        if a == "--" {
+            positional.extend(rest[i + 1..].iter().cloned());
+            break;
+        }
+        if a.starts_with('-') && a != "-" {
+            i += if known(a, s)? == Takes::Next { 2 } else { 1 };
+        } else {
+            positional.push(a.clone());
+            i += 1;
+        }
+    }
+    Some(positional)
 }
 
 /// A Bash rule against a command line: every simple command (`all`, for
@@ -1235,13 +1386,19 @@ mod tests {
     }
 
     #[test]
-    fn r_perm_1_git_told_what_to_run_is_never_covered_by_an_allow_rule() {
+    fn r_perm_1_git_is_covered_only_in_forms_known_to_run_nothing() {
         for cmd in [
+            // Global options: only the known harmless ones.
             "git -c core.pager='rm -rf ~' log",
             "git -ccore.sshCommand=x fetch",
             "git --config-env=core.editor=E commit",
             "git --exec-path=/tmp/x status",
             "git -C sub -c x=y log",
+            "git --attr-source HEAD -c x=y log",
+            "git --attr-source HEAD config core.pager x",
+            "git --some-future-option x log",
+            "git --no-pager -c a=b log",
+            // config: reads only.
             "git config alias.x '!rm -rf .'",
             "git config --global alias.st status",
             "git config core.hooksPath /tmp/h",
@@ -1250,24 +1407,84 @@ mod tests {
             "git config --add core.editor vi",
             "git config --unset user.name",
             "git config -e",
+            // Remote-side programs, spelled out, abbreviated, bundled.
             "git fetch --upload-pack='rm -rf x' origin",
+            "git fetch --up=x origin",
+            "git fetch --upload=x origin",
             "git pull --upload-pack=x",
             "git push --receive-pack='x' origin",
+            "git push --rec=x origin",
+            "git push --exec=x origin",
             "git clone -u x repo",
             "git clone --upload-pack x repo",
+            "git clone -c core.fsmonitor=x repo",
+            "git clone --config core.hooksPath=h repo",
+            "git clone --template=/tmp/hooks repo",
+            "git clone --recurse-submodules repo",
+            "git init --template=/tmp/hooks",
             "git ls-remote -u x origin",
             "git archive --remote=r --exec=x HEAD",
+            // Exec steps and tools.
             "git rebase -x 'make test' main",
             "git rebase --exec='rm x' main",
+            "git rebase --ex='rm x' main",
             "git rebase -xmake main",
+            "git rebase -fx make main",
+            "git rebase -i main",
+            "git rebase -s ours main",
             "git bisect run ./script.sh",
+            "git bisect visualize",
             "git submodule foreach 'rm -rf .'",
             "git difftool -x 'rm' HEAD",
             "git difftool --extcmd=x",
+            "git difftool --ext=x",
+            "git difftool -yx rm",
+            "git mergetool --tool=x",
+            "git grep -O x",
+            "git grep --open-files-in-pager=vi x",
+            "git grep -iO x",
+            "git grep --open x",
+            "git filter-branch --tree-filter 'rm x'",
+            "git send-email --smtp-server=/tmp/x a.patch",
+            "git send-email --sendmail-cmd=x a.patch",
+            "git instaweb",
+            "git help -w config",
         ] {
             assert!(!bash("Bash(git:*)", cmd, true) && !bash("Bash", cmd, true), "{cmd}");
         }
-        for cmd in ["git log --oneline -5", "git config --get user.name", "git config user.name", "git config --list", "git config get user.name", "git -C sub status", "git commit -c HEAD", "git push -u origin main", "git fetch origin", "git rebase main", "git bisect good"] {
+        for cmd in [
+            "git log --oneline -5",
+            "git status",
+            "git commit -m 'fix it'",
+            "git commit -c HEAD",
+            "git config --get user.name",
+            "git config user.name",
+            "git config --list",
+            "git config --global --get-regexp '^user'",
+            "git config get user.name",
+            "git -C sub status",
+            "git --no-pager log",
+            "git --attr-source HEAD log",
+            "git push -u origin main",
+            "git push --force-with-lease origin main",
+            "git clone https://github.com/x/y",
+            "git clone --depth 1 -b main https://github.com/x/y dir",
+            "git fetch origin",
+            "git fetch --prune --tags",
+            "git pull --rebase origin main",
+            "git rebase main",
+            "git rebase --onto main topic",
+            "git rebase --continue",
+            "git bisect good",
+            "git bisect start HEAD v1",
+            "git submodule update --init --recursive",
+            "git grep x",
+            "git grep -n -i -e foo -A3 -- src",
+            "git grep -in foo",
+            "git difftool -y HEAD",
+            "git init",
+            "git ls-remote --tags origin",
+        ] {
             assert!(bash("Bash(git:*)", cmd, true), "{cmd} is still covered");
         }
     }

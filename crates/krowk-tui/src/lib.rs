@@ -648,7 +648,8 @@ impl<'h> Ui<'h> {
         app.touch();
         // A call waiting for the person's say takes the keys that answer it
         // (R-PERM-2): y once, s for the session, p for the project, n or
-        // Esc no. Ctrl-C still interrupts the turn, which declines it too.
+        // Esc no, v to print a request that was cut to fit (its y/s/p work
+        // only after). Ctrl-C still interrupts the turn, which declines it too.
         if let Some(req) = app.approvals.first().cloned()
             && !ctrl
         {
@@ -657,10 +658,16 @@ impl<'h> Ui<'h> {
             if app.approval_shown.is_some_and(|t| t.elapsed() < APPROVAL_SETTLE) {
                 return false;
             }
+            // A request cut to fit takes no allow until it is seen whole.
+            let ready = app.approval_ready();
+            if k.code == KeyCode::Char('v') {
+                app.expand_approval();
+                return false;
+            }
             let decision = match k.code {
-                KeyCode::Char('y') => Some(ApprovalDecision::Allow),
-                KeyCode::Char('s') if !req.remember.is_empty() => Some(ApprovalDecision::AllowSession),
-                KeyCode::Char('p') if !req.remember.is_empty() => Some(ApprovalDecision::AllowProject),
+                KeyCode::Char('y') if ready => Some(ApprovalDecision::Allow),
+                KeyCode::Char('s') if ready && !req.remember.is_empty() => Some(ApprovalDecision::AllowSession),
+                KeyCode::Char('p') if ready && !req.remember.is_empty() => Some(ApprovalDecision::AllowProject),
                 KeyCode::Char('n') | KeyCode::Esc => Some(ApprovalDecision::Deny),
                 _ => None,
             };

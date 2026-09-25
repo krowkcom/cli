@@ -23,7 +23,11 @@
 //! Each local message accounts for at most one ledger row, so two identical
 //! calls where the client saw one leave one unobserved. Claude writes one
 //! transcript line per content block, each repeating its API message's
-//! usage, so lines sharing a `message.id` are one message. Rows are taken in
+//! usage — with output growing as it streams — so Claude lines sharing a
+//! `message.id` are one message at its largest output. A Claude call killed
+//! mid-stream leaves only partial counts, so its ledger row stays unobserved
+//! even though the transcript counted its input: the provider's figure is
+//! the one it billed. Rows are taken in
 //! the order they were first stored, which makes the answer the same on
 //! every run. Reconciling reads
 //! only what is stored — the message usage is the source of truth, the turn
@@ -54,8 +58,8 @@ pub struct Reconciled {
 /// `input_tokens`/`output_tokens` (thinking inside output), opencode's
 /// `input`/`output` with `reasoning` beside output, OpenAI's
 /// `prompt_tokens`/`completion_tokens`.
-const FINGERPRINT: &str = "COALESCE(json_extract(m.usage, '$.input_tokens'), json_extract(m.usage, '$.input'), json_extract(m.usage, '$.prompt_tokens')), \
-     COALESCE(json_extract(m.usage, '$.output_tokens'), json_extract(m.usage, '$.output') + COALESCE(json_extract(m.usage, '$.reasoning'), 0), json_extract(m.usage, '$.completion_tokens'))";
+const FINGERPRINT: &str = "COALESCE(json_extract(m.usage, '$.input_tokens'), json_extract(m.usage, '$.input'), json_extract(m.usage, '$.prompt_tokens')) AS input, \
+     COALESCE(json_extract(m.usage, '$.output_tokens'), json_extract(m.usage, '$.output') + COALESCE(json_extract(m.usage, '$.reasoning'), 0), json_extract(m.usage, '$.completion_tokens')) AS output";
 
 /// Gives every ledger message its turn and marks each turn duplicate,
 /// observed or unobserved, in one transaction.
@@ -100,10 +104,12 @@ pub fn reconcile_ledger(conn: &Connection) -> Result<Reconciled, StoreError> {
     {
         let mut st = tx
             .prepare(&format!(
-                "SELECT DISTINCT m.model, {FINGERPRINT}, COALESCE(json_extract(m.raw_json, '$.message.id'), m.id) \
+                "SELECT model, input, MAX(output) FROM (SELECT m.model AS model, {FINGERPRINT}, \
+                 CASE WHEN s.harness = 'claude' AND json_valid(m.raw_json) THEN json_extract(m.raw_json, '$.message.id') END AS call, m.id AS mid \
                  FROM message m JOIN session s ON s.id = m.session_id \
                  WHERE s.harness != ?1 AND m.role = 'assistant' \
-                 AND m.model IN (SELECT DISTINCT lm.model FROM message lm JOIN session ls ON ls.id = lm.session_id WHERE ls.harness = ?1)"
+                 AND m.model IN (SELECT DISTINCT lm.model FROM message lm JOIN session ls ON ls.id = lm.session_id WHERE ls.harness = ?1)) \
+                 GROUP BY model, COALESCE(call, mid)"
             ))
             .map_err(|e| other("reconcile ledger: read transcripts", e))?;
         let found = st
@@ -329,9 +335,16 @@ mod tests {
         w.ingest(&ledger("zen", &rows)).unwrap();
         let mut th = transcript("m", r#"{"input_tokens":10,"output_tokens":20}"#);
         let line = th.messages[0].clone();
-        th.messages = ["l1", "l2"]
+        // Streaming lines of one call: output grows, the last is the billed count.
+        th.session.harness = "claude".into();
+        th.messages = [("l1", 1), ("l2", 20), ("l3", 20)]
             .iter()
-            .map(|id| Message { foreign_id: (*id).into(), raw_json: Some(r#"{"message":{"id":"msg_1"}}"#.into()), ..line.clone() })
+            .map(|(id, out)| Message {
+                foreign_id: (*id).into(),
+                usage: format!(r#"{{"input_tokens":10,"output_tokens":{out}}}"#),
+                raw_json: Some(r#"{"message":{"id":"msg_1"}}"#.into()),
+                ..line.clone()
+            })
             .collect();
         w.ingest(&th).unwrap();
         assert_eq!(reconcile_ledger(&conn).unwrap(), Reconciled { observed: 1, unobserved: 1, duplicate: 0 });

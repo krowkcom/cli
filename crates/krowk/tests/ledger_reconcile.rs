@@ -77,7 +77,8 @@ fn a_request_killed_client_side_is_still_counted_from_the_provider_ledger() {
 
     // A second import converges on the same rows.
     let again = krowk(&home, &["sessions", "import", "--from", "all"]);
-    assert_eq!(again["data"]["providers"][3]["messages_inserted"], 0);
+    let ledger_row = again["data"]["providers"].as_array().unwrap().iter().find(|p| p["provider"] == "ledger").unwrap();
+    assert_eq!(ledger_row["messages_inserted"], 0);
     assert_eq!(again["data"]["ledger"]["unobserved"], 1);
     let _ = std::fs::remove_dir_all(home.parent().unwrap());
 }

@@ -7,6 +7,9 @@
 
 #![cfg(all(feature = "harness", unix))]
 
+#[path = "common/pty.rs"]
+mod pty;
+
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -293,6 +296,42 @@ fn r_inst_1_providers_add_claude_with_a_router_hands_it_the_named_key_and_nothin
     // A plain Claude account never sees the ambient key either.
     b.json(&["providers", "add", "claude", "--json"], &[]);
     b.json(&["-p", "hello", "--model", "claude/sonnet", "--trust", "--output-format", "json"], &env);
-    let last = b.fake_log().lines().filter(|l| l.starts_with("env ANTHROPIC_AUTH_TOKEN=")).last().unwrap().to_string();
+    let last = b.fake_log().lines().rfind(|l| l.starts_with("env ANTHROPIC_AUTH_TOKEN=")).unwrap().to_string();
     assert_eq!(last, "env ANTHROPIC_AUTH_TOKEN=");
+}
+
+/// Bare `krowk` on a terminal, on a Claude Code instance, in a repository
+/// nobody trusted: the trust prompt comes before the TUI takes the
+/// terminal, a yes is remembered and the session runs on the fake claude;
+/// a no opens the TUI anyway, and the first prompt is refused with why,
+/// with nothing spawned.
+#[test]
+fn r_back_6_the_tui_asks_before_claude_runs_in_an_untrusted_repository() {
+    for yes in [true, false] {
+        let b = Sandbox::new(if yes { "tui-yes" } else { "tui-no" });
+        b.json(&["providers", "add", "claude", "--json"], &[]);
+        let cmd = b.command(&["--model", "claude/sonnet"], &[("TERM", "xterm-256color")]);
+        let mut t = pty::Pty::spawn(cmd, 100, 30);
+        assert!(t.wait_for("and run Claude Code in it?", std::time::Duration::from_secs(10)).is_some(), "no trust prompt: {:?}", t.text());
+        assert!(!b.fake_log().contains("argv -p"), "nothing spawned before the answer");
+        t.write(if yes { b"y\r" } else { b"n\r" });
+        assert!(t.wait_for("ask anything", std::time::Duration::from_secs(10)).is_some(), "the TUI opens: {:?}", t.text());
+        t.write(b"hello\r");
+        let trusted = b.root.join("home/.config/krowk/trusted.json");
+        if yes {
+            assert!(t.wait_for("tokens", std::time::Duration::from_secs(10)).is_some(), "the turn ran on Claude Code: {:?}", t.text());
+            assert!(std::fs::read_to_string(&trusted).unwrap().contains(&b.root.join("repo").display().to_string()), "a yes is remembered");
+            assert!(b.fake_log().contains("argv -p"));
+        } else {
+            assert!(t.wait_for("trust prompt", std::time::Duration::from_secs(10)).is_some(), "the refusal says why: {:?}", t.text());
+            assert!(!b.fake_log().contains("argv -p"), "claude never ran");
+            assert!(!trusted.exists());
+        }
+        t.write(b"\x04");
+        let st = t.wait(std::time::Duration::from_secs(10)).expect("krowk exits on Ctrl-D");
+        assert!(st.success(), "{st}");
+        if yes {
+            assert!(b.fake_log().lines().last() == Some("eof"), "the TUI let Claude Code go cleanly: {}", b.fake_log());
+        }
+    }
 }

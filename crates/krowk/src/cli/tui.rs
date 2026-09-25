@@ -58,6 +58,21 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
     let history_file = sessions_dir.parent().map(|d| d.join("tui-history.jsonl"));
     let toolset = prompt::toolset_flag(ctx)?;
     let effort = prompt::effort_flag(ctx)?;
+    // R-BACK-6: asked now, while the terminal is still the person's — the
+    // TUI takes it raw from here on. A resumed session runs on its last
+    // model and in the directory it started in.
+    let past = resume.as_ref().and_then(|id| log::read_events(&sessions_dir.join(id).join(log::EVENTS_FILE)).ok()).unwrap_or_default();
+    let session_model = past.iter().rev().find_map(|e| match &e.body {
+        krowk_harness::protocol::LogBody::TurnStarted { model, .. } => Some(model.clone()),
+        _ => None,
+    });
+    let session_cwd = past.first().and_then(|e| match &e.body {
+        krowk_harness::protocol::LogBody::SessionStarted { cwd, .. } => Some(std::path::PathBuf::from(cwd)),
+        _ => None,
+    });
+    let effective = model.clone().or(session_model).or_else(|| registry.default_model().ok());
+    let home = Some(ctx.env("HOME")).filter(|h| !h.trim().is_empty()).map(std::path::PathBuf::from);
+    let trust = prompt::tui_trust_gate(effective.as_ref(), &registry, session_cwd.as_deref().unwrap_or(&cwd), home);
     let host = HostConfig {
         sessions_dir,
         cwd,
@@ -66,6 +81,7 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
         pricer: prompt::pricer(ctx.io.env),
         catalog: prompt::catalog(ctx.io.env),
         credentials: super::providers::credentials_path(),
+        trust,
     };
     let outcome = krowk_tui::run(krowk_tui::Options {
         host,

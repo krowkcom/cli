@@ -739,16 +739,16 @@ stdout:
     },
     {
       "name": "providers",
-      "summary": "The native engine's provider instances",
+      "summary": "The provider instances: API keys, logins, and Claude Code accounts",
       "subcommands": [
         {
           "name": "add",
-          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device]",
-          "summary": "Add an instance for the native engine, or sign in to SuperGrok",
+          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device] [--binary PATH] [--config-dir DIR]",
+          "summary": "Add an instance, sign in to SuperGrok, or add a Claude Code account (signed in with `claude auth login`)",
           "args": [
             {
               "name": "provider",
-              "summary": "anthropic, openai, xai, openrouter, openai-compatible, or supergrok (xAI with a SuperGrok or X Premium subscription)",
+              "summary": "anthropic, openai, xai, openrouter, openai-compatible, supergrok (xAI with a SuperGrok or X Premium subscription), or claude (runs Claude Code, signed in with its own login)",
               "required": true
             }
           ],
@@ -763,7 +763,7 @@ stdout:
               "name": "api-key-env",
               "type": "string",
               "default": "",
-              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance"
+              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance. For claude, only when given: the key a router (with --base-url) or a Console account runs on, handed to Claude Code"
             },
             {
               "name": "base-url",
@@ -788,13 +788,25 @@ stdout:
               "type": "bool",
               "default": "false",
               "usage": "supergrok: print the sign-in link instead of opening a browser"
+            },
+            {
+              "name": "binary",
+              "type": "string",
+              "default": "",
+              "usage": "claude: the claude binary to run; claude on PATH when absent"
+            },
+            {
+              "name": "config-dir",
+              "type": "string",
+              "default": "",
+              "usage": "claude: the CLAUDE_CONFIG_DIR this instance signs in and keeps its sessions in; a new one under krowk's data directory for a named instance"
             }
           ]
         },
         {
           "name": "list",
           "usage": "krowk providers list",
-          "summary": "List every instance the native engine can use, and whether it has its key or login"
+          "summary": "List every instance, and whether it has its key or login — a Claude Code one as `claude auth status` reports it"
         },
         {
           "name": "remove",
@@ -885,7 +897,7 @@ stdout:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, or claude:work/sonnet to run Claude Code"
     },
     {
       "name": "resume",
@@ -910,6 +922,12 @@ stdout:
       "type": "string",
       "default": "",
       "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
+    },
+    {
+      "name": "trust",
+      "type": "bool",
+      "default": "false",
+      "usage": "With -p: let a Claude Code instance run in a repository not yet trusted — it runs the repository's hooks and MCP servers without asking. Without it, -p refuses unless a person at the terminal says yes"
     }
   ],
   "environment": [
@@ -1683,16 +1701,16 @@ stdout:
     },
     {
       "name": "providers",
-      "summary": "The native engine's provider instances",
+      "summary": "The provider instances: API keys, logins, and Claude Code accounts",
       "subcommands": [
         {
           "name": "add",
-          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device]",
-          "summary": "Add an instance for the native engine, or sign in to SuperGrok",
+          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device] [--binary PATH] [--config-dir DIR]",
+          "summary": "Add an instance, sign in to SuperGrok, or add a Claude Code account (signed in with `claude auth login`)",
           "args": [
             {
               "name": "provider",
-              "summary": "anthropic, openai, xai, openrouter, openai-compatible, or supergrok (xAI with a SuperGrok or X Premium subscription)",
+              "summary": "anthropic, openai, xai, openrouter, openai-compatible, supergrok (xAI with a SuperGrok or X Premium subscription), or claude (runs Claude Code, signed in with its own login)",
               "required": true
             }
           ],
@@ -1707,7 +1725,7 @@ stdout:
               "name": "api-key-env",
               "type": "string",
               "default": "",
-              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance"
+              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance. For claude, only when given: the key a router (with --base-url) or a Console account runs on, handed to Claude Code"
             },
             {
               "name": "base-url",
@@ -1732,13 +1750,25 @@ stdout:
               "type": "bool",
               "default": "false",
               "usage": "supergrok: print the sign-in link instead of opening a browser"
+            },
+            {
+              "name": "binary",
+              "type": "string",
+              "default": "",
+              "usage": "claude: the claude binary to run; claude on PATH when absent"
+            },
+            {
+              "name": "config-dir",
+              "type": "string",
+              "default": "",
+              "usage": "claude: the CLAUDE_CONFIG_DIR this instance signs in and keeps its sessions in; a new one under krowk's data directory for a named instance"
             }
           ]
         },
         {
           "name": "list",
           "usage": "krowk providers list",
-          "summary": "List every instance the native engine can use, and whether it has its key or login"
+          "summary": "List every instance, and whether it has its key or login — a Claude Code one as `claude auth status` reports it"
         },
         {
           "name": "remove",
@@ -1829,7 +1859,7 @@ stdout:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, or claude:work/sonnet to run Claude Code"
     },
     {
       "name": "resume",
@@ -1854,6 +1884,12 @@ stdout:
       "type": "string",
       "default": "",
       "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
+    },
+    {
+      "name": "trust",
+      "type": "bool",
+      "default": "false",
+      "usage": "With -p: let a Claude Code instance run in a repository not yet trusted — it runs the repository's hooks and MCP servers without asking. Without it, -p refuses unless a person at the terminal says yes"
     }
   ],
   "environment": [
@@ -2641,16 +2677,16 @@ stdout:
     },
     {
       "name": "providers",
-      "summary": "The native engine's provider instances",
+      "summary": "The provider instances: API keys, logins, and Claude Code accounts",
       "subcommands": [
         {
           "name": "add",
-          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device]",
-          "summary": "Add an instance for the native engine, or sign in to SuperGrok",
+          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device] [--binary PATH] [--config-dir DIR]",
+          "summary": "Add an instance, sign in to SuperGrok, or add a Claude Code account (signed in with `claude auth login`)",
           "args": [
             {
               "name": "provider",
-              "summary": "anthropic, openai, xai, openrouter, openai-compatible, or supergrok (xAI with a SuperGrok or X Premium subscription)",
+              "summary": "anthropic, openai, xai, openrouter, openai-compatible, supergrok (xAI with a SuperGrok or X Premium subscription), or claude (runs Claude Code, signed in with its own login)",
               "required": true
             }
           ],
@@ -2665,7 +2701,7 @@ stdout:
               "name": "api-key-env",
               "type": "string",
               "default": "",
-              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance"
+              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance. For claude, only when given: the key a router (with --base-url) or a Console account runs on, handed to Claude Code"
             },
             {
               "name": "base-url",
@@ -2690,13 +2726,25 @@ stdout:
               "type": "bool",
               "default": "false",
               "usage": "supergrok: print the sign-in link instead of opening a browser"
+            },
+            {
+              "name": "binary",
+              "type": "string",
+              "default": "",
+              "usage": "claude: the claude binary to run; claude on PATH when absent"
+            },
+            {
+              "name": "config-dir",
+              "type": "string",
+              "default": "",
+              "usage": "claude: the CLAUDE_CONFIG_DIR this instance signs in and keeps its sessions in; a new one under krowk's data directory for a named instance"
             }
           ]
         },
         {
           "name": "list",
           "usage": "krowk providers list",
-          "summary": "List every instance the native engine can use, and whether it has its key or login"
+          "summary": "List every instance, and whether it has its key or login — a Claude Code one as `claude auth status` reports it"
         },
         {
           "name": "remove",
@@ -2787,7 +2835,7 @@ stdout:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, or claude:work/sonnet to run Claude Code"
     },
     {
       "name": "resume",
@@ -2812,6 +2860,12 @@ stdout:
       "type": "string",
       "default": "",
       "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
+    },
+    {
+      "name": "trust",
+      "type": "bool",
+      "default": "false",
+      "usage": "With -p: let a Claude Code instance run in a repository not yet trusted — it runs the repository's hooks and MCP servers without asking. Without it, -p refuses unless a person at the terminal says yes"
     }
   ],
   "environment": [
@@ -3599,16 +3653,16 @@ tty:
     },
     {
       "name": "providers",
-      "summary": "The native engine's provider instances",
+      "summary": "The provider instances: API keys, logins, and Claude Code accounts",
       "subcommands": [
         {
           "name": "add",
-          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device]",
-          "summary": "Add an instance for the native engine, or sign in to SuperGrok",
+          "usage": "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device] [--binary PATH] [--config-dir DIR]",
+          "summary": "Add an instance, sign in to SuperGrok, or add a Claude Code account (signed in with `claude auth login`)",
           "args": [
             {
               "name": "provider",
-              "summary": "anthropic, openai, xai, openrouter, openai-compatible, or supergrok (xAI with a SuperGrok or X Premium subscription)",
+              "summary": "anthropic, openai, xai, openrouter, openai-compatible, supergrok (xAI with a SuperGrok or X Premium subscription), or claude (runs Claude Code, signed in with its own login)",
               "required": true
             }
           ],
@@ -3623,7 +3677,7 @@ tty:
               "name": "api-key-env",
               "type": "string",
               "default": "",
-              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance"
+              "usage": "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance. For claude, only when given: the key a router (with --base-url) or a Console account runs on, handed to Claude Code"
             },
             {
               "name": "base-url",
@@ -3648,13 +3702,25 @@ tty:
               "type": "bool",
               "default": "false",
               "usage": "supergrok: print the sign-in link instead of opening a browser"
+            },
+            {
+              "name": "binary",
+              "type": "string",
+              "default": "",
+              "usage": "claude: the claude binary to run; claude on PATH when absent"
+            },
+            {
+              "name": "config-dir",
+              "type": "string",
+              "default": "",
+              "usage": "claude: the CLAUDE_CONFIG_DIR this instance signs in and keeps its sessions in; a new one under krowk's data directory for a named instance"
             }
           ]
         },
         {
           "name": "list",
           "usage": "krowk providers list",
-          "summary": "List every instance the native engine can use, and whether it has its key or login"
+          "summary": "List every instance, and whether it has its key or login — a Claude Code one as `claude auth status` reports it"
         },
         {
           "name": "remove",
@@ -3745,7 +3811,7 @@ tty:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, or claude:work/sonnet to run Claude Code"
     },
     {
       "name": "resume",
@@ -3770,6 +3836,12 @@ tty:
       "type": "string",
       "default": "",
       "usage": "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent"
+    },
+    {
+      "name": "trust",
+      "type": "bool",
+      "default": "false",
+      "usage": "With -p: let a Claude Code instance run in a repository not yet trusted — it runs the repository's hooks and MCP servers without asking. Without it, -p refuses unless a person at the terminal says yes"
     }
   ],
   "environment": [

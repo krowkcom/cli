@@ -173,24 +173,53 @@ fn trust_gate(flag: bool, ask: bool, home: Option<std::path::PathBuf>) -> trust:
         if !ask {
             return Err(trust::untrusted(root, "Look at what it would run, then pass --trust to run it anyway, or run krowk -p there once on a terminal and answer its prompt."));
         }
-        let runs = trust::what_runs(root);
-        use std::io::Write as _;
-        let mut stderr = std::io::stderr();
-        let _ = writeln!(stderr, "Claude Code (`claude -p`) runs a repository's own hooks and MCP servers without asking.");
-        if runs.is_empty() {
-            let _ = writeln!(stderr, "{} has none of those files now, but it is not a repository you have trusted.", root.display());
-        } else {
-            let _ = writeln!(stderr, "{} has {}.", root.display(), runs.join(", "));
-        }
-        match inquire::Confirm::new(&format!("Trust {} and run Claude Code in it?", root.display())).with_default(false).prompt() {
-            Ok(true) => {
-                if let Err(e) = store.trust(root) {
-                    let _ = writeln!(stderr, "! trusted for this run, but not remembered: {e}");
-                }
-                Ok(())
+        if ask_trust(&store, root) { Ok(()) } else { Err(trust::untrusted(root, "Nothing was run.")) }
+    })
+}
+
+/// The trust prompt itself, on the terminal as it is (not raw): what the
+/// repository would make Claude Code run, and a yes-or-no that defaults to
+/// no. A yes is remembered.
+pub(super) fn ask_trust(store: &trust::Store, root: &std::path::Path) -> bool {
+    let runs = trust::what_runs(root);
+    use std::io::Write as _;
+    let mut stderr = std::io::stderr();
+    let _ = writeln!(stderr, "Claude Code (`claude -p`) runs a repository's own hooks and MCP servers without asking.");
+    if runs.is_empty() {
+        let _ = writeln!(stderr, "{} has none of those files now, but it is not a repository you have trusted.", root.display());
+    } else {
+        let _ = writeln!(stderr, "{} has {}.", root.display(), runs.join(", "));
+    }
+    match inquire::Confirm::new(&format!("Trust {} and run Claude Code in it?", root.display())).with_default(false).prompt() {
+        Ok(true) => {
+            if let Err(e) = store.trust(root) {
+                let _ = writeln!(stderr, "! trusted for this run, but not remembered: {e}");
             }
-            _ => Err(trust::untrusted(root, "Nothing was run.")),
+            true
         }
+        _ => false,
+    }
+}
+
+/// The TUI's gate. The TUI owns the terminal in raw mode once it opens, so
+/// the question is asked before that — for the model its session will run
+/// on (the flag, a resumed session's last, the default), in the directory
+/// it will run in — and the gate then answers from that answer and the
+/// trusted list. A no, or a home directory, is refused when the first
+/// prompt is sent, and the TUI shows why.
+pub(super) fn tui_trust_gate(model: Option<&krowk_harness::protocol::ModelRef>, registry: &Registry, cwd: &std::path::Path, home: Option<std::path::PathBuf>) -> trust::Gate {
+    let store = trust::Store::new(krowk_api::creds::config_dir().join(trust::FILE), home);
+    let backend = model.and_then(|m| registry.get(&m.instance).ok()).is_some_and(|i| i.backend.is_some());
+    let asked = trust::root(cwd);
+    let accepted = backend && !store.trusts(&asked) && store.refuses(&asked).is_none() && ask_trust(&store, &asked);
+    Arc::new(move |root: &std::path::Path| {
+        if store.trusts(root) || (accepted && root == asked) {
+            return Ok(());
+        }
+        if let Some(why) = store.refuses(root) {
+            return Err(trust::untrusted(root, &format!("It cannot be trusted for good — {why}. Run `krowk -p --trust` there for one run, or start krowk from a repository of its own.")));
+        }
+        Err(trust::untrusted(root, "Nothing was run — start krowk again there and answer its trust prompt."))
     })
 }
 

@@ -398,6 +398,8 @@ impl App {
                     }
                 }
             }
+            // The vendor session behind a backend turn: the log's to keep.
+            LogBody::BackendSession { .. } => {}
             LogBody::TurnCompleted { status, usage, duration_ms, error, .. } => {
                 self.turns += 1;
                 self.finish_live();

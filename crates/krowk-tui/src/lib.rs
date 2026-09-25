@@ -177,6 +177,9 @@ async fn session(opts: Options) -> Outcome {
     let host = Host::new(opts.host);
     let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, effort: opts.effort, target, keys: None, turn: None, rx: None, abandoned: false };
     let result = ui.run(&mut app, &mut term).await;
+    // A backend's process (Claude Code) is let go cleanly, and whatever it
+    // started with it, before the terminal is handed back.
+    host.shutdown().await;
     let _ = term.finish();
     let mut out = term.into_inner();
     if let Some(id) = &app.session_id {

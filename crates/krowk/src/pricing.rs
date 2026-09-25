@@ -3,6 +3,7 @@
 //! cache `pricing refresh` writes is preferred when it holds the pair. Tokens
 //! are stored per turn and priced at read time, so a refresh reprices history.
 
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -49,6 +50,39 @@ impl Rates {
 
 type Table = HashMap<(String, String), Rates>;
 
+/// Where a price came from, and so how current it is: the refreshed cache as
+/// of its last fetch, or the snapshot embedded at build time. Either way the
+/// rate is today's, never the one in force when the tokens were spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Basis {
+    Cache { fetched_at_ms: Option<i64> },
+    Snapshot,
+}
+
+impl Basis {
+    /// The footnote a priced figure carries.
+    pub fn note(&self) -> String {
+        match self {
+            Basis::Cache { fetched_at_ms: Some(ms) } => format!("models.dev prices fetched {}", date_of(*ms)),
+            Basis::Cache { fetched_at_ms: None } => "models.dev prices from the refreshed cache".into(),
+            Basis::Snapshot => format!("models.dev snapshot {SNAPSHOT_DATE} embedded in this build"),
+        }
+    }
+}
+
+/// Every basis a set of figures was priced on, as one footnote.
+pub fn basis_note(bases: &std::collections::BTreeSet<Basis>) -> String {
+    let notes: Vec<String> = bases.iter().map(Basis::note).collect();
+    if notes.is_empty() {
+        return String::new();
+    }
+    format!("priced at current rates ({}), not the rates in force at the time", notes.join(" and "))
+}
+
+fn date_of(ms: i64) -> String {
+    jiff::Timestamp::from_millisecond(ms).map(|t| t.strftime("%Y-%m-%d").to_string()).unwrap_or_else(|_| "at an unknown date".into())
+}
+
 /// $XDG_CACHE_HOME/krowk/models.json when absolute, else ~/.cache/krowk/.
 pub fn cache_path(env: &dyn Fn(&str) -> String) -> Option<PathBuf> {
     let xdg = env("XDG_CACHE_HOME");
@@ -63,42 +97,69 @@ pub fn meta_path(cache: &Path) -> PathBuf {
     cache.with_file_name("models.meta.json")
 }
 
-/// The cache and the snapshot, each parsed once per process. They fail
-/// independently: a corrupt cache never hides the snapshot.
-static LOADED: Mutex<Option<(Option<Table>, Table)>> = Mutex::new(None);
+/// The cache (with when it was fetched) and the snapshot, each parsed once
+/// per process. They fail independently: a corrupt cache never hides the
+/// snapshot.
+type Loaded = (Option<(Table, Option<i64>)>, Table);
+static LOADED: Mutex<Option<Loaded>> = Mutex::new(None);
 
 /// The rates for a (provider, model) pair: the cache's, else the snapshot's.
 pub fn price(env: &dyn Fn(&str) -> String, provider: &str, model: &str) -> Option<Rates> {
+    price_with_basis(env, provider, model).map(|(r, _)| r)
+}
+
+/// `price`, and which of the two sources answered.
+pub fn price_with_basis(env: &dyn Fn(&str) -> String, provider: &str, model: &str) -> Option<(Rates, Basis)> {
     let mut loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
     let (cache, embedded) = loaded.get_or_insert_with(|| {
-        let cache = cache_path(env).and_then(|p| std::fs::read(p).ok()).and_then(|raw| parse_rates(&raw));
+        let cache = cache_path(env).and_then(|p| {
+            let table = parse_rates(&std::fs::read(&p).ok()?)?;
+            Some((table, fetched_at_ms(&p)))
+        });
         (cache, parse_rates(EMBEDDED.as_bytes()).unwrap_or_default())
     });
     let key = (provider.to_string(), model.to_string());
-    cache.as_ref().and_then(|c| c.get(&key)).or_else(|| embedded.get(&key)).copied()
+    if let Some((table, fetched)) = cache
+        && let Some(r) = table.get(&key)
+    {
+        return Some((*r, Basis::Cache { fetched_at_ms: *fetched }));
+    }
+    embedded.get(&key).map(|r| (*r, Basis::Snapshot))
 }
 
 /// Either shape prices come in: the trimmed snapshot's
 /// `{provider: {model: cost}}`, or models.dev's full
-/// `{provider: {models: {model: {cost: …}}}}`.
+/// `{provider: {models: {model: {cost: …}}}}`. Typed, with every
+/// field but `cost` skipped unread: the full file is megabytes, and it is
+/// parsed on every `sessions` listing.
 fn parse_rates(raw: &[u8]) -> Option<Table> {
-    let top: Map<String, Value> = serde_json::from_slice(raw).ok()?;
+    // One bad entry costs that entry, never its provider.
+    #[derive(serde::Deserialize)]
+    struct FullModel {
+        cost: Option<Map<String, Value>>,
+    }
+    let top: HashMap<String, &RawValue> = serde_json::from_slice(raw).ok()?;
     let mut out = Table::new();
-    for (provider, fields) in &top {
-        let Some(fields) = fields.as_object() else { continue };
-        let full: Vec<(&String, &Map<String, Value>)> = fields
+    for (provider, fields) in top {
+        let Ok(fields) = serde_json::from_str::<HashMap<String, &RawValue>>(fields.get()) else { continue };
+        let full: Vec<(String, Map<String, Value>)> = fields
             .get("models")
-            .and_then(Value::as_object)
-            .map(|models| models.iter().filter_map(|(m, v)| Some((m, v.get("cost")?.as_object().filter(|c| !c.is_empty())?))).collect())
+            .and_then(|m| serde_json::from_str::<HashMap<String, &RawValue>>(m.get()).ok())
+            .map(|models| {
+                models
+                    .into_iter()
+                    .filter_map(|(m, v)| Some((m, serde_json::from_str::<FullModel>(v.get()).ok()?.cost.filter(|c| !c.is_empty())?)))
+                    .collect()
+            })
             .unwrap_or_default();
-        let entries: Vec<(&String, &Map<String, Value>)> = if full.is_empty() {
-            fields.iter().filter_map(|(m, v)| Some((m, v.as_object()?))).collect()
+        let entries: Vec<(String, Map<String, Value>)> = if full.is_empty() {
+            fields.iter().filter_map(|(m, v)| Some((m.clone(), serde_json::from_str::<Map<String, Value>>(v.get()).ok()?))).collect()
         } else {
             full
         };
         for (model, cost) in entries {
-            if let Some(r) = rates_from(cost) {
-                out.insert((provider.clone(), model.clone()), r);
+            if let Some(r) = rates_from(&cost) {
+                out.insert((provider.clone(), model), r);
             }
         }
     }
@@ -228,6 +289,8 @@ mod tests {
         let cost = r.cost(Tokens { input: 1_000_000, output: 500_000, reasoning: 500_000, cache_read: -5, ..Tokens::default() });
         assert!((cost - 3.0).abs() < 1e-9);
         assert!(parse_rates(b"not json").is_none());
+        let bad_neighbours = parse_rates(br#"{"p":{"models":{"m":{"cost":{"input":1}},"n":null,"o":{"cost":"free"}}}}"#).unwrap();
+        assert_eq!(bad_neighbours.len(), 1, "a bad entry costs itself, not its provider");
         assert_eq!(sanitize_etag("W/\"abc\""), "W/\"abc\"");
         assert_eq!(sanitize_etag("bad etag"), "");
     }

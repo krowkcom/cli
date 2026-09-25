@@ -217,6 +217,7 @@ mod tests {
                 foreign_id: (*id).into(),
                 usage: u.clone(),
                 raw_json: None,
+                turn_seq: None,
                 parts: Vec::new(),
             })
             .collect();
@@ -242,6 +243,7 @@ mod tests {
                 foreign_id: "msg_1".into(),
                 usage: usage.into(),
                 raw_json: None,
+                turn_seq: None,
                 parts: Vec::new(),
             }],
             ..Thread::default()

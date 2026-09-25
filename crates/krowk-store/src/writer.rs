@@ -82,6 +82,9 @@ pub struct Message {
     pub foreign_id: String,
     pub usage: String,
     pub raw_json: Option<String>,
+    /// The seq of the thread turn this message belongs to, when the source
+    /// knows it; the message is then linked to that turn's row.
+    pub turn_seq: Option<i64>,
     pub parts: Vec<Part>,
 }
 
@@ -236,14 +239,35 @@ impl<'a> Writer<'a> {
         let (mut messages, mut parts) = (Count::default(), Count::default());
         let mut pending = Vec::new();
         let mut next = max_seq + 1;
+        let mut relink = Vec::new();
         for m in msgs {
             if !m.foreign_id.is_empty() && !known.insert(m.foreign_id.clone()) {
                 messages.skipped += 1;
                 parts.skipped += m.parts.len();
+                if let Some(turn) = m.turn_seq {
+                    relink.push((&m.foreign_id, turn));
+                }
                 continue;
             }
             pending.push((m, next));
             next += 1;
+        }
+        // A message stored before the source named its turn gets the link
+        // now, so an upgraded store prices per turn without a rebuild.
+        if !relink.is_empty() {
+            let tx = self.conn.unchecked_transaction().map_err(e("begin"))?;
+            {
+                let mut st = tx
+                    .prepare(
+                        "UPDATE message SET turn_id = (SELECT id FROM turn WHERE session_id = ?1 AND seq = ?2) \
+                         WHERE session_id = ?1 AND foreign_id = ?3 AND turn_id IS NULL",
+                    )
+                    .map_err(e("relink messages"))?;
+                for (fid, turn) in relink {
+                    st.execute(params![session_id, turn, fid]).map_err(e("relink message"))?;
+                }
+            }
+            tx.commit().map_err(e("commit"))?;
         }
         for chunk in pending.chunks(INGEST_BATCH) {
             let tx = self.conn.unchecked_transaction().map_err(e("begin"))?;
@@ -418,8 +442,8 @@ fn insert_message(tx: &Connection, now: i64, session_id: &str, m: &Message, seq:
     let id = clock::new_id();
     let usage = if m.usage.is_empty() { "{}" } else { &m.usage };
     tx.execute(
-        "INSERT INTO message (id, session_id, turn_id, seq, role, provider, model, foreign_id, usage, raw_json, time_created) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
-        params![id, session_id, seq, m.role.as_str(), m.provider, m.model, none_if_empty(&m.foreign_id), usage, m.raw_json, now],
+        "INSERT INTO message (id, session_id, turn_id, seq, role, provider, model, foreign_id, usage, raw_json, time_created) VALUES (?, ?, (SELECT id FROM turn WHERE session_id = ?2 AND seq = ?), ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![id, session_id, m.turn_seq, seq, m.role.as_str(), m.provider, m.model, none_if_empty(&m.foreign_id), usage, m.raw_json, now],
     )
     .map_err(e("insert message"))?;
     for (i, p) in m.parts.iter().enumerate() {
@@ -480,6 +504,7 @@ mod tests {
                     foreign_id: format!("m{i}"),
                     usage: String::new(),
                     raw_json: None,
+                    turn_seq: None,
                     parts: vec![Part { kind: "text".into(), data: serde_json::json!({ "text": t }).to_string(), ..Part::default() }],
                 })
                 .collect(),

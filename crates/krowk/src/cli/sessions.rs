@@ -9,10 +9,10 @@ use crate::pricing;
 use crate::termclean;
 use krowk_api::{fail, Error};
 use krowk_import::{Ref, Source};
-use krowk_store::{Connection, SessionDetail, SessionRow, StoreError};
+use krowk_store::{Connection, CostGroup, SessionDetail, SessionRow, StoreError, TurnDetail};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -74,10 +74,17 @@ pub fn list(ctx: &mut Ctx) -> Result<(), Error> {
     let limit = if ctx.f.all { -1 } else { ctx.f.limit };
     let conn = open_store(ctx)?;
     let rows = krowk_store::list_sessions(&conn, &ctx.f.harness, &ctx.f.worktree, limit).map_err(|e| store_fail(&e, &db_path_string(ctx)))?;
+    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let groups = if ids.is_empty() { HashMap::new() } else { krowk_store::cost_groups(&conn, &ids).map_err(|e| store_fail(&e, &db_path_string(ctx)))? };
+    let priced: Vec<Priced> = rows.iter().map(|r| price_session(ctx, r, groups.get(&r.id))).collect();
+    let bases: BTreeSet<pricing::Basis> = priced.iter().flat_map(|p| p.bases.iter().copied()).collect();
     let now = now_ms();
     if ctx.format != Format::Human {
-        let sessions: Vec<Value> = rows.iter().map(|r| session_row_json(ctx, r, now)).collect();
-        let data = json!({ "sessions": sessions });
+        let sessions: Vec<Value> = rows.iter().zip(&priced).map(|(r, p)| session_row_json(r, p, now)).collect();
+        let mut data = json!({ "sessions": sessions });
+        if !bases.is_empty() {
+            data["priced_with"] = json!(pricing::basis_note(&bases));
+        }
         return emit_data(ctx, data, format!("{} sessions", rows.len()));
     }
     // One option per row: an unbounded page would hang the terminal building
@@ -87,10 +94,14 @@ pub fn list(ctx: &mut Ctx) -> Result<(), Error> {
         let _ = writeln!(ctx.io.stdout, "krowk sessions show {id}");
         return Ok(());
     }
-    let table = human_sessions_list(ctx, &rows, ctx.colour, now);
+    let table = human_sessions_list(&rows, &priced, ctx.colour, now);
     let _ = write!(ctx.io.stdout, "{table}");
     if !rows.is_empty() {
         let _ = writeln!(ctx.io.stdout);
+        let note = cost_footnote(&bases, priced.iter().any(|p| p.total().is_none()));
+        if !note.is_empty() {
+            let _ = writeln!(ctx.io.stdout, "{}", paint(ctx.colour, "2", &note));
+        }
     }
     Ok(())
 }
@@ -108,19 +119,160 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
-fn price_row(ctx: &Ctx, r: &SessionRow) -> Option<f64> {
-    let rates = pricing::price(ctx.io.env, &r.provider, &r.model)?;
-    Some(rates.cost(pricing::Tokens {
-        input: r.sum_input,
-        output: r.sum_output,
-        cache_read: r.sum_cache_read,
-        cache_write: r.sum_cache_write,
-        reasoning: r.sum_reasoning,
-    }))
+/// A session's cost: the dollars that could be priced or were reported,
+/// every (provider, model) with neither, and the price sources used. A cost
+/// with an unpriced pair in it is unknown — shown as —, never as the part
+/// that could be priced, and never as a silent 0.
+///
+/// Turns with no tokens and no price (a turn the model never answered, a
+/// Claude `<synthetic>` error) cost nothing wherever something else in the
+/// session is priced; only when nothing is — a harness that records no
+/// usage at all — do they make the cost unknown.
+#[derive(Debug, Default)]
+struct Priced {
+    usd: f64,
+    unpriced: BTreeSet<String>,
+    unpriced_empty: BTreeSet<String>,
+    known: bool,
+    /// Every turn is counted in another session.
+    elsewhere: bool,
+    bases: BTreeSet<pricing::Basis>,
+    /// The known dollars per (provider, model), unrounded.
+    by_model: BTreeMap<String, f64>,
 }
 
-fn session_row_json(ctx: &Ctx, r: &SessionRow, now: i64) -> Value {
-    let cost = price_row(ctx, r);
+impl Priced {
+    fn total(&self) -> Option<f64> {
+        (self.unpriced.is_empty() && (self.known || self.unpriced_empty.is_empty())).then_some(self.usd)
+    }
+
+    /// The pairs that make the cost unknown.
+    fn missing(&self) -> BTreeSet<String> {
+        let mut out = self.unpriced.clone();
+        if !self.known {
+            out.extend(self.unpriced_empty.iter().cloned());
+        }
+        out
+    }
+
+    fn add(&mut self, cost: Option<TurnCost>, provider: &str, model: &str, t: pricing::Tokens) {
+        match cost {
+            Some(TurnCost { usd, basis }) => {
+                self.known = true;
+                self.usd += usd;
+                *self.by_model.entry(pair_name(provider, model)).or_default() += usd;
+                if let Some(b) = basis {
+                    self.bases.insert(b);
+                }
+            }
+            None if t == pricing::Tokens::default() => {
+                self.unpriced_empty.insert(pair_name(provider, model));
+            }
+            None => {
+                self.unpriced.insert(pair_name(provider, model));
+            }
+        }
+    }
+}
+
+/// One figure: dollars, and the price source when krowk priced it rather
+/// than the source reporting it.
+#[derive(Debug, Clone, Copy)]
+struct TurnCost {
+    usd: f64,
+    basis: Option<pricing::Basis>,
+}
+
+/// Claude writes `<synthetic>` where no model answered; that names no model.
+fn real_model(model: &str) -> &str {
+    if model.starts_with('<') && model.ends_with('>') { "" } else { model }
+}
+
+fn pair_name(provider: &str, model: &str) -> String {
+    let model = real_model(model);
+    match (provider.is_empty(), model.is_empty()) {
+        (_, true) => format!("{} (no model recorded)", if provider.is_empty() { "unknown provider" } else { provider }),
+        (true, false) => model.to_string(),
+        _ => format!("{provider}/{model}"),
+    }
+}
+
+/// Reported dollars win: the source knew what it was charged. A reported 0
+/// is no report — opencode writes 0 for any model it cannot price — so it
+/// falls through to the tokens, priced at current rates, or unknown.
+fn cost_of(ctx: &Ctx, provider: &str, model: &str, reported_micros: Option<i64>, t: pricing::Tokens) -> Option<TurnCost> {
+    if let Some(m) = reported_micros.filter(|m| *m > 0) {
+        return Some(TurnCost { usd: m as f64 / 1e6, basis: None });
+    }
+    let model = real_model(model);
+    if model.is_empty() {
+        return None;
+    }
+    let (rates, basis) = pricing::price_with_basis(ctx.io.env, provider, model)?;
+    Some(TurnCost { usd: rates.cost(t), basis: Some(basis) })
+}
+
+fn group_tokens(g: &CostGroup) -> pricing::Tokens {
+    pricing::Tokens { input: g.input, output: g.output, cache_read: g.cache_read, cache_write: g.cache_write, reasoning: g.reasoning }
+}
+
+fn turn_tokens(t: &TurnDetail) -> pricing::Tokens {
+    pricing::Tokens { input: t.input, output: t.output, cache_read: t.cache_read, cache_write: t.cache_write, reasoning: t.reasoning }
+}
+
+/// A session priced per (provider, model) its turns ran on. A session with
+/// no turns costs what its own model says nothing costs: 0 when the model
+/// has a price, unknown when it has none.
+///
+/// A session whose every turn is counted elsewhere (a ledger whose rows all
+/// sit in transcripts) costs 0 here, and says where the cost went.
+fn price_session(ctx: &Ctx, r: &SessionRow, groups: Option<&Vec<CostGroup>>) -> Priced {
+    let groups: &[CostGroup] = groups.map_or(&[], Vec::as_slice);
+    price_groups(ctx, &r.provider, &r.model, r.turn_count, groups)
+}
+
+/// The one roll-up both the listing and `show` use, so both sum the same
+/// figures in the same order.
+fn price_groups(ctx: &Ctx, provider: &str, model: &str, turn_count: i64, groups: &[CostGroup]) -> Priced {
+    let mut p = Priced::default();
+    if groups.is_empty() && turn_count > 0 {
+        p.known = true;
+        p.elsewhere = true;
+        return p;
+    }
+    if groups.is_empty() {
+        p.add(cost_of(ctx, provider, model, None, pricing::Tokens::default()), provider, model, pricing::Tokens::default());
+    }
+    for g in groups {
+        p.add(cost_of(ctx, &g.provider, &g.model, g.reported.then_some(g.usd_micros), group_tokens(g)), &g.provider, &g.model, group_tokens(g));
+    }
+    p
+}
+
+fn turn_cost(ctx: &Ctx, t: &TurnDetail) -> Option<TurnCost> {
+    cost_of(ctx, &t.provider, &t.model, t.usd_micros, turn_tokens(t))
+}
+
+/// A ledger turn counted elsewhere: in a transcript, or an earlier export.
+fn is_observed(t: &TurnDetail) -> bool {
+    t.status == krowk_store::STATUS_OBSERVED || t.status == krowk_store::STATUS_DUPLICATE
+}
+
+/// The footnote under every priced listing: where the rates came from, and
+/// what — means.
+fn cost_footnote(bases: &BTreeSet<pricing::Basis>, dashes: bool) -> String {
+    let note = pricing::basis_note(bases);
+    let dash = "— has no price for its model";
+    match (note.is_empty(), dashes) {
+        (true, true) => dash.into(),
+        (true, false) => String::new(),
+        (false, true) => format!("costs {note}; {dash}"),
+        (false, false) => format!("costs {note}"),
+    }
+}
+
+fn session_row_json(r: &SessionRow, p: &Priced, now: i64) -> Value {
+    let cost = p.total();
     let mut v = json!({
         "id": r.id,
         "title": r.title,
@@ -129,7 +281,7 @@ fn session_row_json(ctx: &Ctx, r: &SessionRow, now: i64) -> Value {
         "provider": r.provider,
         "turns": r.turn_count,
         "cost_usd": cost,
-        "cost_display": cost.map_or("—".to_string(), format_cost),
+        "cost_display": cost_display(p),
         "time_updated_ms": r.time_updated,
         "time_updated_relative": relative_time(r.time_updated, now),
         "worktree": r.worktree_path,
@@ -140,11 +292,44 @@ fn session_row_json(ctx: &Ctx, r: &SessionRow, now: i64) -> Value {
     if !r.directory.is_empty() {
         v["directory"] = json!(r.directory);
     }
+    if p.total().is_none() {
+        v["unpriced"] = json!(p.missing());
+    }
+    if p.elsewhere {
+        v["cost_counted_elsewhere"] = json!(true);
+    }
     v
 }
 
+/// A session's cost as text: the figure, —, or where it was counted.
+fn cost_display(p: &Priced) -> String {
+    if p.elsewhere {
+        return "counted elsewhere".into();
+    }
+    p.total().map_or("—".to_string(), format_cost)
+}
+
+/// Cents from a cent up; below that, three significant digits, so $0.00007
+/// and $0.00012 do not both read as $0.0001. Rounded here, once, at display.
 fn format_cost(usd: f64) -> String {
-    if usd < 0.01 { format!("${usd:.4}") } else { format!("${usd:.2}") }
+    if usd >= 0.01 || usd <= 0.0 {
+        return format!("${usd:.2}");
+    }
+    significant(usd)
+}
+
+/// `show`'s figures, where one session's split between models is the point:
+/// three significant digits below a dollar, cents above.
+fn format_cost_precise(usd: f64) -> String {
+    if usd >= 1.0 || usd <= 0.0 {
+        return format!("${usd:.2}");
+    }
+    significant(usd)
+}
+
+fn significant(usd: f64) -> String {
+    let places = (2 - usd.log10().floor() as i32).clamp(2, 12) as usize;
+    format!("${usd:.places$}")
 }
 
 /// The human table's cost: exact 0 is free, dust collapses to <$0.01.
@@ -223,7 +408,7 @@ fn short_id(id: &str) -> String {
     cell(id).chars().take(8).collect()
 }
 
-fn human_sessions_list(ctx: &Ctx, rows: &[SessionRow], colour: bool, now: i64) -> String {
+fn human_sessions_list(rows: &[SessionRow], priced: &[Priced], colour: bool, now: i64) -> String {
     if rows.is_empty() {
         return "no sessions — run `krowk sessions import --from all`".into();
     }
@@ -244,7 +429,8 @@ fn human_sessions_list(ctx: &Ctx, rows: &[SessionRow], colour: bool, now: i64) -
     for (i, r) in rows.iter().enumerate() {
         let title = truncate_chars(&titles[i], MAX_TITLE);
         let turns = format!("{:3} {}", r.turn_count, paint(colour, "2", if r.turn_count == 1 { "turn" } else { "turns" }));
-        let (cost, code) = match price_row(ctx, r) {
+        let (cost, code) = match priced[i].total() {
+            Some(_) if priced[i].elsewhere => ("elsewhere".into(), "2"),
             Some(p) => (human_cost(p), if p == 0.0 { "2" } else { "32" }),
             None => ("—".into(), "2"),
         };
@@ -325,7 +511,36 @@ pub fn show(ctx: &mut Ctx, args: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Each turn priced for display, and the session's total rolled up exactly
+/// as the listing rolls it up: per (provider, model, reported), in that order.
+fn price_turns(ctx: &Ctx, d: &SessionDetail) -> (Vec<Option<TurnCost>>, Priced) {
+    let costs: Vec<Option<TurnCost>> = d.turns.iter().map(|t| if is_observed(t) { None } else { turn_cost(ctx, t) }).collect();
+    let mut groups: BTreeMap<(String, String, bool), CostGroup> = BTreeMap::new();
+    for t in d.turns.iter().filter(|t| !is_observed(t)) {
+        let reported = t.usd_micros.is_some_and(|m| m > 0);
+        let g = groups.entry((t.provider.clone(), t.model.clone(), reported)).or_insert_with(|| CostGroup {
+            provider: t.provider.clone(),
+            model: t.model.clone(),
+            reported,
+            ..CostGroup::default()
+        });
+        g.turns += 1;
+        g.input += t.input;
+        g.output += t.output;
+        g.cache_read += t.cache_read;
+        g.cache_write += t.cache_write;
+        g.reasoning += t.reasoning;
+        if reported {
+            g.usd_micros += t.usd_micros.unwrap_or(0);
+        }
+    }
+    let groups: Vec<CostGroup> = groups.into_values().collect();
+    let s = &d.session;
+    (costs, price_groups(ctx, &s.provider, &s.model, d.turns.len() as i64, &groups))
+}
+
 fn session_show_json(ctx: &Ctx, d: &SessionDetail) -> (Value, String) {
+    let (costs, total) = price_turns(ctx, d);
     let messages: Vec<Value> = d
         .messages
         .iter()
@@ -373,18 +588,34 @@ fn session_show_json(ctx: &Ctx, d: &SessionDetail) -> (Value, String) {
     let turns: Vec<Value> = d
         .turns
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let mut v = serde_json::Map::new();
             v.insert("seq".into(), json!(t.seq));
             if !t.status.is_empty() {
                 v.insert("status".into(), json!(t.status));
             }
+            if !t.model.is_empty() {
+                v.insert("provider".into(), json!(t.provider));
+                v.insert("model".into(), json!(t.model));
+            }
             v.insert("input_tokens".into(), json!(t.input));
             v.insert("output_tokens".into(), json!(t.output));
+            v.insert("reasoning_tokens".into(), json!(t.reasoning));
+            v.insert("cache_read_tokens".into(), json!(t.cache_read));
+            v.insert("cache_write_tokens".into(), json!(t.cache_write));
             v.insert("total_tokens".into(), json!(t.total));
-            match t.usd_micros {
-                Some(usd) => v.insert("cost_usd_micros".into(), json!(usd)),
-                None => v.insert("cost_unknown".into(), json!(true)),
+            if let Some(usd) = t.usd_micros {
+                v.insert("cost_usd_micros".into(), json!(usd));
+            }
+            // Unrounded: the display rounds, once.
+            match (is_observed(t), costs[i]) {
+                (true, _) => v.insert("cost_counted_elsewhere".into(), json!(true)),
+                (false, Some(c)) => {
+                    v.insert("cost_usd".into(), json!(c.usd));
+                    v.insert("cost_source".into(), json!(if c.basis.is_some() { "priced" } else { "reported" }))
+                }
+                (false, None) => v.insert("cost_usd".into(), Value::Null),
             };
             Value::Object(v)
         })
@@ -403,15 +634,19 @@ fn session_show_json(ctx: &Ctx, d: &SessionDetail) -> (Value, String) {
     let summary = format!("{} — {} turns, {} messages", display_title(&cell(&s.title)), turns.len(), messages.len());
     out.insert("turns".into(), Value::Array(turns));
     out.insert("messages".into(), Value::Array(messages));
-    match price_row(ctx, s) {
-        Some(priced) => {
-            out.insert("priced_cost_usd".into(), json!(priced));
-            out.insert("cost_display".into(), json!(format_cost(priced)));
-            out.insert("priced_with".into(), json!(format!("priced from embedded models.dev snapshot {}", pricing::SNAPSHOT_DATE)));
-        }
-        None => {
-            out.insert("cost_display".into(), json!("—"));
-        }
+    out.insert("cost_usd".into(), json!(total.total()));
+    out.insert("cost_display".into(), json!(cost_display(&total)));
+    if total.elsewhere {
+        out.insert("cost_counted_elsewhere".into(), json!(true));
+    }
+    if total.total().is_none() {
+        out.insert("unpriced".into(), json!(total.missing()));
+    }
+    if total.by_model.len() > 1 {
+        out.insert("cost_by_model".into(), json!(total.by_model));
+    }
+    if !total.bases.is_empty() {
+        out.insert("priced_with".into(), json!(pricing::basis_note(&total.bases)));
     }
     (Value::Object(out), summary)
 }
@@ -426,10 +661,8 @@ fn human_session_show(ctx: &Ctx, d: &SessionDetail, show_thinking: bool, now: i6
     if !model.is_empty() {
         meta += &format!("  {model}");
     }
-    meta += &match price_row(ctx, s) {
-        Some(p) => format!("  {}", format_cost(p)),
-        None => "  —".into(),
-    };
+    let (costs, total) = price_turns(ctx, d);
+    meta += &format!("  {}", if total.elsewhere { "counted elsewhere".to_string() } else { total.total().map_or("—".to_string(), format_cost_precise) });
     meta += &format!("  {}", relative_time(s.time_updated, now));
     for extra in [cell(&s.worktree_path), cell(&s.directory)] {
         if !extra.is_empty() {
@@ -438,17 +671,34 @@ fn human_session_show(ctx: &Ctx, d: &SessionDetail, show_thinking: bool, now: i6
     }
     b += &meta;
     b += "\n";
-    for t in &d.turns {
+    for (i, t) in d.turns.iter().enumerate() {
         b += &format!("\nturn {}", t.seq);
         let st = cell(&t.status);
         if !st.is_empty() {
             b += &format!("  {st}");
         }
-        b += &format!("  {} tokens", t.total);
-        if let Some(usd) = t.usd_micros {
-            b += &format!("  {}", format_cost(usd as f64 / 1e6));
+        let model = cell(&t.model);
+        if !model.is_empty() && model != cell(&s.model) {
+            b += &format!("  {model}");
         }
+        b += &format!("  {} tokens", t.total);
+        b += &match (is_observed(t), costs[i]) {
+            (true, _) => "  counted elsewhere".to_string(),
+            (false, Some(c)) => format!("  {}{}", format_cost_precise(c.usd), if c.basis.is_none() { " reported" } else { "" }),
+            (false, None) => "  —".to_string(),
+        };
         b += "\n";
+    }
+    if total.by_model.len() > 1 {
+        let parts: Vec<String> = total.by_model.iter().map(|(m, usd)| format!("{} {}", cell(m), format_cost_precise(*usd))).collect();
+        b += &format!("\nby model  {}\n", parts.join("  ·  "));
+    }
+    if !d.turns.is_empty() {
+        let dashes = total.total().is_none() || costs.iter().zip(&d.turns).any(|(c, t)| c.is_none() && !is_observed(t));
+        let note = cost_footnote(&total.bases, dashes);
+        if !note.is_empty() {
+            b += &format!("\n{}\n", paint(ctx.colour, "2", &note));
+        }
     }
     for m in &d.messages {
         b += &format!("\n[{}]\n", cell(&m.role));
@@ -561,6 +811,10 @@ struct ImportReport {
     pricing: Option<SyncPricing>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ledger: Option<LedgerReport>,
+    /// Every (provider, model) in the store with tokens krowk cannot price
+    /// and no cost the source reported: their sessions' costs read —.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unpriced_models: Vec<String>,
 }
 
 impl ProviderReport {
@@ -749,6 +1003,10 @@ fn import_into(ctx: &mut Ctx, conn: Option<&Connection>, store_path: &str, sourc
             Ok(_) => {}
             Err(e) => broken.push(format!("the provider ledgers could not be reconciled: {}", sanitize_store_err(e.message(), store_path))),
         }
+        match unpriced_models(ctx, conn) {
+            Ok(u) => report.unpriced_models = u,
+            Err(e) => broken.push(format!("prices could not be checked: {}", sanitize_store_err(e.message(), store_path))),
+        }
     }
     report.duration_ms = started.elapsed().as_millis();
     emit_import_report(ctx, &report)?;
@@ -756,6 +1014,18 @@ fn import_into(ctx: &mut Ctx, conn: Option<&Connection>, store_path: &str, sourc
         return Err(fail("import_failed", format!("{} — the reasons are in `errors` in the report above", broken.join("; "))));
     }
     Ok(())
+}
+
+/// The pairs with tokens no price covers, across the whole store — so a model the
+/// cache does not know yet is named at import instead of costing a silent 0.
+fn unpriced_models(ctx: &Ctx, conn: &Connection) -> Result<Vec<String>, StoreError> {
+    let mut out = BTreeSet::new();
+    for g in krowk_store::cost_groups(conn, &[])?.values().flatten() {
+        if group_tokens(g) != pricing::Tokens::default() && cost_of(ctx, &g.provider, &g.model, g.reported.then_some(g.usd_micros), group_tokens(g)).is_none() {
+            out.insert(pair_name(&g.provider, &g.model));
+        }
+    }
+    Ok(out.into_iter().collect())
 }
 
 fn run_source(ctx: &Ctx, conn: Option<&Connection>, store_path: &str, s: &dyn Source, skip_unchanged: bool) -> ProviderReport {
@@ -837,6 +1107,9 @@ fn emit_import_report(ctx: &mut Ctx, report: &ImportReport) -> Result<(), Error>
         if p.errors_truncated > 0 {
             out += &format!("  ! ... and {} more not shown\n", p.errors_truncated);
         }
+    }
+    if !report.unpriced_models.is_empty() {
+        out += &format!("! no price for {} — their costs show as —; `krowk pricing refresh` may know them\n", report.unpriced_models.join(", "));
     }
     if let Some(l) = &report.ledger {
         out += &format!("reconciled {} ledger rows a transcript saw, {} only the provider saw", l.observed, l.unobserved);
@@ -1010,7 +1283,8 @@ mod tests {
         assert_eq!(relative_time(now - 90_000, now), "1m ago");
         assert_eq!(relative_time(now - 36 * 3_600_000, now), "yesterday");
         assert_eq!(relative_time(now + 1, now), "in the future");
-        assert_eq!((format_cost(0.005), human_cost(0.005), human_cost(0.0)), ("$0.0050".into(), "<$0.01".into(), "free".into()));
+        assert_eq!((format_cost(0.005), human_cost(0.005), human_cost(0.0)), ("$0.00500".into(), "<$0.01".into(), "free".into()));
+        assert_eq!((format_cost(0.000_07), format_cost(0.000_12), format_cost(0.012_3)), ("$0.0000700".into(), "$0.000120".into(), "$0.01".into()));
         assert_eq!(truncate_chars("ąčęėįšųū", 5), "ąč...");
     }
 }

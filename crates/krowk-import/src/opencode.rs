@@ -504,6 +504,7 @@ impl<'a> Builder<'a> {
             foreign_id: id.to_string(),
             usage: d.usage,
             raw_json: d.raw_json,
+            turn_seq: None,
             parts,
         });
         self.tokens.push(d.tokens);
@@ -643,7 +644,11 @@ impl<'a> Builder<'a> {
             parent: (!self.parent_id.is_empty() && self.parent_id != self.r.id).then(|| binding(&self.parent_id)),
             turns: self.turns(),
             events: Vec::new(),
-            messages: self.messages,
+            messages: {
+                let mut messages = self.messages;
+                crate::link_turns(&mut messages, &split_turns(&self.candidates));
+                messages
+            },
         };
         (th, self.acc)
     }
@@ -1442,5 +1447,37 @@ mod tests {
         assert_eq!(resolve_worktree("/abs/wt/", "git", "/abs/dir"), s("/abs/wt", VCS_GIT));
         assert_eq!(resolve_worktree("/abs/wt", "hg", ""), s("/abs/wt", VCS_NONE));
         assert_eq!((clean("a/../../b"), base_name("/"), base_name("")), ("../b".into(), "/".into(), String::new()));
+    }
+
+    #[test]
+    fn each_message_names_its_turn_so_a_model_switch_prices_per_turn() {
+        let f = Fixture::new();
+        f.exec(
+            "INSERT INTO session (id, project_id, parent_id, directory, title, model, time_created, time_updated) VALUES ('ses_hop', 'prj_1', NULL, ?1, 't', NULL, 1, 1)",
+            rusqlite::params![f.worktree],
+        );
+        let rows = [
+            ("msg_1", r#"{"role":"user"}"#, Some("first")),
+            ("msg_2", r#"{"role":"assistant","modelID":"m-a","providerID":"p"}"#, None),
+            ("msg_3", r#"{"role":"user"}"#, Some("second")),
+            ("msg_4", r#"{"role":"assistant","modelID":"m-b","providerID":"p"}"#, None),
+        ];
+        for (i, (id, data, text)) in rows.iter().enumerate() {
+            let t = 1_757_000_000_000_i64 + i as i64;
+            f.exec(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, 'ses_hop', ?2, ?2, ?3)",
+                rusqlite::params![id, t, data],
+            );
+            if let Some(text) = text {
+                f.exec(
+                    "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1, ?2, 'ses_hop', ?3, ?3, ?4)",
+                    rusqlite::params![format!("prt_{id}"), id, t, json!({ "type": "text", "text": text }).to_string()],
+                );
+            }
+        }
+        let (th, _, _) = f.read("ses_hop");
+        assert_eq!(th.turns.len(), 2);
+        let links: Vec<(Option<i64>, &str)> = th.messages.iter().map(|m| (m.turn_seq, m.model.as_str())).collect();
+        assert_eq!(links, vec![(Some(0), ""), (Some(0), "m-a"), (Some(1), ""), (Some(1), "m-b")]);
     }
 }

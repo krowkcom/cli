@@ -9,6 +9,86 @@ const SESSION_LIST: &str = "WITH page AS (SELECT s.id AS pid FROM session s LEFT
 
 pub const DEFAULT_SESSION_PAGE: i64 = 50;
 
+/// The (provider, model) a turn is priced by: its last assistant message
+/// naming a real model, else the session's. Claude writes `<synthetic>` on
+/// messages no model produced, which name no price. A scalar subquery per
+/// turn, answered from idx_message_turn alone (it covers every column read
+/// here), so a page of sessions reads only its own turns and no message rows.
+const TURN_MODEL_FROM: &str = "FROM message m WHERE m.turn_id = t.id AND m.role = 'assistant' AND m.model != '' AND m.model NOT LIKE '<%>' ORDER BY m.seq DESC LIMIT 1";
+
+/// A session's turns summed per (provider, model) — the pair a price is
+/// looked up by — and split by whether the source reported the dollars.
+/// Ledger turns something else already accounts for — a transcript, or an
+/// earlier export — are left out: they count once, there.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CostGroup {
+    pub provider: String,
+    pub model: String,
+    /// The source stated a cost above 0 for these turns; `usd_micros` is its
+    /// sum. opencode writes 0 for a model it cannot price, so a stated 0 is
+    /// no statement — those turns are priced from their tokens instead.
+    pub reported: bool,
+    pub turns: i64,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub reasoning: i64,
+    pub usd_micros: i64,
+}
+
+/// Cost groups for the given sessions, keyed by session id. With no ids,
+/// every session in the store.
+pub fn cost_groups(conn: &Connection, session_ids: &[String]) -> Result<HashMap<String, Vec<CostGroup>>, StoreError> {
+    let base = format!(
+        "SELECT t.session_id, COALESCE((SELECT m.provider {TURN_MODEL_FROM}), s.provider), COALESCE((SELECT m.model {TURN_MODEL_FROM}), s.model), \
+         COALESCE(t.cost_usd_micros, 0) > 0, COUNT(*), SUM(t.cost_input_tokens), SUM(t.cost_output_tokens), SUM(t.cost_cache_read_tokens), \
+         SUM(t.cost_cache_write_tokens), SUM(t.cost_reasoning_tokens), COALESCE(SUM(CASE WHEN t.cost_usd_micros > 0 THEN t.cost_usd_micros END), 0) \
+         FROM turn t JOIN session s ON s.id = t.session_id WHERE t.status NOT IN ('{observed}', '{duplicate}')",
+        observed = crate::STATUS_OBSERVED,
+        duplicate = crate::STATUS_DUPLICATE,
+    );
+    let mut out: HashMap<String, Vec<CostGroup>> = HashMap::new();
+    let mut run = |sql: &str, ids: &[String]| -> Result<(), StoreError> {
+        let mut st = conn.prepare(sql).map_err(|e| other("cost groups", e))?;
+        let rows = st
+            .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    CostGroup {
+                        provider: string(r, 1)?,
+                        model: string(r, 2)?,
+                        reported: r.get(3)?,
+                        turns: r.get(4)?,
+                        input: r.get(5)?,
+                        output: r.get(6)?,
+                        cache_read: r.get(7)?,
+                        cache_write: r.get(8)?,
+                        reasoning: r.get(9)?,
+                        usd_micros: r.get(10)?,
+                    },
+                ))
+            })
+            .map_err(|e| other("cost groups", e))?;
+        for row in rows {
+            let (sid, g) = row.map_err(|e| other("scan cost group", e))?;
+            out.entry(sid).or_default().push(g);
+        }
+        Ok(())
+    };
+    const GROUP_BY: &str = " GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4";
+    if session_ids.is_empty() {
+        run(&format!("{base}{GROUP_BY}"), &[])?;
+    }
+    // Chunked under SQLite's bound-parameter limit.
+    for chunk in session_ids.chunks(500) {
+        let marks = vec!["?"; chunk.len()].join(", ");
+        run(&format!("{base} AND t.session_id IN ({marks}){GROUP_BY}"), chunk)?;
+    }
+    Ok(out)
+}
+
+
 /// One row of the listing: the session, its first binding, and its turns summed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionRow {
@@ -171,6 +251,9 @@ fn cell(s: &str) -> String {
 pub struct TurnDetail {
     pub seq: i64,
     pub status: String,
+    /// The pair this turn is priced by; see `cost_groups`.
+    pub provider: String,
+    pub model: String,
     pub input: i64,
     pub output: i64,
     pub total: i64,
@@ -250,7 +333,8 @@ pub fn load_session_detail(conn: &Connection, session_id: &str) -> Result<Sessio
     }
 
     let turns: Vec<TurnDetail> = tx
-        .prepare("SELECT seq, status, cost_input_tokens, cost_output_tokens, cost_total_tokens, cost_cache_read_tokens, cost_cache_write_tokens, cost_reasoning_tokens, cost_usd_micros, time_created, time_updated FROM turn WHERE session_id = ? ORDER BY seq")
+        .prepare(&format!("SELECT t.seq, t.status, t.cost_input_tokens, t.cost_output_tokens, t.cost_total_tokens, t.cost_cache_read_tokens, t.cost_cache_write_tokens, t.cost_reasoning_tokens, t.cost_usd_micros, t.time_created, t.time_updated, \
+             (SELECT m.provider {TURN_MODEL_FROM}), (SELECT m.model {TURN_MODEL_FROM}) FROM turn t WHERE t.session_id = ? ORDER BY t.seq"))
         .and_then(|mut s| {
             s.query_map([session_id], |r| {
                 Ok(TurnDetail {
@@ -265,11 +349,19 @@ pub fn load_session_detail(conn: &Connection, session_id: &str) -> Result<Sessio
                     usd_micros: r.get(8)?,
                     time_created: r.get(9)?,
                     time_updated: r.get(10)?,
+                    provider: string(r, 11)?,
+                    model: string(r, 12)?,
                 })
             })?
             .collect()
         })
         .map_err(|e| other("load turns", e))?;
+    let mut turns = turns;
+    for t in &mut turns {
+        if t.model.is_empty() {
+            (t.provider, t.model) = (session.provider.clone(), session.model.clone());
+        }
+    }
     session.turn_count = turns.len() as i64;
     for t in &turns {
         session.sum_input += t.input;
@@ -377,6 +469,7 @@ mod tests {
                 foreign_id: "x".into(),
                 usage: String::new(),
                 raw_json: None,
+                turn_seq: None,
                 parts: vec![
                     Part { kind: "tool_call".into(), tool_call_id: "c1".into(), data: r#"{"name":"Bash"}"#.into(), ..Part::default() },
                     Part { kind: "tool_result".into(), tool_call_id: "c1".into(), ..Part::default() },
@@ -423,5 +516,44 @@ mod tests {
             Err(StoreError::Ambiguous { ids, .. }) => assert_eq!(ids.len(), 2),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_turn_is_priced_by_its_own_model_and_synthetic_names_no_model() {
+        let home = Home::new("groups");
+        let env = home.env();
+        let conn = open(&env).unwrap();
+        let msg = |model: &str, turn: i64, fid: &str| Message {
+            role: Role::Assistant,
+            provider: "anthropic".into(),
+            model: model.into(),
+            foreign_id: fid.into(),
+            usage: String::new(),
+            raw_json: None,
+            turn_seq: Some(turn),
+            parts: Vec::new(),
+        };
+        let th = Thread {
+            worktree: Worktree { path: "/repo".into(), ..Worktree::default() },
+            session: Session { title: "hop".into(), harness: "claude".into(), provider: "anthropic".into(), model: "fable".into(), ..Session::default() },
+            binding: Binding { provider: "claude".into(), harness: "claude".into(), foreign_session_id: "s".into(), ..Binding::default() },
+            turns: vec![Turn { cost_input: 1, ..Turn::default() }, Turn { cost_input: 2, ..Turn::default() }, Turn { cost_input: 4, cost_usd_micros: Some(9), ..Turn::default() }],
+            messages: vec![msg("opus", 0, "a"), msg("sonnet", 1, "b"), msg("<synthetic>", 1, "c")],
+            ..Thread::default()
+        };
+        Writer::new(&conn).ingest(&th).unwrap();
+        let id = resolve_session_id(&conn, "s").unwrap();
+        let groups = &cost_groups(&conn, std::slice::from_ref(&id)).unwrap()[&id];
+        let got: Vec<(&str, bool, i64, i64)> = groups.iter().map(|g| (g.model.as_str(), g.reported, g.input, g.usd_micros)).collect();
+        assert_eq!(got, vec![("fable", true, 4, 9), ("opus", false, 1, 0), ("sonnet", false, 2, 0)], "no message: the session's model");
+        assert_eq!(cost_groups(&conn, &[]).unwrap()[&id], *groups, "no ids is every session");
+        let d = load_session_detail(&conn, &id).unwrap();
+        assert_eq!(d.turns.iter().map(|t| t.model.as_str()).collect::<Vec<_>>(), vec!["opus", "sonnet", "fable"]);
+
+        // A store from before the link: a re-import links what it skips.
+        conn.execute("UPDATE message SET turn_id = NULL", []).unwrap();
+        assert_eq!(load_session_detail(&conn, &id).unwrap().turns[0].model, "fable");
+        Writer::new(&conn).ingest(&th).unwrap();
+        assert_eq!(load_session_detail(&conn, &id).unwrap().turns[0].model, "opus");
     }
 }

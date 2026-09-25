@@ -71,7 +71,10 @@ stdout:
       "duration_ms": <n>
     }
   ],
-  "duration_ms": <n>
+  "duration_ms": <n>,
+  "unpriced_models": [
+    "anthropic/claude-opus-5-20260401"
+  ]
 }
 exit: 0
 
@@ -94,7 +97,10 @@ stdout:
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/home/plain",
         "foreign_session_id": "<uuid_2>",
-        "directory": "<scratch>/home/plain"
+        "directory": "<scratch>/home/plain",
+        "unpriced": [
+          "anthropic/claude-opus-5-20260401"
+        ]
       },
       {
         "id": "<uuid_3>",
@@ -109,7 +115,10 @@ stdout:
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work",
         "foreign_session_id": "a0123456789abcdef",
-        "directory": "<scratch>/work/claude"
+        "directory": "<scratch>/work/claude",
+        "unpriced": [
+          "anthropic/claude-opus-5-20260401"
+        ]
       },
       {
         "id": "<uuid_4>",
@@ -124,7 +133,10 @@ stdout:
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work",
         "foreign_session_id": "<uuid_5>",
-        "directory": "<scratch>/work/claude"
+        "directory": "<scratch>/work/claude",
+        "unpriced": [
+          "anthropic/claude-opus-5-20260401"
+        ]
       },
       {
         "id": "<uuid_6>",
@@ -138,7 +150,10 @@ stdout:
         "time_updated_ms": <store_ms_1>,
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/home/.claude/projects/-home-elvinas",
-        "foreign_session_id": "<uuid_7>"
+        "foreign_session_id": "<uuid_7>",
+        "unpriced": [
+          "anthropic (no model recorded)"
+        ]
       }
     ]
   },
@@ -164,7 +179,10 @@ stdout:
         "time_updated_ms": <store_ms_6>,
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work",
-        "foreign_session_id": "<uuid_5>"
+        "foreign_session_id": "<uuid_5>",
+        "unpriced": [
+          "cursor (no model recorded)"
+        ]
       },
       {
         "id": "<uuid_9>",
@@ -178,7 +196,10 @@ stdout:
         "time_updated_ms": <store_ms_5>,
         "time_updated_relative": "<ago>",
         "worktree": "cursor:missing-dir-xyz",
-        "foreign_session_id": "<uuid_2>"
+        "foreign_session_id": "<uuid_2>",
+        "unpriced": [
+          "cursor (no model recorded)"
+        ]
       }
     ]
   },
@@ -199,8 +220,8 @@ stdout:
         "model": "gpt-5.5",
         "provider": "openai",
         "turns": 2,
-        "cost_usd": null,
-        "cost_display": "—",
+        "cost_usd": 0.012445,
+        "cost_display": "$0.01",
         "time_updated_ms": <store_ms_8>,
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work/oc",
@@ -214,8 +235,8 @@ stdout:
         "model": "gpt-5.5",
         "provider": "openai",
         "turns": 1,
-        "cost_usd": null,
-        "cost_display": "—",
+        "cost_usd": 0.00001,
+        "cost_display": "$0.0000100",
         "time_updated_ms": <store_ms_7>,
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work/oc",
@@ -257,7 +278,10 @@ stdout:
         "time_updated_ms": <store_ms_6>,
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work",
-        "foreign_session_id": "<uuid_5>"
+        "foreign_session_id": "<uuid_5>",
+        "unpriced": [
+          "cursor (no model recorded)"
+        ]
       },
       {
         "id": "<uuid_3>",
@@ -272,7 +296,10 @@ stdout:
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work",
         "foreign_session_id": "a0123456789abcdef",
-        "directory": "<scratch>/work/claude"
+        "directory": "<scratch>/work/claude",
+        "unpriced": [
+          "anthropic/claude-opus-5-20260401"
+        ]
       },
       {
         "id": "<uuid_4>",
@@ -287,7 +314,10 @@ stdout:
         "time_updated_relative": "<ago>",
         "worktree": "<scratch>/work",
         "foreign_session_id": "<uuid_5>",
-        "directory": "<scratch>/work/claude"
+        "directory": "<scratch>/work/claude",
+        "unpriced": [
+          "anthropic/claude-opus-5-20260401"
+        ]
       }
     ]
   },

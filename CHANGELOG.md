@@ -95,6 +95,16 @@ the versions are the `v*` tags a release is cut from. Entries land under
   accounts — `{"anthropic:work": {"kind": "anthropic-api", "apiKeyEnv":
   "WORK_ANTHROPIC_KEY"}}` — and `"defaultModel"` the model `-p` uses. A key
   is never stored in the file, only the variable it is read from.
+- **The performance and size promises fail CI when broken.** Every number
+  krowk promises is in `crates/krowk-bench/budgets.toml`, and `make bench`
+  (run by CI on every pull request, on one pinned runner) holds the release
+  builds to it: the agent build's size (3.76 MiB, budget 4.00 MiB) and its
+  136 crates, the full build's size, `krowk --version` and `krowk sessions`
+  startup, a session log append (under 1 ms; ~8 µs today), and `krowk -p`
+  waiting on a provider using no CPU, no wakeups and under 30 MB. Each is
+  the median of repeated runs against the absolute number, never against
+  the last run. The TUI, redraw and remote-attach budgets are listed and
+  shown as pending until the features they measure exist.
 - **`krowk sessions budget <id> --max-usd N --max-tokens N`** checks a
   session against a spend limit by what the provider metered, never by the
   `max_tokens` its requests asked for — providers do not strictly enforce

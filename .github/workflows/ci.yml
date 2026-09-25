@@ -45,3 +45,28 @@ jobs:
 
       - name: Lint, unit tests and golden cases
         run: make check
+
+  # R-PERF-7: the performance and size budgets, on one pinned runner class so
+  # every number is read on the same kind of machine — an image named by
+  # version, not -latest, which moves under the numbers. Each check is the
+  # median of repeated runs held against the absolute number in
+  # crates/krowk-bench/budgets.toml, never against an earlier run, and the
+  # idle checks read Linux /proc, so this runner is also the one machine where
+  # nothing may be skipped (--strict). The table lands in the job summary.
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.97 --profile minimal
+          rustup default 1.97
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Performance and size budgets
+        run: make bench BENCH_FLAGS=--strict

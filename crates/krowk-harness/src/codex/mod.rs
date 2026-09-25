@@ -23,21 +23,25 @@
 //! | `turn/steer` | krowk → codex | `Command::Steer`, into the running turn |
 //! | `turn/interrupt` | krowk → codex | `Command::Interrupt`; the process lives on for the next turn |
 //! | `item/*`, `thread/tokenUsage/updated` | codex → krowk | translated into krowk's events by `stream` (R-BACK-5) |
-//! | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, … | codex → krowk | answered by krowk's approval path (`approve_command`, `approve_file_change`) |
+//! | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, … | codex → krowk | judged by krowk's permission evaluator (`crate::permissions`), as `Bash(<command>)` and `Edit(<files>)` |
 //! | `item/tool/call` | codex → krowk | a call of krowk's own tools, answered by `crate::bridge` |
 //!
 //! **The mode.** Every mode but `bypassPermissions` runs Codex in its
 //! `read-only` sandbox with approvals `on-request` and krowk as the
 //! reviewer, so every edit and every command that needs more than reading
-//! is asked about, and `approve_*` answers it by krowk's rule;
-//! `bypassPermissions` is `danger-full-access` with no approvals. The mode
+//! is asked about, and krowk's permission evaluator answers it — asking the
+//! person when a client is attached; `bypassPermissions` is
+//! `danger-full-access` with no approvals. The mode
 //! is named on `thread/start` and `thread/resume`, so a default in Codex's
 //! config cannot loosen it, and a thread Codex reports in a looser sandbox,
 //! or with another reviewer, is stopped before a turn runs. What Codex's
 //! sandbox lets a command do without asking — read the disk, not write it
 //! — and what the user's own Codex rules allow by themselves, is Codex's to
 //! decide: the vendor behaving as its user set it up, as with every
-//! backend, and ticket 09's rules are where krowk takes that into account.
+//! backend. krowk's deny rules reach Codex only through what it asks, so a
+//! `Read(.env)` deny does not stop a command reading the file inside
+//! Codex's read-only sandbox; the OS sandbox (Harness ticket 26) is what
+//! closes that.
 //!
 //! **Compliance** (R-BACK-3) is structural: krowk starts the binary as the
 //! user installed it, as itself (client `krowk`), sends it no system
@@ -53,6 +57,7 @@ use crate::bridge::{self, BridgeEnv};
 use crate::catalog::ModelInfo;
 use crate::engine::{cancelled, BoxFuture, Engine, EngineError, EngineEvent, Events, TurnContext, TurnEnd};
 use crate::instances::{Backend, Resolved};
+use crate::permissions::{self, Access, Call, Gate, Verdict};
 use crate::protocol::{Billing, Effort, Item, ItemKind, ModelRef, PermissionMode, WireApi};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -209,37 +214,28 @@ pub fn effort_for(want: Option<Effort>, codex: Option<&[String]>, info: Option<&
     crate::effort::map(want, &takes).map(|e| e.name().to_string())
 }
 
-/// A command Codex asks to run outside its read-only sandbox, answered
-/// until the permission system lands (ticket 9 replaces this evaluator): as
-/// in the native loop, running a command needs `bypassPermissions`.
-pub fn approve_command(mode: PermissionMode) -> Result<(), String> {
-    if mode == PermissionMode::BypassPermissions {
-        return Ok(());
-    }
-    Err("krowk declined the command: until krowk's permission rules land, commands beyond Codex's read-only sandbox run only when krowk is started with `--permission-mode bypassPermissions`".into())
+/// A command Codex asks to run outside its read-only sandbox, as krowk's
+/// permission evaluator judges it: `Bash(<command>)`, so the rules written
+/// for Claude Code hold for Codex's commands too.
+pub fn command_call(command: &str) -> Call {
+    Call { tool: "Bash".into(), access: Access::Bash(command.to_string()), subject: None }
 }
 
-/// A patch Codex asks to apply, by the files it names: the native loop's
-/// rule — edits need `acceptEdits`, reach only inside the working
-/// directory, and never into `.git`, `.codex`, `.claude` or the instance's
-/// own home (`protected`) — unless permissions are bypassed. A patch that
-/// asks for a whole root for the rest of the session is not granted one.
-pub fn approve_file_change(mode: PermissionMode, paths: Option<&[String]>, grant_root: Option<&str>, cwd: &Path, protected: &[PathBuf]) -> Result<(), String> {
-    if mode == PermissionMode::BypassPermissions {
-        return Ok(());
-    }
-    if mode != PermissionMode::AcceptEdits {
-        return Err("krowk declined the change: this session does not allow edits — until krowk's permission rules land, they run only when krowk is started with `--permission-mode acceptEdits` or `bypassPermissions`. Say what you would change instead.".into());
-    }
+/// A patch Codex asks to apply, by every file it names (each change's path
+/// and a move's destination, `stream::change_paths`): an `Edit` of them. A
+/// patch whose files krowk did not see, or that asks to write anywhere
+/// under a root for the rest of the session, is refused before it is
+/// judged: krowk judges each change by its files.
+pub fn file_change_call(paths: Option<&[String]>, grant_root: Option<&str>, cwd: &Path) -> Result<Call, String> {
     if let Some(root) = grant_root.filter(|r| !r.is_empty()) {
         return Err(format!("krowk declined the change: it asked to write anywhere under {root} for the rest of the session, and krowk approves each change by its files"));
     }
     let paths = paths.filter(|p| !p.is_empty()).ok_or("krowk declined the change: it did not see which files the patch changes")?;
-    let scope = crate::tools::Scope { cwd: cwd.to_path_buf(), bypass: false, protected: protected.to_vec() };
-    for p in paths {
-        scope.edit_path(p).map_err(|e| format!("krowk declined the change: {e}"))?;
-    }
-    Ok(())
+    let at = |p: &String| {
+        let p = Path::new(p);
+        if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+    };
+    Ok(Call { tool: "Edit".into(), access: Access::Edit(paths.iter().map(at).collect()), subject: None })
 }
 
 /// What a Codex account's home shares with the person's own Codex home:
@@ -436,10 +432,9 @@ impl Engine for CodexEngine {
                 turn_id: ctx.turn_id.clone(),
                 model: ctx.model.clone(),
                 cwd: ctx.cwd.clone(),
-                mode: ctx.permission_mode,
                 krowk_version: self.krowk_version.clone(),
-                protected: self.backend().home.iter().chain(&self.backend().shared_home).cloned().collect(),
                 evidence: ctx.evidence.clone(),
+                gate: ctx.gate.protecting(self.backend().home.iter().chain(&self.backend().shared_home).cloned()),
             };
             // The running process serves this turn when it is alive and in
             // the same sandbox; another mode is another thread setting,
@@ -500,19 +495,35 @@ struct Answers {
     turn_id: String,
     model: ModelRef,
     cwd: PathBuf,
-    mode: PermissionMode,
     krowk_version: String,
-    /// The instance's home: no edit reaches it.
-    protected: Vec<PathBuf>,
+    /// The turn's permissions, with the instance's home kept from edits too.
+    gate: Gate,
     /// Where a bridged `publish` sends files.
     evidence: Option<crate::evidence::Evidence>,
 }
 
+/// Where a question for a person goes while a turn runs; outside one
+/// (while a thread opens) nobody is asked.
+type Asking<'a> = Option<(&'a Events, &'a tokio::sync::watch::Receiver<bool>)>;
+
 impl Answers {
+    /// Judges a call, asking a person when the verdict says to and a turn
+    /// is there to ask through.
+    async fn permit(&self, call: Result<Call, String>, tool: &str, input: &Value, asking: Asking<'_>) -> Result<(), String> {
+        let call = call?;
+        let r = match asking {
+            Some((events, cancel)) => self.gate.check(&call, tool, input, None, events, cancel).await.map(drop),
+            None => match self.gate.verdict(&call, None) {
+                Verdict::Allow(_) => Ok(()),
+                Verdict::Deny(m) => Err(m),
+                Verdict::Ask { reason, .. } => Err(format!("{} needs approval — {reason} — and Codex asked outside a turn, where nobody can be asked", permissions::summary(&call))),
+            },
+        };
+        r.map_err(|e| if e.starts_with("krowk declined") { e } else { format!("krowk declined it: {e}") })
+    }
+
     /// The answer to one of Codex's requests: a result, or a JSON-RPC error.
-    /// `events` is where a run `publish` opens is reported: none while a
-    /// process is being set up, before a turn has anywhere to report to.
-    async fn answer(&self, method: &str, params: &Value, t: &mut Translator, events: Option<&Events>) -> Result<Value, (i64, String)> {
+    async fn answer(&self, method: &str, params: &Value, t: &mut Translator, asking: Asking<'_>) -> Result<Value, (i64, String)> {
         let item = str_of(params, "itemId").to_string();
         // A decline's reason is kept for the call's result: Codex tells the
         // model only that it was declined.
@@ -526,10 +537,15 @@ impl Answers {
             }
         };
         match method {
-            "item/commandExecution/requestApproval" => Ok(decide(t, approve_command(self.mode))),
+            "item/commandExecution/requestApproval" => {
+                let command = str_of(params, "command").to_string();
+                let verdict = self.permit(Ok(command_call(&command)), "shell", params, asking).await;
+                Ok(decide(t, verdict))
+            }
             "item/fileChange/requestApproval" => {
                 let paths = t.changes.get(&item).cloned();
-                let verdict = approve_file_change(self.mode, paths.as_deref(), params.get("grantRoot").and_then(Value::as_str), &self.cwd, &self.protected);
+                let call = file_change_call(paths.as_deref(), params.get("grantRoot").and_then(Value::as_str), &self.cwd);
+                let verdict = self.permit(call, "apply_patch", params, asking).await;
                 Ok(decide(t, verdict))
             }
             // More sandbox for the rest of the turn: none is granted — what
@@ -544,21 +560,29 @@ impl Answers {
                 Ok(json!({ "answers": answers }))
             }
             "mcpServer/elicitation/request" => Ok(json!({"action": "decline"})),
-            "item/tool/call" => Ok(self.tool_call(params, events).await),
+            "item/tool/call" => Ok(self.tool_call(params, asking).await),
             // The requests of Codex's first protocol, for a Codex that
             // still sends them.
             "applyPatchApproval" => {
                 let paths = params.get("fileChanges").map(stream::change_paths).unwrap_or_default();
-                let verdict = approve_file_change(self.mode, Some(&paths), params.get("grantRoot").and_then(Value::as_str), &self.cwd, &self.protected);
+                let call = file_change_call(Some(&paths), params.get("grantRoot").and_then(Value::as_str), &self.cwd);
+                let verdict = self.permit(call, "apply_patch", params, asking).await;
                 Ok(json!({"decision": if verdict.is_ok() { "approved" } else { "denied" }}))
             }
-            "execCommandApproval" => Ok(json!({"decision": if approve_command(self.mode).is_ok() { "approved" } else { "denied" }})),
+            "execCommandApproval" => {
+                let command = params.get("command").map(|c| match c {
+                    Value::Array(a) => a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+                    v => v.as_str().unwrap_or_default().to_string(),
+                });
+                let verdict = self.permit(Ok(command_call(&command.unwrap_or_default())), "shell", params, asking).await;
+                Ok(json!({"decision": if verdict.is_ok() { "approved" } else { "denied" }}))
+            }
             m => Err((-32601, format!("krowk does not answer {m:?}"))),
         }
     }
 
     /// A call of one of krowk's tools, run by the bridge as a `tools/call`.
-    async fn tool_call(&self, params: &Value, events: Option<&Events>) -> Value {
+    async fn tool_call(&self, params: &Value, asking: Asking<'_>) -> Value {
         let namespace = params.get("namespace").and_then(Value::as_str).unwrap_or_default();
         let tool = str_of(params, "tool");
         if namespace != bridge::SERVER {
@@ -571,8 +595,9 @@ impl Answers {
             cwd: &self.cwd,
             backend: BACKEND,
             krowk_version: &self.krowk_version,
-            permission_mode: self.mode,
-            evidence: self.evidence.as_ref().zip(events),
+            gate: &self.gate,
+            cancel: asking.map(|(_, c)| c),
+            evidence: self.evidence.as_ref().zip(asking.map(|(e, _)| e)),
         };
         let call = json!({"jsonrpc": "2.0", "id": 0, "method": "tools/call", "params": {"name": tool, "arguments": params.get("arguments").cloned().unwrap_or(Value::Null)}});
         let answer = bridge::handle(&call, &env).await;
@@ -894,7 +919,8 @@ impl Proc {
         // --strict-mcp-config. Codex's effective config for this directory
         // names them, and the thread turns each off. MCP servers an
         // installed Codex plugin brings may not be listed there, and are
-        // not reached by this: ticket 09's permission rules are.
+        // not reached by this — still open: the pinned protocol has no
+        // thread setting krowk can verify turns a plugin's server off.
         if ctx.permission_mode != PermissionMode::BypassPermissions {
             let config = self.request("config/read", json!({ "cwd": cwd }), ask, INITIALIZE_TIMEOUT).await.map_err(|e| EngineError::new(&e.code, format!("krowk asks Codex which MCP servers its config names, to keep them off, and it did not say: {}", e.message)))?;
             if let Some(off) = mcp_off(&config) {
@@ -1046,7 +1072,7 @@ impl Proc {
                                 Some(Pending::Interrupt) | None => {}
                             },
                             Msg::Request { id, method, params } => {
-                                let answer = ask.answer(&method, &params, &mut t, Some(events)).await;
+                                let answer = ask.answer(&method, &params, &mut t, Some((events, &ctx.cancel))).await;
                                 self.reply(id, answer).await?;
                             }
                             Msg::Note { method, params } => {
@@ -1276,63 +1302,63 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let cwd = cwd.canonicalize().unwrap();
         let f = |p: &str| vec![cwd.join(p).display().to_string()];
-        assert!(approve_command(PermissionMode::AcceptEdits).unwrap_err().contains("bypassPermissions"));
-        assert!(approve_command(PermissionMode::BypassPermissions).is_ok());
+        let judge = |m, call: Result<Call, String>, protected: &[PathBuf]| crate::permissions::judge(m, call, &cwd, protected);
+        let change = |m, paths: Option<&[String]>, root: Option<&str>| judge(m, file_change_call(paths, root, &cwd), &[]);
+        assert!(judge(PermissionMode::AcceptEdits, Ok(command_call("ls")), &[]).unwrap_err().contains("runs a command"));
+        assert!(judge(PermissionMode::BypassPermissions, Ok(command_call("ls")), &[]).is_ok());
         let ae = PermissionMode::AcceptEdits;
-        assert!(approve_file_change(PermissionMode::Default, Some(&f("a.txt")), None, &cwd, &[]).unwrap_err().contains("acceptEdits"));
-        assert!(approve_file_change(PermissionMode::Plan, Some(&f("a.txt")), None, &cwd, &[]).is_err());
-        assert!(approve_file_change(ae, Some(&f("a.txt")), None, &cwd, &[]).is_ok());
-        assert!(approve_file_change(ae, Some(&["/etc/passwd".to_string()]), None, &cwd, &[]).unwrap_err().contains("outside the working directory"));
-        for p in [".codex/config.toml", ".git/hooks/pre-commit", "sub/.CODEX/rules/x.rules", ".claude/settings.json"] {
-            assert!(approve_file_change(ae, Some(&f(p)), None, &cwd, &[]).is_err(), "{p}");
+        assert!(change(PermissionMode::Default, Some(&f("a.txt")), None).unwrap_err().contains("default mode"));
+        assert!(change(PermissionMode::Plan, Some(&f("a.txt")), None).unwrap_err().contains("plan mode"));
+        assert!(change(ae, Some(&f("a.txt")), None).is_ok());
+        assert!(change(ae, Some(&["/etc/passwd".to_string()]), None).unwrap_err().contains("outside the working directory"));
+        for p in [".codex/config.toml", ".git/hooks/pre-commit", "sub/.CODEX/rules/x.rules", ".claude/settings.json", ".krowk/config.json"] {
+            assert!(change(ae, Some(&f(p)), None).is_err(), "{p}");
         }
-        assert!(approve_file_change(ae, Some(&f("a.txt")), Some("/"), &cwd, &[]).unwrap_err().contains("rest of the session"));
-        assert!(approve_file_change(ae, None, None, &cwd, &[]).is_err(), "a patch whose files krowk did not see is not approved blind");
+        assert!(change(ae, Some(&f("a.txt")), Some("/")).unwrap_err().contains("rest of the session"));
+        assert!(change(ae, None, None).is_err(), "a patch whose files krowk did not see is not approved blind");
         // A move is judged by where it lands too, in both protocols.
         let moved = stream::change_paths(&json!([{"path": cwd.join("a.txt"), "kind": {"type": "update", "move_path": cwd.join(".git/hooks/pre-commit")}, "diff": ""}]));
         assert_eq!(moved.len(), 2);
-        assert!(approve_file_change(ae, Some(&moved), None, &cwd, &[]).unwrap_err().contains(".git"));
+        assert!(change(ae, Some(&moved), None).unwrap_err().contains(".git"));
         let legacy = stream::change_paths(&json!({ cwd.join("a.txt").display().to_string(): {"type": "update", "unified_diff": "", "move_path": "/etc/cron.d/x"} }));
-        assert!(approve_file_change(ae, Some(&legacy), None, &cwd, &[]).unwrap_err().contains("outside the working directory"));
+        assert!(change(ae, Some(&legacy), None).unwrap_err().contains("outside the working directory"));
         let home = cwd.join("codex-home");
         std::fs::create_dir_all(&home).unwrap();
-        assert!(approve_file_change(ae, Some(&f("codex-home/config.toml")), None, &cwd, std::slice::from_ref(&home)).unwrap_err().contains("config directory"));
-        assert!(approve_file_change(PermissionMode::BypassPermissions, Some(&f(".codex/config.toml")), Some("/"), &cwd, &[home]).is_ok());
+        assert!(judge(ae, file_change_call(Some(&f("codex-home/config.toml")), None, &cwd), std::slice::from_ref(&home)).unwrap_err().contains("settings decide what runs"));
+        assert!(judge(PermissionMode::BypassPermissions, file_change_call(Some(&f(".codex/config.toml")), None, &cwd), &[home]).is_ok());
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
-    #[test]
-    fn r_back_3_codex_requests_are_answered_and_krowks_tools_run_through_the_bridge() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn r_back_3_codex_requests_are_answered_and_krowks_tools_run_through_the_bridge() {
         let ask = Answers {
             session_id: "s-1".into(),
             turn_id: "t-1".into(),
             model: ModelRef { instance: "codex:team".into(), model: "gpt-5.5".into() },
             cwd: PathBuf::from("/repo"),
-            mode: PermissionMode::Default,
             krowk_version: "test".into(),
-            protected: vec![],
+            gate: Gate::modes_only(Path::new("/repo"), PermissionMode::Default),
             evidence: None,
         };
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let mut t = Translator::default();
-        let a = rt.block_on(ask.answer("item/tool/call", &json!({"threadId": "th", "turnId": "tu", "callId": "c", "namespace": "krowk", "tool": "session_info", "arguments": {}}), &mut t, None)).unwrap();
+        let a = ask.answer("item/tool/call", &json!({"threadId": "th", "turnId": "tu", "callId": "c", "namespace": "krowk", "tool": "session_info", "arguments": {}}), &mut t, None).await.unwrap();
         assert_eq!(a["success"], true);
         let text = a["contentItems"][0]["text"].as_str().unwrap();
         assert!(text.contains("krowk session: s-1") && text.contains("instance: codex:team") && text.contains("backend: codex-app-server"), "{text}");
-        assert_eq!(rt.block_on(ask.answer("item/tool/call", &json!({"namespace": "other", "tool": "x", "arguments": {}}), &mut t, None)).unwrap()["success"], false);
-        assert_eq!(rt.block_on(ask.answer("item/commandExecution/requestApproval", &json!({"itemId": "c1"}), &mut t, None)).unwrap()["decision"], "decline");
-        assert!(t.declined["c1"].contains("bypassPermissions"), "the reason is kept for the call's result");
-        assert_eq!(rt.block_on(ask.answer("item/fileChange/requestApproval", &json!({"itemId": "f1"}), &mut t, None)).unwrap()["decision"], "decline");
-        assert_eq!(rt.block_on(ask.answer("item/permissions/requestApproval", &json!({"itemId": "p1"}), &mut t, None)).unwrap(), json!({"permissions": {}, "scope": "turn"}));
-        assert_eq!(rt.block_on(ask.answer("mcpServer/elicitation/request", &json!({}), &mut t, None)).unwrap()["action"], "decline");
-        let q = rt.block_on(ask.answer("item/tool/requestUserInput", &json!({"questions": [{"id": "q1", "header": "h", "question": "which?"}]}), &mut t, None)).unwrap();
+        assert_eq!(ask.answer("item/tool/call", &json!({"namespace": "other", "tool": "x", "arguments": {}}), &mut t, None).await.unwrap()["success"], false);
+        assert_eq!(ask.answer("item/commandExecution/requestApproval", &json!({"itemId": "c1"}), &mut t, None).await.unwrap()["decision"], "decline");
+        assert!(t.declined["c1"].contains("needs approval"), "the reason is kept for the call's result");
+        assert_eq!(ask.answer("item/fileChange/requestApproval", &json!({"itemId": "f1"}), &mut t, None).await.unwrap()["decision"], "decline");
+        assert_eq!(ask.answer("item/permissions/requestApproval", &json!({"itemId": "p1"}), &mut t, None).await.unwrap(), json!({"permissions": {}, "scope": "turn"}));
+        assert_eq!(ask.answer("mcpServer/elicitation/request", &json!({}), &mut t, None).await.unwrap()["action"], "decline");
+        let q = ask.answer("item/tool/requestUserInput", &json!({"questions": [{"id": "q1", "header": "h", "question": "which?"}]}), &mut t, None).await.unwrap();
         assert!(q["answers"]["q1"]["answers"][0].as_str().unwrap().contains("decide"));
-        assert_eq!(rt.block_on(ask.answer("execCommandApproval", &json!({}), &mut t, None)).unwrap()["decision"], "denied");
-        // publish is offered too, and held to what an edit is.
-        let refused = rt.block_on(ask.answer("item/tool/call", &json!({"namespace": "krowk", "tool": "publish", "arguments": {"files": ["a.png"]}}), &mut t, None)).unwrap();
+        assert_eq!(ask.answer("execCommandApproval", &json!({}), &mut t, None).await.unwrap()["decision"], "denied");
+        // publish is offered too, and judged as the native one is.
+        let refused = ask.answer("item/tool/call", &json!({"namespace": "krowk", "tool": "publish", "arguments": {"files": ["a.png"]}}), &mut t, None).await.unwrap();
         assert_eq!(refused["success"], false);
-        assert!(refused["contentItems"][0]["text"].as_str().unwrap().contains("--permission-mode acceptEdits"), "{refused}");
-        assert_eq!(rt.block_on(ask.answer("account/chatgptAuthTokens/refresh", &json!({}), &mut t, None)).unwrap_err().0, -32601, "krowk never handles Codex's tokens");
+        assert!(refused["contentItems"][0]["text"].as_str().unwrap().contains("needs approval"), "{refused}");
+        assert_eq!(ask.answer("account/chatgptAuthTokens/refresh", &json!({}), &mut t, None).await.unwrap_err().0, -32601, "krowk never handles Codex's tokens");
     }
 
     #[test]

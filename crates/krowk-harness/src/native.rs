@@ -4,7 +4,9 @@
 
 use crate::engine::{BoxFuture, Engine, EngineError, EngineEvent, Events, HistoryItem, TurnContext, TurnEnd};
 use crate::protocol::{Effort, Item, ItemKind, ProviderBlob, ToolDefinition, Usage, WireApi};
+use crate::hooks;
 use crate::tools;
+use serde_json::json;
 use crate::toolset::Toolset;
 use tokio::sync::watch;
 
@@ -192,8 +194,14 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
     fn run_turn<'a>(&'a self, ctx: TurnContext, events: Events) -> BoxFuture<'a, Result<TurnEnd, EngineError>> {
         Box::pin(async move {
             let toolset = Toolset { preset: ctx.preset, custom_tools: self.client.custom_tools(&ctx.model.model) };
-            let system = system_prompt(&ctx.cwd, &toolset);
-            let tool_defs = tools::definitions(&toolset);
+            // The instructions and the skills' names ride after krowk's own
+            // lines: stable for as long as their files are, so the prefix
+            // still caches.
+            let system = system_prompt(&ctx.cwd, &toolset) + &ctx.compat.prompt();
+            let mut tool_defs = tools::definitions(&toolset);
+            if !ctx.compat.skills.is_empty() {
+                tool_defs.push(crate::compat::skills::definition());
+            }
             let _ = events.send(EngineEvent::Context { system: system.clone(), tools: tool_defs.clone() }).await;
             let family = ctx.model_info.as_ref().and_then(|i| i.family.clone()).or_else(|| crate::toolset::family_from_id(&ctx.model.model).map(String::from));
             let takes = crate::effort::supported(ctx.model_info.as_ref(), family.as_deref());
@@ -206,6 +214,26 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                 effort: effort_for(self.client.wire_api(), ctx.effort, &takes),
                 reasoning: ctx.model_info.as_ref().map_or_else(|| crate::toolset::reasons(&ctx.model.model), |i| i.reasoning),
             };
+            let hooks = Hooked::new(&ctx, &events);
+            // SessionStart and UserPromptSubmit, before the model sees the
+            // prompt: what they print is context the model reads with it,
+            // and a prompt hook that blocks ends the turn with its reason.
+            if let Some(source) = ctx.compat.session_start {
+                let o = hooks.run(hooks::Event::SessionStart, Some(source), json!({"source": source})).await;
+                add_context(&events, &mut req, "SessionStart", o.context).await;
+                hooks.stopped()?;
+            }
+            let prompt = match ctx.history.last().map(|h| &h.item) {
+                Some(Item::UserText { text }) => text.clone(),
+                _ => String::new(),
+            };
+            let o = hooks.run(hooks::Event::UserPromptSubmit, None, json!({"prompt": prompt})).await;
+            if let Some(why) = o.block {
+                return Err(EngineError::new("prompt_blocked", format!("a UserPromptSubmit hook refused the prompt: {why}")));
+            }
+            add_context(&events, &mut req, "UserPromptSubmit", o.context).await;
+            hooks.stopped()?;
+            let mut stops = 0usize;
             // Response indexes continue from the history's, so a replayed
             // turn and this one never share an index.
             let first_response = req.history.iter().filter_map(|h| h.response).max().map_or(0, |m| m + 1);
@@ -252,6 +280,18 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                     return Ok(TurnEnd::Interrupted);
                 }
                 if calls.is_empty() {
+                    // A Stop hook that blocks keeps the turn going, its
+                    // reason the model's next input — a few times at most, so
+                    // a hook that always blocks cannot hold the turn forever.
+                    if stops < MAX_STOP_HOOK_CONTINUES && ctx.compat.hooks.has(hooks::Event::Stop) {
+                        let o = hooks.run(hooks::Event::Stop, None, json!({"stop_hook_active": stops > 0})).await;
+                        hooks.stopped()?;
+                        if let Some(why) = o.block {
+                            stops += 1;
+                            add_context(&events, &mut req, "Stop", vec![why]).await;
+                            continue;
+                        }
+                    }
                     // An answer that crossed a steer in flight is not the
                     // end: the model has not read it yet.
                     if ctx.steers.close_if_empty() {
@@ -267,15 +307,19 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                     // with no result cannot be sent back to the provider.
                     let (output, is_error) = if interrupted {
                         ("not run: the turn was interrupted".to_string(), true)
+                    } else if hooks.is_stopped() {
+                        ("not run: a hook stopped the turn".to_string(), true)
                     } else {
                         let mut cancel = ctx.cancel.clone();
-                        tokio::select! {
-                            r = tools::run(&name, &input, &tool_env) => r,
-                            _ = crate::engine::cancelled(&mut cancel) => {
-                                interrupted = true;
-                                ("interrupted before it finished".to_string(), true)
-                            }
-                        }
+                        let r = tokio::select! {
+                            r = call_tool(&ctx, &hooks, &tool_env, &events, &name, &input) => r,
+                            _ = crate::engine::cancelled(&mut cancel) => ("interrupted before it finished".to_string(), true),
+                        };
+                        // An interrupt that landed while the call waited for
+                        // a person's say stops the turn as surely as one
+                        // that landed while it ran.
+                        interrupted = *ctx.cancel.borrow();
+                        r
                     };
                     let item = Item::ToolResult { call_id, output, is_error };
                     let _ = events.send(EngineEvent::ItemCompleted { item_id, item: item.clone() }).await;
@@ -284,6 +328,8 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
                 if interrupted {
                     return Ok(TurnEnd::Interrupted);
                 }
+                // Every call has its result; then a hook's stop ends the turn.
+                hooks.stopped()?;
             }
             Err(EngineError::new(
                 "turn_step_limit",
@@ -291,6 +337,136 @@ impl<C: ModelClient> Engine for NativeEngine<C> {
             ))
         })
     }
+}
+
+/// How many times a `Stop` hook may send the model back to work in one turn.
+const MAX_STOP_HOOK_CONTINUES: usize = 8;
+
+/// A turn's hooks, with what every event's input carries.
+struct Hooked<'a> {
+    ctx: &'a TurnContext,
+    events: &'a Events,
+    mode: &'static str,
+    /// A hook said `continue: false`: why.
+    stop: std::sync::Mutex<Option<String>>,
+}
+
+impl<'a> Hooked<'a> {
+    fn new(ctx: &'a TurnContext, events: &'a Events) -> Hooked<'a> {
+        let mode = crate::protocol::PermissionMode::NAMES[match ctx.permission_mode {
+            crate::protocol::PermissionMode::Default => 0,
+            crate::protocol::PermissionMode::AcceptEdits => 1,
+            crate::protocol::PermissionMode::Plan => 2,
+            crate::protocol::PermissionMode::BypassPermissions => 3,
+        }];
+        Hooked { ctx, events, mode, stop: std::sync::Mutex::new(None) }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stop.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// The turn's end when a hook stopped it (Claude Code's `continue:
+    /// false`): a failure named `hook_stopped`, with the hook's
+    /// `stopReason`, which the person reads and the model does not.
+    fn stopped(&self) -> Result<(), EngineError> {
+        match self.stop.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            Some(why) => Err(EngineError::new("hook_stopped", format!("a hook stopped the turn: {why}"))),
+            None => Ok(()),
+        }
+    }
+
+    async fn run(&self, event: hooks::Event, subject: Option<&str>, fields: serde_json::Value) -> hooks::Outcome {
+        let c = &self.ctx.compat;
+        if !c.hooks.has(event) {
+            return hooks::Outcome::default();
+        }
+        let base = hooks::Base { session_id: &self.ctx.session_id, transcript_path: &c.transcript, cwd: &self.ctx.cwd, project_dir: &c.project_dir, permission_mode: self.mode };
+        let o = hooks::run(&c.hooks, event, subject, &base, fields, &self.ctx.cancel).await;
+        // A hook's systemMessage is the person's: a notice, never logged,
+        // never read by the model.
+        for m in &o.messages {
+            let _ = self.events.send(EngineEvent::Notice { text: format!("{} hook: {m}", event.name()) }).await;
+        }
+        if let Some(why) = &o.stop {
+            self.stop.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| why.clone());
+        }
+        o
+    }
+}
+
+/// Context a hook added, as the model reads it: a `userText` item in the
+/// log where it landed, framed with the event that produced it.
+async fn add_context(events: &Events, req: &mut ModelRequest, event: &str, context: Vec<String>) {
+    for text in context {
+        let item = Item::UserText { text: format!("<hook event=\"{event}\">\n{}\n</hook>", text.trim()) };
+        let _ = events.send(EngineEvent::ItemCompleted { item_id: krowk_store::new_id(), item: item.clone() }).await;
+        req.history.push(HistoryItem { item, response: None });
+    }
+}
+
+/// A native tool's input in the shape Claude Code's tool of that name
+/// takes, for a hook written against Claude Code: `file_path`, `old_string`,
+/// `new_string`, `timeout`.
+fn claude_input(name: &str, input: &serde_json::Value) -> serde_json::Value {
+    if name == tools::APPLY_PATCH {
+        let text = match input {
+            serde_json::Value::String(s) => s.clone(),
+            v => v.get("input").and_then(|i| i.as_str()).unwrap_or_default().to_string(),
+        };
+        return json!({ "patch": text });
+    }
+    let mut v = input.clone();
+    if let Some(m) = v.as_object_mut() {
+        for (from, to) in [("path", "file_path"), ("old_str", "old_string"), ("new_str", "new_string"), ("timeout_ms", "timeout")] {
+            if name != tools::GREP && name != tools::GLOB
+                && let Some(x) = m.remove(from)
+            {
+                m.insert(to.into(), x);
+            }
+        }
+    }
+    v
+}
+
+/// One tool call, whole: the skill tool, or a file tool or bash — its
+/// PreToolUse hooks, its permission, the run, its PostToolUse hooks.
+async fn call_tool(ctx: &TurnContext, hooks: &Hooked<'_>, env: &tools::ToolEnv<'_>, events: &Events, name: &str, input: &serde_json::Value) -> (String, bool) {
+    // The skill tool is a call like any other: its hooks see it as
+    // Claude Code's `Skill`, and `Skill(name)` rules — and a `Read` deny of
+    // its file — judge it before its body enters the conversation.
+    let skill = name == crate::compat::skills::TOOL && !ctx.compat.skills.is_empty();
+    let (call, claude, tool_input) = if skill {
+        match crate::compat::skills::call(&ctx.compat.skills, input) {
+            Ok((call, skill_name)) => (call, "Skill".to_string(), json!({ "skill": skill_name })),
+            Err(e) => return e,
+        }
+    } else {
+        match tools::describe(name, input, env) {
+            Ok(c) => (c, crate::permissions::rules::canonical(name), claude_input(name, input)),
+            Err(e) => return e,
+        }
+    };
+    let pre = hooks.run(hooks::Event::PreToolUse, Some(&claude), json!({"tool_name": claude, "tool_input": tool_input})).await;
+    if let Some(why) = pre.block {
+        return (format!("{name} was not run: a PreToolUse hook blocked it: {why}"), true);
+    }
+    if hooks.is_stopped() {
+        return (format!("{name} was not run: a hook stopped the turn"), true);
+    }
+    let opens = match ctx.gate.check(&call, name, input, pre.decision, events, &ctx.cancel).await {
+        Ok(o) => o,
+        Err(why) => return (why, true),
+    };
+    let (mut output, is_error) = if skill { crate::compat::skills::load(&ctx.compat.skills, input) } else { tools::execute(name, input, env, ctx.gate.scope(opens)).await };
+    let post = hooks.run(hooks::Event::PostToolUse, Some(&claude), json!({"tool_name": claude, "tool_input": tool_input, "tool_response": {"output": output, "isError": is_error}})).await;
+    if let Some(why) = post.block {
+        output.push_str(&format!("\n\n(a PostToolUse hook says: {why})"));
+    }
+    for c in pre.context.into_iter().chain(post.context) {
+        output.push_str(&format!("\n\n(a hook adds: {c})"));
+    }
+    (output, is_error)
 }
 
 #[cfg(test)]

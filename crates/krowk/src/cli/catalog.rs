@@ -427,7 +427,7 @@ fn prompt_flags() -> Vec<Flag> {
             flag(
                 "permission-mode",
                 STRING,
-                "With -p: default, acceptEdits, plan or bypassPermissions. Until permission rules land, bash runs only under bypassPermissions",
+                "With -p and the agent: default, acceptEdits, plan or bypassPermissions, as in Claude Code. Without it, the settings' permissions.defaultMode; a deny rule holds in every mode",
             ),
             "default",
         ),

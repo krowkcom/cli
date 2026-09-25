@@ -255,8 +255,9 @@ fn r_evid_1_without_a_key_publish_is_anonymous_opens_no_run_and_its_claim_token_
     assert!(!m.seen.lock().unwrap().iter().any(|r| r.raw.contains(&token)), "the provider was sent the claim token");
 }
 
-/// publish uploads to a public link, so until the permission rules land it
-/// is held to what an edit is: refused in the default and plan modes.
+/// publish uploads to a public link, so the permission evaluator holds it
+/// to what an edit is: asked about in the default mode (refused, with
+/// nobody to ask) and refused in plan.
 #[test]
 fn r_evid_1_publish_needs_accept_edits_as_an_edit_does() {
     let registry = krowk_devregistry::start(TcpListener::bind("127.0.0.1:0").unwrap(), krowk_devregistry::Config::default()).unwrap();
@@ -269,7 +270,8 @@ fn r_evid_1_publish_needs_accept_edits_as_an_edit_does() {
         let out = b.krowk(&["-p", "publish the notes", "--model", "claude-sonnet-4-6", "--output-format", "json", "--permission-mode", mode]);
         assert!(out.status.success(), "{}", text(&out.stderr));
         let (said, is_error) = tool_result(&m);
-        assert!(is_error && said.contains("--permission-mode acceptEdits"), "{mode}: {said}");
+        let why = if mode == "plan" { "plan mode" } else { "--permission-mode acceptEdits" };
+        assert!(is_error && said.contains(why), "{mode}: {said}");
         let session = serde_json::from_slice::<Value>(&out.stdout).unwrap()["sessionId"].as_str().unwrap().to_string();
         assert!(!b.log(&session).iter().any(|e| e["type"] == "run.opened"), "{mode}: nothing was published");
     }
@@ -332,7 +334,10 @@ fn r_evid_1_publish_refuses_credentials_paths_outside_the_root_and_hard_links_as
         let out = b.krowk(&["-p", "publish it", "--model", "claude-sonnet-4-6", "--output-format", "json", "--permission-mode", "acceptEdits"]);
         assert!(out.status.success(), "a refusal is a tool result, not a failed turn: {}", text(&out.stderr));
         let (said, is_error) = tool_result(&m);
-        assert!(is_error && said.contains(&format!("krowk failed: {code}")), "{file}: {said}");
+        // A path that leads out is refused before krowk_push sees it — the
+        // permission evaluator's own reach — and by krowk_push behind it.
+        let outside = code == "outside_root" && said.contains("outside the working directory");
+        assert!(is_error && (said.contains(&format!("krowk failed: {code}")) || outside), "{file}: {said}");
         let session = serde_json::from_slice::<Value>(&out.stdout).unwrap()["sessionId"].as_str().unwrap().to_string();
         assert!(!b.log(&session).iter().any(|e| e["type"] == "run.opened"), "{file}: a refused publish opens no run");
     }

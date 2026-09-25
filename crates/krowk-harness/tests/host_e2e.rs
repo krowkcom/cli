@@ -63,6 +63,7 @@ impl Home {
             credentials: self.root.join("home/.config/krowk/providers/credentials.json"),
             trust: krowk_harness::trust::allow_all(),
             publisher: None,
+            permissions: Default::default(),
         }
     }
 

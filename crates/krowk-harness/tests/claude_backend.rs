@@ -107,6 +107,7 @@ impl Home {
             credentials: self.root.join("home/.config/krowk/providers/credentials.json"),
             trust: gate,
             publisher,
+            permissions: Default::default(),
         })
     }
 

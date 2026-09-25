@@ -70,6 +70,16 @@ unit = "bytes"
 # by ticket 08: no crate is added — the growth is the budget, the
 # evidence tool, the stream frames and their tests' code paths — and the
 # raise leaves 236,440 bytes for the rest of Harness P0 to justify.
+# Ticket 09's permissions (no new crate: the rule evaluator and its shell
+# splitter, the settings loader, remembered grants, approval frames and the
+# TUI's prompt for them, Claude-format hooks, instructions and skills) adds
+# 172,864 bytes: 7,538,600 (7.19 MiB), and its review round (bash's
+# quoting, opaque program names, anchored path rules, skill and hook
+# fields) 26,880 more, and round 2 (git's program-running forms, glob-safe
+# grants) 5,600, and the final review (git's safe-option lists, the TUI's
+# expand key) 20,992, and bare-repository checks 2,272: 7,594,344
+# (7.24 MiB), 7,832 under this — the next
+# harness ticket that grows the build raises it with its own reason.
 max = { x86_64-linux = 7_602_176 }
 status = "enforced"
 

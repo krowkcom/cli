@@ -20,6 +20,10 @@
 //! - `tools` — read, write, the edit tools, bash, grep and glob;
 //!   `evidence` — `publish`, and the session's krowk run.
 //! - `budget` — what a session may spend, checked before every model call.
+//! - `permissions` — Claude-Code-compatible modes, rules and approvals:
+//!   the one evaluator every call is judged by, native or a backend's.
+//! - `compat` — the instructions (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules`)
+//!   and skills a native turn reads; `hooks` — Claude-format command hooks.
 //! - `toolset` — the preset registry: which edit tool a model is offered.
 //! - `host` — executes commands, writes the log, prices the turn.
 //! - `log` — the append-only JSONL session log and its layout on disk.
@@ -38,11 +42,13 @@ pub mod catalog;
 pub mod chat;
 pub mod claude;
 pub mod codex;
+pub mod compat;
 pub mod effort;
 pub mod engine;
 pub mod evidence;
 pub mod group;
 pub mod headless;
+pub mod hooks;
 pub mod host;
 pub mod http;
 pub mod instances;
@@ -50,6 +56,7 @@ pub mod log;
 pub mod native;
 pub mod oauth;
 pub mod openai;
+pub mod permissions;
 pub mod project;
 pub mod protocol;
 pub mod schema;

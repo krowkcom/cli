@@ -104,6 +104,7 @@ impl Home {
             credentials: self.root.join("home/.config/krowk/providers/credentials.json"),
             trust: gate,
             publisher: None,
+            permissions: Default::default(),
         })
     }
 
@@ -303,7 +304,7 @@ const MCP: &str = r#"{"tripwire":{"command":"/bin/sh","args":["-c","touch ran"],
 fn r_back_3_codexs_approval_requests_are_answered_by_krowks_modes() {
     let h = Home::new("approvals");
     let home = h.signed_in("codex-team", "chatgpt team@example.com");
-    for (mode, patch, why) in [(PermissionMode::Default, "decline", "does not allow edits"), (PermissionMode::AcceptEdits, "accept", "inside a .codex directory")] {
+    for (mode, patch) in [(PermissionMode::Default, "decline"), (PermissionMode::AcceptEdits, "accept")] {
         let _ = std::fs::remove_file(home.join("fake-turns"));
         let _ = std::fs::remove_file(h.log_file());
         let host = h.host(vec![("codex:team", h.instance(&home, Some("approvals.jsonl"), &[("FAKE_CODEX_MCP", MCP)]))], trust::allow_all());
@@ -324,9 +325,8 @@ fn r_back_3_codexs_approval_requests_are_answered_by_krowks_modes() {
             // that it was declined.
             let results: Vec<(String, bool)> = items(&h.events(&r.session_id)).into_iter().filter_map(|i| if let Item::ToolResult { output, is_error, .. } = i { Some((output, is_error)) } else { None }).collect();
             assert!(results[0].1 && results[0].0.contains("bypassPermissions"), "{:?}", results[0]);
-            assert!(results[2].1 && results[2].0.contains(why), "{:?}", results[2]);
-            let move_why = if mode == PermissionMode::AcceptEdits { "inside a .git directory" } else { why };
-            assert!(results[3].1 && results[3].0.contains(move_why), "{:?}", results[3]);
+            assert!(results[2].1 && results[2].0.contains("inside a .codex directory"), "{:?}", results[2]);
+            assert!(results[3].1 && results[3].0.contains("inside a .git directory"), "{:?}", results[3]);
             host.shutdown().await;
         });
     }

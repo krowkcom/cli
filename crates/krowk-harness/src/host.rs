@@ -27,6 +27,7 @@ use crate::protocol::{
 use crate::claude::ClaudeEngine;
 use crate::codex::CodexEngine;
 use crate::trust;
+use crate::{compat, permissions};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -61,6 +62,10 @@ pub struct HostConfig {
     /// Pushes what `publish` is handed to krowk's registry (R-EVID-1);
     /// none, and the tool says it cannot run.
     pub publisher: Option<Publisher>,
+    /// The person's own settings and where krowk keeps its own: what the
+    /// permission rules, instructions, skills and hooks are read from, and
+    /// whether a client answers approval requests (R-PERM-1, R-PERM-2).
+    pub permissions: permissions::Config,
 }
 
 pub struct Host {
@@ -73,6 +78,13 @@ pub struct Host {
     backends: Mutex<HashMap<String, Backend>>,
     /// How long a session's backend process is kept without a turn.
     backend_idle: std::time::Duration,
+    /// Approval requests waiting for a client's answer, every session's.
+    approvals: permissions::Approvals,
+    /// What a person allowed for the rest of each session.
+    grants: Mutex<HashMap<String, permissions::SessionGrants>>,
+    /// The sessions this host has run a turn of: a session's first turn
+    /// here is its SessionStart.
+    started: Mutex<std::collections::HashSet<String>>,
 }
 
 struct Running {
@@ -108,7 +120,15 @@ fn log_failure(e: LogError) -> EngineError {
 
 impl Host {
     pub fn new(cfg: HostConfig) -> Host {
-        Host { cfg, running: Mutex::new(HashMap::new()), backends: Mutex::new(HashMap::new()), backend_idle: BACKEND_IDLE }
+        Host {
+            cfg,
+            running: Mutex::new(HashMap::new()),
+            backends: Mutex::new(HashMap::new()),
+            backend_idle: BACKEND_IDLE,
+            approvals: permissions::Approvals::default(),
+            grants: Mutex::new(HashMap::new()),
+            started: Mutex::new(std::collections::HashSet::new()),
+        }
     }
 
     /// Keeps an idle session's backend process this long instead of
@@ -205,7 +225,13 @@ impl Host {
                     None => Err(EngineError::new("no_running_turn", format!("session {session_id} has no turn running to steer — send it as a prompt instead"))),
                 }
             }
-            Command::Approve { .. } | Command::SwitchModel { .. } | Command::Fork { .. } => {
+            // Whichever client answers first decides; the turn that asked
+            // tells every client it was answered (`approval.resolved`).
+            Command::Approve { session_id, request_id, decision } => {
+                self.approvals.answer(&session_id, &request_id, decision).map_err(|e| EngineError::new("no_approval_request", e))?;
+                Ok(None)
+            }
+            Command::SwitchModel { .. } | Command::Fork { .. } => {
                 Err(EngineError::new("not_implemented", "this command is part of the protocol but not served by this build yet"))
             }
         }
@@ -269,6 +295,12 @@ impl Host {
             }
         };
         let effort = effort.or(instance.effort);
+        // The rules, instructions, skills and hooks for where the session
+        // runs. A settings file that does not parse refuses the prompt: a
+        // deny rule it held would otherwise silently stop holding.
+        let mut policy = permissions::Policy::load(&self.cfg.permissions, &cwd_before).map_err(|e| EngineError::new("bad_settings", format!("{e} — fix the file, then send the prompt again")))?;
+        let mut compat = compat::Compat::load(&self.cfg.permissions, &cwd_before, policy.loaded.hooks.clone());
+        policy.read_dirs = compat.skills.iter().map(|k| k.dir.clone()).collect();
         let (mut log, events) = match opened {
             Some(opened) => opened,
             None => {
@@ -289,6 +321,19 @@ impl Host {
         let backend_session = past.backend.as_ref().filter(|b| b.instance == model.instance).map(|b| b.session_id.clone());
 
         let turn_id = krowk_store::new_id();
+        let first_here = self.started.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone());
+        compat.session_start = first_here.then_some(if past.items.is_empty() { "startup" } else { "resume" });
+        compat.transcript = self.cfg.sessions_dir.join(&session_id).join(log::EVENTS_FILE).display().to_string();
+        let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner()).entry(session_id.clone()).or_default().clone();
+        let gate = permissions::Gate::new(
+            policy,
+            permission_mode,
+            grants,
+            self.cfg.permissions.approvals.then(|| self.approvals.clone()),
+            self.cfg.permissions.grants_file(),
+            &session_id,
+            &turn_id,
+        );
         let mut w = Writer { log: &mut log, out: &out, turn_id: turn_id.clone(), preset, wire, provider: instance.provider.clone(), backend: past.backend.clone() };
         w.log(LogBody::TurnStarted { turn_id: turn_id.clone(), model: model.clone(), provider: engine.provider().into(), wire_api: engine.wire_api(), permission_mode, effort }).await?;
         let prompt_item = Item::UserText { text };
@@ -320,6 +365,8 @@ impl Host {
             backend_session,
             budget: budget.clone(),
             evidence,
+            gate,
+            compat: Arc::new(compat),
         };
         let mut tally = Tally::default();
         // A backend's calls are the vendor's to make: its turn is not begun
@@ -344,6 +391,7 @@ impl Host {
         // Refused from here on, not queued for a turn that is over; what an
         // interrupted or failed turn never took goes back on its result.
         let unread_steers = steers.close();
+        self.approvals.forget_session(&session_id);
         self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&session_id);
         if let Some(b) = self.backends.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&session_id) {
             b.used = Instant::now();
@@ -586,6 +634,10 @@ impl Writer<'_> {
                 }
                 self.log(LogBody::ResponseCompleted { turn_id: turn_id.clone(), response_id, model: answered, usage, stop_reason, item_ids }).await?;
                 self.spent(session_id, turn_id, tally, &spent).await;
+            }
+            EngineEvent::Approval(req) => self.live(LiveEvent::ApprovalRequested(req)).await,
+            EngineEvent::ApprovalResolved { request_id, decision } => {
+                self.live(LiveEvent::ApprovalResolved { session_id: session_id.into(), turn_id, request_id, decision }).await;
             }
             EngineEvent::BackendSession { backend, session_id: vendor, transcript, billing } => {
                 let rec = BackendRecord { instance: model.instance.clone(), session_id: vendor.clone(), transcript: transcript.clone(), billing };

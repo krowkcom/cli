@@ -10,7 +10,7 @@ use krowk_api::{fail, Error};
 use krowk_harness::host::HostConfig;
 use krowk_harness::instances::Registry;
 use krowk_harness::log;
-use krowk_harness::protocol::PermissionMode;
+use std::sync::Arc;
 
 /// Whether this invocation opens the TUI: nothing asked but `krowk` itself
 /// (and its TUI flags), the human format, and a person at both ends of the
@@ -31,11 +31,7 @@ pub(super) fn wanted(io: &Io, f: &Flags, format: Format, positionals: &[String],
 
 pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
     sessions::check_os()?;
-    let permission_mode = match ctx.f.permission_mode.as_str() {
-        "" => PermissionMode::Default,
-        m => PermissionMode::parse(m)
-            .ok_or_else(|| fail("bad_flag", format!("--permission-mode {m} is not a mode — one of {}", PermissionMode::NAMES.join(", "))))?,
-    };
+    let flag_mode = prompt::permission_flag(ctx)?;
     let config = prompt::config_json()?;
     let registry = Registry::resolve(&prompt::instances_from(&config)?, ctx.io.env);
     let model = match ctx.f.model.as_str() {
@@ -73,7 +69,14 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
     });
     let effective = model.clone().or(session_model).or_else(|| registry.default_model().ok());
     let home = Some(ctx.env("HOME")).filter(|h| !h.trim().is_empty()).map(std::path::PathBuf::from);
-    let trust = prompt::tui_trust_gate(effective.as_ref(), &registry, session_cwd.as_deref().unwrap_or(&cwd), home);
+    let runs_in = session_cwd.clone().unwrap_or_else(|| cwd.clone());
+    // What a repository's own settings would widen is asked about with the
+    // trust question too; the TUI answers approvals itself (R-PERM-2).
+    let probe = prompt::permissions_config(ctx, &config, Arc::new(|_: &std::path::Path| false), true);
+    let widens = krowk_harness::permissions::settings::widens(&probe, &runs_in);
+    let (trust, trusted) = prompt::tui_trust_gate(effective.as_ref(), &registry, &runs_in, home, widens);
+    let permissions = prompt::permissions_config(ctx, &config, trusted, true);
+    let permission_mode = prompt::resolve_mode(flag_mode, &permissions, &runs_in)?;
     let host = HostConfig {
         sessions_dir,
         cwd,
@@ -84,6 +87,7 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
         credentials: super::providers::credentials_path(),
         trust,
         publisher: Some(prompt::publisher(ctx)),
+        permissions,
     };
     let outcome = krowk_tui::run(krowk_tui::Options {
         host,

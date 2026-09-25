@@ -161,6 +161,8 @@ fn line_session(line: &StreamLine) -> &str {
         StreamLine::Log(ev) => &ev.session_id,
         StreamLine::Live(LiveEvent::ItemStarted { session_id, .. } | LiveEvent::ItemDelta { session_id, .. }) => session_id,
         StreamLine::Live(LiveEvent::Cost { session_id, .. } | LiveEvent::Notice { session_id, .. }) => session_id,
+        StreamLine::Live(LiveEvent::ApprovalRequested(r)) => &r.session_id,
+        StreamLine::Live(LiveEvent::ApprovalResolved { session_id, .. }) => session_id,
         StreamLine::Live(LiveEvent::Result(r)) => &r.session_id,
     }
 }

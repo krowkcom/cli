@@ -16,7 +16,6 @@
 //! it through the tool bridge as `mcp__krowk__publish`.
 
 use crate::engine::{EngineEvent, Events};
-use crate::protocol::PermissionMode;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -123,15 +122,20 @@ impl Evidence {
     }
 }
 
-/// Whether a session in `mode` may publish. An artifact is at a URL that
-/// needs no credential to read, so until the permission rules land (ticket
-/// 9) publishing is held to what changing files is: `acceptEdits` and up.
-/// The same rule for the native tool and the bridged one, whoever asks.
-pub fn permitted(mode: PermissionMode) -> Result<(), String> {
-    match mode {
-        PermissionMode::AcceptEdits | PermissionMode::BypassPermissions => Ok(()),
-        _ => Err("publish uploads files to a public link, which this session does not allow: until krowk's permission rules land, it runs only when krowk is started with `--permission-mode acceptEdits` or `bypassPermissions`. Say which files you would publish instead, or ask the person to rerun with one of those flags.".into()),
-    }
+/// A publish, as the permission evaluator judges it (`crate::permissions`):
+/// `Publish` of every file it names. An artifact is at a URL that needs no
+/// credential to read, so it is held to what changing files is — run under
+/// `acceptEdits` and `bypassPermissions`, asked about under `default`,
+/// refused in plan — and a `Read` deny rule denies it too: uploading a file
+/// is reading it out. One rule for the native tool and the bridged one,
+/// whoever asks.
+pub fn call(cwd: &Path, input: &serde_json::Value) -> Result<crate::permissions::Call, (String, bool)> {
+    let i = PublishInput::deserialize(input).map_err(|e| (format!("invalid input for publish: {e}"), true))?;
+    let at = |f: &String| {
+        let p = Path::new(f.trim());
+        if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+    };
+    Ok(crate::permissions::Call { tool: "Publish".into(), access: crate::permissions::Access::Publish(i.files.iter().filter(|f| !f.trim().is_empty()).map(at).collect()), subject: None })
 }
 
 /// A host without a publisher still offers the tool — its definition is

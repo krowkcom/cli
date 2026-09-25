@@ -34,7 +34,7 @@ use futures_core::Stream;
 use krowk_harness::engine::EngineError;
 use krowk_harness::host::{Host, HostConfig, Pricer};
 use krowk_harness::log;
-use krowk_harness::protocol::{BudgetLimits, Command, Effort, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus};
+use krowk_harness::protocol::{ApprovalDecision, BudgetLimits, Command, Effort, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus};
 use net::Target;
 use ratatui::layout::Size;
 use settings::Settings;
@@ -53,6 +53,8 @@ use tokio::time::Instant;
 pub const FRAME: Duration = Duration::from_millis(17);
 /// A model call silent for this long gets a connectivity probe.
 const STALL: Duration = Duration::from_millis(700);
+/// How long an approval request is on screen before a key answers it.
+const APPROVAL_SETTLE: Duration = Duration::from_millis(400);
 /// How often an interrupt the host could not take yet is asked again.
 const INTERRUPT_RETRY: Duration = Duration::from_millis(50);
 
@@ -644,6 +646,39 @@ impl<'h> Ui<'h> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         app.touch();
+        // A call waiting for the person's say takes the keys that answer it
+        // (R-PERM-2): y once, s for the session, p for the project, n or
+        // Esc no, v to print a request that was cut to fit (its y/s/p work
+        // only after). Ctrl-C still interrupts the turn, which declines it too.
+        if let Some(req) = app.approvals.first().cloned()
+            && !ctrl
+        {
+            // A key already on its way when the request came up — the
+            // person was typing — is not an answer.
+            if app.approval_shown.is_some_and(|t| t.elapsed() < APPROVAL_SETTLE) {
+                return false;
+            }
+            // A request cut to fit takes no allow until it is seen whole.
+            let ready = app.approval_ready();
+            if k.code == KeyCode::Char('v') {
+                app.expand_approval();
+                return false;
+            }
+            let decision = match k.code {
+                KeyCode::Char('y') if ready => Some(ApprovalDecision::Allow),
+                KeyCode::Char('s') if ready && !req.remember.is_empty() => Some(ApprovalDecision::AllowSession),
+                KeyCode::Char('p') if ready && !req.remember.is_empty() => Some(ApprovalDecision::AllowProject),
+                KeyCode::Char('n') | KeyCode::Esc => Some(ApprovalDecision::Deny),
+                _ => None,
+            };
+            if let Some(d) = decision {
+                app.answered(&req.request_id);
+                if self.command(Command::Approve { session_id: req.session_id.clone(), request_id: req.request_id.clone(), decision: d }).await.is_err() {
+                    app.notice("that approval was already answered, or its turn is over");
+                }
+            }
+            return false;
+        }
         let e = &mut app.editor;
         match k.code {
             KeyCode::Char('c') if ctrl => {

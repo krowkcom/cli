@@ -10,6 +10,9 @@
 #
 #   LEAN_DEPS_UPDATE=1 scripts/lean_deps_check.sh
 set -euo pipefail
+# One collation everywhere: sort order is the locale's, and a list written
+# under en_US would not match one sorted under CI's C locale.
+export LC_ALL=C
 cd "$(dirname "$0")/.."
 want=crates/krowk/lean-deps.txt
 got=$(cargo tree -p krowk -e normal --prefix none --locked --target all | awk '{print $1}' | sort -u)

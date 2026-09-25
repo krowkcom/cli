@@ -3,6 +3,7 @@
 //! environment, and overridden by whatever the caller said.
 
 use serde::Serialize;
+use std::path::Path;
 use std::process::Command;
 
 /// The process environment, as the CLI reads it.
@@ -160,7 +161,13 @@ pub struct Overrides {
 
 /// Detection with the caller's overrides applied.
 pub fn resolve(env: Env, o: Overrides) -> Metadata {
-    let mut m = detect(env);
+    resolve_in(env, o, None)
+}
+
+/// `resolve`, with git asked about `dir` rather than the working directory:
+/// a harness session's own, which a resumed session need not share.
+pub fn resolve_in(env: Env, o: Overrides, dir: Option<&Path>) -> Metadata {
+    let mut m = detect_in(env, dir);
     let over = |dst: &mut String, v: String| {
         if !v.is_empty() {
             *dst = v;
@@ -183,13 +190,17 @@ pub fn resolve(env: Env, o: Overrides) -> Metadata {
 
 /// What git and the environment say, with nothing overridden.
 pub fn detect(env: Env) -> Metadata {
-    let remote = git(&["remote", "get-url", "origin"]);
+    detect_in(env, None)
+}
+
+fn detect_in(env: Env, dir: Option<&Path>) -> Metadata {
+    let remote = git(dir, &["remote", "get-url", "origin"]);
     let mut m = Metadata {
         repo_name: first(&[env("GITHUB_REPOSITORY"), slug(&remote)]),
         repo_url: repo_url(env, &remote),
-        commit: first(&[env("GITHUB_SHA"), git(&["rev-parse", "HEAD"])]),
-        branch: branch(env),
-        dirty: dirty(),
+        commit: first(&[env("GITHUB_SHA"), git(dir, &["rev-parse", "HEAD"])]),
+        branch: branch_in(env, dir),
+        dirty: dirty(dir),
         harness: detect_agent(env),
         model: first(&[env("KROWK_MODEL"), env("ANTHROPIC_MODEL")]),
         session: first(&[env("KROWK_SESSION"), env("CLAUDE_CODE_SESSION_ID"), env("CURSOR_TRACE_ID"), env("GITHUB_RUN_ID")]),
@@ -242,8 +253,21 @@ fn first(values: &[String]) -> String {
     values.iter().find(|v| !v.is_empty()).cloned().unwrap_or_default()
 }
 
-fn git(args: &[&str]) -> String {
-    Command::new("git")
+/// One git query. A repository's config names commands git runs on its
+/// own — `core.fsmonitor` on `status` above all — and the repository may be
+/// one a model was handed, so none is run and no lock is taken: the rule
+/// the harness's search tools keep.
+fn git_cmd(dir: Option<&Path>) -> Command {
+    let mut c = Command::new("git");
+    c.args(["-c", "core.fsmonitor=false", "--no-optional-locks"]).stdin(std::process::Stdio::null());
+    if let Some(d) = dir {
+        c.current_dir(d);
+    }
+    c
+}
+
+fn git(dir: Option<&Path>, args: &[&str]) -> String {
+    git_cmd(dir)
         .args(args)
         .output()
         .ok()
@@ -254,6 +278,10 @@ fn git(args: &[&str]) -> String {
 
 /// The branch: CI's word first, then git's, and none on a detached head.
 pub fn branch(env: Env) -> String {
+    branch_in(env, None)
+}
+
+fn branch_in(env: Env, dir: Option<&Path>) -> String {
     let head_ref = env("GITHUB_HEAD_REF");
     if !head_ref.is_empty() {
         return head_ref;
@@ -262,7 +290,7 @@ pub fn branch(env: Env) -> String {
     if !ref_name.is_empty() && env("GITHUB_REF_TYPE") == "branch" {
         return ref_name;
     }
-    let b = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let b = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
     if b == "HEAD" { String::new() } else { b }
 }
 
@@ -365,8 +393,8 @@ pub fn ci_pull_request(env: Env) -> String {
     }
 }
 
-fn dirty() -> Option<bool> {
-    let out = Command::new("git").args(["status", "--porcelain"]).output().ok().filter(|o| o.status.success())?;
+fn dirty(dir: Option<&Path>) -> Option<bool> {
+    let out = git_cmd(dir).args(["status", "--porcelain"]).output().ok().filter(|o| o.status.success())?;
     Some(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
@@ -405,6 +433,28 @@ mod tests {
         assert_eq!(change_id("https://github.com/acme/storefront"), "");
         let ci = env(&[("GITHUB_REF", "refs/pull/42/merge"), ("GITHUB_REPOSITORY", "o/r")]);
         assert_eq!(ci_pull_request(&ci), "https://github.com/o/r/pull/42");
+    }
+
+    /// A repository a model was handed can name a command in its config;
+    /// detection runs none of it, and reads the directory it is pointed at.
+    #[test]
+    fn detection_runs_nothing_from_the_repositorys_config_and_reads_the_directory_named() {
+        let d = std::env::temp_dir().join(format!("krowk-runctx-fsmonitor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let git = |args: &[&str]| Command::new("git").args(args).current_dir(&d).status().is_ok_and(|s| s.success());
+        if !git(&["init", "-q"]) {
+            eprintln!("git is not installed: skipping");
+            return;
+        }
+        std::fs::write(d.join("a.txt"), "x\n").unwrap();
+        let marker = d.join("fsmonitor-ran");
+        let config = std::fs::read_to_string(d.join(".git/config")).unwrap();
+        std::fs::write(d.join(".git/config"), format!("{config}[core]\n\tfsmonitor = \"touch '{}'; false\"\n", marker.display())).unwrap();
+        let m = detect_in(&env(&[]), Some(&d));
+        assert_eq!(m.dirty, Some(true), "read from the directory named, not the process's");
+        assert!(!marker.exists(), "the repository's fsmonitor ran");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

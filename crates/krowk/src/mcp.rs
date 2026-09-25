@@ -285,9 +285,10 @@ impl Server<'_> {
             for f in &req.files {
                 permit(&root, &req.root, f)?;
             }
-            let meta = runctx::resolve(
+            let meta = runctx::resolve_in(
                 self.env,
                 Overrides { session: req.session_id.clone(), agent: "krowk".into(), client: format!("krowk/{}", self.version), ..Overrides::default() },
+                Some(&req.root),
             );
             run = Some(self.client.create_run(&serde_json::to_value(&meta).expect("metadata serializes"))?.slug);
         }
@@ -301,12 +302,31 @@ impl Server<'_> {
             }
         }
         let args = json!({ "files": req.files, "run": run.clone().unwrap_or_default(), "metadata": metadata });
-        let (mut text, _) = self.push_from(&req.root, &args)?;
+        let (_, pushed) = self.push_from(&req.root, &args)?;
+        // A keyless upload's claim token is a secret the person spends:
+        // what the model reads is logged, sent to the provider on every
+        // later call and printed by stream-json, so it never carries one.
+        // The claim command goes to the person alone.
+        let mut artifacts: Vec<Artifact> = serde_json::from_value(pushed["artifacts"].clone()).unwrap_or_default();
+        let opened: Option<Run> = pushed.get("run").and_then(|r| serde_json::from_value(r.clone()).ok());
+        let notes: Vec<String> = pushed.get("notes").and_then(|n| serde_json::from_value(n.clone()).ok()).unwrap_or_default();
+        let for_person: Vec<String> = artifacts
+            .iter()
+            .filter(|a| !a.claim_token.is_empty())
+            .map(|a| format!("{} is anonymous and expires within the day — keep it with `{}` (the token is a secret, shown once: do not paste it anywhere public)", a.filename, output::claim_crumb(a).cmd))
+            .collect();
+        for a in &mut artifacts {
+            a.claim_token.clear();
+        }
+        let (mut text, _) = render_push(&artifacts, opened.as_ref(), &notes);
+        if !for_person.is_empty() {
+            text += "\n\nThe command that keeps this anonymous upload past its expiry carries a secret, so it was shown to the person rather than to you.";
+        }
         match &run {
             Some(r) => text += &format!("\n\nGrouped under run {r}, this krowk session's run."),
             None => text += "\n\nNo API key was found, so this upload is anonymous and belongs to no run — `krowk doctor` shows where krowk looks for one.",
         }
-        Ok(krowk_harness::evidence::Published { text, run })
+        Ok(krowk_harness::evidence::Published { text, run, for_person })
     }
 }
 
@@ -416,7 +436,7 @@ impl Server<'_> {
         let files = a.files.iter().map(|p| permit(&root, base, p)).collect::<Result<Vec<_>, _>>()?;
         let specs = files.iter().map(|p| krowk_api::spec::inspect(p)).collect::<Result<Vec<_>, _>>()?;
 
-        let resolved = runctx::resolve(
+        let resolved = runctx::resolve_in(
             self.env,
             Overrides {
                 repo: a.repo.clone(),
@@ -429,6 +449,7 @@ impl Server<'_> {
                 title: a.title.clone(),
                 client: format!("krowk-mcp/{}", self.version),
             },
+            (!base.as_os_str().is_empty()).then_some(base),
         );
         let (mut run, mut run_slug, mut own_run): (Option<Run>, String, bool) = (None, named_run.clone(), false);
         if run_slug.is_empty() && self.authenticated() {

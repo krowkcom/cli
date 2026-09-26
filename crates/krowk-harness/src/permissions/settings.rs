@@ -122,7 +122,7 @@ struct File {
     rules: Vec<(Kind, Rule)>,
     dirs: Vec<PathBuf>,
     default_mode: Option<PermissionMode>,
-    /// A `defaultMode` krowk does not run, as written: it counts as
+    /// A `defaultMode` krowk does not run, as JSON text: it counts as
     /// `default`, with a notice.
     unknown_mode: Option<String>,
     hooks: Hooks,
@@ -135,7 +135,7 @@ impl File {
         match &self.unknown_mode {
             Some(m) => (
                 Some(PermissionMode::Default),
-                Some(format!("{}: permissions.defaultMode {m:?} is not a mode krowk runs, so it runs in default — one of {}, or --permission-mode", self.source, PermissionMode::NAMES.join(", "))),
+                Some(format!("{}: permissions.defaultMode {m} is not a mode krowk runs, so it runs in default — one of {}, or --permission-mode", self.source, PermissionMode::NAMES.join(", "))),
             ),
             None => (self.default_mode, None),
         }
@@ -155,11 +155,15 @@ fn read_object(v: &Value, source: &str, root: &Path, base: &Path, home: Option<&
                 f.rules.push((kind, rules::parse(text, source, root).map_err(|e| format!("{source}: permissions.{key}: {e}"))?));
             }
         }
-        if let Some(m) = p.get("defaultMode").and_then(Value::as_str) {
-            match PermissionMode::parse(m) {
+        // Anything else there — a mode krowk does not run, or not a string
+        // at all — is read as default: never left to an earlier file's.
+        match p.get("defaultMode") {
+            None => {}
+            Some(Value::String(m)) => match PermissionMode::parse(m) {
                 Some(mode) => f.default_mode = Some(mode),
-                None => f.unknown_mode = Some(m.to_string()),
-            }
+                None => f.unknown_mode = Some(format!("{m:?}")),
+            },
+            Some(other) => f.unknown_mode = Some(other.to_string()),
         }
         if let Some(dirs) = p.get("additionalDirectories") {
             let dirs = dirs.as_array().ok_or_else(|| format!("{source}: \"permissions.additionalDirectories\" must be a list of paths"))?;

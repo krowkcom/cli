@@ -515,3 +515,19 @@ fn r_perm_1_an_unknown_default_mode_in_a_repository_counts_only_once_trusted() {
     assert_eq!(trusted.loaded.notices.len(), 1, "{:?}", trusted.loaded.notices);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn r_perm_1_a_default_mode_that_is_not_a_string_is_read_as_default_with_a_notice() {
+    let d = repo("mode-not-string");
+    let claude = d.join("home/.claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    for bad in [json!(2), json!(["acceptEdits"]), json!({"mode": "auto"}), json!(true), json!(null)] {
+        std::fs::write(claude.join("settings.json"), json!({"permissions": {"defaultMode": bad}}).to_string()).unwrap();
+        let cfg = Config { user: Some(json!({"permissions": {"defaultMode": "acceptEdits"}})), claude_dir: Some(claude.clone()), ..Config::default() };
+        let p = Policy::load(&cfg, &d.join("src")).unwrap();
+        assert_eq!(p.loaded.default_mode, Some(PermissionMode::Default), "{bad} does not leave the earlier acceptEdits standing");
+        let file = claude.join("settings.json").display().to_string();
+        assert!(matches!(p.loaded.notices.as_slice(), [n] if n.contains(&file) && n.contains(&bad.to_string())), "{bad}: {:?}", p.loaded.notices);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

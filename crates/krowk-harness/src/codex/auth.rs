@@ -4,11 +4,16 @@
 //! status`, and a login is made by `codex login` itself, on the person's
 //! own terminal, in OpenAI's own flow. Both run with the instance's
 //! `CODEX_HOME`, so each account signs in, and is asked about, on its own.
+//! Whether there is a login is asked first of `codex app-server`'s
+//! `account/read` (`account`), a structured answer, and of `codex login
+//! status`'s words only when that fails.
 
 use crate::instances::Backend;
 use crate::protocol::Billing;
+use serde_json::{json, Value};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 /// What `codex login status` said. Only whether there is a login and what
 /// it is billed to are kept: an API-key login prints part of its key, and
@@ -65,14 +70,100 @@ pub fn command(b: &Backend, args: &[&str]) -> Command {
     c
 }
 
-/// Asks Codex whether this instance is signed in.
+/// Asks Codex whether this instance is signed in, as `codex login status`
+/// words it: the fallback for a Codex whose app-server cannot be asked.
 pub fn status(b: &Backend) -> Result<Status, String> {
-    let out = command(b, &["login", "status"]).stdin(Stdio::null()).output().map_err(|e| format!("{} could not be run: {e}", b.binary))?;
+    let out = crate::readiness::output_within(&mut command(b, &["login", "status"]), crate::readiness::VENDOR_TIMEOUT)
+        .map_err(|e| format!("{} could not be run: {e}", b.binary))?
+        .ok_or_else(|| format!("`{} login status` did not answer within {} seconds", b.binary, crate::readiness::VENDOR_TIMEOUT.as_secs()))?;
     let said = format!("{}\n{}", String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
     if !said.contains("Logged in") && !said.contains("Not logged in") {
         return Err(format!("`{} login status` answered in a way krowk does not read (exit {})", b.binary, out.status));
     }
     Ok(Status::parse(out.status.success(), &said))
+}
+
+/// Asks Codex whether this instance is signed in, and to what, the way the
+/// backend itself asks before a turn: `initialize`, then `account/read`, of
+/// a `codex app-server` started for nothing else and stopped at once. A
+/// structured answer, where `codex login status` is words that have
+/// changed between versions. Only the account's type is read — never its
+/// email or plan's owner.
+///
+/// No account, where Codex says it needs none (`requiresOpenaiAuth` false —
+/// a model provider of its own config that takes no OpenAI login), is as
+/// good as signed in: a turn runs.
+pub fn account(b: &Backend, within: Duration) -> Result<Status, String> {
+    use std::io::{BufRead, Write};
+    // The account's links to the person's configuration, as before any
+    // app-server the backend starts: without them a new `skills` would be
+    // Codex's to write into through a stale link.
+    if let (Some(home), Some(own)) = (&b.config_dir, &b.shared_home) {
+        let _ = super::share(home, own);
+    }
+    // Outside the repository, as every status check runs
+    // (`readiness::output_within`).
+    let mut child = command(b, &super::args(&b.args).iter().map(String::as_str).collect::<Vec<_>>())
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("{} could not be run: {e}", b.binary))?;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let out = child.stdout.take().expect("piped");
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let asked = child.stdin.take().map(|mut i| {
+        let lines = [
+            json!({"id": 1, "method": "initialize", "params": super::initialize_params(env!("CARGO_PKG_VERSION"))}),
+            json!({"method": "initialized"}),
+            json!({"id": 2, "method": "account/read", "params": {"refreshToken": false}}),
+        ];
+        let sent = lines.iter().try_for_each(|l| writeln!(i, "{l}"));
+        (i, sent)
+    });
+    let deadline = Instant::now() + within;
+    let answer = match asked {
+        Some((_, Err(e))) => Err(format!("`{} app-server` did not take the question: {e}", b.binary)),
+        None => Err(format!("`{} app-server` has no stdin", b.binary)),
+        Some((_stdin, Ok(()))) => loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(line) => {
+                    let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                    if v.get("id").and_then(Value::as_u64) != Some(2) || v.get("method").is_some() {
+                        continue;
+                    }
+                    break match v.get("result") {
+                        Some(r) => Ok(read_account(r)),
+                        None => Err(format!("`{} app-server` refused account/read", b.binary)),
+                    };
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break Err(format!("`{} app-server` did not answer account/read within {} seconds", b.binary, within.as_secs())),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Err(format!("`{} app-server` exited before it answered account/read", b.binary)),
+            }
+        },
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    answer
+}
+
+/// `account/read`'s result: a ChatGPT account is a subscription, any other
+/// an API key; none is signed out unless Codex needs no login at all.
+fn read_account(r: &Value) -> Status {
+    match r.pointer("/account/type").and_then(Value::as_str) {
+        Some("chatgpt") => Status { logged_in: true, billing: Some(Billing::Subscription) },
+        Some(_) => Status { logged_in: true, billing: Some(Billing::ApiKey) },
+        None => Status { logged_in: r.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(false), billing: None },
+    }
 }
 
 /// Runs `codex login` on this terminal: OpenAI's own sign-in, which opens

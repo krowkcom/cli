@@ -303,9 +303,9 @@ pub(super) fn vendor_of(model: Option<&krowk_harness::protocol::ModelRef>, regis
     model.and_then(|m| registry.get(&m.instance).ok()).filter(|i| i.backend.is_some()).map(|i| i.vendor).unwrap_or("the backend")
 }
 
-/// The trust prompt itself, on the terminal as it is (not raw): what the
-/// repository would make the vendor run, and a yes-or-no that defaults to
-/// no. A yes is remembered.
+/// The trust prompt itself, a card answered with one key before anything
+/// takes the terminal: what the repository would make the vendor run, and
+/// `y` to trust it, anything else not. A yes is remembered.
 pub(super) fn ask_trust(store: &trust::Store, root: &std::path::Path, vendor: &str) -> bool {
     let runs = trust::what_runs(root);
     let why = match vendor {
@@ -340,7 +340,10 @@ pub(super) fn tui_trust_gate(model: Option<&krowk_harness::protocol::ModelRef>, 
     let backend = model.and_then(|m| registry.get(&m.instance).ok()).is_some_and(|i| i.backend.is_some());
     let asked = trust::root(cwd);
     let vendor = if backend { vendor_of(model, registry) } else { "krowk" };
-    let accepted = (backend || widens) && !store.trusts(&asked) && store.refuses(&asked).is_none() && ask_trust(&store, &asked, vendor);
+    // The card is drawn on stderr: with that not a terminal it would be a
+    // question nobody sees, answered by the next key.
+    let seen = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let accepted = (backend || widens) && seen && !store.trusts(&asked) && store.refuses(&asked).is_none() && ask_trust(&store, &asked, vendor);
     let (s2, a2) = (store.clone(), asked.clone());
     let trusted: permissions::settings::Trusted = Arc::new(move |root: &std::path::Path| s2.trusts(root) || (accepted && root == a2));
     let gate: trust::Gate = Arc::new(move |root: &std::path::Path| {

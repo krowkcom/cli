@@ -33,6 +33,9 @@
 //!   it is read at is cut rather than pushed onto the next row. What is left:
 //!   such a row above the caret, cut, is measured after the resize as if the
 //!   terminal had reflowed it, and the clear starts that many rows too high.
+//!   The prompt box's top edge is always such a row, so a narrowing that
+//!   lands while a frame is on its way can blank the conversation line
+//!   right above the region.
 //!   The row it is on is tracked, not re-read: a glyph the terminal draws
 //!   wider than `unicode-width` says would put that off until the next
 //!   resize or job stop asks the terminal again.
@@ -59,6 +62,11 @@ use std::rc::Rc;
 /// Begin and end synchronized update (DEC private mode 2026).
 pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 pub const SYNC_END: &[u8] = b"\x1b[?2026l";
+/// The window title before krowk's, saved on xterm's title stack at start
+/// and put back when the TUI gives the terminal up (a terminal without the
+/// stack ignores both).
+pub const TITLE_SAVE: &[u8] = b"\x1b[22;2t";
+pub const TITLE_RESTORE: &[u8] = b"\x1b[23;2t";
 /// Autowrap off and on again (DECAWM), around the live region's cells.
 const AUTOWRAP_OFF: &[u8] = b"\x1b[?7l";
 const AUTOWRAP_ON: &[u8] = b"\x1b[?7h";
@@ -375,7 +383,7 @@ impl<W: Write> Term<W> {
     /// Sets the window title with the next frame (OSC 2, which moves
     /// nothing).
     pub fn title(&mut self, title: &str) -> io::Result<()> {
-        let title: String = title.chars().filter(|c| !c.is_control()).collect();
+        let title = crate::card::clean(title);
         write!(self.buf.clone(), "\x1b]2;{title}\x07")
     }
 
@@ -466,6 +474,7 @@ impl<W: Write> Term<W> {
         self.buf.goto(0, top)?;
         w.queue(Clear(CtClear::FromCursorDown))?;
         w.queue(crossterm::cursor::Show)?;
+        w.write_all(TITLE_RESTORE)?;
         self.flush()
     }
 

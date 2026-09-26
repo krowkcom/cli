@@ -140,17 +140,22 @@ async fn session(opts: Options) -> Outcome {
     // Asked once, before anything else reads the terminal. A cursor mid-line
     // (a prompt without a trailing newline) gets a line of its own.
     let top = match crossterm::cursor::position() {
-        Ok((0, y)) => y,
+        Ok((0, y)) => Some(y),
         Ok((_, y)) => {
             let _ = stdout.write_all(b"\r\n");
-            (y + 1).min(size.height - 1)
+            Some((y + 1).min(size.height - 1))
         }
-        Err(_) => size.height - 1,
+        Err(_) => None,
     };
     // A clean window to open on: what the shell left on screen scrolls up
     // into scrollback — kept, not erased, the way a clear-screen that
     // scrolls first keeps it — and the session starts on an empty screen.
-    let top = clear_by_scrolling(&mut stdout, size, top);
+    // Where the cursor is unknown nothing is scrolled: a screenful of
+    // blank rows in scrollback is no clean window.
+    let top = match top {
+        Some(top) => clear_by_scrolling(&mut stdout, size, top),
+        None => size.height - 1,
+    };
 
     let sessions_dir = opts.host.sessions_dir.clone();
     let pricer: Pricer = opts.host.pricer.clone();
@@ -187,6 +192,8 @@ async fn session(opts: Options) -> Outcome {
     let mut term = match Term::new(stdout, size, top, initial_height) {
         Ok(mut t) => {
             t.reflows = term::reflows_from(&|k| std::env::var(k).unwrap_or_default());
+            // Saved only once there is a TUI to put it back on the way out.
+            let _ = std::io::stdout().write_all(term::TITLE_SAVE);
             t
         }
         Err(e) => return Outcome { session_id: None, abandoned: false, error: Some(format!("the terminal could not be drawn on: {e}")) },
@@ -207,8 +214,8 @@ async fn session(opts: Options) -> Outcome {
     } else {
         host.shutdown().await;
     }
-    ui.presence.release();
     let _ = term.finish();
+    ui.presence.finish();
     let mut out = term.into_inner();
     if let Some(id) = &app.session_id {
         let _ = write!(out, "\x1b[2mresume this session with: krowk --resume {id}\x1b[0m\r\n");
@@ -721,7 +728,7 @@ impl<'h> Ui<'h> {
         #[cfg(unix)]
         {
             self.keys = None;
-            self.presence.release();
+            self.presence.pause();
             term.finish()?;
             restore_terminal();
             // SAFETY: raise only sends a signal to this process.
@@ -731,6 +738,7 @@ impl<'h> Ui<'h> {
             crossterm::terminal::enable_raw_mode()?;
             let mut out = std::io::stdout();
             let _ = out.write_all(b"\x1b[?2004h");
+            let _ = out.write_all(term::TITLE_SAVE);
             let _ = out.flush();
             let (w, h) = crossterm::terminal::size().unwrap_or((term.size().width, term.size().height));
             term.resume(Size { width: w.max(1), height: h.max(1) }, cursor_row())?;

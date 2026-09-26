@@ -31,6 +31,7 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
     let prompt = prompt_text(positionals)?;
     let config = config_json()?;
     let registry = Registry::resolve(&instances_from(&config)?, ctx.io.env);
+    registry.check_rollover().map_err(|e| fail("bad_config", e))?;
     let model = match ctx.f.model.as_str() {
         "" => None,
         m => Some(registry.parse_model(m).map_err(|e| fail("bad_flag", format!("--model: {e}")))?),

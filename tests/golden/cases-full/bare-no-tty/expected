@@ -897,7 +897,7 @@ stdout:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, claude:work/sonnet to run Claude Code, or codex:team/gpt-5.5 to run Codex"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, claude:work/sonnet to run Claude Code, or codex:team/gpt-5.5 to run Codex; with --resume, the session moves there"
     },
     {
       "name": "resume",
@@ -1871,7 +1871,7 @@ stdout:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, claude:work/sonnet to run Claude Code, or codex:team/gpt-5.5 to run Codex"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, claude:work/sonnet to run Claude Code, or codex:team/gpt-5.5 to run Codex; with --resume, the session moves there"
     },
     {
       "name": "resume",
@@ -2859,7 +2859,7 @@ stdout:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, claude:work/sonnet to run Claude Code, or codex:team/gpt-5.5 to run Codex"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, claude:work/sonnet to run Claude Code, or codex:team/gpt-5.5 to run Codex; with --resume, the session moves there"
     },
     {
       "name": "resume",
@@ -3847,7 +3847,7 @@ tty:
       "name": "model",
       "type": "string",
       "default": "",
-      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, claude:work/sonnet to run Claude Code, or codex:team/gpt-5.5 to run Codex"
+      "usage": "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, claude:work/sonnet to run Claude Code, or codex:team/gpt-5.5 to run Codex; with --resume, the session moves there"
     },
     {
       "name": "resume",

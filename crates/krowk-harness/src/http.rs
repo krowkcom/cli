@@ -7,6 +7,7 @@
 //! the answer says — with the credential attached.
 
 use crate::engine::{EngineError, EngineEvent, Events};
+use crate::protocol::{LimitState, LimitStatus};
 use crate::native::ModelResponse;
 use crate::sse::{SseEvent, SseParser};
 use serde_json::Value;
@@ -117,6 +118,146 @@ pub async fn refusal(r: reqwest::Response) -> (u16, String) {
     (status, said.unwrap_or_else(|| if body.trim().is_empty() { format!("HTTP {status}") } else { clip(body.trim(), 300) }))
 }
 
+/// A refusal read and worded: `refusal` and `status_error` together, with
+/// when a rate limit lifts when the answer's headers say (R-INST-7).
+pub async fn refused(r: reqwest::Response, peer: Peer<'_>, model: &str, auth_fix: &str) -> EngineError {
+    let resets = resets_at(r.headers(), krowk_store::now_ms());
+    let (status, said) = refusal(r).await;
+    let e = status_error(status, &said, peer, model, auth_fix);
+    if e.limited() { e.with_resets(resets) } else { e }
+}
+
+/// When a limit lifts, in milliseconds since the epoch, as a 429's headers
+/// say: `retry-after` (seconds, or an HTTP date is not read), Anthropic's
+/// `anthropic-ratelimit-*-reset` (RFC 3339), OpenAI's and xAI's
+/// `x-ratelimit-reset-*` (`1s`, `6m0s`, `20ms`) — the latest of them.
+pub fn resets_at(h: &reqwest::header::HeaderMap, now_ms: i64) -> Option<i64> {
+    let mut at: Option<i64> = None;
+    // A time in the past, or further off than any provider's window, is
+    // a header krowk misread or a server's mistake: not when a limit lifts.
+    let mut later = |t: i64| {
+        if (now_ms..=now_ms.saturating_add(MAX_RESET_MS)).contains(&t) {
+            at = Some(at.map_or(t, |a| a.max(t)));
+        }
+    };
+    for (name, value) in h {
+        let (name, Ok(v)) = (name.as_str(), value.to_str()) else { continue };
+        let v = v.trim();
+        if name == "retry-after" {
+            if let Ok(s) = v.parse::<i64>()
+                && s >= 0
+            {
+                later(now_ms.saturating_add(s.saturating_mul(1000)));
+            }
+        } else if name.starts_with("anthropic-ratelimit-") && name.ends_with("-reset") {
+            if let Some(t) = rfc3339_ms(v) {
+                later(t);
+            }
+        } else if name.starts_with("x-ratelimit-reset-")
+            && let Some(d) = duration_ms(v)
+        {
+            later(now_ms.saturating_add(d));
+        }
+    }
+    at
+}
+
+/// How much of its rate limit an instance has used, as a successful
+/// answer's headers say (R-INST-6): the most used of the request and token
+/// windows Anthropic (`anthropic-ratelimit-<what>-limit` / `-remaining`) or
+/// OpenAI and xAI (`x-ratelimit-limit-<what>` / `x-ratelimit-remaining-<what>`)
+/// report, a warning from 80%. None when they report none.
+pub fn limits_of(h: &reqwest::header::HeaderMap, now_ms: i64) -> Option<LimitStatus> {
+    let num = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<f64>().ok());
+    let mut best: Option<(f64, String)> = None;
+    for what in ["requests", "tokens", "input-tokens", "output-tokens"] {
+        let pairs = [(format!("anthropic-ratelimit-{what}-limit"), format!("anthropic-ratelimit-{what}-remaining")), (format!("x-ratelimit-limit-{what}"), format!("x-ratelimit-remaining-{what}"))];
+        for (limit, remaining) in pairs {
+            if let (Some(l), Some(r)) = (num(&limit), num(&remaining))
+                && l > 0.0
+            {
+                let used = ((l - r) / l * 100.0).clamp(0.0, 100.0);
+                if best.as_ref().is_none_or(|(b, _)| used > *b) {
+                    best = Some((used, what.to_string()));
+                }
+            }
+        }
+    }
+    let (used, window) = best?;
+    let status = if used >= 100.0 { LimitState::Limited } else if used >= 80.0 { LimitState::Warning } else { LimitState::Allowed };
+    Some(LimitStatus { status, window: Some(window), used_percent: Some(used), resets_at_ms: resets_at(h, now_ms) })
+}
+
+/// The furthest off a limit's reset is believed: thirty days, past every
+/// provider's longest window.
+const MAX_RESET_MS: i64 = 30 * 24 * 3600 * 1000;
+
+/// An RFC 3339 UTC time (`2026-09-26T14:00:00Z`, fractions and a numeric
+/// offset allowed) in milliseconds since the epoch.
+fn rfc3339_ms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, mo, d, h, mi, sec) = (n(0..4)?, n(5..7)?, n(8..10)?, n(11..13)?, n(14..16)?, n(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let mut rest = &s[19..];
+    let mut ms = 0;
+    if let Some(f) = rest.strip_prefix('.') {
+        let digits: String = f.chars().take_while(char::is_ascii_digit).collect();
+        ms = format!("{:0<3}", &digits[..digits.len().min(3)]).parse().ok()?;
+        rest = &f[digits.len()..];
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        o if o.len() == 6 && (o.starts_with('+') || o.starts_with('-')) => {
+            let m = o[1..3].parse::<i64>().ok()? * 60 + o[4..6].parse::<i64>().ok()?;
+            if o.starts_with('+') { m } else { -m }
+        }
+        _ => return None,
+    };
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let (y, mo) = if mo <= 2 { (y - 1, mo + 9) } else { (y, mo - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * mo + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 86_400 + h * 3600 + mi * 60 + sec - offset * 60) * 1000) + ms)
+}
+
+/// A duration as OpenAI writes one: `20ms`, `1s`, `6m0s`, `1h2m3.5s`.
+fn duration_ms(s: &str) -> Option<i64> {
+    let mut total = 0f64;
+    let mut num = String::new();
+    let mut chars = s.chars().peekable();
+    let mut any = false;
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            continue;
+        }
+        let v: f64 = num.parse().ok()?;
+        num.clear();
+        let unit = match c {
+            'h' => 3_600_000.0,
+            'm' if chars.peek() == Some(&'s') => {
+                chars.next();
+                1.0
+            }
+            'm' => 60_000.0,
+            's' => 1_000.0,
+            _ => return None,
+        };
+        total += v * unit;
+        any = true;
+    }
+    (any && num.is_empty() && (0.0..1e15).contains(&total)).then_some(total as i64)
+}
+
 /// A refusal as the engine's error, worded for the provider. `auth_fix`
 /// says what to do about a credential it refused.
 pub fn status_error(status: u16, said: &str, peer: Peer<'_>, model: &str, auth_fix: &str) -> EngineError {
@@ -174,6 +315,9 @@ pub trait Decode {
 /// Reads a streaming answer into `dec` to its end, forwarding every item
 /// event as it happens.
 pub async fn read_stream<D: Decode>(mut resp: reqwest::Response, mut dec: D, events: &Events, cancel: &watch::Receiver<bool>, model: &str, peer: Peer<'_>) -> Result<ModelResponse, EngineError> {
+    if let Some(l) = limits_of(resp.headers(), krowk_store::now_ms()) {
+        let _ = events.send(EngineEvent::Limits(l)).await;
+    }
     let mut parser = SseParser::default();
     let mut cancel_wait = cancel.clone();
     loop {
@@ -219,4 +363,40 @@ pub async fn read_stream<D: Decode>(mut resp: reqwest::Response, mut dec: D, eve
 
 pub fn clip(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { s.chars().take(n).collect::<String>() + "…" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&'static str, &str)]) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn r_inst_6_a_native_apis_rate_limit_headers_are_read_per_call() {
+        let now = 1_790_000_000_000;
+        assert_eq!(rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_ms("2026-09-26T14:00:00Z"), Some(1_790_431_200_000));
+        assert_eq!(rfc3339_ms("2026-09-26T16:00:00.250+02:00"), Some(1_790_431_200_250));
+        assert_eq!(rfc3339_ms("yesterday"), None);
+        assert_eq!([duration_ms("20ms"), duration_ms("1s"), duration_ms("6m0s"), duration_ms("1h2m3.5s"), duration_ms("soon")], [Some(20), Some(1000), Some(360_000), Some(3_723_500), None]);
+        let a = limits_of(&headers(&[("anthropic-ratelimit-requests-limit", "50"), ("anthropic-ratelimit-requests-remaining", "45"), ("anthropic-ratelimit-tokens-limit", "1000"), ("anthropic-ratelimit-tokens-remaining", "100"), ("anthropic-ratelimit-tokens-reset", "2026-09-26T14:00:00Z")]), now).unwrap();
+        assert_eq!((a.status, a.window.as_deref(), a.used_percent.map(|u| u.round()), a.resets_at_ms), (LimitState::Warning, Some("tokens"), Some(90.0), Some(1_790_431_200_000)));
+        let o = limits_of(&headers(&[("x-ratelimit-limit-requests", "100"), ("x-ratelimit-remaining-requests", "99"), ("x-ratelimit-reset-requests", "6m0s")]), now).unwrap();
+        assert_eq!((o.status, o.resets_at_ms), (LimitState::Allowed, Some(now + 360_000)));
+        assert!(limits_of(&headers(&[("content-type", "text/event-stream")]), now).is_none());
+        assert_eq!(resets_at(&headers(&[("retry-after", "30")]), now), Some(now + 30_000), "R-INST-7: a 429 says when it lifts");
+        // Nothing negative, absurd or overflowing is believed.
+        for bad in ["-5", "9223372036854775807", "99999999999"] {
+            assert_eq!(resets_at(&headers(&[("retry-after", bad)]), now), None, "{bad}");
+        }
+        assert_eq!(resets_at(&headers(&[("x-ratelimit-reset-tokens", "99999999999h")]), now), None);
+        assert_eq!(resets_at(&headers(&[("anthropic-ratelimit-tokens-reset", "1999-01-01T00:00:00Z")]), now), None, "a reset in the past");
+        assert_eq!(rfc3339_ms("2026-13-40T99:00:00Z"), None);
+    }
 }

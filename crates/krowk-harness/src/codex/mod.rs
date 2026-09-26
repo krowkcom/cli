@@ -58,7 +58,7 @@ use crate::catalog::ModelInfo;
 use crate::engine::{cancelled, BoxFuture, Engine, EngineError, EngineEvent, Events, TurnContext, TurnEnd};
 use crate::instances::{Backend, Resolved};
 use crate::permissions::{self, Access, Call, Gate, Verdict};
-use crate::protocol::{Billing, Effort, Item, ItemKind, ModelRef, PermissionMode, WireApi};
+use crate::protocol::{Billing, Effort, Item, ItemKind, LimitState, LimitStatus, ModelRef, PermissionMode, WireApi};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -392,6 +392,36 @@ fn failure(err: &Value, instance: &str) -> EngineError {
     }
 }
 
+/// A rate-limit snapshot (`account/rateLimits/updated`'s `rateLimits`) as
+/// krowk's limit status (R-INST-6): the fuller of its two windows, limited
+/// when Codex says a limit was reached, a warning from 80% used.
+pub fn limit_of(snapshot: &Value) -> Option<LimitStatus> {
+    let window = |k: &str| snapshot.get(k).filter(|w| w.is_object());
+    let used = |w: &Value| w.get("usedPercent").and_then(Value::as_f64).unwrap_or(0.0);
+    let w = match (window("primary"), window("secondary")) {
+        (Some(p), Some(s)) => Some(if used(s) > used(p) { s } else { p }),
+        (p, s) => p.or(s),
+    };
+    let reached = snapshot.get("rateLimitReachedType").is_some_and(|r| !r.is_null());
+    if w.is_none() && !reached {
+        return None;
+    }
+    let used_percent = w.map(used);
+    let status = if reached || used_percent.is_some_and(|u| u >= 100.0) {
+        LimitState::Limited
+    } else if used_percent.is_some_and(|u| u >= 80.0) {
+        LimitState::Warning
+    } else {
+        LimitState::Allowed
+    };
+    Some(LimitStatus {
+        status,
+        window: w.and_then(|w| w.get("windowDurationMins")).and_then(Value::as_i64).map(|m| format!("{m}m")),
+        used_percent,
+        resets_at_ms: w.and_then(|w| w.get("resetsAt")).and_then(Value::as_i64).map(|s| s * 1000),
+    })
+}
+
 /// The engine for one session on one `codex-app-server` instance. The host
 /// keeps it between turns, so the process it starts serves the whole
 /// session.
@@ -457,15 +487,35 @@ impl Engine for CodexEngine {
             let p = slot.as_mut().expect("spawned above");
             let outcome = async {
                 // The thread: the one this process has open, else the
-                // session's to resume, else a new one.
+                // session's to resume — by the path it was copied to, when
+                // it came from another account (R-INST-4) — else a new one.
                 let want = ctx.backend_session.clone();
-                if p.thread.is_none() || (want.is_some() && want != p.thread) {
-                    p.open_thread(want.as_deref(), &ctx, &ask, &self.instance.name).await?;
+                let path = ctx.handoff.as_ref().and_then(|h| h.carried_to.as_ref()).map(|p| p.display().to_string());
+                let mut resumed = p.thread.is_some() && (want.is_none() || want == p.thread);
+                let mut fell_back = None;
+                if !resumed {
+                    match p.open_thread(want.as_deref(), path.as_deref(), &ctx, &ask, &self.instance.name).await {
+                        Ok(()) => resumed = want.is_some(),
+                        // A thread Codex cannot resume is no reason to lose
+                        // the session: the log has it, and a new thread is
+                        // seeded from it (R-SWITCH-4).
+                        Err(e) if e.code == "backend_resume_failed" && ctx.handoff.is_some() => {
+                            fell_back = Some(e.message);
+                            p.open_thread(None, None, &ctx, &ask, &self.instance.name).await?;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 let prompt = match ctx.history.last().map(|h| &h.item) {
                     Some(Item::UserText { text }) => text.clone(),
                     _ => return Err(EngineError::new("empty_prompt", "a backend turn needs the prompt as its last item")),
                 };
+                // What the thread did not run goes ahead of the prompt, in
+                // the same input (R-SWITCH-2); what was sent is reported.
+                let (prompt, handoff) = crate::handoff::Handoff::opening(ctx.handoff.as_ref(), &prompt, resumed, fell_back);
+                if let Some(ev) = handoff {
+                    let _ = events.send(ev).await;
+                }
                 p.turn(prompt, &mut ctx, &ask, &events, &self.instance.name).await
             }
             .await;
@@ -906,13 +956,19 @@ impl Proc {
     /// Starts the session's thread, or resumes the one the log names, in
     /// krowk's mode and with krowk's tools; a thread Codex reports in a
     /// looser sandbox, or with another reviewer than krowk, is refused.
-    async fn open_thread(&mut self, resume: Option<&str>, ctx: &TurnContext, ask: &Answers, instance: &str) -> Result<(), EngineError> {
+    async fn open_thread(&mut self, resume: Option<&str>, path: Option<&str>, ctx: &TurnContext, ask: &Answers, instance: &str) -> Result<(), EngineError> {
         let pol = policy(ctx.permission_mode);
         let cwd = ctx.cwd.display().to_string();
         let (method, mut params) = match resume {
             Some(thread) => ("thread/resume", json!({"threadId": thread, "model": ctx.model.model, "cwd": cwd, "approvalPolicy": pol.approval, "approvalsReviewer": "user", "sandbox": pol.sandbox, "excludeTurns": true})),
             None => ("thread/start", json!({"model": ctx.model.model, "cwd": cwd, "approvalPolicy": pol.approval, "approvalsReviewer": "user", "sandbox": pol.sandbox, "dynamicTools": dynamic_tools()})),
         };
+        // A rollout copied from another account's home is resumed from where
+        // it was copied to, not looked up by id in Codex's index of this
+        // home, which has never heard of it.
+        if let (Some(path), Some(_)) = (path, resume) {
+            params["path"] = json!(path);
+        }
         // Outside bypassPermissions no MCP server of the person's or the
         // project's config runs: Codex would start each one — a command —
         // on the thread without asking, as Claude Code's are kept out by
@@ -966,6 +1022,7 @@ impl Proc {
         let effort = effort_for(ctx.effort, self.efforts.get(&ctx.model.model).map(Vec::as_slice), ctx.model_info.as_ref(), &ctx.model.model);
         let mut t = Translator::new(&ctx.model.model);
         let mut subs = stream::SubThreads::default();
+        let mut limit: Option<LimitStatus> = None;
         let mut input = vec![prompt];
         let mut interrupted = false;
         loop {
@@ -1092,6 +1149,13 @@ impl Proc {
                                 }
                                 match method.as_str() {
                                     "turn/started" if codex_turn.is_none() => codex_turn = of_turn.map(String::from),
+                                    // How near the account is to its limit (R-INST-6).
+                                    "account/rateLimits/updated" => {
+                                        if let Some(l) = params.get("rateLimits").and_then(limit_of) {
+                                            limit = Some(l.clone());
+                                            let _ = events.send(EngineEvent::Limits(l)).await;
+                                        }
+                                    }
                                     "turn/completed" => completed = Some(params.get("turn").cloned().unwrap_or(Value::Null)),
                                     _ => forward(events, t.apply(&method, &params)).await,
                                 }
@@ -1119,7 +1183,9 @@ impl Proc {
                     t.finish(&mut out);
                     forward(events, out).await;
                     let err = turn.get("error").filter(|e| !e.is_null()).cloned().or_else(|| t.error.clone()).unwrap_or_else(|| json!({"message": "no reason given"}));
-                    return Err(failure(&err, instance));
+                    let e = failure(&err, instance);
+                    // A limit says when it lifts, when Codex said.
+                    return Err(if e.limited() { e.with_resets(limit.and_then(|l| l.resets_at_ms)) } else { e });
                 }
                 _ => {}
             }

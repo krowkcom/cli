@@ -257,8 +257,7 @@ impl ModelClient for ChatClient {
                     Answer::Streaming(resp) => return http::read_stream(resp, stream::Decoder::new(&inst.provider), events, &cancel, &req.model, peer).await,
                     Answer::Refused(resp) if resp.status().as_u16() == 401 && !refresh && matches!(self.credential, Credential::OAuth(_)) => continue,
                     Answer::Refused(resp) => {
-                        let (status, said) = http::refusal(resp).await;
-                        return Err(http::status_error(status, &said, peer, &req.model, &self.auth_fix()));
+                        return Err(http::refused(resp, peer, &req.model, &self.auth_fix()).await);
                     }
                     Answer::Interrupted => return Ok(ModelResponse { model: req.model.clone(), interrupted: true, ..ModelResponse::default() }),
                 }

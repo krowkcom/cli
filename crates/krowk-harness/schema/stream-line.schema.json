@@ -366,6 +366,99 @@
           ]
         },
         {
+          "description": "The session moved to another model, instance or engine: asked for\n(`switchModel`), rolled over from an instance at its limit\n(R-INST-8), or back to the one before when the new one could not run\na turn (R-SWITCH-4). The next turn runs on `to` unless its prompt\nnames another.",
+          "type": "object",
+          "properties": {
+            "turnId": {
+              "description": "The turn it followed, when it followed one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "from": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ModelRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "to": {
+              "$ref": "#/$defs/ModelRef"
+            },
+            "reason": {
+              "$ref": "#/$defs/SwitchReason"
+            },
+            "detail": {
+              "description": "Why, in words: the limit that was hit and when it lifts, or the\nfailure the new model's turn ended with.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "model.switched"
+            }
+          },
+          "required": [
+            "type",
+            "to",
+            "reason"
+          ]
+        },
+        {
+          "description": "How a backend turn was brought up to date with what the session did\nelsewhere (R-SWITCH-2, R-INST-4). What the vendor was sent is in\n`context.jsonl` under the turn, as `handoff`.",
+          "type": "object",
+          "properties": {
+            "turnId": {
+              "type": "string"
+            },
+            "how": {
+              "$ref": "#/$defs/HandoffKind"
+            },
+            "fromInstance": {
+              "description": "The instance whose transcript was copied, for `transcript`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "summarizedTurns": {
+              "description": "Earlier turns told as a summary, and recent ones as they happened.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "default": 0
+            },
+            "recentTurns": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "default": 0
+            },
+            "fellBack": {
+              "description": "Why a better handoff was not possible: a transcript that could\nnot be copied, a thread the vendor could not resume.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "backend.handoff"
+            }
+          },
+          "required": [
+            "type",
+            "turnId",
+            "how"
+          ]
+        },
+        {
           "description": "The turn is over.",
           "type": "object",
           "properties": {
@@ -691,6 +784,46 @@
         "completed"
       ]
     },
+    "SwitchReason": {
+      "description": "Why a session moved to another model.",
+      "oneOf": [
+        {
+          "description": "A client asked (`switchModel`).",
+          "type": "string",
+          "const": "requested"
+        },
+        {
+          "description": "The instance it was on hit its rate or usage limit, and `rollover`\nis `auto` (R-INST-8).",
+          "type": "string",
+          "const": "rateLimited"
+        },
+        {
+          "description": "The model a turn switched to could not run it — no login, no key,\nno binary — so the session went back to the one before (R-SWITCH-4).",
+          "type": "string",
+          "const": "switchFailed"
+        }
+      ]
+    },
+    "HandoffKind": {
+      "description": "How a backend was brought up to date with a session that ran somewhere\nelse first (R-SWITCH-2, R-INST-4).",
+      "oneOf": [
+        {
+          "description": "The vendor's own transcript, copied from another instance of the\nsame vendor into this one's config directory and resumed there: the\nfull context, not a summary.",
+          "type": "string",
+          "const": "transcript"
+        },
+        {
+          "description": "The vendor resumed its own thread, and was told what happened on\nother models since it last ran.",
+          "type": "string",
+          "const": "catchUp"
+        },
+        {
+          "description": "A new vendor session, seeded with krowk's summary of the earlier\nturns and the most recent ones as they happened.",
+          "type": "string",
+          "const": "summary"
+        }
+      ]
+    },
     "TurnStatus": {
       "description": "How a turn ended.",
       "oneOf": [
@@ -731,6 +864,14 @@
           "format": "uint16",
           "minimum": 0,
           "maximum": 65535
+        },
+        "resetsAtMs": {
+          "description": "For a rate or usage limit: when the provider said it lifts, in\nmilliseconds since the Unix epoch, when it said.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
         }
       },
       "required": [
@@ -862,6 +1003,35 @@
             "sessionId",
             "turnId",
             "text"
+          ]
+        },
+        {
+          "description": "How close an instance is to its rate or usage limit, whenever its\nprovider says (R-INST-6).",
+          "type": "object",
+          "properties": {
+            "sessionId": {
+              "type": "string"
+            },
+            "turnId": {
+              "type": "string"
+            },
+            "instance": {
+              "type": "string"
+            },
+            "limit": {
+              "$ref": "#/$defs/LimitStatus"
+            },
+            "type": {
+              "type": "string",
+              "const": "limits"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId",
+            "turnId",
+            "instance",
+            "limit"
           ]
         },
         {
@@ -1039,6 +1209,50 @@
         }
       ]
     },
+    "LimitStatus": {
+      "description": "How close an instance is to its rate or usage limit, as its provider\nlast said (R-INST-6): Claude Code's rate-limit events, Codex's\nrate-limit snapshots, a native API's rate-limit headers.",
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "`allowed`, `warning` (near it) or `limited` (reached).",
+          "$ref": "#/$defs/LimitState"
+        },
+        "window": {
+          "description": "The window the limit counts over, as the provider names it:\n`five_hour`, `seven_day`, `requests`, `tokens`, `300m`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "usedPercent": {
+          "description": "How much of it is used, 0–100, when the provider says.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "resetsAtMs": {
+          "description": "When it resets, in milliseconds since the Unix epoch, when the\nprovider says.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "LimitState": {
+      "type": "string",
+      "enum": [
+        "allowed",
+        "warning",
+        "limited"
+      ]
+    },
     "ApprovalRequest": {
       "description": "A tool call waiting for a person's say (R-PERM-2): sent to every client\nof the session as `approval.requested`, and answered by one of them with\n`approve`. It waits until answered or the turn is interrupted; a host\nwith no client that answers never sends one, and refuses the call.",
       "type": "object",
@@ -1094,6 +1308,30 @@
         "allowSession",
         "allowProject",
         "deny"
+      ]
+    },
+    "SwitchOffer": {
+      "description": "A switch the host suggests when an instance hits its limit and\n`rollover` is `offer`, the default (R-INST-7): the client asks the\nperson, and a yes is `switchModel` to `to` and the prompt again.",
+      "type": "object",
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/ModelRef"
+        },
+        "to": {
+          "$ref": "#/$defs/ModelRef"
+        },
+        "resetsAtMs": {
+          "description": "When `from`'s limit lifts, when the provider said.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "from",
+        "to"
       ]
     },
     "RunResult": {
@@ -1156,6 +1394,17 @@
           "items": {
             "type": "string"
           }
+        },
+        "switchOffer": {
+          "description": "A turn that failed on its instance's rate or usage limit, with\n`rollover` at `offer`: the instance it could continue on (R-INST-7).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SwitchOffer"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

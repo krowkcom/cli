@@ -24,7 +24,7 @@
 
 use crate::anthropic::stream::Decoder;
 use crate::engine::{EngineError, EngineEvent};
-use crate::protocol::{Item, ItemKind, ProviderBlob, Usage, WireApi};
+use crate::protocol::{Item, ItemKind, LimitState, LimitStatus, ProviderBlob, Usage, WireApi};
 use crate::sse::SseEvent;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -109,6 +109,25 @@ pub struct Translator {
     subagents: Vec<SubagentMessage>,
     /// The message the last subagent line was for.
     subagent_at: Option<usize>,
+    /// What Claude Code last said of the account's rate limit.
+    pub limit: Option<LimitStatus>,
+}
+
+/// A `rate_limit_event`'s `rate_limit_info`, as krowk's limit status:
+/// `allowed`, `allowed_warning` (near it) or `rejected` (reached), over a
+/// window such as `five_hour`, with when it resets (seconds since the
+/// epoch) and how much is used (`utilization`, 0–1), when it says.
+pub fn rate_limit(info: &Value) -> Option<LimitStatus> {
+    let status = match str_of(info, "status") {
+        "allowed" => LimitState::Allowed,
+        "allowed_warning" => LimitState::Warning,
+        "rejected" => LimitState::Limited,
+        _ => return None,
+    };
+    let window = Some(str_of(info, "rateLimitType").to_string()).filter(|w| !w.is_empty());
+    let resets_at_ms = info.get("resetsAt").and_then(Value::as_i64).map(|s| s * 1000);
+    let used_percent = info.get("utilization").and_then(Value::as_f64).map(|u| if u <= 1.0 { u * 100.0 } else { u });
+    Some(LimitStatus { status, window, used_percent, resets_at_ms })
 }
 
 fn str_of<'a>(v: &'a Value, k: &str) -> &'a str {
@@ -186,8 +205,16 @@ impl Translator {
                     api_status: msg.get("api_error_status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()),
                 });
             }
-            // Status lines, rate-limit notices, hook lifecycle, thinking-token
-            // estimates: Claude Code's own bookkeeping, not the conversation.
+            // How near the account is to its plan's limit (R-INST-6): shown
+            // per instance, and what a limited turn's failure names.
+            "rate_limit_event" => {
+                if let Some(l) = msg.get("rate_limit_info").and_then(rate_limit) {
+                    self.limit = Some(l.clone());
+                    out.push(EngineEvent::Limits(l));
+                }
+            }
+            // Status lines, hook lifecycle, thinking-token estimates: Claude
+            // Code's own bookkeeping, not the conversation.
             _ => {}
         }
         Ok(out)

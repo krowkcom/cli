@@ -32,6 +32,10 @@
 #                      would, and logs its pid; `@grandchild-holding` leaves
 #                      it holding stdout open, as a careless one does
 # The turn ends with the scenario's own `result` line.
+#
+# `--resume <id>` needs the session's transcript in this config directory
+# (`projects/<cwd slug>/<id>.jsonl`, where each turn's prompt is appended),
+# as Claude Code does: without it the process says so and exits.
 
 set -u
 LOG="${FAKE_CLAUDE_LOG:-/dev/null}"
@@ -77,11 +81,12 @@ esac
 
 MODEL=default
 PMODE=default
+RESUMING=
 SESSION="${FAKE_CLAUDE_SESSION:-fa4e0000-0000-4000-8000-000000000001}"
 while [ $# -gt 0 ]; do
   case "$1" in
   --model) MODEL="$2"; shift ;;
-  --resume) SESSION="$2"; log "resume $2"; shift ;;
+  --resume) SESSION="$2"; RESUMING=1; log "resume $2"; shift ;;
   --permission-mode) PMODE="$2"; log "permission-mode $2"; shift ;;
   esac
   shift
@@ -95,6 +100,16 @@ log "env ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+set} ANTHROPIC_BASE_URL=${ANTHRO
 log "env ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:-}"
 SLUG="${PWD//[^a-zA-Z0-9]/-}"
 TRANSCRIPT="$DIR/projects/$SLUG/$SESSION.jsonl"
+# As Claude Code does: a session is resumed from its transcript in this
+# config directory, or not at all.
+if [ -n "$RESUMING" ]; then
+  if [ ! -f "$TRANSCRIPT" ]; then
+    log "resume-missing $SESSION"
+    echo "No conversation found with session ID: $SESSION" >&2
+    exit 1
+  fi
+  log "resume-lines $(wc -l <"$TRANSCRIPT" | tr -d ' ')"
+fi
 
 LINES=()
 if [ -n "${FAKE_CLAUDE_SCENARIO:-}" ]; then

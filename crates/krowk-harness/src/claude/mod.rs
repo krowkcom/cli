@@ -345,6 +345,7 @@ impl Engine for ClaudeEngine {
             };
             // The running process serves this turn when its launch still
             // fits; a model it can switch to in place is switched to.
+            let mut resumed = false;
             if let Some(p) = slot.as_mut() {
                 // The mode it is in counts too: a plan turn that approved
                 // ExitPlanMode leaves Claude Code in default, which the next
@@ -357,15 +358,39 @@ impl Engine for ClaudeEngine {
                 if !switched && let Some(old) = slot.take() {
                     old.shutdown().await;
                 }
+                // Kept: it holds the session's thread as far as it has run.
+                resumed = slot.is_some();
             }
+            let mut fell_back = None;
             if slot.is_none() {
-                *slot = Some(Proc::spawn(self.backend(), &ctx.cwd, want, &ask).await?);
+                let resume = want.resume.clone();
+                *slot = Some(match Proc::spawn(self.backend(), &ctx.cwd, want.clone(), &ask).await {
+                    Ok(p) => {
+                        resumed = resume.is_some();
+                        p
+                    }
+                    // A thread Claude Code cannot resume — its transcript
+                    // gone, or a copy it would not take — is no reason to
+                    // lose the session: the log has it, and a new thread is
+                    // seeded from it (R-SWITCH-4, R-INST-4).
+                    Err(e) if resume.is_some() && ctx.handoff.is_some() && e.code != "backend_not_found" => {
+                        fell_back = Some(format!("Claude Code on {} could not resume its session {} ({}: {})", self.instance.name, resume.unwrap_or_default(), e.code, e.message));
+                        Proc::spawn(self.backend(), &ctx.cwd, Launch { resume: None, ..want }, &ask).await?
+                    }
+                    Err(e) => return Err(e),
+                });
             }
             let p = slot.as_mut().expect("spawned above");
             let prompt = match ctx.history.last().map(|h| &h.item) {
                 Some(Item::UserText { text }) => text.clone(),
                 _ => return Err(EngineError::new("empty_prompt", "a backend turn needs the prompt as its last item")),
             };
+            // What the thread did not run goes ahead of the prompt, in the
+            // same user message (R-SWITCH-2); what was sent is reported.
+            let (prompt, handoff) = crate::handoff::Handoff::opening(ctx.handoff.as_ref(), &prompt, resumed, fell_back);
+            if let Some(ev) = handoff {
+                let _ = events.send(ev).await;
+            }
             let outcome = p.turn(&prompt, &mut ctx, &ask, &events, self.backend(), &self.instance.name).await;
             // A process that died, or a turn that failed partway, is not
             // trusted with the next turn: that one starts clean on --resume.
@@ -781,6 +806,18 @@ impl Proc {
         }
         let said = if !result.text.trim().is_empty() { result.text.trim().to_string() } else if !result.errors.is_empty() { result.errors.join("; ") } else { result.subtype.clone() };
         let lower = said.to_lowercase();
+        // The account's plan limit, or the API's rate limit: what a switch to
+        // another instance answers (R-INST-7), with when it lifts.
+        let rejected = t.limit.as_ref().filter(|l| l.status == crate::protocol::LimitState::Limited);
+        // Only what Claude Code reports about the account — its rate-limit
+        // event, the API's status, its own error list — never the model's
+        // words, which a prompt can make say anything.
+        let errors = result.errors.join(" ").to_lowercase();
+        if rejected.is_some() || result.api_status == Some(429) || errors.contains("usage limit") || errors.contains("limit reached") || errors.contains("rate limit") {
+            let resets = rejected.and_then(|l| l.resets_at_ms).or_else(|| t.limit.as_ref().and_then(|l| l.resets_at_ms));
+            let until = resets.map(|ms| format!(" until {}", crate::host::clock(ms))).unwrap_or_default();
+            return Err(EngineError::new("rate_limited", format!("Claude Code on {instance} is limited{until} ({said}) — continue on another instance with --model, or wait")).with_status(result.api_status.unwrap_or(429)).with_resets(resets));
+        }
         if lower.contains("/login") || lower.contains("not logged in") || lower.contains("invalid api key") || result.api_status == Some(401) {
             let add = match instance.split_once(':') {
                 Some((_, name)) => format!("krowk providers add claude --name {name}"),
@@ -858,7 +895,9 @@ async fn announce(events: &Events, init: &Init, b: &Backend, instance: &str) -> 
         "none" => Some(Billing::Subscription),
         _ => Some(Billing::ApiKey),
     };
-    let transcript = (!init.session_id.is_empty()).then(|| b.home.as_ref().map(|h| transcript_path(h, &init.cwd, &init.session_id).display().to_string())).flatten();
+    // A session id is joined to a path only when it is one (a UUID's
+    // characters): the vendor's output is not trusted to name a file.
+    let transcript = crate::handoff::valid_session_id(&init.session_id).then(|| b.home.as_ref().map(|h| transcript_path(h, &init.cwd, &init.session_id).display().to_string())).flatten();
     if !init.session_id.is_empty() {
         let _ = events.send(EngineEvent::BackendSession { backend: BACKEND.into(), session_id: init.session_id.clone(), transcript, billing }).await;
     }

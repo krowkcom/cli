@@ -89,7 +89,15 @@ unit = "bytes"
 # MiB. Raised 7.25 -> 7.50 MiB by ticket 10, for 09 and 10 together — no
 # crate is added, the growth is their code — leaving 118,456 bytes for the
 # rest of Harness P0 to justify.
-max = { x86_64-linux = 7_864_320 }
+# Ticket 10 merged at 7,752,680 (7.39 MiB). Ticket 11's switching (no new
+# crate: the handoff that seeds a backend and its framing, transcripts
+# carried between accounts and the checks on their paths, switchModel and
+# the rollover loop, rate-limit detection and headers on every engine, the
+# TUI's picker, offer and per-instance usage) adds 143,200 bytes on top of
+# 10: 7,895,880 (7.53 MiB), 31,560 over 7.50 MiB. Raised 7.50 -> 7.75 MiB
+# by ticket 11, for 10 and 11 together — no crate is added, the growth is
+# their code — leaving 230,584 bytes for the rest of Harness P0.
+max = { x86_64-linux = 8_126_464 }
 status = "enforced"
 
 # --- Startup: a new process each run, no daemon ---

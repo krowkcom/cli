@@ -90,6 +90,39 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Added
 
+- **Switch model, instance or engine at any time, without losing the
+  thread.** In the TUI, `/model` opens a picker of the models the session
+  has run on and every instance you have, and `/model <instance>/<model>`
+  switches directly; `krowk -p --resume <id> --model <instance>/<model>`
+  does the same headless. Between the native APIs (Anthropic, OpenAI,
+  xAI, OpenRouter, anything compatible) nothing is lost but another
+  provider's private reasoning, which arrives as marked plain text. **Into
+  Claude Code or Codex**, the backend is seeded with krowk's handoff — the
+  earlier turns summarized, the last three as they happened, then your
+  prompt — and a backend that ran earlier in the session is caught up on
+  only what it missed; **back from one** the native model reads its turns
+  whole. **Between two accounts of the same vendor** (`claude:work` →
+  `claude:personal`, `codex:team` → `codex:personal`) krowk copies the
+  vendor's own transcript into the other account's config directory and
+  resumes it there, so the context is whole, falling back to the handoff
+  when the copy or the resume fails. A switch that cannot run — no key, no
+  login, no binary — is refused with the fix, and the session stays on the
+  model it was on; one that fails on its first turn goes back by itself.
+  Switching never loosens the permission mode, and a session's budget
+  counts what it spent on every model.
+- **Rate limits are detected on every engine, and offered around.** A
+  turn that hits its instance's limit (an API's 429, Claude Code's plan
+  limit, Codex's usage limit) ends with an offer — "claude:work limited
+  until 14:00, continue on claude:personal? [y/N]" — which `y` accepts in
+  the TUI and `krowk -p` prints as a `--resume … --model …` fix. It is
+  never taken silently. With `"rollover": "auto"` and an ordered
+  `"rolloverOrder"` in `config.json`, krowk moves to the next instance by
+  itself, tells every client, and logs where from, where to and why. It is
+  off by default, and stacking one plan's limits across accounts is your
+  own call: Anthropic's plan limits assume ordinary, individual usage.
+  Each instance's usage and how near its limit it last said it was show in
+  the TUI's session details (Ctrl-O), and in the status bar once it is
+  close.
 - **krowk's agent follows Claude Code's permission rules, so a repository
   set up for Claude Code needs nothing new.** `permissions.allow`, `ask`
   and `deny` are read in Claude Code's syntax — `Bash(git:*)`,

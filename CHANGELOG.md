@@ -552,6 +552,17 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `unobserved` turn in `krowk sessions` and `sessions show`. The import
   report says how many of each it found.
 
+### Fixed
+
+- **A Claude Code `defaultMode` krowk does not run no longer refuses every
+  prompt.** `"defaultMode": "auto"` in `~/.claude/settings.json` (or any
+  mode krowk does not know) used to fail the settings with `bad_settings`,
+  even with `--permission-mode` given. krowk now runs in `default` — never
+  looser — and says so once, naming the file and the value;
+  `--permission-mode` wins without a word. A rule that does not parse
+  still refuses the prompt, and the TUI now says so before it asks the
+  trust question rather than after saving the answer.
+
 ## [0.10.0] - 2026-09-24
 
 krowk is written in Rust now, and it can read your agents' sessions back.

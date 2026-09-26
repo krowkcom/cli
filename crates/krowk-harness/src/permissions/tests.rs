@@ -452,3 +452,82 @@ fn r_sub_1_krowks_session_tools_need_no_mode_but_deny_and_ask_rules_and_a_hooks_
         v => panic!("{v:?}"),
     }
 }
+
+/// Claude Code's own user settings, the way Claude Code writes them, with
+/// the `auto` mode krowk does not run.
+fn claude_settings(dir: &Path, deny: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("settings.json"),
+        serde_json::to_string_pretty(&json!({
+            "$schema": "https://json.schemastore.org/claude-code-settings.json",
+            "model": "opus",
+            "permissions": {"allow": ["Bash(npm test)"], "deny": [deny], "defaultMode": "auto"},
+            "enabledPlugins": {"caveman@caveman": true},
+            "alwaysThinkingEnabled": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn r_perm_1_a_default_mode_krowk_does_not_run_is_read_as_default_with_a_notice() {
+    let d = repo("auto-user");
+    let claude = d.join("home/.claude");
+    claude_settings(&claude, "Read(.env)");
+    // krowk's own config asks for acceptEdits; Claude's file, read after
+    // it, names `auto` — which counts as default, never looser.
+    let cfg = Config { user: Some(json!({"permissions": {"defaultMode": "acceptEdits"}})), claude_dir: Some(claude.clone()), ..Config::default() };
+    let p = Policy::load(&cfg, &d.join("src")).expect("an unknown defaultMode does not refuse the settings");
+    assert_eq!(p.loaded.default_mode, Some(PermissionMode::Default));
+    let file = claude.join("settings.json").display().to_string();
+    assert!(matches!(p.loaded.notices.as_slice(), [n] if n.contains(&file) && n.contains("\"auto\"") && n.contains("runs in default")), "{:?}", p.loaded.notices);
+    let g = gate(&p, PermissionMode::Default);
+    assert_eq!(letter(&g.verdict(&read(d.join("src/.env")), None)), 'N', "the file's deny rule still holds");
+    assert_eq!(letter(&g.verdict(&bash("npm test"), None)), 'Y', "and its allow rule");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_perm_1_an_unknown_default_mode_never_excuses_a_rule_that_does_not_parse() {
+    let d = repo("auto-bad-deny");
+    let claude = d.join("home/.claude");
+    claude_settings(&claude, "Read(.env");
+    let cfg = Config { claude_dir: Some(claude.clone()), ..Config::default() };
+    let e = Policy::load(&cfg, &d.join("src")).unwrap_err();
+    assert!(e.contains(&claude.join("settings.json").display().to_string()) && e.contains("permissions.deny"), "{e}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_perm_1_an_unknown_default_mode_in_a_repository_counts_only_once_trusted() {
+    let d = repo("auto-repo");
+    std::fs::create_dir_all(d.join(".claude")).unwrap();
+    std::fs::write(d.join(".claude/settings.json"), json!({"permissions": {"defaultMode": "auto"}}).to_string()).unwrap();
+    let user = Some(json!({"permissions": {"defaultMode": "acceptEdits"}}));
+    let untrusted = Policy::load(&Config { user: user.clone(), ..Config::default() }, &d.join("src")).unwrap();
+    assert_eq!(untrusted.loaded.default_mode, Some(PermissionMode::AcceptEdits), "an untrusted repository's mode is ignored");
+    assert!(untrusted.loaded.notices.is_empty() && !untrusted.loaded.widens, "and neither noticed nor a reason to ask for trust");
+    let cfg = Config { user, trusted: Some(Arc::new(|_: &Path| true)), ..Config::default() };
+    let trusted = Policy::load(&cfg, &d.join("src")).unwrap();
+    assert_eq!(trusted.loaded.default_mode, Some(PermissionMode::Default), "trusted, it narrows to default");
+    assert_eq!(trusted.loaded.notices.len(), 1, "{:?}", trusted.loaded.notices);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn r_perm_1_a_default_mode_that_is_not_a_string_is_read_as_default_with_a_notice() {
+    let d = repo("mode-not-string");
+    let claude = d.join("home/.claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    for bad in [json!(2), json!(["acceptEdits"]), json!({"mode": "auto"}), json!(true), json!(null)] {
+        std::fs::write(claude.join("settings.json"), json!({"permissions": {"defaultMode": bad}}).to_string()).unwrap();
+        let cfg = Config { user: Some(json!({"permissions": {"defaultMode": "acceptEdits"}})), claude_dir: Some(claude.clone()), ..Config::default() };
+        let p = Policy::load(&cfg, &d.join("src")).unwrap();
+        assert_eq!(p.loaded.default_mode, Some(PermissionMode::Default), "{bad} does not leave the earlier acceptEdits standing");
+        let file = claude.join("settings.json").display().to_string();
+        assert!(matches!(p.loaded.notices.as_slice(), [n] if n.contains(&file) && n.contains(&bad.to_string())), "{bad}: {:?}", p.loaded.notices);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

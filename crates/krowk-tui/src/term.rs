@@ -21,6 +21,21 @@
 //!   `xai-ratatui-inline`'s `emit_to_scrollback`, does the same; this is
 //!   written from the idea, not its code.) The viewport is the only thing
 //!   ever repainted.
+//! - **Every move is relative to where the cursor is.** A frame already on
+//!   its way when the terminal changes size is read by the terminal at the
+//!   new size, where an absolute row names some other row — a clamped one,
+//!   on a screen that got shorter — and the frame clears and draws in the
+//!   wrong place, leaving the old live region in scrollback above the new
+//!   one. The terminal keeps the cursor on the caret through a resize, so a
+//!   frame that moves up and down from it still starts at the region's top
+//!   and still leaves the cursor on the caret, whichever size it is read at.
+//!   Its cells are drawn with autowrap off, so a row wider than the screen
+//!   it is read at is cut rather than pushed onto the next row. What is left:
+//!   such a row above the caret, cut, is measured after the resize as if the
+//!   terminal had reflowed it, and the clear starts that many rows too high.
+//!   The row it is on is tracked, not re-read: a glyph the terminal draws
+//!   wider than `unicode-width` says would put that off until the next
+//!   resize or job stop asks the terminal again.
 //! - **The terminal is asked where the cursor is only when nothing else is
 //!   reading it**: at start, and after a resize, with the key reader stopped
 //!   (the caller drops it). Everything in between — a taller or shorter live
@@ -30,7 +45,6 @@
 //!   handled here instead: the old live region is cleared from its top down
 //!   and the viewport rebuilt in place.
 
-use crossterm::cursor::MoveTo;
 use crossterm::terminal::{Clear, ClearType as CtClear};
 use crossterm::{queue, QueueableCommand};
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
@@ -45,16 +59,29 @@ use std::rc::Rc;
 /// Begin and end synchronized update (DEC private mode 2026).
 pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 pub const SYNC_END: &[u8] = b"\x1b[?2026l";
+/// Autowrap off and on again (DECAWM), around the live region's cells.
+const AUTOWRAP_OFF: &[u8] = b"\x1b[?7l";
+const AUTOWRAP_ON: &[u8] = b"\x1b[?7h";
 
-/// Where a frame's bytes collect until the frame is done. ratatui flushes
-/// its writer after almost every operation; here that is a no-op, so the
-/// frame leaves in one piece.
+/// Where a frame's bytes collect until the frame is done, and the row they
+/// leave the cursor on. ratatui flushes its writer after almost every
+/// operation; here that is a no-op, so the frame leaves in one piece.
 #[derive(Clone, Default)]
-pub struct FrameBuf(Rc<RefCell<Vec<u8>>>);
+pub struct FrameBuf(Rc<RefCell<Buf>>);
+
+#[derive(Default)]
+struct Buf {
+    bytes: Vec<u8>,
+    /// The row the cursor is on once `bytes` are written.
+    row: u16,
+    /// The row the cursor is on with what has been sent: where it is when
+    /// what was queued since is dropped.
+    sent_row: u16,
+}
 
 impl Write for FrameBuf {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(b);
+        self.0.borrow_mut().bytes.extend_from_slice(b);
         Ok(b.len())
     }
 
@@ -64,17 +91,72 @@ impl Write for FrameBuf {
 }
 
 impl FrameBuf {
+    /// What is queued, to send: the cursor is where it leaves it.
     fn take(&self) -> Vec<u8> {
-        std::mem::take(&mut *self.0.borrow_mut())
+        let mut b = self.0.borrow_mut();
+        b.sent_row = b.row;
+        std::mem::take(&mut b.bytes)
+    }
+
+    /// What is queued, dropped: the cursor is where what was sent left it.
+    fn discard(&self) {
+        let mut b = self.0.borrow_mut();
+        b.bytes.clear();
+        b.row = b.sent_row;
+    }
+
+    fn row(&self) -> u16 {
+        self.0.borrow().row
+    }
+
+    /// The terminal says, or a sequence just sent sets, where the cursor is.
+    fn set_row(&self, row: u16) {
+        let mut b = self.0.borrow_mut();
+        b.row = row;
+        if b.bytes.is_empty() {
+            b.sent_row = row;
+        }
+    }
+
+    /// To column `x` of row `y` by moves from the row the cursor is on:
+    /// CR, then up or down, then right.
+    fn goto(&self, x: u16, y: u16) -> io::Result<()> {
+        let mut b = self.0.borrow_mut();
+        let from = b.row;
+        b.bytes.push(b'\r');
+        match y.cmp(&from) {
+            std::cmp::Ordering::Less => write!(b.bytes, "\x1b[{}A", from - y)?,
+            std::cmp::Ordering::Greater => write!(b.bytes, "\x1b[{}B", y - from)?,
+            std::cmp::Ordering::Equal => {}
+        }
+        if x > 0 {
+            write!(b.bytes, "\x1b[{x}C")?;
+        }
+        b.row = y;
+        Ok(())
+    }
+
+    /// `n` line feeds: down `n` rows, scrolling at the bottom of a screen
+    /// `height` rows tall.
+    fn feed(&self, n: u16, height: u16) {
+        let mut b = self.0.borrow_mut();
+        b.bytes.extend(std::iter::repeat_n(b'\n', usize::from(n)));
+        b.row = b.row.saturating_add(n).min(height.saturating_sub(1));
     }
 }
 
 /// crossterm's backend writing into the frame buffer, with the two things
 /// that would otherwise talk to the terminal answered from what is known:
 /// its size (so ratatui never resizes behind our back) and the cursor (so
-/// ratatui never queries it while the key reader owns the input).
+/// ratatui never queries it while the key reader owns the input). Cells are
+/// drawn here rather than by crossterm, which moves to absolute rows, and
+/// with `sgr`'s styles: blink, hidden and underline colours, which nothing
+/// here uses, are not drawn. `scroll_region_*` and `clear` still go through
+/// crossterm and set a scroll region, which moves the cursor where the row
+/// model cannot follow; nothing calls them (ratatui's `insert_before` would).
 pub struct Back {
     inner: CrosstermBackend<FrameBuf>,
+    buf: FrameBuf,
     size: Size,
     cursor: Position,
 }
@@ -86,11 +168,35 @@ impl Backend for Back {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        self.inner.draw(content)
+        let mut out = self.buf.clone();
+        let mut last: Option<Position> = None;
+        let mut style = None;
+        for (x, y, cell) in content {
+            if !matches!(last, Some(p) if x == p.x + 1 && y == p.y) {
+                self.buf.goto(x, y)?;
+            }
+            last = Some(Position { x, y });
+            let s = ratatui::style::Style::new().fg(cell.fg).bg(cell.bg).add_modifier(cell.modifier);
+            if style != Some(s) {
+                let codes = sgr(s);
+                if codes.is_empty() {
+                    out.write_all(b"\x1b[0m")?;
+                } else {
+                    write!(out, "\x1b[0;{codes}m")?;
+                }
+                style = Some(s);
+            }
+            out.write_all(cell.symbol().as_bytes())?;
+        }
+        if style.is_some() {
+            out.write_all(b"\x1b[0m")?;
+        }
+        Ok(())
     }
 
     fn append_lines(&mut self, n: u16) -> io::Result<()> {
-        self.inner.append_lines(n)
+        self.buf.feed(n, self.size.height);
+        Ok(())
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
@@ -108,7 +214,7 @@ impl Backend for Back {
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
         let p = position.into();
         self.cursor = p;
-        self.inner.set_cursor_position(p)
+        self.buf.goto(p.x, p.y)
     }
 
     fn clear(&mut self) -> io::Result<()> {
@@ -156,10 +262,9 @@ pub struct Term<W: Write> {
     /// narrowing resize, a terminal that reflows splits each wider row
     /// into several, and this is how many.
     widths: Vec<u16>,
-    /// Where the region was, and how wide the terminal, when the last frame
-    /// reached it: what a resize is measured against, however many resizes
-    /// come before the next frame.
-    drawn_top: u16,
+    /// How wide the terminal was when the last frame reached it: what a
+    /// resize is measured against, however many resizes come before the
+    /// next frame.
     drawn_width: u16,
     /// Whether this terminal reflows lines on a narrowing resize. Most do;
     /// xterm and the Linux console truncate instead (see `reflows_from`).
@@ -174,6 +279,7 @@ impl<W: Write> Term<W> {
     /// is moved down to sit right above the viewport (see `anchor`).
     pub fn new(mut out: W, size: Size, top: u16, height: u16) -> io::Result<Term<W>> {
         let buf = FrameBuf::default();
+        buf.set_row(top);
         let height = height.clamp(1, size.height.max(1));
         let top = anchor(&buf, size, top, height)?;
         // Out now, not with the first frame: a resize before that frame
@@ -181,9 +287,7 @@ impl<W: Write> Term<W> {
         out.write_all(&buf.take())?;
         out.flush()?;
         let terminal = build(&buf, size, top, height)?;
-        let mut t = Term { terminal, buf, out, size, height, caret_row: 0, caret_col: 0, widths: Vec::new(), drawn_top: top, drawn_width: size.width, reflows: true, frames: 0 };
-        t.drawn_top = t.top();
-        Ok(t)
+        Ok(Term { terminal, buf, out, size, height, caret_row: 0, caret_col: 0, widths: Vec::new(), drawn_width: size.width, reflows: true, frames: 0 })
     }
 
     pub fn width(&self) -> u16 {
@@ -211,8 +315,8 @@ impl<W: Write> Term<W> {
     }
 
     fn rebuild(&mut self, top: u16, height: u16) -> io::Result<()> {
-        let mut w = self.buf.clone();
-        queue!(w, MoveTo(0, top), Clear(CtClear::FromCursorDown))?;
+        self.buf.goto(0, top)?;
+        queue!(self.buf.clone(), Clear(CtClear::FromCursorDown))?;
         self.terminal = build(&self.buf, self.size, top, height)?;
         self.height = height;
         Ok(())
@@ -242,16 +346,21 @@ impl<W: Write> Term<W> {
     /// order — and never the region itself, unless the reflowed region is
     /// taller than the whole screen.
     pub fn resize(&mut self, size: Size, cursor_row: Option<u16>) -> io::Result<()> {
-        self.buf.take();
+        self.buf.discard();
         self.size = size;
         let height = self.height.clamp(1, size.height.max(1));
         let narrowed = size.width < self.drawn_width;
-        let top = match cursor_row {
-            Some(row) if narrowed && self.reflows => row.saturating_sub(self.reflowed_above_caret(size.width)),
-            Some(row) => row.saturating_sub(self.caret_row),
-            None => self.drawn_top,
-        };
-        let top = top.min(size.height.saturating_sub(height));
+        let above = if narrowed && self.reflows { self.reflowed_above_caret(size.width) } else { self.caret_row };
+        // Not asked, the cursor is still on the caret, but its row was
+        // numbered on the old screen: on the new one it is at most the last.
+        let row = cursor_row.unwrap_or_else(|| self.buf.row().min(size.height.saturating_sub(1)));
+        self.buf.set_row(row);
+        let top = row.saturating_sub(above);
+        // A shorter screen can leave the region's top too low for all of it:
+        // the terminal took the rows below the caret. The rows it needs are
+        // made the way a new line makes them, scrolling what is above into
+        // scrollback — moving the top up instead would clear conversation.
+        let top = top.min(size.height.saturating_sub(1));
         self.rebuild(top, height)
     }
 
@@ -275,20 +384,26 @@ impl<W: Write> Term<W> {
             self.emit(lines, height)?;
         }
         let shown = usize::from(self.height);
-        self.terminal.draw(|f| {
+        // The live region is drawn with autowrap off: a row wider than the
+        // screen it is read at — a frame drawn before a narrowing — is cut
+        // at the last column rather than wrapped onto the next row, or off
+        // the bottom one, which would scroll the screen under the cursor.
+        self.buf.clone().write_all(AUTOWRAP_OFF)?;
+        let drawn = self.terminal.draw(|f| {
             let area = f.area();
             for (i, row) in rows.iter().enumerate().take(usize::from(area.height)) {
                 f.buffer_mut().set_line(area.x, area.y + i as u16, row, width);
             }
             f.set_cursor_position((area.x + caret.0.min(width.saturating_sub(1)), area.y + caret.1.min(area.height.saturating_sub(1))));
-        })?;
+        });
+        self.buf.clone().write_all(AUTOWRAP_ON)?;
+        drawn?;
         self.widths = rows.iter().take(shown).map(|r| (r.width() as u16).min(width)).collect();
         let top = self.top();
         if let Some(Position { x, y }) = completed_cursor(&mut self.terminal) {
             self.caret_row = y.saturating_sub(top);
             self.caret_col = x;
         }
-        self.drawn_top = top;
         self.drawn_width = width;
         self.flush()
     }
@@ -301,7 +416,8 @@ impl<W: Write> Term<W> {
         let (w, h) = (self.size.width, self.size.height.max(1));
         let top = self.top();
         let mut out = self.buf.clone();
-        queue!(out, MoveTo(0, top), Clear(CtClear::FromCursorDown))?;
+        self.buf.goto(0, top)?;
+        queue!(out, Clear(CtClear::FromCursorDown))?;
         let mut used: u32 = 0;
         for line in lines {
             write_styled(&mut out, line)?;
@@ -311,9 +427,8 @@ impl<W: Write> Term<W> {
         // The cursor is on the row after the text, at most the last; line
         // feeds from there reserve the viewport, scrolling if they must.
         let below = (u32::from(top) + used).min(u32::from(h - 1)) as u16;
-        for _ in 1..height {
-            out.write_all(b"\n")?;
-        }
+        self.buf.set_row(below);
+        self.buf.feed(height - 1, h);
         let y = (below + height - 1).min(h - 1) - (height - 1);
         self.terminal = build(&self.buf, self.size, y, height)?;
         self.height = height;
@@ -341,7 +456,7 @@ impl<W: Write> Term<W> {
     pub fn finish(&mut self) -> io::Result<()> {
         let top = self.top();
         let mut w = self.buf.clone();
-        w.queue(MoveTo(0, top))?;
+        self.buf.goto(0, top)?;
         w.queue(Clear(CtClear::FromCursorDown))?;
         w.queue(crossterm::cursor::Show)?;
         self.flush()
@@ -350,13 +465,18 @@ impl<W: Write> Term<W> {
     /// Back after a job stop: the live region starts afresh on the row the
     /// cursor is on now (the shell may have printed below it).
     pub fn resume(&mut self, size: Size, cursor_row: Option<u16>) -> io::Result<()> {
-        self.buf.take();
+        self.buf.discard();
         self.size = size;
         let height = self.height.clamp(1, size.height.max(1));
-        let top = cursor_row.unwrap_or(size.height.saturating_sub(height)).min(size.height.saturating_sub(height));
+        // A cursor near the bottom keeps its row: the rebuild scrolls what
+        // the shell printed up, rather than clearing it.
+        // Unknown, the cursor is taken to be on the last row: the line
+        // feeds that reserve the region only move down or scroll, so nothing
+        // the shell printed is cleared wherever it really is.
+        let top = cursor_row.unwrap_or(size.height.saturating_sub(1)).min(size.height.saturating_sub(1));
+        self.buf.set_row(top);
         let top = anchor(&self.buf, size, top, height)?;
         self.rebuild(top, height)?;
-        self.drawn_top = self.top();
         self.drawn_width = size.width;
         Ok(())
     }
@@ -475,16 +595,17 @@ fn anchor(buf: &FrameBuf, size: Size, top: u16, height: u16) -> io::Result<u16> 
     }
     if top > 0 {
         CrosstermBackend::new(buf.clone()).scroll_region_down(0..bottom, bottom - top)?;
+        // Setting the scroll region moves the cursor to the top left.
+        buf.set_row(0);
     }
     Ok(bottom)
 }
 
 fn build(buf: &FrameBuf, size: Size, top: u16, height: u16) -> io::Result<Terminal<Back>> {
-    let back = Back { inner: CrosstermBackend::new(buf.clone()), size, cursor: Position { x: 0, y: top } };
-    let mut back = back;
     // ratatui reserves the viewport's rows by printing newlines from the
     // cursor, so the real cursor has to be at the top first.
-    back.inner.set_cursor_position(Position { x: 0, y: top })?;
+    buf.goto(0, top)?;
+    let back = Back { inner: CrosstermBackend::new(buf.clone()), buf: buf.clone(), size, cursor: Position { x: 0, y: top } };
     Terminal::with_options(back, TerminalOptions { viewport: Viewport::Inline(height) })
 }
 
@@ -509,6 +630,22 @@ mod tests {
         assert!(!text.contains("\x1b[2J"), "the screen is never cleared whole: {text:?}");
     }
 
+    #[test]
+    fn r_tui_3_a_frame_moves_only_up_and_down_from_the_cursor() {
+        // Read at a size it was not written for, an absolute row lands
+        // somewhere else; a move from the caret lands where it was meant to.
+        let mut t = Term::new(Vec::new(), Size { width: 40, height: 10 }, 0, 3).unwrap();
+        let start = t.out.len();
+        t.frame(&[Line::from("one"), Line::from("two")], &[Line::from("› hi"), Line::from("bar"), Line::default()], (4, 0)).unwrap();
+        t.frame(&[], &[Line::from("› hi there"), Line::from("bar"), Line::default()], (10, 0)).unwrap();
+        t.resize(Size { width: 30, height: 8 }, Some(5)).unwrap();
+        t.frame(&[Line::from("three")], &[Line::from("› hi there"), Line::from("bar"), Line::default()], (10, 0)).unwrap();
+        let out = String::from_utf8_lossy(&t.out[start..]).into_owned();
+        let absolute = out.split("\x1b[").skip(1).any(|seq| seq.find(|c: char| c.is_ascii_alphabetic()).is_some_and(|end| matches!(&seq[end..=end], "H" | "f" | "d" | "r")));
+        assert!(!absolute, "an absolute move: {out:?}");
+        assert!(out.contains("one\r\ntwo\r\n") && out.contains("three\r\n"), "{out:?}");
+    }
+
     /// A 90-wide overlay row, the prompt with the caret at column 50, and a
     /// 90-wide status bar, on a 100x30 terminal whose cursor started at row 10.
     fn drawn() -> Term<Vec<u8>> {
@@ -529,8 +666,8 @@ mod tests {
 
     #[test]
     fn r_tui_3_the_region_starts_at_the_bottom_with_what_was_above_it_moved_down() {
-        let t = Term::new(Vec::new(), Size { width: 40, height: 10 }, 4, 3).unwrap();
-        assert_eq!(t.drawn_top, 7, "the bottom three rows");
+        let mut t = Term::new(Vec::new(), Size { width: 40, height: 10 }, 4, 3).unwrap();
+        assert_eq!(t.top(), 7, "the bottom three rows");
         let out = String::from_utf8_lossy(&t.out).into_owned();
         // Rows 1-7 scrolled down by 3: the four rows above the cursor land
         // right above the viewport, and only blank rows leave the region.
@@ -542,15 +679,16 @@ mod tests {
     #[test]
     fn r_tui_3_a_narrowed_region_is_measured_as_the_terminal_reflows_it() {
         let mut t = drawn();
-        assert_eq!(t.drawn_top, 27);
+        assert_eq!(t.top(), 27);
         // At 40 columns the 90-wide row above the caret takes three rows,
         // and the caret itself has moved one row down its own line.
         assert_eq!(t.reflowed_above_caret(40), 3 + 1);
         assert_eq!(t.reflowed_above_caret(100), 1, "unchanged at the old width");
         // Reflowed at the bottom of the grid, the region is 3 + 2 + 3 rows,
-        // 22 to 29, and the caret on row 26: its top is 26 - 4 = 22.
+        // 22 to 29, and the caret on row 26: its top is 26 - 4 = 22, four
+        // rows up from the cursor.
         let out = after_resize(&mut t, &[(40, 26)]);
-        assert!(out.starts_with("\x1b[?2026h\x1b[23;1H\x1b[J"), "{out:?}");
+        assert!(out.starts_with("\x1b[?2026h\r\x1b[4A\x1b[J"), "{out:?}");
     }
 
     #[test]
@@ -558,7 +696,7 @@ mod tests {
         let mut t = drawn();
         t.reflows = false;
         let out = after_resize(&mut t, &[(40, 28)]);
-        assert!(out.starts_with("\x1b[?2026h\x1b[28;1H\x1b[J"), "{out:?}");
+        assert!(out.starts_with("\x1b[?2026h\r\x1b[1A\x1b[J"), "the caret's row, less one: {out:?}");
     }
 
     #[test]
@@ -569,7 +707,7 @@ mod tests {
         // 100, and the first resize's clear is never sent.
         let out = after_resize(&mut t, &[(70, 26), (40, 26)]);
         assert_eq!(out.matches("\x1b[J").count(), 1, "one clear, not two: {out:?}");
-        assert!(out.starts_with("\x1b[?2026h\x1b[23;1H\x1b[J"), "{out:?}");
+        assert!(out.starts_with("\x1b[?2026h\r\x1b[4A\x1b[J"), "{out:?}");
     }
 
     #[test]

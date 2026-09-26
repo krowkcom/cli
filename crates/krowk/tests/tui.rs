@@ -336,6 +336,22 @@ impl Tmux {
         None
     }
 
+    /// The whole history once the TUI has stopped drawing: the same across
+    /// two polls, with `ready` true of the screen.
+    fn wait_still(&self, ready: impl Fn(&str) -> bool, timeout: Duration) -> Option<String> {
+        let t0 = Instant::now();
+        let mut last = self.history();
+        while t0.elapsed() < timeout {
+            std::thread::sleep(Duration::from_millis(80));
+            let now = self.history();
+            if now == last && ready(&self.screen()) {
+                return Some(now);
+            }
+            last = now;
+        }
+        None
+    }
+
     fn wait_gone(&self, needle: &str, timeout: Duration) -> Option<Duration> {
         let t0 = Instant::now();
         while t0.elapsed() < timeout {
@@ -426,18 +442,21 @@ fn r_tui_3_a_resize_mid_stream_never_repeats_a_line_or_leaves_the_live_region_be
     tm.tmux(&["resize-window", "-t", "t", "-x", "70", "-y", "20"]);
     assert!(tm.wait_for("tokens", Duration::from_secs(60)).is_some(), "{}", tm.screen());
     tm.tmux(&["resize-window", "-t", "t", "-x", "120", "-y", "40"]);
-    std::thread::sleep(Duration::from_millis(300));
-    let history = tm.history();
-    // A frame already on its way when the terminal changes size lands in
-    // rows that moved under it — a race every terminal program has — so the
-    // lines streamed across the resize itself are not held here. Nothing is
-    // ever there twice, nothing of the live region is left behind, and
-    // every line from shortly after the resize on is there, in order.
+    // Redrawn at 120x40: the status bar on the last of forty rows.
+    let redrawn = |s: &str| s.lines().count() == 40 && s.lines().last().is_some_and(|l| l.contains("api key")) && s.matches("api key").count() == 1;
+    let history = tm.wait_still(redrawn, Duration::from_secs(10)).unwrap_or_else(|| panic!("never redrawn after the resize:\n{}", tm.screen()));
+    // A frame already on its way when the terminal changes size is read at
+    // the new size; it moves from the caret, so it still lands where it was
+    // meant to (crates/krowk-tui/tests/resize.rs makes that race happen
+    // every time). Nothing is ever there twice, nothing of the live region
+    // is left behind, and every line is there, in order — but a resize the
+    // terminal takes in the middle of one frame's bytes, which the terminal
+    // alone decides, can still cost the line in flight.
     let seen: Vec<u32> = history.lines().filter_map(|l| l.strip_prefix("line ")?.get(..5)?.parse().ok()).collect();
     let mut sorted = seen.clone();
     sorted.dedup();
     assert_eq!(sorted, seen, "a line twice, or out of order:\n{history}");
-    // At most the one line in flight at each of the two resizes.
+    // At most the one line in flight at each of the two resizes, that way.
     let missing: Vec<u32> = (1..=300).filter(|n| !seen.contains(n)).collect();
     assert!(missing.len() <= 2, "more than a line lost per resize: {missing:?}\n{history}");
     assert!(seen.contains(&300), "the end of the answer is there:\n{history}");

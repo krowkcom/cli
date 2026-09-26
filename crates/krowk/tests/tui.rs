@@ -125,13 +125,10 @@ fn r_perf_2_nothing_is_drawn_while_idle() {
     let m = mock::serve(mock::readme_script);
     let b = Sandbox::new("idle");
     let t = pty::Pty::spawn(b.command(&m.url, &[]), 80, 24);
-    // Online is not shown; the frame that takes "connecting…" off the row
-    // under the prompt is the last one there is reason to draw.
-    let t0 = Instant::now();
-    while !t.text().rsplit_once("connecting").is_some_and(|(_, after)| after.contains("$0.00")) {
-        assert!(t0.elapsed() < Duration::from_secs(10), "never online: {:?}", t.text());
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // The first frame, status line and all, is the last one there is
+    // reason to draw: the start-up probe answering online changes nothing
+    // on screen, so it draws nothing.
+    assert!(t.wait_for("? help", Duration::from_secs(10)).is_some(), "no status line: {:?}", t.text());
     std::thread::sleep(Duration::from_millis(300));
     let before = t.output().len();
     std::thread::sleep(Duration::from_secs(2));
@@ -449,7 +446,7 @@ fn r_tui_3_a_resize_mid_stream_never_repeats_a_line_or_leaves_the_live_region_be
     assert!(tm.wait_for("tokens", Duration::from_secs(60)).is_some(), "{}", tm.screen());
     tm.tmux(&["resize-window", "-t", "t", "-x", "120", "-y", "40"]);
     // Redrawn at 120x40: the status bar on the last of forty rows.
-    let redrawn = |s: &str| s.lines().count() == 40 && s.lines().last().is_some_and(|l| l.contains("api key")) && s.matches("api key").count() == 1;
+    let redrawn = |s: &str| s.lines().count() == 40 && s.lines().last().is_some_and(|l| l.contains("? help")) && s.matches("? help").count() == 1;
     let history = tm.wait_still(redrawn, Duration::from_secs(10)).unwrap_or_else(|| panic!("never redrawn after the resize:\n{}", tm.screen()));
     // A frame already on its way when the terminal changes size is read at
     // the new size; it moves from the caret, so it still lands where it was
@@ -470,7 +467,7 @@ fn r_tui_3_a_resize_mid_stream_never_repeats_a_line_or_leaves_the_live_region_be
         assert!(!history.contains(live), "the old live region was left in scrollback:\n{history}");
     }
     assert_eq!(history.matches("❯ go").count(), 1, "{history}");
-    let bars = tm.screen().matches("api key").count();
+    let bars = tm.screen().matches("? help").count();
     assert_eq!(bars, 1, "one status bar on screen after two resizes:\n{}", tm.screen());
 }
 
@@ -496,13 +493,18 @@ fn narrowing(name: &str, before: &str, steps: &[&str]) {
     tm.tmux(&args);
     std::thread::sleep(Duration::from_millis(800));
     let history = tm.history();
-    for row in ["enter send · alt-enter", "⚠ no network connectivity", "→ Plan, search, build anything", "offline · $0.00"] {
+    for row in ["enter send · alt-enter", "⚠ no network connectivity", "→ Plan, search, build anything", "offline | ? help"] {
         assert_eq!(history.matches(row).count(), 1, "{row:?} is in scrollback twice — the old live region was left behind:\n{history}");
     }
     assert_eq!(history.matches("krowk · claude-opus-5-5").count(), 1, "the header is still there, once:\n{history}");
     for edge in ['┌', '└'] {
         assert_eq!(history.matches(edge).count(), 1, "one prompt box, its {edge} edge once:\n{history}");
     }
+    // At 40 columns the status line is one row still: the device and the
+    // cost gave way, the model is cut short, offline and the help stay.
+    let screen = tm.screen();
+    let bar = screen.lines().map(str::trim_end).rfind(|l| !l.is_empty()).unwrap_or_default();
+    assert!(bar.starts_with("  anthropic/claude-") && bar.ends_with(" | offline | ? help") && bar.chars().count() <= 40 && !bar.contains('$'), "{bar:?}\n{screen}");
     if !before.is_empty() {
         // What was on the terminal is kept: the open scrolls it into
         // scrollback, the way a clear that keeps scrollback does, and the
@@ -644,14 +646,16 @@ fn r_off_1_a_cut_network_shows_the_notice_within_two_seconds_and_nothing_hangs()
     let relay = Relay::new(&m.url);
     let b = Sandbox::new("offline");
     let Some(tm) = Tmux::start("offline", 100, 30, &b.root.join("repo"), &b.env(&relay.url()), &[]) else { return };
-    assert!(tm.wait_for("anything", Duration::from_secs(10)).is_some() && tm.wait_gone("connecting", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    assert!(tm.wait_for("? help", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    // The start-up probe, answered: nothing on screen says so.
+    std::thread::sleep(Duration::from_millis(300));
     tm.keys(&["tell me everything", "Enter"]);
     assert!(tm.wait_in_history("line 00003", Duration::from_secs(10)).is_some(), "{}", tm.screen());
 
     relay.cut.store(true, Ordering::SeqCst);
     let shown = tm.wait_for("no network connectivity", Duration::from_secs(5)).unwrap_or_else(|| panic!("no notice:\n{}", tm.screen()));
     assert!(shown <= Duration::from_secs(2), "the notice took {shown:?}");
-    assert!(tm.screen().contains("offline ·"), "the status bar says so too:\n{}", tm.screen());
+    assert!(tm.screen().contains("| offline | ? help"), "the status line says so too, just before the help:\n{}", tm.screen());
 
     // Nothing hangs: Esc stops the stalled turn, and what arrived is kept.
     tm.keys(&["Escape"]);
@@ -662,7 +666,7 @@ fn r_off_1_a_cut_network_shows_the_notice_within_two_seconds_and_nothing_hangs()
     relay.cut.store(false, Ordering::SeqCst);
     let cleared = tm.wait_gone("no network connectivity", Duration::from_secs(15)).unwrap_or_else(|| panic!("the notice never cleared:\n{}", tm.screen()));
     assert!(cleared <= Duration::from_secs(12), "{cleared:?}");
-    assert!(tm.wait_gone("offline ·", Duration::from_secs(2)).is_some(), "the row under the prompt says so too:\n{}", tm.screen());
+    assert!(tm.wait_gone("offline |", Duration::from_secs(2)).is_some(), "the row under the prompt says so too:\n{}", tm.screen());
 }
 
 /// A settings file that does not load is named before the trust question
@@ -678,8 +682,11 @@ fn r_perm_1_a_settings_error_is_named_before_the_trust_question() {
     std::fs::write(b.root.join("home/.config/krowk/config.json"), r#"{"permissions": {"deny": ["Read(.env"]}}"#).unwrap();
     let mut t = pty::Pty::spawn(b.command("http://127.0.0.1:9", &[]), 80, 24);
     let st = t.wait(Duration::from_secs(10)).expect("krowk exits");
+    // The process can be gone before the pty's reader has taken the last
+    // of what it wrote: read until the words are there, or a deadline.
+    assert!(t.wait_for("bad_settings", Duration::from_secs(5)).is_some() && t.wait_for("permissions.deny", Duration::from_secs(5)).is_some(), "{:?}", t.text());
     let out = t.text();
-    assert!(!st.success() && out.contains("bad_settings") && out.contains("permissions.deny"), "{out:?}");
+    assert!(!st.success(), "{st}");
     assert!(!out.contains("Trust "), "no trust question was asked: {out:?}");
     assert!(!b.root.join("home/.config/krowk/trusted.json").exists(), "and none saved");
 }

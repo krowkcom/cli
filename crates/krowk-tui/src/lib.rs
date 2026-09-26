@@ -9,7 +9,8 @@
 //! - `app` — what is shown, driven by frames and keys.
 //! - `editor` — the multi-line prompt and its history.
 //! - `look` — glyphs, colours, the spinner and the light markdown.
-//! - `settings` — the status bar's configuration (R-TUI-2).
+//! - `settings` — the status line's configuration (R-TUI-2).
+//! - `device` — the `<user>/<host>` the status line opens with, read once.
 //! - `net` — the connectivity probe behind the offline notice (R-OFF-1).
 //!
 //! The loop is event-driven end to end (R-PERF-2): it sleeps in one
@@ -22,6 +23,7 @@
 
 pub mod app;
 pub mod card;
+pub mod device;
 pub mod presence;
 pub mod editor;
 pub mod look;
@@ -176,6 +178,7 @@ async fn session(opts: Options) -> Outcome {
     let shown = opts.model.clone().or_else(|| app.model.clone()).or_else(|| opts.host.registry.default_model().ok());
     let target = shown.as_ref().and_then(|m| opts.host.registry.get(&m.instance).ok()).and_then(|i| Target::for_url(&i.base_url, &|k| std::env::var(k).unwrap_or_default()));
     app.model = shown;
+    app.device = device::name(&|k| std::env::var(k).unwrap_or_default());
     app.vendor_instances = opts.host.registry.instances.values().filter(|i| i.backend.is_some()).map(|i| i.name.clone()).collect();
     app.header(&home_relative(&opts.host.cwd));
     for n in &opts.notices {

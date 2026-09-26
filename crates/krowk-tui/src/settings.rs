@@ -1,14 +1,25 @@
 //! The TUI's part of krowk's config.json, under `"tui"` (R-TUI-2):
 //!
 //! ```json
-//! { "tui": { "statusBar": true, "statusItems": ["model", "instance", "cost", "connectivity"] } }
+//! { "tui": { "statusBar": true, "statusItems": ["device", "model", "cost", "tasks", "subagents", "help"] } }
 //! ```
 //!
-//! - `statusBar` — false hides the status bar. The "no network
-//!   connectivity" notice is not part of it and shows regardless (R-OFF-1).
-//! - `statusItems` — which items the bar shows, in order: any of `model`,
-//!   `instance`, `cost`, `connectivity`, `session`, `todos` and `subagents`
-//!   — the last two only while there is a list, or a subagent running.
+//! - `statusBar` — false hides the status line under the prompt. The "no
+//!   network connectivity" notice is not part of it and shows regardless
+//!   (R-OFF-1).
+//! - `statusItems` — which items the status line shows, in order, joined by
+//!   ` | `: any of `device` (`<user>/<host>`), `model` (the instance and
+//!   model, `anthropic/claude-opus-5-5`, with the instance's limit once it
+//!   is near it — R-INST-6), `cost` (the session's), `tasks` (`[2 tasks]`,
+//!   only while the todo list has open items), `subagents` (`[1 subagent]`,
+//!   only while subagents run) and `help` (`? help`, always last). The
+//!   default is all six in that order. While the API cannot be reached an
+//!   `offline` item is added before `help` whatever the list says.
+//!
+//! Names from before the status line was one template still read: `todos`
+//! is `tasks`, `instance` is `model`, and `connectivity` and `session` are
+//! taken and ignored — offline shows by itself, and the session's id is in
+//! the details overlay.
 //!
 //! The overlays are toggled from the keyboard rather than configured: `?` on
 //! an empty prompt for the keys, Ctrl-O for the session's details, Ctrl-T
@@ -18,30 +29,38 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Item {
+    /// `<user>/<short hostname>`, as it was when the TUI started.
+    Device,
+    /// `<instance>/<model>`, and the instance's limit once it is near.
     Model,
-    Instance,
     Cost,
-    Connectivity,
-    Session,
-    /// `todos 2/5` while the session has a todo list.
-    Todos,
-    /// `2 agents` while subagents run.
+    /// `[N tasks]` while the todo list has pending or in-progress items.
+    Tasks,
+    /// `[N subagents]` while subagents run.
     Subagents,
+    /// `? help`, always drawn last.
+    Help,
 }
 
 impl Item {
-    pub const ALL: [(&'static str, Item); 7] = [
+    pub const ALL: [(&'static str, Item); 6] = [
+        ("device", Item::Device),
         ("model", Item::Model),
-        ("instance", Item::Instance),
         ("cost", Item::Cost),
-        ("connectivity", Item::Connectivity),
-        ("session", Item::Session),
-        ("todos", Item::Todos),
+        ("tasks", Item::Tasks),
         ("subagents", Item::Subagents),
+        ("help", Item::Help),
     ];
 
-    fn parse(s: &str) -> Option<Item> {
-        Item::ALL.iter().find(|(n, _)| *n == s).map(|(_, i)| *i)
+    /// An item by name — `Some(None)` for an old name kept so a config that
+    /// has it still reads, and that no longer shows anything of its own.
+    fn parse(s: &str) -> Option<Option<Item>> {
+        match s {
+            "todos" => Some(Some(Item::Tasks)),
+            "instance" => Some(Some(Item::Model)),
+            "connectivity" | "session" => Some(None),
+            _ => Item::ALL.iter().find(|(n, _)| *n == s).map(|(_, i)| Some(*i)),
+        }
     }
 }
 
@@ -53,7 +72,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { status_bar: true, status_items: vec![Item::Model, Item::Instance, Item::Cost, Item::Todos, Item::Subagents, Item::Connectivity] }
+        Settings { status_bar: true, status_items: Item::ALL.iter().map(|(_, i)| *i).collect() }
     }
 }
 
@@ -79,7 +98,7 @@ pub fn from_config(raw: &Value) -> (Settings, Vec<String>) {
             s.status_items.clear();
             for v in items {
                 match v.as_str().and_then(Item::parse) {
-                    Some(i) if !s.status_items.contains(&i) => s.status_items.push(i),
+                    Some(Some(i)) if !s.status_items.contains(&i) => s.status_items.push(i),
                     Some(_) => {}
                     None => warnings.push(format!(
                         "config tui.statusItems: {v} is not an item — one of {}",
@@ -106,14 +125,22 @@ mod tests {
     #[test]
     fn r_tui_2_the_status_bar_is_optional_and_its_items_configurable() {
         assert_eq!(from_config(&json!({})).0, Settings::default());
+        assert_eq!(Settings::default().status_items, [Item::Device, Item::Model, Item::Cost, Item::Tasks, Item::Subagents, Item::Help], "the template's order");
         let (s, w) = from_config(&json!({"tui": {"statusBar": false}}));
         assert!(!s.status_bar && w.is_empty());
         let (s, w) = from_config(&json!({"tui": {"statusItems": ["cost", "model", "cost", "nope"]}}));
         assert_eq!(s.status_items, [Item::Cost, Item::Model], "in the order given, once each");
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("\"nope\"") && w[0].contains("connectivity"), "{w:?}");
+        assert!(w[0].contains("\"nope\"") && w[0].contains("subagents"), "{w:?}");
         let (s, w) = from_config(&json!({"tui": {"statusBar": "yes", "colour": 1}}));
         assert!(s.status_bar, "a malformed value leaves the default");
         assert_eq!(w.len(), 2, "{w:?}");
+    }
+
+    #[test]
+    fn r_tui_2_a_config_written_for_the_old_bar_still_reads() {
+        let (s, w) = from_config(&json!({"tui": {"statusItems": ["model", "instance", "cost", "connectivity", "session", "todos", "subagents"]}}));
+        assert!(w.is_empty(), "no warning for a name the bar once had: {w:?}");
+        assert_eq!(s.status_items, [Item::Model, Item::Cost, Item::Tasks, Item::Subagents], "instance is model, todos is tasks, connectivity and session show nothing of their own");
     }
 }

@@ -113,7 +113,7 @@ fn shrunk_around_a_frame(name: &str, to: (u16, u16), frame_read_first: bool, ans
     let line = |n: u32| Line::from(format!("line {n:05}: the quick brown fox jumps over the lazy dog again"));
     let live = |tail: Option<&str>| {
         let mut rows: Vec<Line<'static>> = tail.map(|t| Line::from(t.to_string())).into_iter().collect();
-        rows.extend([Line::from("⠹ Responding… 0.3s │ esc to interrupt"), Line::from("❯ "), Line::from("claude-opus-5-5 │ anthropic · api key │ $0.05 │ online")]);
+        rows.extend([Line::from("⠹ Responding… 0.3s │ esc to interrupt"), Line::from("❯ "), Line::from("  anthropic/claude-opus-5-5 | $0.05 | ? help")]);
         let caret = (2, rows.len() as u16 - 2);
         (rows, caret)
     };

@@ -340,7 +340,10 @@ pub(super) fn tui_trust_gate(model: Option<&krowk_harness::protocol::ModelRef>, 
     let backend = model.and_then(|m| registry.get(&m.instance).ok()).is_some_and(|i| i.backend.is_some());
     let asked = trust::root(cwd);
     let vendor = if backend { vendor_of(model, registry) } else { "krowk" };
-    let accepted = (backend || widens) && !store.trusts(&asked) && store.refuses(&asked).is_none() && ask_trust(&store, &asked, vendor);
+    // The card is drawn on stderr: with that not a terminal it would be a
+    // question nobody sees, answered by the next key.
+    let seen = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let accepted = (backend || widens) && seen && !store.trusts(&asked) && store.refuses(&asked).is_none() && ask_trust(&store, &asked, vendor);
     let (s2, a2) = (store.clone(), asked.clone());
     let trusted: permissions::settings::Trusted = Arc::new(move |root: &std::path::Path| s2.trusts(root) || (accepted && root == a2));
     let gate: trust::Gate = Arc::new(move |root: &std::path::Path| {

@@ -154,7 +154,6 @@ async fn session(opts: Options) -> Outcome {
         Some(top) => clear_by_scrolling(&mut stdout, size, top),
         None => size.height - 1,
     };
-    let _ = stdout.write_all(term::TITLE_SAVE);
 
     let sessions_dir = opts.host.sessions_dir.clone();
     let pricer: Pricer = opts.host.pricer.clone();
@@ -190,6 +189,8 @@ async fn session(opts: Options) -> Outcome {
     let mut term = match Term::new(stdout, size, top, initial_height) {
         Ok(mut t) => {
             t.reflows = term::reflows_from(&|k| std::env::var(k).unwrap_or_default());
+            // Saved only once there is a TUI to put it back on the way out.
+            let _ = std::io::stdout().write_all(term::TITLE_SAVE);
             t
         }
         Err(e) => return Outcome { session_id: None, abandoned: false, error: Some(format!("the terminal could not be drawn on: {e}")) },
@@ -210,8 +211,8 @@ async fn session(opts: Options) -> Outcome {
     } else {
         host.shutdown().await;
     }
-    ui.presence.finish();
     let _ = term.finish();
+    ui.presence.finish();
     let mut out = term.into_inner();
     if let Some(id) = &app.session_id {
         let _ = write!(out, "\x1b[2mresume this session with: krowk --resume {id}\x1b[0m\r\n");
@@ -724,7 +725,7 @@ impl<'h> Ui<'h> {
         #[cfg(unix)]
         {
             self.keys = None;
-            self.presence.release();
+            self.presence.pause();
             term.finish()?;
             restore_terminal();
             // SAFETY: raise only sends a signal to this process.

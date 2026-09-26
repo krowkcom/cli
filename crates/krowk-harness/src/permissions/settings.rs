@@ -167,7 +167,7 @@ fn read_object(v: &Value, source: &str, root: &Path, base: &Path, home: Option<&
         // Code, not a string at all) may have meant stricter, so it is read
         // as default, and an earlier file's looser mode does not stand.
         match p.get("defaultMode") {
-            None => {}
+            None | Some(Value::Null) => {}
             Some(Value::String(m)) => match PermissionMode::parse(m) {
                 Some(mode) => f.default_mode = Some(mode),
                 None if m == "auto" => f.unknown_mode = Some((format!("{m:?}"), false)),
@@ -268,14 +268,18 @@ pub fn load(cfg: &Config, cwd: &Path) -> Result<Loaded, String> {
     let config = cfg.user_path.as_ref().map(|p| tilde(&p.display().to_string(), home)).unwrap_or_else(|| "krowk's config.json".into());
     // `auto`'s notices, said only if nothing sets a mode.
     let mut unknown: Vec<String> = Vec::new();
-    let mut said = |mode: Option<PermissionMode>, notice: Option<String>, out: &mut Loaded| match (mode, notice) {
-        (Some(_), Some(n)) => out.notices.push(n),
+    // A mode krowk does not run, read as default, is said only while it is
+    // the mode that runs: a later file's mode takes its notice with it.
+    let mut narrowed: Option<String> = None;
+    let mut said = |mode: Option<PermissionMode>, notice: Option<String>| match (mode, notice) {
+        (Some(_), Some(n)) => narrowed = Some(n),
+        (Some(_), None) => narrowed = None,
         (None, Some(n)) => unknown.push(n),
-        _ => {}
+        (None, None) => {}
     };
     for f in user {
         let (mode, notice) = f.mode(home, &config);
-        said(mode, notice, &mut out);
+        said(mode, notice);
         out.rules.extend(f.rules);
         out.dirs.extend(f.dirs);
         out.default_mode = mode.or(out.default_mode);
@@ -287,7 +291,7 @@ pub fn load(cfg: &Config, cwd: &Path) -> Result<Loaded, String> {
         if trusted {
             // A repository never puts the person in bypassPermissions.
             let (mode, notice) = f.mode(home, &config);
-            said(mode, notice, &mut out);
+            said(mode.filter(|m| *m != PermissionMode::BypassPermissions), notice);
             out.rules.extend(f.rules);
             out.dirs.extend(f.dirs);
             out.default_mode = mode.filter(|m| *m != PermissionMode::BypassPermissions).or(out.default_mode);
@@ -301,6 +305,7 @@ pub fn load(cfg: &Config, cwd: &Path) -> Result<Loaded, String> {
             }
         }
     }
+    out.notices.extend(narrowed);
     if out.default_mode.is_none() {
         out.notices.extend(unknown.pop());
     }

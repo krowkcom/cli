@@ -537,11 +537,33 @@ fn r_perm_1_a_mode_krowk_does_not_run_other_than_auto_narrows_to_default() {
 }
 
 #[test]
+fn r_perm_1_a_narrowing_notice_goes_when_a_later_file_sets_the_mode() {
+    // Claude's own file says dontAsk (default, said); a trusted repository
+    // then sets acceptEdits, which is what runs: nothing is said.
+    let d = repo("dont-ask-then");
+    let claude = d.join("home/.claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::write(claude.join("settings.json"), json!({"permissions": {"defaultMode": "dontAsk"}}).to_string()).unwrap();
+    std::fs::create_dir_all(d.join(".claude")).unwrap();
+    std::fs::write(d.join(".claude/settings.json"), json!({"permissions": {"defaultMode": "acceptEdits"}}).to_string()).unwrap();
+    let cfg = Config { claude_dir: Some(claude.clone()), trusted: Some(Arc::new(|_: &Path| true)), ..Config::default() };
+    let p = Policy::load(&cfg, &d.join("src")).unwrap();
+    assert_eq!(p.loaded.default_mode, Some(PermissionMode::AcceptEdits));
+    assert!(p.loaded.notices.is_empty(), "{:?}", p.loaded.notices);
+    // A null mode is no mode at all.
+    std::fs::write(d.join(".claude/settings.json"), json!({"permissions": {"defaultMode": null}}).to_string()).unwrap();
+    let cfg = Config { user: Some(json!({"permissions": {"defaultMode": "acceptEdits"}})), trusted: Some(Arc::new(|_: &Path| true)), ..Config::default() };
+    let p = Policy::load(&cfg, &d.join("src")).unwrap();
+    assert_eq!((p.loaded.default_mode, p.loaded.notices.len()), (Some(PermissionMode::AcceptEdits), 0));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn r_perm_1_a_default_mode_that_is_not_a_string_is_read_as_default_with_a_notice() {
     let d = repo("mode-not-string");
     let claude = d.join("home/.claude");
     std::fs::create_dir_all(&claude).unwrap();
-    for bad in [json!(2), json!(["acceptEdits"]), json!({"mode": "auto"}), json!(true), json!(null)] {
+    for bad in [json!(2), json!(["acceptEdits"]), json!({"mode": "auto"}), json!(true)] {
         std::fs::write(claude.join("settings.json"), json!({"permissions": {"defaultMode": bad}}).to_string()).unwrap();
         let cfg = Config { user: Some(json!({"permissions": {"defaultMode": "acceptEdits"}})), claude_dir: Some(claude.clone()), ..Config::default() };
         let p = Policy::load(&cfg, &d.join("src")).unwrap();

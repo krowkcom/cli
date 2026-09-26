@@ -40,7 +40,7 @@ fn read_answer() -> bool {
                     let _ = write!(std::io::stderr(), "\r\n");
                     std::process::exit(130);
                 }
-                KeyCode::Char('y' | 'Y') => break true,
+                KeyCode::Char('y' | 'Y') if (k.modifiers - KeyModifiers::SHIFT).is_empty() => break true,
                 _ => break false,
             },
             Ok(Event::Paste(_)) => break false,

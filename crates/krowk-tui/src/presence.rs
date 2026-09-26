@@ -38,17 +38,30 @@ pub struct Presence {
 /// own — each waited for, so none is left a zombie and a later state never
 /// overtakes an earlier one — and never waited on by the TUI.
 struct Reporter {
-    tx: mpsc::Sender<Vec<String>>,
+    tx: mpsc::Sender<Job>,
     done: mpsc::Receiver<()>,
+}
+
+enum Job {
+    Run(Vec<String>),
+    /// Answered once everything before it has run.
+    Flush(mpsc::Sender<()>),
 }
 
 impl Reporter {
     fn start() -> Reporter {
-        let (tx, rx) = mpsc::channel::<Vec<String>>();
+        let (tx, rx) = mpsc::channel::<Job>();
         let (done_tx, done) = mpsc::channel();
         std::thread::spawn(move || {
-            for args in rx {
-                let _ = Command::new("herdr").args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            for job in rx {
+                match job {
+                    Job::Run(args) => {
+                        let _ = Command::new("herdr").args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+                    }
+                    Job::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
             }
             let _ = done_tx.send(());
         });
@@ -56,7 +69,15 @@ impl Reporter {
     }
 
     fn send(&self, args: &[&str]) {
-        let _ = self.tx.send(args.iter().map(|a| a.to_string()).collect());
+        let _ = self.tx.send(Job::Run(args.iter().map(|a| a.to_string()).collect()));
+    }
+
+    /// Waits, at most `limit`, for what is queued to have run.
+    fn flush(&self, limit: Duration) {
+        let (ack, wait) = mpsc::channel();
+        if self.tx.send(Job::Flush(ack)).is_ok() {
+            let _ = wait.recv_timeout(limit);
+        }
     }
 }
 
@@ -79,6 +100,15 @@ impl Presence {
         if let Some(r) = self.herdr.take() {
             drop(r.tx);
             let _ = r.done.recv_timeout(Duration::from_millis(500));
+        }
+    }
+
+    /// Before a job stop, which stops the reporting thread with the rest of
+    /// the process: released, and the release given a moment to arrive.
+    pub fn pause(&mut self) {
+        self.release();
+        if let Some(r) = &self.herdr {
+            r.flush(Duration::from_millis(300));
         }
     }
 

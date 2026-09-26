@@ -382,6 +382,34 @@ impl App {
         self.push_wrapped("", "", text, style, style);
     }
 
+    /// The line a session opens on: `krowk · <model> via <instance> · <dir>`,
+    /// then a blank line.
+    pub fn header(&mut self, cwd: &str) {
+        let mut spans = vec![Span::styled("krowk".to_string(), look::accent().add_modifier(Modifier::BOLD))];
+        if let Some(m) = &self.model {
+            spans.push(Span::styled(format!(" · {} via {}", m.model, m.instance), dim()));
+        }
+        // The directory gives way first, from its start: the end of a path
+        // is the part that says where this is.
+        let used: usize = spans.iter().map(|s| s.content.width()).sum::<usize>() + 3;
+        let room = usize::from(self.width).saturating_sub(used).max(4);
+        let cwd = clean(cwd);
+        let cwd = if cwd.width() > room {
+            let tail: String = cwd.chars().rev().scan(0, |w, c| {
+                *w += c.width().unwrap_or(0);
+                (*w < room).then_some(c)
+            }).collect::<Vec<_>>().into_iter().rev().collect();
+            format!("…{tail}")
+        } else {
+            cwd
+        };
+        spans.push(Span::styled(format!(" · {cwd}"), dim()));
+        self.pending.push(Line::from(spans));
+        self.pending.push(Line::default());
+        self.last_blank = true;
+        self.dirty = true;
+    }
+
     /// A blank line before a new block, unless there is one already.
     fn gap(&mut self) {
         if !self.last_blank {
@@ -416,6 +444,12 @@ impl App {
     pub fn gap_say(&mut self, text: &str) {
         self.gap();
         self.push_wrapped("", "", text, dim(), dim());
+    }
+
+    /// A note from before the session started (a setting read one way
+    /// rather than another): quieter than a notice, one warning glyph.
+    pub fn note(&mut self, text: &str) {
+        self.push_wrapped(look::WARN, "  ", text, yellow(), dim());
     }
 
     pub fn notice(&mut self, text: &str) {
@@ -1081,46 +1115,76 @@ impl App {
             }
             Overlay::Models => rows.extend(self.models_overlay(width)),
         }
-        // The prompt, scrolled to keep the caret in view.
-        let (input, (crow, ccol)) = self.editor.layout(self.width.saturating_sub(2).max(1));
+        // The prompt, in a box, scrolled to keep the caret in view: `→ `
+        // before its first row, the box's sides around every row.
+        let inner = width.saturating_sub(4).max(1);
+        let (input, (crow, ccol)) = self.editor.layout(inner.saturating_sub(2).max(1) as u16);
         let first = (crow as usize + 1).saturating_sub(MAX_INPUT_ROWS);
+        let edge = look::border();
+        let across = "─".repeat(width.saturating_sub(2));
+        rows.push(Line::from(Span::styled(format!("┌{across}┐"), edge)));
         let top = rows.len() as u16;
         for (i, row) in input.iter().enumerate().skip(first).take(MAX_INPUT_ROWS) {
-            let prefix = if i == 0 { Span::styled(look::PROMPT, look::prompt()) } else { Span::raw("  ") };
-            if i == 0 && self.editor.is_empty() {
-                let hint = if self.running() { "type to steer the running turn" } else { "ask anything · ? for keys · ctrl-d to quit" };
-                rows.push(Line::from(vec![prefix, Span::styled(clip(hint, width.saturating_sub(2)), dim())]));
+            let prefix = if i == 0 { Span::styled(look::ARROW, look::prompt()) } else { Span::raw("  ") };
+            let (text, style) = if i == 0 && self.editor.is_empty() {
+                (clip(if self.running() { "Steer the running turn" } else { "Plan, search, build anything" }, inner.saturating_sub(2)), dim())
             } else {
-                rows.push(Line::from(vec![prefix, Span::raw(row.clone())]));
-            }
+                (row.clone(), Style::new())
+            };
+            let pad = inner.saturating_sub(2 + text.width());
+            rows.push(Line::from(vec![Span::styled("│ ", edge), prefix, Span::styled(text, style), Span::raw(" ".repeat(pad)), Span::styled(" │", edge)]));
         }
-        let caret = (ccol + 2, top + (crow as usize - first) as u16);
+        rows.push(Line::from(Span::styled(format!("└{across}┘"), edge)));
+        let caret = (ccol + 4, top + (crow as usize - first) as u16);
         if self.settings.status_bar {
-            let bar = self.status_bar();
-            if !bar.is_empty() {
-                // Offline is the one item not dim: it is news.
-                let clipped = clip(&bar, width);
-                let line = match clipped.find("offline") {
-                    Some(i) if self.offline.is_some() => Line::from(vec![
-                        Span::styled(clipped[..i].to_string(), dim()),
-                        Span::styled("offline".to_string(), yellow()),
-                        Span::styled(clipped[i + "offline".len()..].to_string(), dim()),
-                    ]),
-                    _ => Line::from(Span::styled(clipped, dim())),
-                };
-                rows.push(line);
-            }
+            rows.push(self.hint_row(width));
         }
         (rows, caret)
     }
 
     pub fn status_bar(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
+        self.status_parts().into_iter().map(|(_, p)| p).collect::<Vec<_>>().join(SEP)
+    }
+
+    /// The row under the prompt box: what the session runs on and the keys
+    /// worth knowing on the left, connectivity (unless online) and cost on
+    /// the right.
+    fn hint_row(&self, width: usize) -> Line<'static> {
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for (item, part) in self.status_parts() {
+            match item {
+                StatusItem::Cost => right.push((part, dim())),
+                StatusItem::Connectivity if part == "online" => {}
+                StatusItem::Connectivity if self.offline.is_some() => right.insert(0, (part, yellow())),
+                StatusItem::Connectivity => right.insert(0, (part, dim())),
+                _ => left.push(part),
+            }
+        }
+        // The working line above says how to interrupt; this says the rest.
+        left.push("/ commands · ? keys".to_string());
+        let left = format!("  {}", left.join(" · "));
+        let right_width: usize = right.iter().map(|(p, _)| p.width()).sum::<usize>() + right.len().saturating_sub(1) * 3;
+        // Two spaces at least between the two sides.
+        let room = width.saturating_sub(right_width + 2);
+        let left = clip(&left, room);
+        let mut spans = vec![Span::styled(left.clone(), dim()), Span::raw(" ".repeat(width.saturating_sub(right_width + left.width())))];
+        for (i, (p, st)) in right.into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" · ", dim()));
+            }
+            spans.push(Span::styled(p, st));
+        }
+        Line::from(spans)
+    }
+
+    fn status_parts(&self) -> Vec<(StatusItem, String)> {
+        let mut parts: Vec<(StatusItem, String)> = Vec::new();
         for item in &self.settings.status_items {
+            let mut texts: Vec<String> = Vec::new();
             match item {
                 StatusItem::Model => {
                     if let Some(m) = &self.model {
-                        parts.push(m.model.clone());
+                        texts.push(m.model.clone());
                     }
                 }
                 // Which instance, and whether it runs on a subscription or
@@ -1140,11 +1204,11 @@ impl App {
                         {
                             part.push_str(&format!(" · {w}"));
                         }
-                        parts.push(part);
+                        texts.push(part);
                     }
                 }
-                StatusItem::Cost => parts.push(if self.unpriced && self.cost == 0.0 { "$—".into() } else { format!("${:.2}", self.cost) }),
-                StatusItem::Connectivity => parts.push(
+                StatusItem::Cost => texts.push(if self.unpriced && self.cost == 0.0 { "$—".into() } else { format!("${:.2}", self.cost) }),
+                StatusItem::Connectivity => texts.push(
                     match (&self.offline, self.online_known) {
                         (Some(_), _) => "offline",
                         (None, true) => "online",
@@ -1154,25 +1218,26 @@ impl App {
                 ),
                 StatusItem::Session => {
                     if let Some(id) = &self.session_id {
-                        parts.push(id.chars().take(8).collect());
+                        texts.push(id.chars().take(8).collect());
                     }
                 }
                 // Only while there is something to count.
                 StatusItem::Todos => {
                     if !self.todos.is_empty() {
                         let done = self.todos.iter().filter(|t| t.status == TodoStatus::Completed).count();
-                        parts.push(format!("todos {done}/{}", self.todos.len()));
+                        texts.push(format!("todos {done}/{}", self.todos.len()));
                     }
                 }
                 StatusItem::Subagents => {
                     let running = self.subs.iter().filter(|s| s.status.is_none()).count();
                     if running > 0 {
-                        parts.push(format!("{running} agent{}", if running == 1 { "" } else { "s" }));
+                        texts.push(format!("{running} agent{}", if running == 1 { "" } else { "s" }));
                     }
                 }
             }
+            parts.extend(texts.into_iter().map(|t| (*item, t)));
         }
-        parts.join(SEP)
+        parts
     }
 
     fn keys_overlay(&self, width: usize) -> Vec<Line<'static>> {
@@ -1613,11 +1678,43 @@ mod tests {
         assert_eq!(a.status_bar(), "$0.00");
         a.settings.status_bar = false;
         let (rows, _) = a.view(Instant::now());
-        assert_eq!(rows.len(), 1, "only the prompt: {:?}", text(&rows));
+        assert_eq!(rows.len(), 3, "only the prompt, in its box: {:?}", text(&rows));
         a.overlay = Overlay::Keys;
         let (rows, caret) = a.view(Instant::now());
-        assert_eq!(rows.len(), 6, "the overlay is five rows over the prompt");
-        assert_eq!(caret, (2, 5));
+        assert_eq!(rows.len(), 8, "the overlay is five rows over the prompt box");
+        assert_eq!(caret, (4, 6), "inside the box, after the arrow");
+    }
+
+    #[test]
+    fn the_prompt_is_a_box_and_the_row_under_it_says_what_runs_and_what_it_costs() {
+        let mut a = app();
+        a.width = 90;
+        let (rows, caret) = a.view(Instant::now());
+        let t = text(&rows);
+        assert_eq!(t[0], format!("┌{}┐", "─".repeat(88)));
+        assert!(t[1].starts_with("│ → Plan, search, build anything") && t[1].ends_with(" │") && t[1].chars().count() == 90, "{:?}", t[1]);
+        assert_eq!(t[2], format!("└{}┘", "─".repeat(88)));
+        assert!(t[3].starts_with("  claude-x · anthropic · api key · / commands · ? keys") && t[3].ends_with("connecting… · $0.00"), "{:?}", t[3]);
+        assert_eq!(t[3].chars().count(), 90, "cost at the right edge");
+        assert_eq!(caret, (4, 1));
+        a.online_known = true;
+        let (rows, _) = a.view(Instant::now());
+        let t = text(&rows);
+        assert!(t[3].ends_with("$0.00") && !t[3].contains("online"), "online is not news: {:?}", t[3]);
+        a.width = 40;
+        let (rows, _) = a.view(Instant::now());
+        let t = text(&rows);
+        assert!(t[3].ends_with("  $0.00") && t[3].contains('…') && t[3].chars().count() == 40, "narrow, the left side gives way: {:?}", t[3]);
+    }
+
+    #[test]
+    fn the_session_opens_on_a_header_that_says_what_runs_where() {
+        let mut a = app();
+        a.width = 40;
+        a.header("~/Repositories/a-rather-long-project-name/crates");
+        let t = text(&a.take_pending());
+        assert!(t[0].starts_with("krowk · claude-x via anthropic · …") && t[0].ends_with("crates") && t[0].chars().count() <= 40, "{:?}", t[0]);
+        assert_eq!(t[1], "", "then a blank line");
     }
 
     fn child_log(session: &str, body: LogBody) -> StreamLine {

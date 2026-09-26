@@ -18,6 +18,8 @@ use ratatui::text::{Line, Span};
 use std::time::Duration;
 
 pub const PROMPT: &str = "❯ ";
+/// Before the prompt's first row, inside its box.
+pub const ARROW: &str = "→ ";
 pub const TOOL: &str = "◆ ";
 pub const WARN: &str = "⚠ ";
 pub const STOPPED: &str = "◌ ";
@@ -60,6 +62,11 @@ pub fn path() -> Style {
 
 pub fn code() -> Style {
     Style::new().fg(Color::Cyan)
+}
+
+/// The prompt box's frame.
+pub fn border() -> Style {
+    Style::new().add_modifier(Modifier::DIM)
 }
 
 pub fn prompt() -> Style {

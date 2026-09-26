@@ -476,13 +476,17 @@ fn r_perm_1_a_default_mode_krowk_does_not_run_is_read_as_default_with_a_notice()
     let d = repo("auto-user");
     let claude = d.join("home/.claude");
     claude_settings(&claude, "Read(.env)");
-    // krowk's own config asks for acceptEdits; Claude's file, read after
-    // it, names `auto` — which counts as default, never looser.
-    let cfg = Config { user: Some(json!({"permissions": {"defaultMode": "acceptEdits"}})), claude_dir: Some(claude.clone()), ..Config::default() };
+    // Claude's file names `auto`, which krowk does not run, and nothing
+    // else names a mode: default, and a notice that says how to choose.
+    let cfg = Config { claude_dir: Some(claude.clone()), home: Some(d.join("home")), ..Config::default() };
     let p = Policy::load(&cfg, &d.join("src")).expect("an unknown defaultMode does not refuse the settings");
-    assert_eq!(p.loaded.default_mode, Some(PermissionMode::Default));
-    let file = claude.join("settings.json").display().to_string();
-    assert!(matches!(p.loaded.notices.as_slice(), [n] if n.contains(&file) && n.contains("\"auto\"") && n.contains("runs in default")), "{:?}", p.loaded.notices);
+    assert_eq!(p.loaded.default_mode, None, "runs in default");
+    assert!(matches!(p.loaded.notices.as_slice(), [n] if n.starts_with("~/.claude/settings.json sets defaultMode \"auto\"") && n.contains("asks before edits and commands")), "{:?}", p.loaded.notices);
+    // krowk's own config naming a mode is the mode, and nothing is said.
+    let cfg = Config { user: Some(json!({"permissions": {"defaultMode": "acceptEdits"}})), claude_dir: Some(claude.clone()), ..Config::default() };
+    let p = Policy::load(&cfg, &d.join("src")).unwrap();
+    assert_eq!(p.loaded.default_mode, Some(PermissionMode::AcceptEdits), "a mode krowk does not run sets nothing");
+    assert!(p.loaded.notices.is_empty(), "{:?}", p.loaded.notices);
     let g = gate(&p, PermissionMode::Default);
     assert_eq!(letter(&g.verdict(&read(d.join("src/.env")), None)), 'N', "the file's deny rule still holds");
     assert_eq!(letter(&g.verdict(&bash("npm test"), None)), 'Y', "and its allow rule");
@@ -511,8 +515,10 @@ fn r_perm_1_an_unknown_default_mode_in_a_repository_counts_only_once_trusted() {
     assert!(untrusted.loaded.notices.is_empty() && !untrusted.loaded.widens, "and neither noticed nor a reason to ask for trust");
     let cfg = Config { user, trusted: Some(Arc::new(|_: &Path| true)), ..Config::default() };
     let trusted = Policy::load(&cfg, &d.join("src")).unwrap();
-    assert_eq!(trusted.loaded.default_mode, Some(PermissionMode::Default), "trusted, it narrows to default");
-    assert_eq!(trusted.loaded.notices.len(), 1, "{:?}", trusted.loaded.notices);
+    assert_eq!(trusted.loaded.default_mode, Some(PermissionMode::AcceptEdits), "trusted, it still sets nothing");
+    assert!(trusted.loaded.notices.is_empty(), "the person's own mode stands, so nothing is said: {:?}", trusted.loaded.notices);
+    let alone = Policy::load(&Config { trusted: Some(Arc::new(|_: &Path| true)), ..Config::default() }, &d.join("src")).unwrap();
+    assert_eq!((alone.loaded.default_mode, alone.loaded.notices.len()), (None, 1), "with no other mode it is default, said once");
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -523,9 +529,9 @@ fn r_perm_1_a_default_mode_that_is_not_a_string_is_read_as_default_with_a_notice
     std::fs::create_dir_all(&claude).unwrap();
     for bad in [json!(2), json!(["acceptEdits"]), json!({"mode": "auto"}), json!(true), json!(null)] {
         std::fs::write(claude.join("settings.json"), json!({"permissions": {"defaultMode": bad}}).to_string()).unwrap();
-        let cfg = Config { user: Some(json!({"permissions": {"defaultMode": "acceptEdits"}})), claude_dir: Some(claude.clone()), ..Config::default() };
+        let cfg = Config { claude_dir: Some(claude.clone()), ..Config::default() };
         let p = Policy::load(&cfg, &d.join("src")).unwrap();
-        assert_eq!(p.loaded.default_mode, Some(PermissionMode::Default), "{bad} does not leave the earlier acceptEdits standing");
+        assert_eq!(p.loaded.default_mode, None, "{bad} is read as default");
         let file = claude.join("settings.json").display().to_string();
         assert!(matches!(p.loaded.notices.as_slice(), [n] if n.contains(&file) && n.contains(&bad.to_string())), "{bad}: {:?}", p.loaded.notices);
     }

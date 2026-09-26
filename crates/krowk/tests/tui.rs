@@ -72,7 +72,7 @@ fn r_pkg_1_r_tui_3_bare_krowk_on_a_terminal_opens_the_prompt_with_only_portable_
     let m = mock::serve(mock::readme_script);
     let b = Sandbox::new("opens");
     let mut t = pty::Pty::spawn(b.command(&m.url, &[]), 80, 24);
-    assert!(t.wait_for("ask anything", Duration::from_secs(10)).is_some(), "no prompt: {:?}", t.text());
+    assert!(t.wait_for("anything", Duration::from_secs(10)).is_some(), "no prompt: {:?}", t.text());
     t.write(b"read README.md and summarise it in one line\r");
     // Blank cells are skipped, not written, so only a word is sure to
     // arrive whole.
@@ -105,7 +105,7 @@ fn r_perf_4_a_500_token_a_second_stream_redraws_at_most_60_times_a_second() {
     let m = mock::serve(move |_, _| mock::Reply::paced(body.clone(), Duration::from_millis(2)));
     let b = Sandbox::new("fps");
     let mut t = pty::Pty::spawn(b.command(&m.url, &[]), 100, 30);
-    assert!(t.wait_for("ask anything", Duration::from_secs(10)).is_some());
+    assert!(t.wait_for("anything", Duration::from_secs(10)).is_some());
     let before = t.frames().len();
     t.write(b"stream\r");
     // The turn's end is its token line; a loaded macOS runner has taken
@@ -125,7 +125,13 @@ fn r_perf_2_nothing_is_drawn_while_idle() {
     let m = mock::serve(mock::readme_script);
     let b = Sandbox::new("idle");
     let t = pty::Pty::spawn(b.command(&m.url, &[]), 80, 24);
-    assert!(t.wait_for("online", Duration::from_secs(10)).is_some(), "{:?}", t.text());
+    // Online is not shown; the frame that takes "connecting…" off the row
+    // under the prompt is the last one there is reason to draw.
+    let t0 = Instant::now();
+    while !t.text().rsplit_once("connecting").is_some_and(|(_, after)| after.contains("$0.00")) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "never online: {:?}", t.text());
+        std::thread::sleep(Duration::from_millis(20));
+    }
     std::thread::sleep(Duration::from_millis(300));
     let before = t.output().len();
     std::thread::sleep(Duration::from_secs(2));
@@ -149,7 +155,7 @@ fn r_inst_7_the_tui_offers_the_next_instance_and_y_continues_there() {
     }});
     std::fs::write(config.join("config.json"), instances.to_string()).unwrap();
     let mut t = pty::Pty::spawn(b.command(&limited.url, &["--model", "anthropic/claude-sonnet-4-6"]), 120, 30);
-    assert!(t.wait_for("ask anything", Duration::from_secs(10)).is_some(), "{:?}", t.text());
+    assert!(t.wait_for("anything", Duration::from_secs(10)).is_some(), "{:?}", t.text());
     t.write(b"read README.md and summarise it\r");
     assert!(t.wait_for("[y/N]", Duration::from_secs(20)).is_some(), "no offer: {:?}", t.text());
     assert!(t.text().contains("anthropic:personal?"), "{:?}", t.text());
@@ -194,7 +200,7 @@ fn sigterm_and_sighup_restore_the_terminal_and_record_the_session() {
         let m = mock::serve(mock::readme_script);
         let b = Sandbox::new(&format!("sig{name}"));
         let mut t = pty::Pty::spawn(b.command(&m.url, &[]), 80, 24);
-        assert!(t.wait_for("ask anything", Duration::from_secs(10)).is_some());
+        assert!(t.wait_for("anything", Duration::from_secs(10)).is_some());
         t.write(b"read README.md and summarise it in one line\r");
         assert!(t.wait_for("tokens", Duration::from_secs(10)).is_some(), "{:?}", t.text());
         // SAFETY: a signal to our own child.
@@ -215,7 +221,7 @@ fn a_second_ctrl_c_leaves_at_once_but_still_records_the_session_and_exits_130() 
     let url = silent_provider();
     let b = Sandbox::new("ctrlc2");
     let mut t = pty::Pty::spawn(b.command(&url, &[]), 80, 24);
-    assert!(t.wait_for("ask anything", Duration::from_secs(10)).is_some());
+    assert!(t.wait_for("anything", Duration::from_secs(10)).is_some());
     t.write(b"wait forever\r");
     assert!(t.wait_for("esc to interrupt", Duration::from_secs(10)).is_some(), "{:?}", t.text());
     t.write(b"\x03\x03");
@@ -231,7 +237,7 @@ fn steering_an_interrupted_turn_never_read_goes_back_into_the_prompt_not_sent() 
     let url = silent_provider();
     let b = Sandbox::new("steerback");
     let mut t = pty::Pty::spawn(b.command(&url, &[]), 80, 24);
-    assert!(t.wait_for("ask anything", Duration::from_secs(10)).is_some());
+    assert!(t.wait_for("anything", Duration::from_secs(10)).is_some());
     t.write(b"wait forever\r");
     assert!(t.wait_for("esc to interrupt", Duration::from_secs(10)).is_some(), "{:?}", t.text());
     t.write(b"also this\r");
@@ -382,7 +388,7 @@ fn r_tui_1_a_10k_token_answer_lands_in_tmux_scrollback_exactly_once() {
     let m = streamed(850, Duration::from_micros(100));
     let b = Sandbox::new("scrollback");
     let Some(tm) = Tmux::start("scrollback", 100, 30, &b.root.join("repo"), &b.env(&m.url), &[]) else { return };
-    assert!(tm.wait_for("ask anything", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    assert!(tm.wait_for("Plan, search, build anything", Duration::from_secs(10)).is_some(), "{}", tm.screen());
     tm.keys(&["write it all out", "Enter"]);
     assert!(tm.wait_for("tokens", Duration::from_secs(60)).is_some(), "the answer never finished:\n{}", tm.screen());
     let history = tm.history();
@@ -400,7 +406,7 @@ fn r_tui_3_a_phone_width_terminal_wraps_and_still_keeps_every_line_once() {
     let m = streamed(200, Duration::from_micros(100));
     let b = Sandbox::new("phone");
     let Some(tm) = Tmux::start("phone", 40, 20, &b.root.join("repo"), &b.env(&m.url), &[]) else { return };
-    assert!(tm.wait_for("❯", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    assert!(tm.wait_for("→", Duration::from_secs(10)).is_some(), "{}", tm.screen());
     tm.keys(&["go", "Enter"]);
     assert!(tm.wait_for("tokens", Duration::from_secs(60)).is_some(), "{}", tm.screen());
     let history = tm.history();
@@ -420,7 +426,7 @@ fn r_tui_3_a_widened_terminal_rewraps_the_answer_already_in_scrollback() {
     let m = streamed(20, Duration::from_micros(100));
     let b = Sandbox::new("widen");
     let Some(tm) = Tmux::start("widen", 40, 30, &b.root.join("repo"), &b.env(&m.url), &[]) else { return };
-    assert!(tm.wait_for("❯", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    assert!(tm.wait_for("→", Duration::from_secs(10)).is_some(), "{}", tm.screen());
     tm.keys(&["go", "Enter"]);
     assert!(tm.wait_for("tokens", Duration::from_secs(30)).is_some(), "{}", tm.screen());
     tm.tmux(&["resize-window", "-t", "t", "-x", "100", "-y", "30"]);
@@ -436,7 +442,7 @@ fn r_tui_3_a_resize_mid_stream_never_repeats_a_line_or_leaves_the_live_region_be
     let m = streamed(300, Duration::from_millis(1));
     let b = Sandbox::new("resize");
     let Some(tm) = Tmux::start("resize", 100, 30, &b.root.join("repo"), &b.env(&m.url), &[]) else { return };
-    assert!(tm.wait_for("ask anything", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    assert!(tm.wait_for("Plan, search, build anything", Duration::from_secs(10)).is_some(), "{}", tm.screen());
     tm.keys(&["go", "Enter"]);
     assert!(tm.wait_in_history("line 00020", Duration::from_secs(30)).is_some(), "{}", tm.screen());
     tm.tmux(&["resize-window", "-t", "t", "-x", "70", "-y", "20"]);
@@ -490,18 +496,20 @@ fn narrowing(name: &str, before: &str, steps: &[&str]) {
     tm.tmux(&args);
     std::thread::sleep(Duration::from_millis(800));
     let history = tm.history();
-    for row in ["enter send · alt-enter", "⚠ no network connectivity", "❯ ask anything", "anthropic · api key"] {
+    for row in ["enter send · alt-enter", "⚠ no network connectivity", "→ Plan, search, build anything", "offline · $0.00"] {
         assert_eq!(history.matches(row).count(), 1, "{row:?} is in scrollback twice — the old live region was left behind:\n{history}");
     }
-    assert_eq!(history.matches("krowk dev").count(), 1, "the header is still there, once:\n{history}");
+    assert_eq!(history.matches("krowk · claude-opus-5-5").count(), 1, "the header is still there, once:\n{history}");
     if !before.is_empty() {
-        // What was on the terminal is kept, and moving the region to the
-        // bottom left no gap between it and the conversation.
+        // What was on the terminal is kept: the open scrolls it into
+        // scrollback, the way a clear that keeps scrollback does, and the
+        // header comes after it and the blank screen it left.
         let lines: Vec<&str> = history.lines().collect();
         let last = lines.iter().rposition(|l| l.starts_with("earlier output")).expect("the earlier output is kept");
         let n: usize = lines[last].trim_start_matches("earlier output ").trim().parse().unwrap();
         assert_eq!(lines.iter().filter(|l| l.starts_with("earlier output")).count(), n, "every earlier line, once:\n{history}");
-        assert!(lines[last + 1].starts_with("krowk dev"), "the header follows the earlier output directly:\n{history}");
+        let header = lines.iter().position(|l| l.starts_with("krowk · ")).expect("the header");
+        assert!(header > last && lines[last + 1..header].iter().all(|l| l.trim().is_empty()), "only the cleared screen between the earlier output and the header:\n{history}");
     }
 }
 
@@ -546,13 +554,13 @@ fn ctrl_z_suspends_to_the_shell_and_fg_brings_the_prompt_back() {
     let wait = |needle: &str| (0..250).any(|_| screen().contains(needle) || { std::thread::sleep(Duration::from_millis(40)); false });
     assert!(wait("sh$"), "{}", screen());
     tmux(&["send-keys", "-t", "t", &format!("'{}'", env!("CARGO_BIN_EXE_krowk")), "Enter"]);
-    assert!(wait("ask anything"), "{}", screen());
+    assert!(wait("Plan, search, build anything"), "{}", screen());
     tmux(&["send-keys", "-t", "t", "C-z"]);
     assert!(wait("Stopped"), "Ctrl-Z did not stop krowk:\n{}", screen());
     let stopped = screen();
-    assert!(!stopped.contains("ask anything"), "the live region was cleared before stopping:\n{stopped}");
+    assert!(!stopped.contains("Plan, search, build anything"), "the live region was cleared before stopping:\n{stopped}");
     tmux(&["send-keys", "-t", "t", "fg", "Enter"]);
-    assert!(wait("ask anything"), "fg did not bring the prompt back:\n{}", screen());
+    assert!(wait("Plan, search, build anything"), "fg did not bring the prompt back:\n{}", screen());
     tmux(&["send-keys", "-t", "t", "C-d"]);
     assert!(wait("krowk --resume") || wait("sh$"), "{}", screen());
     tmux(&["kill-server"]);
@@ -633,14 +641,14 @@ fn r_off_1_a_cut_network_shows_the_notice_within_two_seconds_and_nothing_hangs()
     let relay = Relay::new(&m.url);
     let b = Sandbox::new("offline");
     let Some(tm) = Tmux::start("offline", 100, 30, &b.root.join("repo"), &b.env(&relay.url()), &[]) else { return };
-    assert!(tm.wait_for("online", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    assert!(tm.wait_for("anything", Duration::from_secs(10)).is_some() && tm.wait_gone("connecting", Duration::from_secs(10)).is_some(), "{}", tm.screen());
     tm.keys(&["tell me everything", "Enter"]);
     assert!(tm.wait_in_history("line 00003", Duration::from_secs(10)).is_some(), "{}", tm.screen());
 
     relay.cut.store(true, Ordering::SeqCst);
     let shown = tm.wait_for("no network connectivity", Duration::from_secs(5)).unwrap_or_else(|| panic!("no notice:\n{}", tm.screen()));
     assert!(shown <= Duration::from_secs(2), "the notice took {shown:?}");
-    assert!(tm.screen().contains("offline"), "the status bar says so too:\n{}", tm.screen());
+    assert!(tm.screen().contains("offline ·"), "the status bar says so too:\n{}", tm.screen());
 
     // Nothing hangs: Esc stops the stalled turn, and what arrived is kept.
     tm.keys(&["Escape"]);
@@ -651,7 +659,7 @@ fn r_off_1_a_cut_network_shows_the_notice_within_two_seconds_and_nothing_hangs()
     relay.cut.store(false, Ordering::SeqCst);
     let cleared = tm.wait_gone("no network connectivity", Duration::from_secs(15)).unwrap_or_else(|| panic!("the notice never cleared:\n{}", tm.screen()));
     assert!(cleared <= Duration::from_secs(12), "{cleared:?}");
-    assert!(tm.screen().contains("online"), "{}", tm.screen());
+    assert!(tm.wait_gone("offline ·", Duration::from_secs(2)).is_some(), "the row under the prompt says so too:\n{}", tm.screen());
 }
 
 /// A settings file that does not load is named before the trust question

@@ -21,6 +21,8 @@
 //! nothing but a key.
 
 pub mod app;
+pub mod card;
+pub mod presence;
 pub mod editor;
 pub mod look;
 pub mod net;
@@ -143,16 +145,16 @@ async fn session(opts: Options) -> Outcome {
         }
         Err(_) => size.height - 1,
     };
+    // A clean window to open on: what the shell left on screen scrolls up
+    // into scrollback — kept, not erased, the way a clear-screen that
+    // scrolls first keeps it — and the session starts on an empty screen.
+    let top = clear_by_scrolling(&mut stdout, size, top);
 
     let sessions_dir = opts.host.sessions_dir.clone();
     let pricer: Pricer = opts.host.pricer.clone();
     let mut app = App::new(Editor::new(opts.history_file.clone()), size.width, opts.settings.clone(), None, Some(pricer));
     app.log_dir = Some(sessions_dir.display().to_string());
     app.permission_mode = serde_json::to_value(opts.permission_mode).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
-    app.say(&format!("krowk {} · {}", opts.version, opts.host.cwd.display()), app::dim());
-    for n in &opts.notices {
-        app.notice(n);
-    }
     if let Some(id) = &opts.resume {
         match log::read_events(&sessions_dir.join(id).join(log::EVENTS_FILE)) {
             Ok(events) => {
@@ -170,6 +172,13 @@ async fn session(opts: Options) -> Outcome {
     let target = shown.as_ref().and_then(|m| opts.host.registry.get(&m.instance).ok()).and_then(|i| Target::for_url(&i.base_url, &|k| std::env::var(k).unwrap_or_default()));
     app.model = shown;
     app.vendor_instances = opts.host.registry.instances.values().filter(|i| i.backend.is_some()).map(|i| i.name.clone()).collect();
+    app.header(&home_relative(&opts.host.cwd));
+    for n in &opts.notices {
+        app.note(n);
+    }
+    if !opts.notices.is_empty() {
+        app.say("", app::dim());
+    }
 
     let initial_height = app.view(Instant::now().into_std()).0.len() as u16;
     let mut term = match Term::new(stdout, size, top, initial_height) {
@@ -180,7 +189,7 @@ async fn session(opts: Options) -> Outcome {
         Err(e) => return Outcome { session_id: None, abandoned: false, error: Some(format!("the terminal could not be drawn on: {e}")) },
     };
     let host = Host::new(opts.host);
-    let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, effort: opts.effort, budget: opts.budget, target, keys: None, turn: None, rx: None, abandoned: false, last_prompt: String::new() };
+    let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, effort: opts.effort, budget: opts.budget, target, keys: None, turn: None, rx: None, abandoned: false, last_prompt: String::new(), presence: presence::Presence::from_env(&|k| std::env::var(k).unwrap_or_default()) };
     let result = ui.run(&mut app, &mut term).await;
     // A turn still running is let go first: its future holds its backend's
     // lock, and would hold a shutdown waiting on it forever.
@@ -195,6 +204,7 @@ async fn session(opts: Options) -> Outcome {
     } else {
         host.shutdown().await;
     }
+    ui.presence.release();
     let _ = term.finish();
     let mut out = term.into_inner();
     if let Some(id) = &app.session_id {
@@ -220,6 +230,8 @@ struct Ui<'h> {
     /// The last prompt sent: what a yes to a limit's offer sends again on
     /// the instance it moves to (R-INST-7).
     last_prompt: String,
+    /// The window title and herdr's agent state.
+    presence: presence::Presence,
 }
 
 /// SIGTERM and SIGHUP as one stream, registered once. Either asks the TUI
@@ -313,6 +325,33 @@ fn cursor_row() -> Option<u16> {
 fn cursor_row() -> Option<u16> {
     let _ = crossterm::event::poll(Duration::ZERO);
     (0..2).find_map(|_| crossterm::cursor::position().ok()).map(|(_, y)| y)
+}
+
+/// Scrolls the rows above `top` off the screen into scrollback, with line
+/// feeds from the bottom row, and leaves the cursor at the top left of the
+/// now empty screen: the row returned.
+fn clear_by_scrolling(out: &mut impl Write, size: Size, top: u16) -> u16 {
+    if top == 0 {
+        return 0;
+    }
+    let mut b = format!("\x1b[{};1H", size.height).into_bytes();
+    b.extend(std::iter::repeat_n(b'\n', usize::from(top)));
+    b.extend_from_slice(b"\x1b[1;1H");
+    let _ = out.write_all(&b);
+    let _ = out.flush();
+    0
+}
+
+/// `~/…` for a directory under the home directory.
+pub fn home_relative(dir: &std::path::Path) -> String {
+    match std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        Some(home) if !home.as_os_str().is_empty() && dir.starts_with(&home) => match dir.strip_prefix(&home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => dir.display().to_string(),
+        },
+        _ => dir.display().to_string(),
+    }
 }
 
 /// The row of the first `ESC [ row ; col R` in `bytes`, zero-based.
@@ -550,6 +589,16 @@ impl<'h> Ui<'h> {
         rows.drain(..skip);
         caret.1 = caret.1.saturating_sub(skip as u16);
         let lines = app.take_pending();
+        let state = if !app.approvals.is_empty() {
+            presence::State::Blocked
+        } else if app.running() {
+            presence::State::Working
+        } else {
+            presence::State::Idle
+        };
+        if let Some(title) = self.presence.update(state, &self.last_prompt) {
+            term.title(&title)?;
+        }
         term.frame(&lines, &rows, caret)
     }
 
@@ -669,6 +718,7 @@ impl<'h> Ui<'h> {
         #[cfg(unix)]
         {
             self.keys = None;
+            self.presence.release();
             term.finish()?;
             restore_terminal();
             // SAFETY: raise only sends a signal to this process.

@@ -129,14 +129,19 @@ struct File {
 }
 
 impl File {
-    /// The mode this file sets, and the notice when it is read as
-    /// `default` because krowk does not run the one it names.
-    fn mode(&self) -> (Option<PermissionMode>, Option<String>) {
+    /// The mode this file sets, and the notice for a mode krowk does not
+    /// run: that one sets nothing, so another file's mode still counts,
+    /// and the notice is shown only when none does and krowk runs in
+    /// `default` because of it.
+    fn mode(&self, home: Option<&Path>) -> (Option<PermissionMode>, Option<String>) {
         match &self.unknown_mode {
-            Some(m) => (
-                Some(PermissionMode::Default),
-                Some(format!("{}: permissions.defaultMode {m} is not a mode krowk runs, so it runs in default — one of {}, or --permission-mode", self.source, PermissionMode::NAMES.join(", "))),
-            ),
+            Some(m) => {
+                let source = match home.and_then(|h| Path::new(&self.source).strip_prefix(h).ok()) {
+                    Some(rest) => format!("~/{}", rest.display()),
+                    None => self.source.clone(),
+                };
+                (None, Some(format!("{source} sets defaultMode {m}, which krowk doesn't have, so it asks before edits and commands · set permissions.defaultMode in ~/.config/krowk/config.json to choose")))
+            }
             None => (self.default_mode, None),
         }
     }
@@ -255,9 +260,10 @@ pub fn load(cfg: &Config, cwd: &Path) -> Result<Loaded, String> {
         project.retain(|f| f.source != user_file);
     }
     let mut out = Loaded { root: root.clone(), trusted, ..Loaded::default() };
+    let mut unknown: Vec<String> = Vec::new();
     for f in user {
-        let (mode, notice) = f.mode();
-        out.notices.extend(notice);
+        let (mode, notice) = f.mode(home);
+        unknown.extend(notice);
         out.rules.extend(f.rules);
         out.dirs.extend(f.dirs);
         out.default_mode = mode.or(out.default_mode);
@@ -268,8 +274,8 @@ pub fn load(cfg: &Config, cwd: &Path) -> Result<Loaded, String> {
         out.widens |= widens;
         if trusted {
             // A repository never puts the person in bypassPermissions.
-            let (mode, notice) = f.mode();
-            out.notices.extend(notice);
+            let (mode, notice) = f.mode(home);
+            unknown.extend(notice);
             out.rules.extend(f.rules);
             out.dirs.extend(f.dirs);
             out.default_mode = mode.filter(|m| *m != PermissionMode::BypassPermissions).or(out.default_mode);
@@ -282,6 +288,9 @@ pub fn load(cfg: &Config, cwd: &Path) -> Result<Loaded, String> {
                 }
             }
         }
+    }
+    if out.default_mode.is_none() {
+        out.notices.extend(unknown.pop());
     }
     Ok(out)
 }

@@ -179,7 +179,16 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `Stop`, with Claude Code's JSON on stdin; a hook that exits 2 blocks, and
   the model reads its reason.
 
-- **Bare `krowk` on a terminal opens krowk's own agent.** An inline prompt
+- **Bare `krowk` on a terminal opens krowk's own agent.** It opens on a
+  clean window — what was on screen scrolls up into scrollback, kept — with
+  one header line (`krowk · opus via claude · ~/project`), the prompt in a
+  box (`→ Plan, search, build anything`) and one row under it for the
+  model, the keys worth knowing and the cost. A repository it has not
+  trusted yet is asked about as a short card answered with one key. The
+  window title says what it is doing (`✳ krowk` waiting, `◑ <what you
+  asked>` working, `✋` when a call waits for your yes), and inside herdr
+  krowk reports the same to its pane, so herdr lists it as an agent with
+  live status and notifications. An inline prompt
   at the bottom of the terminal, with the conversation going into the
   terminal's normal scrollback as it finishes — no alternate screen, so it
   scrolls, copies and searches like any other output, and works over SSH,
@@ -564,9 +573,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
 - **A Claude Code `defaultMode` krowk does not run no longer refuses every
   prompt.** `"defaultMode": "auto"` in `~/.claude/settings.json` (or any
   mode krowk does not know) used to fail the settings with `bad_settings`,
-  even with `--permission-mode` given. krowk now runs in `default` — never
-  looser — and says so once, naming the file and the value;
-  `--permission-mode` wins without a word. A rule that does not parse
+  even with `--permission-mode` given. Such a mode now sets nothing: a
+  mode in krowk's own config (`permissions.defaultMode` in
+  `~/.config/krowk/config.json`) or `--permission-mode` wins without a
+  word, and with neither krowk runs in `default` and says so in one line. A rule that does not parse
   still refuses the prompt, and the TUI now says so before it asks the
   trust question rather than after saving the answer.
 

@@ -538,23 +538,40 @@ fn offers(ctx: &TurnContext, name: &str) -> bool {
 /// to — the name as the definition spells it — so no spelling of a denied
 /// agent slips past its rule; a name no definition has is refused here,
 /// before hooks or rules see it. `None` for any other tool.
-fn session_tool(ctx: &TurnContext, name: &str, input: &serde_json::Value) -> Option<Result<crate::permissions::Call, String>> {
-    let (tool, subject) = match name {
-        crate::todo::TODO_WRITE => ("TodoWrite", None),
+fn session_tool(ctx: &TurnContext, name: &str, input: &serde_json::Value) -> Option<Result<SessionCall, String>> {
+    let call = |tool: &str, subject: Option<String>| crate::permissions::Call { tool: tool.into(), access: crate::permissions::Access::Session, subject };
+    match name {
+        crate::todo::TODO_WRITE => Some(Ok(SessionCall { call: call("TodoWrite", None), asked: None, hook_input: input.clone() })),
         SUBAGENT => {
-            let asked = input.get("agent").and_then(|a| a.as_str());
+            let asked = input.get("agent").and_then(|a| a.as_str()).map(str::trim).filter(|a| !a.is_empty());
             let resolved = match &ctx.subagents {
                 Some(s) => s.resolve(asked).map(|d| d.map(|d| d.name.clone())),
                 None => Ok(None),
             };
-            match resolved {
-                Ok(agent) => ("Task", Some(agent.unwrap_or_else(|| "general-purpose".into()))),
+            let agent = match resolved {
+                Ok(agent) => agent.unwrap_or_else(|| "general-purpose".into()),
                 Err(why) => return Some(Err(why)),
-            }
+            };
+            // Claude Code's `Task` input, which a hook written for it reads.
+            let s = |k: &str| input.get(k).cloned().unwrap_or(serde_json::Value::Null);
+            let hook_input = json!({"description": s("description"), "prompt": s("prompt"), "subagent_type": agent});
+            // The name as the model asked for it is judged too, when it is
+            // spelled otherwise than the definition it found.
+            let asked = asked.filter(|a| *a != agent).map(|a| call("Task", Some(a.to_string())));
+            Some(Ok(SessionCall { call: call("Task", Some(agent)), asked, hook_input }))
         }
-        _ => return None,
-    };
-    Some(Ok(crate::permissions::Call { tool: tool.into(), access: crate::permissions::Access::Session, subject }))
+        _ => None,
+    }
+}
+
+/// A session tool's call as the evaluator judges it: the call, the agent
+/// name as the model spelled it when that differs, and the input its
+/// hooks read.
+#[derive(Clone)]
+struct SessionCall {
+    call: crate::permissions::Call,
+    asked: Option<crate::permissions::Call>,
+    hook_input: serde_json::Value,
 }
 
 /// One tool call, whole: the skill tool, the session's own tools, or a
@@ -575,8 +592,8 @@ async fn call_tool(ctx: &TurnContext, hooks: &Hooked<'_>, env: &tools::ToolEnv<'
         None => None,
     };
     let (call, claude, tool_input) = if let Some(c) = own.clone() {
-        let claude = c.tool.clone();
-        (c, claude, input.clone())
+        let claude = c.call.tool.clone();
+        (c.call, claude, c.hook_input)
     } else if skill {
         match crate::compat::skills::call(&ctx.compat.skills, input) {
             Ok((call, skill_name)) => (call, "Skill".to_string(), json!({ "skill": skill_name })),
@@ -594,6 +611,13 @@ async fn call_tool(ctx: &TurnContext, hooks: &Hooked<'_>, env: &tools::ToolEnv<'
     }
     if hooks.is_stopped() {
         return (format!("{name} was not run: a hook stopped the turn"), true);
+    }
+    // A deny rule on the name as the model asked for it holds as surely as
+    // one on the definition's own.
+    if let Some(Some(asked)) = own.as_ref().map(|o| &o.asked)
+        && let crate::permissions::Verdict::Deny(why) = ctx.gate.verdict(asked, None)
+    {
+        return (why, true);
     }
     let opens = match ctx.gate.check(&call, name, input, pre.decision, events, &ctx.cancel).await {
         Ok(o) => o,

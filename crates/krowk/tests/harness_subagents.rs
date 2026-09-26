@@ -897,3 +897,66 @@ fn r_sub_1_a_subagent_fires_subagent_stop_not_stop_or_user_prompt_submit_and_hoo
     let last_child = seen.iter().map(|s| &s.body).rfind(|b| is_child(b)).unwrap();
     assert!(last_child.to_string().contains("check your work"), "{last_child}");
 }
+
+#[test]
+fn r_sub_5_a_definition_spelled_in_another_case_never_dodges_a_task_deny() {
+    // The reviewer's case: the person denies `Task(reviewer)`; the
+    // repository defines `Reviewer`, found first; the model asks for it by
+    // either spelling. And the same with the rule spelled in capitals, and
+    // with the person's own `reviewer` shadowed by the repository's.
+    for (rule, asked, user_def) in [
+        ("Task(reviewer)", "Reviewer", false),
+        ("Task(reviewer)", "reviewer", false),
+        ("Task(reviewer)", " REVIEWER ", true),
+        ("Task(REVIEWER)", "Reviewer", false),
+        ("Task(rev*)", "Reviewer", true),
+    ] {
+        let m = mock::serve(names_agent(Box::leak(asked.to_string().into_boxed_str())));
+        let b = Sandbox::new("case-deny", &m.url);
+        std::fs::create_dir_all(b.root.join("repo/.krowk/agents")).unwrap();
+        std::fs::write(b.root.join("repo/.krowk/agents/Reviewer.md"), "---\nname: Reviewer\ndescription: the repository's\n---\n").unwrap();
+        let mut cfg = b.host_with(json!({"permissions": {"deny": [rule]}}), false);
+        if user_def {
+            let dir = b.root.join("home/.config/krowk/agents");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("reviewer.md"), "---\nname: reviewer\ndescription: the person's\n---\n").unwrap();
+            cfg.agents.user_dirs = vec![dir];
+        }
+        let r = run_in_process(&b, cfg, None, "review it", PermissionMode::BypassPermissions);
+        let (out, err) = parent_result(&b, &r.session_id);
+        assert!(err && out.contains("is denied by the rule"), "{rule} / {asked:?}: {out}");
+        assert!(children_of(&b, &r.session_id).is_empty(), "{rule} / {asked:?} started no subagent");
+    }
+    // An agent the rule does not name still runs.
+    let m = mock::serve(names_agent("Reviewer"));
+    let b = Sandbox::new("case-allow", &m.url);
+    std::fs::create_dir_all(b.root.join("repo/.krowk/agents")).unwrap();
+    std::fs::write(b.root.join("repo/.krowk/agents/Reviewer.md"), "---\nname: Reviewer\ndescription: the repository's\n---\n").unwrap();
+    let r = run_in_process(&b, b.host_with(json!({"permissions": {"deny": ["Task(writer)"]}}), false), None, "review it", PermissionMode::BypassPermissions);
+    assert_eq!(children_of(&b, &r.session_id).len(), 1);
+}
+
+#[test]
+fn r_sub_1_task_hooks_read_claude_codes_input_and_can_filter_on_subagent_type() {
+    for (asked, blocked) in [("reviewer", true), ("", false)] {
+        let m = mock::serve(names_agent(asked));
+        let b = Sandbox::new("task-hook-type", &m.url);
+        std::fs::create_dir_all(b.root.join("repo/.krowk/agents")).unwrap();
+        std::fs::write(b.root.join("repo/.krowk/agents/reviewer.md"), "---\nname: reviewer\ndescription: reviews\n---\n").unwrap();
+        let seen = b.root.join("task-input.json");
+        // Blocks only the reviewer, reading tool_input.subagent_type as a
+        // hook written for Claude Code does.
+        let command = format!("input=$(cat); printf '%s' \"$input\" > '{}'; case \"$input\" in *'\"subagent_type\":\"reviewer\"'*) echo 'no reviews today' >&2; exit 2;; esac", seen.display());
+        let hooks = json!({"hooks": {"PreToolUse": [{"matcher": "Task", "hooks": [{"type": "command", "command": command}]}]}});
+        let r = run_in_process(&b, b.host_with(hooks, false), None, "review it", PermissionMode::BypassPermissions);
+        let input: Value = serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+        let want = if blocked { "reviewer" } else { "general-purpose" };
+        assert_eq!(input["tool_input"], json!({"description": "review it", "prompt": "TASK-R", "subagent_type": want}), "Claude Code's Task input");
+        let (out, err) = parent_result(&b, &r.session_id);
+        assert_eq!(err, blocked, "{out}");
+        assert_eq!(children_of(&b, &r.session_id).len(), usize::from(!blocked));
+        if blocked {
+            assert!(out.contains("no reviews today"), "{out}");
+        }
+    }
+}

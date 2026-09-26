@@ -60,7 +60,11 @@ pub struct AgentDef {
 pub const PROJECT_DIRS: [&str; 2] = [".krowk/agents", ".claude/agents"];
 
 /// Every definition for a session in `root` (its repository), then those
-/// in `user_dirs`, first by name winning. A file that does not parse is
+/// in `user_dirs`, first by name winning — names compared regardless of
+/// case, so a repository's `Reviewer` replaces the person's `reviewer`, as
+/// Claude Code's project agents replace its user agents. That is the name
+/// a permission rule judges, matched regardless of case too, so replacing a
+/// definition never dodges a `Task(reviewer)` rule. A file that does not parse is
 /// skipped with the reason, for the caller to say.
 pub fn discover(root: &Path, user_dirs: &[PathBuf]) -> (Vec<AgentDef>, Vec<String>) {
     let mut defs: Vec<AgentDef> = Vec::new();
@@ -92,7 +96,9 @@ pub fn discover(root: &Path, user_dirs: &[PathBuf]) -> (Vec<AgentDef>, Vec<Strin
                 _ => continue,
             };
             match parse(&text, &path) {
-                Ok(d) if !defs.iter().any(|e| e.name == d.name) => defs.push(AgentDef { project, ..d }),
+                // One definition a name, whatever its case — the name is
+                // looked up regardless of case — the first found winning.
+                Ok(d) if !defs.iter().any(|e| e.name.eq_ignore_ascii_case(&d.name)) => defs.push(AgentDef { project, ..d }),
                 Ok(_) => {}
                 Err(why) => problems.push(format!("{}: {why}", path.display())),
             }
@@ -241,6 +247,7 @@ mod tests {
         std::fs::write(repo.join(".claude/agents/broken.md"), "no frontmatter").unwrap();
         std::fs::write(user.join("tester.md"), "---\nname: tester\ndescription: the person's\n---\n").unwrap();
         std::fs::write(user.join("writer.md"), "---\nname: writer\ndescription: writes\n---\n").unwrap();
+        std::fs::write(user.join("Reviewer.md"), "---\nname: Reviewer\ndescription: the person's, in another case\n---\n").unwrap();
         std::fs::write(user.join("notes.txt"), "not a definition").unwrap();
         let (defs, problems) = discover(&repo, &[user, root.join("missing")]);
         let got: Vec<(&str, &str)> = defs.iter().map(|d| (d.name.as_str(), d.description.as_str())).collect();

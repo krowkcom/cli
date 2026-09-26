@@ -356,7 +356,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   and a session grant covers it. `subagent` and `todo_write` need no mode,
   but a deny or ask rule on Claude Code's names for them (`Task`,
   `Task(<agent>)`, `TodoWrite`) refuses or asks, and hooks see them under
-  those names. As in Claude Code, a subagent fires `SubagentStop` when it
+  those names — an agent's name matched regardless of case, and a `Task`
+  hook reading Claude Code's `{description, prompt, subagent_type}`. As in
+  Claude Code, a subagent fires `SubagentStop` when it
   is done — not `Stop` or `UserPromptSubmit` — and its hooks get the
   parent's `session_id`, with the subagent's as `agent_session_id`. Its
   spend counts toward the session's `--max-usd` and `--max-tokens`: a

@@ -256,7 +256,7 @@ impl Subagents {
     /// for a general subagent; a name no definition has is refused.
     pub fn resolve(&self, agent: Option<&str>) -> Result<Option<&AgentDef>, String> {
         let Some(name) = agent.map(str::trim).filter(|a| !a.is_empty()) else { return Ok(None) };
-        match self.0.defs.iter().find(|d| d.name.eq_ignore_ascii_case(name)) {
+        match self.0.defs.iter().find(|d| d.name == name).or_else(|| self.0.defs.iter().find(|d| d.name.eq_ignore_ascii_case(name))) {
             Some(d) => Ok(Some(d)),
             None => {
                 let names: Vec<&str> = self.0.defs.iter().map(|d| d.name.as_str()).collect();

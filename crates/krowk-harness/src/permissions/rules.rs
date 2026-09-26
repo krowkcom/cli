@@ -257,8 +257,13 @@ pub fn matches(r: &Rule, call: &Call, at: &Places<'_>, all: bool) -> bool {
             }
         }
         Access::Mcp { server, tool } => mcp_matches(&r.tool, server, tool),
-        Access::Free | Access::Other | Access::Session => {
+        Access::Free | Access::Other => {
             r.tool == call.tool && r.spec.as_deref().is_none_or(|s| call.subject.as_deref().is_some_and(|subj| wildcard(s, subj)))
+        }
+        // An agent's name is matched regardless of case, as it is looked
+        // up: `Task(reviewer)` holds a definition spelled `Reviewer` too.
+        Access::Session => {
+            r.tool == call.tool && r.spec.as_deref().is_none_or(|s| call.subject.as_deref().is_some_and(|subj| wildcard(&s.to_lowercase(), &subj.to_lowercase())))
         }
     }
 }

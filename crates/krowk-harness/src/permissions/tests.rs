@@ -443,6 +443,9 @@ fn r_sub_1_krowks_session_tools_need_no_mode_but_deny_and_ask_rules_and_a_hooks_
     let bypass = gate(&ask, PermissionMode::BypassPermissions);
     assert_eq!(letter(&bypass.verdict(&task("reviewer"), None)), '?', "an ask rule asks, bypass or not");
     assert_eq!(letter(&bypass.verdict(&task("writer"), None)), 'Y', "another agent is not that rule's");
+    assert_eq!(letter(&bypass.verdict(&task("Reviewer"), None)), '?', "an agent's name is matched regardless of case");
+    let deny = gate(&policy(&cwd, &[(Kind::Deny, "Task(REV*)")]), PermissionMode::BypassPermissions);
+    assert_eq!(letter(&deny.verdict(&task("reviewer"), None)), 'N', "the rule's case too, wildcards included");
     assert_eq!(letter(&bypass.verdict(&todo, None)), 'N');
     match bypass.verdict(&task("reviewer"), None) {
         Verdict::Ask { remember, .. } => assert_eq!(remember, ["Task(reviewer)"]),

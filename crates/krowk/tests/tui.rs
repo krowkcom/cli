@@ -442,7 +442,9 @@ fn r_tui_3_a_resize_mid_stream_never_repeats_a_line_or_leaves_the_live_region_be
     tm.tmux(&["resize-window", "-t", "t", "-x", "70", "-y", "20"]);
     assert!(tm.wait_for("tokens", Duration::from_secs(60)).is_some(), "{}", tm.screen());
     tm.tmux(&["resize-window", "-t", "t", "-x", "120", "-y", "40"]);
-    let history = tm.wait_still(|s| s.matches("api key").count() == 1, Duration::from_secs(10)).unwrap_or_else(|| panic!("never redrawn after the resize:\n{}", tm.screen()));
+    // Redrawn at 120x40: the status bar on the last of forty rows.
+    let redrawn = |s: &str| s.lines().count() == 40 && s.lines().last().is_some_and(|l| l.contains("api key")) && s.matches("api key").count() == 1;
+    let history = tm.wait_still(redrawn, Duration::from_secs(10)).unwrap_or_else(|| panic!("never redrawn after the resize:\n{}", tm.screen()));
     // A frame already on its way when the terminal changes size is read at
     // the new size; it moves from the caret, so it still lands where it was
     // meant to (crates/krowk-tui/tests/resize.rs makes that race happen

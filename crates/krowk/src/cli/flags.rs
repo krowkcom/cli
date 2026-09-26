@@ -44,6 +44,45 @@ pub struct Flags {
     pub thinking: bool,
     pub max_usd: String,
     pub max_tokens: String,
+    /// `-p`: run one prompt headless.
+    #[cfg(feature = "harness")]
+    pub print: bool,
+    #[cfg(feature = "harness")]
+    pub output_format: String,
+    #[cfg(feature = "harness")]
+    pub model: String,
+    #[cfg(feature = "harness")]
+    pub resume: String,
+    /// `--resume` with no value: pick the session from a list.
+    #[cfg(feature = "harness")]
+    pub resume_pick: bool,
+    #[cfg(feature = "harness")]
+    pub permission_mode: String,
+    #[cfg(feature = "harness")]
+    pub toolset: String,
+    #[cfg(feature = "harness")]
+    pub effort: String,
+    /// `-p`: run a backend in a repository nobody has trusted yet.
+    #[cfg(feature = "harness")]
+    pub trust: bool,
+    /// `providers add`: the instance's name, its key's variable, its base
+    /// URL, and how SuperGrok signs in.
+    #[cfg(feature = "harness")]
+    pub name: String,
+    #[cfg(feature = "harness")]
+    pub api_key_env: String,
+    #[cfg(feature = "harness")]
+    pub base_url: String,
+    #[cfg(feature = "harness")]
+    pub client_id: String,
+    #[cfg(feature = "harness")]
+    pub device: bool,
+    /// `providers add claude|codex`: the binary, and the config directory
+    /// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`).
+    #[cfg(feature = "harness")]
+    pub binary: String,
+    #[cfg(feature = "harness")]
+    pub config_dir: String,
     /// Which flags were typed, by canonical name — a different question from
     /// what they carry: `--jq "$UNSET"` was given and is empty.
     pub given: BTreeSet<String>,
@@ -89,6 +128,15 @@ pub fn parse(args: &[String]) -> (Flags, Vec<String>, Result<(), String>) {
                 i += 1;
                 args[i - 1].clone()
             } else {
+                // Last on the line with no value: `krowk --resume`, which
+                // picks the session. Only the TUI takes it; `cli::run`
+                // refuses it everywhere else the way it always was.
+                #[cfg(feature = "harness")]
+                if spec.name == "resume" {
+                    f.resume_pick = true;
+                    f.given.insert(spec.name.to_string());
+                    continue;
+                }
                 return Err(format!("flag needs an argument: -{name}"));
             };
             f.set(spec, &value)?;
@@ -172,6 +220,30 @@ impl Flags {
             "worktree" => text(&mut self.worktree),
             "max-usd" => text(&mut self.max_usd),
             "max-tokens" => text(&mut self.max_tokens),
+            #[cfg(feature = "harness")]
+            "output-format" => text(&mut self.output_format),
+            #[cfg(feature = "harness")]
+            "model" => text(&mut self.model),
+            #[cfg(feature = "harness")]
+            "resume" => text(&mut self.resume),
+            #[cfg(feature = "harness")]
+            "permission-mode" => text(&mut self.permission_mode),
+            #[cfg(feature = "harness")]
+            "toolset" => text(&mut self.toolset),
+            #[cfg(feature = "harness")]
+            "effort" => text(&mut self.effort),
+            #[cfg(feature = "harness")]
+            "name" => text(&mut self.name),
+            #[cfg(feature = "harness")]
+            "api-key-env" => text(&mut self.api_key_env),
+            #[cfg(feature = "harness")]
+            "base-url" => text(&mut self.base_url),
+            #[cfg(feature = "harness")]
+            "client-id" => text(&mut self.client_id),
+            #[cfg(feature = "harness")]
+            "binary" => text(&mut self.binary),
+            #[cfg(feature = "harness")]
+            "config-dir" => text(&mut self.config_dir),
             _ => {
                 let b = parse_bool(name, v)?;
                 *match name {
@@ -188,6 +260,12 @@ impl Flags {
                     "no-network" => &mut self.no_network,
                     "all" => &mut self.all,
                     "thinking" => &mut self.thinking,
+                    #[cfg(feature = "harness")]
+                    "print" => &mut self.print,
+                    #[cfg(feature = "harness")]
+                    "device" => &mut self.device,
+                    #[cfg(feature = "harness")]
+                    "trust" => &mut self.trust,
                     other => unreachable!("catalog flag {other} has no field"),
                 } = b;
             }

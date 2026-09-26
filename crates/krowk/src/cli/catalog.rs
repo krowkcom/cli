@@ -160,7 +160,8 @@ fn global_flag() -> Flag {
 
 pub fn catalog(version: &str) -> Catalog {
     let file = Arg { repeated: true, ..arg("file", "Path to upload", true) };
-    Catalog {
+    #[allow(unused_mut)]
+    let mut c = Catalog {
         name: "krowk",
         version: version.into(),
         summary: "permalinks for agent output",
@@ -349,11 +350,14 @@ pub fn catalog(version: &str) -> Catalog {
             EnvVar { name: "KROWK_AGENT", usage: "Agent name to report", default: "" },
             EnvVar { name: "KROWK_NO_UPDATE_CHECK", usage: "1/true/yes/on — never check for or mention new releases", default: "" },
         ],
-    }
+    };
+    #[cfg(feature = "harness")]
+    c.commands.push(providers_command());
+    c
 }
 
 pub fn global_flags() -> Vec<Flag> {
-    vec![
+    let flags = vec![
         flag("workspace", STRING, "Use this workspace's stored key for this one command — outranks KROWK_WORKSPACE and every config file"),
         flag("dev", BOOL, format!("Talk to a local registry at {}", krowk_api::DEV_BASE_URL)),
         flag("format", STRING, "human | json | markdown | url (default: human on a TTY, json when piped)"),
@@ -366,6 +370,92 @@ pub fn global_flags() -> Vec<Flag> {
         ),
         Flag { aliases: vec!["h"], ..flag("help", BOOL, "Show the help") },
         Flag { aliases: vec!["v"], ..flag("version", BOOL, "Print the version") },
+    ];
+    #[cfg(feature = "harness")]
+    let flags = [flags, prompt_flags()].concat();
+    flags
+}
+
+/// `krowk providers`: the native engine's instances — API-key profiles,
+/// compatible servers, and the SuperGrok login. The harness build's only.
+#[cfg(feature = "harness")]
+fn providers_command() -> Command {
+    const PROVIDER_ARG: &str = "anthropic, openai, xai, openrouter, openai-compatible, supergrok (xAI with a SuperGrok or X Premium subscription), claude (runs Claude Code, signed in with its own login), or codex (runs Codex, signed in with its own login)";
+    Command {
+        subcommands: vec![
+            Command {
+                args: vec![arg("provider", PROVIDER_ARG, true)],
+                flags: vec![
+                    flag("name", STRING, "Name the instance <provider>:<name> (for openai-compatible, <name> alone); the provider's own name when absent"),
+                    flag("api-key-env", STRING, "The environment variable holding the key — krowk stores its name, never the key. Default: the conventional one, or <PROVIDER>_<NAME>_API_KEY for a named instance. For claude and codex, only when given: the key a router (with --base-url) or a Console account runs on, handed to the backend"),
+                    flag("base-url", STRING, "Where the API is, for a gateway, a router or a local server — required for openai-compatible"),
+                    flag("client-id", STRING, "supergrok: the OAuth client id to sign in as, when xAI's server offers no registration"),
+                    flag("device", BOOL, "supergrok, codex: sign in with a code typed into any browser, instead of one opened here"),
+                    flag("no-browser", BOOL, "supergrok: print the sign-in link instead of opening a browser"),
+                    flag("binary", STRING, "claude, codex: the binary to run; claude or codex on PATH when absent"),
+                    flag("config-dir", STRING, "claude, codex: the CLAUDE_CONFIG_DIR or CODEX_HOME this instance signs in and keeps its sessions in; a new one under krowk's data directory for a named instance"),
+                ],
+                ..cmd(
+                    "add",
+                    "krowk providers add <provider> [--name N] [--api-key-env VAR] [--base-url URL] [--device] [--binary PATH] [--config-dir DIR]",
+                    "Add an instance, sign in to SuperGrok, or add a Claude Code or Codex account (signed in with `claude auth login` or `codex login`)",
+                )
+            },
+            cmd("list", "krowk providers list", "List every instance, and whether it has its key or login — a Claude Code or Codex one as `claude auth status` or `codex login status` reports it"),
+            Command {
+                args: vec![arg("instance", "The instance to remove, e.g. openai:work", true)],
+                ..cmd("remove", "krowk providers remove <instance>", "Remove an instance's definition, and forget its login")
+            },
+        ],
+        ..cmd("providers", "", "The provider instances: API keys, logins, and Claude Code and Codex accounts")
+    }
+}
+
+/// `krowk -p "…"`: the harness build's headless agent. Flags rather than a
+/// command, because that is how every agent CLI spells it.
+#[cfg(feature = "harness")]
+fn prompt_flags() -> Vec<Flag> {
+    vec![
+        Flag {
+            aliases: vec!["p"],
+            ..flag("print", BOOL, "Run the prompt given as the arguments (or on stdin) headless: krowk's own agent answers it, then exits")
+        },
+        with_default(flag("output-format", STRING, "With -p: text (the answer), json (the result event) or stream-json (every event, one per line)"), "text"),
+        flag("model", STRING, "With -p: the model, as <instance>/<model> or a model id on the anthropic instance, e.g. claude-opus-5-5, claude:work/sonnet to run Claude Code, or codex:team/gpt-5.5 to run Codex; with --resume, the session moves there"),
+        flag("resume", STRING, "With -p: continue this krowk session — the sessionId a result names, or its krowk.db id"),
+        with_default(
+            flag(
+                "permission-mode",
+                STRING,
+                "With -p and the agent: default, acceptEdits, plan or bypassPermissions, as in Claude Code. Without it, the settings' permissions.defaultMode; a deny rule holds in every mode",
+            ),
+            "default",
+        ),
+        flag(
+            "toolset",
+            STRING,
+            "With -p: the tools' preset — claude (str_replace), gpt (apply_patch) or grok (search_replace). The model's family picks one when absent",
+        ),
+        flag(
+            "effort",
+            STRING,
+            "With -p: how hard the model thinks — none, minimal, low, medium, high, xhigh or max, mapped onto the nearest the model takes. The instance's, else the provider's default, when absent",
+        ),
+        flag(
+            "max-usd",
+            STRING,
+            "With -p, and in the TUI: stop the session before the model call that would take it, with its subagents, past this many dollars — metered, priced from models.dev. Exits 4, like `krowk sessions budget`",
+        ),
+        flag(
+            "max-tokens",
+            STRING,
+            "With -p, and in the TUI: stop the session before the model call that would take its generated tokens (output and reasoning, subagents included) past this many. Exits 4",
+        ),
+        flag(
+            "trust",
+            BOOL,
+            "With -p: let a backend (Claude Code, Codex) run in a repository not yet trusted — it runs the repository's hooks and MCP servers without asking. Without it, -p refuses unless a person at the terminal says yes",
+        ),
     ]
 }
 
@@ -429,6 +519,9 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
     ("RUNS", &["runs start", "runs finish", "runs show", "runs list"]),
     ("UPLOADS", &["uploads list", "uploads show", "uploads attach", "uploads delete", "claim"]),
     ("SESSIONS", &["sessions", "sessions show", "sessions budget", "sessions import", "sessions rebuild", "sessions sync"]),
+    // The harness build's own commands.
+    #[cfg(feature = "harness")]
+    ("AGENT", &["providers add", "providers list", "providers remove"]),
     (
         "ACCOUNT & SYSTEM",
         &[

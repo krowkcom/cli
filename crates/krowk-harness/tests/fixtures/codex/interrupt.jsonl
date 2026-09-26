@@ -1,0 +1,9 @@
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg-long","text":""},"threadId":"{{THREAD}}","turnId":"{{TURN}}","startedAtMs":1}}
+{"method":"item/agentMessage/delta","params":{"itemId":"msg-long","delta":"1\n2\n3\n","threadId":"{{THREAD}}","turnId":"{{TURN}}"}}
+@await-interrupt
+{"method":"turn/completed","params":{"threadId":"{{THREAD}}","turn":{"id":"{{TURN}}","items":[],"status":"interrupted","error":null}}}
+---
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg-after","text":""},"threadId":"{{THREAD}}","turnId":"{{TURN}}","startedAtMs":2}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-after","text":"Picking up where we left off."},"threadId":"{{THREAD}}","turnId":"{{TURN}}","completedAtMs":3}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"{{THREAD}}","turnId":"{{TURN}}","tokenUsage":{"last":{"inputTokens":50,"cachedInputTokens":0,"outputTokens":6,"reasoningOutputTokens":0,"totalTokens":56},"total":{"inputTokens":50,"cachedInputTokens":0,"outputTokens":6,"reasoningOutputTokens":0,"totalTokens":56}}}}
+{"method":"turn/completed","params":{"threadId":"{{THREAD}}","turn":{"id":"{{TURN}}","items":[],"status":"completed","error":null}}}

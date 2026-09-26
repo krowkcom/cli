@@ -10,8 +10,14 @@ pub mod flags;
 pub mod help;
 #[cfg(feature = "sessions")]
 mod budget;
+#[cfg(feature = "harness")]
+mod prompt;
+#[cfg(feature = "harness")]
+mod providers;
 #[cfg(feature = "sessions")]
 mod sessions;
+#[cfg(feature = "harness")]
+mod tui;
 mod upgrade;
 mod workspace;
 
@@ -36,6 +42,8 @@ pub struct Io<'a> {
     pub tty: bool,
     /// Whether stderr is: a string --jq prints raw there could repaint it.
     pub err_tty: bool,
+    /// Whether stdin is: with stdout, whether bare `krowk` opens the TUI.
+    pub stdin_tty: bool,
 }
 
 /// One command's context once the command line has been read.
@@ -90,6 +98,13 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         Err(e) => return report(io, &e, Format::Json, f.quiet, false, None),
     };
     let colour = io.tty;
+    // A bare `--resume` opens the session picker in the TUI; anywhere else
+    // it is the missing value it always was.
+    #[cfg(feature = "harness")]
+    let parsed = parsed.and_then(|()| match f.resume_pick && !tui::wanted(io, &f, format, &positionals, jq_given) {
+        true => Err("flag needs an argument: -resume".to_string()),
+        false => Ok(()),
+    });
     if let Err(why) = parsed {
         return report(io, &fail("bad_flag", format!("{why} — run `krowk --help`")), format, f.quiet, colour, None);
     }
@@ -123,6 +138,32 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     if f.version {
         let _ = writeln!(io.stdout, "{VERSION}");
         return exit::OK;
+    }
+    // `-p` is a mode rather than a command: its arguments are the prompt.
+    #[cfg(feature = "harness")]
+    if f.print && !f.help {
+        let mut ctx = Ctx { io, f, format, colour, filter };
+        return match prompt::run(&mut ctx, &positionals) {
+            Ok(()) => exit::OK,
+            Err(e) => {
+                let quiet = ctx.f.quiet;
+                report(ctx.io, &e, format, quiet, colour, None)
+            }
+        };
+    }
+    // Bare `krowk` with a person at the terminal: the agent (R-PKG-1).
+    // Without one — a pipe, a file, CI capturing output — everything below
+    // runs exactly as it did before the TUI existed.
+    #[cfg(feature = "harness")]
+    if tui::wanted(io, &f, format, &positionals, jq_given) {
+        let mut ctx = Ctx { io, f, format, colour, filter };
+        return match tui::run(&mut ctx) {
+            Ok(()) => exit::OK,
+            Err(e) => {
+                let quiet = ctx.f.quiet;
+                report(ctx.io, &e, format, quiet, colour, None)
+            }
+        };
     }
     if positionals.is_empty() && !f.help && format != Format::Json {
         let _ = write!(io.stdout, "{}", help::greeting(VERSION));
@@ -192,6 +233,12 @@ fn dispatch(ctx: &mut Ctx, p: &[String]) -> Result<(), Error> {
         ["sessions", "sync", ..] => sessions::sync(ctx),
         #[cfg(feature = "sessions")]
         ["pricing", "refresh", ..] => sessions::pricing_refresh(ctx),
+        #[cfg(feature = "harness")]
+        ["providers", "add", ..] => providers::add(ctx, rest(2)),
+        #[cfg(feature = "harness")]
+        ["providers"] | ["providers", "list", ..] => providers::list(ctx),
+        #[cfg(feature = "harness")]
+        ["providers", "remove", ..] => providers::remove(ctx, rest(2)),
         _ if catalog::catalog(VERSION).leaves().iter().any(|l| p.starts_with(&l.name.split(' ').map(String::from).collect::<Vec<_>>())) => Err(fail(
             "not_in_build",
             format!(
@@ -291,6 +338,29 @@ fn reject_misplaced_sessions_flags(f: &Flags, p: &[String]) -> Result<(), Error>
         ("yes", "`krowk sessions rebuild`", rebuild),
         ("no-network", "`krowk sessions sync`", sync),
     ];
+    #[cfg(feature = "harness")]
+    {
+        for name in ["output-format", "model", "resume", "permission-mode", "toolset", "effort", "trust"] {
+            if f.given.contains(name) && !f.print {
+                return Err(fail("bad_flag", format!("`--{name}` is only a flag of `krowk -p`")));
+            }
+        }
+        // A budget holds a -p session (and the TUI's, which takes no words)
+        // or is the one `sessions budget` checks; anywhere else it would
+        // hold nothing.
+        let budget = words.starts_with(&["sessions", "budget"]);
+        for name in ["max-usd", "max-tokens"] {
+            if f.given.contains(name) && !f.print && !budget {
+                return Err(fail("bad_flag", format!("`--{name}` is only a flag of `krowk -p`, the TUI and `krowk sessions budget`")));
+            }
+        }
+        let add = words.starts_with(&["providers", "add"]);
+        for name in ["name", "api-key-env", "base-url", "client-id", "device", "binary", "config-dir"] {
+            if f.given.contains(name) && !add {
+                return Err(fail("bad_flag", format!("`--{name}` is only a flag of `krowk providers add`")));
+            }
+        }
+    }
     for (name, owner, allowed) in owners {
         if f.given.contains(name) && !allowed {
             return Err(fail("bad_flag", format!("`--{name}` is only a flag of {owner}")));

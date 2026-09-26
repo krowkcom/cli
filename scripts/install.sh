@@ -7,6 +7,20 @@
 # archive: an agent container that wants krowk usually wants krowk-mcp too, and
 # one download is one thing to get wrong.
 #
+# Which krowk comes down depends on who is installing it (R-PKG-3). A person
+# gets the full build: krowk's own agent (bare `krowk` opens it), its session
+# store, everything. CI and containers get the lean build, the one agent
+# containers run: a few megabytes, no SQLite, nothing to fail on. CI is read
+# from the variables CI systems set (CI, GITHUB_ACTIONS, GITLAB_CI, …) and a
+# container from the markers container runtimes leave (/.dockerenv,
+# /run/.containerenv, $container, a Kubernetes service host), or from there
+# being no controlling terminal at all — a Dockerfile RUN, a provisioning
+# script. `--lean` or
+# KROWK_LEAN=1 asks for the lean build anywhere; `--full` or KROWK_LEAN=0 for
+# the full one:
+#
+#   curl -fsSL https://krowk.com/install | bash -s -- --lean
+#
 # There is no wizard at the end and nothing to log into. A keyless push works the
 # moment the binary lands, so the last thing this script does is say what to run,
 # not ask a question nobody is there to answer — the common caller is `curl |
@@ -18,6 +32,8 @@
 #                     ~/.local/bin everywhere else)
 #   KROWK_VERSION     A version to install, e.g. 0.1.0 (default: the latest release)
 #   KROWK_SKIP_SKILL  1 to leave the agent skill alone
+#   KROWK_LEAN        1 for the lean build, 0 for the full one (default: lean in
+#                     CI and containers, full everywhere else)
 #
 #   KROWK_INSTALL_BASE_URL
 #                     Test-only. A directory holding the archives, checksums.txt
@@ -25,6 +41,13 @@
 #                     scripts/install_test.sh can run this file end to end
 #                     against a local server; it is not a supported knob, and it
 #                     requires KROWK_VERSION since there is no release to ask.
+#   KROWK_INSTALL_FS_ROOT
+#                     Test-only. Where the container markers are looked for,
+#                     instead of /, so the detection can be tested on a machine
+#                     that is, or is not, a container.
+#   KROWK_INSTALL_TTY Test-only. The terminal device opened to tell whether a
+#                     person is there (default /dev/tty), so a test run with no
+#                     terminal can stand in for one that has one.
 
 set -euo pipefail
 
@@ -34,6 +57,14 @@ REPO="${KROWK_REPO:-krowkcom/krowk}"
 BIN_DIR="${KROWK_BIN_DIR:-}"
 VERSION="${KROWK_VERSION:-}"
 BASE_URL_OVERRIDE="${KROWK_INSTALL_BASE_URL:-}"
+FS_ROOT="${KROWK_INSTALL_FS_ROOT:-}"
+TTY_DEVICE="${KROWK_INSTALL_TTY:-/dev/tty}"
+# full or lean, and why; main settles both from the arguments, KROWK_LEAN and
+# what this machine is, before anything is downloaded.
+BUILD=""
+BUILD_REASON=""
+# yes once the installed krowk is found to carry the agent (`krowk -p`).
+HAS_AGENT=""
 CURL_SCHANNEL_FALLBACK_FLAG=""
 # Both of these are files rather than variables, and main fills them in. See
 # curl_run for why.
@@ -115,20 +146,20 @@ detect_platform() {
     darwin) os="darwin" ;;
     linux) os="linux" ;;
     mingw*|msys*|cygwin*) os="windows" ;;
-    *) error "krowk has no build for $os. Linux, macOS and Windows are what the release carries; from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk" ;;
+    *) error "krowk has no build for $os. Linux, macOS and Windows are what the release carries; from source: cargo install --locked --git https://github.com/${REPO} --features harness krowk" ;;
   esac
 
   arch=$(uname -m)
   case "$arch" in
     x86_64|amd64) arch="amd64" ;;
     aarch64|arm64) arch="arm64" ;;
-    *) error "krowk has no build for $arch. amd64 and arm64 are what the release carries; from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk" ;;
+    *) error "krowk has no build for $arch. amd64 and arm64 are what the release carries; from source: cargo install --locked --git https://github.com/${REPO} --features harness krowk" ;;
   esac
 
   # Windows ARM is deliberately not built. Say so, rather than offering a
   # download that was never uploaded.
   if [[ "$os" == "windows" && "$arch" == "arm64" ]]; then
-    error "No Windows ARM build is published. Install inside WSL2, or build from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk"
+    error "No Windows ARM build is published. Install inside WSL2, or build from source: cargo install --locked --git https://github.com/${REPO} --features harness krowk"
   fi
 
   echo "${os}_${arch}"
@@ -235,7 +266,7 @@ latest_version() {
 
   local why
   why=$(curl_reason)
-  error "Could not find the latest release of ${REPO}. ${why:+curl said: ${why}. }Name one with KROWK_VERSION, or install from source: cargo install --locked --git https://github.com/${REPO} --features sessions krowk"
+  error "Could not find the latest release of ${REPO}. ${why:+curl said: ${why}. }Name one with KROWK_VERSION, or install from source: cargo install --locked --git https://github.com/${REPO} --features harness krowk"
 }
 
 release_base_url() {
@@ -251,18 +282,13 @@ release_base_url() {
 # archive, or names a different digest all end the install — there is no path
 # through this function that installs an unverified binary.
 verify_checksum() {
-  local base_url="$1" tmp_dir="$2" archive="$3"
-  local expected actual why
+  local tmp_dir="$1" archive="$2"
+  local expected actual
 
   step "Verifying the download"
 
-  if ! curl_run -fsSL "${base_url}/checksums.txt" -o "${tmp_dir}/checksums.txt"; then
-    why=$(curl_reason)
-    error "checksums.txt would not download from ${base_url}${why:+ (${why})}. Nothing is installed: an archive nobody can check is not one to run."
-  fi
-
   # scripts/dist.sh writes `<digest>  <name>`; a binary-mode digest writes `*<name>`.
-  expected=$(awk -v f="$archive" '$2 == f || $2 == ("*" f) {print $1; exit}' "${tmp_dir}/checksums.txt")
+  expected=$(checksum_for "$tmp_dir" "$archive")
   if [[ -z "$expected" ]]; then
     error "checksums.txt does not mention ${archive}, so there is nothing to check it against. Report this at https://github.com/${REPO}/issues"
   fi
@@ -275,27 +301,156 @@ verify_checksum() {
   info "Checksum matches"
 }
 
+# fetch_checksums downloads the release's checksums.txt into tmp_dir, before
+# any archive: it is also the release's list of what it carries, which is how
+# a release from before the lean build is told apart.
+fetch_checksums() {
+  local base_url="$1" tmp_dir="$2" why
+  if ! curl_run -fsSL "${base_url}/checksums.txt" -o "${tmp_dir}/checksums.txt"; then
+    why=$(curl_reason)
+    error "checksums.txt would not download from ${base_url}${why:+ (${why})}. Nothing is installed: an archive nobody can check is not one to run."
+  fi
+}
+
+checksum_for() {
+  awk -v f="$2" '$2 == f || $2 == ("*" f) {print $1; exit}' "$1/checksums.txt"
+}
+
+# truthy says whether a CI variable is set to something that means yes: CI
+# systems set CI=true or CI=1, and nobody sets CI=false to mean "this is CI".
+truthy() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    "" | 0 | false | no | off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# ci_name names the CI system this runs under, or prints nothing.
+ci_name() {
+  local var
+  for var in GITHUB_ACTIONS GITLAB_CI BUILDKITE CIRCLECI TRAVIS JENKINS_URL TF_BUILD TEAMCITY_VERSION CODEBUILD_BUILD_ID BITBUCKET_BUILD_NUMBER DRONE; do
+    if [[ -n "${!var:-}" ]]; then
+      echo "$var"
+      return
+    fi
+  done
+  if truthy "${CI:-}"; then
+    echo "CI=${CI}"
+  fi
+}
+
+# container_name names the container marker this machine carries, or prints
+# nothing. Only markers a runtime leaves on purpose: guessing from cgroup paths
+# misreads a systemd desktop as a container.
+container_name() {
+  # BuildKit, which runs every `docker build` now, leaves no /.dockerenv
+  # during a RUN step, so a Dockerfile `RUN curl … | bash` is found here: no
+  # controlling terminal means no person, and a script or an image build
+  # wants the lean build. Toolbox and distrobox are containers too, and say
+  # so; their users pass --full.
+  if ! { : <"$TTY_DEVICE"; } 2>/dev/null; then
+    echo "no terminal"
+  elif [[ -e "${FS_ROOT}/.dockerenv" ]]; then
+    echo "/.dockerenv"
+  elif [[ -e "${FS_ROOT}/run/.containerenv" ]]; then
+    echo "/run/.containerenv"
+  elif [[ -n "${container:-}" ]]; then
+    echo "container=${container}"
+  elif [[ -n "${KUBERNETES_SERVICE_HOST:-}" ]]; then
+    echo "KUBERNETES_SERVICE_HOST"
+  fi
+}
+
+# choose_build settles BUILD and BUILD_REASON: an explicit ask first (the
+# argument, then KROWK_LEAN), then what this machine is.
+choose_build() {
+  local asked="$1" found
+  if [[ -n "$asked" ]]; then
+    BUILD="$asked"
+    BUILD_REASON="--${asked} was passed"
+    return
+  fi
+  case "${KROWK_LEAN:-}" in
+    "") ;;
+    1 | true | yes)
+      BUILD=lean
+      BUILD_REASON="KROWK_LEAN=${KROWK_LEAN}"
+      return
+      ;;
+    0 | false | no)
+      BUILD=full
+      BUILD_REASON="KROWK_LEAN=${KROWK_LEAN}"
+      return
+      ;;
+    *) error "KROWK_LEAN=${KROWK_LEAN} is neither 1 (the lean build) nor 0 (the full build)" ;;
+  esac
+  found=$(ci_name)
+  if [[ -n "$found" ]]; then
+    BUILD=lean
+    BUILD_REASON="CI detected (${found})"
+    return
+  fi
+  found=$(container_name)
+  if [[ "$found" == "no terminal" ]]; then
+    BUILD=lean
+    BUILD_REASON="no terminal, so no person (a Dockerfile RUN, a script)"
+    return
+  elif [[ -n "$found" ]]; then
+    BUILD=lean
+    BUILD_REASON="a container detected (${found})"
+    return
+  fi
+  BUILD=full
+  BUILD_REASON=""
+}
+
+# archive_for is the name scripts/dist.sh gives the archive: krowk_… for the
+# full build, krowk-lean_… for the lean one.
+archive_for() {
+  local version="$1" platform="$2" build="$3" ext="tar.gz" name="krowk"
+  [[ "$platform" == windows_* ]] && ext="zip"
+  [[ "$build" == lean ]] && name="krowk-lean"
+  echo "${name}_${version}_${platform}.${ext}"
+}
+
 # download_binaries fetches one archive and installs both binaries out of it.
 download_binaries() {
   local version="$1" platform="$2" tmp_dir="$3"
-  local ext="tar.gz" archive base_url why suffix=""
+  local archive base_url why suffix="" ext="tar.gz"
 
   if [[ "$platform" == windows_* ]]; then
     ext="zip"
     suffix=".exe"
   fi
 
-  # The name scripts/dist.sh builds: krowk_<version>_<os>_<arch>.<ext>.
-  archive="krowk_${version}_${platform}.${ext}"
   base_url=$(release_base_url "$version")
+  fetch_checksums "$base_url" "$tmp_dir"
+  archive=$(archive_for "$version" "$platform" "$BUILD")
+  # A release cut before the lean build existed has only the one archive.
+  # Asking it for krowk-lean_… would 404 every CI install of a pinned old
+  # version, so that release's only build is installed, and said so.
+  if [[ "$BUILD" == lean && -z "$(checksum_for "$tmp_dir" "$archive")" ]]; then
+    local full
+    full=$(archive_for "$version" "$platform" full)
+    if [[ -n "$(checksum_for "$tmp_dir" "$full")" ]]; then
+      BUILD=full
+      BUILD_REASON="krowk ${version} predates the lean build, so its one build is installed"
+      archive="$full"
+    fi
+  fi
 
-  step "Downloading krowk ${version} for ${platform//_/ }, from ${REPO}"
+  step "Downloading krowk ${version} (${BUILD} build) for ${platform//_/ }, from ${REPO}"
+  if [[ "$BUILD" == lean ]]; then
+    note "The lean build: ${BUILD_REASON}. Pass --full, or set KROWK_LEAN=0, for krowk's own agent."
+  elif [[ -n "$BUILD_REASON" ]]; then
+    note "The full build: ${BUILD_REASON}."
+  fi
   if ! curl_run -fsSL "${base_url}/${archive}" -o "${tmp_dir}/${archive}"; then
     why=$(curl_reason)
     error "Could not download ${base_url}/${archive}${why:+ (${why})}. Check that ${version} is a released version: https://github.com/${REPO}/releases"
   fi
 
-  verify_checksum "$base_url" "$tmp_dir" "$archive"
+  verify_checksum "$tmp_dir" "$archive"
 
   if [[ "$ext" == "zip" ]]; then
     command -v unzip >/dev/null 2>&1 || error "unzip is needed to open ${archive} and is not installed"
@@ -372,6 +527,11 @@ verify_install() {
   if installed=$("${BIN_DIR}/krowk${suffix}" --version 2>"$err_file"); then
     rm -f "$err_file"
     info "krowk ${installed} works"
+    # Asked of the binary itself rather than read off the build asked for: a
+    # release from before the agent, or the fallback for one, has none.
+    if "${BIN_DIR}/krowk${suffix}" -p --help >/dev/null 2>&1; then
+      HAS_AGENT=yes
+    fi
     return 0
   fi
 
@@ -692,13 +852,37 @@ install_skill() {
 next_steps() {
   echo ""
   echo "  Next:"
+  if [[ "$HAS_AGENT" == yes ]]; then
+    echo "    $(bold "krowk")                         Open krowk's agent in this terminal"
+  fi
   echo "    $(bold "krowk push screenshot.png")     Upload without a key — the link is live, and lasts a day"
   echo "    $(bold "krowk auth login --token …")    Add a key, and uploads keep, group under runs and stay yours"
   echo "    $(bold "krowk help")                    Everything else — add --json for the surface as data"
   echo ""
 }
 
+usage() {
+  echo "usage: install.sh [--lean | --full]    (piped: curl -fsSL https://krowk.com/install | bash -s -- --lean)"
+}
+
 main() {
+  local asked=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --lean) asked=lean ;;
+      --full) asked=full ;;
+      -h | --help)
+        usage
+        return 0
+        ;;
+      *)
+        usage >&2
+        error "$1 is not an option of the installer"
+        ;;
+    esac
+    shift
+  done
+
   echo ""
   echo "  $(bold "krowk") — permalinks for agent output"
   echo ""
@@ -709,6 +893,7 @@ main() {
   resolve_sha256
 
   local platform version tmp_dir
+  choose_build "$asked"
   platform=$(detect_platform)
   detect_curl_fallback
 

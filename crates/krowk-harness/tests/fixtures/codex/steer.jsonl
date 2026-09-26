@@ -1,0 +1,18 @@
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg-s1","text":""},"threadId":"{{THREAD}}","turnId":"{{TURN}}","startedAtMs":1}}
+{"method":"item/agentMessage/delta","params":{"itemId":"msg-s1","delta":"Counting: 1, 2","threadId":"{{THREAD}}","turnId":"{{TURN}}"}}
+@await-steer
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-s1","text":"Counting: 1, 2"},"threadId":"{{THREAD}}","turnId":"{{TURN}}","completedAtMs":2}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"{{THREAD}}","turnId":"{{TURN}}","tokenUsage":{"last":{"inputTokens":40,"cachedInputTokens":0,"outputTokens":5,"reasoningOutputTokens":0,"totalTokens":45},"total":{"inputTokens":40,"cachedInputTokens":0,"outputTokens":5,"reasoningOutputTokens":0,"totalTokens":45}}}}
+{"method":"item/started","params":{"item":{"type":"userMessage","id":"u-steer","content":[{"type":"text","text":"count in French","text_elements":[]}]},"threadId":"{{THREAD}}","turnId":"{{TURN}}","startedAtMs":3}}
+{"method":"item/completed","params":{"item":{"type":"userMessage","id":"u-steer","content":[{"type":"text","text":"count in French","text_elements":[]}]},"threadId":"{{THREAD}}","turnId":"{{TURN}}","completedAtMs":3}}
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg-s2","text":""},"threadId":"{{THREAD}}","turnId":"{{TURN}}","startedAtMs":4}}
+{"method":"item/agentMessage/delta","params":{"itemId":"msg-s2","delta":"Un, deux, trois.","threadId":"{{THREAD}}","turnId":"{{TURN}}"}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-s2","text":"Un, deux, trois."},"threadId":"{{THREAD}}","turnId":"{{TURN}}","completedAtMs":5}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"{{THREAD}}","turnId":"{{TURN}}","tokenUsage":{"last":{"inputTokens":60,"cachedInputTokens":40,"outputTokens":6,"reasoningOutputTokens":0,"totalTokens":66},"total":{"inputTokens":100,"cachedInputTokens":40,"outputTokens":11,"reasoningOutputTokens":0,"totalTokens":111}}}}
+@refuse-steer
+{"method":"turn/completed","params":{"threadId":"{{THREAD}}","turn":{"id":"{{TURN}}","items":[],"status":"completed","error":null}}}
+---
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg-s3","text":""},"threadId":"{{THREAD}}","turnId":"{{TURN}}","startedAtMs":6}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-s3","text":"And in German: eins, zwei, drei."},"threadId":"{{THREAD}}","turnId":"{{TURN}}","completedAtMs":7}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"{{THREAD}}","turnId":"{{TURN}}","tokenUsage":{"last":{"inputTokens":80,"cachedInputTokens":60,"outputTokens":9,"reasoningOutputTokens":0,"totalTokens":89},"total":{"inputTokens":180,"cachedInputTokens":100,"outputTokens":20,"reasoningOutputTokens":0,"totalTokens":200}}}}
+{"method":"turn/completed","params":{"threadId":"{{THREAD}}","turn":{"id":"{{TURN}}","items":[],"status":"completed","error":null}}}

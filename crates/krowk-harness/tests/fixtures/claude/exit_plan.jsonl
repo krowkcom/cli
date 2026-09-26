@@ -1,0 +1,6 @@
+{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001","id":"msg_fake_plan","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_fake_exit","name":"ExitPlanMode","input":{"plan":"1. edit the file"}}],"usage":{"input_tokens":4,"output_tokens":9}},"parent_tool_use_id":null,"session_id":"{{SESSION}}"}
+@ask {"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{"plan":"1. edit the file"},"tool_use_id":"toolu_fake_exit"}
+@tool_result toolu_fake_exit
+@mode default
+{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001","id":"msg_fake_planned","type":"message","role":"assistant","content":[{"type":"text","text":"Here is the plan."}],"usage":{"input_tokens":6,"output_tokens":5}},"parent_tool_use_id":null,"session_id":"{{SESSION}}"}
+{"type":"result","subtype":"success","is_error":false,"result":"Here is the plan.","session_id":"{{SESSION}}"}

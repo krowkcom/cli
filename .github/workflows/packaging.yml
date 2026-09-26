@@ -121,9 +121,10 @@ jobs:
       # Alpine through docker rather than as the job container: the runner's
       # JavaScript actions (download-artifact above) do not run inside an
       # arm64 Alpine container.
-      - name: Run both binaries in Alpine
+      # The full build and the lean one, which is the one a container gets.
+      - name: Run both builds in Alpine
         run: |
-          chmod +x dist/${{ matrix.triple }}/*
+          chmod +x dist/${{ matrix.triple }}/* dist/${{ matrix.triple }}-lean/*
           docker run --rm -v "$PWD/dist:/d:ro" -e KROWK_NO_UPDATE_CHECK=1 -e HOME=/tmp/h alpine:3 sh -euxc '
             mkdir -p "$HOME"
             /d/${{ matrix.triple }}/krowk --version
@@ -131,6 +132,10 @@ jobs:
             /d/${{ matrix.triple }}/krowk sessions import --from all --json
             /d/${{ matrix.triple }}/krowk doctor --json
             printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}" | /d/${{ matrix.triple }}/krowk-mcp
+            /d/${{ matrix.triple }}-lean/krowk --version
+            /d/${{ matrix.triple }}-lean/krowk doctor --json
+            ! /d/${{ matrix.triple }}-lean/krowk sessions --json 2>/tmp/lean.json
+            grep -q not_in_build /tmp/lean.json
           '
 
   windows:
@@ -162,3 +167,4 @@ jobs:
           test "$code" = 1
           grep -q unsupported_os err.json
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"ping"}' | $bin/krowk-mcp.exe
+          dist/x86_64-pc-windows-gnu-lean/krowk.exe --version

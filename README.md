@@ -33,14 +33,16 @@ krowk push screenshot.png \
 # The installer — picks your platform, verifies checksums, installs the agent skill
 curl -fsSL https://krowk.com/install | bash
 
-# Go
-cargo install --locked --git https://github.com/krowkcom/krowk --features sessions krowk
+# From source (the full build)
+cargo install --locked --git https://github.com/krowkcom/krowk --features harness krowk
 
 # npm
 npx @krowk/cli push screenshot.png
 ```
 
 Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.txt`.
+
+Every release has two builds of `krowk`. The **full build** carries krowk's own agent (bare `krowk` opens it), the session store and everything else; the **lean build** is the few-megabyte agent-container build — push, runs, uploads, no SQLite. The installer gives a workstation the full build and CI or a container (it reads `CI`, `GITHUB_ACTIONS` and the like, and `/.dockerenv`, `/run/.containerenv`, `$container`) the lean one. Ask for either with `bash -s -- --lean` / `--full`, or `KROWK_LEAN=1` / `0`. `krowk upgrade` stays on the build it is; the GitHub Action installs the lean build. A shell with no terminal (a Dockerfile `RUN`, a provisioning script) counts as a container too, and so do toolbox and distrobox: there, pass `--full` for the agent.
 
 ## Usage
 
@@ -66,6 +68,27 @@ Linux and macOS (amd64/arm64), Windows (amd64). Every release ships `checksums.t
 | `krowk sessions rebuild` | Delete the local store and re-import every transcript — the fix when the store's schema version does not match (`--yes` off a terminal) |
 | `krowk pricing refresh` | Refresh the models.dev price cache (conditional GET, silent on failure) |
 | `krowk upgrade` | Upgrade krowk to the latest release |
+
+### The agent
+
+In the full build, bare `krowk` on a terminal opens krowk's own agent: an inline prompt at the bottom of your terminal, with everything finished going into the terminal's normal scrollback — no alternate screen, so it scrolls, copies and searches like any other output, over SSH, in tmux and on a phone. With stdout or stdin not a terminal, bare `krowk` prints exactly what it always did.
+
+| | |
+| --- | --- |
+| `krowk` | Open the agent (`--model <instance>/<model>`, `--permission-mode`) |
+| `krowk --resume` / `--resume <id>` | Continue a krowk session — picked from a list, or named |
+| `krowk -p "…"` | One prompt, headless (`--output-format text\|json\|stream-json`, `--resume`, `--model`) |
+| `krowk -p "…" --max-usd 0.50` | Stop the session before the model call that would take it, subagents included, past a metered limit (`--max-tokens N`; the TUI takes both) — exits 4 like `krowk sessions budget` |
+
+The agent's tools are read, write, an edit tool in its model's format, bash, grep, glob and `publish`, which pushes a screenshot, diff or log as a krowk artifact with `krowk_push`'s own rules (inside the working directory, no credential files, no hard links). With an API key, a session's first publish opens a krowk run recording the session, and every artifact is tagged `krowk.session` and grouped under it.
+
+It keeps a todo list (`todo_write`, Ctrl-T in the TUI), and hands work to subagents (`subagent`): child sessions with a fresh context and a cheaper model by default, several at once, each one line in the TUI (Ctrl-G to expand one or interrupt it alone), of which only the final summary comes back. Agent definitions — krowk's `.krowk/agents/*.md` or Claude Code's `.claude/agents/*.md`, as they are — give a subagent its instructions, model and tool allowlist.
+
+What you see: `❯` before what you asked; the answer as it streams, in light markdown (headings, `•` lists, `code` and fenced blocks coloured), two columns in from both edges and wrapped by krowk inside that padding (drawn by moving the cursor, not with spaces, as Claude Code does); each tool call once, with its outcome — `◆ Read README.md (3 lines)`, `◆ Run cargo test` with the head and tail of its output, `◆ Edit src/main.rs +3/-1` with the removed and added lines on red and green bands, a red `◆` when it failed; thinking collapsed to `◆ Thought for 4.2s`; and `Worked for 12s · 6.2k tokens` when the turn is done. While a turn runs, one line says what it is doing (`⠋ Thinking… 3.2s │ esc to interrupt`). The visual language follows xAI's Grok Build (see THIRD-PARTY-NOTICES).
+
+**Permissions follow Claude Code's.** The modes are `default` (asks before edits and commands), `acceptEdits`, `plan` (changes nothing) and `bypassPermissions`, and the rules are Claude Code's — `permissions.allow`, `ask` and `deny` with `Bash(git:*)`, `Read(./secrets/**)`, `Edit(src/**)`, `WebFetch(domain:…)`, `Mcp(server:tool)` — read from `.claude/settings.json`, `.claude/settings.local.json`, `~/.claude/settings.json`, and the `permissions` key of `~/.config/krowk/config.json` or a repository's `.krowk/config.json`. A deny rule wins in every mode, `bypassPermissions` included. A repository's own allow rules, directories and hooks count once you trust it. When a call needs your say, the TUI shows it over the prompt — `y` once, `s` for the session, `p` for this project, `n` no; `krowk -p` refuses it instead of waiting, and tells the model what would allow it. `AGENTS.md`, `CLAUDE.md` and `.cursor/rules` are read from the repository root down, deeper files winning; Claude-format skills and hooks load as they are. Canon's `engineering/harness.md` (Permissions) has the evaluation order.
+
+Enter sends; Alt-Enter, Ctrl-J or a trailing `\` starts a new line, and ↑/↓ walk the prompt history. Esc or Ctrl-C interrupts the running turn, keeping what arrived; typing while it runs steers it — the model reads it before its next step. `?` on an empty prompt shows the keys, Ctrl-O the session's details (tokens, log path), Ctrl-Y copies the last answer to the clipboard as the model wrote it — no padding, no wrapping, Ctrl-D or `/exit` quits. When the model's API cannot be reached, a persistent **no network connectivity** notice says so within two seconds, and clears when the API answers again; nothing hangs waiting for it.
 
 Wherever a command takes `<artifact>`, `<run>` or `--run`, it takes the link as readily as the slug: paste `https://krowk.com/a/art_…` or the CDN URL under it, and the slug is read out of it.
 
@@ -183,18 +206,38 @@ Tools: `krowk_push`, `krowk_list_artifacts`, `krowk_get_artifact`, `krowk_claim_
 | `KROWK_MODEL` | Name the model doing the work (`gen_ai.request.model`) — harness-agnostic; `ANTHROPIC_MODEL` is also read |
 | `KROWK_NO_UPDATE_CHECK` | `1`/`true` — never check for or mention new releases |
 
+The agent's status line, under the prompt, reads
+`elvinas/primevise-arch-1 | anthropic/claude-opus-5-5 | $21.47 | [4 tasks] | [3 subagents] | ? help`
+and is configured in `~/.config/krowk/config.json`, under `tui`:
+
+```json
+{ "tui": { "statusBar": true, "statusItems": ["device", "model", "cost", "tasks", "subagents", "help"] } }
+```
+
+| Key | Purpose |
+| --- | --- |
+| `tui.statusBar` | `false` hides the status line. The no-network notice shows regardless |
+| `tui.statusItems` | Which items the line shows, in order (all six by default): `device` (`<user>/<host>`), `model` (the instance and model, with the instance's rate limit once it is near it: `claude:work/haiku (78% of 7-day)`), `cost` (the session's, priced from models.dev), `tasks` (open todos, only while there are any), `subagents` (only while they run) and `help` (`? help`, always last). `offline` is added before the help while the API cannot be reached. The old names still read: `todos` is `tasks`, `instance` is `model`, and `connectivity` and `session` are ignored |
+
+On a narrow terminal the items give way one at a time — the device first, then the subagents, the tasks and the cost — and then the model is cut short; `? help` stays.
+
+A key or item the TUI does not know is named above the first prompt, and the rest still applies. Prompt history is kept beside the session logs, in `~/.local/share/krowk/tui-history.jsonl`.
+
 Credentials from `krowk auth login` live in `~/.config/krowk/credentials.json` (0600), one key per workspace. Which key a command uses resolves in order: `--workspace` → `KROWK_WORKSPACE` → `.krowk/config.json` at the git root → `~/.config/krowk/config.json` → whichever key logged in last. Commit the repo file and everyone who clones the repository — person or agent — uploads to the right workspace without naming it; the file selects among keys already on the machine and never carries one itself.
 
 ## Development
 
 ```bash
 make check          # clippy, the unit tests and every golden case
-make build          # → target/release/krowk (with sessions) and krowk-mcp
+make build          # → target/release/krowk (the full build) and krowk-mcp
 make mock           # a local stand-in registry — then run any command with --dev
 make golden-update  # re-record tests/golden/cases after an intended output change
+make bench          # hold the release builds to the performance and size budgets
 ```
 
 Rust (a cargo workspace under `crates/`). The repository ships the registry it develops against as a crate of its own (`crates/krowk-devregistry`, run by `make mock`), so trying krowk out needs neither the network nor a key. It is not part of any released binary.
+
+Every performance and size number krowk promises is in [`crates/krowk-bench/budgets.toml`](crates/krowk-bench/budgets.toml); [its README](crates/krowk-bench/README.md) explains how the numbers are measured and how a pending budget is turned on.
 
 ## Who uses Krowk?
 

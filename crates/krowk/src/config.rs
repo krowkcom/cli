@@ -104,6 +104,13 @@ pub fn unset(path: &Path, key: &str) -> Result<(), String> {
     })
 }
 
+/// Edits the file as a JSON object, keeping every key the edit does not
+/// touch: how `krowk providers` writes the harness's `instances`.
+#[cfg(feature = "harness")]
+pub fn edit(path: &Path, edit: impl FnOnce(&mut Map<String, Value>)) -> Result<(), String> {
+    rewrite(path, edit)
+}
+
 /// Read, edit, write back by rename, keeping every key this build does not
 /// know about as it was.
 fn rewrite(path: &Path, edit: impl FnOnce(&mut Map<String, Value>)) -> Result<(), String> {

@@ -114,7 +114,9 @@ runs:
         # the installer, with no fetch to go stale and nothing hard-coded that
         # GitHub Enterprise would not resolve. The binary is pinned by the
         # version resolved above.
-        bash "${GITHUB_ACTION_PATH:?}/scripts/install.sh"
+        # A runner is CI, so this is the lean build either way; asked for by
+        # name so a self-hosted runner without CI set gets it too.
+        bash "${GITHUB_ACTION_PATH:?}/scripts/install.sh" --lean
         echo "$KROWK_BIN_DIR" >> "$GITHUB_PATH"
         # `@v0` resolved to the latest release just now, which is what that tag
         # means for as long as 0.x is the latest line and not one release after.

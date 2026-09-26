@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"id":"msg_says","model":"claude-haiku-4-5-20251001","role":"assistant","content":[{"type":"text","text":"You have hit your usage limit; the rate limit resets at 2pm."}],"usage":{"input_tokens":3,"output_tokens":9}},"parent_tool_use_id":null,"session_id":"{{SESSION}}"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"result":"You have hit your usage limit; the rate limit resets at 2pm.","errors":["the tool loop failed"],"session_id":"{{SESSION}}"}

@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-const DEFAULT_SESSION_LIMIT: usize = 50;
+pub(super) const DEFAULT_SESSION_LIMIT: usize = 50;
 const MAX_REPORTED_ERRORS: usize = 10;
 const MAX_SKIPPED_TYPES: usize = 32;
 const MAX_SKIPPED_TYPE_LEN: usize = 64;
@@ -24,6 +24,42 @@ const MAX_ERROR_REASON_LEN: usize = 512;
 const SKIPPED_TYPE_OTHER: &str = "krowk:other";
 const UNSUPPORTED_OS: &str = "sessions is not supported on Windows in v1";
 const PRICING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Every source import, sync and rebuild read: the transcripts on this
+/// machine, and in the harness build krowk's own session logs too.
+fn all_sources() -> Vec<Box<dyn Source>> {
+    #[allow(unused_mut)]
+    let mut all = krowk_import::sources();
+    #[cfg(feature = "harness")]
+    all.push(Box::new(krowk_harness::project::Krowk));
+    all
+}
+
+/// Brings one native session's rows up to date from its log, right after a
+/// `krowk -p` turn: the same read and write an import does, for its log and
+/// for every subagent's under it (R-SUB-6), parents first, so each child
+/// links to the session that started it.
+#[cfg(feature = "harness")]
+pub(super) fn project_native(ctx: &Ctx, session_id: &str) -> Result<(), Error> {
+    let store_path = resolve_store_path(ctx)?;
+    let src = krowk_harness::project::Krowk;
+    let found = src.discover(ctx.io.env).map_err(|e| fail("import_failed", e.to_string()))?;
+    let Some(r) = found.iter().find(|r| r.id == session_id) else {
+        return Err(fail("import_failed", format!("the log of session {session_id} is not where krowk keeps sessions")));
+    };
+    let mut tree = vec![r.clone()];
+    if let Some(dir) = krowk_harness::log::sessions_dir(ctx.io.env) {
+        let children = krowk_harness::budget::descendants(&dir, session_id);
+        tree.extend(children.iter().filter_map(|(id, _)| found.iter().find(|r| &r.id == id).cloned()));
+    }
+    let _lock = lock_store_waiting(&store_path, REFRESH_LOCK_WAIT)?;
+    let conn = open_store(ctx)?;
+    for r in &tree {
+        let (thread, next, _) = src.read(ctx.io.env, r, "").map_err(|e| fail("import_failed", e.to_string()))?;
+        krowk_store::Writer::new(&conn).ingest_with_cursor(&thread, &r.key(), &next).map_err(|e| store_fail(&e, &store_path))?;
+    }
+    Ok(())
+}
 
 pub(super) fn check_os() -> Result<(), Error> {
     krowk_import::check_os().map_err(|_| fail("unsupported_os", UNSUPPORTED_OS))
@@ -39,11 +75,11 @@ fn sanitize_store_err(msg: &str, store_path: &str) -> String {
     msg.to_string()
 }
 
-fn store_fail(e: &StoreError, store_path: &str) -> Error {
+pub(super) fn store_fail(e: &StoreError, store_path: &str) -> Error {
     fail("store_unavailable", sanitize_store_err(e.message(), store_path))
 }
 
-fn db_path_string(ctx: &Ctx) -> String {
+pub(super) fn db_path_string(ctx: &Ctx) -> String {
     krowk_store::db_path(ctx.io.env).map(|p| p.display().to_string()).unwrap_or_default()
 }
 
@@ -481,7 +517,7 @@ fn human_sessions_list(rows: &[SessionRow], priced: &[Priced], colour: bool, now
 
 /// The picker offers only rows already in the store, which is what makes it
 /// safe to offer.
-fn pick_session(rows: &[SessionRow], now: i64) -> Result<String, Error> {
+pub(super) fn pick_session(rows: &[SessionRow], now: i64) -> Result<String, Error> {
     let labels: Vec<String> = rows
         .iter()
         .map(|r| {
@@ -564,7 +600,7 @@ const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(15);
 /// `import_locked` rather than answer from a stale store.
 pub(super) fn refresh_session(ctx: &Ctx, provider: &str, foreign_ids: &[String]) -> Result<Refresh, Error> {
     let foreign_ids: Vec<&String> = foreign_ids.iter().filter(|f| !f.is_empty()).collect();
-    let Some(source) = krowk_import::sources().into_iter().find(|s| s.name() == provider) else { return Ok(Refresh::NotRefreshable) };
+    let Some(source) = all_sources().into_iter().find(|s| s.name() == provider) else { return Ok(Refresh::NotRefreshable) };
     if foreign_ids.is_empty() || matches!(provider, krowk_import::PROVIDER_LEDGER | krowk_import::PROVIDER_CURSOR) {
         return Ok(Refresh::NotRefreshable);
     }
@@ -1007,7 +1043,7 @@ fn truncate_for_report(s: &str, max: usize) -> String {
 }
 
 fn selected_sources(from: &str) -> Result<Vec<Box<dyn Source>>, Error> {
-    let all = krowk_import::sources();
+    let all = all_sources();
     let names: Vec<&str> = all.iter().map(|s| s.name()).collect();
     let choices = format!("{}|all", names.join("|"));
     match from {
@@ -1070,7 +1106,7 @@ pub fn rebuild(ctx: &mut Ctx) -> Result<(), Error> {
         }
     }
     let conn = open_store(ctx)?;
-    let sources = krowk_import::sources();
+    let sources = all_sources();
     import_into(ctx, Some(&conn), &store_path, &sources, false, ImportReport { removed: Some(removed), ..ImportReport::default() })
 }
 
@@ -1085,7 +1121,7 @@ pub fn sync(ctx: &mut Ctx) -> Result<(), Error> {
     if !p.warning.is_empty() && ctx.format == Format::Human {
         let _ = writeln!(ctx.io.stderr, "! {}", p.warning);
     }
-    let sources = krowk_import::sources();
+    let sources = all_sources();
     import_into(ctx, Some(&conn), &store_path, &sources, true, ImportReport { pricing: Some(p), ..ImportReport::default() })
 }
 

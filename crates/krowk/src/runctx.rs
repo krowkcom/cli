@@ -3,6 +3,7 @@
 //! environment, and overridden by whatever the caller said.
 
 use serde::Serialize;
+use std::path::Path;
 use std::process::Command;
 
 /// The process environment, as the CLI reads it.
@@ -21,7 +22,9 @@ pub struct Metadata {
     pub commit: String,
     #[serde(rename = "vcs.ref.head.name", skip_serializing_if = "String::is_empty")]
     pub branch: String,
-    /// None outside a git checkout — the distinction a plain bool cannot carry.
+    /// None outside a git checkout, and where it cannot be told without
+    /// running a repository's filters — the distinction a plain bool cannot
+    /// carry.
     #[serde(rename = "krowk.vcs.dirty", skip_serializing_if = "Option::is_none")]
     pub dirty: Option<bool>,
     #[serde(rename = "krowk.harness", skip_serializing_if = "String::is_empty")]
@@ -160,7 +163,13 @@ pub struct Overrides {
 
 /// Detection with the caller's overrides applied.
 pub fn resolve(env: Env, o: Overrides) -> Metadata {
-    let mut m = detect(env);
+    resolve_in(env, o, None)
+}
+
+/// `resolve`, with git asked about `dir` rather than the working directory:
+/// a harness session's own, which a resumed session need not share.
+pub fn resolve_in(env: Env, o: Overrides, dir: Option<&Path>) -> Metadata {
+    let mut m = detect_in(env, dir);
     let over = |dst: &mut String, v: String| {
         if !v.is_empty() {
             *dst = v;
@@ -183,13 +192,17 @@ pub fn resolve(env: Env, o: Overrides) -> Metadata {
 
 /// What git and the environment say, with nothing overridden.
 pub fn detect(env: Env) -> Metadata {
-    let remote = git(&["remote", "get-url", "origin"]);
+    detect_in(env, None)
+}
+
+fn detect_in(env: Env, dir: Option<&Path>) -> Metadata {
+    let remote = git(dir, &["remote", "get-url", "origin"]);
     let mut m = Metadata {
         repo_name: first(&[env("GITHUB_REPOSITORY"), slug(&remote)]),
         repo_url: repo_url(env, &remote),
-        commit: first(&[env("GITHUB_SHA"), git(&["rev-parse", "HEAD"])]),
-        branch: branch(env),
-        dirty: dirty(),
+        commit: first(&[env("GITHUB_SHA"), git(dir, &["rev-parse", "HEAD"])]),
+        branch: branch_in(env, dir),
+        dirty: dirty(dir),
         harness: detect_agent(env),
         model: first(&[env("KROWK_MODEL"), env("ANTHROPIC_MODEL")]),
         session: first(&[env("KROWK_SESSION"), env("CLAUDE_CODE_SESSION_ID"), env("CURSOR_TRACE_ID"), env("GITHUB_RUN_ID")]),
@@ -242,8 +255,21 @@ fn first(values: &[String]) -> String {
     values.iter().find(|v| !v.is_empty()).cloned().unwrap_or_default()
 }
 
-fn git(args: &[&str]) -> String {
-    Command::new("git")
+/// One git query. A repository's config names commands git runs on its
+/// own — `core.fsmonitor` on `status` above all — and the repository may be
+/// one a model was handed, so none is run and no lock is taken: the rule
+/// the harness's search tools keep.
+fn git_cmd(dir: Option<&Path>) -> Command {
+    let mut c = Command::new("git");
+    c.args(["-c", "core.fsmonitor=false", "--no-optional-locks"]).stdin(std::process::Stdio::null());
+    if let Some(d) = dir {
+        c.current_dir(d);
+    }
+    c
+}
+
+fn git(dir: Option<&Path>, args: &[&str]) -> String {
+    git_cmd(dir)
         .args(args)
         .output()
         .ok()
@@ -254,6 +280,10 @@ fn git(args: &[&str]) -> String {
 
 /// The branch: CI's word first, then git's, and none on a detached head.
 pub fn branch(env: Env) -> String {
+    branch_in(env, None)
+}
+
+fn branch_in(env: Env, dir: Option<&Path>) -> String {
     let head_ref = env("GITHUB_HEAD_REF");
     if !head_ref.is_empty() {
         return head_ref;
@@ -262,7 +292,7 @@ pub fn branch(env: Env) -> String {
     if !ref_name.is_empty() && env("GITHUB_REF_TYPE") == "branch" {
         return ref_name;
     }
-    let b = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let b = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
     if b == "HEAD" { String::new() } else { b }
 }
 
@@ -365,8 +395,24 @@ pub fn ci_pull_request(env: Env) -> String {
     }
 }
 
-fn dirty() -> Option<bool> {
-    let out = Command::new("git").args(["status", "--porcelain"]).output().ok().filter(|o| o.status.success())?;
+/// Whether the work tree differs from HEAD. `git status` reads a file's
+/// content when its stat data cannot settle it — a racily clean entry, a
+/// touched one — and reading it runs the `filter.<driver>.clean` (or
+/// `.process`) command `.gitattributes` maps it to: a command any
+/// repository can name. No work-tree comparison git offers avoids that
+/// read (measured: `status`, `diff-files`, `diff-index HEAD` and
+/// `ls-files -m` all run a clean filter on a racy entry), so where any
+/// filter is configured — the repository's, the person's, git-lfs's — the
+/// answer is unknown rather than a command run. Submodules, whose own
+/// config is another repository's, are not looked into.
+fn dirty(dir: Option<&Path>) -> Option<bool> {
+    let filters = git_cmd(dir).args(["config", "--get-regexp", r"^filter\."]).output().ok()?;
+    // 1: no filter is configured; 0: some are; anything else, no answer.
+    match filters.status.code() {
+        Some(1) => {}
+        _ => return None,
+    }
+    let out = git_cmd(dir).args(["status", "--porcelain", "--ignore-submodules=all"]).output().ok().filter(|o| o.status.success())?;
     Some(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
@@ -405,6 +451,53 @@ mod tests {
         assert_eq!(change_id("https://github.com/acme/storefront"), "");
         let ci = env(&[("GITHUB_REF", "refs/pull/42/merge"), ("GITHUB_REPOSITORY", "o/r")]);
         assert_eq!(ci_pull_request(&ci), "https://github.com/o/r/pull/42");
+    }
+
+    /// A repository a model was handed can name a command in its config;
+    /// detection runs none of it, and reads the directory it is pointed at.
+    #[test]
+    fn detection_runs_nothing_from_the_repositorys_config_and_reads_the_directory_named() {
+        let d = std::env::temp_dir().join(format!("krowk-runctx-fsmonitor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let git = |args: &[&str]| Command::new("git").args(args).current_dir(&d).status().is_ok_and(|s| s.success());
+        if !git(&["init", "-q"]) {
+            eprintln!("git is not installed: skipping");
+            return;
+        }
+        std::fs::write(d.join("a.txt"), "x\n").unwrap();
+        let marker = d.join("fsmonitor-ran");
+        let config = std::fs::read_to_string(d.join(".git/config")).unwrap();
+        std::fs::write(d.join(".git/config"), format!("{config}[core]\n\tfsmonitor = \"touch '{}'; false\"\n", marker.display())).unwrap();
+        // A filter in the person's own config (git-lfs's) makes it unknown
+        // anywhere; the machine running this may have one.
+        let own_filters = Command::new("git").args(["config", "--global", "--get-regexp", r"^filter\."]).output().is_ok_and(|o| o.status.success())
+            || Command::new("git").args(["config", "--system", "--get-regexp", r"^filter\."]).output().is_ok_and(|o| o.status.success());
+        let m = detect_in(&env(&[]), Some(&d));
+        assert_eq!(m.dirty, if own_filters { None } else { Some(true) }, "read from the directory named, not the process's");
+        assert!(!marker.exists(), "the repository's fsmonitor ran");
+
+        // A clean (or process, or smudge) filter .gitattributes maps a file
+        // to: git runs it to read a racily clean or touched file, so with
+        // one configured dirtiness is unknown and nothing runs.
+        let g = |args: &[&str]| Command::new("git").args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.fsmonitor=false"]).args(args).current_dir(&d).status().is_ok_and(|s| s.success());
+        std::fs::write(d.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+        assert!(g(&["add", "-A"]) && g(&["commit", "-qm", "x"]));
+        for (key, cmd) in [("clean", "cat"), ("process", "false"), ("smudge", "cat")] {
+            let mut config = std::fs::read_to_string(d.join(".git/config")).unwrap();
+            config = config.split("[filter \"evil\"]").next().unwrap().to_string();
+            std::fs::write(d.join(".git/config"), format!("{config}[filter \"evil\"]\n\t{key} = \"touch '{}'; {cmd}\"\n", marker.display())).unwrap();
+            // Rewritten in the same second the index was: racily clean.
+            std::fs::write(d.join("a.txt"), "x\n").unwrap();
+            assert_eq!(detect_in(&env(&[]), Some(&d)).dirty, None, "{key}: unknown, not run");
+            assert!(!marker.exists(), "the repository's {key} filter ran");
+            // A touched file: stat-dirty, same content.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            std::fs::write(d.join("a.txt"), "x\n").unwrap();
+            assert_eq!(detect_in(&env(&[]), Some(&d)).dirty, None);
+            assert!(!marker.exists(), "the repository's {key} filter ran on a touched file");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

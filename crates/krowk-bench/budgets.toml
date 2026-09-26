@@ -1,0 +1,286 @@
+# Every performance and size number krowk promises, in one file. `make bench`
+# measures each enforced budget and fails when a median lands over its `max`;
+# CI runs the same thing on every pull request (R-PERF-7). How a budget is
+# measured, and how a pending one is turned on, is in README.md beside this
+# file.
+#
+# A number here is a promise, not a record of the last run: changing one needs
+# a line of justification in the pull request that changes it. A measurement
+# is compared against the absolute number below, never against a previous run,
+# so a slow drift fails as surely as a jump.
+#
+# Fields:
+#   id      what the bench measures; an enforced id must have a measurement
+#   req     the requirement it holds the build to
+#   what    the line the CI summary prints
+#   unit    bytes, count, ms, us, ticks, wakeups, MB or fps
+#   max     the budget, the most the median may be; a table of numbers per
+#           target ("x86_64-linux", "aarch64-macos", …) where the number
+#           depends on the target — a target with no number is reported,
+#           not held
+#   runs    how many times it is measured; the median is what is compared
+#   status  "enforced", or "pending" until the ticket named in `owner`
+#           builds the thing it measures
+
+# --- The agent build (no features): what a container fetches or compiles ---
+
+[[budget]]
+id = "lean.size"
+req = "R-PKG-2"
+what = "Agent build (no features): release binary size"
+unit = "bytes"
+# 3,943,808 bytes (3.76 MiB) with rust 1.97 when this budget was set. The
+# headroom is a quarter of a megabyte, so one real new dependency breaks it.
+max = { x86_64-linux = 4_194_304 }
+status = "enforced"
+
+[[budget]]
+id = "lean.deps"
+req = "R-PKG-2"
+what = "Agent build (no features): crates linked, every target"
+unit = "count"
+# The length of crates/krowk/lean-deps.txt, which `make lean-deps` holds to
+# the exact list; this is the number the promise is stated in.
+max = 136
+status = "enforced"
+
+# --- The full build (--features harness): everything krowk can link ---
+
+[[budget]]
+id = "full.size"
+req = "R-OSS-7"
+what = "Full build (--features harness): release binary size"
+unit = "bytes"
+# 6,253,544 bytes (5.96 MiB) when this budget was set. The harness is
+# growing: a ticket that adds a dependency raises this in its own PR, with
+# the dependency's cost in the justification. Raised 6.50 -> 7.00 MiB by
+# ticket 04 (the same number ticket 06 sets): the TUI (ratatui, crossterm's
+# event stream) on top of ticket 05's three wire clients measured 6,903,624
+# bytes (6.58 MiB) together. Ticket 06's Claude Code backend (the process,
+# the control protocol, the stream translation, the MCP bridge, trust,
+# `providers add claude`; no new crate) adds 183,392 bytes: 7,087,016
+# (6.76 MiB) on x86_64 Linux with both, 253,016 bytes under this. Ticket
+# 07's Codex backend (the app-server JSON-RPC client, the stream
+# translation, approvals, `providers add codex`; no new crate) adds 141,408
+# bytes, and its review round 26,824 more: 7,240,840 (6.91 MiB), 99,192
+# bytes under this.
+# Ticket 08's budget and `publish` (no new crate) add 126,656 bytes of its
+# own (measured on the umbrella before ticket 07); with 07 they measure
+# 7,365,736 (7.02 MiB), 25,704 bytes over 7.00 MiB. Raised 7.00 -> 7.25 MiB
+# by ticket 08: no crate is added — the growth is the budget, the
+# evidence tool, the stream frames and their tests' code paths — and the
+# raise leaves 236,440 bytes for the rest of Harness P0 to justify.
+# Ticket 09's permissions (no new crate: the rule evaluator and its shell
+# splitter, the settings loader, remembered grants, approval frames and the
+# TUI's prompt for them, Claude-format hooks, instructions and skills) adds
+# 172,864 bytes: 7,538,600 (7.19 MiB), and its review round (bash's
+# quoting, opaque program names, anchored path rules, skill and hook
+# fields) 26,880 more, and round 2 (git's program-running forms, glob-safe
+# grants) 5,600, and the final review (git's safe-option lists, the TUI's
+# expand key) 20,992, and bare-repository checks 2,272: 7,594,344
+# (7.24 MiB), 7,832 under this — the next
+# harness ticket that grows the build raises it with its own reason.
+# Ticket 10's subagents and todos (no new crate: the subagent tool and
+# child turns on the shared host, agent definitions and their parser, the
+# catalog's tier listing, incremental tree metering, `todo_write` and its
+# reminder, Codex sub-thread metering, the TUI's subagent lines and
+# overlays, and routing all of it through ticket 09's evaluator and hooks)
+# add 151,520 bytes on top of 09: 7,745,864 (7.39 MiB), 143,688 over 7.25
+# MiB. Raised 7.25 -> 7.50 MiB by ticket 10, for 09 and 10 together — no
+# crate is added, the growth is their code — leaving 118,456 bytes for the
+# rest of Harness P0 to justify.
+# Ticket 10 merged at 7,752,680 (7.39 MiB). Ticket 11's switching (no new
+# crate: the handoff that seeds a backend and its framing, transcripts
+# carried between accounts and the checks on their paths, switchModel and
+# the rollover loop, rate-limit detection and headers on every engine, the
+# TUI's picker, offer and per-instance usage) adds 143,200 bytes on top of
+# 10: 7,895,880 (7.53 MiB), 31,560 over 7.50 MiB. Raised 7.50 -> 7.75 MiB
+# by ticket 11, for 10 and 11 together — no crate is added, the growth is
+# their code — leaving 230,584 bytes for the rest of Harness P0.
+max = { x86_64-linux = 8_126_464 }
+status = "enforced"
+
+# --- Startup: a new process each run, no daemon ---
+
+[[budget]]
+id = "startup.version"
+req = "R-PERF-1"
+what = "Agent build: `krowk --version`, cold process"
+unit = "ms"
+# ~2.3 ms locally. A tripwire well under R-PERF-1's 150 ms cold prompt:
+# nothing krowk does before its prompt may cost more than printing a version.
+max = 15
+runs = 21
+status = "enforced"
+
+[[budget]]
+id = "startup.sessions"
+req = "R-PERF-1"
+what = "Full build: `krowk sessions` on an empty store, cold process"
+unit = "ms"
+# ~3.5 ms locally: opening krowk.db and listing it, the picker's first step.
+max = 30
+runs = 21
+status = "enforced"
+
+[[budget]]
+id = "tui.startup_cold"
+req = "R-PERF-1"
+what = "Bare `krowk` to an interactive prompt, no daemon running"
+unit = "ms"
+# Spawn to the first complete frame (the end of the first synchronized
+# update), which is the prompt, on a pseudo-terminal answering the cursor
+# query; the startup connectivity probe is not waited for.
+max = 150
+runs = 21
+status = "enforced"
+
+[[budget]]
+id = "tui.startup_warm"
+req = "R-PERF-1"
+what = "Bare `krowk` to an interactive prompt, daemon warm"
+unit = "ms"
+max = 50
+runs = 21
+status = "pending"
+owner = "13"
+
+# --- Idle: no polling and no timers while nothing happens (Linux /proc) ---
+
+[[budget]]
+id = "engine.idle_cpu"
+req = "R-PERF-2"
+what = "`krowk -p` waiting on a silent provider: CPU ticks over 10 s"
+unit = "ticks"
+max = 0
+window_s = 10
+status = "enforced"
+
+[[budget]]
+id = "engine.idle_wakeups"
+req = "R-PERF-2"
+what = "`krowk -p` waiting on a silent provider: thread wakeups over 10 s"
+unit = "wakeups"
+# Stricter than ticks: a timer that wakes for a microsecond a second rarely
+# lands on a tick, but it is a context switch every time.
+max = 0
+window_s = 10
+status = "enforced"
+
+[[budget]]
+id = "engine.idle_rss"
+req = "R-PERF-3"
+what = "`krowk -p` waiting on a silent provider: resident memory"
+unit = "MB"
+# The engine alone, held to the TUI-plus-engine number: if the engine does
+# not fit, the pair cannot.
+max = 30
+window_s = 10
+status = "enforced"
+
+[[budget]]
+id = "tui.idle_cpu"
+req = "R-PERF-2"
+what = "TUI with an idle session: CPU ticks over 10 s"
+unit = "ticks"
+# At its prompt, nothing running, the start-up probe answered: the crossterm
+# reader parked on the terminal and the runtime on nothing. Wakeups are
+# printed beside it.
+max = 0
+window_s = 10
+status = "enforced"
+
+[[budget]]
+id = "tui.turn_cpu"
+req = "R-PERF-2"
+what = "TUI with a turn waiting on a silent provider: CPU ticks over 5 s"
+unit = "ticks"
+# Not idle — a turn is running, so the clock and spinner redraw at 8 fps
+# (40 frames in the window) — but nothing else happens, and a frame of a
+# few rows costs well under a tick: 0-1 measured. 10 ticks is 2% of one
+# core; a deadline that has fallen into the past, which spins the loop and
+# redraws at 60 fps, is hundreds.
+max = 10
+window_s = 5
+status = "enforced"
+
+[[budget]]
+id = "tui.idle_rss"
+req = "R-PERF-3"
+what = "TUI plus engine with an idle session: resident memory"
+unit = "MB"
+# The same idle TUI: the whole process, engine and runtime included.
+max = 30
+status = "enforced"
+
+[[budget]]
+id = "session.replay_rss"
+req = "R-PERF-3"
+what = "TUI plus engine replaying a synthetic 200k-token session: peak resident memory"
+unit = "MB"
+# `krowk --resume` on a synthetic session of 100 turns and 200k tokens of
+# answer: the history drawn into scrollback, then one more turn that sends
+# all of it to the provider. VmHWM, the process's peak.
+max = 100
+status = "enforced"
+
+# --- The session log ---
+
+[[budget]]
+id = "log.append"
+req = "R-PERF-5"
+what = "Session log: one event appended (1 KiB assistant text)"
+unit = "us"
+max = 1000
+runs = 2000
+status = "enforced"
+
+# --- The model's context: what every call pays for before the conversation ---
+
+[[budget]]
+id = "context.tokens"
+req = "R-TOOL-1"
+what = "Full build: system prompt plus tool definitions, largest toolset preset (estimated tokens, bytes / 4)"
+unit = "tokens"
+# An estimate, not a tokenizer's count: four bytes a token, as `krowk -p`
+# records it in context.jsonl, measured from `/` so the checkout's path does
+# not move it. 1,182 when this budget was set (ticket 03: the gpt preset,
+# apply_patch as a JSON tool; claude 1,165, grok 1,178), and about 1,310 for
+# apply_patch in its freeform form, which only a wire API with grammar tools
+# offers. Ticket 08's `publish` brings them to 1,327 (gpt; claude
+# 1,310, grok 1,323), and about 1,450 in the freeform form. Ticket 10 adds
+# `todo_write` (R-TOOL-1's list complete) and `subagent`, about 240 tokens
+# between them, and takes about 70 back from the existing definitions — an
+# optional field's schema is its type alone, a nested type is written in
+# place, and a path's field no longer repeats what the system prompt says
+# of relative paths: 1,472 (gpt; claude 1,437, grok 1,450), inside 1,500.
+# The freeform form, which only a wire API with grammar tools is sent and
+# this bench never measures, is held to its own ceiling (1,650) by the
+# unit test. Every model call carries these tokens, so a new tool or a
+# longer description has to fit here or raise this with a reason. The unit
+# test `r_tool_1_the_system_prompt_and_tool_definitions_stay_small` holds
+# every preset's JSON form to this same number.
+max = 1500
+runs = 1
+status = "enforced"
+
+# --- Rendering and remote ---
+
+[[budget]]
+id = "tui.redraw_fps"
+req = "R-PERF-4"
+what = "TUI under a synthetic token stream: redraws per second"
+unit = "fps"
+# The most frames begun inside any one second while an answer streams at
+# 500 tokens a second (one delta every 2 ms, for about four seconds).
+max = 60
+status = "enforced"
+
+[[budget]]
+id = "remote.attach"
+req = "R-PERF-6"
+what = "Attach from a checkpoint on a remote device"
+unit = "ms"
+max = 500
+status = "pending"
+owner = "19"

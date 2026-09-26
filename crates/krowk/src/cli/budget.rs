@@ -178,6 +178,17 @@ fn current_session(ctx: &Ctx, args: &[String]) -> Result<(String, Refresh), Erro
 }
 
 fn limits(ctx: &Ctx) -> Result<Limits, Error> {
+    let l = given_limits(ctx)?;
+    if l.usd.is_none() && l.tokens.is_none() {
+        return Err(fail("bad_flag", "`krowk sessions budget` needs a limit: --max-usd <dollars>, --max-tokens <count>, or both"));
+    }
+    Ok(l)
+}
+
+/// `--max-usd` and `--max-tokens` as given, either or both absent: what
+/// `krowk sessions budget` checks a session against, and what `krowk -p`
+/// and the TUI hold one to before every model call.
+pub(super) fn given_limits(ctx: &Ctx) -> Result<Limits, Error> {
     // A limit given blank — `--max-usd "$UNSET"` — is a mistake to name, not
     // a check to switch off.
     for (name, v) in [("max-usd", &ctx.f.max_usd), ("max-tokens", &ctx.f.max_tokens)] {
@@ -197,9 +208,6 @@ fn limits(ctx: &Ctx) -> Result<Limits, Error> {
             fail("bad_flag", format!("--max-tokens {v:?} is not a count of tokens — pass a whole number like 200000"))
         })?),
     };
-    if usd.is_none() && tokens.is_none() {
-        return Err(fail("bad_flag", "`krowk sessions budget` needs a limit: --max-usd <dollars>, --max-tokens <count>, or both"));
-    }
     Ok(Limits { usd, tokens })
 }
 

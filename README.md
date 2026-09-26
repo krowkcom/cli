@@ -206,16 +206,20 @@ Tools: `krowk_push`, `krowk_list_artifacts`, `krowk_get_artifact`, `krowk_claim_
 | `KROWK_MODEL` | Name the model doing the work (`gen_ai.request.model`) — harness-agnostic; `ANTHROPIC_MODEL` is also read |
 | `KROWK_NO_UPDATE_CHECK` | `1`/`true` — never check for or mention new releases |
 
-The agent's status bar is configured in `~/.config/krowk/config.json`, under `tui`:
+The agent's status line, under the prompt, reads
+`elvinas/primevise-arch-1 | anthropic/claude-opus-5-5 | $21.47 | [4 tasks] | [3 subagents] | ? help`
+and is configured in `~/.config/krowk/config.json`, under `tui`:
 
 ```json
-{ "tui": { "statusBar": true, "statusItems": ["model", "instance", "cost", "connectivity"] } }
+{ "tui": { "statusBar": true, "statusItems": ["device", "model", "cost", "tasks", "subagents", "help"] } }
 ```
 
 | Key | Purpose |
 | --- | --- |
-| `tui.statusBar` | `false` hides the status bar. The no-network notice shows regardless |
-| `tui.statusItems` | Which items the bar shows, in order: `model`, `instance`, `cost` (the session's, priced from models.dev), `connectivity`, `session` (its id) |
+| `tui.statusBar` | `false` hides the status line. The no-network notice shows regardless |
+| `tui.statusItems` | Which items the line shows, in order (all six by default): `device` (`<user>/<host>`), `model` (the instance and model, with the instance's rate limit once it is near it: `claude:work/haiku (78% of 7-day)`), `cost` (the session's, priced from models.dev), `tasks` (open todos, only while there are any), `subagents` (only while they run) and `help` (`? help`, always last). `offline` is added before the help while the API cannot be reached. The old names still read: `todos` is `tasks`, `instance` is `model`, and `connectivity` and `session` are ignored |
+
+On a narrow terminal the items give way one at a time — the device first, then the subagents, the tasks and the cost — and then the model is cut short; `? help` stays.
 
 A key or item the TUI does not know is named above the first prompt, and the rest still applies. Prompt history is kept beside the session logs, in `~/.local/share/krowk/tui-history.jsonl`.
 

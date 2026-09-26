@@ -31,6 +31,31 @@ const MAX_LIVE_ROWS: usize = 3;
 pub use look::dim;
 use look::{bold, error as red, warning as yellow};
 
+/// Between the status line's items.
+const BAR_SEP: &str = " | ";
+
+/// Which of the status line's items gives way first when the row is too
+/// narrow for them all: the lowest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    Device,
+    Subagents,
+    Tasks,
+    Cost,
+    /// Cut short rather than dropped.
+    Model,
+    Offline,
+    Help,
+}
+
+/// One item of the status line, as drawn.
+#[derive(Debug)]
+struct Part {
+    rank: Rank,
+    text: String,
+    style: Style,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     None,
@@ -150,6 +175,26 @@ impl InstanceUsage {
         }
     }
 
+    /// The limit as the status line puts it, and only once it is not merely
+    /// allowed: `78% of 7-day`, `limited, resets 14:00`.
+    pub fn limit_brief(&self) -> Option<String> {
+        let l = self.limit.as_ref().filter(|l| l.status != LimitState::Allowed)?;
+        let window = l.window.as_deref().map(window_name);
+        let mut s = match (l.status, l.used_percent, &window) {
+            (LimitState::Limited, _, _) => "limited".to_string(),
+            (_, Some(u), Some(w)) => format!("{u:.0}% of {w}"),
+            (_, Some(u), None) => format!("{u:.0}% used"),
+            (_, None, Some(w)) => format!("near its {w} limit"),
+            (_, None, None) => "near its limit".to_string(),
+        };
+        if l.status == LimitState::Limited
+            && let Some(at) = l.resets_at_ms
+        {
+            s.push_str(&format!(", resets {}", krowk_harness::host::clock(at)));
+        }
+        Some(s)
+    }
+
     /// The limit in a few words: `82% of five_hour, resets 14:00`.
     pub fn limit_words(&self) -> Option<String> {
         let l = self.limit.as_ref()?;
@@ -166,6 +211,19 @@ impl InstanceUsage {
             s.push_str(&format!(", resets {}", krowk_harness::host::clock(at)));
         }
         Some(s)
+    }
+}
+
+/// A vendor's rate-limit window as a person says it: `five_hour` is
+/// `5-hour`, `seven_day_opus` is `7-day opus`.
+fn window_name(w: &str) -> String {
+    let mut words = w.split('_');
+    let first = words.next().unwrap_or_default();
+    let n = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"].iter().position(|x| *x == first);
+    let rest: Vec<&str> = words.collect();
+    match (n, rest.split_first()) {
+        (Some(n), Some((unit, more))) => [format!("{}-{unit}", n + 1)].into_iter().chain(more.iter().map(|m| m.to_string())).collect::<Vec<_>>().join(" "),
+        _ => w.replace('_', " "),
     }
 }
 
@@ -199,7 +257,6 @@ struct Call {
     call_id: String,
     name: String,
     input: serde_json::Value,
-    started: Instant,
 }
 
 /// A turn in flight.
@@ -235,8 +292,8 @@ pub struct App {
     turns: u32,
     /// Some(target) while the API cannot be reached.
     pub offline: Option<String>,
-    /// Whether connectivity has been established at all yet.
-    pub online_known: bool,
+    /// `<user>/<host>`, read once at start, for the status line.
+    pub device: Option<String>,
     pub overlay: Overlay,
     settings: Settings,
     /// Steering the host has queued and the engine not yet taken, oldest
@@ -322,7 +379,7 @@ impl App {
             usage: Usage::default(),
             turns: 0,
             offline: None,
-            online_known: false,
+            device: None,
             overlay: Overlay::None,
             settings,
             steers: Vec::new(),
@@ -978,7 +1035,7 @@ impl App {
                 if streamed {
                     self.live = None;
                 }
-                self.calls.push(Call { call_id: call_id.clone(), name: name.clone(), input: input.clone(), started: Instant::now() });
+                self.calls.push(Call { call_id: call_id.clone(), name: name.clone(), input: input.clone() });
             }
             Item::ToolResult { call_id, output, is_error } => {
                 if streamed {
@@ -1089,9 +1146,17 @@ impl App {
                 (_, true) => "Interrupting…".to_string(),
                 (Some(Live { kind: LiveKind::Reasoning, .. }), _) => "Thinking…".to_string(),
                 (Some(Live { kind: LiveKind::Text, .. }), _) => "Responding…".to_string(),
-                _ if t.tool_running => match self.calls.first() {
-                    Some(c) => format!("Running for {}…", look::duration(now.saturating_duration_since(c.started))),
-                    None => "Running…".to_string(),
+                // What runs, not for how long: the turn's clock on the
+                // right is the one duration the line shows.
+                _ if t.tool_running => match self.calls.iter().find(|c| c.name != "subagent") {
+                    Some(c) => {
+                        let (verb, arg) = look::tool_title(&c.name, &c.input);
+                        if arg.is_empty() { format!("Running {verb}…") } else { format!("Running {verb} {arg}…") }
+                    }
+                    None => match self.subs.iter().filter(|s| s.status.is_none()).count() as u32 {
+                        0 => "Running…".to_string(),
+                        n => format!("Waiting on {}…", plural(n, "subagent")),
+                    },
                 },
                 _ => "Working…".to_string(),
             };
@@ -1162,104 +1227,99 @@ impl App {
         (rows, caret)
     }
 
+    /// The status line as text, every item it has room for at any width.
     pub fn status_bar(&self) -> String {
-        self.status_parts().into_iter().map(|(_, p)| p).collect::<Vec<_>>().join(SEP)
+        self.status_parts().into_iter().map(|p| p.text).collect::<Vec<_>>().join(BAR_SEP)
     }
 
-    /// The row under the prompt box: what the session runs on and the keys
-    /// worth knowing on the left, connectivity (unless online) and cost on
-    /// the right.
+    /// The row under the prompt box: `<device> | <instance>/<model> | <cost>
+    /// | [N tasks] | [N subagents] | ? help`, the counts only while there is
+    /// something to count and `offline` before the help while the API
+    /// cannot be reached. Narrow, the items give way one at a time — the
+    /// device first, then the subagents, the tasks and the cost — then the
+    /// model is cut short; `? help` stays.
     fn hint_row(&self, width: usize) -> Line<'static> {
-        let (mut left, mut right) = (Vec::new(), Vec::new());
-        for (item, part) in self.status_parts() {
-            match item {
-                StatusItem::Cost => right.push((part, dim())),
-                StatusItem::Connectivity if part == "online" => {}
-                StatusItem::Connectivity if self.offline.is_some() => right.insert(0, (part, yellow())),
-                StatusItem::Connectivity => right.insert(0, (part, dim())),
-                _ => left.push(part),
+        const INDENT: usize = 2;
+        let room = width.saturating_sub(INDENT);
+        // What a key just did (Ctrl-Y), in place of the line until the next.
+        if let Some(f) = &self.flash {
+            return Line::from(vec![Span::raw(" ".repeat(INDENT.min(width))), Span::styled(clip(f, room), dim())]);
+        }
+        let mut parts = self.status_parts();
+        let used = |parts: &[Part]| parts.iter().map(|p| p.text.width()).sum::<usize>() + parts.len().saturating_sub(1) * BAR_SEP.len();
+        while used(&parts) > room {
+            // The one to give way next: the lowest rank below the model's.
+            let Some(i) = (0..parts.len()).filter(|&i| parts[i].rank < Rank::Model).min_by_key(|&i| parts[i].rank) else { break };
+            parts.remove(i);
+        }
+        if used(&parts) > room
+            && let Some(i) = parts.iter().position(|p| p.rank == Rank::Model)
+        {
+            let rest = used(&parts) - parts[i].text.width();
+            match room.checked_sub(rest) {
+                Some(left) if left >= 2 => parts[i].text = clip(&parts[i].text, left),
+                _ => {
+                    parts.remove(i);
+                }
             }
         }
-        // The working line above says how to interrupt; this says the rest.
-        match &self.flash {
-            Some(f) => left.push(f.clone()),
-            None if !self.answer.trim().is_empty() && !self.running() => left.push("/ commands · ? keys · ctrl-y copy".to_string()),
-            None => left.push("/ commands · ? keys".to_string()),
+        while used(&parts) > room && parts.len() > 1 {
+            parts.remove(0);
         }
-        let left = format!("  {}", left.join(" · "));
-        let right_width: usize = right.iter().map(|(p, _)| p.width()).sum::<usize>() + right.len().saturating_sub(1) * 3;
-        // Two spaces at least between the two sides.
-        let room = width.saturating_sub(right_width + 2);
-        let left = clip(&left, room);
-        let mut spans = vec![Span::styled(left.clone(), dim()), Span::raw(" ".repeat(width.saturating_sub(right_width + left.width())))];
-        for (i, (p, st)) in right.into_iter().enumerate() {
+        let mut spans = vec![Span::raw(" ".repeat(INDENT.min(width)))];
+        for (i, p) in parts.into_iter().enumerate() {
             if i > 0 {
-                spans.push(Span::styled(" · ", dim()));
+                spans.push(Span::styled(BAR_SEP, dim()));
             }
-            spans.push(Span::styled(p, st));
+            spans.push(Span::styled(clip(&p.text, room), p.style));
         }
         Line::from(spans)
     }
 
-    fn status_parts(&self) -> Vec<(StatusItem, String)> {
-        let mut parts: Vec<(StatusItem, String)> = Vec::new();
+    /// The status line's items, in the order drawn.
+    fn status_parts(&self) -> Vec<Part> {
+        let part = |rank, text: String| Part { rank, text, style: dim() };
+        let mut parts: Vec<Part> = Vec::new();
         for item in &self.settings.status_items {
-            let mut texts: Vec<String> = Vec::new();
             match item {
+                StatusItem::Device => {
+                    if let Some(d) = self.device.as_ref().filter(|d| !d.is_empty()) {
+                        parts.push(part(Rank::Device, d.clone()));
+                    }
+                }
+                // The instance and model as krowk names them, and the
+                // instance's limit once it is worth knowing (R-INST-6).
                 StatusItem::Model => {
                     if let Some(m) = &self.model {
-                        texts.push(m.model.clone());
-                    }
-                }
-                // Which instance, and whether it runs on a subscription or
-                // an API key: a backend's as it reported it, a native
-                // instance's key otherwise.
-                StatusItem::Instance => {
-                    if let Some(m) = &self.model {
-                        let mut part = match &self.billing {
-                            Some((i, b)) if *i == m.instance => format!("{} · {}", m.instance, if *b == Billing::Subscription { "subscription" } else { "api key" }),
-                            _ if self.vendor_instances.contains(&m.instance) => m.instance.clone(),
-                            _ => format!("{} · api key", m.instance),
-                        };
-                        // Its limit, once it is worth knowing (R-INST-6).
-                        if let Some(u) = self.instances.get(&m.instance)
-                            && u.limit.as_ref().is_some_and(|l| l.status != LimitState::Allowed)
-                            && let Some(w) = u.limit_words()
-                        {
-                            part.push_str(&format!(" · {w}"));
+                        match self.instances.get(&m.instance).and_then(InstanceUsage::limit_brief) {
+                            Some(w) => parts.push(Part { rank: Rank::Model, text: format!("{m} ({w})"), style: yellow() }),
+                            None => parts.push(part(Rank::Model, m.to_string())),
                         }
-                        texts.push(part);
                     }
                 }
-                StatusItem::Cost => texts.push(if self.unpriced && self.cost == 0.0 { "$—".into() } else { format!("${:.2}", self.cost) }),
-                StatusItem::Connectivity => texts.push(
-                    match (&self.offline, self.online_known) {
-                        (Some(_), _) => "offline",
-                        (None, true) => "online",
-                        (None, false) => "connecting…",
-                    }
-                    .into(),
-                ),
-                StatusItem::Session => {
-                    if let Some(id) = &self.session_id {
-                        texts.push(id.chars().take(8).collect());
-                    }
-                }
+                StatusItem::Cost => parts.push(part(Rank::Cost, if self.unpriced && self.cost == 0.0 { "$—".into() } else { format!("${:.2}", self.cost) })),
                 // Only while there is something to count.
-                StatusItem::Todos => {
-                    if !self.todos.is_empty() {
-                        let done = self.todos.iter().filter(|t| t.status == TodoStatus::Completed).count();
-                        texts.push(format!("todos {done}/{}", self.todos.len()));
+                StatusItem::Tasks => {
+                    let open = self.todos.iter().filter(|t| t.status != TodoStatus::Completed).count() as u32;
+                    if open > 0 {
+                        parts.push(part(Rank::Tasks, format!("[{}]", plural(open, "task"))));
                     }
                 }
                 StatusItem::Subagents => {
-                    let running = self.subs.iter().filter(|s| s.status.is_none()).count();
+                    let running = self.subs.iter().filter(|s| s.status.is_none()).count() as u32;
                     if running > 0 {
-                        texts.push(format!("{running} agent{}", if running == 1 { "" } else { "s" }));
+                        parts.push(part(Rank::Subagents, format!("[{}]", plural(running, "subagent"))));
                     }
                 }
+                StatusItem::Help => {}
             }
-            parts.extend(texts.into_iter().map(|t| (*item, t)));
+        }
+        // Whatever the list says: being offline is news (R-OFF-1).
+        if self.offline.is_some() {
+            parts.push(Part { rank: Rank::Offline, text: "offline".into(), style: yellow() });
+        }
+        if self.settings.status_items.contains(&StatusItem::Help) {
+            parts.push(part(Rank::Help, "? help".into()));
         }
         parts
     }
@@ -1319,6 +1379,13 @@ impl App {
             let mut l = format!("{name}: {} · {} tokens · {cost}", plural(u.turns, "turn"), tokens(u.tokens));
             if let Some(w) = u.limit_words() {
                 l.push_str(&format!(" · {w}"));
+            }
+            // Whether it runs on a subscription or an API key (R-INST-3):
+            // a backend's as it reported it, a native instance's key.
+            match &self.billing {
+                Some((i, b)) if i == name => l.push_str(if *b == Billing::Subscription { " · subscription" } else { " · api key" }),
+                _ if self.vendor_instances.contains(name) => {}
+                _ => l.push_str(" · api key"),
             }
             lines.push(l);
         }
@@ -1406,10 +1473,9 @@ impl App {
         }
     }
 
+    /// Online is not news: only coming back from offline redraws.
     pub fn set_online(&mut self) {
-        if self.offline.is_some() || !self.online_known {
-            self.offline = None;
-            self.online_known = true;
+        if self.offline.take().is_some() {
             self.dirty = true;
         }
     }
@@ -1675,11 +1741,22 @@ mod tests {
         let (rows, _) = a.view(Instant::now());
         let all = text(&rows).join("\n");
         assert!(all.contains("no network connectivity"), "{all}");
-        assert!(a.status_bar().contains("offline"));
+        assert!(a.status_bar().ends_with("$0.00 | offline | ? help"), "offline, just before the help: {}", a.status_bar());
+        let (rows, _) = a.view(Instant::now());
+        let bar = rows.last().unwrap();
+        assert!(bar.spans.iter().any(|s| s.content == "offline" && s.style == yellow()), "in yellow: {bar:?}");
+        // Offline shows whatever the items are.
+        a.settings.status_items = vec![StatusItem::Cost];
+        assert_eq!(a.status_bar(), "$0.00 | offline");
+        a.settings = Settings::default();
+        a.take_dirty();
         a.set_online();
+        assert!(a.take_dirty(), "coming back is redrawn");
         let (rows, _) = a.view(Instant::now());
         assert!(!text(&rows).join("\n").contains("no network"));
-        assert!(a.status_bar().contains("online"));
+        assert_eq!(a.status_bar(), "anthropic/claude-x | $0.00 | ? help", "and online is not news");
+        a.set_online();
+        assert!(!a.take_dirty(), "online again draws nothing");
     }
 
     #[test]
@@ -1718,25 +1795,35 @@ mod tests {
     }
 
     #[test]
-    fn r_inst_3_the_status_bar_shows_the_instance_and_whether_it_runs_on_a_subscription() {
-        let mut a = App::new(Editor::new(None), 40, Settings { status_bar: true, status_items: vec![StatusItem::Instance] }, Some(ModelRef { instance: "codex:team".into(), model: "gpt-5.5".into() }), None);
+    fn r_inst_3_the_session_details_say_whether_each_instance_runs_on_a_subscription() {
+        let mut a = App::new(Editor::new(None), 100, Settings { status_bar: true, status_items: vec![StatusItem::Model] }, Some(ModelRef { instance: "codex:team".into(), model: "gpt-5.5".into() }), None);
         a.vendor_instances = vec!["codex:team".into(), "codex:personal".into()];
-        assert_eq!(a.status_bar(), "codex:team", "nothing is assumed before Codex says");
+        a.overlay = Overlay::Details;
+        let details = |a: &App| text(&a.view(Instant::now()).0).join("\n");
         let turn = |instance: &str| LogBody::TurnStarted { turn_id: "t".into(), model: ModelRef { instance: instance.into(), model: "gpt-5.5".into() }, provider: "openai".into(), wire_api: WireApi::CodexAppServer, permission_mode: PermissionMode::Default, effort: None };
         let session = |b: Billing| LogBody::BackendSession { turn_id: "t".into(), backend: "codex-app-server".into(), vendor_session_id: "th".into(), transcript_path: None, billing: Some(b) };
         a.on_line(&log(turn("codex:team")));
+        let billed = |a: &App, i: &str| details(a).lines().find(|l| l.starts_with(&format!("{i}:"))).map(|l| if l.ends_with(" · subscription") { "subscription" } else if l.ends_with(" · api key") { "api key" } else { "" }.to_string());
+        assert_eq!(billed(&a, "codex:team").as_deref(), Some(""), "nothing is assumed before Codex says: {}", details(&a));
         a.on_line(&log(session(Billing::Subscription)));
-        assert_eq!(a.status_bar(), "codex:team · subscription");
+        assert_eq!(billed(&a, "codex:team").as_deref(), Some("subscription"), "{}", details(&a));
+        assert_eq!(a.status_bar(), "codex:team/gpt-5.5", "and the status line does not say");
         a.on_line(&log(turn("codex:personal")));
-        assert_eq!(a.status_bar(), "codex:personal", "another instance's billing is not this one's");
+        assert_eq!(billed(&a, "codex:personal").as_deref(), Some(""), "another instance's billing is not this one's: {}", details(&a));
         a.on_line(&log(session(Billing::ApiKey)));
-        assert_eq!(a.status_bar(), "codex:personal · api key");
+        assert_eq!(billed(&a, "codex:personal").as_deref(), Some("api key"), "{}", details(&a));
+        a.vendor_instances.clear();
+        a.billing = None;
+        assert_eq!(billed(&a, "codex:team").as_deref(), Some("api key"), "a native instance runs on its key");
     }
 
     #[test]
     fn r_tui_2_the_status_bar_follows_its_settings() {
         let mut a = app();
-        assert_eq!(a.status_bar(), "claude-x │ anthropic · api key │ $0.00 │ connecting…");
+        a.device = Some("elvinas/primevise-arch-1".into());
+        assert_eq!(a.status_bar(), "elvinas/primevise-arch-1 | anthropic/claude-x | $0.00 | ? help", "the template, nothing to count yet");
+        a.settings = Settings { status_bar: true, status_items: vec![StatusItem::Help, StatusItem::Cost, StatusItem::Model] };
+        assert_eq!(a.status_bar(), "$0.00 | anthropic/claude-x | ? help", "in the order given, the help last");
         a.settings = Settings { status_bar: true, status_items: vec![StatusItem::Cost] };
         assert_eq!(a.status_bar(), "$0.00");
         a.settings.status_bar = false;
@@ -1757,17 +1844,98 @@ mod tests {
         assert_eq!(t[0], format!("┌{}┐", "─".repeat(88)));
         assert!(t[1].starts_with("│ → Plan, search, build anything") && t[1].ends_with(" │") && t[1].chars().count() == 90, "{:?}", t[1]);
         assert_eq!(t[2], format!("└{}┘", "─".repeat(88)));
-        assert!(t[3].starts_with("  claude-x · anthropic · api key · / commands · ? keys") && t[3].ends_with("connecting… · $0.00"), "{:?}", t[3]);
-        assert_eq!(t[3].chars().count(), 90, "cost at the right edge");
+        assert_eq!(t[3], "  anthropic/claude-x | $0.00 | ? help", "one line, no device known");
+        assert_eq!(t.len(), 4);
         assert_eq!(caret, (4, 1));
-        a.online_known = true;
-        let (rows, _) = a.view(Instant::now());
-        let t = text(&rows);
-        assert!(t[3].ends_with("$0.00") && !t[3].contains("online"), "online is not news: {:?}", t[3]);
-        a.width = 40;
-        let (rows, _) = a.view(Instant::now());
-        let t = text(&rows);
-        assert!(t[3].ends_with("  $0.00") && t[3].contains('…') && t[3].chars().count() == 40, "narrow, the left side gives way: {:?}", t[3]);
+    }
+
+    #[test]
+    fn the_status_line_follows_the_template() {
+        let mut a = app();
+        a.set_width(120);
+        a.device = Some("elvinas/primevise-arch-1".into());
+        a.model = Some(ModelRef { instance: "anthropic".into(), model: "claude-opus-5-5".into() });
+        a.on_line(&live(LiveEvent::Cost { session_id: "s".into(), turn_id: "t".into(), cost_usd: Some(21.4666), turn_cost_usd: Some(1.0), generated_tokens: 1 }));
+        let todo = |s| Todo { content: "x".into(), status: s };
+        a.on_line(&log(LogBody::TodosUpdated { turn_id: "t".into(), todos: vec![todo(TodoStatus::Completed), todo(TodoStatus::InProgress), todo(TodoStatus::Pending), todo(TodoStatus::Pending), todo(TodoStatus::Pending)] }));
+        for k in ["k1", "k2", "k3"] {
+            a.subs.push(Sub::new(k));
+        }
+        let bar = |a: &App| text(&a.view(Instant::now()).0).last().unwrap().clone();
+        assert_eq!(bar(&a), "  elvinas/primevise-arch-1 | anthropic/claude-opus-5-5 | $21.47 | [4 tasks] | [3 subagents] | ? help");
+        assert_eq!(a.status_bar(), "elvinas/primevise-arch-1 | anthropic/claude-opus-5-5 | $21.47 | [4 tasks] | [3 subagents] | ? help");
+        // One of each is said in the singular.
+        a.on_line(&log(LogBody::TodosUpdated { turn_id: "t".into(), todos: vec![todo(TodoStatus::Completed), todo(TodoStatus::InProgress)] }));
+        a.subs[1].status = Some(TurnStatus::Completed);
+        a.subs[2].status = Some(TurnStatus::Failed);
+        assert_eq!(a.status_bar(), "elvinas/primevise-arch-1 | anthropic/claude-opus-5-5 | $21.47 | [1 task] | [1 subagent] | ? help");
+        // Nothing open, nothing running: neither is there.
+        a.on_line(&log(LogBody::TodosUpdated { turn_id: "t".into(), todos: vec![todo(TodoStatus::Completed)] }));
+        a.subs.clear();
+        assert_eq!(a.status_bar(), "elvinas/primevise-arch-1 | anthropic/claude-opus-5-5 | $21.47 | ? help");
+        // A price not known is not a price of nothing.
+        let mut b = app();
+        b.on_line(&live(LiveEvent::Cost { session_id: "s".into(), turn_id: "t".into(), cost_usd: None, turn_cost_usd: None, generated_tokens: 1 }));
+        b.on_line(&live(LiveEvent::Result(RunResult { session_id: "s".into(), turn_id: "t".into(), status: TurnStatus::Completed, is_error: false, result: String::new(), model: ModelRef { instance: "anthropic".into(), model: "claude-x".into() }, usage: Usage::default(), cost_usd: None, duration_ms: 1, num_model_calls: 1, error: None, unread_steers: Vec::new(), switch_offer: None })));
+        assert_eq!(b.status_bar(), "anthropic/claude-x | $— | ? help");
+    }
+
+    #[test]
+    fn the_working_line_never_has_two_durations() {
+        let mut a = app();
+        a.set_width(100);
+        let t0 = Instant::now();
+        a.start_turn(t0);
+        a.turn.as_mut().unwrap().tool_running = true;
+        let working = |a: &App, at: Instant| text(&a.view(at).0).into_iter().find(|r| r.contains("esc to interrupt")).unwrap();
+        let durations = |row: &str| row.split(|c: char| !c.is_ascii_alphanumeric() && c != '.').filter(|w| w.len() > 1 && w.ends_with('s') && w[..w.len() - 1].chars().all(|c| c.is_ascii_digit() || c == '.')).count();
+        a.calls.push(Call { call_id: "s1".into(), name: "subagent".into(), input: serde_json::json!({"description": "x"}) });
+        a.subs.push(Sub::new("k1"));
+        a.subs.push(Sub::new("k2"));
+        let row = working(&a, t0 + Duration::from_secs(10));
+        assert!(row.contains("Waiting on 2 subagents… 10s"), "only subagent calls out: {row:?}");
+        assert_eq!(durations(&row), 1, "{row:?}");
+        a.calls.push(Call { call_id: "c1".into(), name: "read".into(), input: serde_json::json!({"path": "README.md"}) });
+        let row = working(&a, t0 + Duration::from_secs(10));
+        assert!(row.contains("Running Read README.md… 10s"), "the first call that is not a subagent's: {row:?}");
+        assert_eq!(durations(&row), 1, "the turn's clock only: {row:?}");
+        a.calls.clear();
+        a.subs.clear();
+        assert!(working(&a, t0 + Duration::from_secs(10)).contains("Running… 10s"));
+    }
+
+    #[test]
+    fn the_status_line_follows_a_switch_of_model() {
+        let mut a = app();
+        a.on_line(&log(switch_turn("claude:work", "haiku")));
+        assert_eq!(a.status_bar(), "claude:work/haiku | $0.00 | ? help");
+    }
+
+    #[test]
+    fn a_narrow_status_line_gives_way_from_the_device_and_keeps_the_help() {
+        let mut a = app();
+        a.device = Some("elvinas/primevise-arch-1".into());
+        a.model = Some(ModelRef { instance: "anthropic".into(), model: "claude-opus-5-5".into() });
+        let todo = |s| Todo { content: "x".into(), status: s };
+        a.on_line(&log(LogBody::TodosUpdated { turn_id: "t".into(), todos: vec![todo(TodoStatus::Pending), todo(TodoStatus::Pending)] }));
+        a.subs.push(Sub::new("k1"));
+        let at = |a: &mut App, w: u16| {
+            a.set_width(w);
+            let row = text(&a.view(Instant::now()).0).last().unwrap().clone();
+            assert!(row.width() <= usize::from(w), "{w}: wider than the terminal: {row:?}");
+            row
+        };
+        assert_eq!(at(&mut a, 100), "  elvinas/primevise-arch-1 | anthropic/claude-opus-5-5 | $0.00 | [2 tasks] | [1 subagent] | ? help");
+        assert_eq!(at(&mut a, 80), "  anthropic/claude-opus-5-5 | $0.00 | [2 tasks] | [1 subagent] | ? help", "the device first");
+        assert_eq!(at(&mut a, 60), "  anthropic/claude-opus-5-5 | $0.00 | [2 tasks] | ? help", "then the subagents");
+        assert_eq!(at(&mut a, 48), "  anthropic/claude-opus-5-5 | $0.00 | ? help", "then the tasks");
+        assert_eq!(at(&mut a, 40), "  anthropic/claude-opus-5-5 | ? help", "then the cost");
+        assert_eq!(at(&mut a, 30), "  anthropic/claude-o… | ? help", "then the model is cut short");
+        assert_eq!(at(&mut a, 12), "  ? help", "the help stays");
+        a.set_offline("api.anthropic.com:443".into());
+        assert_eq!(at(&mut a, 40), "  anthropic/claude-o… | offline | ? help", "offline outlasts the rest");
+        assert_eq!(at(&mut a, 20), "  offline | ? help");
+        assert_eq!(at(&mut a, 4), "  ?…");
     }
 
     #[test]
@@ -1824,7 +1992,7 @@ mod tests {
         a.on_line(&live(LiveEvent::Cost { session_id: "k1".into(), turn_id: "u".into(), cost_usd: Some(0.02), turn_cost_usd: Some(0.02), generated_tokens: 500 }));
         a.on_line(&child_log("k2", LogBody::TurnCompleted { turn_id: "v".into(), status: TurnStatus::Interrupted, usage: Usage::default(), duration_ms: 900, error: None, reported_cost_usd: None }));
         assert!(a.take_pending().is_empty(), "nothing of a child's reaches the conversation");
-        assert_eq!(a.status_bar(), "claude-x │ anthropic · api key │ $0.00 │ 1 agent │ connecting…", "a child's cost frame is its line's, not the session's");
+        assert_eq!(a.status_bar(), "anthropic/claude-x | $0.00 | [1 subagent] | ? help", "a child's cost frame is its line's, not the session's");
         let (rows, _) = a.view(Instant::now());
         let rows = text(&rows);
         let lines: Vec<&String> = rows.iter().filter(|r| r.contains("Agent ")).collect();
@@ -1853,11 +2021,11 @@ mod tests {
     #[test]
     fn r_todo_3_the_todo_list_is_an_optional_overlay_and_a_reminder_is_krowks() {
         let mut a = app();
-        a.settings = Settings { status_bar: true, status_items: vec![StatusItem::Todos] };
+        a.settings = Settings { status_bar: true, status_items: vec![StatusItem::Tasks] };
         assert_eq!(a.status_bar(), "", "no list, no item");
         let todo = |c: &str, s| Todo { content: c.into(), status: s };
         a.on_line(&log(LogBody::TodosUpdated { turn_id: "t".into(), todos: vec![todo("read", TodoStatus::Completed), todo("fix", TodoStatus::InProgress), todo("test", TodoStatus::Pending)] }));
-        assert_eq!(a.status_bar(), "todos 1/3");
+        assert_eq!(a.status_bar(), "[2 tasks]", "the open ones: pending or in progress");
         a.overlay = Overlay::Todos;
         let (rows, _) = a.view(Instant::now());
         assert_eq!(&text(&rows)[..3], ["☑ read", "◐ fix", "☐ test"]);
@@ -1971,7 +2139,7 @@ mod tests {
     fn r_inst_6_usage_and_limits_are_shown_per_instance() {
         let mut a = app();
         a.set_width(160);
-        a.settings = Settings { status_bar: true, status_items: vec![StatusItem::Instance] };
+        a.settings = Settings { status_bar: true, status_items: vec![StatusItem::Model] };
         let usage = Usage { input_tokens: 1000, output_tokens: 200, ..Usage::default() };
         let response = |model: &str| LogBody::ResponseCompleted { turn_id: "t".into(), response_id: None, model: model.into(), usage, stop_reason: None, item_ids: Vec::new() };
         let done = LogBody::TurnCompleted { turn_id: "t".into(), status: TurnStatus::Completed, usage, duration_ms: 1, error: None, reported_cost_usd: None };
@@ -1985,11 +2153,19 @@ mod tests {
         a.on_line(&live(LiveEvent::Limits { session_id: "s".into(), turn_id: "t".into(), instance: "claude:work".into(), limit: LimitStatus { status: LimitState::Warning, window: Some("five_hour".into()), used_percent: Some(82.0), resets_at_ms: None } }));
         a.on_line(&cost(0.35));
         a.on_line(&log(done));
-        assert_eq!(a.status_bar(), "claude:work · api key · 82% used of five_hour", "the instance's limit, once it is near");
+        assert_eq!(a.status_bar(), "claude:work/sonnet (82% of 5-hour)", "the instance's limit, once it is near");
+        a.on_line(&live(LiveEvent::Limits { session_id: "s".into(), turn_id: "t".into(), instance: "claude:work".into(), limit: LimitStatus { status: LimitState::Warning, window: Some("seven_day".into()), used_percent: Some(78.0), resets_at_ms: None } }));
+        assert_eq!(a.status_bar(), "claude:work/sonnet (78% of 7-day)");
         a.overlay = Overlay::Details;
         let rows = text(&a.view(Instant::now()).0).join("\n");
         assert!(rows.contains("anthropic: 1 turn · 1.2k tokens · $0.25"), "{rows}");
-        assert!(rows.contains("claude:work: 1 turn · 1.2k tokens · $0.35 · 82% used of five_hour"), "{rows}");
+        assert!(rows.contains("claude:work: 1 turn · 1.2k tokens · $0.35 · 78% used of seven_day"), "{rows}");
+        a.on_line(&live(LiveEvent::Limits { session_id: "s".into(), turn_id: "t".into(), instance: "claude:work".into(), limit: LimitStatus { status: LimitState::Allowed, window: Some("seven_day".into()), used_percent: Some(20.0), resets_at_ms: None } }));
+        assert_eq!(a.status_bar(), "claude:work/sonnet", "shown only while it is near");
+        a.on_line(&live(LiveEvent::Limits { session_id: "s".into(), turn_id: "t".into(), instance: "claude:work".into(), limit: LimitStatus { status: LimitState::Limited, window: Some("five_hour".into()), used_percent: Some(100.0), resets_at_ms: None } }));
+        assert_eq!(a.status_bar(), "claude:work/sonnet (limited)");
+        assert_eq!(super::window_name("seven_day_opus"), "7-day opus");
+        assert_eq!(super::window_name("requests"), "requests");
     }
 
     #[test]

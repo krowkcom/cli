@@ -72,7 +72,7 @@ pub fn startup(bin: &Path, home: &Path, runs: usize) -> Outcome {
             std::thread::sleep(Duration::from_micros(200));
         };
         let ms = first.duration_since(t.started).as_secs_f64() * 1000.0;
-        if !t.text().contains("anything") {
+        if !t.text().contains("? help") {
             return Err(format!("the first frame is not the prompt: {:?}", t.text()));
         }
         quit(&mut t)?;
@@ -102,15 +102,7 @@ pub fn idle(bin: &Path, home: &Path, window: Duration) -> Result<Idle, String> {
     let mut t = pty::Pty::spawn(tui(bin, home, &m.url, &[]), COLS, ROWS);
     let pid = t.child.id();
     let result = (|| {
-        // Online is not shown: the probe has answered once a frame has
-        // taken "connecting…" off the row under the prompt.
-        let t0 = Instant::now();
-        while !t.text().rsplit_once("connecting").is_some_and(|(_, after)| after.contains("$0.00")) {
-            if t0.elapsed() > Duration::from_secs(10) {
-                return Err(format!("the TUI never reached its prompt: {:?}", t.text()));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        t.wait_for("? help", Duration::from_secs(10)).ok_or_else(|| format!("the TUI never reached its prompt: {:?}", t.text()))?;
         // What is left of start-up — the probe's blocking thread above
         // all, kept alive a quarter of a second — settles well inside this.
         std::thread::sleep(Duration::from_secs(2));
@@ -155,7 +147,7 @@ pub fn turn_cpu(bin: &Path, home: &Path, window: Duration) -> Outcome {
         let mut t = pty::Pty::spawn(tui(bin, home, &url, &[]), COLS, ROWS);
         let pid = t.child.id();
         let r = (|| {
-            t.wait_for("anything", Duration::from_secs(10)).ok_or("the TUI never reached its prompt")?;
+            t.wait_for("? help", Duration::from_secs(10)).ok_or("the TUI never reached its prompt")?;
             t.write(b"wait\r");
             t.wait_for("esc to interrupt", Duration::from_secs(10)).ok_or("the turn never started")?;
             // Past the start: the request out, the stall probe answered.
@@ -181,7 +173,7 @@ pub fn redraw(bin: &Path, home: &Path) -> Outcome {
     let m = provider(move || mock::Reply::paced(body.clone(), Duration::from_millis(2)));
     let mut t = pty::Pty::spawn(tui(bin, home, &m.url, &[]), COLS, ROWS);
     let result = (|| {
-        t.wait_for("anything", Duration::from_secs(10)).ok_or("the TUI never reached its prompt")?;
+        t.wait_for("? help", Duration::from_secs(10)).ok_or("the TUI never reached its prompt")?;
         let before = t.frames().len();
         let t0 = Instant::now();
         t.write(b"stream\r");

@@ -27,6 +27,11 @@
 //! the tool result it was sent back, word for word — what the model read,
 //! for watching a permission rule, an approval or a hook decide a call.
 //!
+//! `fan-out` writes a todo list of five (one done, one in progress, three
+//! to do), then starts one subagent, then answers; the subagent answers
+//! slowly — a line every two seconds, for a minute — so the TUI's status
+//! line can be seen counting both.
+//!
 //! `--long LINES` answers every prompt instead with that many numbered lines
 //! (about twelve tokens each), streamed at `--rate TOKENS` a second (default
 //! 500): the long, steady answer the TUI's scrollback and redraw checks
@@ -39,7 +44,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut port = "8788".to_string();
     let (mut long, mut rate, mut edit, mut read_edit, mut pace, mut fail) = (0usize, 500u64, false, false, 0u64, 0u16);
-    let (mut publish, mut reread): (Option<String>, bool) = (None, false);
+    let (mut publish, mut reread, mut fan_out): (Option<String>, bool, bool) = (None, false, false);
     let mut tool: Option<(String, serde_json::Value)> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -51,6 +56,7 @@ fn main() {
             "read-edit" => read_edit = true,
             "publish" => publish = Some(args.next().expect("publish FILE")),
             "reread" => reread = true,
+            "fan-out" => fan_out = true,
             "tool" => {
                 let name = args.next().expect("tool NAME JSON");
                 let input = args.next().and_then(|j| serde_json::from_str(&j).ok()).expect("tool NAME JSON: the input as JSON");
@@ -74,7 +80,9 @@ fn main() {
             return mock::Reply::json(fail, &serde_json::json!({"type": "error", "error": {"type": kind, "message": "the stand-in was told to fail"}}));
         }
         let answered = body["messages"].as_array().and_then(|m| m.last()).and_then(|m| m["content"].as_array()).is_some_and(|c| c.iter().any(|b| b["type"] == "tool_result"));
-        let reply = if reread {
+        let reply = if fan_out {
+            return fan_out_script(body, &tools);
+        } else if reread {
             let call = mock::tool_use(&format!("toolu_{n:02}"), "read", &serde_json::json!({"path": "README.md"}));
             mock::Reply::sse(&call.replace("\"cache_read_input_tokens\":0", "\"cache_read_input_tokens\":20000"))
         } else if let Some(file) = publish.as_ref().filter(|_| !answered) {
@@ -105,6 +113,27 @@ fn main() {
     eprintln!("mock: Anthropic stand-in on {}", m.url);
     loop {
         std::thread::park();
+    }
+}
+
+/// The todo list, then a subagent, then the answer; a subagent's own
+/// request — it is offered no `subagent` of its own — answers slowly.
+fn fan_out_script(body: &serde_json::Value, tools: &[&str]) -> mock::Reply {
+    if !tools.contains(&"subagent") {
+        return mock::Reply::paced(mock::text_stream(&mock::numbered_lines(30)), std::time::Duration::from_secs(2));
+    }
+    let results = body["messages"].as_array().into_iter().flatten().flat_map(|m| m["content"].as_array().into_iter().flatten()).filter(|b| b["type"] == "tool_result").count();
+    let todos = serde_json::json!({"todos": [
+        {"content": "read the code", "status": "completed"},
+        {"content": "fix the bug", "status": "in_progress"},
+        {"content": "write the test", "status": "pending"},
+        {"content": "update the docs", "status": "pending"},
+        {"content": "open the PR", "status": "pending"},
+    ]});
+    match results {
+        0 => mock::Reply::sse(&mock::tool_use("toolu_todos", "todo_write", &todos)),
+        1 => mock::Reply::sse(&mock::tool_use("toolu_sub", "subagent", &serde_json::json!({"description": "survey the tests", "prompt": "read the tests and list them"}))),
+        _ => mock::Reply::sse(&mock::text_stream("The subagent is done and the list is under way.")),
     }
 }
 

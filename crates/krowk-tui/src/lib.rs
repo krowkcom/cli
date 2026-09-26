@@ -23,6 +23,7 @@
 
 pub mod app;
 pub mod card;
+pub mod clipboard;
 pub mod device;
 pub mod presence;
 pub mod editor;
@@ -159,7 +160,7 @@ async fn session(opts: Options) -> Outcome {
 
     let sessions_dir = opts.host.sessions_dir.clone();
     let pricer: Pricer = opts.host.pricer.clone();
-    let mut app = App::new(Editor::new(opts.history_file.clone()), size.width, opts.settings.clone(), None, Some(pricer));
+    let mut app = App::new(Editor::new(opts.history_file.clone()), inner(size.width), opts.settings.clone(), None, Some(pricer));
     app.log_dir = Some(sessions_dir.display().to_string());
     app.permission_mode = serde_json::to_value(opts.permission_mode).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
     if let Some(id) = &opts.resume {
@@ -192,6 +193,7 @@ async fn session(opts: Options) -> Outcome {
     let mut term = match Term::new(stdout, size, top, initial_height) {
         Ok(mut t) => {
             t.reflows = term::reflows_from(&|k| std::env::var(k).unwrap_or_default());
+            t.pad = PAD;
             // Saved only once there is a TUI to put it back on the way out.
             let _ = std::io::stdout().write_all(term::TITLE_SAVE);
             t
@@ -335,6 +337,15 @@ fn cursor_row() -> Option<u16> {
 fn cursor_row() -> Option<u16> {
     let _ = crossterm::event::poll(Duration::ZERO);
     (0..2).find_map(|_| crossterm::cursor::position().ok()).map(|(_, y)| y)
+}
+
+/// Columns of padding on each side of everything the TUI draws.
+const PAD: u16 = 2;
+
+/// The width the app lays out in, inside the padding (none on a terminal
+/// too narrow to spare it).
+fn inner(width: u16) -> u16 {
+    if width > 2 * PAD + 10 { width - 2 * PAD } else { width.max(1) }
 }
 
 /// Scrolls the rows above `top` off the screen into scrollback, with line
@@ -609,6 +620,18 @@ impl<'h> Ui<'h> {
         if let Some(title) = self.presence.update(state, &self.last_prompt) {
             term.title(&title)?;
         }
+        if std::mem::take(&mut app.copy) {
+            // What was shown, not what was sent: no escape or bidi control
+            // reaches the place it is pasted.
+            let text: String = app.answer.trim_end().split('\n').map(|l| card::clean(&l.replace('\t', "    "))).collect::<Vec<_>>().join("\n");
+            app.flash = Some(if text.len() > clipboard::MAX {
+                format!("the answer is too long to copy ({} KB)", text.len() / 1024)
+            } else {
+                term.clipboard(&text)?;
+                clipboard::system(&text);
+                format!("sent the last answer to the clipboard ({} lines)", text.lines().count())
+            });
+        }
         term.frame(&lines, &rows, caret)
     }
 
@@ -714,7 +737,7 @@ impl<'h> Ui<'h> {
         self.keys = None;
         term.resize(Size { width: w.max(1), height: h.max(1) }, cursor_row())?;
         self.keys = Some(EventStream::new());
-        app.set_width(w);
+        app.set_width(inner(w));
         Ok(())
     }
 
@@ -743,7 +766,7 @@ impl<'h> Ui<'h> {
             let (w, h) = crossterm::terminal::size().unwrap_or((term.size().width, term.size().height));
             term.resume(Size { width: w.max(1), height: h.max(1) }, cursor_row())?;
             self.keys = Some(EventStream::new());
-            app.set_width(w);
+            app.set_width(inner(w));
         }
         #[cfg(not(unix))]
         let _ = (app, term);
@@ -754,6 +777,7 @@ impl<'h> Ui<'h> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         app.touch();
+        app.flash = None;
         // A call waiting for the person's say takes the keys that answer it
         // (R-PERM-2): y once, s for the session, p for the project, n or
         // Esc no, v to print a request that was cut to fit (its y/s/p work
@@ -896,6 +920,13 @@ impl<'h> Ui<'h> {
                     app.overlay = Overlay::None;
                 } else if app.running() {
                     self.interrupt(app).await;
+                }
+            }
+            KeyCode::Char('y') if ctrl => {
+                if app.answer.trim().is_empty() {
+                    app.flash = Some("nothing to copy yet".into());
+                } else {
+                    app.copy = true;
                 }
             }
             KeyCode::Char('o') if ctrl => app.overlay = if app.overlay == Overlay::Details { Overlay::None } else { Overlay::Details },

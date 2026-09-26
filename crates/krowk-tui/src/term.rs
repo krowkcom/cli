@@ -389,14 +389,15 @@ impl<W: Write> Term<W> {
         // at the last column rather than wrapped onto the next row, or off
         // the bottom one, which would scroll the screen under the cursor.
         self.buf.clone().write_all(AUTOWRAP_OFF)?;
-        self.terminal.draw(|f| {
+        let drawn = self.terminal.draw(|f| {
             let area = f.area();
             for (i, row) in rows.iter().enumerate().take(usize::from(area.height)) {
                 f.buffer_mut().set_line(area.x, area.y + i as u16, row, width);
             }
             f.set_cursor_position((area.x + caret.0.min(width.saturating_sub(1)), area.y + caret.1.min(area.height.saturating_sub(1))));
-        })?;
+        });
         self.buf.clone().write_all(AUTOWRAP_ON)?;
+        drawn?;
         self.widths = rows.iter().take(shown).map(|r| (r.width() as u16).min(width)).collect();
         let top = self.top();
         if let Some(Position { x, y }) = completed_cursor(&mut self.terminal) {

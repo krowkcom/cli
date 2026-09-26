@@ -679,8 +679,11 @@ fn r_perm_1_a_settings_error_is_named_before_the_trust_question() {
     std::fs::write(b.root.join("home/.config/krowk/config.json"), r#"{"permissions": {"deny": ["Read(.env"]}}"#).unwrap();
     let mut t = pty::Pty::spawn(b.command("http://127.0.0.1:9", &[]), 80, 24);
     let st = t.wait(Duration::from_secs(10)).expect("krowk exits");
+    // The process can be gone before the pty's reader has taken the last
+    // of what it wrote: read until the words are there, or a deadline.
+    assert!(t.wait_for("bad_settings", Duration::from_secs(5)).is_some() && t.wait_for("permissions.deny", Duration::from_secs(5)).is_some(), "{:?}", t.text());
     let out = t.text();
-    assert!(!st.success() && out.contains("bad_settings") && out.contains("permissions.deny"), "{out:?}");
+    assert!(!st.success(), "{st}");
     assert!(!out.contains("Trust "), "no trust question was asked: {out:?}");
     assert!(!b.root.join("home/.config/krowk/trusted.json").exists(), "and none saved");
 }

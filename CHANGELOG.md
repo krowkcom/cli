@@ -207,8 +207,13 @@ the versions are the `v*` tags a release is cut from. Entries land under
   whole. The prompt sits
   at the bottom of the terminal, what was on screen moved down to meet
   it, so narrowing the window never leaves a copy of it in scrollback.
-  **Known limits:** krowk takes a terminal to reflow on resize unless it is
-  real xterm (`XTERM_VERSION`) or the Linux console; one that is taken
+  Resizing mid-answer neither repeats nor drops the line being streamed:
+  every frame moves from the cursor rather than to numbered rows, so one
+  the terminal reads after it has changed size still lands where it
+  should, and a shorter window scrolls the conversation up rather than
+  clearing a line of it. **Known limits:** a resize the terminal takes in
+  the middle of a single frame can still cost that line; krowk takes a
+  terminal to reflow on resize unless it is real xterm (`XTERM_VERSION`) or the Linux console; one that is taken
   wrongly can leave a copy of the prompt area in scrollback, or blank a
   few lines above it. A live region that reflows taller than the whole
   screen (a very narrow window under a long overlay) leaves its top rows in

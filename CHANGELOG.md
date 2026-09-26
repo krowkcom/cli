@@ -212,12 +212,14 @@ the versions are the `v*` tags a release is cut from. Entries land under
   the terminal reads after it has changed size still lands where it
   should, and a shorter window scrolls the conversation up rather than
   clearing a line of it. **Known limits:** a resize the terminal takes in
-  the middle of a single frame can still cost that line; krowk takes a
-  terminal to reflow on resize unless it is real xterm (`XTERM_VERSION`)
-  or the Linux console; one that is taken wrongly can leave a copy of the
-  prompt area in scrollback, or blank a few lines above it. A live region that reflows taller than the whole
-  screen (a very narrow window under a long overlay) leaves its top rows in
-  scrollback. Steering an interrupted turn never read comes back into the
+  the middle of a single frame can still cost that line, and a frame read
+  after the window narrowed below the width of a row above the prompt can
+  blank a line above the prompt area; krowk takes a terminal to reflow on
+  resize unless it is real xterm (`XTERM_VERSION`) or the Linux console;
+  one that is taken wrongly can leave a copy of the prompt area in
+  scrollback, or blank a few lines above it. A live region that reflows
+  taller than the whole screen (a very narrow window under a long overlay)
+  leaves its top rows in scrollback. Steering an interrupted turn never read comes back into the
   prompt, and on `-p`'s result as `unreadSteers`. With stdin
   or stdout not a terminal, bare `krowk` prints exactly what it always has.
 - **`krowk -p "…"` runs krowk's own agent, headless, on the Anthropic API.**

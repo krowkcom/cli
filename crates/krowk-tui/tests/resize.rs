@@ -163,6 +163,13 @@ fn r_tui_3_a_narrower_screen_is_measured_as_it_reflowed_when_the_cursor_goes_una
 }
 
 #[test]
+fn r_tui_3_a_frame_read_after_a_narrowing_past_a_live_row_cuts_the_row_rather_than_wrapping_it() {
+    // The 55-column status bar, drawn for 100 columns and read at 40: wrapped
+    // off the bottom row it would scroll the screen, and the caret with it.
+    shrunk_around_a_frame("narrow-race", (40, 30), false, true);
+}
+
+#[test]
 fn r_tui_3_a_frame_the_terminal_reads_after_it_resized_still_lands_on_the_region() {
     // Drawn for 100x30 and read at 70x20: its moves from the caret still
     // start at the region's top, where absolute rows would clamp to the

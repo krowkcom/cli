@@ -29,6 +29,10 @@
 //!   one. The terminal keeps the cursor on the caret through a resize, so a
 //!   frame that moves up and down from it still starts at the region's top
 //!   and still leaves the cursor on the caret, whichever size it is read at.
+//!   Its cells are drawn with autowrap off, so a row wider than the screen
+//!   it is read at is cut rather than pushed onto the next row. What is left:
+//!   such a row above the caret, cut, is measured after the resize as if the
+//!   terminal had reflowed it, and the clear starts that many rows too high.
 //!   The row it is on is tracked, not re-read: a glyph the terminal draws
 //!   wider than `unicode-width` says would put that off until the next
 //!   resize or job stop asks the terminal again.
@@ -41,7 +45,6 @@
 //!   handled here instead: the old live region is cleared from its top down
 //!   and the viewport rebuilt in place.
 
-use crossterm::cursor::MoveTo;
 use crossterm::terminal::{Clear, ClearType as CtClear};
 use crossterm::{queue, QueueableCommand};
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
@@ -56,6 +59,9 @@ use std::rc::Rc;
 /// Begin and end synchronized update (DEC private mode 2026).
 pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 pub const SYNC_END: &[u8] = b"\x1b[?2026l";
+/// Autowrap off and on again (DECAWM), around the live region's cells.
+const AUTOWRAP_OFF: &[u8] = b"\x1b[?7l";
+const AUTOWRAP_ON: &[u8] = b"\x1b[?7h";
 
 /// Where a frame's bytes collect until the frame is done, and the row they
 /// leave the cursor on. ratatui flushes its writer after almost every
@@ -378,6 +384,11 @@ impl<W: Write> Term<W> {
             self.emit(lines, height)?;
         }
         let shown = usize::from(self.height);
+        // The live region is drawn with autowrap off: a row wider than the
+        // screen it is read at — a frame drawn before a narrowing — is cut
+        // at the last column rather than wrapped onto the next row, or off
+        // the bottom one, which would scroll the screen under the cursor.
+        self.buf.clone().write_all(AUTOWRAP_OFF)?;
         self.terminal.draw(|f| {
             let area = f.area();
             for (i, row) in rows.iter().enumerate().take(usize::from(area.height)) {
@@ -385,6 +396,7 @@ impl<W: Write> Term<W> {
             }
             f.set_cursor_position((area.x + caret.0.min(width.saturating_sub(1)), area.y + caret.1.min(area.height.saturating_sub(1))));
         })?;
+        self.buf.clone().write_all(AUTOWRAP_ON)?;
         self.widths = rows.iter().take(shown).map(|r| (r.width() as u16).min(width)).collect();
         let top = self.top();
         if let Some(Position { x, y }) = completed_cursor(&mut self.terminal) {
@@ -457,16 +469,11 @@ impl<W: Write> Term<W> {
         let height = self.height.clamp(1, size.height.max(1));
         // A cursor near the bottom keeps its row: the rebuild scrolls what
         // the shell printed up, rather than clearing it.
-        let top = cursor_row.unwrap_or(size.height.saturating_sub(height)).min(size.height.saturating_sub(1));
-        // Where the shell left the cursor is known only if the terminal
-        // said; otherwise the region's row is gone to by its number.
-        match cursor_row {
-            Some(row) => self.buf.set_row(row),
-            None => {
-                queue!(self.buf.clone(), MoveTo(0, top))?;
-                self.buf.set_row(top);
-            }
-        }
+        // Unknown, the cursor is taken to be on the last row: the line
+        // feeds that reserve the region only move down or scroll, so nothing
+        // the shell printed is cleared wherever it really is.
+        let top = cursor_row.unwrap_or(size.height.saturating_sub(1)).min(size.height.saturating_sub(1));
+        self.buf.set_row(top);
         let top = anchor(&self.buf, size, top, height)?;
         self.rebuild(top, height)?;
         self.drawn_width = size.width;

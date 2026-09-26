@@ -137,7 +137,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   signed-in answer is remembered for a minute in the TUI, so switching
   back and forth does not re-ask; a signed-out one is asked again every
   time, so signing in in another terminal works at once. Before a turn the
-  vendor is asked in the (trusted) repository, so a project that signs
+  vendor is asked in the session's own directory, once its repository is
+  trusted — where the turn will start it — so a project that signs
   Claude Code in through its own settings — Bedrock, Vertex, an
   `apiKeyHelper` — still runs; `krowk status` and `providers list` ask in
   a directory of krowk's own, where such an account shows `not signed

@@ -20,8 +20,10 @@
 //! make the login moot there (Bedrock or Vertex in its `env`, an
 //! `apiKeyHelper`); Codex reads a project's `.codex/config.toml` the same
 //! way (a `model_provider` that needs no OpenAI login). So a `Probe` names
-//! the directory: before a turn, the repository's root, once it is trusted
-//! — the answer the turn will get — and for `krowk status`, `providers
+//! the directory: before a turn, the session's own working directory,
+//! once its repository is trusted — where the turn starts the vendor, and
+//! so the answer the turn will get (Claude Code reads the settings of that
+//! directory alone, not its parents') — and for `krowk status`, `providers
 //! list`, `doctor` and a rollover offer, where no repository has been
 //! trusted, krowk's own `0700` directory (`neutral_dir`), which holds
 //! nothing and which nobody else can write into — never the shared
@@ -29,7 +31,8 @@
 //!
 //! Vendor checks spawn a process, so `check_all` runs them in parallel,
 //! each bounded by one deadline (`VENDOR_TIMEOUT`) and killed with its
-//! whole process group when it passes, and a long-lived host (the TUI) does
+//! whole process group when it passes (unix; on Windows only the process
+//! krowk started, see `probing`), and a long-lived host (the TUI) does
 //! not re-ask for every switch: a vendor's "signed in" is kept for
 //! `CACHE_FOR`. Only "signed in" is kept. A person who is told to sign in
 //! does so in another terminal and tries again at once, and a remembered
@@ -383,7 +386,11 @@ fn vendor(inst: &Resolved, b: &Backend, probe: &Probe) -> Readiness {
 
 /// A vendor process for a check: started in `probe.dir` — never wherever
 /// krowk happens to run, whose project settings nobody may have trusted —
-/// in a process group of its own, so the whole of it can be stopped.
+/// in a process group of its own, so the whole of it can be stopped. The
+/// group is unix's: on Windows only the process krowk started is stopped,
+/// and one it started in turn (`claude.cmd`'s Node) can outlive the check
+/// until it exits by itself — a Job object would close that, and is not
+/// worth a new dependency for a status check.
 pub(crate) fn probing(cmd: &mut Command, probe: &Probe) -> std::io::Result<std::process::Child> {
     cmd.current_dir(&probe.dir);
     #[cfg(unix)]
@@ -392,16 +399,26 @@ pub(crate) fn probing(cmd: &mut Command, probe: &Probe) -> std::io::Result<std::
 }
 
 /// Stops a check's process and everything it started — a Node runtime's
-/// workers, a shell's `sleep` — and reaps it: nothing outlives a check.
+/// workers, a shell's `sleep` — and reaps it: nothing outlives a check
+/// (on unix; see `probing`).
 pub(crate) fn stop(child: &mut std::process::Child) {
+    kill_group(child);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// SIGKILL to the process group `child` leads (`probing` made it its own).
+/// Also after the leader exited: whatever it left behind in its group
+/// would otherwise hold the output pipes, and the check with them.
+fn kill_group(child: &std::process::Child) {
     #[cfg(unix)]
-    // SAFETY: kill with a negative pid signals the process group the child
-    // leads (`probing` made it its own); it touches no memory.
+    // SAFETY: kill with a negative pid signals a process group; it touches
+    // no memory. A group with nobody left in it is ESRCH, ignored.
     unsafe {
         libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    #[cfg(not(unix))]
+    let _ = child;
 }
 
 /// Runs a check's command to its end, or stops it at `probe.within`: none
@@ -425,6 +442,9 @@ pub(crate) fn output_within(cmd: &mut Command, probe: &Probe) -> std::io::Result
     let started = Instant::now();
     let status = loop {
         if let Some(s) = child.try_wait()? {
+            // The vendor answered and left; anything it left running in its
+            // group still holds the pipes the answer is read from.
+            kill_group(&child);
             break s;
         }
         if started.elapsed() > within {

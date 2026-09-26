@@ -57,9 +57,14 @@ impl Home {
     }
 
     fn host(&self, registry: Registry, gate: trust::Gate) -> Host {
+        self.host_in(registry, gate, self.root.join("repo"))
+    }
+
+    /// A host whose sessions start in `cwd`.
+    fn host_in(&self, registry: Registry, gate: trust::Gate, cwd: PathBuf) -> Host {
         Host::new(HostConfig {
             sessions_dir: log::sessions_dir(&self.env()).unwrap(),
-            cwd: self.root.join("repo"),
+            cwd,
             registry,
             krowk_version: "test".into(),
             pricer: Arc::new(|_, _, _| None),
@@ -119,6 +124,20 @@ fn readiness_a_trusted_repositorys_settings_count_and_an_untrusted_ones_are_neve
     switch(&h.host(reg.clone(), trust::allow_all()), "claude:bedrock/sonnet").unwrap();
     assert!(h.log().contains(&format!("argv auth status --json pwd {}", h.root.join("repo").display())), "{}", h.log());
 
+    // In a subdirectory of the repository, the vendor is asked where the
+    // turn will start it — the session's own directory, whose settings
+    // alone Claude Code reads, not its parents': its own Bedrock settings
+    // count, and the root's do not.
+    let sub = h.root.join("repo/sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let _ = std::fs::remove_file(h.root.join("fake.log"));
+    let e = switch(&h.host_in(reg.clone(), trust::allow_all(), sub.clone()), "claude:bedrock/sonnet").unwrap_err();
+    assert_eq!(e.code, "not_authenticated", "the root's settings do not reach a turn started in sub/: {e:?}");
+    assert!(h.log().contains(&format!("argv auth status --json pwd {}", sub.display())), "{}", h.log());
+    std::fs::create_dir_all(sub.join(".claude")).unwrap();
+    std::fs::write(sub.join(".claude/settings.json"), r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#).unwrap();
+    switch(&h.host_in(reg.clone(), trust::allow_all(), sub.clone()), "claude:bedrock/sonnet").unwrap();
+
     // Untrusted: refused for trust, and the vendor never started there.
     let _ = std::fs::remove_file(h.root.join("fake.log"));
     let gate: trust::Gate = Arc::new(|root: &Path| Err(trust::untrusted(root, "Pass --trust.")));
@@ -174,4 +193,25 @@ fn readiness_a_vendor_that_outlives_the_deadline_is_unknown_and_stopped_with_wha
         });
         assert!(gone, "{name}: the vendor or its child outlived the check: {started_pids:?}");
     }
+}
+
+#[test]
+fn readiness_a_vendor_that_answers_and_leaves_a_process_behind_does_not_hold_the_check() {
+    let h = Home::new("leftover");
+    let pids = h.root.join("pids");
+    // Answers at once and exits 0, leaving a sleeper that holds its stdout.
+    let claude = h.install("claude", &format!("#!/bin/bash\nsleep 60 &\necho $! >>'{}'\necho '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}}'\nexit 0\n", pids.display()));
+    let reg = h.registry(vec![("claude:leaves", h.claude(&claude))]);
+    let neutral = readiness::neutral_dir(&h.root.join("data")).unwrap();
+    let started = Instant::now();
+    let r = readiness::check(reg.get("claude:leaves").unwrap(), &h.root.join("creds.json"), &Probe { dir: neutral, within: Duration::from_secs(5) });
+    let took = started.elapsed();
+    assert!(r.readiness.is_ready(), "{:?}", r.readiness);
+    assert!(took < Duration::from_secs(2), "the sleeper held the check for {took:?}");
+    let sleeper: i32 = std::fs::read_to_string(&pids).unwrap().trim().parse().unwrap();
+    let gone = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !alive(sleeper)
+    });
+    assert!(gone, "the sleeper ({sleeper}) outlived the check");
 }

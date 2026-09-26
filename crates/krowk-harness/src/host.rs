@@ -409,9 +409,11 @@ impl Shared {
     /// what needs no process first, then for a backend the repository's
     /// trust, then the vendor's own login — so nothing at all is spawned
     /// for a repository nobody trusted. The vendor is asked in the
-    /// repository's root, now trusted: its project settings (Bedrock, an
-    /// `apiKeyHelper`, a Codex model provider) are part of the answer the
-    /// turn will get. `known_good` skips the vendor: a session whose process
+    /// session's own working directory — inside the root just trusted, and
+    /// where the turn will start it: Claude Code reads the project settings
+    /// of its working directory alone, not of its parents, so its answer
+    /// there (Bedrock, an `apiKeyHelper`, a Codex model provider) is the
+    /// one the turn will get. `known_good` skips the vendor: a session whose process
     /// is up and serving it has shown its login.
     async fn ready(&self, instance: &Resolved, cwd: &std::path::Path, known_good: bool) -> Result<(), EngineError> {
         let creds = &self.cfg.credentials;
@@ -423,12 +425,12 @@ impl Shared {
         if instance.backend.is_none() {
             return Ok(());
         }
-        let root = trust::root(cwd);
-        (self.cfg.trust)(&root)?;
+        (self.cfg.trust)(&trust::root(cwd))?;
         if known_good {
             return Ok(());
         }
-        readiness::check_async(instance, creds, &readiness::Probe::at(root)).await.refusal(instance).map_or(Ok(()), Err)
+        let at = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        readiness::check_async(instance, creds, &readiness::Probe::at(at)).await.refusal(instance).map_or(Ok(()), Err)
     }
 
     /// Where a vendor is asked outside any repository: krowk's own `0700`

@@ -104,11 +104,11 @@ impl Drop for Pane {
 }
 
 /// Forty lines in scrollback and the forty-first streaming, at 100x30; the
-/// frame that finishes it is read by the pane before the window shrinks to
-/// 70x20, or after. Then the resize is handled — with the cursor asked
+/// frame that finishes it is read by the pane before the window changes to
+/// `to`, or after. Then the resize is handled — with the cursor asked
 /// for, or with the question gone unanswered — and line 42 comes. Every
 /// line must be in scrollback once, and the live region only on screen.
-fn shrunk_around_a_frame(name: &str, frame_read_first: bool, answered: bool) {
+fn shrunk_around_a_frame(name: &str, to: (u16, u16), frame_read_first: bool, answered: bool) {
     let Some(mut pane) = Pane::start(name, 100, 30) else { return };
     let line = |n: u32| Line::from(format!("line {n:05}: the quick brown fox jumps over the lazy dog again"));
     let live = |tail: Option<&str>| {
@@ -126,32 +126,40 @@ fn shrunk_around_a_frame(name: &str, frame_read_first: bool, answered: bool) {
     t.frame(&[line(41)], &rows, caret).unwrap();
     if frame_read_first {
         pane.send(&out);
-        pane.resize(70, 20);
+        pane.resize(to.0, to.1);
     } else {
-        pane.resize(70, 20);
+        pane.resize(to.0, to.1);
         pane.send(&out);
     }
-    t.resize(Size { width: 70, height: 20 }, answered.then(|| pane.cursor_row())).unwrap();
+    t.resize(Size { width: to.0, height: to.1 }, answered.then(|| pane.cursor_row())).unwrap();
     t.frame(&[line(42)], &rows, caret).unwrap();
     pane.send(&out);
     let history = pane.history();
     let seen: Vec<u32> = history.lines().filter_map(|l| l.strip_prefix("line ")?.get(..5)?.parse().ok()).collect();
     assert_eq!(seen, (1..=42).collect::<Vec<_>>(), "every line once, in order:\n{history}");
-    assert_eq!(history.matches("esc to interrupt").count(), 1, "the old live region was left behind:\n{history}");
+    // "Responding": narrow enough, the terminal splits the rest of the row.
+    assert_eq!(history.matches("Responding").count(), 1, "the old live region was left behind:\n{history}");
 }
 
 #[test]
 fn r_tui_3_a_shorter_screen_scrolls_the_conversation_up_rather_than_clearing_it() {
     // tmux takes the rows below the caret first, so the region no longer
     // fits under its top: rows are made for it, and none is cleared.
-    shrunk_around_a_frame("shrink", true, true);
+    shrunk_around_a_frame("shrink", (70, 20), true, true);
 }
 
 #[test]
 fn r_tui_3_a_shorter_screen_is_measured_from_the_caret_when_the_cursor_goes_unanswered() {
     // The row the model had for the cursor was numbered on the taller
     // screen; the move to the region's top is from the caret regardless.
-    shrunk_around_a_frame("unanswered", true, false);
+    shrunk_around_a_frame("unanswered", (70, 20), true, false);
+}
+
+#[test]
+fn r_tui_3_a_narrower_screen_is_measured_as_it_reflowed_when_the_cursor_goes_unanswered() {
+    // At 30 columns the rows above the caret split in two or three: the
+    // region's top is that many rows up, asked or not.
+    shrunk_around_a_frame("narrow-unanswered", (30, 20), true, false);
 }
 
 #[test]
@@ -159,5 +167,5 @@ fn r_tui_3_a_frame_the_terminal_reads_after_it_resized_still_lands_on_the_region
     // Drawn for 100x30 and read at 70x20: its moves from the caret still
     // start at the region's top, where absolute rows would clamp to the
     // bottom and leave the old region, and the line it held, above it.
-    shrunk_around_a_frame("race", false, true);
+    shrunk_around_a_frame("race", (70, 20), false, true);
 }

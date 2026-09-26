@@ -256,10 +256,9 @@ pub struct Term<W: Write> {
     /// narrowing resize, a terminal that reflows splits each wider row
     /// into several, and this is how many.
     widths: Vec<u16>,
-    /// Where the region was, and how wide the terminal, when the last frame
-    /// reached it: what a resize is measured against, however many resizes
-    /// come before the next frame.
-    drawn_top: u16,
+    /// How wide the terminal was when the last frame reached it: what a
+    /// resize is measured against, however many resizes come before the
+    /// next frame.
     drawn_width: u16,
     /// Whether this terminal reflows lines on a narrowing resize. Most do;
     /// xterm and the Linux console truncate instead (see `reflows_from`).
@@ -282,9 +281,7 @@ impl<W: Write> Term<W> {
         out.write_all(&buf.take())?;
         out.flush()?;
         let terminal = build(&buf, size, top, height)?;
-        let mut t = Term { terminal, buf, out, size, height, caret_row: 0, caret_col: 0, widths: Vec::new(), drawn_top: top, drawn_width: size.width, reflows: true, frames: 0 };
-        t.drawn_top = t.top();
-        Ok(t)
+        Ok(Term { terminal, buf, out, size, height, caret_row: 0, caret_col: 0, widths: Vec::new(), drawn_width: size.width, reflows: true, frames: 0 })
     }
 
     pub fn width(&self) -> u16 {
@@ -344,24 +341,15 @@ impl<W: Write> Term<W> {
     /// taller than the whole screen.
     pub fn resize(&mut self, size: Size, cursor_row: Option<u16>) -> io::Result<()> {
         self.buf.discard();
-        if let Some(row) = cursor_row {
-            self.buf.set_row(row);
-        }
         self.size = size;
         let height = self.height.clamp(1, size.height.max(1));
         let narrowed = size.width < self.drawn_width;
-        let top = match cursor_row {
-            Some(row) if narrowed && self.reflows => row.saturating_sub(self.reflowed_above_caret(size.width)),
-            Some(row) => row.saturating_sub(self.caret_row),
-            // Not asked: the cursor is still on the caret, but its row was
-            // numbered on the old screen. On the new one it is at most the
-            // last, and the region's top is the caret's row above it.
-            None => {
-                let row = self.buf.row().min(size.height.saturating_sub(1));
-                self.buf.set_row(row);
-                row.saturating_sub(self.caret_row)
-            }
-        };
+        let above = if narrowed && self.reflows { self.reflowed_above_caret(size.width) } else { self.caret_row };
+        // Not asked, the cursor is still on the caret, but its row was
+        // numbered on the old screen: on the new one it is at most the last.
+        let row = cursor_row.unwrap_or_else(|| self.buf.row().min(size.height.saturating_sub(1)));
+        self.buf.set_row(row);
+        let top = row.saturating_sub(above);
         // A shorter screen can leave the region's top too low for all of it:
         // the terminal took the rows below the caret. The rows it needs are
         // made the way a new line makes them, scrolling what is above into
@@ -403,7 +391,6 @@ impl<W: Write> Term<W> {
             self.caret_row = y.saturating_sub(top);
             self.caret_col = x;
         }
-        self.drawn_top = top;
         self.drawn_width = width;
         self.flush()
     }
@@ -468,7 +455,9 @@ impl<W: Write> Term<W> {
         self.buf.discard();
         self.size = size;
         let height = self.height.clamp(1, size.height.max(1));
-        let top = cursor_row.unwrap_or(size.height.saturating_sub(height)).min(size.height.saturating_sub(height));
+        // A cursor near the bottom keeps its row: the rebuild scrolls what
+        // the shell printed up, rather than clearing it.
+        let top = cursor_row.unwrap_or(size.height.saturating_sub(height)).min(size.height.saturating_sub(1));
         // Where the shell left the cursor is known only if the terminal
         // said; otherwise the region's row is gone to by its number.
         match cursor_row {
@@ -480,7 +469,6 @@ impl<W: Write> Term<W> {
         }
         let top = anchor(&self.buf, size, top, height)?;
         self.rebuild(top, height)?;
-        self.drawn_top = self.top();
         self.drawn_width = size.width;
         Ok(())
     }
@@ -670,8 +658,8 @@ mod tests {
 
     #[test]
     fn r_tui_3_the_region_starts_at_the_bottom_with_what_was_above_it_moved_down() {
-        let t = Term::new(Vec::new(), Size { width: 40, height: 10 }, 4, 3).unwrap();
-        assert_eq!(t.drawn_top, 7, "the bottom three rows");
+        let mut t = Term::new(Vec::new(), Size { width: 40, height: 10 }, 4, 3).unwrap();
+        assert_eq!(t.top(), 7, "the bottom three rows");
         let out = String::from_utf8_lossy(&t.out).into_owned();
         // Rows 1-7 scrolled down by 3: the four rows above the cursor land
         // right above the viewport, and only blank rows leave the region.
@@ -683,7 +671,7 @@ mod tests {
     #[test]
     fn r_tui_3_a_narrowed_region_is_measured_as_the_terminal_reflows_it() {
         let mut t = drawn();
-        assert_eq!(t.drawn_top, 27);
+        assert_eq!(t.top(), 27);
         // At 40 columns the 90-wide row above the caret takes three rows,
         // and the caret itself has moved one row down its own line.
         assert_eq!(t.reflowed_above_caret(40), 3 + 1);

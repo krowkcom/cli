@@ -102,9 +102,9 @@ unit = "bytes"
 # parallel, bounded vendor checks, Codex's account/read over app-server,
 # `krowk status`, doctor's providers line, and the host's switch, settle and
 # rollover checks made async to ask a vendor off the runtime's thread),
-# adds 63,616 bytes: 8,176,104 (7.80 MiB), 49,640 over 7.75 MiB. Raised
+# adds 65,920 bytes: 8,178,408 (7.80 MiB), 51,944 over 7.75 MiB. Raised
 # 7.75 -> 8.00 MiB by provider auth 01 — no crate is added, the growth is
-# its code — leaving 212,504 bytes for the rest of Provider auth.
+# its code — leaving 210,200 bytes for the rest of Provider auth.
 max = { x86_64-linux = 8_388_608 }
 status = "enforced"
 

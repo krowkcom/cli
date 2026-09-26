@@ -445,7 +445,7 @@ fn r_todo_1_r_todo_2_the_todo_list_lives_in_the_log_and_survives_resume() {
     app.overlay = krowk_tui::app::Overlay::Todos;
     let rows = row_text!(app.view(std::time::Instant::now()).0);
     assert_eq!(&rows[..3], ["☑ read the README", "◐ fix the typo", "☐ run the tests"]);
-    assert!(app.status_bar().contains("todos 1/3"), "{}", app.status_bar());
+    assert!(app.status_bar().contains("[2 tasks]"), "the open ones: {}", app.status_bar());
 }
 
 /// The session tree as `krowk sessions` lists it: each listed child of the

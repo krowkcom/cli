@@ -11,6 +11,21 @@ the versions are the `v*` tags a release is cut from. Entries land under
 
 ### Changed
 
+- **The TUI's status line is one line in one order**:
+  `<user>/<host> | <instance>/<model> | $cost | [N tasks] | [N subagents] | ? help`,
+  under the prompt box. The task count is the todo list's open items and
+  shows only while there are any; the subagent count only while they run;
+  `offline`, in yellow, comes before `? help` while the API cannot be
+  reached, and an instance near its rate limit says so beside its model
+  (`claude:work/haiku (78% of 7-day)`). Whether an instance runs on a
+  subscription or an API key moved to the session details (Ctrl-O), and
+  online, `connecting…` and the key hints are no longer shown. On a narrow
+  terminal the device goes first, then the counts and the cost, then the
+  model is cut short; `? help` stays. `tui.statusItems` takes `device`,
+  `model`, `cost`, `tasks`, `subagents` and `help`; a config with the old
+  names still reads — `todos` is `tasks`, `instance` is `model`, and
+  `connectivity` and `session` are ignored.
+
 - **Edits into `.git`, `.claude`, `.codex` and `.krowk` are asked about
   instead of refused**, and so is anything in krowk's own config directory
   or a backend's: the TUI shows the request, and `krowk -p` still refuses

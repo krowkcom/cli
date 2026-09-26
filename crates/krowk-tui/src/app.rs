@@ -10,6 +10,7 @@
 //! only the unfinished tail is drawn in the live region.
 
 use crate::editor::Editor;
+use crate::help;
 use crate::look::{self, SEP};
 use crate::settings::{Item as StatusItem, Settings};
 use krowk_harness::host::Pricer;
@@ -25,6 +26,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Rows the prompt may take before it scrolls within itself.
 const MAX_INPUT_ROWS: usize = 8;
+/// The `/` menu shows this many entries at most, scrolling past them.
+const SLASH_ROWS: usize = 8;
+/// The Krowk mark (.github/logo.svg): its 4×4 glyph, `#`, on a plate a
+/// unit wider all round, `.`.
+const LOGO: [&str; 6] = ["......", ".#..#.", ".#..#.", ".###..", ".#..#.", "......"];
 /// Rows of an unfinished line shown while it streams.
 const MAX_LIVE_ROWS: usize = 3;
 
@@ -320,6 +326,12 @@ pub struct App {
     /// The instances that run a vendor's backend: their billing is the
     /// vendor's to report, so none is assumed before it has.
     pub vendor_instances: Vec<String>,
+    /// The skills that apply here, name and description, for `/`.
+    pub skills: Vec<(String, String)>,
+    /// The `/` menu's selected entry, and whether esc put it away until the
+    /// prompt stops being a command.
+    pub slash_at: usize,
+    pub slash_closed: bool,
     /// Tool calls waiting for the person's say, oldest first (R-PERM-2):
     /// the first is shown over the prompt until it is answered, here or by
     /// another client.
@@ -360,6 +372,8 @@ pub struct App {
     /// The picker's rows and the one chosen.
     pub picks: Vec<Pick>,
     pub pick_at: usize,
+    /// The help menu's selected entry, among those its filter finds.
+    pub help_at: usize,
 }
 
 impl App {
@@ -395,6 +409,9 @@ impl App {
             thinking_since: None,
             billing: None,
             vendor_instances: Vec::new(),
+            skills: Vec::new(),
+            slash_at: 0,
+            slash_closed: false,
             approvals: Vec::new(),
             answer: String::new(),
             copy: false,
@@ -411,6 +428,7 @@ impl App {
             used: Vec::new(),
             picks: Vec::new(),
             pick_at: 0,
+            help_at: 0,
         }
     }
 
@@ -452,29 +470,48 @@ impl App {
         self.push_wrapped("", "", text, style, style);
     }
 
-    /// The line a session opens on: `krowk · <model> via <instance> · <dir>`,
-    /// then a blank line.
-    pub fn header(&mut self, cwd: &str) {
-        let mut spans = vec![Span::styled("krowk".to_string(), look::accent().add_modifier(Modifier::BOLD))];
-        if let Some(m) = &self.model {
-            spans.push(Span::styled(format!(" · {} via {}", m.model, m.instance), dim()));
+    /// What a session opens on: the Krowk mark, then a stack of what this
+    /// session is — the directory, the branch, the model — then a blank
+    /// line. `branch` is empty off a branch, and its row is left out.
+    pub fn header(&mut self, cwd: &str, branch: &str, effort: Option<&str>) {
+        // Black on a white plate, two units to a cell: `▀` in the top
+        // one's colour over the bottom one's. A unit is a column wide and
+        // half a row tall, square in a cell twice as tall as it is wide.
+        let ink = |c: u8| if c == b'#' { Color::Indexed(16) } else { Color::Indexed(231) };
+        for pair in LOGO.chunks(2) {
+            let (top, bottom) = (pair[0].as_bytes(), pair[1].as_bytes());
+            let cells = top.iter().zip(bottom).map(|(t, b)| Span::styled("▀", Style::new().fg(ink(*t)).bg(ink(*b))));
+            self.pending.push(Line::from(cells.collect::<Vec<_>>()));
         }
-        // The directory gives way first, from its start: the end of a path
-        // is the part that says where this is.
-        let used: usize = spans.iter().map(|s| s.content.width()).sum::<usize>() + 3;
-        let room = usize::from(self.width).saturating_sub(used).max(4);
-        let cwd = clean(cwd);
-        let cwd = if cwd.width() > room {
-            let tail: String = cwd.chars().rev().scan(0, |w, c| {
-                *w += c.width().unwrap_or(0);
-                (*w < room).then_some(c)
-            }).collect::<Vec<_>>().into_iter().rev().collect();
-            format!("…{tail}")
-        } else {
-            cwd
-        };
-        spans.push(Span::styled(format!(" · {cwd}"), dim()));
-        self.pending.push(Line::from(spans));
+        self.pending.push(Line::default());
+        let mut stack = vec![("Directory", clean(cwd))];
+        if !branch.is_empty() {
+            stack.push(("Branch", clean(branch)));
+        }
+        if let Some(m) = &self.model {
+            let mut model = format!("{}/{}", m.instance, m.model);
+            if let Some(e) = effort {
+                model.push_str(&format!(" ({e})"));
+            }
+            stack.push(("Model", clean(&model)));
+        }
+        let label = stack.iter().map(|(l, _)| l.width()).max().unwrap_or(0) + 2;
+        let width = usize::from(self.width);
+        for (l, v) in stack {
+            // A value too long gives way from its start: the end of a path
+            // is the part that says where this is.
+            let room = width.saturating_sub(label).max(4);
+            let v = if v.width() > room {
+                let tail: String = v.chars().rev().scan(0, |w, c| {
+                    *w += c.width().unwrap_or(0);
+                    (*w < room).then_some(c)
+                }).collect::<Vec<_>>().into_iter().rev().collect();
+                format!("…{tail}")
+            } else {
+                v
+            };
+            self.pending.push(Line::from(vec![Span::styled(format!("{:<label$}", format!("{l}:")), dim()), Span::raw(v)]));
+        }
         self.pending.push(Line::default());
         self.last_blank = true;
         self.dirty = true;
@@ -999,6 +1036,12 @@ impl App {
                 self.gap();
                 self.push_line(Line::from(vec![Span::styled(look::TOOL, dim()), Span::styled("Reminded the model of its todo list", dim().add_modifier(Modifier::ITALIC))]));
             }
+            // A skill the person asked for, loaded next to the prompt.
+            Item::UserText { text } if text.starts_with(krowk_harness::compat::skills::INVOKED) => {
+                let name = text[krowk_harness::compat::skills::INVOKED.len()..].split('"').next().unwrap_or_default();
+                self.finish_live();
+                self.push_line(Line::from(vec![Span::styled(look::TOOL, dim()), Span::styled(format!("Loaded the {} skill", clean(name)), dim().add_modifier(Modifier::ITALIC))]));
+            }
             Item::UserText { text } => {
                 if let Some(i) = self.steers.iter().position(|s| s == text) {
                     self.steers.remove(i);
@@ -1190,6 +1233,7 @@ impl App {
             }
         }
         match self.overlay {
+            Overlay::None if self.slash_open() => rows.extend(self.slash_overlay(width)),
             Overlay::None => {}
             Overlay::Keys => rows.extend(self.keys_overlay(width)),
             Overlay::Details => rows.extend(self.details_overlay(width)),
@@ -1200,28 +1244,30 @@ impl App {
             }
             Overlay::Models => rows.extend(self.models_overlay(width)),
         }
-        // The prompt, in a box, scrolled to keep the caret in view: `→ `
-        // before its first row, the box's sides around every row.
-        let inner = width.saturating_sub(4).max(1);
+        // The prompt between two rules, scrolled to keep the caret in
+        // view: `→ ` before its first row, open at the sides.
+        let inner = width.max(1);
         let (input, (crow, ccol)) = self.editor.layout(inner.saturating_sub(2).max(1) as u16);
         let first = (crow as usize + 1).saturating_sub(MAX_INPUT_ROWS);
         let edge = look::border();
-        let across = "─".repeat(width.saturating_sub(2));
-        rows.push(Line::from(Span::styled(format!("┌{across}┐"), edge)));
+        let across = "─".repeat(width);
+        rows.push(Line::from(Span::styled(across.clone(), edge)));
         let top = rows.len() as u16;
         for (i, row) in input.iter().enumerate().skip(first).take(MAX_INPUT_ROWS) {
             let prefix = if i == 0 { Span::styled(look::ARROW, look::prompt()) } else { Span::raw("  ") };
             let (text, style) = if i == 0 && self.editor.is_empty() {
-                (clip(if self.running() { "Steer the running turn" } else { "Plan, search, build anything" }, inner.saturating_sub(2)), dim())
+                (clip(if self.overlay == Overlay::Keys { "Type to filter" } else if self.running() { "Steer the running turn" } else { "Plan, search, build anything" }, inner.saturating_sub(2)), dim())
             } else {
                 (row.clone(), Style::new())
             };
-            let pad = inner.saturating_sub(2 + text.width());
-            rows.push(Line::from(vec![Span::styled("│ ", edge), prefix, Span::styled(text, style), Span::raw(" ".repeat(pad)), Span::styled(" │", edge)]));
+            rows.push(Line::from(vec![prefix, Span::styled(text, style)]));
         }
-        rows.push(Line::from(Span::styled(format!("└{across}┘"), edge)));
-        let caret = (ccol + 4, top + (crow as usize - first) as u16);
+        rows.push(Line::from(Span::styled(across, edge)));
+        let caret = (ccol + 2, top + (crow as usize - first) as u16);
         if self.settings.status_bar {
+            // A blank row over the status line; the terminal's own edge is
+            // the gap under it.
+            rows.push(Line::default());
             rows.push(self.hint_row(width));
         }
         (rows, caret)
@@ -1324,18 +1370,36 @@ impl App {
         parts
     }
 
+    /// Opens the help menu on everything, or closes it.
+    pub fn toggle_help(&mut self) {
+        self.overlay = if self.overlay == Overlay::Keys { Overlay::None } else { Overlay::Keys };
+        self.help_at = 0;
+        self.dirty = true;
+    }
+
+    /// The help menu: an entry a row — its title, what it does, and its
+    /// keys.
     fn keys_overlay(&self, width: usize) -> Vec<Line<'static>> {
-        [
-            "enter send · alt-enter, ctrl-j or \\ then enter: new line",
-            "↑ ↓ lines, then history · ctrl-a/e line start/end · ctrl-u/k/w kill",
-            "esc or ctrl-c interrupt · type while it runs to steer",
-            "ctrl-t todos · ctrl-g subagents: select, expand, interrupt one",
-            "ctrl-y copy the last answer · ctrl-o session details · /model switch model",
-            "ctrl-d or /exit quit · ? or esc closes this",
-        ]
-        .iter()
-        .map(|l| Line::from(Span::styled(clip(l, width), Style::new().fg(Color::Blue))))
-        .collect()
+        let found = help::filter(self.editor.text());
+        let rows: Vec<[String; 3]> = found.iter().map(|e| [e.title.to_string(), e.description.to_string(), e.keys.to_string()]).collect();
+        menu(&rows, self.help_at, width, usize::MAX)
+    }
+
+    /// Whether the prompt is a command still being typed — `/` and a word,
+    /// no space yet — and esc has not put the menu away.
+    pub fn slash_open(&self) -> bool {
+        let t = self.editor.text();
+        t.starts_with('/') && !t.contains(char::is_whitespace) && !self.slash_closed && self.overlay == Overlay::None
+    }
+
+    /// The `/` menu: krowk's commands and the skills, `/name`, what it
+    /// does, and which it is.
+    fn slash_overlay(&self, width: usize) -> Vec<Line<'static>> {
+        let rows: Vec<[String; 3]> = help::slash(self.editor.text(), &self.skills)
+            .into_iter()
+            .map(|s| [if s.skill { format!("/{} [skill]", s.name) } else { format!("/{}", s.name) }, s.description, String::new()])
+            .collect();
+        menu(&rows, self.slash_at, width, SLASH_ROWS)
     }
 
     fn todos_overlay(&self, width: usize) -> Vec<Line<'static>> {
@@ -1675,6 +1739,86 @@ fn flat(s: &str) -> String {
         .collect()
 }
 
+/// A menu over the prompt: a ratatui table under a top border, a row an
+/// entry — a title, a dim description, a faint third column — the selected
+/// one marked and its title coloured. Narrow, the third column goes and
+/// the description is cut; the columns fit the rows shown, the description
+/// at most half the width.
+fn menu(rows: &[[String; 3]], at: usize, width: usize, most_rows: usize) -> Vec<Line<'static>> {
+    use ratatui::layout::Constraint;
+    use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Row, Table, TableState};
+    let block = Block::new().borders(Borders::TOP).border_style(look::border());
+    if rows.is_empty() {
+        let none = vec![Row::new([Cell::from(Span::styled("  nothing matches · esc closes", dim()))])];
+        return widget_rows(Table::new(none, [Constraint::Fill(1)]).block(block), &mut TableState::default(), width, 2);
+    }
+    let at = at.min(rows.len() - 1);
+    // Grok Build's layout: the title column fits the titles, at most 40
+    // wide and 60% of the row; the description takes what is left, cut
+    // with `…`; a third column only while there is room and something in it.
+    let most = |i: usize| rows.iter().map(|r| r[i].width()).max().unwrap_or(0);
+    let title = most(0).min(40).min(width * 3 / 5);
+    let third = most(2);
+    let with_third = third > 0 && 2 + title + 2 + most(1).min(width / 2) + 2 + third <= width;
+    let described = if with_third { most(1).min(width / 2) } else { width.saturating_sub(2 + title + 2) };
+    let table_rows = rows.iter().enumerate().map(|(i, r)| {
+        // Only the selected title is coloured; the rest stays quiet.
+        let name = clip(&r[0], title);
+        let name = if i == at { Span::styled(name, look::prompt()) } else { Span::raw(name) };
+        let mut cells = vec![Cell::from(name), Cell::from(Span::styled(clip(&r[1], described), dim()))];
+        if with_third {
+            cells.push(Cell::from(Span::styled(r[2].clone(), look::border())));
+        }
+        Row::new(cells)
+    });
+    let (title, described, third) = (title as u16, described as u16, third as u16);
+    let widths = if with_third { vec![Constraint::Length(title), Constraint::Length(described), Constraint::Length(third)] } else { vec![Constraint::Length(title), Constraint::Fill(1)] };
+    let table = Table::new(table_rows, widths).block(block).column_spacing(2).highlight_symbol(Span::styled("› ", look::prompt())).highlight_spacing(HighlightSpacing::Always);
+    let mut state = TableState::default().with_selected(Some(at));
+    // Taller than `most_rows`, the table scrolls to keep the selection in view.
+    widget_rows(table, &mut state, width, rows.len().min(most_rows) + 1)
+}
+
+/// A ratatui widget drawn `width` by `height` and read back as the rows the
+/// live region is made of.
+fn widget_rows<W: ratatui::widgets::StatefulWidget>(widget: W, state: &mut W::State, width: usize, height: usize) -> Vec<Line<'static>> {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    let area = Rect::new(0, 0, width.min(usize::from(u16::MAX)) as u16, height.min(usize::from(u16::MAX)) as u16);
+    let mut buf = Buffer::empty(area);
+    widget.render(area, &mut buf, state);
+    (0..area.height)
+        .map(|y| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut x = 0;
+            while x < area.width {
+                let cell = &buf[(x, y)];
+                // An untouched cell's colours are Reset: no colour, not one
+                // to write out.
+                let mut style = cell.style();
+                let unset = |c: Option<Color>| c.filter(|c| *c != Color::Reset);
+                (style.fg, style.bg, style.underline_color) = (unset(style.fg), unset(style.bg), unset(style.underline_color));
+                match spans.last_mut() {
+                    Some(last) if last.style == style => last.content.to_mut().push_str(cell.symbol()),
+                    _ => spans.push(Span::styled(cell.symbol().to_string(), style)),
+                }
+                // A wide symbol hides the cells after it.
+                x += cell.symbol().width().max(1) as u16;
+            }
+            let mut line = Line::from(spans);
+            // No trailing blanks: the region measures its rows' widths.
+            while line.spans.last().is_some_and(|s| s.content.trim_end().is_empty()) {
+                line.spans.pop();
+            }
+            if let Some(last) = line.spans.last_mut() {
+                let kept = last.content.trim_end().to_string();
+                last.content = kept.into();
+            }
+            line
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1831,8 +1975,8 @@ mod tests {
         assert_eq!(rows.len(), 3, "only the prompt, in its box: {:?}", text(&rows));
         a.overlay = Overlay::Keys;
         let (rows, caret) = a.view(Instant::now());
-        assert_eq!(rows.len(), 9, "the overlay is six rows over the prompt box");
-        assert_eq!(caret, (4, 7), "inside the box, after the arrow");
+        assert_eq!(rows.len(), 17, "the help menu, a rule and thirteen entries, over the prompt box");
+        assert_eq!(caret, (2, 15), "after the arrow");
     }
 
     #[test]
@@ -1841,12 +1985,13 @@ mod tests {
         a.width = 90;
         let (rows, caret) = a.view(Instant::now());
         let t = text(&rows);
-        assert_eq!(t[0], format!("┌{}┐", "─".repeat(88)));
-        assert!(t[1].starts_with("│ → Plan, search, build anything") && t[1].ends_with(" │") && t[1].chars().count() == 90, "{:?}", t[1]);
-        assert_eq!(t[2], format!("└{}┘", "─".repeat(88)));
-        assert_eq!(t[3], "  anthropic/claude-x | $0.00 | ? help", "one line, no device known");
-        assert_eq!(t.len(), 4);
-        assert_eq!(caret, (4, 1));
+        assert_eq!(t[0], "─".repeat(90));
+        assert_eq!(t[1], "→ Plan, search, build anything", "no sides to the box");
+        assert_eq!(t[2], "─".repeat(90));
+        assert_eq!(t[3], "", "a blank row over the status line");
+        assert_eq!(t[4], "  anthropic/claude-x | $0.00 | ? help", "one line, no device known");
+        assert_eq!(t.len(), 5, "the status line last");
+        assert_eq!(caret, (2, 1));
     }
 
     #[test]
@@ -1964,10 +2109,11 @@ mod tests {
     fn the_session_opens_on_a_header_that_says_what_runs_where() {
         let mut a = app();
         a.width = 40;
-        a.header("~/Repositories/a-rather-long-project-name/crates");
+        a.header("~/Repositories/a-rather-long-project-name/crates", "main", Some("medium"));
         let t = text(&a.take_pending());
-        assert!(t[0].starts_with("krowk · claude-x via anthropic · …") && t[0].ends_with("crates") && t[0].chars().count() <= 40, "{:?}", t[0]);
-        assert_eq!(t[1], "", "then a blank line");
+        assert_eq!(&t[..4], ["▀▀▀▀▀▀", "▀▀▀▀▀▀", "▀▀▀▀▀▀", ""], "the mark, two units to a cell");
+        assert!(t[4].starts_with("Directory: …") && t[4].ends_with("crates") && t[4].chars().count() <= 40, "{:?}", t[4]);
+        assert_eq!(t[5..], ["Branch:    main", "Model:     anthropic/claude-x (medium)", ""]);
     }
 
     fn child_log(session: &str, body: LogBody) -> StreamLine {

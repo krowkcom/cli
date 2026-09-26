@@ -489,8 +489,8 @@ fn narrowing(name: &str, before: &str, steps: &[&str]) {
     let b = Sandbox::new(name);
     let Some(tm) = Tmux::start_after(name, 100, 30, &b.root.join("repo"), &b.env(&format!("http://127.0.0.1:{port}")), &[], before) else { return };
     assert!(tm.wait_for("no network connectivity", Duration::from_secs(10)).is_some(), "{}", tm.screen());
-    tm.keys(&["?"]);
-    assert!(tm.wait_for("? or esc closes this", Duration::from_secs(5)).is_some(), "{}", tm.screen());
+    tm.keys(&["quit"]);
+    tm.wait_still(|s: &str| s.contains("→ quit"), Duration::from_secs(5)).unwrap_or_else(|| panic!("never typed:\n{}", tm.screen()));
     // Back to back in one tmux command: no frame in between.
     let mut args: Vec<&str> = Vec::new();
     for (i, w) in steps.iter().enumerate() {
@@ -502,13 +502,12 @@ fn narrowing(name: &str, before: &str, steps: &[&str]) {
     tm.tmux(&args);
     std::thread::sleep(Duration::from_millis(800));
     let history = tm.history();
-    for row in ["enter send · alt-enter", "⚠ no network connectivity", "→ Plan, search, build anything", "offline | ? help"] {
+    for row in ["⚠ no network connectivity", "→ quit", "offline | ? help"] {
         assert_eq!(history.matches(row).count(), 1, "{row:?} is in scrollback twice — the old live region was left behind:\n{history}");
     }
-    assert_eq!(history.matches("krowk · claude-opus-5-5").count(), 1, "the header is still there, once:\n{history}");
-    for edge in ['┌', '└'] {
-        assert_eq!(history.matches(edge).count(), 1, "one prompt box, its {edge} edge once:\n{history}");
-    }
+    assert_eq!(history.matches("Model:     anthropic/claude-opus-5-5").count(), 1, "the header is still there, once:\n{history}");
+    let rules = history.lines().filter(|l| l.trim().len() > 3 && l.trim().chars().all(|c| c == '─')).count();
+    assert_eq!(rules, 2, "one prompt, its two rules once each:\n{history}");
     // At 40 columns the status line is one row still: the device and the
     // cost gave way, the model is cut short, offline and the help stay.
     let screen = tm.screen();
@@ -522,7 +521,7 @@ fn narrowing(name: &str, before: &str, steps: &[&str]) {
         let last = lines.iter().rposition(|l| l.starts_with("earlier output")).expect("the earlier output is kept");
         let n: usize = lines[last].trim_start_matches("earlier output ").trim().parse().unwrap();
         assert_eq!(lines.iter().filter(|l| l.starts_with("earlier output")).count(), n, "every earlier line, once:\n{history}");
-        let header = lines.iter().position(|l| l.trim_start().starts_with("krowk · ")).expect("the header");
+        let header = lines.iter().position(|l| l.trim_start().starts_with("▀▀▀▀▀▀")).expect("the header");
         assert!(header > last && lines[last + 1..header].iter().all(|l| l.trim().is_empty()), "only the cleared screen between the earlier output and the header:\n{history}");
     }
 }
@@ -698,4 +697,66 @@ fn r_perm_1_a_settings_error_is_named_before_the_trust_question() {
     assert!(!st.success(), "{st}");
     assert!(!out.contains("Trust "), "no trust question was asked: {out:?}");
     assert!(!b.root.join("home/.config/krowk/trusted.json").exists(), "and none saved");
+}
+
+#[test]
+fn the_help_menu_filters_as_you_type_and_enter_runs_the_entry() {
+    let m = mock::serve(mock::readme_script);
+    let b = Sandbox::new("help");
+    let Some(tm) = Tmux::start("help", 100, 34, &b.root.join("repo"), &b.env(&m.url), &[]) else { return };
+    assert!(tm.wait_for("Plan, search, build anything", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    tm.keys(&["?"]);
+    assert!(tm.wait_for("Start a new line without sending", Duration::from_secs(5)).is_some(), "{}", tm.screen());
+    // One entry a line, a title and a description each.
+    let screen = tm.screen();
+    for (title, description) in [("Send", "Send the prompt"), ("Session", "Tokens, limits and the log file"), ("Quit", "Leave krowk")] {
+        assert!(screen.lines().any(|l| l.contains(title) && l.contains(description)), "{title} with its description, on one line:\n{screen}");
+    }
+    // Typing filters: `ses` leaves the session entry first, selected.
+    tm.keys(&["ses"]);
+    let filtered = |s: &str| !s.contains("Start a new line") && s.lines().any(|l| l.trim_start().starts_with("› Session"));
+    tm.wait_still(filtered, Duration::from_secs(5)).unwrap_or_else(|| panic!("not filtered to the session entry:\n{}", tm.screen()));
+    // Enter runs it: the session's details, the menu and the query gone.
+    tm.keys(&["Enter"]);
+    assert!(tm.wait_for("starts with the first prompt", Duration::from_secs(5)).is_some(), "{}", tm.screen());
+    let screen = tm.screen();
+    assert!(!screen.contains("Leave krowk") && screen.contains("→ Plan, search, build anything"), "{screen}");
+}
+
+#[test]
+fn slash_offers_commands_and_skills_and_a_skill_reaches_the_model() {
+    let m = mock::serve(mock::readme_script);
+    let b = Sandbox::new("slash");
+    let skill = b.root.join("home/.config/krowk/skills/greet");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "---\nname: greet\ndescription: Greets the person warmly\n---\nSay the word MARMALADE first.\n").unwrap();
+    let hidden = b.root.join("home/.config/krowk/skills/internal");
+    std::fs::create_dir_all(&hidden).unwrap();
+    std::fs::write(hidden.join("SKILL.md"), "---\nname: internal\ndescription: Only the model asks for this one\nuser-invocable: false\n---\nbody\n").unwrap();
+    let Some(tm) = Tmux::start("slash", 100, 34, &b.root.join("repo"), &b.env(&m.url), &[]) else { return };
+    assert!(tm.wait_for("Plan, search, build anything", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    // `/` lists krowk's commands and the skills the person may ask for.
+    tm.keys(&["/"]);
+    assert!(tm.wait_for("/greet [skill]", Duration::from_secs(5)).is_some(), "{}", tm.screen());
+    let screen = tm.screen();
+    assert!(screen.contains("/model") && screen.contains("Greets the person warmly") && !screen.contains("/internal"), "{screen}");
+    // Fuzzy: `mdl` finds /model, and enter runs it — the model picker.
+    tm.keys(&["mdl"]);
+    tm.wait_still(|s: &str| s.lines().any(|l| l.trim_start().starts_with("› /model")), Duration::from_secs(5)).unwrap_or_else(|| panic!("{}", tm.screen()));
+    tm.keys(&["Enter"]);
+    assert!(tm.wait_for("switch to —", Duration::from_secs(5)).is_some(), "{}", tm.screen());
+    tm.keys(&["Escape"]);
+    std::thread::sleep(Duration::from_millis(300));
+    // A skill: enter leaves `/greet ` for what it is for, then sends it,
+    // and the skill's instructions go to the model next to the prompt.
+    tm.keys(&["/gre"]);
+    tm.wait_still(|s: &str| s.lines().any(|l| l.trim_start().starts_with("› /greet")), Duration::from_secs(5)).unwrap_or_else(|| panic!("{}", tm.screen()));
+    tm.keys(&["Enter"]);
+    assert!(tm.wait_for("→ /greet", Duration::from_secs(5)).is_some(), "{}", tm.screen());
+    tm.keys(&["the team", "Enter"]);
+    assert!(tm.wait_for("Loaded the greet skill", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    assert!(tm.wait_for("tokens", Duration::from_secs(10)).is_some(), "{}", tm.screen());
+    let seen = m.seen.lock().unwrap();
+    let first = seen.iter().find(|s| s.body["messages"].is_array()).expect("the model was asked").body["messages"].to_string();
+    assert!(first.contains("/greet the team") && first.contains("MARMALADE"), "the prompt and the skill's body: {first}");
 }

@@ -27,6 +27,9 @@ pub struct Skill {
     pub description: String,
     /// Its directory.
     pub dir: PathBuf,
+    /// Whether the person can ask for it as `/name` (front matter
+    /// `user-invocable`, true unless it says `false`).
+    pub user_invocable: bool,
 }
 
 /// Load a skill's instructions.
@@ -60,8 +63,9 @@ fn read_dir_of(root: &Path, out: &mut Vec<Skill>, repo: Option<&Path>) {
         if description.is_empty() {
             continue;
         }
+        let user_invocable = get("user-invocable").trim() != "false";
         out.retain(|s| s.name != name);
-        out.push(Skill { name, description, dir });
+        out.push(Skill { name, description, dir, user_invocable });
     }
 }
 
@@ -79,6 +83,21 @@ pub fn discover(cfg: &Config, cwd: &Path) -> Vec<Skill> {
         read_dir_of(&dir.join(".claude/skills"), &mut out, Some(&root));
     }
     out
+}
+
+/// What a skill the person asked for starts with in the log: clients show
+/// it as krowk's, not the person's words.
+pub const INVOKED: &str = "<skill name=\"";
+
+/// A prompt that asks for a skill — `/name`, then what it is for — as the
+/// model reads it next to the prompt: the skill's instructions, loaded as
+/// the `skill` tool would. None when the prompt names no skill the person
+/// may ask for.
+pub fn invoked(list: &[Skill], prompt: &str) -> Option<String> {
+    let name = prompt.strip_prefix('/')?.split_whitespace().next()?;
+    list.iter().find(|k| k.name == name && k.user_invocable)?;
+    let (body, failed) = load(list, &serde_json::json!({ "name": name }));
+    (!failed).then(|| format!("{INVOKED}{name}\">\nThe person asked for this skill with /{name}; follow it for the rest of their message.\n\n{body}\n</skill>"))
 }
 
 /// The skills as the system prompt lists them: names and descriptions only.

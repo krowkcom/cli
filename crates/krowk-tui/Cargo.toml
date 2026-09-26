@@ -16,7 +16,7 @@ krowk-harness = { path = "../krowk-harness" }
 # scrolling-regions: lines go into scrollback through a scroll region
 # rather than by clearing and repainting the viewport, so nothing flickers
 # and nothing already in scrollback is drawn twice. No default features: no
-# widgets beyond the paragraph, no layout cache, no macros.
+# layout cache, no macros; the menus use its Table and Block.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "scrolling-regions"] }
 # The same crossterm the pickers already link (through inquire), plus its
 # event stream: key presses and resizes wake the loop, nothing polls.
@@ -25,6 +25,10 @@ futures-core = "0.3"
 tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros", "net", "signal"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 unicode-width = "0.2"
+# Fuzzy matching for the `/` menu, as Grok Build's is (nucleo). With the
+# menus' ratatui Table it adds 161,024 bytes to full.size (7,951,400 ->
+# 8,112,424 on x86_64 Linux, 14,040 under the ceiling).
+nucleo-matcher = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 # Ctrl-Z: stopping ourselves with SIGTSTP once the terminal is given back.

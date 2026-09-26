@@ -67,6 +67,20 @@ pub struct InstancesConfig {
     /// How subagents run: how many at once, and on which model.
     #[serde(default, skip_serializing_if = "SubagentsConfig::is_empty")]
     pub subagents: SubagentsConfig,
+    /// What happens when an instance hits its rate or usage limit
+    /// (R-INST-7, R-INST-8): `offer` (the default) asks the person whether
+    /// to continue on the next instance; `auto` moves there by itself, says
+    /// so in every client and logs it. Stacking one plan's limits across
+    /// accounts is the person's own responsibility: Anthropic's plan limits
+    /// assume ordinary, individual usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollover: Option<Rollover>,
+    /// The instances a limited session moves through, in order: each
+    /// `<instance>` (the same model id) or `<instance>/<model>`. `auto`
+    /// needs it; `offer` without it offers another instance of the same
+    /// kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rollover_order: Vec<String>,
 }
 
 /// `subagents` in config.json (R-SUB-1, R-SUB-2).
@@ -92,6 +106,17 @@ impl SubagentsConfig {
     pub fn max_parallel(&self) -> usize {
         self.max_parallel.unwrap_or(crate::subagent::MAX_PARALLEL).max(1)
     }
+}
+
+/// `rollover` in config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum Rollover {
+    /// Ask, one keystroke, never silently: the default.
+    #[default]
+    Offer,
+    /// Move to the next instance of `rolloverOrder` without asking.
+    Auto,
 }
 
 /// What an instance is. Tagged by `kind`. Every API-key kind names the
@@ -439,6 +464,9 @@ pub struct Registry {
     /// Config's `toolset`, already known to name a preset.
     pub toolset: Option<String>,
     pub subagents: SubagentsConfig,
+    pub rollover: Rollover,
+    /// Config's `rolloverOrder`, as written.
+    pub rollover_order: Vec<String>,
 }
 
 impl Registry {
@@ -452,7 +480,76 @@ impl Registry {
         for (name, kind) in &cfg.instances {
             instances.insert(name.clone(), resolve_one(name, kind, env));
         }
-        Registry { instances, default_model: cfg.default_model.clone(), toolset: cfg.toolset.clone(), subagents: cfg.subagents.clone() }
+        Registry { instances, default_model: cfg.default_model.clone(), toolset: cfg.toolset.clone(), subagents: cfg.subagents.clone(), rollover: cfg.rollover.unwrap_or_default(), rollover_order: cfg.rollover_order.clone() }
+    }
+
+    /// Whether `rollover` and `rolloverOrder` say something krowk can do,
+    /// checked when the config is read so a mistake is named then, not at
+    /// the limit (R-INST-8): every entry an instance this host has, `auto`
+    /// with an order to follow, and an entry on another kind of instance
+    /// than the first naming its model — the first's id means nothing there.
+    pub fn check_rollover(&self) -> Result<(), String> {
+        if self.rollover == Rollover::Auto && self.rollover_order.is_empty() {
+            return Err("config rollover is \"auto\" but rolloverOrder is empty — list the instances to move through, in order, e.g. [\"claude:work\", \"claude:personal\"]".into());
+        }
+        let mut first_kind: Option<&'static str> = None;
+        for e in &self.rollover_order {
+            let e = e.trim();
+            let (name, model) = match e.split_once('/') {
+                Some((i, m)) if self.instances.contains_key(i) => (i, Some(m)),
+                _ => (e, None),
+            };
+            let i = self.get(name).map_err(|why| format!("config rolloverOrder entry {e:?}: {why}"))?;
+            if model.is_some_and(str::is_empty) {
+                return Err(format!("config rolloverOrder entry {e:?} names no model after the /"));
+            }
+            match first_kind {
+                None => first_kind = Some(i.kind),
+                Some(k) if k != i.kind && model.is_none() => {
+                    return Err(format!("config rolloverOrder entry {e:?} is a {} instance, unlike the first ({k}): name its model, as {name}/<model>", i.kind));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Where a session limited on `from` could go next, best first, none of
+    /// the instances in `tried` (R-INST-7, R-INST-8): the entries of
+    /// `rolloverOrder` after `from`'s instance (from the top when it is not
+    /// listed), an entry naming no model keeping `from`'s id; with no order,
+    /// and only for an offer, every other instance of the same kind. Whether
+    /// each can run is the host's to check.
+    pub fn rollover_candidates(&self, from: &ModelRef, tried: &[String]) -> Vec<ModelRef> {
+        let parse = |e: &str| -> Option<ModelRef> {
+            let e = e.trim();
+            match e.split_once('/') {
+                Some((i, m)) if self.instances.contains_key(i) && !m.is_empty() => Some(ModelRef { instance: i.into(), model: m.into() }),
+                None if self.instances.contains_key(e) => Some(ModelRef { instance: e.into(), model: from.model.clone() }),
+                _ => None,
+            }
+        };
+        let skip = |m: &ModelRef| m.instance == from.instance || tried.contains(&m.instance);
+        if !self.rollover_order.is_empty() {
+            let order: Vec<ModelRef> = self.rollover_order.iter().filter_map(|e| parse(e)).collect();
+            let after = order.iter().position(|m| m.instance == from.instance).map_or(0, |i| i + 1);
+            // An entry on another kind of instance with no model of its own
+            // would ask it for a model id it has never heard of.
+            let kind = |i: &str| self.instances.get(i).map(|r| r.kind);
+            return order[after..]
+                .iter()
+                .zip(self.rollover_order.iter().filter(|e| parse(e).is_some()).skip(after))
+                .filter(|(m, e)| e.contains('/') || kind(&m.instance) == kind(&from.instance))
+                .map(|(m, _)| m)
+                .filter(|m| !skip(m))
+                .cloned()
+                .collect();
+        }
+        if self.rollover == Rollover::Auto {
+            return Vec::new();
+        }
+        let kind = self.instances.get(&from.instance).map(|i| i.kind);
+        self.instances.values().filter(|i| Some(i.kind) == kind).map(|i| ModelRef { instance: i.name.clone(), model: from.model.clone() }).filter(|m| !skip(m)).collect()
     }
 
     /// `--model`'s reading: `<instance>/<model>` when the part before the
@@ -916,5 +1013,19 @@ mod tests {
         assert_eq!(from_config_json(&serde_json::json!({})).unwrap().subagents.max_parallel(), crate::subagent::MAX_PARALLEL);
         assert!(from_config_json(&serde_json::json!({"subagents": {"maxParallel": 0}})).unwrap_err().contains("at least 1"));
         assert!(from_config_json(&serde_json::json!({"subagents": {"maxParalel": 2}})).unwrap_err().contains("subagents"), "a typo is named");
+    }
+
+    #[test]
+    fn r_inst_8_rollover_config_is_checked_when_it_is_read() {
+        let env = |_: &str| String::new();
+        let reg = |rollover: Option<Rollover>, order: &[&str]| Registry::resolve(&InstancesConfig { rollover, rollover_order: order.iter().map(|s| s.to_string()).collect(), ..Default::default() }, &env);
+        assert!(reg(None, &[]).check_rollover().is_ok(), "an offer needs no order");
+        assert!(reg(Some(Rollover::Auto), &[]).check_rollover().unwrap_err().contains("rolloverOrder is empty"));
+        assert!(reg(Some(Rollover::Auto), &["claude", "nowhere"]).check_rollover().unwrap_err().contains("\"nowhere\""));
+        assert!(reg(Some(Rollover::Auto), &["claude", "anthropic"]).check_rollover().unwrap_err().contains("name its model"));
+        assert!(reg(Some(Rollover::Auto), &["claude", "anthropic/claude-opus-5-5", "codex/gpt-5.5"]).check_rollover().is_ok());
+        let r = reg(Some(Rollover::Auto), &["claude", "anthropic", "anthropic/claude-opus-5-5"]);
+        let from = ModelRef { instance: "claude".into(), model: "sonnet".into() };
+        assert_eq!(r.rollover_candidates(&from, &[]), [ModelRef { instance: "anthropic".into(), model: "claude-opus-5-5".into() }], "another kind without a model is skipped");
     }
 }

@@ -47,6 +47,13 @@
       "format": "uint64",
       "minimum": 0,
       "default": 0
+    },
+    "handoff": {
+      "description": "What a backend was sent ahead of the prompt to bring it up to date\nwith turns it did not run (`backend.handoff`): exactly the text.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [

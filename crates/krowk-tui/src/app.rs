@@ -13,7 +13,11 @@ use crate::editor::Editor;
 use crate::look::{self, SEP};
 use crate::settings::{Item as StatusItem, Settings};
 use krowk_harness::host::Pricer;
-use krowk_harness::protocol::{ApprovalRequest, Billing, Delta, ErrorInfo, Item, ItemKind, LiveEvent, LogBody, LogEvent, ModelRef, RunResult, StreamLine, Todo, TodoStatus, TurnStatus, Usage};
+use krowk_harness::protocol::{
+    ApprovalRequest, Billing, Delta, ErrorInfo, HandoffKind, Item, ItemKind, LimitState, LimitStatus, LiveEvent, LogBody, LogEvent, ModelRef, RunResult, StreamLine, SwitchOffer, SwitchReason, Todo, TodoStatus,
+    TurnStatus, Usage,
+};
+use std::collections::BTreeMap;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::time::{Duration, Instant};
@@ -36,6 +40,8 @@ pub enum Overlay {
     Todos,
     /// The subagents' lines, selectable: expand one, interrupt one (R-SUB-3).
     Agents,
+    /// The model and instance picker (`/model`).
+    Models,
 }
 
 /// A subagent of the session, drawn as one line while it runs and
@@ -104,6 +110,67 @@ impl Sub {
         }
         parts.join(" · ")
     }
+}
+
+/// One row of the model picker: an instance, and the model to run there
+/// when one is known — else choosing it puts `/model <instance>/` in the
+/// prompt for the id to be typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pick {
+    pub instance: String,
+    pub model: Option<String>,
+    /// What the row says beside it: `now`, `used here`, the instance's kind.
+    pub note: String,
+}
+
+/// What one instance has done in this session, and how near its limit it
+/// last said it was (R-INST-6).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InstanceUsage {
+    pub turns: u32,
+    pub tokens: i64,
+    pub cost: f64,
+    pub unpriced: bool,
+    pub limit: Option<LimitStatus>,
+    /// The running turn's cost so far, from its `cost` frames: added when
+    /// the turn ends.
+    live_turn: Option<Option<f64>>,
+}
+
+impl InstanceUsage {
+    fn pending_cost(&mut self, turn: Option<f64>) {
+        self.live_turn = Some(turn);
+    }
+
+    fn settle(&mut self) {
+        match self.live_turn.take() {
+            Some(Some(usd)) => self.cost += usd,
+            Some(None) => self.unpriced = true,
+            None => {}
+        }
+    }
+
+    /// The limit in a few words: `82% of five_hour, resets 14:00`.
+    pub fn limit_words(&self) -> Option<String> {
+        let l = self.limit.as_ref()?;
+        let mut s = match (l.status, l.used_percent) {
+            (LimitState::Limited, _) => "limited".to_string(),
+            (_, Some(u)) => format!("{u:.0}% used"),
+            (LimitState::Warning, None) => "near its limit".to_string(),
+            (LimitState::Allowed, None) => return None,
+        };
+        if let Some(w) = &l.window {
+            s.push_str(&format!(" of {w}"));
+        }
+        if let Some(at) = l.resets_at_ms {
+            s.push_str(&format!(", resets {}", krowk_harness::host::clock(at)));
+        }
+        Some(s)
+    }
+}
+
+fn plural(n: u32, what: &str) -> String {
+    if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") }
 }
 
 /// The item streaming now.
@@ -213,6 +280,21 @@ pub struct App {
     pub agent_sel: usize,
     /// The todo list, as the log last set it (R-TODO-2).
     todos: Vec<Todo>,
+    /// Each instance the session has run on, by name (R-INST-6).
+    pub instances: BTreeMap<String, InstanceUsage>,
+    /// The instance the running (or replayed) turn is on.
+    turn_instance: Option<String>,
+    /// The last turn hit its instance's limit, and the host suggests where
+    /// to continue (R-INST-7): asked over the prompt, `y` or not.
+    pub offer: Option<SwitchOffer>,
+    /// A `model.switched` the stream brought — a rollover, a switch that
+    /// went back — for the client to follow with its next prompt.
+    pub switched: Option<ModelRef>,
+    /// The models this session has run on, oldest first: the picker's top.
+    pub used: Vec<ModelRef>,
+    /// The picker's rows and the one chosen.
+    pub picks: Vec<Pick>,
+    pub pick_at: usize,
 }
 
 impl App {
@@ -254,6 +336,13 @@ impl App {
             subs: Vec::new(),
             agent_sel: 0,
             todos: Vec::new(),
+            instances: BTreeMap::new(),
+            turn_instance: None,
+            offer: None,
+            switched: None,
+            used: Vec::new(),
+            picks: Vec::new(),
+            pick_at: 0,
         }
     }
 
@@ -321,6 +410,12 @@ impl App {
             self.pending.push(line);
         }
         self.dirty = true;
+    }
+
+    /// A dim line of its own, after a gap: what the client did, not the model.
+    pub fn gap_say(&mut self, text: &str) {
+        self.gap();
+        self.push_wrapped("", "", text, dim(), dim());
     }
 
     pub fn notice(&mut self, text: &str) {
@@ -455,7 +550,11 @@ impl App {
             StreamLine::Live(LiveEvent::ItemDelta { .. }) => {}
             // The session's spend after each metered call, subagents
             // included, priced by the host: the status bar shows it as is.
-            StreamLine::Live(LiveEvent::Cost { cost_usd, .. }) => {
+            StreamLine::Live(LiveEvent::Cost { cost_usd, turn_cost_usd, .. }) => {
+                if let Some(i) = self.turn_instance.clone() {
+                    let u = self.instances.entry(i).or_default();
+                    u.pending_cost(*turn_cost_usd);
+                }
                 match cost_usd {
                     Some(usd) => {
                         self.cost = *usd;
@@ -468,6 +567,11 @@ impl App {
             }
             // For the person alone (a claim command): shown, never logged.
             StreamLine::Live(LiveEvent::Notice { text, .. }) => self.notice(text),
+            // How near an instance is to its limit, as its provider says.
+            StreamLine::Live(LiveEvent::Limits { instance, limit, .. }) => {
+                self.instances.entry(instance.clone()).or_default().limit = Some(limit.clone());
+                self.dirty = true;
+            }
             StreamLine::Live(LiveEvent::ApprovalRequested(req)) => {
                 if self.approvals.is_empty() {
                     self.approval_shown = Some(Instant::now());
@@ -480,6 +584,7 @@ impl App {
             StreamLine::Live(LiveEvent::Result(r)) => {
                 self.approvals.clear();
                 self.on_result(r);
+                self.offer = r.switch_offer.clone();
             }
         }
     }
@@ -671,6 +776,11 @@ impl App {
             LogBody::TurnStarted { model, provider, permission_mode, .. } => {
                 self.session_id = Some(ev.session_id.clone());
                 self.model = Some(model.clone());
+                self.instances.entry(model.instance.clone()).or_default().turns += 1;
+                self.turn_instance = Some(model.instance.clone());
+                if !self.used.contains(model) {
+                    self.used.push(model.clone());
+                }
                 self.replay_model = Some((provider.clone(), model.model.clone()));
                 self.permission_mode = serde_json::to_value(permission_mode).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
                 if let Some(t) = &mut self.turn {
@@ -680,6 +790,8 @@ impl App {
             LogBody::ItemCompleted { item_id, item, .. } => self.on_item(item_id, item, live),
             LogBody::ResponseCompleted { usage, model, .. } | LogBody::SubagentResponse { usage, model, .. } => {
                 self.usage += *usage;
+                let instance = self.turn_instance.clone().unwrap_or_default();
+                self.instances.entry(instance.clone()).or_default().tokens += usage.total();
                 // A live turn's cost arrives with its result; a replayed
                 // one is priced here, the way the host priced it.
                 if !live {
@@ -687,11 +799,48 @@ impl App {
                         (Some(p), Some((provider, asked))) => p(provider, asked, usage).or_else(|| p(provider, model, usage)),
                         _ => None,
                     };
+                    let u = self.instances.entry(instance).or_default();
                     match priced {
-                        Some(usd) => self.cost += usd,
-                        None => self.unpriced = true,
+                        Some(usd) => {
+                            self.cost += usd;
+                            u.cost += usd;
+                        }
+                        None => {
+                            self.unpriced = true;
+                            u.unpriced = true;
+                        }
                     }
                 }
+            }
+            // Where the session went, and why: shown, and followed by the
+            // client's next prompt.
+            LogBody::ModelSwitched { from, to, reason, detail, .. } => {
+                self.gap();
+                let why = match (reason, detail) {
+                    (SwitchReason::Requested, _) => String::new(),
+                    (_, Some(d)) => format!(" — {d}"),
+                    (_, None) => String::new(),
+                };
+                let from = from.as_ref().map(|f| format!("{f} → ")).unwrap_or_default();
+                let style = if *reason == SwitchReason::Requested { dim() } else { yellow() };
+                self.push_wrapped(look::SWITCH, "  ", &format!("{from}{to}{why}"), style, style);
+                self.model = Some(to.clone());
+                if live {
+                    self.switched = Some(to.clone());
+                }
+            }
+            // How a backend was brought up to date with turns it did not run.
+            LogBody::BackendHandoff { how, from_instance, summarized_turns, recent_turns, fell_back, .. } => {
+                let said = match how {
+                    HandoffKind::Transcript => format!("continued from {}'s transcript, whole", from_instance.as_deref().unwrap_or("another account")),
+                    HandoffKind::CatchUp => format!("caught up on {} it did not run", plural(*recent_turns + *summarized_turns, "turn")),
+                    HandoffKind::Summary => match summarized_turns {
+                        0 => format!("seeded with the last {} as they happened", plural(*recent_turns, "turn")),
+                        n => format!("seeded with a summary of {} and the last {} as they happened", plural(*n, "earlier turn"), plural(*recent_turns, "turn")),
+                    },
+                };
+                let fell = fell_back.as_ref().map(|f| format!(" ({f})")).unwrap_or_default();
+                self.push_wrapped(look::SWITCH, "  ", &format!("{said}{fell}"), dim(), dim());
             }
             // The run the session's evidence goes under: the log's to keep.
             LogBody::RunOpened { .. } => {}
@@ -706,6 +855,9 @@ impl App {
             LogBody::TodosUpdated { todos, .. } => self.todos.clone_from(todos),
             LogBody::TurnCompleted { status, usage, duration_ms, error, .. } => {
                 self.turns += 1;
+                if let Some(u) = self.turn_instance.as_ref().and_then(|i| self.instances.get_mut(i)) {
+                    u.settle();
+                }
                 self.finish_live();
                 self.flush_calls();
                 match status {
@@ -913,6 +1065,11 @@ impl App {
             let from = self.subs.iter().find(|s| s.session_id == req.session_id).map(|s| if s.description.is_empty() { "a subagent".to_string() } else { format!("subagent “{}”", s.description) });
             rows.extend(approval_rows(req, self.approvals.len(), width, self.approval_ready(), from.as_deref()));
         }
+        if let Some(o) = &self.offer {
+            for row in wrap(&offer_question(o), width) {
+                rows.push(Line::from(Span::styled(row, yellow().add_modifier(Modifier::BOLD))));
+            }
+        }
         match self.overlay {
             Overlay::None => {}
             Overlay::Keys => rows.extend(self.keys_overlay(width)),
@@ -922,6 +1079,7 @@ impl App {
                 let hint = if self.subs.is_empty() { "no subagents running · esc closes this" } else { "↑ ↓ select · enter expands · x interrupts that one · esc closes this" };
                 rows.push(Line::from(Span::styled(clip(hint, width), Style::new().fg(Color::Blue))));
             }
+            Overlay::Models => rows.extend(self.models_overlay(width)),
         }
         // The prompt, scrolled to keep the caret in view.
         let (input, (crow, ccol)) = self.editor.layout(self.width.saturating_sub(2).max(1));
@@ -970,11 +1128,19 @@ impl App {
                 // instance's key otherwise.
                 StatusItem::Instance => {
                     if let Some(m) = &self.model {
-                        match &self.billing {
-                            Some((i, b)) if *i == m.instance => parts.push(format!("{} · {}", m.instance, if *b == Billing::Subscription { "subscription" } else { "api key" })),
-                            _ if self.vendor_instances.contains(&m.instance) => parts.push(m.instance.clone()),
-                            _ => parts.push(format!("{} · api key", m.instance)),
+                        let mut part = match &self.billing {
+                            Some((i, b)) if *i == m.instance => format!("{} · {}", m.instance, if *b == Billing::Subscription { "subscription" } else { "api key" }),
+                            _ if self.vendor_instances.contains(&m.instance) => m.instance.clone(),
+                            _ => format!("{} · api key", m.instance),
+                        };
+                        // Its limit, once it is worth knowing (R-INST-6).
+                        if let Some(u) = self.instances.get(&m.instance)
+                            && u.limit.as_ref().is_some_and(|l| l.status != LimitState::Allowed)
+                            && let Some(w) = u.limit_words()
+                        {
+                            part.push_str(&format!(" · {w}"));
                         }
+                        parts.push(part);
                     }
                 }
                 StatusItem::Cost => parts.push(if self.unpriced && self.cost == 0.0 { "$—".into() } else { format!("${:.2}", self.cost) }),
@@ -1015,7 +1181,7 @@ impl App {
             "↑ ↓ lines, then history · ctrl-a/e line start/end · ctrl-u/k/w kill",
             "esc or ctrl-c interrupt · type while it runs to steer",
             "ctrl-t todos · ctrl-g subagents: select, expand, interrupt one",
-            "ctrl-o session details · ctrl-d or /exit quit · ? or esc closes this",
+            "ctrl-o session details · /model switch model · ctrl-d or /exit quit · ? or esc closes this",
         ]
         .iter()
         .map(|l| Line::from(Span::styled(clip(l, width), Style::new().fg(Color::Blue))))
@@ -1057,7 +1223,58 @@ impl App {
         if let (Some(dir), Some(id)) = (&self.log_dir, &self.session_id) {
             lines.push(format!("log {dir}/{id}/events.jsonl"));
         }
+        // Usage and limits per instance (R-INST-6).
+        for (name, u) in &self.instances {
+            let cost = if u.unpriced && u.cost == 0.0 { "$—".to_string() } else { format!("${:.2}", u.cost) };
+            let mut l = format!("{name}: {} · {} tokens · {cost}", plural(u.turns, "turn"), tokens(u.tokens));
+            if let Some(w) = u.limit_words() {
+                l.push_str(&format!(" · {w}"));
+            }
+            lines.push(l);
+        }
         lines.into_iter().flat_map(|l| wrap(&l, width)).map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Blue)))).collect()
+    }
+
+    fn models_overlay(&self, width: usize) -> Vec<Line<'static>> {
+        let mut out = vec![Line::from(Span::styled(clip("switch to — ↑ ↓ choose · enter switch · esc closes · or /model <instance>/<model>", width), dim()))];
+        for (i, p) in self.picks.iter().enumerate() {
+            let chosen = i == self.pick_at;
+            let name = match &p.model {
+                Some(m) => format!("{}/{m}", p.instance),
+                None => format!("{}/…", p.instance),
+            };
+            let text = clip(&format!("{}{name}  {}", if chosen { "❯ " } else { "  " }, p.note), width);
+            out.push(Line::from(Span::styled(text, if chosen { look::accent() } else { Style::new().fg(Color::Blue) })));
+        }
+        out
+    }
+
+    /// Opens the picker: the models this session ran on, newest first, then
+    /// every other instance — with the session's model id where the
+    /// instance is of the same kind, else to be typed.
+    pub fn open_picker(&mut self, instances: &[(String, &'static str)]) {
+        let kind_of = |i: &str| instances.iter().find(|(n, _)| n == i).map(|(_, k)| *k);
+        let mut picks: Vec<Pick> = Vec::new();
+        let now = self.model.clone();
+        for m in self.used.iter().rev().chain(now.iter()) {
+            if picks.iter().any(|p| p.instance == m.instance && p.model.as_deref() == Some(&m.model)) {
+                continue;
+            }
+            let note = if Some(m) == now.as_ref() { "now".to_string() } else { "used in this session".to_string() };
+            picks.push(Pick { instance: m.instance.clone(), model: Some(m.model.clone()), note });
+        }
+        for (name, kind) in instances {
+            if picks.iter().any(|p| &p.instance == name) {
+                continue;
+            }
+            let model = now.as_ref().filter(|m| kind_of(&m.instance) == Some(*kind)).map(|m| m.model.clone());
+            picks.push(Pick { instance: name.clone(), model, note: kind.to_string() });
+        }
+        // The one after the current, so enter moves somewhere.
+        self.pick_at = usize::from(picks.len() > 1 && picks.first().is_some_and(|p| p.note == "now"));
+        self.picks = picks;
+        self.overlay = Overlay::Models;
+        self.dirty = true;
     }
 
     /// A turn has started: `Command::Prompt` is on its way.
@@ -1111,7 +1328,7 @@ impl App {
 fn line_session(line: &StreamLine) -> Option<&str> {
     Some(match line {
         StreamLine::Log(ev) => &ev.session_id,
-        StreamLine::Live(LiveEvent::ItemStarted { session_id, .. } | LiveEvent::ItemDelta { session_id, .. } | LiveEvent::Cost { session_id, .. } | LiveEvent::Notice { session_id, .. }) => session_id,
+        StreamLine::Live(LiveEvent::ItemStarted { session_id, .. } | LiveEvent::ItemDelta { session_id, .. } | LiveEvent::Cost { session_id, .. } | LiveEvent::Notice { session_id, .. } | LiveEvent::Limits { session_id, .. }) => session_id,
         StreamLine::Live(LiveEvent::Result(r)) => &r.session_id,
         StreamLine::Live(LiveEvent::ApprovalRequested(r)) => &r.session_id,
         StreamLine::Live(LiveEvent::ApprovalResolved { session_id, .. }) => session_id,
@@ -1212,6 +1429,13 @@ fn approval_rows(req: &ApprovalRequest, waiting: usize, width: usize, ready: boo
     };
     rows.push(Line::from(Span::styled(clip(&keys, width), look::accent())));
     rows
+}
+
+/// R-INST-7's question: "claude:work limited until 14:00, continue on
+/// claude:personal? [y/N]".
+pub fn offer_question(o: &SwitchOffer) -> String {
+    let until = o.resets_at_ms.map(|ms| format!(" until {}", krowk_harness::host::clock(ms))).unwrap_or_default();
+    format!("{}{} limited{until}, continue on {}? [y/N]", look::SWITCH, o.from.instance, if o.to.model == o.from.model { o.to.instance.clone() } else { o.to.to_string() })
 }
 
 /// How much of a model-supplied string an approval shows.
@@ -1354,6 +1578,7 @@ mod tests {
             num_model_calls: 1,
             error: None,
             unread_steers: Vec::new(),
+            switch_offer: None,
         };
         a.on_line(&live(LiveEvent::Result(result.clone())));
         assert_eq!(a.status_bar(), "$1.50", "the result's cost is already in the frame");
@@ -1525,6 +1750,100 @@ mod tests {
         a.answered("r2");
         a.on_line(&live(LiveEvent::ApprovalRequested(ApprovalRequest { request_id: "r3".into(), summary: "Bash `ls`".into(), session_id: "s".into(), turn_id: "t".into(), tool: "bash".into(), input: serde_json::json!({}), reason: "x".into(), remember: vec![] })));
         assert!(a.approval_ready());
+    }
+
+    fn switch_turn(instance: &str, model: &str) -> LogBody {
+        LogBody::TurnStarted { turn_id: "t".into(), model: ModelRef { instance: instance.into(), model: model.into() }, provider: "anthropic".into(), wire_api: WireApi::AnthropicMessages, permission_mode: PermissionMode::Default, effort: None }
+    }
+
+    #[test]
+    fn r_inst_7_a_limit_offers_the_next_instance_as_one_question() {
+        let mut a = app();
+        a.set_width(100);
+        let offer = SwitchOffer { from: ModelRef { instance: "claude:work".into(), model: "sonnet".into() }, to: ModelRef { instance: "claude:personal".into(), model: "sonnet".into() }, resets_at_ms: None };
+        let result = RunResult {
+            session_id: "s".into(),
+            turn_id: "t".into(),
+            status: TurnStatus::Failed,
+            is_error: true,
+            result: String::new(),
+            model: offer.from.clone(),
+            usage: Usage::default(),
+            cost_usd: None,
+            duration_ms: 1,
+            num_model_calls: 0,
+            error: None,
+            unread_steers: Vec::new(),
+            switch_offer: Some(offer.clone()),
+        };
+        a.on_line(&live(LiveEvent::Result(result)));
+        let rows = text(&a.view(Instant::now()).0).join("\n");
+        assert!(rows.contains("⇄ claude:work limited, continue on claude:personal? [y/N]"), "{rows}");
+        let later = SwitchOffer { resets_at_ms: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 + 3_600_000), ..offer.clone() };
+        assert!(offer_question(&later).contains("claude:work limited until "), "{}", offer_question(&later));
+        let other = SwitchOffer { to: ModelRef { instance: "anthropic".into(), model: "claude-opus-5-5".into() }, ..offer };
+        assert!(offer_question(&other).ends_with("continue on anthropic/claude-opus-5-5? [y/N]"), "another model is named whole");
+    }
+
+    #[test]
+    fn r_inst_6_usage_and_limits_are_shown_per_instance() {
+        let mut a = app();
+        a.set_width(160);
+        a.settings = Settings { status_bar: true, status_items: vec![StatusItem::Instance] };
+        let usage = Usage { input_tokens: 1000, output_tokens: 200, ..Usage::default() };
+        let response = |model: &str| LogBody::ResponseCompleted { turn_id: "t".into(), response_id: None, model: model.into(), usage, stop_reason: None, item_ids: Vec::new() };
+        let done = LogBody::TurnCompleted { turn_id: "t".into(), status: TurnStatus::Completed, usage, duration_ms: 1, error: None, reported_cost_usd: None };
+        let cost = |usd: f64| live(LiveEvent::Cost { session_id: "s".into(), turn_id: "t".into(), cost_usd: Some(usd), turn_cost_usd: Some(usd), generated_tokens: 1 });
+        a.on_line(&log(switch_turn("anthropic", "claude-x")));
+        a.on_line(&log(response("claude-x")));
+        a.on_line(&cost(0.25));
+        a.on_line(&log(done.clone()));
+        a.on_line(&log(switch_turn("claude:work", "sonnet")));
+        a.on_line(&log(response("sonnet")));
+        a.on_line(&live(LiveEvent::Limits { session_id: "s".into(), turn_id: "t".into(), instance: "claude:work".into(), limit: LimitStatus { status: LimitState::Warning, window: Some("five_hour".into()), used_percent: Some(82.0), resets_at_ms: None } }));
+        a.on_line(&cost(0.35));
+        a.on_line(&log(done));
+        assert_eq!(a.status_bar(), "claude:work · api key · 82% used of five_hour", "the instance's limit, once it is near");
+        a.overlay = Overlay::Details;
+        let rows = text(&a.view(Instant::now()).0).join("\n");
+        assert!(rows.contains("anthropic: 1 turn · 1.2k tokens · $0.25"), "{rows}");
+        assert!(rows.contains("claude:work: 1 turn · 1.2k tokens · $0.35 · 82% used of five_hour"), "{rows}");
+    }
+
+    #[test]
+    fn r_switch_4_a_switch_the_host_made_is_shown_and_followed() {
+        let mut a = app();
+        a.set_width(160);
+        a.take_pending();
+        let to = ModelRef { instance: "claude:personal".into(), model: "sonnet".into() };
+        a.on_line(&log(LogBody::ModelSwitched { turn_id: None, from: Some(ModelRef { instance: "claude:work".into(), model: "sonnet".into() }), to: to.clone(), reason: SwitchReason::RateLimited, detail: Some("claude:work is limited".into()) }));
+        assert_eq!(text(&a.take_pending()), ["⇄ claude:work/sonnet → claude:personal/sonnet — claude:work is limited"]);
+        assert_eq!((a.model.clone(), a.switched.take()), (Some(to.clone()), Some(to)), "the next prompt goes where the session went");
+        a.on_line(&log(LogBody::BackendHandoff { turn_id: "t".into(), how: HandoffKind::Summary, from_instance: None, summarized_turns: 2, recent_turns: 3, fell_back: None }));
+        assert_eq!(text(&a.take_pending()), ["⇄ seeded with a summary of 2 earlier turns and the last 3 turns as they happened"]);
+    }
+
+    #[test]
+    fn the_model_picker_lists_the_sessions_models_then_every_instance() {
+        let mut a = app();
+        a.on_line(&log(switch_turn("openai", "gpt-5.4")));
+        a.on_line(&log(switch_turn("anthropic", "claude-x")));
+        a.open_picker(&[("anthropic".into(), "anthropic-api"), ("anthropic:work".into(), "anthropic-api"), ("claude".into(), "claude-code"), ("openai".into(), "openai-api")]);
+        assert_eq!(a.overlay, Overlay::Models);
+        let picks: Vec<(String, Option<String>)> = a.picks.iter().map(|p| (p.instance.clone(), p.model.clone())).collect();
+        assert_eq!(
+            picks,
+            [
+                ("anthropic".to_string(), Some("claude-x".to_string())),
+                ("openai".to_string(), Some("gpt-5.4".to_string())),
+                ("anthropic:work".to_string(), Some("claude-x".to_string())),
+                ("claude".to_string(), None),
+            ],
+            "the session's models first; an instance of the same kind keeps the model id; another kind's is typed"
+        );
+        assert_eq!(a.pick_at, 1, "enter moves somewhere");
+        let rows = text(&a.view(Instant::now()).0).join("\n");
+        assert!(rows.contains("❯ openai/gpt-5.4") && rows.contains("claude/…"), "{rows}");
     }
 
     #[test]

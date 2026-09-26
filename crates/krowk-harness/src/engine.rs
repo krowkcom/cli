@@ -43,7 +43,7 @@ use crate::budget::Budget;
 use crate::evidence::Evidence;
 use crate::toolset::Preset;
 use crate::catalog::ModelInfo;
-use crate::protocol::{ApprovalDecision, ApprovalRequest, Billing, Delta, Effort, ErrorInfo, Item, ItemKind, ModelRef, PermissionMode, Todo, ToolDefinition, Usage, WireApi};
+use crate::protocol::{ApprovalDecision, ApprovalRequest, Billing, Delta, Effort, ErrorInfo, HandoffKind, Item, ItemKind, LimitStatus, ModelRef, PermissionMode, Todo, ToolDefinition, Usage, WireApi};
 use crate::subagent::{AgentRun, Subagents};
 use std::future::Future;
 use std::path::PathBuf;
@@ -90,6 +90,13 @@ pub enum EngineEvent {
     /// A subagent started, as the child session `session_id`, answering
     /// the tool call `call_id`: the host logs the link.
     SubagentStarted { call_id: String, session_id: String, description: String, agent: Option<String>, model: ModelRef },
+    /// How close the instance is to its rate or usage limit, as its
+    /// provider just said (R-INST-6).
+    Limits(LimitStatus),
+    /// A backend was brought up to date with turns it did not run
+    /// (R-SWITCH-2, R-INST-4): how, and exactly what it was sent. Reported
+    /// before the turn's `Context`, so the context record carries it.
+    Handoff { how: HandoffKind, from_instance: Option<String>, summarized_turns: u32, recent_turns: u32, fell_back: Option<String>, text: String },
 }
 
 /// Where an engine sends its events. Bounded, so a slow client slows the
@@ -139,6 +146,10 @@ pub struct TurnContext {
     /// For a subagent: the definition it runs — its instructions and its
     /// tool allowlist.
     pub agent: Option<AgentRun>,
+    /// For a backend: how to bring its vendor session up to date with
+    /// turns it did not run (`crate::handoff`). None when there is nothing
+    /// it has not seen; the native loop reads the whole branch instead.
+    pub handoff: Option<crate::handoff::Handoff>,
 }
 
 /// The steering a running turn has been sent and not yet taken: a queue
@@ -224,19 +235,32 @@ pub struct EngineError {
     pub code: String,
     pub message: String,
     pub status: u16,
+    /// For a rate or usage limit: when the provider said it lifts, in
+    /// milliseconds since the Unix epoch.
+    pub resets_at_ms: Option<i64>,
 }
 
 impl EngineError {
     pub fn new(code: &str, message: impl Into<String>) -> EngineError {
-        EngineError { code: code.into(), message: message.into(), status: 0 }
+        EngineError { code: code.into(), message: message.into(), status: 0, resets_at_ms: None }
     }
 
     pub fn with_status(self, status: u16) -> EngineError {
         EngineError { status, ..self }
     }
 
+    pub fn with_resets(self, resets_at_ms: Option<i64>) -> EngineError {
+        EngineError { resets_at_ms, ..self }
+    }
+
+    /// The instance hit its rate or usage limit: the failure a switch to
+    /// another instance answers (R-INST-7), whichever engine reported it.
+    pub fn limited(&self) -> bool {
+        matches!(self.code.as_str(), "rate_limited" | "usage_limit") || self.status == 429
+    }
+
     pub fn info(&self) -> ErrorInfo {
-        ErrorInfo { code: self.code.clone(), message: self.message.clone(), http_status: (self.status != 0).then_some(self.status) }
+        ErrorInfo { code: self.code.clone(), message: self.message.clone(), http_status: (self.status != 0).then_some(self.status), resets_at_ms: self.resets_at_ms }
     }
 }
 

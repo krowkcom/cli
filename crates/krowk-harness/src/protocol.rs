@@ -223,6 +223,10 @@ pub struct ErrorInfo {
     /// answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
+    /// For a rate or usage limit: when the provider said it lifts, in
+    /// milliseconds since the Unix epoch, when it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<i64>,
 }
 
 /// Claude-Code-compatible permission modes (R-PERM-1): `default` asks
@@ -299,10 +303,10 @@ pub struct ApprovalRequest {
     pub remember: Vec<String>,
 }
 
-/// What a client asks of the engine. `prompt`, `interrupt`, `steer` and
-/// `approve` are served today; the rest are typed now so every client is written against
-/// the whole vocabulary, and are refused with `not_implemented` until their
-/// tickets land.
+/// What a client asks of the engine. `prompt`, `interrupt`, `steer`,
+/// `approve` and `switchModel` are served today; the rest are typed now so
+/// every client is written against the whole vocabulary, and are refused
+/// with `not_implemented` until their tickets land.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Command {
@@ -338,8 +342,18 @@ pub enum Command {
     Steer { session_id: String, text: String },
     /// Answer an `approval.requested`.
     Approve { session_id: String, request_id: String, decision: ApprovalDecision },
-    /// Continue the session on another model.
-    SwitchModel { session_id: String, model: ModelRef },
+    /// Continue the session on another model, instance or engine
+    /// (R-SWITCH-4): checked now — the instance, its key or login, its
+    /// binary — and refused with the fix when it cannot run, the session
+    /// staying where it was; accepted, it is logged as `model.switched` and
+    /// the session's next prompt runs there. While a turn runs it is logged
+    /// once the turn is over. Without `sessionId` it is only checked: a
+    /// client that has no session yet asks before its first prompt.
+    SwitchModel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        model: ModelRef,
+    },
     /// Branch the session at an event: the new branch's first event names
     /// it as its parent.
     Fork { session_id: String, from_event_id: String },
@@ -364,6 +378,79 @@ impl BudgetLimits {
     pub fn is_empty(&self) -> bool {
         self.max_usd.is_none() && self.max_tokens.is_none()
     }
+}
+
+/// Why a session moved to another model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum SwitchReason {
+    /// A client asked (`switchModel`).
+    Requested,
+    /// The instance it was on hit its rate or usage limit, and `rollover`
+    /// is `auto` (R-INST-8).
+    RateLimited,
+    /// The model a turn switched to could not run it — no login, no key,
+    /// no binary — so the session went back to the one before (R-SWITCH-4).
+    SwitchFailed,
+}
+
+/// A switch the host suggests when an instance hits its limit and
+/// `rollover` is `offer`, the default (R-INST-7): the client asks the
+/// person, and a yes is `switchModel` to `to` and the prompt again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchOffer {
+    pub from: ModelRef,
+    pub to: ModelRef,
+    /// When `from`'s limit lifts, when the provider said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<i64>,
+}
+
+/// How close an instance is to its rate or usage limit, as its provider
+/// last said (R-INST-6): Claude Code's rate-limit events, Codex's
+/// rate-limit snapshots, a native API's rate-limit headers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitStatus {
+    /// `allowed`, `warning` (near it) or `limited` (reached).
+    pub status: LimitState,
+    /// The window the limit counts over, as the provider names it:
+    /// `five_hour`, `seven_day`, `requests`, `tokens`, `300m`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// How much of it is used, 0–100, when the provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<f64>,
+    /// When it resets, in milliseconds since the Unix epoch, when the
+    /// provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum LimitState {
+    Allowed,
+    Warning,
+    Limited,
+}
+
+/// How a backend was brought up to date with a session that ran somewhere
+/// else first (R-SWITCH-2, R-INST-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum HandoffKind {
+    /// The vendor's own transcript, copied from another instance of the
+    /// same vendor into this one's config directory and resumed there: the
+    /// full context, not a summary.
+    Transcript,
+    /// The vendor resumed its own thread, and was told what happened on
+    /// other models since it last ran.
+    CatchUp,
+    /// A new vendor session, seeded with krowk's summary of the earlier
+    /// turns and the most recent ones as they happened.
+    Summary,
 }
 
 /// One line of a session's log: typed, with a UUIDv7 `id`, and a `parentId`
@@ -501,6 +588,45 @@ pub enum LogBody {
         /// The run's slug, e.g. `run_…`.
         run: String,
     },
+    /// The session moved to another model, instance or engine: asked for
+    /// (`switchModel`), rolled over from an instance at its limit
+    /// (R-INST-8), or back to the one before when the new one could not run
+    /// a turn (R-SWITCH-4). The next turn runs on `to` unless its prompt
+    /// names another.
+    #[serde(rename = "model.switched")]
+    ModelSwitched {
+        /// The turn it followed, when it followed one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<ModelRef>,
+        to: ModelRef,
+        reason: SwitchReason,
+        /// Why, in words: the limit that was hit and when it lifts, or the
+        /// failure the new model's turn ended with.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// How a backend turn was brought up to date with what the session did
+    /// elsewhere (R-SWITCH-2, R-INST-4). What the vendor was sent is in
+    /// `context.jsonl` under the turn, as `handoff`.
+    #[serde(rename = "backend.handoff")]
+    BackendHandoff {
+        turn_id: String,
+        how: HandoffKind,
+        /// The instance whose transcript was copied, for `transcript`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_instance: Option<String>,
+        /// Earlier turns told as a summary, and recent ones as they happened.
+        #[serde(default)]
+        summarized_turns: u32,
+        #[serde(default)]
+        recent_turns: u32,
+        /// Why a better handoff was not possible: a transcript that could
+        /// not be copied, a thread the vendor could not resume.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fell_back: Option<String>,
+    },
     /// The turn is over.
     #[serde(rename = "turn.completed")]
     TurnCompleted {
@@ -565,6 +691,10 @@ pub enum LiveEvent {
     /// and leaves it out of `stream-json`.
     #[serde(rename = "notice")]
     Notice { session_id: String, turn_id: String, text: String },
+    /// How close an instance is to its rate or usage limit, whenever its
+    /// provider says (R-INST-6).
+    #[serde(rename = "limits")]
+    Limits { session_id: String, turn_id: String, instance: String, limit: LimitStatus },
     /// A tool call waits for a person's say.
     #[serde(rename = "approval.requested")]
     ApprovalRequested(ApprovalRequest),
@@ -602,6 +732,10 @@ pub struct RunResult {
     /// completed turn: a turn does not complete with steering unread.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unread_steers: Vec<String>,
+    /// A turn that failed on its instance's rate or usage limit, with
+    /// `rollover` at `offer`: the instance it could continue on (R-INST-7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_offer: Option<SwitchOffer>,
 }
 
 /// One line of `--output-format stream-json`, and of anything else that
@@ -664,4 +798,8 @@ pub struct ContextRecord {
     /// provider is sent.
     #[serde(default)]
     pub tools_tokens: u64,
+    /// What a backend was sent ahead of the prompt to bring it up to date
+    /// with turns it did not run (`backend.handoff`): exactly the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<String>,
 }

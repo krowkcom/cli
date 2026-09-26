@@ -355,6 +355,99 @@
       ]
     },
     {
+      "description": "The session moved to another model, instance or engine: asked for\n(`switchModel`), rolled over from an instance at its limit\n(R-INST-8), or back to the one before when the new one could not run\na turn (R-SWITCH-4). The next turn runs on `to` unless its prompt\nnames another.",
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "description": "The turn it followed, when it followed one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "to": {
+          "$ref": "#/$defs/ModelRef"
+        },
+        "reason": {
+          "$ref": "#/$defs/SwitchReason"
+        },
+        "detail": {
+          "description": "Why, in words: the limit that was hit and when it lifts, or the\nfailure the new model's turn ended with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "model.switched"
+        }
+      },
+      "required": [
+        "type",
+        "to",
+        "reason"
+      ]
+    },
+    {
+      "description": "How a backend turn was brought up to date with what the session did\nelsewhere (R-SWITCH-2, R-INST-4). What the vendor was sent is in\n`context.jsonl` under the turn, as `handoff`.",
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string"
+        },
+        "how": {
+          "$ref": "#/$defs/HandoffKind"
+        },
+        "fromInstance": {
+          "description": "The instance whose transcript was copied, for `transcript`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summarizedTurns": {
+          "description": "Earlier turns told as a summary, and recent ones as they happened.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 0
+        },
+        "recentTurns": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 0
+        },
+        "fellBack": {
+          "description": "Why a better handoff was not possible: a transcript that could\nnot be copied, a thread the vendor could not resume.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "backend.handoff"
+        }
+      },
+      "required": [
+        "type",
+        "turnId",
+        "how"
+      ]
+    },
+    {
       "description": "The turn is over.",
       "type": "object",
       "properties": {
@@ -680,6 +773,46 @@
         "completed"
       ]
     },
+    "SwitchReason": {
+      "description": "Why a session moved to another model.",
+      "oneOf": [
+        {
+          "description": "A client asked (`switchModel`).",
+          "type": "string",
+          "const": "requested"
+        },
+        {
+          "description": "The instance it was on hit its rate or usage limit, and `rollover`\nis `auto` (R-INST-8).",
+          "type": "string",
+          "const": "rateLimited"
+        },
+        {
+          "description": "The model a turn switched to could not run it — no login, no key,\nno binary — so the session went back to the one before (R-SWITCH-4).",
+          "type": "string",
+          "const": "switchFailed"
+        }
+      ]
+    },
+    "HandoffKind": {
+      "description": "How a backend was brought up to date with a session that ran somewhere\nelse first (R-SWITCH-2, R-INST-4).",
+      "oneOf": [
+        {
+          "description": "The vendor's own transcript, copied from another instance of the\nsame vendor into this one's config directory and resumed there: the\nfull context, not a summary.",
+          "type": "string",
+          "const": "transcript"
+        },
+        {
+          "description": "The vendor resumed its own thread, and was told what happened on\nother models since it last ran.",
+          "type": "string",
+          "const": "catchUp"
+        },
+        {
+          "description": "A new vendor session, seeded with krowk's summary of the earlier\nturns and the most recent ones as they happened.",
+          "type": "string",
+          "const": "summary"
+        }
+      ]
+    },
     "TurnStatus": {
       "description": "How a turn ended.",
       "oneOf": [
@@ -720,6 +853,14 @@
           "format": "uint16",
           "minimum": 0,
           "maximum": 65535
+        },
+        "resetsAtMs": {
+          "description": "For a rate or usage limit: when the provider said it lifts, in\nmilliseconds since the Unix epoch, when it said.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
         }
       },
       "required": [

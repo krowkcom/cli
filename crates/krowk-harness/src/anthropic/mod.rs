@@ -107,20 +107,21 @@ fn messages(history: &[HistoryItem]) -> Vec<Value> {
             // Replayed only when the blob itself says it is ours — never
             // by where the item sits, which a response that failed before
             // completing does not record. Another provider's reasoning is
-            // downgraded to framed plain text (R-SWITCH-1); our own that
-            // cannot replay (no signature) is left out.
+            // downgraded to framed plain text (R-SWITCH-1) — with a blob of
+            // its own, or none at all, as a backend that keeps its reasoning
+            // to itself (Codex) leaves it: this API's own thinking always
+            // carries its signature, and is never completed without one.
             Item::Reasoning { text, blob } => match native::replays(blob, stream::PROVIDER, WireApi::AnthropicMessages) {
                 Some(b) => {
                     if let Some(block) = replay(b, text) {
                         push(&mut out, "assistant", block);
                     }
                 }
-                None if blob.is_some() => {
+                None => {
                     if let Some(t) = native::downgraded(text) {
                         push(&mut out, "assistant", json!({ "type": "text", "text": t }));
                     }
                 }
-                None => {}
             },
         }
     }
@@ -192,8 +193,7 @@ impl ModelClient for AnthropicClient {
             match http::send(&build, &cancel, peer).await? {
                 Answer::Streaming(resp) => http::read_stream(resp, stream::Decoder::default(), events, &cancel, &req.model, peer).await,
                 Answer::Refused(resp) => {
-                    let (status, said) = http::refusal(resp).await;
-                    Err(http::status_error(status, &said, peer, &req.model, &format!("check {}", inst.api_key_env)))
+                    Err(http::refused(resp, peer, &req.model, &format!("check {}", inst.api_key_env)).await)
                 }
                 Answer::Interrupted => Ok(ModelResponse { model: req.model.clone(), interrupted: true, ..ModelResponse::default() }),
             }

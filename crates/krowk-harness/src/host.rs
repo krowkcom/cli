@@ -23,8 +23,11 @@ use crate::openai::ResponsesClient;
 use crate::log::{self, LogError, SessionLog};
 use crate::native::{self, NativeEngine};
 use crate::toolset;
+use crate::handoff::{self, TurnSpan};
+use crate::instances::Rollover;
 use crate::protocol::{
-    Billing, BudgetLimits, Command, ContextRecord, Effort, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus, Usage, WireApi,
+    Billing, BudgetLimits, Command, ContextRecord, Effort, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, SwitchOffer, SwitchReason, TurnStatus, Usage,
+    WireApi,
 };
 use crate::claude::ClaudeEngine;
 use crate::codex::CodexEngine;
@@ -103,6 +106,9 @@ pub(crate) struct Shared {
 struct Running {
     cancel: Arc<watch::Sender<bool>>,
     steers: Steers,
+    /// A `switchModel` that arrived while the turn ran: logged once it is
+    /// over, since the turn holds the log.
+    switch: Option<ModelRef>,
 }
 
 /// A session's backend engine, the instance it was made for, and when a
@@ -217,9 +223,8 @@ impl Host {
                 shared.approvals.answer(&session_id, &request_id, decision).map_err(|e| EngineError::new("no_approval_request", e))?;
                 Ok(None)
             }
-            Command::SwitchModel { .. } | Command::Fork { .. } => {
-                Err(EngineError::new("not_implemented", "this command is part of the protocol but not served by this build yet"))
-            }
+            Command::SwitchModel { session_id, model } => shared.switch_model(session_id.as_deref(), model, out).await.map(|()| None),
+            Command::Fork { .. } => Err(EngineError::new("not_implemented", "this command is part of the protocol but not served by this build yet")),
         }
     }
 }
@@ -258,9 +263,21 @@ struct TurnPlan {
     /// Flips when the parent's turn is interrupted.
     parent_cancel: Option<watch::Receiver<bool>>,
     /// Whether the result goes to the client as a `result` frame: a
-    /// subagent's goes back to the tool call instead.
+    /// subagent's goes back to the tool call instead. Only such a turn — a
+    /// session's own, never a subagent's, which stays on the model it was
+    /// started on — follows up a failure with a switch.
     announce: bool,
     started: Instant,
+    /// How a backend's thread is brought up to date (`crate::handoff`).
+    handoff: Option<handoff::Handoff>,
+    /// The session held in this host from before its log was opened: the
+    /// turn's cancel switch, its steering, a switch for after it.
+    here: Registration,
+    /// A rollover this turn is the move of: logged once it has passed its
+    /// checks, as it starts (R-INST-8).
+    rolling: Option<Rolling>,
+    /// The instances this prompt has tried already.
+    tried: Vec<String>,
 }
 
 /// The parent turn a subagent's spend is reported to.
@@ -306,6 +323,13 @@ impl Shared {
         Ok(e)
     }
 
+    /// A `prompt`: one turn — and, with `rollover` at `auto`, another on the
+    /// next instance each time one ends on its instance's limit (R-INST-8),
+    /// every instance tried once. The move is logged only once the next
+    /// turn has passed every check and starts: a candidate that fails one
+    /// is skipped for the next, and with none left the limited turn's
+    /// result stands, the session where it was. The result is the last
+    /// turn's.
     #[allow(clippy::too_many_arguments)]
     async fn prompt(
         self: &Arc<Self>,
@@ -318,13 +342,171 @@ impl Shared {
         limits: BudgetLimits,
         out: mpsc::Sender<StreamLine>,
     ) -> Result<RunResult, EngineError> {
+        let mut session = session_id.map(String::from);
+        let mut model = model;
+        let mut tried: Vec<String> = Vec::new();
+        let mut rolling: Option<Rolling> = None;
+        let mut limited: Option<RunResult> = None;
+        loop {
+            let r = match self.settle(session.as_deref(), text.clone(), model.clone(), permission_mode, toolset, effort, limits, &out, &tried, rolling.clone()).await {
+                Ok(plan) => self.turn(plan, out.clone()).await,
+                Err(e) => Err(e),
+            };
+            match (r, rolling.take()) {
+                (Ok((result, Some(next))), _) => {
+                    tried.push(result.model.instance.clone());
+                    session = Some(result.session_id.clone());
+                    model = Some(next.to.clone());
+                    limited = Some(result);
+                    rolling = Some(next);
+                }
+                (Ok((result, None)), _) => return Ok(result),
+                // The instance rolled over to could not start its turn: the
+                // move was never logged, so the session is where it was.
+                // The next candidate, or the limit's own result.
+                (Err(e), Some(r)) => {
+                    tried.push(r.to.instance.clone());
+                    match self.next_instance(&r.from, &tried, &r.cwd, true) {
+                        Some(to) => {
+                            model = Some(to.clone());
+                            rolling = Some(Rolling { to, ..r });
+                        }
+                        None => {
+                            let mut result = limited.take().expect("a rollover follows a limited turn");
+                            if let Some(err) = result.error.as_mut() {
+                                err.message.push_str(&format!(" (rollover to {} could not start: {})", r.to, e.message));
+                            }
+                            return Ok(result);
+                        }
+                    }
+                }
+                (Err(e), None) => return Err(e),
+            }
+        }
+    }
+
+    /// Checks that `model` can run a turn here before a session is moved to
+    /// it (R-SWITCH-4): the instance, its key or login, its binary, and for
+    /// a backend whether the repository is trusted to run one. `stays` is
+    /// the model the session is on, named in the refusal's words.
+    fn check_model(&self, model: &ModelRef, cwd: &std::path::Path, stays: Option<&ModelRef>) -> Result<(), EngineError> {
+        let staying = |e: EngineError| match stays.filter(|s| *s != model) {
+            Some(s) => EngineError { message: format!("{} — the session stays on {s}", e.message), ..e },
+            None => e,
+        };
+        let instance = self.cfg.registry.get(&model.instance).map_err(|e| staying(EngineError::new("no_instance", e)))?;
+        match &instance.backend {
+            None => {
+                let info = (self.cfg.catalog)(&instance.provider, &model.model);
+                let wire = instance.wire_for(info.as_ref().and_then(|i| i.wire_api));
+                engine_for(instance, wire, &self.cfg.credentials, &self.cfg.krowk_version).map(drop).map_err(staying)
+            }
+            Some(b) => {
+                if b.path.is_none() {
+                    return Err(staying(backend_missing(instance)));
+                }
+                if let Some(fix) = instance.missing_key() {
+                    return Err(staying(EngineError::new("not_authenticated", fix)));
+                }
+                (self.cfg.trust)(&trust::root(cwd)).map_err(staying)
+            }
+        }
+    }
+
+    /// `switchModel`: checked, then logged — now, or when the running turn
+    /// is over — so the session's next turn runs there.
+    async fn switch_model(self: &Arc<Self>, session_id: Option<&str>, model: ModelRef, out: mpsc::Sender<StreamLine>) -> Result<(), EngineError> {
+        let Some(id) = session_id else {
+            return self.check_model(&model, &self.cfg.cwd, None);
+        };
+        if !log::valid_id(id) {
+            return Err(EngineError::new("no_session", format!("{id:?} is not a krowk session id")));
+        }
+        let events = log::read_events(&self.cfg.sessions_dir.join(id).join(log::EVENTS_FILE)).map_err(log_failure)?;
+        let past = replay(&log::branch(&events, events.last().map(|e| e.id.as_str()).unwrap_or_default()));
+        // A subagent runs one turn, on the model its definition (or
+        // `subagents.model`) chose: there is no next turn to switch.
+        if let Some(parent) = &past.parent {
+            return Err(EngineError::new("subagent_session", format!("session {id} is a subagent of {parent}, and runs on the model it was started on — switch {parent}, whose next turn and subagents follow it")));
+        }
+        self.check_model(&model, past.cwd.as_deref().unwrap_or(&self.cfg.cwd), past.model.as_ref())?;
+        {
+            let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(r) = running.get_mut(id) {
+                r.switch = Some(model);
+                return Ok(());
+            }
+        }
+        if past.model.as_ref() == Some(&model) {
+            return Ok(());
+        }
+        // A turn of this host letting go of the log right now holds it a
+        // moment longer than its registration: asked again, briefly.
+        let mut tries = 0;
+        let (mut log, _) = loop {
+            match SessionLog::open(&self.cfg.sessions_dir, id) {
+                Err(LogError::Busy(_)) if tries < 40 => {
+                    tries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(r) = running.get_mut(id) {
+                        r.switch = Some(model);
+                        return Ok(());
+                    }
+                }
+                r => break r.map_err(log_failure)?,
+            }
+        };
+        let ev = log.append(LogBody::ModelSwitched { turn_id: None, from: past.model, to: model, reason: SwitchReason::Requested, detail: None }).map_err(log_failure)?;
+        log.sync().map_err(log_failure)?;
+        let _ = out.send(StreamLine::Log(ev)).await;
+        Ok(())
+    }
+
+    /// Where a session limited on `from` may continue: the first candidate
+    /// that can run here (R-INST-7, R-INST-8). A rollover (`full`) checks
+    /// each as `switchModel` does, trust included; an offer leaves trust to
+    /// be asked when the person takes it and the turn runs there.
+    fn next_instance(&self, from: &ModelRef, tried: &[String], cwd: &std::path::Path, full: bool) -> Option<ModelRef> {
+        self.cfg.registry.rollover_candidates(from, tried).into_iter().find(|m| {
+            let Ok(i) = self.cfg.registry.get(&m.instance) else { return false };
+            match &i.backend {
+                Some(b) if !full => b.path.is_some() && i.missing_key().is_none(),
+                _ => self.check_model(m, cwd, None).is_ok(),
+            }
+        })
+    }
+
+    /// One turn of a `prompt`, settled: everything that can refuse it
+    /// checked before a new session is created, so a refusal leaves no
+    /// empty session behind — and, for a turn that names another model,
+    /// says the session stays where it was (R-SWITCH-4).
+    #[allow(clippy::too_many_arguments)]
+    async fn settle(
+        self: &Arc<Self>,
+        session_id: Option<&str>,
+        text: String,
+        model: Option<ModelRef>,
+        permission_mode: PermissionMode,
+        toolset: Option<&str>,
+        effort: Option<Effort>,
+        limits: BudgetLimits,
+        out: &mpsc::Sender<StreamLine>,
+        tried: &[String],
+        rolling: Option<Rolling>,
+    ) -> Result<TurnPlan, EngineError> {
         let started = Instant::now();
         self.evict_idle().await;
         if text.trim().is_empty() {
             return Err(EngineError::new("empty_prompt", "the prompt is empty — pass it as an argument, or on stdin"));
         }
-        // Everything that can refuse the prompt is settled before a new
-        // session is created, so a refusal leaves no empty session behind.
+        // The turn is this host's from before its log is opened until it
+        // lets go, so a `switchModel` in between is kept for it rather than
+        // meeting the log's lock.
+        let mut here = Registration::new(self.clone());
+        if let Some(id) = session_id {
+            here.register(id)?;
+        }
         let opened = match session_id {
             Some(id) => Some(SessionLog::open(&self.cfg.sessions_dir, id).map_err(log_failure)?),
             None => None,
@@ -337,29 +519,29 @@ impl Shared {
                 None => self.cfg.registry.default_model().map_err(|e| EngineError::new("bad_config", e))?,
             },
         };
-        let instance = self.cfg.registry.get(&model.instance).map_err(|e| EngineError::new("no_instance", e))?.clone();
+        let staying = |e: EngineError| match past.model.as_ref().filter(|p| **p != model) {
+            Some(p) => EngineError { message: format!("{} — the session stays on {p}", e.message), ..e },
+            None => e,
+        };
+        let instance = self.cfg.registry.get(&model.instance).map_err(|e| staying(EngineError::new("no_instance", e)))?.clone();
         let info = (self.cfg.catalog)(&instance.provider, &model.model);
         let family = info.as_ref().and_then(|i| i.family.clone());
         let (preset, _) = toolset::choose(toolset, self.cfg.registry.toolset.as_deref(), family.as_deref(), &model.model).map_err(|e| EngineError::new("bad_toolset", e))?;
         let wire = instance.wire_for(info.as_ref().and_then(|i| i.wire_api));
         let cwd = past.cwd.clone().unwrap_or_else(|| self.cfg.cwd.clone());
         let native = match &instance.backend {
-            None => Some(engine_for(&instance, wire, &self.cfg.credentials, &self.cfg.krowk_version)?),
+            None => Some(engine_for(&instance, wire, &self.cfg.credentials, &self.cfg.krowk_version).map_err(staying)?),
             // A backend runs the repository's own hooks and MCP servers, so
             // it is not started in one nobody trusted; and a binary that is
             // not there is named before a session exists for it.
             Some(b) => {
                 if b.path.is_none() {
-                    let (install, add) = match instance.wire_api {
-                        WireApi::CodexAppServer => ("Codex (https://developers.openai.com/codex)", "codex"),
-                        _ => ("Claude Code (https://claude.com/claude-code)", "claude"),
-                    };
-                    return Err(EngineError::new("backend_not_found", format!("{} was not found — install {install}, or name the binary with `krowk providers add {add} --binary <path>`", b.binary)));
+                    return Err(staying(backend_missing(&instance)));
                 }
                 if let Some(fix) = instance.missing_key() {
-                    return Err(EngineError::new("not_authenticated", fix));
+                    return Err(staying(EngineError::new("not_authenticated", fix)));
                 }
-                (self.cfg.trust)(&trust::root(&cwd))?;
+                (self.cfg.trust)(&trust::root(&cwd)).map_err(staying)?;
                 None
             }
         };
@@ -374,6 +556,7 @@ impl Shared {
             Some(opened) => opened,
             None => {
                 let (log, root) = SessionLog::create(&self.cfg.sessions_dir, &self.cfg.cwd, &self.cfg.krowk_version).map_err(log_failure)?;
+                here.register(&log.session_id)?;
                 let _ = out.send(StreamLine::Log(root.clone())).await;
                 (log, vec![root])
             }
@@ -384,10 +567,14 @@ impl Shared {
             Some(e) => Arc::from(e),
             None => self.backend_for(&session_id, &instance)?,
         };
-        // The vendor session to resume (Claude Code's session, Codex's
-        // thread): the branch's last, if it ran on this instance — another
-        // account's config directory does not have it.
-        let backend_session = past.backend.as_ref().filter(|b| b.instance == model.instance).map(|b| b.session_id.clone());
+        // A backend keeps its own thread and reads nothing of the log: the
+        // thread it resumes — its own, or another account's of the same
+        // vendor copied over — and what to tell it of the turns it did not
+        // run (`handoff`). The native loop reads the whole branch.
+        let (backend_session, handoff) = match &instance.backend {
+            Some(b) => self.carry_over(&past, &instance, b, &text),
+            None => (None, None),
+        };
         // Everything the session and its subagents have spent, from their
         // logs; this turn's calls are added as they are metered.
         let budget = Budget::new(limits, &session_id, &self.cfg.sessions_dir, self.cfg.pricer.clone(), &instance.provider, &model.model, &events);
@@ -422,8 +609,12 @@ impl Shared {
             parent_cancel: None,
             announce: true,
             started,
+            handoff,
+            here,
+            rolling,
+            tried: tried.to_vec(),
         };
-        self.turn(plan, out).await
+        Ok(plan)
     }
 
     /// A subagent (R-SUB-1): a child session of the parent turn `spawn`
@@ -480,16 +671,27 @@ impl Shared {
             parent_cancel: Some(p.cancel.clone()),
             announce: false,
             started: Instant::now(),
+            handoff: None,
+            here: Registration::new(self.clone()),
+            rolling: None,
+            tried: Vec::new(),
         };
         // Boxed: a subagent's turn is a turn of this host, inside the
         // parent's.
-        let turn: BoxFuture<'_, Result<RunResult, EngineError>> = Box::pin(self.turn(plan, spawn.out.clone()));
-        turn.await
+        let turn: BoxFuture<'_, Result<(RunResult, Option<Rolling>), EngineError>> = Box::pin(self.turn(plan, spawn.out.clone()));
+        turn.await.map(|(r, _)| r)
     }
 
-    /// Runs one settled turn to its end and logs it whole.
-    async fn turn(self: &Arc<Self>, mut plan: TurnPlan, out: mpsc::Sender<StreamLine>) -> Result<RunResult, EngineError> {
+    /// Runs one settled turn to its end and logs it whole, with what
+    /// follows from how it ended for a session's own turn: a switch that
+    /// could not run going back (R-SWITCH-4), a limit's offer, or where
+    /// `rollover = "auto"` goes next (R-INST-7, R-INST-8), and a
+    /// `switchModel` that came while it ran.
+    async fn turn(self: &Arc<Self>, mut plan: TurnPlan, out: mpsc::Sender<StreamLine>) -> Result<(RunResult, Option<Rolling>), EngineError> {
         let session_id = plan.log.session_id.clone();
+        if plan.here.id.is_none() {
+            plan.here.register(&session_id)?;
+        }
         let turn_id = krowk_store::new_id();
         let engine = plan.engine.clone();
         let model = plan.model.clone();
@@ -502,7 +704,15 @@ impl Shared {
             provider: plan.provider.clone(),
             backend: plan.past.backend.clone(),
             parent: plan.parent.clone(),
+            handoff: None,
         };
+        // A rollover is on the record only now that its turn has passed
+        // every check, and every client is told: never silent (R-INST-8).
+        if let Some(r) = &plan.rolling {
+            let detail = r.detail();
+            w.log(LogBody::ModelSwitched { turn_id: None, from: Some(r.from.clone()), to: model.clone(), reason: SwitchReason::RateLimited, detail: Some(detail.clone()) }).await?;
+            w.live(LiveEvent::Notice { session_id: session_id.clone(), turn_id: turn_id.clone(), text: format!("{detail} (rollover = \"auto\")") }).await;
+        }
         w.log(LogBody::TurnStarted { turn_id: turn_id.clone(), model: model.clone(), provider: engine.provider().into(), wire_api: engine.wire_api(), permission_mode: plan.permission_mode, effort: plan.effort }).await?;
         let prompt_item = Item::UserText { text: std::mem::take(&mut plan.text) };
         w.log(LogBody::ItemCompleted { turn_id: turn_id.clone(), item_id: krowk_store::new_id(), item: prompt_item.clone() }).await?;
@@ -519,10 +729,7 @@ impl Shared {
             &turn_id,
         );
         let compat = Arc::new(std::mem::take(&mut plan.compat));
-        let (cancel_tx, cancel) = watch::channel(false);
-        let cancel_tx = Arc::new(cancel_tx);
-        let steers = Steers::default();
-        self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), Running { cancel: cancel_tx.clone(), steers: steers.clone() });
+        let (cancel_tx, cancel, steers) = (plan.here.cancel.clone(), plan.here.cancel_rx.clone(), plan.here.steers.clone());
         // The agent definitions a subagent can be started from, read afresh
         // each turn from the repository and the person's own.
         let subagents = plan.spawns.then(|| {
@@ -580,6 +787,7 @@ impl Shared {
             compat,
             subagents,
             agent: plan.agent.clone(),
+            handoff: plan.handoff.take(),
         };
         let mut tally = Tally::default();
         // A backend's calls are the vendor's to make: its turn is not begun
@@ -618,22 +826,38 @@ impl Shared {
         // Refused from here on, not queued for a turn that is over; what an
         // interrupted or failed turn never took goes back on its result.
         let unread_steers = steers.close();
-        self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&session_id);
         self.approvals.forget_session(&session_id);
         if let Some(b) = self.backends.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&session_id) {
             b.used = Instant::now();
         }
 
-        let (status, error) = match outcome {
+        let (status, mut error) = match &outcome {
             Ok(TurnEnd::Completed) => (TurnStatus::Completed, None),
             Ok(TurnEnd::Interrupted) => (TurnStatus::Interrupted, None),
             Err(e) => (TurnStatus::Failed, Some(e.info())),
+        };
+        let (after, offer, next) = match &outcome {
+            Err(e) if plan.announce => self.after_failure(e, (plan.past.reached.as_ref(), &plan.tried, &plan.cwd), &model, &session_id, tally.calls, error.as_mut()),
+            _ => (None, None, None),
         };
         let duration_ms = plan.started.elapsed().as_millis() as u64;
         // The turn's cost is its subagents' too, as a backend's own
         // subagents' are part of its turn (R-SUB-4).
         let (children_usd, children_unpriced) = spawned.as_ref().map_or((0.0, false), Subagents::spent);
         w.log(LogBody::TurnCompleted { turn_id: turn_id.clone(), status, usage: tally.usage, duration_ms, error: error.clone(), reported_cost_usd: tally.reported }).await?;
+        if let Some((to, reason, detail)) = &after {
+            w.log(LogBody::ModelSwitched { turn_id: Some(turn_id.clone()), from: Some(model.clone()), to: to.clone(), reason: *reason, detail: Some(detail.clone()) }).await?;
+        }
+        // Asked for while the turn ran: the person's word is the last. Taken
+        // as the turn lets go of the session, so none comes too late for it.
+        let mut next = next;
+        if let Some(to) = plan.here.finish() {
+            let from = after.as_ref().map(|(m, ..)| m.clone()).unwrap_or_else(|| model.clone());
+            if from != to {
+                w.log(LogBody::ModelSwitched { turn_id: Some(turn_id.clone()), from: Some(from), to, reason: SwitchReason::Requested, detail: None }).await?;
+                next = None;
+            }
+        }
         plan.log.sync().map_err(log_failure)?;
         let result = RunResult {
             session_id,
@@ -648,11 +872,198 @@ impl Shared {
             num_model_calls: tally.calls,
             error,
             unread_steers,
+            switch_offer: offer,
         };
         if plan.announce {
             let _ = out.send(StreamLine::Live(LiveEvent::Result(result.clone()))).await;
         }
-        Ok(result)
+        Ok((result, next))
+    }
+
+    /// What follows a session's own turn that failed: a switch that could
+    /// not run goes back to the model of the last turn that reached its
+    /// model, however the switch was made (R-SWITCH-4); a limit offers the
+    /// next instance, or with `rollover = "auto"` names where to go next —
+    /// logged when that turn starts (R-INST-7, R-INST-8). `error` gets the
+    /// words that say so.
+    #[allow(clippy::type_complexity)]
+    fn after_failure(&self, e: &EngineError, (reached, tried, cwd): (Option<&ModelRef>, &[String], &PathBuf), model: &ModelRef, session_id: &str, calls: u32, error: Option<&mut crate::protocol::ErrorInfo>) -> (Option<(ModelRef, SwitchReason, String)>, Option<SwitchOffer>, Option<Rolling>) {
+        let previous = reached.filter(|p| *p != model).cloned();
+        if e.limited() {
+            let until = e.resets_at_ms.map(|ms| format!(" until {}", clock(ms))).unwrap_or_default();
+            let mut tried = tried.to_vec();
+            tried.push(model.instance.clone());
+            let auto = self.cfg.registry.rollover == Rollover::Auto;
+            return match self.next_instance(model, &tried, cwd, auto) {
+                Some(to) if auto => (None, None, Some(Rolling { from: model.clone(), to, until, cwd: cwd.clone() })),
+                Some(to) => {
+                    if let Some(err) = error {
+                        err.message.push_str(&format!(" — continue on {to} with `krowk -p --resume {session_id} --model {to}`, or say yes when krowk offers it"));
+                    }
+                    (None, Some(SwitchOffer { from: model.clone(), to, resets_at_ms: e.resets_at_ms }), None)
+                }
+                None => (None, None, None),
+            };
+        }
+        match previous {
+            Some(prev) if cannot_run_here(&e.code, calls) => {
+                if let Some(err) = error {
+                    err.message.push_str(&format!(" — the session continues on {prev}"));
+                }
+                (Some((prev, SwitchReason::SwitchFailed, format!("{model} could not run the turn: {}", e.code))), None, None)
+            }
+            _ => (None, None, None),
+        }
+    }
+
+    /// The vendor thread a backend turn on `instance` resumes, and how it
+    /// is brought up to date (R-SWITCH-2, R-INST-4). The thread that has
+    /// run the most of the session among this vendor's instances is the
+    /// one to continue: this instance's own, resumed; another account's,
+    /// its transcript copied into this one's config directory first; none,
+    /// and a new thread is seeded with krowk's handoff.
+    fn carry_over(&self, past: &Past, instance: &Resolved, b: &crate::instances::Backend, prompt: &str) -> (Option<String>, Option<handoff::Handoff>) {
+        let vendor = match instance.wire_api {
+            WireApi::CodexAppServer => crate::codex::BACKEND,
+            _ => crate::claude::BACKEND,
+        };
+        let own = past.vendors.iter().find(|v| v.instance == instance.name);
+        let best = past.vendors.iter().filter(|v| v.backend == vendor).max_by_key(|v| v.seen);
+        let mut not_carried = None;
+        let mut carried: Option<(&Vendor, PathBuf)> = None;
+        if let Some(best) = best.filter(|v| v.instance != instance.name && own.is_none_or(|o| v.seen > o.seen)) {
+            let from_home = self.cfg.registry.get(&best.instance).ok().and_then(|i| i.backend.as_ref()).and_then(|fb| fb.home.clone());
+            let r = match (&best.transcript, from_home, &b.home) {
+                (Some(t), Some(from), Some(to)) => handoff::carry(std::path::Path::new(t), &from, to, if vendor == crate::codex::BACKEND { handoff::Vendor::Codex } else { handoff::Vendor::ClaudeCode }, &best.session_id),
+                (None, _, _) => Err(format!("{} did not say where it keeps the transcript", best.instance)),
+                (_, None, _) => Err(format!("{}'s config directory is not known", best.instance)),
+                (_, _, None) => Err(format!("{}'s config directory is not known", instance.name)),
+            };
+            match r {
+                Ok(path) => carried = Some((best, path)),
+                Err(e) => not_carried = Some(format!("the transcript on {} could not be carried over: {e}", best.instance)),
+            }
+        }
+        let (resume, seen, from, path) = match (carried, own) {
+            (Some((v, path)), _) => (Some(v.session_id.clone()), Some(v.seen), Some(v.instance.clone()), Some(path)),
+            (None, Some(o)) => (Some(o.session_id.clone()), Some(o.seen), None, None),
+            (None, None) => (None, None, None, None),
+        };
+        let plan = handoff::plan(&past.items, &past.turns, seen, prompt, from, not_carried).map(|h| handoff::Handoff { carried_to: path, ..h });
+        (resume, plan)
+    }
+
+}
+
+/// A move `rollover = "auto"` makes: from the limited model to the next
+/// candidate, and why, in words that name both whole (R-INST-8).
+#[derive(Debug, Clone)]
+struct Rolling {
+    from: ModelRef,
+    to: ModelRef,
+    /// ` until 14:00`, when the limit said.
+    until: String,
+    cwd: PathBuf,
+}
+
+impl Rolling {
+    fn detail(&self) -> String {
+        let mut d = format!("{} is limited{}; rollover is auto, so the session continues on {}", self.from, self.until, self.to);
+        if self.to.model != self.from.model {
+            d.push_str(&format!(" — another model: {} instead of {}", self.to.model, self.from.model));
+        }
+        d
+    }
+}
+
+/// A turn's hold on its session in this host: its cancel switch, its
+/// steering, and a `switchModel` for after it — from before the log is
+/// opened until the turn lets go. Let go of on drop, however it ends.
+struct Registration {
+    shared: Arc<Shared>,
+    id: Option<String>,
+    cancel: Arc<watch::Sender<bool>>,
+    cancel_rx: watch::Receiver<bool>,
+    steers: Steers,
+}
+
+impl Registration {
+    fn new(shared: Arc<Shared>) -> Registration {
+        let (tx, rx) = watch::channel(false);
+        Registration { shared, id: None, cancel: Arc::new(tx), cancel_rx: rx, steers: Steers::default() }
+    }
+
+    fn register(&mut self, id: &str) -> Result<(), EngineError> {
+        let mut running = self.shared.running.lock().unwrap_or_else(|e| e.into_inner());
+        if running.contains_key(id) {
+            return Err(EngineError::new("session_busy", format!("session {id} has a turn running here already — wait for it, or steer it")));
+        }
+        running.insert(id.to_string(), Running { cancel: self.cancel.clone(), steers: self.steers.clone(), switch: None });
+        self.id = Some(id.to_string());
+        Ok(())
+    }
+
+    /// Lets go, and returns the switch that arrived for after the turn.
+    fn finish(&mut self) -> Option<ModelRef> {
+        let id = self.id.take()?;
+        self.shared.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&id).and_then(|r| r.switch)
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+/// Whether a turn's failure, on a model the session had just switched to,
+/// says that model cannot run turns here at all — as against a failure any
+/// turn can have. No login, no key, no access, no such model, a backend in
+/// the wrong mode: never, however far it got (a vendor answers a missing
+/// login with a message of its own). A backend that would not start or
+/// answer, a history the provider refused: only when nothing reached the
+/// model — after that, the switch worked and the turn failed.
+fn cannot_run_here(code: &str, calls: u32) -> bool {
+    match code {
+        "not_authenticated" | "provider_auth" | "provider_forbidden" | "model_not_found" | "backend_not_found" | "backend_permission_mode" => true,
+        "provider_invalid_request" | "backend_unresponsive" | "backend_exited" | "backend_failed" => calls == 0,
+        _ => false,
+    }
+}
+
+/// A backend instance's binary is not there: named with how to install it.
+fn backend_missing(instance: &Resolved) -> EngineError {
+    let binary = instance.backend.as_ref().map(|b| b.binary.clone()).unwrap_or_default();
+    let (install, add) = match instance.wire_api {
+        WireApi::CodexAppServer => ("Codex (https://developers.openai.com/codex)", "codex"),
+        _ => ("Claude Code (https://claude.com/claude-code)", "claude"),
+    };
+    EngineError::new("backend_not_found", format!("{binary} was not found — install {install}, or name the binary with `krowk providers add {add} --binary <path>`"))
+}
+
+/// A moment as the person's clock shows it: `14:00` today, else with its
+/// date — for when a limit lifts.
+pub fn clock(ms: i64) -> String {
+    #[cfg(unix)]
+    {
+        let at = (ms / 1000) as libc::time_t;
+        let now = krowk_store::now_ms() / 1000;
+        // SAFETY: localtime_r writes only into the struct it is handed.
+        let tm = |t: libc::time_t| unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            libc::localtime_r(&t, &mut tm);
+            tm
+        };
+        let (a, n) = (tm(at), tm(now as libc::time_t));
+        if (a.tm_year, a.tm_yday) == (n.tm_year, n.tm_yday) {
+            return format!("{:02}:{:02}", a.tm_hour, a.tm_min);
+        }
+        format!("{:04}-{:02}-{:02} {:02}:{:02}", a.tm_year + 1900, a.tm_mon + 1, a.tm_mday, a.tm_hour, a.tm_min)
+    }
+    #[cfg(not(unix))]
+    {
+        let s = ms / 1000;
+        format!("{:02}:{:02} UTC", (s / 3600) % 24, (s / 60) % 60)
     }
 }
 
@@ -678,16 +1089,26 @@ fn engine_for(instance: &Resolved, wire: WireApi, credentials: &std::path::Path,
 }
 
 /// What the branch so far says: its items, grouped the way they were on the
-/// wire, the model it last ran on, where it runs, and the backend session
-/// behind it.
+/// wire, its turns, the model it is on, where it runs, and the vendor
+/// threads behind it.
 #[derive(Default)]
 struct Past {
     items: Vec<HistoryItem>,
+    turns: Vec<TurnSpan>,
+    /// The last turn's model, or the one a later `model.switched` moved to.
     model: Option<ModelRef>,
+    /// The model of the last turn that reached its model: where a switch
+    /// that could not run goes back to.
+    reached: Option<ModelRef>,
     cwd: Option<PathBuf>,
+    /// The last `backend.session` logged, whichever instance it was on.
     backend: Option<BackendRecord>,
+    /// Each backend instance's thread, and how much of the session it holds.
+    vendors: Vec<Vendor>,
     /// The krowk run its evidence goes under, once `publish` opened one.
     run: Option<String>,
+    /// For a subagent: the session that started it.
+    parent: Option<String>,
 }
 
 /// The last `backend.session` of a branch, and the instance it ran on.
@@ -699,25 +1120,52 @@ struct BackendRecord {
     billing: Option<Billing>,
 }
 
+/// A backend instance's thread of this session: the vendor session it
+/// resumes, where the vendor keeps it, and how many of the branch's turns it
+/// holds — every turn up to the last one it ran, since each turn it ran
+/// began by bringing it up to date.
+#[derive(Debug, Clone, PartialEq)]
+struct Vendor {
+    instance: String,
+    backend: String,
+    session_id: String,
+    transcript: Option<String>,
+    seen: usize,
+}
+
 fn replay(branch: &[&LogEvent]) -> Past {
     let mut past = Past::default();
     let mut at: HashMap<&str, usize> = HashMap::new();
     let mut responses = 0usize;
+    // Whether the running turn reached its backend: a thread that never
+    // got the prompt has not seen it.
+    let mut reached = false;
+    let mut answered = false;
     for ev in branch {
         match &ev.body {
-            LogBody::SessionStarted { cwd, .. } => past.cwd = Some(PathBuf::from(cwd)),
-            LogBody::TurnStarted { model, .. } => past.model = Some(model.clone()),
-            LogBody::BackendSession { vendor_session_id, transcript_path, billing, .. } => {
-                past.backend = Some(BackendRecord {
-                    instance: past.model.as_ref().map(|m| m.instance.clone()).unwrap_or_default(),
-                    session_id: vendor_session_id.clone(),
-                    transcript: transcript_path.clone(),
-                    billing: *billing,
-                });
+            LogBody::SessionStarted { cwd, parent_session_id, .. } => {
+                past.cwd = Some(PathBuf::from(cwd));
+                past.parent = parent_session_id.clone();
+            }
+            LogBody::TurnStarted { model, .. } => {
+                past.model = Some(model.clone());
+                past.turns.push(TurnSpan { model: model.clone(), items: past.items.len()..past.items.len() });
+                reached = false;
+                answered = false;
+            }
+            LogBody::BackendSession { backend, vendor_session_id, transcript_path, billing, .. } => {
+                let instance = past.turns.last().map(|t| t.model.instance.clone()).unwrap_or_default();
+                past.backend = Some(BackendRecord { instance: instance.clone(), session_id: vendor_session_id.clone(), transcript: transcript_path.clone(), billing: *billing });
+                past.vendors.retain(|v| v.instance != instance);
+                past.vendors.push(Vendor { instance, backend: backend.clone(), session_id: vendor_session_id.clone(), transcript: transcript_path.clone(), seen: past.turns.len().saturating_sub(1) });
+                reached = true;
             }
             LogBody::ItemCompleted { item_id, item, .. } => {
                 at.insert(item_id, past.items.len());
                 past.items.push(HistoryItem { item: item.clone(), response: None });
+                if let Some(t) = past.turns.last_mut() {
+                    t.items.end = past.items.len();
+                }
             }
             LogBody::ResponseCompleted { item_ids, .. } => {
                 for id in item_ids {
@@ -726,11 +1174,29 @@ fn replay(branch: &[&LogEvent]) -> Past {
                     }
                 }
                 responses += 1;
+                reached = true;
+                answered = true;
             }
+            LogBody::TurnCompleted { status, error, .. } => {
+                // It reached its model when a model answered, and did not
+                // then fail on one of the ways a model cannot run here.
+                let ran = match status {
+                    TurnStatus::Failed => answered && !error.as_ref().is_some_and(|e| cannot_run_here(&e.code, 1)),
+                    _ => true,
+                };
+                if ran {
+                    past.reached = past.turns.last().map(|t| t.model.clone());
+                }
+                let instance = past.turns.last().map(|t| t.model.instance.as_str()).unwrap_or_default();
+                if reached && let Some(v) = past.vendors.iter_mut().find(|v| v.instance == instance) {
+                    v.seen = past.turns.len();
+                }
+            }
+            LogBody::ModelSwitched { to, .. } => past.model = Some(to.clone()),
             LogBody::RunOpened { run, .. } => past.run = Some(run.clone()),
             // The subagents' own logs hold their conversations; the todo
             // list is read back from the calls that set it.
-            LogBody::TurnCompleted { .. } | LogBody::SubagentResponse { .. } | LogBody::SubagentStarted { .. } | LogBody::TodosUpdated { .. } => {}
+            LogBody::SubagentResponse { .. } | LogBody::BackendHandoff { .. } | LogBody::SubagentStarted { .. } | LogBody::TodosUpdated { .. } => {}
         }
     }
     past
@@ -764,6 +1230,9 @@ struct Writer<'a> {
     backend: Option<BackendRecord>,
     /// A subagent's parent turn, whose spend the subagent's calls add to.
     parent: Option<ParentLink>,
+    /// What a backend was sent to bring it up to date, for the turn's
+    /// context record.
+    handoff: Option<String>,
 }
 
 impl Writer<'_> {
@@ -856,6 +1325,7 @@ impl Writer<'_> {
                     tools_tokens: native::tools_tokens(&tools),
                     system,
                     tools,
+                    handoff: self.handoff.take(),
                 };
                 self.log.record_context(&rec).map_err(log_failure)?;
             }
@@ -918,6 +1388,15 @@ impl Writer<'_> {
             }
             EngineEvent::SubagentStarted { call_id, session_id: child, description, agent, model } => {
                 self.log(LogBody::SubagentStarted { turn_id, call_id, subagent_session_id: child, description, agent, model }).await?;
+            }
+            EngineEvent::Limits(limit) => {
+                self.live(LiveEvent::Limits { session_id: session_id.into(), turn_id, instance: model.instance.clone(), limit }).await;
+            }
+            EngineEvent::Handoff { how, from_instance, summarized_turns, recent_turns, fell_back, text } => {
+                self.log(LogBody::BackendHandoff { turn_id, how, from_instance, summarized_turns, recent_turns, fell_back }).await?;
+                if !text.is_empty() {
+                    self.handoff = Some(text);
+                }
             }
         }
         Ok(())

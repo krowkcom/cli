@@ -63,12 +63,21 @@ pub fn downgraded(text: &str) -> Option<String> {
     if text.is_empty() {
         return None;
     }
+    Some(format!("<reasoning from an earlier model>\n{}\n</reasoning>", neutralised(text, "reasoning")))
+}
+
+/// `text` with every opening or closing tag named `name` a model could
+/// read in it — by the rule `downgraded` describes — made harmless by
+/// replacing its bracket with `‹`: what keeps a frame krowk puts around
+/// text it did not write (reasoning, a handoff) from being closed by that
+/// text. Everything else is left as it was.
+pub fn neutralised(text: &str, name: &str) -> String {
     let mut safe = String::with_capacity(text.len());
     let mut at = 0;
     while at < text.len() {
         let rest = &text[at..];
         if let Some(bracket) = tag_bracket(rest)
-            && names_reasoning(&rest[bracket..])
+            && names_tag(&rest[bracket..], name)
         {
             safe.push('‹');
             at += bracket;
@@ -78,7 +87,7 @@ pub fn downgraded(text: &str) -> Option<String> {
         safe.push(c);
         at += c.len_utf8();
     }
-    Some(format!("<reasoning from an earlier model>\n{safe}\n</reasoning>"))
+    safe
 }
 
 /// Characters that render as nothing, which a tag can hide between.
@@ -98,11 +107,11 @@ fn tag_bracket(rest: &str) -> Option<usize> {
     ["&lt;", "&#60;", "&#x3c;"].into_iter().find(|e| head.starts_with(e)).map(str::len)
 }
 
-/// Whether what follows a bracket spells a `reasoning` tag's name.
-fn names_reasoning(after: &str) -> bool {
+/// Whether what follows a bracket spells the tag name `name` (lowercase).
+fn names_tag(after: &str, name: &str) -> bool {
     let mut chars = after.chars().filter(|c| !zero_width(*c)).peekable();
     while chars.next_if(|c| *c == '/' || *c == '／' || c.is_whitespace()).is_some() {}
-    "reasoning".chars().all(|want| chars.next().is_some_and(|c| c.to_ascii_lowercase() == want))
+    name.chars().all(|want| chars.next().is_some_and(|c| c.to_ascii_lowercase() == want))
         // The whole name, not a prefix: `Vec<ReasoningItem>` is code.
         && chars.next().is_none_or(|c| !c.is_alphanumeric() && c != '_')
 }

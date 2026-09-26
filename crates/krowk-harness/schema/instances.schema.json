@@ -28,6 +28,24 @@
     "subagents": {
       "description": "How subagents run: how many at once, and on which model.",
       "$ref": "#/$defs/SubagentsConfig"
+    },
+    "rollover": {
+      "description": "What happens when an instance hits its rate or usage limit\n(R-INST-7, R-INST-8): `offer` (the default) asks the person whether\nto continue on the next instance; `auto` moves there by itself, says\nso in every client and logs it. Stacking one plan's limits across\naccounts is the person's own responsibility: Anthropic's plan limits\nassume ordinary, individual usage.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Rollover"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rolloverOrder": {
+      "description": "The instances a limited session moves through, in order: each\n`<instance>` (the same model id) or `<instance>/<model>`. `auto`\nneeds it; `offer` without it offers another instance of the same\nkind.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     }
   },
   "$defs": {
@@ -509,6 +527,21 @@
         }
       },
       "additionalProperties": false
+    },
+    "Rollover": {
+      "description": "`rollover` in config.",
+      "oneOf": [
+        {
+          "description": "Ask, one keystroke, never silently: the default.",
+          "type": "string",
+          "const": "offer"
+        },
+        {
+          "description": "Move to the next instance of `rolloverOrder` without asking.",
+          "type": "string",
+          "const": "auto"
+        }
+      ]
     }
   }
 }

@@ -98,9 +98,10 @@ pub fn thread(events: &[LogEvent], res: &mut ReadResult) -> Option<Thread> {
             // So does the run its evidence went to: the registry holds the
             // run, and the tool result that published names it.
             // A subagent is its own session, projected from its own log and
-            // linked here by its root's parent; the todo list is the log's
+            // linked here by its root's parent; the todo list is the log's,
+            // and so are a switch and how a backend was caught up
             // (and the calls that set it are messages already).
-            LogBody::SessionStarted { .. } | LogBody::BackendSession { .. } | LogBody::RunOpened { .. } | LogBody::SubagentStarted { .. } | LogBody::TodosUpdated { .. } => {}
+            LogBody::SessionStarted { .. } | LogBody::BackendSession { .. } | LogBody::RunOpened { .. } | LogBody::SubagentStarted { .. } | LogBody::TodosUpdated { .. } | LogBody::ModelSwitched { .. } | LogBody::BackendHandoff { .. } => {}
             LogBody::TurnStarted { model, provider: p, .. } => {
                 flush(&mut th, &mut pending, &provider, turn);
                 provider.clone_from(p);
@@ -181,6 +182,8 @@ fn event_type(b: &LogBody) -> &'static str {
         LogBody::SubagentResponse { .. } => "subagent.response",
         LogBody::SubagentStarted { .. } => "subagent.started",
         LogBody::TodosUpdated { .. } => "todos.updated",
+        LogBody::ModelSwitched { .. } => "model.switched",
+        LogBody::BackendHandoff { .. } => "backend.handoff",
     }
 }
 

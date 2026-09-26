@@ -34,6 +34,7 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
     let flag_mode = prompt::permission_flag(ctx)?;
     let config = prompt::config_json()?;
     let registry = Registry::resolve(&prompt::instances_from(&config)?, ctx.io.env);
+    registry.check_rollover().map_err(|e| fail("bad_config", e))?;
     let model = match ctx.f.model.as_str() {
         "" => None,
         m => Some(registry.parse_model(m).map_err(|e| fail("bad_flag", format!("--model: {e}")))?),

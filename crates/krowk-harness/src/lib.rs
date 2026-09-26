@@ -30,6 +30,9 @@
 //!   and skills a native turn reads; `hooks` — Claude-format command hooks.
 //! - `toolset` — the preset registry: which edit tool a model is offered.
 //! - `host` — executes commands, writes the log, prices the turn.
+//! - `handoff` — carrying a session into a backend that did not run all of
+//!   it: its own thread caught up, another account's transcript copied, or
+//!   a new thread seeded with krowk's summary (R-SWITCH-2, R-INST-4).
 //! - `log` — the append-only JSONL session log and its layout on disk.
 //! - `project` — the log as a `krowk_import::Source`, so krowk.db lists
 //!   native sessions beside imported ones.
@@ -52,6 +55,7 @@ pub mod effort;
 pub mod engine;
 pub mod evidence;
 pub mod group;
+pub mod handoff;
 pub mod headless;
 pub mod hooks;
 pub mod host;

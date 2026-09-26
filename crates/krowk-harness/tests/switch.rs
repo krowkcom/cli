@@ -598,19 +598,35 @@ fn r_switch_4_a_switch_to_a_model_without_credentials_is_refused_and_the_session
     let (tx, _rx) = mpsc::channel(16);
     let e = rt.block_on(host.execute(prompt(Some(&id), "second", Some(nokey)), tx)).unwrap_err();
     assert!(e.message.ends_with("the session stays on anthropic/claude-sonnet-4-6"), "{}", e.message);
-    // One that fails only once it runs — Claude Code with no login — goes
-    // back to the model before, on the record.
+    // A backend instance that is signed out — `claude auth status` says so —
+    // is refused by the readiness check the same way, before a Claude
+    // process is started for a turn, with the fix and the session kept.
     let nologin = ModelRef { instance: "claude:nologin".into(), model: "haiku".into() };
-    let (r2, _) = rt.block_on(run(&host, prompt(Some(&id), "third", Some(nologin.clone()))));
+    let (tx, _rx) = mpsc::channel(16);
+    let e = rt.block_on(host.execute(Command::SwitchModel { session_id: Some(id.clone()), model: nologin.clone() }, tx)).unwrap_err();
+    assert_eq!(e.code, "not_authenticated");
+    assert!(e.message.contains("sign in with `krowk providers add claude --name nologin`, which runs Claude's own login") && e.message.ends_with("the session stays on anthropic/claude-sonnet-4-6"), "{}", e.message);
+    let (tx, _rx) = mpsc::channel(16);
+    let e = rt.block_on(host.execute(prompt(Some(&id), "third", Some(nologin.clone())), tx)).unwrap_err();
+    assert!(e.message.contains("krowk providers add claude --name nologin") && e.message.ends_with("the session stays on anthropic/claude-sonnet-4-6"), "{}", e.message);
+    let asked = w.fake_log("claude-nologin");
+    assert!(asked.contains("argv auth status --json") && !asked.contains("argv -p"), "status asked, no turn process: {asked}");
+    // One that fails only once it runs — a Claude Code login gone stale
+    // after its status said yes — goes back to the model before, on the
+    // record.
+    w.claude("claude:stale", "claude-stale", Some("stale_login.jsonl"), true);
+    let host = w.host();
+    let stale = ModelRef { instance: "claude:stale".into(), model: "haiku".into() };
+    let (r2, _) = rt.block_on(run(&host, prompt(Some(&id), "third", Some(stale.clone()))));
     assert_eq!(r2.status, TurnStatus::Failed);
     let err = r2.error.unwrap();
     assert_eq!(err.code, "not_authenticated");
-    assert!(err.message.contains("krowk providers add claude --name nologin") && err.message.ends_with("the session continues on anthropic/claude-sonnet-4-6"), "{}", err.message);
+    assert!(err.message.contains("krowk providers add claude --name stale") && err.message.ends_with("the session continues on anthropic/claude-sonnet-4-6"), "{}", err.message);
     let back = w.events(&id).into_iter().find_map(|e| match e.body {
         LogBody::ModelSwitched { from, to, reason, .. } => Some((from, to, reason)),
         _ => None,
     });
-    assert_eq!(back, Some((Some(nologin), Eng::Anthropic.model(), SwitchReason::SwitchFailed)));
+    assert_eq!(back, Some((Some(stale), Eng::Anthropic.model(), SwitchReason::SwitchFailed)));
     // The session continues where it was.
     let (r3, _) = rt.block_on(run(&host, prompt(Some(&id), "fourth", None)));
     assert_eq!((r3.status, r3.model), (TurnStatus::Completed, Eng::Anthropic.model()));
@@ -751,7 +767,8 @@ fn r_inst_6_each_instance_reports_how_near_its_limit_it_is() {
 #[test]
 fn r_switch_4_a_switch_the_picker_made_goes_back_when_its_first_turn_cannot_run() {
     let mut w = World::new("picker-back");
-    w.claude("claude:nologin", "claude-nologin", None, false);
+    // Signed in as far as `claude auth status` says, stale once it runs.
+    w.claude("claude:nologin", "claude-nologin", Some("stale_login.jsonl"), true);
     let host = w.host();
     let rt = rt();
     let (r1, _) = rt.block_on(run(&host, prompt(None, "first", Some(Eng::Anthropic.model()))));

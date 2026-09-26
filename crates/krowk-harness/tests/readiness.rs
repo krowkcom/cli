@@ -216,6 +216,9 @@ fn readiness_a_vendor_that_answers_and_leaves_a_process_behind_does_not_hold_the
     assert!(gone, "the sleeper ({sleeper}) outlived the check");
 }
 
+// Linux only: macOS has no setsid(1), and without it nothing escapes the
+// group, so the test would pass without exercising the fix.
+#[cfg(target_os = "linux")]
 #[test]
 fn readiness_a_leftover_that_escaped_the_group_cannot_hold_a_check_past_its_deadline() {
     let h = Home::new("setsid");

@@ -457,7 +457,16 @@ pub(crate) fn output_within(cmd: &mut Command, probe: &Probe) -> std::io::Result
     let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let started = Instant::now();
     loop {
-        if exited(&mut child)? {
+        let gone = match exited(&mut child) {
+            Ok(gone) => gone,
+            // Stopped and reaped before the error goes up, so nothing is
+            // left running or unreaped (ECHILD when SIGCHLD is ignored).
+            Err(e) => {
+                stop(&mut child);
+                return Err(e);
+            }
+        };
+        if gone {
             // The vendor answered and left, not yet reaped, so its pid —
             // the group's id — is still its own: whatever it left running
             // in the group, holding the pipes the answer is read from, is
@@ -473,7 +482,11 @@ pub(crate) fn output_within(cmd: &mut Command, probe: &Probe) -> std::io::Result
     }
     let status = child.wait()?;
     let take = |(buf, finished): (Arc<Mutex<Vec<u8>>>, mpsc::Receiver<()>)| {
-        let _ = finished.recv_timeout(within.saturating_sub(started.elapsed()));
+        // A small floor: a vendor that answered right at the deadline
+        // still has its last bytes copied; a leftover holding the pipe is
+        // still abandoned. The reader it leaves blocks until that leftover
+        // exits — a thread per stuck check, bounded by the signed-in memo.
+        let _ = finished.recv_timeout(within.saturating_sub(started.elapsed()).max(Duration::from_millis(50)));
         std::mem::take(&mut *buf.lock().unwrap_or_else(|e| e.into_inner()))
     };
     Ok(Some(Output { status, stdout: take(out), stderr: take(err) }))

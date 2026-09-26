@@ -267,6 +267,13 @@ pub struct App {
     /// the first is shown over the prompt until it is answered, here or by
     /// another client.
     pub approvals: Vec<ApprovalRequest>,
+    /// The last answer as the model wrote it, unwrapped and unpadded: what
+    /// Ctrl-Y copies. One answer, not the conversation.
+    pub answer: String,
+    /// Set by Ctrl-Y; the next frame puts `answer` on the clipboard.
+    pub copy: bool,
+    /// A word under the prompt until the next key: "copied".
+    pub flash: Option<String>,
     /// When the approval shown now came up: keys typed in the moment
     /// before are not taken as its answer.
     pub approval_shown: Option<Instant>,
@@ -331,6 +338,9 @@ impl App {
             billing: None,
             vendor_instances: Vec::new(),
             approvals: Vec::new(),
+            answer: String::new(),
+            copy: false,
+            flash: None,
             approval_shown: None,
             approval_expanded: false,
             subs: Vec::new(),
@@ -360,9 +370,11 @@ impl App {
         std::mem::take(&mut self.dirty)
     }
 
-    /// The lines owed to scrollback, oldest first.
+    /// The lines owed to scrollback, oldest first, each wrapped to the
+    /// width.
     pub fn take_pending(&mut self) -> Vec<Line<'static>> {
-        std::mem::take(&mut self.pending)
+        let width = usize::from(self.width);
+        std::mem::take(&mut self.pending).into_iter().flat_map(|l| wrap_line(l, width)).collect()
     }
 
     pub fn running(&self) -> bool {
@@ -577,6 +589,9 @@ impl App {
                     ItemKind::ToolResult { .. } => LiveKind::Result,
                     ItemKind::UserText => return,
                 };
+                if kind == LiveKind::Text {
+                    self.answer.clear();
+                }
                 self.live = Some(Live { id: item_id.clone(), kind, tail: String::new(), committed: false });
                 self.dirty = true;
             }
@@ -772,6 +787,7 @@ impl App {
                 // Each line that is now whole goes to scrollback, once.
                 if let Some(end) = live.tail.rfind('\n') {
                     let done: String = live.tail.drain(..=end).collect();
+                    self.answer.push_str(&done);
                     let first = !live.committed;
                     live.committed = true;
                     if first {
@@ -988,6 +1004,7 @@ impl App {
     fn finish_live(&mut self) {
         let Some(live) = self.live.take() else { return };
         if live.kind == LiveKind::Text && !live.tail.is_empty() {
+            self.answer.push_str(&live.tail);
             if !live.committed {
                 self.gap();
             }
@@ -1161,7 +1178,11 @@ impl App {
             }
         }
         // The working line above says how to interrupt; this says the rest.
-        left.push("/ commands · ? keys".to_string());
+        match &self.flash {
+            Some(f) => left.push(f.clone()),
+            None if !self.answer.trim().is_empty() && !self.running() => left.push("/ commands · ? keys · ctrl-y copy".to_string()),
+            None => left.push("/ commands · ? keys".to_string()),
+        }
         let left = format!("  {}", left.join(" · "));
         let right_width: usize = right.iter().map(|(p, _)| p.width()).sum::<usize>() + right.len().saturating_sub(1) * 3;
         // Two spaces at least between the two sides.
@@ -1246,7 +1267,8 @@ impl App {
             "↑ ↓ lines, then history · ctrl-a/e line start/end · ctrl-u/k/w kill",
             "esc or ctrl-c interrupt · type while it runs to steer",
             "ctrl-t todos · ctrl-g subagents: select, expand, interrupt one",
-            "ctrl-o session details · /model switch model · ctrl-d or /exit quit · ? or esc closes this",
+            "ctrl-y copy the last answer · ctrl-o session details · /model switch model",
+            "ctrl-d or /exit quit · ? or esc closes this",
         ]
         .iter()
         .map(|l| Line::from(Span::styled(clip(l, width), Style::new().fg(Color::Blue))))
@@ -1442,6 +1464,39 @@ pub fn wrap(s: &str, width: usize) -> Vec<String> {
         }
     }
     rows
+}
+
+/// A styled line as rows at most `width` columns wide, broken where `wrap`
+/// breaks its text, each piece keeping its style. krowk wraps what it
+/// prints itself so every row keeps the left padding; a copy of the whole
+/// answer, unwrapped, is Ctrl-Y.
+pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    if text.width() <= width.max(1) || text.contains('\n') {
+        return vec![line];
+    }
+    let styled: Vec<(char, Style)> = line.spans.iter().flat_map(|s| s.content.chars().map(move |c| (c, s.style))).collect();
+    let mut at = 0;
+    wrap(&text, width)
+        .into_iter()
+        .map(|row| {
+            let n = row.chars().count();
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for &(c, st) in &styled[at..at + n] {
+                match spans.last_mut() {
+                    Some(last) if last.style == st => last.content.to_mut().push(c),
+                    _ => spans.push(Span::styled(c.to_string(), st)),
+                }
+            }
+            at += n;
+            // The space a row broke at is not drawn at its end.
+            if let Some(last) = spans.last_mut() {
+                let trimmed = last.content.trim_end().to_string();
+                last.content = trimmed.into();
+            }
+            Line::from(spans).style(line.style)
+        })
+        .collect()
 }
 
 /// `s` cut to `width` columns, with an ellipsis when it was longer.
@@ -1681,8 +1736,8 @@ mod tests {
         assert_eq!(rows.len(), 3, "only the prompt, in its box: {:?}", text(&rows));
         a.overlay = Overlay::Keys;
         let (rows, caret) = a.view(Instant::now());
-        assert_eq!(rows.len(), 8, "the overlay is five rows over the prompt box");
-        assert_eq!(caret, (4, 6), "inside the box, after the arrow");
+        assert_eq!(rows.len(), 9, "the overlay is six rows over the prompt box");
+        assert_eq!(caret, (4, 7), "inside the box, after the arrow");
     }
 
     #[test]
@@ -1705,6 +1760,21 @@ mod tests {
         let (rows, _) = a.view(Instant::now());
         let t = text(&rows);
         assert!(t[3].ends_with("  $0.00") && t[3].contains('…') && t[3].chars().count() == 40, "narrow, the left side gives way: {:?}", t[3]);
+    }
+
+    #[test]
+    fn scrollback_is_wrapped_here_keeping_each_pieces_style_and_the_last_answer_is_kept_whole() {
+        let line = Line::from(vec![Span::raw("one two "), Span::styled("three four five", bold())]);
+        let rows = wrap_line(line, 10);
+        assert_eq!(text(&rows), ["one two", "three", "four five"]);
+        assert_eq!(rows[2].spans[0].style, bold(), "four five keeps its style");
+        let mut a = app();
+        a.width = 12;
+        a.on_line(&live(LiveEvent::ItemStarted { session_id: "s".into(), turn_id: "t".into(), item_id: "i".into(), item: ItemKind::AssistantText }));
+        a.on_line(&delta("i", "a rather long first line of the answer\nand a second\n"));
+        let t = text(&a.take_pending());
+        assert!(t.iter().all(|r| r.chars().count() <= 12), "{t:?}");
+        assert_eq!(a.answer, "a rather long first line of the answer\nand a second\n", "Ctrl-Y copies it unwrapped");
     }
 
     #[test]

@@ -312,12 +312,6 @@ impl Tmux {
         self.tmux(&["capture-pane", "-p", "-t", "t", "-S", "-", "-E", "-"])
     }
 
-    /// The whole history with the terminal's own soft wraps joined back:
-    /// each line as it was printed.
-    fn history_joined(&self) -> String {
-        self.tmux(&["capture-pane", "-p", "-J", "-t", "t", "-S", "-", "-E", "-"])
-    }
-
     fn wait_for(&self, needle: &str, timeout: Duration) -> Option<Duration> {
         let t0 = Instant::now();
         while t0.elapsed() < timeout {
@@ -392,10 +386,12 @@ fn r_tui_1_a_10k_token_answer_lands_in_tmux_scrollback_exactly_once() {
     tm.keys(&["write it all out", "Enter"]);
     assert!(tm.wait_for("tokens", Duration::from_secs(60)).is_some(), "the answer never finished:\n{}", tm.screen());
     let history = tm.history();
-    let got: Vec<&str> = history.lines().filter(|l| l.starts_with("line ")).collect();
+    // Two columns of padding in front of every row, never written.
+    assert!(history.lines().filter(|l| !l.trim().is_empty()).all(|l| l.starts_with("  ")), "every row padded:\n{history}");
+    let got: Vec<&str> = history.lines().map(str::trim).filter(|l| l.starts_with("line ")).collect();
     let want: Vec<String> = mock::numbered_lines(850).lines().map(String::from).collect();
     assert_eq!(got.len(), want.len(), "every line once, none twice");
-    assert!(got.iter().zip(&want).all(|(g, w)| g.trim_end() == w), "in order, byte for byte");
+    assert!(got.iter().zip(&want).all(|(g, w)| g == w), "in order, byte for byte");
     // The prompt line is in scrollback once too, and the live region is not.
     assert_eq!(history.matches("❯ write it all out").count(), 1, "{history}");
     assert_eq!(history.matches("esc to interrupt").count(), 0, "a live row leaked into scrollback");
@@ -410,19 +406,31 @@ fn r_tui_3_a_phone_width_terminal_wraps_and_still_keeps_every_line_once() {
     tm.keys(&["go", "Enter"]);
     assert!(tm.wait_for("tokens", Duration::from_secs(60)).is_some(), "{}", tm.screen());
     let history = tm.history();
-    assert!(history.lines().all(|l| l.trim_end().chars().count() <= 40), "a row wider than the terminal:\n{history}");
-    // The terminal wrapped the answer itself, so joining its wraps gives
-    // back every line exactly as it was streamed, once and in order.
-    let joined = tm.history_joined();
-    let got: Vec<&str> = joined.lines().map(str::trim_end).filter(|l| l.starts_with("line ")).collect();
+    assert!(history.lines().all(|l| l.trim_end().chars().count() <= 38), "a row into the right padding:\n{history}");
+    // krowk wrapped the answer inside the padding, so each streamed line is
+    // its first row and the rows after it, up to the next line: joined
+    // back, every line exactly as it was streamed, once and in order.
+    let mut got: Vec<String> = Vec::new();
+    for row in history.lines().map(str::trim) {
+        if row.starts_with("line ") {
+            got.push(row.to_string());
+        } else if let Some(last) = got.last_mut()
+            && !row.is_empty()
+            && !last.ends_with("again")
+        {
+            last.push(' ');
+            last.push_str(row);
+        }
+    }
     let want: Vec<String> = mock::numbered_lines(200).lines().map(String::from).collect();
-    assert_eq!(got, want, "the answer, wrapped by the terminal, is in scrollback once and in order");
+    assert_eq!(got, want, "the answer, wrapped by krowk, is in scrollback once and in order");
 }
 
 #[test]
-fn r_tui_3_a_widened_terminal_rewraps_the_answer_already_in_scrollback() {
-    // Printed at 40 columns, the answer's lines wrap; widened to 100 the
-    // terminal joins them again, because krowk left the wrapping to it.
+fn r_tui_3_a_widened_terminal_keeps_the_answer_in_scrollback_once() {
+    // Printed at 40 columns, the answer's lines are wrapped by krowk inside
+    // its padding; widened to 100 they stay as they were printed, each once
+    // (Ctrl-Y copies the answer unwrapped).
     let m = streamed(20, Duration::from_micros(100));
     let b = Sandbox::new("widen");
     let Some(tm) = Tmux::start("widen", 40, 30, &b.root.join("repo"), &b.env(&m.url), &[]) else { return };
@@ -432,8 +440,9 @@ fn r_tui_3_a_widened_terminal_rewraps_the_answer_already_in_scrollback() {
     tm.tmux(&["resize-window", "-t", "t", "-x", "100", "-y", "30"]);
     std::thread::sleep(Duration::from_millis(500));
     let history = tm.history();
-    let whole = history.lines().filter(|l| l.trim_end().ends_with("lazy dog again") && l.starts_with("line ")).count();
-    assert_eq!(whole, 20, "every line is one row again at 100 columns:\n{history}");
+    let firsts = history.lines().filter(|l| l.trim().starts_with("line ")).count();
+    let lasts = history.lines().filter(|l| l.trim_end().ends_with("dog again")).count();
+    assert_eq!((firsts, lasts), (20, 20), "every line once, start and end:\n{history}");
 }
 
 #[test]
@@ -458,7 +467,7 @@ fn r_tui_3_a_resize_mid_stream_never_repeats_a_line_or_leaves_the_live_region_be
     // is left behind, and every line is there, in order — but a resize the
     // terminal takes in the middle of one frame's bytes, which the terminal
     // alone decides, can still cost the line in flight.
-    let seen: Vec<u32> = history.lines().filter_map(|l| l.strip_prefix("line ")?.get(..5)?.parse().ok()).collect();
+    let seen: Vec<u32> = history.lines().filter_map(|l| l.trim_start().strip_prefix("line ")?.get(..5)?.parse().ok()).collect();
     let mut sorted = seen.clone();
     sorted.dedup();
     assert_eq!(sorted, seen, "a line twice, or out of order:\n{history}");
@@ -511,7 +520,7 @@ fn narrowing(name: &str, before: &str, steps: &[&str]) {
         let last = lines.iter().rposition(|l| l.starts_with("earlier output")).expect("the earlier output is kept");
         let n: usize = lines[last].trim_start_matches("earlier output ").trim().parse().unwrap();
         assert_eq!(lines.iter().filter(|l| l.starts_with("earlier output")).count(), n, "every earlier line, once:\n{history}");
-        let header = lines.iter().position(|l| l.starts_with("krowk · ")).expect("the header");
+        let header = lines.iter().position(|l| l.trim_start().starts_with("krowk · ")).expect("the header");
         assert!(header > last && lines[last + 1..header].iter().all(|l| l.trim().is_empty()), "only the cleared screen between the earlier output and the header:\n{history}");
     }
 }

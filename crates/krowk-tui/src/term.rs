@@ -279,6 +279,10 @@ pub struct Term<W: Write> {
     pub reflows: bool,
     /// Frames written, for the tests and the redraw budget's evidence.
     pub frames: u64,
+    /// Columns kept clear on the left and the right of everything drawn.
+    /// The left ones are moved over, never written — as Claude Code does —
+    /// so a terminal that copies only what was written leaves them out.
+    pub pad: u16,
 }
 
 impl<W: Write> Term<W> {
@@ -295,12 +299,14 @@ impl<W: Write> Term<W> {
         out.write_all(&buf.take())?;
         out.flush()?;
         let terminal = build(&buf, size, top, height)?;
-        Ok(Term { terminal, buf, out, size, height, caret_row: 0, caret_col: 0, widths: Vec::new(), drawn_width: size.width, reflows: true, frames: 0 })
+        Ok(Term { terminal, buf, out, size, height, caret_row: 0, caret_col: 0, widths: Vec::new(), drawn_width: size.width, reflows: true, frames: 0, pad: 0 })
     }
 
     pub fn width(&self) -> u16 {
         self.size.width
     }
+
+
 
     pub fn size(&self) -> Size {
         self.size
@@ -380,6 +386,11 @@ impl<W: Write> Term<W> {
         above + self.caret_col / width
     }
 
+    /// Puts `text` on the clipboard with the next frame (OSC 52).
+    pub fn clipboard(&mut self, text: &str) -> io::Result<()> {
+        self.buf.clone().write_all(crate::clipboard::osc52(text).as_bytes())
+    }
+
     /// Sets the window title with the next frame (OSC 2, which moves
     /// nothing).
     pub fn title(&mut self, title: &str) -> io::Result<()> {
@@ -399,6 +410,8 @@ impl<W: Write> Term<W> {
             self.emit(lines, height)?;
         }
         let shown = usize::from(self.height);
+        let pad = if width > 2 * self.pad + 10 { self.pad } else { 0 };
+        let inner = width - 2 * pad;
         // The live region is drawn with autowrap off: a row wider than the
         // screen it is read at — a frame drawn before a narrowing — is cut
         // at the last column rather than wrapped onto the next row, or off
@@ -407,13 +420,13 @@ impl<W: Write> Term<W> {
         let drawn = self.terminal.draw(|f| {
             let area = f.area();
             for (i, row) in rows.iter().enumerate().take(usize::from(area.height)) {
-                f.buffer_mut().set_line(area.x, area.y + i as u16, row, width);
+                f.buffer_mut().set_line(area.x + pad, area.y + i as u16, row, inner);
             }
-            f.set_cursor_position((area.x + caret.0.min(width.saturating_sub(1)), area.y + caret.1.min(area.height.saturating_sub(1))));
+            f.set_cursor_position((area.x + pad + caret.0.min(inner.saturating_sub(1)), area.y + caret.1.min(area.height.saturating_sub(1))));
         });
         self.buf.clone().write_all(AUTOWRAP_ON)?;
         drawn?;
-        self.widths = rows.iter().take(shown).map(|r| (r.width() as u16).min(width)).collect();
+        self.widths = rows.iter().take(shown).map(|r| (r.width() as u16).min(inner) + pad).collect();
         let top = self.top();
         if let Some(Position { x, y }) = completed_cursor(&mut self.terminal) {
             self.caret_row = y.saturating_sub(top);
@@ -434,10 +447,14 @@ impl<W: Write> Term<W> {
         self.buf.goto(0, top)?;
         queue!(out, Clear(CtClear::FromCursorDown))?;
         let mut used: u32 = 0;
+        let pad = if w > 2 * self.pad + 10 { self.pad } else { 0 };
         for line in lines {
+            if pad > 0 && line.width() > 0 {
+                write!(out, "\x1b[{pad}C")?;
+            }
             write_styled(&mut out, line)?;
             out.write_all(b"\r\n")?;
-            used += u32::from(soft_rows(line, w));
+            used += u32::from(soft_rows(line, w.saturating_sub(pad)));
         }
         // The cursor is on the row after the text, at most the last; line
         // feeds from there reserve the viewport, scrolling if they must.

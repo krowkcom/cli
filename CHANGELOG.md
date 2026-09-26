@@ -213,9 +213,13 @@ the versions are the `v*` tags a release is cut from. Entries land under
   is shown once, with its outcome (`◆ Read README.md (3 lines)`, an edit's
   removed and added lines on red and green bands, a command's head and
   tail), thinking as `◆ Thought for 4.2s`, and answers in light markdown;
-  the look follows xAI's Grok Build. Finished lines are printed as text the
-  terminal wraps, so they rewrap when the window is resized and copy
-  whole. The prompt sits
+  the look follows xAI's Grok Build. Everything sits two columns in from
+  both edges; the left padding is moved over, never written, as Claude
+  Code does it, and krowk wraps answers inside it itself, so lines already
+  printed keep their width when the window changes. Ctrl-Y copies the
+  last answer as the model wrote it, without the padding or the wrapping,
+  to the clipboard (OSC 52, and `wl-copy`, `xclip` or `pbcopy` where
+  there is one). The prompt sits
   at the bottom of the terminal, what was on screen moved down to meet
   it, so narrowing the window never leaves a copy of it in scrollback.
   Resizing mid-answer neither repeats nor drops the line being streamed:

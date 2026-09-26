@@ -27,6 +27,7 @@ pub mod clipboard;
 pub mod device;
 pub mod presence;
 pub mod editor;
+pub mod help;
 pub mod look;
 pub mod net;
 pub mod settings;
@@ -180,8 +181,21 @@ async fn session(opts: Options) -> Outcome {
     let target = shown.as_ref().and_then(|m| opts.host.registry.get(&m.instance).ok()).and_then(|i| Target::for_url(&i.base_url, &|k| std::env::var(k).unwrap_or_default()));
     app.model = shown;
     app.device = device::name(&|k| std::env::var(k).unwrap_or_default());
+    app.skills = krowk_harness::compat::skills::discover(&opts.host.permissions, &opts.host.cwd).into_iter().filter(|k| k.user_invocable).map(|k| (k.name, k.description)).collect();
     app.vendor_instances = opts.host.registry.instances.values().filter(|i| i.backend.is_some()).map(|i| i.name.clone()).collect();
-    app.header(&home_relative(&opts.host.cwd));
+    let branch = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&opts.host.cwd)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|b| b != "HEAD")
+        .unwrap_or_default();
+    let effort = opts.effort.and_then(|e| serde_json::to_value(e).ok()).and_then(|v| v.as_str().map(String::from));
+    app.header(&home_relative(&opts.host.cwd), &branch, effort.as_deref());
     for n in &opts.notices {
         app.note(n);
     }
@@ -854,6 +868,84 @@ impl<'h> Ui<'h> {
                 _ => {}
             }
         }
+        // The `/` menu, while a command is being typed: the arrows choose,
+        // tab completes, enter runs a command or completes a skill, esc
+        // puts the menu away. Everything else goes to the prompt.
+        if app.slash_open() && !ctrl && !alt {
+            let found = help::slash(app.editor.text(), &app.skills);
+            match k.code {
+                KeyCode::Up => {
+                    app.slash_at = app.slash_at.saturating_sub(1);
+                    return false;
+                }
+                KeyCode::Down => {
+                    app.slash_at = (app.slash_at + 1).min(found.len().saturating_sub(1));
+                    return false;
+                }
+                KeyCode::Esc => {
+                    app.slash_closed = true;
+                    return false;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    let Some(s) = found.get(app.slash_at.min(found.len().saturating_sub(1))) else { return false };
+                    app.editor.clear();
+                    app.slash_at = 0;
+                    if s.skill || k.code == KeyCode::Tab {
+                        // A skill takes what follows it: the menu closes on
+                        // the space, and the next enter sends it.
+                        app.editor.insert_str(&format!("/{} ", s.name));
+                        return false;
+                    }
+                    app.editor.insert_str(&format!("/{}", s.name));
+                    return self.submit(app).await;
+                }
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete => app.slash_at = 0,
+                _ => {}
+            }
+        }
+        // The help menu takes the arrows, enter and esc while it is open;
+        // everything typed goes to the prompt, and filters it.
+        if app.overlay == Overlay::Keys && !ctrl && !alt {
+            let found = help::filter(app.editor.text());
+            match k.code {
+                KeyCode::Up => {
+                    app.help_at = app.help_at.saturating_sub(1);
+                    return false;
+                }
+                KeyCode::Down => {
+                    app.help_at = (app.help_at + 1).min(found.len().saturating_sub(1));
+                    return false;
+                }
+                KeyCode::Esc => {
+                    app.overlay = Overlay::None;
+                    app.editor.clear();
+                    return false;
+                }
+                KeyCode::Enter => {
+                    app.overlay = Overlay::None;
+                    app.editor.clear();
+                    if let Some(entry) = found.get(app.help_at) {
+                        match entry.action {
+                            help::Action::Tell => {}
+                            help::Action::Model => self.open_models(app),
+                            help::Action::Todos => app.overlay = Overlay::Todos,
+                            help::Action::Agents => app.overlay = Overlay::Agents,
+                            help::Action::Details => app.overlay = Overlay::Details,
+                            help::Action::Copy => copy(app),
+                            help::Action::Interrupt => {
+                                if app.running() {
+                                    self.interrupt(app).await;
+                                }
+                            }
+                            help::Action::Quit => app.quit = true,
+                        }
+                    }
+                    return false;
+                }
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete => app.help_at = 0,
+                _ => {}
+            }
+        }
         // The model picker takes the arrows and enter while it is open.
         if app.overlay == Overlay::Models && !ctrl {
             match k.code {
@@ -922,18 +1014,12 @@ impl<'h> Ui<'h> {
                     self.interrupt(app).await;
                 }
             }
-            KeyCode::Char('y') if ctrl => {
-                if app.answer.trim().is_empty() {
-                    app.flash = Some("nothing to copy yet".into());
-                } else {
-                    app.copy = true;
-                }
-            }
+            KeyCode::Char('y') if ctrl => copy(app),
             KeyCode::Char('o') if ctrl => app.overlay = if app.overlay == Overlay::Details { Overlay::None } else { Overlay::Details },
             KeyCode::Char('t') if ctrl => app.overlay = if app.overlay == Overlay::Todos { Overlay::None } else { Overlay::Todos },
             KeyCode::Char('g') if ctrl => app.overlay = if app.overlay == Overlay::Agents { Overlay::None } else { Overlay::Agents },
-            KeyCode::F(1) => app.overlay = if app.overlay == Overlay::Keys { Overlay::None } else { Overlay::Keys },
-            KeyCode::Char('?') if e.is_empty() && !ctrl && !alt => app.overlay = if app.overlay == Overlay::Keys { Overlay::None } else { Overlay::Keys },
+            KeyCode::F(1) => app.toggle_help(),
+            KeyCode::Char('?') if e.is_empty() && !ctrl && !alt => app.toggle_help(),
             KeyCode::Enter if alt => e.insert('\n'),
             KeyCode::Char('j') if ctrl => e.insert('\n'),
             KeyCode::Enter => {
@@ -966,7 +1052,15 @@ impl<'h> Ui<'h> {
             KeyCode::Char(c) if !ctrl => e.insert(c),
             _ => {}
         }
+        if !app.editor.text().starts_with('/') {
+            app.slash_closed = false;
+        }
         false
+    }
+
+    fn open_models(&self, app: &mut App) {
+        let instances: Vec<(String, &'static str)> = self.host.registry().instances.values().map(|i| (i.name.clone(), i.kind)).collect();
+        app.open_picker(&instances);
     }
 
     async fn interrupt(&mut self, app: &mut App) {
@@ -992,13 +1086,12 @@ impl<'h> Ui<'h> {
             }
             "/help" => {
                 app.editor.clear();
-                app.overlay = Overlay::Keys;
+                app.toggle_help();
                 return false;
             }
             "/model" => {
                 app.editor.clear();
-                let instances: Vec<(String, &'static str)> = self.host.registry().instances.values().map(|i| (i.name.clone(), i.kind)).collect();
-                app.open_picker(&instances);
+                self.open_models(app);
                 return false;
             }
             t if t.starts_with("/model ") => {
@@ -1015,6 +1108,7 @@ impl<'h> Ui<'h> {
         }
         let text = app.editor.take().trim_end().to_string();
         app.overlay = Overlay::None;
+        app.slash_closed = false;
         if app.running() {
             app.unsent_steers.push(text);
             self.flush_requests(app).await;
@@ -1022,6 +1116,15 @@ impl<'h> Ui<'h> {
         }
         self.prompt(app, text);
         app.offline.is_some()
+    }
+}
+
+/// Ctrl-Y: the last answer to the clipboard, on the next frame.
+fn copy(app: &mut App) {
+    if app.answer.trim().is_empty() {
+        app.flash = Some("nothing to copy yet".into());
+    } else {
+        app.copy = true;
     }
 }
 

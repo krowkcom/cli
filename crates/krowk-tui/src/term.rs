@@ -314,15 +314,22 @@ impl<W: Write> Term<W> {
         self.terminal.get_frame().area().y
     }
 
-    /// Changes the live region's height in place: its top stays where it is,
-    /// and a taller one pushes what is above it up into scrollback the way
-    /// a new line would.
+    /// Changes the live region's height. A taller one keeps its top and
+    /// pushes what is above it up into scrollback the way a new line would;
+    /// a shorter one is cleared and drops back to the bottom of the screen,
+    /// what is above it moving down with it (`anchor`), so the prompt never
+    /// floats with blank rows under it.
     fn set_height(&mut self, height: u16) -> io::Result<()> {
         let height = height.clamp(1, self.size.height.max(1));
         if height == self.height {
             return Ok(());
         }
-        let top = self.top();
+        let mut top = self.top();
+        if height < self.height {
+            self.buf.goto(0, top)?;
+            queue!(self.buf.clone(), Clear(CtClear::FromCursorDown))?;
+            top = anchor(&self.buf, self.size, top, height)?;
+        }
         self.rebuild(top, height)
     }
 

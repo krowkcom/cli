@@ -717,7 +717,18 @@ impl Shared {
         let prompt_item = Item::UserText { text: std::mem::take(&mut plan.text) };
         w.log(LogBody::ItemCompleted { turn_id: turn_id.clone(), item_id: krowk_store::new_id(), item: prompt_item.clone() }).await?;
         let mut history = std::mem::take(&mut plan.past.items);
+        // `/name` for a skill, on krowk's own loop: its instructions come
+        // right after the prompt. A vendor's agent expands its own.
+        let asked = match &prompt_item {
+            Item::UserText { text } if plan.spawns => compat::skills::invoked(&plan.compat.skills, text),
+            _ => None,
+        };
         history.push(HistoryItem { item: prompt_item, response: None });
+        if let Some(text) = asked {
+            let item = Item::UserText { text };
+            w.log(LogBody::ItemCompleted { turn_id: turn_id.clone(), item_id: krowk_store::new_id(), item: item.clone() }).await?;
+            history.push(HistoryItem { item, response: None });
+        }
 
         let gate = permissions::Gate::new(
             plan.policy.clone(),

@@ -128,7 +128,7 @@ fn r_perf_2_nothing_is_drawn_while_idle() {
     // The first frame, status line and all, is the last one there is
     // reason to draw: the start-up probe answering online changes nothing
     // on screen, so it draws nothing.
-    assert!(t.wait_for("help", Duration::from_secs(10)).is_some(), "no status line: {:?}", t.text());
+    assert!(t.wait_for("? help", Duration::from_secs(10)).is_some(), "no status line: {:?}", t.text());
     std::thread::sleep(Duration::from_millis(300));
     let before = t.output().len();
     std::thread::sleep(Duration::from_secs(2));

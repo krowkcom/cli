@@ -25,6 +25,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `model`, `cost`, `tasks`, `subagents` and `help`; a config with the old
   names still reads — `todos` is `tasks`, `instance` is `model`, and
   `connectivity` and `session` are ignored.
+- **The working line says what runs, and one duration**: `Running Read
+  README.md…` or `Waiting on 2 subagents…`, with the turn's clock on the
+  right — no longer `Running for 10s… 10s`.
 
 - **Edits into `.git`, `.claude`, `.codex` and `.krowk` are asked about
   instead of refused**, and so is anything in krowk's own config directory

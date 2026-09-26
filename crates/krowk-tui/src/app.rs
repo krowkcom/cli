@@ -257,7 +257,6 @@ struct Call {
     call_id: String,
     name: String,
     input: serde_json::Value,
-    started: Instant,
 }
 
 /// A turn in flight.
@@ -1017,7 +1016,7 @@ impl App {
                 if streamed {
                     self.live = None;
                 }
-                self.calls.push(Call { call_id: call_id.clone(), name: name.clone(), input: input.clone(), started: Instant::now() });
+                self.calls.push(Call { call_id: call_id.clone(), name: name.clone(), input: input.clone() });
             }
             Item::ToolResult { call_id, output, is_error } => {
                 if streamed {
@@ -1127,9 +1126,17 @@ impl App {
                 (_, true) => "Interrupting…".to_string(),
                 (Some(Live { kind: LiveKind::Reasoning, .. }), _) => "Thinking…".to_string(),
                 (Some(Live { kind: LiveKind::Text, .. }), _) => "Responding…".to_string(),
-                _ if t.tool_running => match self.calls.first() {
-                    Some(c) => format!("Running for {}…", look::duration(now.saturating_duration_since(c.started))),
-                    None => "Running…".to_string(),
+                // What runs, not for how long: the turn's clock on the
+                // right is the one duration the line shows.
+                _ if t.tool_running => match self.calls.iter().find(|c| c.name != "subagent") {
+                    Some(c) => {
+                        let (verb, arg) = look::tool_title(&c.name, &c.input);
+                        if arg.is_empty() { format!("Running {verb}…") } else { format!("Running {verb} {arg}…") }
+                    }
+                    None => match self.subs.iter().filter(|s| s.status.is_none()).count() as u32 {
+                        0 => "Running…".to_string(),
+                        n => format!("Waiting on {}…", plural(n, "subagent")),
+                    },
                 },
                 _ => "Working…".to_string(),
             };
@@ -1808,6 +1815,30 @@ mod tests {
         b.on_line(&live(LiveEvent::Cost { session_id: "s".into(), turn_id: "t".into(), cost_usd: None, turn_cost_usd: None, generated_tokens: 1 }));
         b.on_line(&live(LiveEvent::Result(RunResult { session_id: "s".into(), turn_id: "t".into(), status: TurnStatus::Completed, is_error: false, result: String::new(), model: ModelRef { instance: "anthropic".into(), model: "claude-x".into() }, usage: Usage::default(), cost_usd: None, duration_ms: 1, num_model_calls: 1, error: None, unread_steers: Vec::new(), switch_offer: None })));
         assert_eq!(b.status_bar(), "anthropic/claude-x | $— | ? help");
+    }
+
+    #[test]
+    fn the_working_line_never_has_two_durations() {
+        let mut a = app();
+        a.set_width(100);
+        let t0 = Instant::now();
+        a.start_turn(t0);
+        a.turn.as_mut().unwrap().tool_running = true;
+        let working = |a: &App, at: Instant| text(&a.view(at).0).into_iter().find(|r| r.contains("esc to interrupt")).unwrap();
+        let durations = |row: &str| row.split(|c: char| !c.is_ascii_alphanumeric() && c != '.').filter(|w| w.len() > 1 && w.ends_with('s') && w[..w.len() - 1].chars().all(|c| c.is_ascii_digit() || c == '.')).count();
+        a.calls.push(Call { call_id: "s1".into(), name: "subagent".into(), input: serde_json::json!({"description": "x"}) });
+        a.subs.push(Sub::new("k1"));
+        a.subs.push(Sub::new("k2"));
+        let row = working(&a, t0 + Duration::from_secs(10));
+        assert!(row.contains("Waiting on 2 subagents… 10s"), "only subagent calls out: {row:?}");
+        assert_eq!(durations(&row), 1, "{row:?}");
+        a.calls.push(Call { call_id: "c1".into(), name: "read".into(), input: serde_json::json!({"path": "README.md"}) });
+        let row = working(&a, t0 + Duration::from_secs(10));
+        assert!(row.contains("Running Read README.md… 10s"), "the first call that is not a subagent's: {row:?}");
+        assert_eq!(durations(&row), 1, "the turn's clock only: {row:?}");
+        a.calls.clear();
+        a.subs.clear();
+        assert!(working(&a, t0 + Duration::from_secs(10)).contains("Running… 10s"));
     }
 
     #[test]

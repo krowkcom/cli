@@ -93,6 +93,8 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> (String, String) {
         "bash" => ("Run".into(), first_line(s("command"))),
         "grep" => ("Search".into(), s("pattern")),
         "glob" => ("Find".into(), s("pattern")),
+        "todo_write" => ("Plan".into(), String::new()),
+        "subagent" => ("Agent".into(), s("description")),
         "str_replace" => ("Edit".into(), s("path")),
         "search_replace" => ("Edit".into(), s("file_path")),
         "apply_patch" => ("Edit".into(), patch_paths(&s("input")).join(", ")),

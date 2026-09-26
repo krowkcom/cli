@@ -10,6 +10,8 @@
 @ask {"method":"item/tool/call","params":{"arguments":{},"callId":"call-info","namespace":"krowk","threadId":"{{THREAD}}","tool":"session_info","turnId":"{{TURN}}"}}
 @tool-result call-info
 {"method":"thread/tokenUsage/updated","params":{"threadId":"{{THREAD}}","turnId":"{{TURN}}","tokenUsage":{"last":{"inputTokens":1200,"cachedInputTokens":1000,"outputTokens":60,"reasoningOutputTokens":40,"totalTokens":1260},"total":{"inputTokens":1200,"cachedInputTokens":1000,"outputTokens":60,"reasoningOutputTokens":40,"totalTokens":1260},"modelContextWindow":272000}}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"sub-thread-1","turnId":"sub-turn-1","tokenUsage":{"last":{"inputTokens":300,"cachedInputTokens":100,"outputTokens":7,"reasoningOutputTokens":0,"totalTokens":307},"total":{"inputTokens":300,"cachedInputTokens":100,"outputTokens":7,"reasoningOutputTokens":0,"totalTokens":307}}}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"sub-thread-1","turnId":"sub-turn-1","tokenUsage":{"last":{"inputTokens":300,"cachedInputTokens":100,"outputTokens":7,"reasoningOutputTokens":0,"totalTokens":307},"total":{"inputTokens":300,"cachedInputTokens":100,"outputTokens":7,"reasoningOutputTokens":0,"totalTokens":307}}}}
 {"method":"item/started","params":{"item":{"type":"agentMessage","id":"msg-1","text":"","phase":null},"threadId":"{{THREAD}}","turnId":"{{TURN}}","startedAtMs":1790344946500}}
 {"method":"item/agentMessage/delta","params":{"itemId":"msg-1","delta":"There is one file, ","threadId":"{{THREAD}}","turnId":"{{TURN}}"}}
 {"method":"item/agentMessage/delta","params":{"itemId":"msg-1","delta":"README.md.","threadId":"{{THREAD}}","turnId":"{{TURN}}"}}

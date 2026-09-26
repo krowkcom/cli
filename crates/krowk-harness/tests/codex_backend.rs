@@ -13,7 +13,7 @@
 use krowk_harness::host::{Host, HostConfig};
 use krowk_harness::instances::{InstanceKind, InstancesConfig, Registry};
 use krowk_harness::log;
-use krowk_harness::protocol::{Billing, Command, ContextRecord, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus, WireApi};
+use krowk_harness::protocol::{Billing, Command, ContextRecord, Item, LiveEvent, LogBody, LogEvent, ModelRef, PermissionMode, RunResult, StreamLine, TurnStatus, Usage, WireApi};
 use krowk_harness::trust;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -105,6 +105,7 @@ impl Home {
             trust: gate,
             publisher: None,
             permissions: Default::default(),
+            agents: krowk_harness::subagent::AgentsConfig::none(),
         })
     }
 
@@ -208,7 +209,11 @@ fn r_back_3_a_tool_using_turn_on_a_codex_instance_completes_and_is_logged() {
         assert_eq!(std::fs::read_link(home.join("skills/later")).unwrap(), h.root.join("home/.codex/skills/later"), "a skill added later reaches the account");
         let r = r.unwrap().unwrap();
         assert_eq!((r.status, r.result.as_str(), r.num_model_calls), (TurnStatus::Completed, "There is one file, README.md.", 2), "{r:?}");
-        assert_eq!((r.usage.input_tokens, r.usage.cache_read_tokens, r.usage.output_tokens, r.usage.reasoning_tokens), (400, 2200, 32, 40));
+        // Codex's own subagent thread made one call: metered once, as the
+        // session's spend, and none of its conversation (R-SUB-4).
+        assert_eq!((r.usage.input_tokens, r.usage.cache_read_tokens, r.usage.output_tokens, r.usage.reasoning_tokens), (600, 2300, 39, 40));
+        let subagent: Vec<Usage> = h.events(&r.session_id).iter().filter_map(|e| if let LogBody::SubagentResponse { usage, .. } = &e.body { Some(*usage) } else { None }).collect();
+        assert_eq!(subagent, [Usage { input_tokens: 200, cache_read_tokens: 100, output_tokens: 7, ..Usage::default() }], "r_sub_4: Codex's subagent thread is metered");
         assert!(lines.iter().any(|l| matches!(l, StreamLine::Live(LiveEvent::ItemDelta { .. }))), "the answer streamed");
 
         let events = h.events(&r.session_id);

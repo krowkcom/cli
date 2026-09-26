@@ -145,6 +145,99 @@ pub fn lookup(raw: &[u8], provider: &str, model: &str) -> Option<ModelInfo> {
     names.into_iter().find_map(|n| of(top[n])).map(|info| ModelInfo { wire_api: None, ..info })
 }
 
+/// One model a provider serves, as the catalog lists it: what choosing a
+/// subagent's model needs (R-SUB-1).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Listed {
+    pub id: String,
+    pub family: String,
+    /// `YYYY-MM-DD`, or empty when the catalog does not say.
+    pub released: String,
+    /// USD per million output tokens, when the catalog prices it.
+    pub output_price: Option<f64>,
+    /// It calls tools and reads and writes text only — not an image, audio
+    /// or realtime model, which cannot run an agent's loop.
+    pub agentic: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct ListedModel {
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    release_date: Option<String>,
+    #[serde(default)]
+    tool_call: bool,
+    #[serde(default)]
+    cost: Option<Cost>,
+    #[serde(default)]
+    modalities: Option<Modalities>,
+}
+
+#[derive(Deserialize, Default)]
+struct Cost {
+    #[serde(default)]
+    output: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+struct Modalities {
+    #[serde(default)]
+    input: Vec<String>,
+    #[serde(default)]
+    output: Vec<String>,
+}
+
+/// Every model the catalog lists under `provider`, sorted by id.
+pub fn models(raw: &[u8], provider: &str) -> Vec<Listed> {
+    let Ok(top) = serde_json::from_slice::<HashMap<String, &RawValue>>(raw) else { return Vec::new() };
+    let Some(models) = top.get(provider).and_then(|p| serde_json::from_str::<Provider>(p.get()).ok()).and_then(|p| p.models) else { return Vec::new() };
+    let mut out: Vec<Listed> = models
+        .into_iter()
+        .filter_map(|(id, m)| {
+            let m: ListedModel = serde_json::from_str(m.get()).ok()?;
+            let text_only = m.modalities.as_ref().is_none_or(|md| md.output.iter().all(|o| o == "text") && md.input.iter().any(|i| i == "text"));
+            Some(Listed {
+                agentic: m.tool_call && text_only,
+                family: m.family.unwrap_or_default(),
+                released: m.release_date.unwrap_or_default(),
+                output_price: m.cost.and_then(|c| c.output),
+                id,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// The vendor a family belongs to: its first word (`claude` of
+/// `claude-opus`, `gpt` of `gpt-mini`).
+fn line_of(family: &str) -> &str {
+    family.split('-').next().unwrap_or(family)
+}
+
+/// The cheaper tier below `model` (R-SUB-1's default for a subagent): of
+/// the same provider's agentic models in the same vendor's line, the newest
+/// that costs at most half as much per output token — Opus to Sonnet,
+/// Sonnet to Haiku, a GPT to its mini. Between two of one release date, the
+/// dearer, which is the nearer tier. None when the catalog does not price
+/// `model` or lists nothing cheaper: the subagent then runs on `model`.
+pub fn cheaper(listed: &[Listed], model: &str) -> Option<String> {
+    let me = listed.iter().find(|m| m.id == model)?;
+    let price = me.output_price.filter(|p| *p > 0.0)?;
+    listed
+        .iter()
+        .filter(|m| m.agentic && m.id != me.id && line_of(&m.family) == line_of(&me.family) && m.output_price.is_some_and(|p| p <= price / 2.0))
+        .max_by(|a, b| a.released.cmp(&b.released).then(a.output_price.partial_cmp(&b.output_price).unwrap_or(std::cmp::Ordering::Equal)).then(b.id.cmp(&a.id)))
+        .map(|m| m.id.clone())
+}
+
+/// The newest agentic model of `family`: what an alias like Claude Code's
+/// `haiku` (`claude-haiku`) names today.
+pub fn newest(listed: &[Listed], family: &str) -> Option<String> {
+    listed.iter().filter(|m| m.agentic && m.family == family).max_by(|a, b| a.released.cmp(&b.released).then(b.id.cmp(&a.id))).map(|m| m.id.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +285,33 @@ mod tests {
         assert_eq!(lookup(b"not json", "openai", "gpt-5.4"), None);
         assert_eq!(wire_of(Some("@ai-sdk/google-vertex/anthropic"), None), Some(WireApi::AnthropicMessages));
         assert_eq!(wire_of(Some("@ai-sdk/openai"), Some("completions")), Some(WireApi::ChatCompletions));
+    }
+
+    #[test]
+    fn r_sub_1_a_subagents_default_model_is_the_cheaper_tier_the_catalog_lists() {
+        let doc = br#"{"anthropic": {"models": {
+            "claude-opus-5-5": {"family": "claude-opus", "tool_call": true, "release_date": "2026-09-22", "cost": {"output": 20}},
+            "claude-sonnet-5": {"family": "claude-sonnet", "tool_call": true, "release_date": "2026-06-29", "cost": {"output": 10}},
+            "claude-haiku-4-5": {"family": "claude-haiku", "tool_call": true, "release_date": "2025-10-15", "cost": {"output": 5}},
+            "claude-haiku-4-5-20251001": {"family": "claude-haiku", "tool_call": true, "release_date": "2025-10-15", "cost": {"output": 5}},
+            "claude-3-haiku": {"family": "claude-haiku", "tool_call": true, "release_date": "2024-03-07", "cost": {"output": 1.25}}
+        }}, "openai": {"models": {
+            "gpt-6-sol": {"family": "gpt-sol", "tool_call": true, "release_date": "2026-09-22", "cost": {"output": 30}},
+            "gpt-6-luna": {"family": "gpt-luna", "tool_call": true, "release_date": "2026-09-22", "cost": {"output": 0.5}},
+            "gpt-6-mini": {"family": "gpt-mini", "tool_call": true, "release_date": "2026-09-22", "cost": {"output": 4}},
+            "gpt-realtime-3": {"family": "gpt", "tool_call": true, "release_date": "2026-09-23", "cost": {"output": 2}, "modalities": {"input": ["text", "audio"], "output": ["text", "audio"]}},
+            "o9": {"family": "o", "tool_call": true, "release_date": "2026-09-24", "cost": {"output": 1}}
+        }}}"#;
+        let anthropic = models(doc, "anthropic");
+        assert_eq!(anthropic.len(), 5);
+        assert_eq!(cheaper(&anthropic, "claude-opus-5-5").as_deref(), Some("claude-sonnet-5"), "one tier down, not the cheapest there is");
+        assert_eq!(cheaper(&anthropic, "claude-sonnet-5").as_deref(), Some("claude-haiku-4-5"), "the newest at half the price; of one date the first id");
+        assert_eq!(cheaper(&anthropic, "claude-3-haiku"), None, "nothing cheaper: the subagent runs on the parent's model");
+        assert_eq!(cheaper(&anthropic, "claude-unknown"), None);
+        let openai = models(doc, "openai");
+        assert_eq!(cheaper(&openai, "gpt-6-sol").as_deref(), Some("gpt-6-mini"), "of one date the dearer; never a realtime model or another vendor's line");
+        assert_eq!(newest(&anthropic, "claude-haiku").as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(newest(&anthropic, "claude-fable"), None);
+        assert!(models(b"nope", "openai").is_empty() && models(doc, "xai").is_empty());
     }
 }

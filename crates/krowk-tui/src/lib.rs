@@ -679,6 +679,29 @@ impl<'h> Ui<'h> {
             }
             return false;
         }
+        // The Agents overlay takes the keys that move through it: select a
+        // subagent, expand its line, interrupt it alone (R-SUB-2, R-SUB-3).
+        if app.overlay == Overlay::Agents && !ctrl && !alt {
+            match k.code {
+                KeyCode::Up | KeyCode::Down => {
+                    app.agent_move(if k.code == KeyCode::Up { -1 } else { 1 });
+                    return false;
+                }
+                KeyCode::Enter => {
+                    app.agent_toggle();
+                    return false;
+                }
+                KeyCode::Char('x') => {
+                    if let Some(id) = app.agent_selected_running()
+                        && let Err(e) = self.command(Command::Interrupt { session_id: id }).await
+                    {
+                        app.notice(&e.message);
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+        }
         let e = &mut app.editor;
         match k.code {
             KeyCode::Char('c') if ctrl => {
@@ -718,6 +741,8 @@ impl<'h> Ui<'h> {
                 }
             }
             KeyCode::Char('o') if ctrl => app.overlay = if app.overlay == Overlay::Details { Overlay::None } else { Overlay::Details },
+            KeyCode::Char('t') if ctrl => app.overlay = if app.overlay == Overlay::Todos { Overlay::None } else { Overlay::Todos },
+            KeyCode::Char('g') if ctrl => app.overlay = if app.overlay == Overlay::Agents { Overlay::None } else { Overlay::Agents },
             KeyCode::F(1) => app.overlay = if app.overlay == Overlay::Keys { Overlay::None } else { Overlay::Keys },
             KeyCode::Char('?') if e.is_empty() && !ctrl && !alt => app.overlay = if app.overlay == Overlay::Keys { Overlay::None } else { Overlay::Keys },
             KeyCode::Enter if alt => e.insert('\n'),

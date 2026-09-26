@@ -403,6 +403,9 @@ pub enum LogBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(regex(pattern = UUID7_PATTERN))]
         parent_session_id: Option<String>,
+        /// The agent definition a subagent runs, by name, when it runs one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
     /// A prompt arrived; the turn runs on `model`. The exact system prompt
     /// and tools it ran with are in the session's `context.jsonl` under
@@ -467,6 +470,28 @@ pub enum LogBody {
         model: String,
         usage: Usage,
     },
+    /// A subagent this session started (R-SUB-1): the child session, which
+    /// is its own log whose root names this session as its parent, and the
+    /// tool call it answers — its final summary is that call's result. The
+    /// link both ways is what moves, syncs and rebuilds a session tree.
+    #[serde(rename = "subagent.started")]
+    SubagentStarted {
+        turn_id: String,
+        /// The `subagent` tool call the child answers.
+        call_id: String,
+        #[schemars(regex(pattern = UUID7_PATTERN))]
+        subagent_session_id: String,
+        /// The few words the model gave it, which the TUI shows.
+        description: String,
+        /// The agent definition it runs, when any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        model: ModelRef,
+    },
+    /// The session's todo list, whole, as `todo_write` last set it
+    /// (R-TODO-2): each write replaces the list before it.
+    #[serde(rename = "todos.updated")]
+    TodosUpdated { turn_id: String, todos: Vec<Todo> },
     /// The krowk run this session's evidence is grouped under, opened by
     /// its first `publish` (R-EVID-1). Logged once; every later publish, and
     /// a resumed session's, attaches to it.
@@ -492,6 +517,24 @@ pub enum LogBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ErrorInfo>,
     },
+}
+
+/// One item of a todo list. Fields other harnesses' todo tools add —
+/// Claude Code's `activeForm`, an `id`, a `priority` — are taken and
+/// dropped, so a model trained on theirs is not refused for them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Todo {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+/// Where a todo stands. The names are the ones models are trained on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
 }
 
 /// A frame that is never logged: the typing, and the answer to a command.
@@ -546,7 +589,8 @@ pub struct RunResult {
     pub result: String,
     pub model: ModelRef,
     pub usage: Usage,
-    /// USD at current models.dev prices; null when the model has no price.
+    /// USD at current models.dev prices, the turn's subagents included;
+    /// null when any of it has no price.
     pub cost_usd: Option<f64>,
     pub duration_ms: u64,
     pub num_model_calls: u32,

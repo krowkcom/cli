@@ -24,6 +24,10 @@
         "string",
         "null"
       ]
+    },
+    "subagents": {
+      "description": "How subagents run: how many at once, and on which model.",
+      "$ref": "#/$defs/SubagentsConfig"
     }
   },
   "$defs": {
@@ -482,6 +486,29 @@
           "const": "codex-app-server"
         }
       ]
+    },
+    "SubagentsConfig": {
+      "description": "`subagents` in config.json (R-SUB-1, R-SUB-2).",
+      "type": "object",
+      "properties": {
+        "maxParallel": {
+          "description": "Subagents one turn runs at once; 4 when absent.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "model": {
+          "description": "The model a subagent runs on when its definition names none:\n`<instance>/<model>`, a model id, `inherit` or an alias (`haiku`);\nthe catalog's cheaper tier below the parent's model when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

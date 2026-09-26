@@ -190,6 +190,11 @@ pub enum Access {
     Skill(Option<PathBuf>),
     /// Needs no permission at all: krowk's own bridged tools, a todo list.
     Free,
+    /// One of krowk's own session tools — `todo_write` (`TodoWrite`), a
+    /// subagent (`Task`, its agent the subject): no mode governs it, since
+    /// it writes the session's own log or starts a session held to these
+    /// same rules, but a deny rule, an ask rule and a hook's `ask` do.
+    Session,
     /// Anything else, by name — asked about unless a rule says otherwise.
     Other,
 }
@@ -254,6 +259,11 @@ pub fn matches(r: &Rule, call: &Call, at: &Places<'_>, all: bool) -> bool {
         Access::Mcp { server, tool } => mcp_matches(&r.tool, server, tool),
         Access::Free | Access::Other => {
             r.tool == call.tool && r.spec.as_deref().is_none_or(|s| call.subject.as_deref().is_some_and(|subj| wildcard(s, subj)))
+        }
+        // An agent's name is matched regardless of case, as it is looked
+        // up: `Task(reviewer)` holds a definition spelled `Reviewer` too.
+        Access::Session => {
+            r.tool == call.tool && r.spec.as_deref().is_none_or(|s| call.subject.as_deref().is_some_and(|subj| wildcard(&s.to_lowercase(), &subj.to_lowercase())))
         }
     }
 }

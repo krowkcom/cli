@@ -47,3 +47,7 @@ libc = "0.2"
 [dev-dependencies]
 # The stand-in registry, served in-process for the wire-shape pin.
 krowk-devregistry = { path = "../krowk-devregistry" }
+# The subagent tests drive the host in-process, to interrupt one child
+# while its siblings run; the harness already links tokio, so no crate is
+# added.
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time"] }

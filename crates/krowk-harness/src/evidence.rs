@@ -76,6 +76,10 @@ pub struct Evidence {
     session_id: String,
     /// Held across a publish, so two at once open one run between them.
     run: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Where a run it opens is reported instead of the caller's channel: a
+    /// subagent's publish opens its parent's run, which the parent's log
+    /// must hold for the parent's next turn to attach to it.
+    report_to: Option<Events>,
 }
 
 impl std::fmt::Debug for Evidence {
@@ -87,7 +91,14 @@ impl std::fmt::Debug for Evidence {
 impl Evidence {
     /// `run` is the session's, from its log's `run.opened`, if it has one.
     pub fn new(publisher: Publisher, session_id: &str, run: Option<String>) -> Evidence {
-        Evidence { publisher, session_id: session_id.into(), run: Arc::new(tokio::sync::Mutex::new(run)) }
+        Evidence { publisher, session_id: session_id.into(), run: Arc::new(tokio::sync::Mutex::new(run)), report_to: None }
+    }
+
+    /// The same evidence — the same session tag, the same run — for a
+    /// subagent, whose run, when it opens one, is reported on its parent's
+    /// `events` and so logged in the parent's log.
+    pub fn for_subagent(&self, events: Events) -> Evidence {
+        Evidence { report_to: Some(events), ..self.clone() }
     }
 
     /// One `publish` call: the output the model reads and whether it is an
@@ -112,7 +123,7 @@ impl Evidence {
                 }
                 if let Some(opened) = p.run.filter(|r| run.as_ref() != Some(r)) {
                     *run = Some(opened.clone());
-                    let _ = events.send(EngineEvent::RunOpened { run: opened }).await;
+                    let _ = self.report_to.as_ref().unwrap_or(events).send(EngineEvent::RunOpened { run: opened }).await;
                 }
                 (p.text, false)
             }

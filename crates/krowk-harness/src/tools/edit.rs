@@ -21,7 +21,7 @@ const SNIPPET_MAX_LINES: usize = 40;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteInput {
-    /// The file to write: absolute, or relative to the working directory. Missing parent directories are created.
+    /// The file to write; missing parent directories are created.
     pub path: String,
     /// The file's entire new content.
     pub content: String,
@@ -31,7 +31,7 @@ pub struct WriteInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StrReplaceInput {
-    /// The file to edit: absolute, or relative to the working directory.
+    /// The file to edit.
     pub path: String,
     /// The exact text to replace, whitespace and indentation included. It must occur exactly once unless `replace_all` is set.
     pub old_str: String,
@@ -46,7 +46,7 @@ pub struct StrReplaceInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchReplaceInput {
-    /// The file to edit: absolute, or relative to the working directory.
+    /// The file to edit.
     pub file_path: String,
     /// The exact text to search for, whitespace and indentation included. It must occur exactly once unless `replace_all` is set.
     pub old_string: String,

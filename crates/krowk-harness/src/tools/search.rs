@@ -35,7 +35,7 @@ const GLOB_MAX_RESULTS: usize = 1000;
 pub struct GrepInput {
     /// The regular expression, in Rust regex syntax (e.g. `fn\s+main`, `TODO|FIXME`).
     pub pattern: String,
-    /// A file or directory to search: absolute, or relative to the working directory. The working directory when absent.
+    /// A file or directory to search; the working directory when absent.
     #[serde(default)]
     pub path: Option<String>,
     /// Only search files whose path matches this glob, e.g. `*.rs` or `src/**/*.ts`.
@@ -52,7 +52,7 @@ pub struct GrepInput {
 pub struct GlobInput {
     /// The glob: `*` and `?` within a path segment, `**` across them, `[abc]` and `{a,b}`. Without a `/` it matches the file name at any depth.
     pub pattern: String,
-    /// The directory to search: absolute, or relative to the working directory. The working directory when absent.
+    /// The directory to search; the working directory when absent.
     #[serde(default)]
     pub path: Option<String>,
 }

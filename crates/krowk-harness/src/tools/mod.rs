@@ -1,5 +1,8 @@
 //! The tools the native loop offers (R-TOOL-1): `read`, `write`, one edit
-//! tool, `bash`, `grep`, `glob` and `publish` (`crate::evidence`). Which edit tool — `str_replace`,
+//! tool, `bash`, `grep`, `glob`, `todo_write` (`crate::todo`), `publish`
+//! (`crate::evidence`) and `subagent` (`crate::subagent`) — the last two of
+//! which the loop runs itself, since they act on the session rather than
+//! the file system. Which edit tool — `str_replace`,
 //! `apply_patch` or `search_replace` — is the turn's toolset preset's to
 //! say (`crate::toolset`). Each input is a Rust type the tool's JSON Schema
 //! is derived from, so the definition the model sees and the parser that
@@ -54,7 +57,7 @@ const BASH_MAX_OUTPUT: usize = 30_000;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadInput {
-    /// The file to read: absolute, or relative to the working directory.
+    /// The file to read.
     pub path: String,
     /// The first line to return, counting from 1.
     #[serde(default)]
@@ -127,14 +130,14 @@ pub fn definitions(ts: &Toolset) -> Vec<ToolDefinition> {
     vec![
         function(
             READ,
-            "Read a text file. Returns its lines numbered from 1, like `cat -n`, 2000 lines at most unless `limit` says otherwise; use `offset` to read further. Prefer this to running `cat` through bash.",
+            "Read a text file. Returns its lines numbered from 1, like `cat -n`; use `offset` and `limit` for a long file. Prefer this to running `cat` through bash.",
             input_schema::<ReadInput>(),
         ),
         function(WRITE, "Write a file, creating it or replacing it whole. To change part of an existing file, use the edit tool instead.", input_schema::<WriteInput>()),
         edit,
         function(
             BASH,
-            "Run a shell command with `bash -c` in the working directory and return its combined stdout and stderr, followed by the exit code. Output beyond 30000 bytes is cut from the middle. Commands time out after 120 seconds unless `timeout_ms` says otherwise.",
+            "Run a shell command with `bash -c` in the working directory; returns its combined stdout and stderr, then the exit code. Output beyond 30000 bytes is cut from the middle.",
             input_schema::<BashInput>(),
         ),
         function(
@@ -143,20 +146,68 @@ pub fn definitions(ts: &Toolset) -> Vec<ToolDefinition> {
             input_schema::<GrepInput>(),
         ),
         function(GLOB, "Find files whose path matches a glob. Returns paths sorted, 1000 at most, skipping what .gitignore excludes.", input_schema::<GlobInput>()),
+        function(crate::todo::TODO_WRITE, crate::todo::DESCRIPTION, input_schema::<crate::todo::TodoWriteInput>()),
         function(crate::evidence::PUBLISH, crate::evidence::DESCRIPTION, input_schema::<crate::evidence::PublishInput>()),
+        function(crate::subagent::SUBAGENT, crate::subagent::DESCRIPTION, input_schema::<crate::subagent::SubagentInput>()),
     ]
 }
 
 /// The schema of a tool's input, as the Anthropic API wants it: an object
-/// schema, without the `$schema` and `title` noise schemars adds.
+/// schema, without the `$schema` and `title` noise schemars adds, and
+/// tidied, since every byte of it rides on every model call: a nested type
+/// is written in place rather than referenced, and an optional field is its
+/// type alone — `required` already says it may be left out, so `null` and
+/// `default: null` beside it tell the model nothing.
 pub(crate) fn input_schema<T: JsonSchema>() -> Value {
     let mut v = schemars::schema_for!(T).to_value();
-    if let Value::Object(m) = &mut v {
-        m.remove("$schema");
-        m.remove("title");
-        m.remove("description");
-    }
+    let defs = match &mut v {
+        Value::Object(m) => {
+            m.remove("$schema");
+            m.remove("title");
+            m.remove("description");
+            m.remove("$defs")
+        }
+        _ => None,
+    };
+    tidy(&mut v, defs.as_ref());
     v
+}
+
+fn tidy(v: &mut Value, defs: Option<&Value>) {
+    match v {
+        Value::Object(m) => {
+            if let Some(Value::String(r)) = m.get("$ref")
+                && let Some(def) = r.strip_prefix("#/$defs/").and_then(|name| defs?.get(name))
+            {
+                let mut def = def.clone();
+                if let Value::Object(d) = &mut def {
+                    // The field's own description says what it is for.
+                    d.remove("description");
+                }
+                m.remove("$ref");
+                if let Value::Object(d) = def {
+                    for (k, x) in d {
+                        m.entry(k).or_insert(x);
+                    }
+                }
+            }
+            if let Some(Value::Array(types)) = m.get("type")
+                && types.len() == 2
+                && types.iter().any(|t| t == "null")
+            {
+                let t = types.iter().find(|t| *t != "null").cloned().unwrap_or(Value::Null);
+                m.insert("type".into(), t);
+                if m.get("default") == Some(&Value::Null) {
+                    m.remove("default");
+                }
+            }
+            for x in m.values_mut() {
+                tidy(x, defs);
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| tidy(x, defs)),
+        _ => {}
+    }
 }
 
 /// Everything a tool call is run with.
@@ -207,7 +258,7 @@ pub fn describe(name: &str, input: &Value, env: &ToolEnv<'_>) -> Result<Call, (S
         GLOB => call(Access::Read(vec![parse_input::<GlobInput>(name, input)?.path.as_deref().map_or_else(|| env.cwd.to_path_buf(), at)])),
         BASH => call(Access::Bash(parse_input::<BashInput>(name, input)?.command)),
         crate::evidence::PUBLISH => crate::evidence::call(env.cwd, input)?,
-        other => return Err((format!("there is no tool named {other:?} — the tools are read, write, {}, bash, grep, glob and publish", env.edit.name()), true)),
+        other => return Err((format!("there is no tool named {other:?} — the tools are read, write, {}, bash, grep, glob, todo_write, publish and subagent", env.edit.name()), true)),
     })
 }
 
@@ -287,7 +338,9 @@ pub async fn execute(name: &str, input: &Value, env: &ToolEnv<'_>, scope: Scope)
             Some((ev, events)) => ev.publish(env.cwd, input, events).await,
             None => (crate::evidence::UNAVAILABLE.into(), true),
         },
-        other => (format!("there is no tool named {other:?} — the tools are read, write, {}, bash, grep, glob and publish", env.edit.name()), true),
+        // The loop's own: they act on the session, not the file system.
+        crate::todo::TODO_WRITE | crate::subagent::SUBAGENT => (format!("{name} is not available in this session"), true),
+        other => (format!("there is no tool named {other:?} — the tools are read, write, {}, bash, grep, glob, todo_write, publish and subagent", env.edit.name()), true),
     }
 }
 
@@ -860,7 +913,7 @@ mod tests {
     fn r_tool_1_the_core_tools_are_derived_object_schemas_in_a_fixed_order() {
         for (preset, edit) in [("claude", STR_REPLACE), ("gpt", APPLY_PATCH), ("grok", SEARCH_REPLACE)] {
             let defs = definitions(&toolset(preset, false));
-            assert_eq!(defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), [READ, WRITE, edit, BASH, GREP, GLOB, crate::evidence::PUBLISH], "{preset}");
+            assert_eq!(defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), [READ, WRITE, edit, BASH, GREP, GLOB, crate::todo::TODO_WRITE, crate::evidence::PUBLISH, crate::subagent::SUBAGENT], "{preset}");
             assert!(defs.iter().all(|d| d.input_schema["type"] == "object" && d.grammar.is_none()), "function tools everywhere without custom tools");
             assert_eq!(definitions(&toolset(preset, false)), defs, "deterministic: the definitions are part of the cached prefix");
         }
@@ -870,7 +923,9 @@ mod tests {
         assert!(defs[3].input_schema["properties"]["timeout_ms"].is_object());
         assert_eq!(definitions(&toolset("grok", false))[2].input_schema["required"], json!(["file_path", "old_string", "new_string"]));
         assert_eq!(definitions(&toolset("gpt", false))[2].input_schema["required"], json!(["input"]));
-        assert_eq!(defs[6].input_schema["required"], json!(["files"]), "publish takes the files krowk_push takes");
+        assert_eq!(defs[6].input_schema["required"], json!(["todos"]), "todo_write takes the whole list");
+        assert_eq!(defs[7].input_schema["required"], json!(["files"]), "publish takes the files krowk_push takes");
+        assert_eq!(defs[8].input_schema["required"], json!(["description", "prompt"]));
     }
 
     #[test]
@@ -1053,6 +1108,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
+    /// Ticket 10: a repository's agent definitions pick a subagent's model,
+    /// prompt and tools, so the model cannot write one below bypass.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r_sub_5_krowk_agent_definitions_are_kept_like_git() {
+        let d = dir("krowk-guard");
+        let env = ToolEnv { cwd: &d, permission_mode: PermissionMode::AcceptEdits, edit: EditTool::StrReplace, evidence: None };
+        for path in [".krowk/agents/evil.md", ".KROWK/agents/evil.md", "sub/.krowk./agents/x.md", ".claude/agents/evil.md"] {
+            let (out, refused) = run(WRITE, &json!({"path": path, "content": "---\nname: evil\n---\n"}), &env).await;
+            assert!(refused && out.contains("inside a ."), "{path}: {out}");
+        }
+        assert!(!d.join(".krowk").exists() && !d.join(".KROWK").exists());
+        let bypass = ToolEnv { permission_mode: PermissionMode::BypassPermissions, ..env };
+        assert!(!run(WRITE, &json!({"path": ".krowk/agents/ok.md", "content": "x"}), &bypass).await.1);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn a_read_only_file_is_not_replaced() {
@@ -1088,7 +1159,7 @@ mod tests {
         let (out, err) = run(STR_REPLACE, &json!({"path": "a.txt", "old_str": "x", "new_str": "y"}), &env).await;
         assert!(err && out.contains("edit files with apply_patch"), "{out}");
         assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "x\n");
-        assert!(run("frobnicate", &json!({}), &env).await.0.contains("read, write, apply_patch, bash, grep, glob and publish"));
+        assert!(run("frobnicate", &json!({}), &env).await.0.contains("read, write, apply_patch, bash, grep, glob, todo_write, publish and subagent"));
         let (out, err) = run(crate::evidence::PUBLISH, &json!({"files": ["a.txt"]}), &env).await;
         assert!(err && out.contains("publish is not available"), "a host with no publisher says so: {out}");
         for mode in [PermissionMode::Default, PermissionMode::Plan] {

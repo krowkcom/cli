@@ -13,7 +13,9 @@ use crate::anthropic::AnthropicClient;
 use crate::catalog::ModelInfo;
 use crate::chat::{ChatClient, Credential};
 use crate::budget::Budget;
-use crate::engine::{Engine, EngineError, EngineEvent, HistoryItem, Steers, TurnContext, TurnEnd};
+use crate::agents;
+use crate::engine::{BoxFuture, Engine, EngineError, EngineEvent, Events, HistoryItem, Steers, TurnContext, TurnEnd};
+use crate::subagent::{AgentRun, AgentsConfig, ParentTurn, Spawn, Subagents};
 use crate::evidence::{Evidence, Publisher};
 use crate::instances::{Auth, Registry, Resolved};
 use crate::oauth;
@@ -32,7 +34,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 
 /// Prices a model call: (provider, model, usage) to USD, or none when the
 /// model has no price. Supplied by the caller, which owns the price cache.
@@ -66,21 +68,32 @@ pub struct HostConfig {
     /// permission rules, instructions, skills and hooks are read from, and
     /// whether a client answers approval requests (R-PERM-1, R-PERM-2).
     pub permissions: permissions::Config,
+    /// The person's agent definitions and the model listing a subagent's
+    /// model is chosen from (R-SUB-1, R-SUB-5).
+    pub agents: AgentsConfig,
 }
 
+/// What executes commands. Cheap to share: its state is behind one `Arc`,
+/// which a turn's subagents hold too, since each is a turn of this host.
 pub struct Host {
-    cfg: HostConfig,
-    /// Each session with a turn running: its cancel switch and the queue
-    /// its steering waits in.
+    shared: Arc<Shared>,
+}
+
+pub(crate) struct Shared {
+    pub(crate) cfg: HostConfig,
+    /// Each session with a turn running — a subagent's too: its cancel
+    /// switch and the queue its steering waits in.
     running: Mutex<HashMap<String, Running>>,
     /// Each session's backend engine, with the instance it runs on: its
     /// process outlives a turn and serves the session's next one.
     backends: Mutex<HashMap<String, Backend>>,
     /// How long a session's backend process is kept without a turn.
     backend_idle: std::time::Duration,
-    /// Approval requests waiting for a client's answer, every session's.
+    /// Approval requests waiting for a client's answer, every session's —
+    /// a subagent's included.
     approvals: permissions::Approvals,
-    /// What a person allowed for the rest of each session.
+    /// What a person allowed for the rest of each session. A subagent
+    /// shares its parent's: a grant for the session holds in its subagents.
     grants: Mutex<HashMap<String, permissions::SessionGrants>>,
     /// The sessions this host has run a turn of: a session's first turn
     /// here is its SessionStart.
@@ -121,22 +134,144 @@ fn log_failure(e: LogError) -> EngineError {
 impl Host {
     pub fn new(cfg: HostConfig) -> Host {
         Host {
-            cfg,
-            running: Mutex::new(HashMap::new()),
-            backends: Mutex::new(HashMap::new()),
-            backend_idle: BACKEND_IDLE,
-            approvals: permissions::Approvals::default(),
-            grants: Mutex::new(HashMap::new()),
-            started: Mutex::new(std::collections::HashSet::new()),
+            shared: Arc::new(Shared {
+                cfg,
+                running: Mutex::new(HashMap::new()),
+                backends: Mutex::new(HashMap::new()),
+                backend_idle: BACKEND_IDLE,
+                approvals: permissions::Approvals::default(),
+                grants: Mutex::new(HashMap::new()),
+                started: Mutex::new(std::collections::HashSet::new()),
+            }),
         }
     }
 
     /// Keeps an idle session's backend process this long instead of
     /// `BACKEND_IDLE`.
-    pub fn with_backend_idle(self, idle: std::time::Duration) -> Host {
-        Host { backend_idle: idle, ..self }
+    pub fn with_backend_idle(mut self, idle: std::time::Duration) -> Host {
+        Arc::get_mut(&mut self.shared).expect("a new host is not shared yet").backend_idle = idle;
+        self
     }
 
+    /// Lets every backend process go cleanly. A host dropped without this
+    /// still stops them (they are killed with their handles), just less
+    /// politely.
+    ///
+    /// Bounded: an engine that cannot be let go of in `SHUTDOWN_GRACE` — its
+    /// lock held by a turn nobody polls any more — has its process group
+    /// killed instead, so a host going away never waits on one.
+    pub async fn shutdown(&self) {
+        let engines: Vec<Arc<dyn Engine>> = self.shared.backends.lock().unwrap_or_else(|e| e.into_inner()).drain().map(|(_, b)| b.engine).collect();
+        let mut stuck = false;
+        for e in engines {
+            stuck |= tokio::time::timeout(SHUTDOWN_GRACE, e.shutdown()).await.is_err();
+        }
+        if stuck {
+            crate::group::kill_all();
+        }
+    }
+
+    pub fn registry(&self) -> &Registry {
+        &self.shared.cfg.registry
+    }
+
+    /// Executes one command. A `prompt` streams its events to `out` and
+    /// answers with its result — a turn that failed is still a result, with
+    /// `isError`. An error here means no turn ran.
+    pub async fn execute(&self, cmd: Command, out: mpsc::Sender<StreamLine>) -> Result<Option<RunResult>, EngineError> {
+        let shared = &self.shared;
+        match cmd {
+            Command::Prompt { session_id, text, model, permission_mode, toolset, effort, budget } => {
+                shared.prompt(session_id.as_deref(), text, model, permission_mode, toolset.as_deref(), effort, budget.unwrap_or_default(), out).await.map(Some)
+            }
+            // A subagent's session is a running turn like any other, so it
+            // is interrupted alone, by its own id (R-SUB-2).
+            Command::Interrupt { session_id } => {
+                let running = shared.running.lock().unwrap_or_else(|e| e.into_inner());
+                match running.get(&session_id) {
+                    Some(r) => {
+                        let _ = r.cancel.send(true);
+                        Ok(None)
+                    }
+                    None => Err(EngineError::new("no_running_turn", format!("session {session_id} has no turn running, so there is nothing to interrupt"))),
+                }
+            }
+            // Queued for the engine's next step; it comes back in the log as
+            // a `userText` item where the turn took it.
+            Command::Steer { session_id, text } => {
+                if text.trim().is_empty() {
+                    return Err(EngineError::new("empty_prompt", "the steering text is empty"));
+                }
+                let running = shared.running.lock().unwrap_or_else(|e| e.into_inner());
+                match running.get(&session_id) {
+                    Some(r) if r.steers.push(text).is_ok() => Ok(None),
+                    // The turn has taken its last input and is ending.
+                    Some(_) => Err(EngineError::new("turn_ending", format!("the turn in session {session_id} is finishing and reads no more input — send it as the next prompt"))),
+                    None => Err(EngineError::new("no_running_turn", format!("session {session_id} has no turn running to steer — send it as a prompt instead"))),
+                }
+            }
+            // Whichever client answers first decides; the turn that asked
+            // tells every client it was answered (`approval.resolved`). A
+            // subagent's request is answered under the subagent's session.
+            Command::Approve { session_id, request_id, decision } => {
+                shared.approvals.answer(&session_id, &request_id, decision).map_err(|e| EngineError::new("no_approval_request", e))?;
+                Ok(None)
+            }
+            Command::SwitchModel { .. } | Command::Fork { .. } => {
+                Err(EngineError::new("not_implemented", "this command is part of the protocol but not served by this build yet"))
+            }
+        }
+    }
+}
+
+/// One turn, settled: the log it appends to, what the branch so far says,
+/// and everything it runs with.
+struct TurnPlan {
+    log: SessionLog,
+    past: Past,
+    text: String,
+    model: ModelRef,
+    /// The instance's provider: what the turn's calls are priced under.
+    provider: String,
+    engine: Arc<dyn Engine>,
+    preset: &'static toolset::Preset,
+    wire: WireApi,
+    info: Option<ModelInfo>,
+    permission_mode: PermissionMode,
+    effort: Option<Effort>,
+    cwd: PathBuf,
+    backend_session: Option<String>,
+    budget: Budget,
+    evidence: Option<Evidence>,
+    /// The rules the turn is judged by, its instructions, skills and hooks,
+    /// and the session's grants: a subagent's are its parent's.
+    policy: permissions::Policy,
+    compat: compat::Compat,
+    grants: permissions::SessionGrants,
+    /// A subagent's definition.
+    agent: Option<AgentRun>,
+    /// Whether the turn may start subagents: a session's own native turn,
+    /// never a subagent's.
+    spawns: bool,
+    /// A subagent's parent turn: where its spend is also reported.
+    parent: Option<ParentLink>,
+    /// Flips when the parent's turn is interrupted.
+    parent_cancel: Option<watch::Receiver<bool>>,
+    /// Whether the result goes to the client as a `result` frame: a
+    /// subagent's goes back to the tool call instead.
+    announce: bool,
+    started: Instant,
+}
+
+/// The parent turn a subagent's spend is reported to.
+#[derive(Clone)]
+struct ParentLink {
+    budget: Budget,
+    session_id: String,
+    turn_id: String,
+}
+
+impl Shared {
     /// Lets go of every backend process idle for longer than the host keeps
     /// one, except a session's with a turn running. Swept when a prompt
     /// arrives, so an idle host costs nothing to keep tidy.
@@ -149,24 +284,6 @@ impl Host {
         };
         for e in idle {
             e.shutdown().await;
-        }
-    }
-
-    /// Lets every backend process go cleanly. A host dropped without this
-    /// still stops them (they are killed with their handles), just less
-    /// politely.
-    ///
-    /// Bounded: an engine that cannot be let go of in `SHUTDOWN_GRACE` — its
-    /// lock held by a turn nobody polls any more — has its process group
-    /// killed instead, so a host going away never waits on one.
-    pub async fn shutdown(&self) {
-        let engines: Vec<Arc<dyn Engine>> = self.backends.lock().unwrap_or_else(|e| e.into_inner()).drain().map(|(_, b)| b.engine).collect();
-        let mut stuck = false;
-        for e in engines {
-            stuck |= tokio::time::timeout(SHUTDOWN_GRACE, e.shutdown()).await.is_err();
-        }
-        if stuck {
-            crate::group::kill_all();
         }
     }
 
@@ -189,57 +306,9 @@ impl Host {
         Ok(e)
     }
 
-    pub fn registry(&self) -> &Registry {
-        &self.cfg.registry
-    }
-
-    /// Executes one command. A `prompt` streams its events to `out` and
-    /// answers with its result — a turn that failed is still a result, with
-    /// `isError`. An error here means no turn ran.
-    pub async fn execute(&self, cmd: Command, out: mpsc::Sender<StreamLine>) -> Result<Option<RunResult>, EngineError> {
-        match cmd {
-            Command::Prompt { session_id, text, model, permission_mode, toolset, effort, budget } => {
-                self.prompt(session_id.as_deref(), text, model, permission_mode, toolset.as_deref(), effort, budget.unwrap_or_default(), out).await.map(Some)
-            }
-            Command::Interrupt { session_id } => {
-                let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
-                match running.get(&session_id) {
-                    Some(r) => {
-                        let _ = r.cancel.send(true);
-                        Ok(None)
-                    }
-                    None => Err(EngineError::new("no_running_turn", format!("session {session_id} has no turn running, so there is nothing to interrupt"))),
-                }
-            }
-            // Queued for the engine's next step; it comes back in the log as
-            // a `userText` item where the turn took it.
-            Command::Steer { session_id, text } => {
-                if text.trim().is_empty() {
-                    return Err(EngineError::new("empty_prompt", "the steering text is empty"));
-                }
-                let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
-                match running.get(&session_id) {
-                    Some(r) if r.steers.push(text).is_ok() => Ok(None),
-                    // The turn has taken its last input and is ending.
-                    Some(_) => Err(EngineError::new("turn_ending", format!("the turn in session {session_id} is finishing and reads no more input — send it as the next prompt"))),
-                    None => Err(EngineError::new("no_running_turn", format!("session {session_id} has no turn running to steer — send it as a prompt instead"))),
-                }
-            }
-            // Whichever client answers first decides; the turn that asked
-            // tells every client it was answered (`approval.resolved`).
-            Command::Approve { session_id, request_id, decision } => {
-                self.approvals.answer(&session_id, &request_id, decision).map_err(|e| EngineError::new("no_approval_request", e))?;
-                Ok(None)
-            }
-            Command::SwitchModel { .. } | Command::Fork { .. } => {
-                Err(EngineError::new("not_implemented", "this command is part of the protocol but not served by this build yet"))
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn prompt(
-        &self,
+        self: &Arc<Self>,
         session_id: Option<&str>,
         text: String,
         model: Option<ModelRef>,
@@ -273,7 +342,7 @@ impl Host {
         let family = info.as_ref().and_then(|i| i.family.clone());
         let (preset, _) = toolset::choose(toolset, self.cfg.registry.toolset.as_deref(), family.as_deref(), &model.model).map_err(|e| EngineError::new("bad_toolset", e))?;
         let wire = instance.wire_for(info.as_ref().and_then(|i| i.wire_api));
-        let cwd_before = past.cwd.clone().unwrap_or_else(|| self.cfg.cwd.clone());
+        let cwd = past.cwd.clone().unwrap_or_else(|| self.cfg.cwd.clone());
         let native = match &instance.backend {
             None => Some(engine_for(&instance, wire, &self.cfg.credentials, &self.cfg.krowk_version)?),
             // A backend runs the repository's own hooks and MCP servers, so
@@ -290,7 +359,7 @@ impl Host {
                 if let Some(fix) = instance.missing_key() {
                     return Err(EngineError::new("not_authenticated", fix));
                 }
-                (self.cfg.trust)(&trust::root(&cwd_before))?;
+                (self.cfg.trust)(&trust::root(&cwd))?;
                 None
             }
         };
@@ -298,10 +367,10 @@ impl Host {
         // The rules, instructions, skills and hooks for where the session
         // runs. A settings file that does not parse refuses the prompt: a
         // deny rule it held would otherwise silently stop holding.
-        let mut policy = permissions::Policy::load(&self.cfg.permissions, &cwd_before).map_err(|e| EngineError::new("bad_settings", format!("{e} — fix the file, then send the prompt again")))?;
-        let mut compat = compat::Compat::load(&self.cfg.permissions, &cwd_before, policy.loaded.hooks.clone());
+        let mut policy = permissions::Policy::load(&self.cfg.permissions, &cwd).map_err(|e| EngineError::new("bad_settings", format!("{e} — fix the file, then send the prompt again")))?;
+        let mut compat = compat::Compat::load(&self.cfg.permissions, &cwd, policy.loaded.hooks.clone());
         policy.read_dirs = compat.skills.iter().map(|k| k.dir.clone()).collect();
-        let (mut log, events) = match opened {
+        let (log, events) = match opened {
             Some(opened) => opened,
             None => {
                 let (log, root) = SessionLog::create(&self.cfg.sessions_dir, &self.cfg.cwd, &self.cfg.krowk_version).map_err(log_failure)?;
@@ -310,7 +379,7 @@ impl Host {
             }
         };
         let session_id = log.session_id.clone();
-        let cwd = cwd_before;
+        let spawns = native.is_some();
         let engine: Arc<dyn Engine> = match native {
             Some(e) => Arc::from(e),
             None => self.backend_for(&session_id, &instance)?,
@@ -319,54 +388,198 @@ impl Host {
         // thread): the branch's last, if it ran on this instance — another
         // account's config directory does not have it.
         let backend_session = past.backend.as_ref().filter(|b| b.instance == model.instance).map(|b| b.session_id.clone());
-
-        let turn_id = krowk_store::new_id();
-        let first_here = self.started.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone());
-        compat.session_start = first_here.then_some(if past.items.is_empty() { "startup" } else { "resume" });
-        compat.transcript = self.cfg.sessions_dir.join(&session_id).join(log::EVENTS_FILE).display().to_string();
-        let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner()).entry(session_id.clone()).or_default().clone();
-        let gate = permissions::Gate::new(
-            policy,
-            permission_mode,
-            grants,
-            self.cfg.permissions.approvals.then(|| self.approvals.clone()),
-            self.cfg.permissions.grants_file(),
-            &session_id,
-            &turn_id,
-        );
-        let mut w = Writer { log: &mut log, out: &out, turn_id: turn_id.clone(), preset, wire, provider: instance.provider.clone(), backend: past.backend.clone() };
-        w.log(LogBody::TurnStarted { turn_id: turn_id.clone(), model: model.clone(), provider: engine.provider().into(), wire_api: engine.wire_api(), permission_mode, effort }).await?;
-        let prompt_item = Item::UserText { text };
-        w.log(LogBody::ItemCompleted { turn_id: turn_id.clone(), item_id: krowk_store::new_id(), item: prompt_item.clone() }).await?;
-        let mut history = past.items;
-        history.push(HistoryItem { item: prompt_item, response: None });
-
-        let (cancel_tx, cancel) = watch::channel(false);
-        let cancel_tx = Arc::new(cancel_tx);
-        let steers = Steers::default();
-        self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), Running { cancel: cancel_tx.clone(), steers: steers.clone() });
         // Everything the session and its subagents have spent, from their
         // logs; this turn's calls are added as they are metered.
         let budget = Budget::new(limits, &session_id, &self.cfg.sessions_dir, self.cfg.pricer.clone(), &instance.provider, &model.model, &events);
         drop(events);
         let evidence = self.cfg.publisher.clone().map(|p| Evidence::new(p, &session_id, past.run.clone()));
+        let first_here = self.started.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone());
+        compat.session_start = first_here.then_some(if past.items.is_empty() { "startup" } else { "resume" });
+        compat.transcript = self.cfg.sessions_dir.join(&session_id).join(log::EVENTS_FILE).display().to_string();
+        let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner()).entry(session_id.clone()).or_default().clone();
+        let plan = TurnPlan {
+            log,
+            past,
+            text,
+            model,
+            provider: instance.provider.clone(),
+            engine,
+            preset,
+            wire,
+            info,
+            permission_mode,
+            effort,
+            cwd,
+            backend_session,
+            budget,
+            evidence,
+            policy,
+            compat,
+            grants,
+            agent: None,
+            spawns,
+            parent: None,
+            parent_cancel: None,
+            announce: true,
+            started,
+        };
+        self.turn(plan, out).await
+    }
+
+    /// A subagent (R-SUB-1): a child session of the parent turn `spawn`
+    /// describes, answering its tool call `call_id` with one turn on
+    /// `model`. Its lines go to the parent's client; its result comes back
+    /// here, for the tool call.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn subagent(self: &Arc<Self>, spawn: &Spawn, call_id: &str, description: &str, prompt: &str, model: ModelRef, run: AgentRun, events: &Events) -> Result<RunResult, EngineError> {
+        let instance = self.cfg.registry.get(&model.instance).map_err(|e| EngineError::new("no_instance", e))?.clone();
+        // A vendor runs its own agents, with its own tools: it could not be
+        // held to the allowlist, so a subagent is always krowk's own loop.
+        if instance.backend.is_some() {
+            return Err(EngineError::new(
+                "bad_subagent_model",
+                format!("{model} runs on a vendor's own agent, and subagents run on krowk's own loop — name an API model in the agent definition or in `subagents.model`"),
+            ));
+        }
+        let info = (self.cfg.catalog)(&instance.provider, &model.model);
+        let family = info.as_ref().and_then(|i| i.family.clone());
+        let (preset, _) = toolset::choose(None, self.cfg.registry.toolset.as_deref(), family.as_deref(), &model.model).map_err(|e| EngineError::new("bad_toolset", e))?;
+        let wire = instance.wire_for(info.as_ref().and_then(|i| i.wire_api));
+        let engine = engine_for(&instance, wire, &self.cfg.credentials, &self.cfg.krowk_version)?;
+        let p = &spawn.parent;
+        let (log, root) = SessionLog::create_child(&self.cfg.sessions_dir, &p.cwd, &self.cfg.krowk_version, Some(&p.session_id), run.name.as_deref()).map_err(log_failure)?;
+        let _ = spawn.out.send(StreamLine::Log(root.clone())).await;
+        let child = log.session_id.clone();
+        let _ = events.send(EngineEvent::SubagentStarted { call_id: call_id.into(), session_id: child.clone(), description: description.into(), agent: run.name.clone(), model: model.clone() }).await;
+        let budget = Budget::for_subagent(&p.budget, &child, &instance.provider, &model.model, std::slice::from_ref(&root));
+        let plan = TurnPlan {
+            log,
+            past: Past { cwd: Some(p.cwd.clone()), ..Past::default() },
+            text: prompt.into(),
+            model,
+            provider: instance.provider.clone(),
+            engine: Arc::from(engine),
+            preset,
+            wire,
+            info,
+            permission_mode: p.permission_mode,
+            effort: instance.effort,
+            cwd: p.cwd.clone(),
+            backend_session: None,
+            budget,
+            evidence: p.evidence.as_ref().map(|e| e.for_subagent(events.clone())),
+            // The parent's rules, instructions, skills and hooks, and its
+            // session's grants: a subagent is judged as its parent would be,
+            // in its parent's mode, and asks under its own session id.
+            policy: p.gate.policy().clone(),
+            compat: compat::Compat { session_start: None, transcript: self.cfg.sessions_dir.join(&child).join(log::EVENTS_FILE).display().to_string(), ..(*p.compat).clone() },
+            grants: p.grants.clone(),
+            agent: Some(run),
+            spawns: false,
+            parent: Some(ParentLink { budget: p.budget.clone(), session_id: p.session_id.clone(), turn_id: p.turn_id.clone() }),
+            parent_cancel: Some(p.cancel.clone()),
+            announce: false,
+            started: Instant::now(),
+        };
+        // Boxed: a subagent's turn is a turn of this host, inside the
+        // parent's.
+        let turn: BoxFuture<'_, Result<RunResult, EngineError>> = Box::pin(self.turn(plan, spawn.out.clone()));
+        turn.await
+    }
+
+    /// Runs one settled turn to its end and logs it whole.
+    async fn turn(self: &Arc<Self>, mut plan: TurnPlan, out: mpsc::Sender<StreamLine>) -> Result<RunResult, EngineError> {
+        let session_id = plan.log.session_id.clone();
+        let turn_id = krowk_store::new_id();
+        let engine = plan.engine.clone();
+        let model = plan.model.clone();
+        let mut w = Writer {
+            log: &mut plan.log,
+            out: &out,
+            turn_id: turn_id.clone(),
+            preset: plan.preset,
+            wire: plan.wire,
+            provider: plan.provider.clone(),
+            backend: plan.past.backend.clone(),
+            parent: plan.parent.clone(),
+        };
+        w.log(LogBody::TurnStarted { turn_id: turn_id.clone(), model: model.clone(), provider: engine.provider().into(), wire_api: engine.wire_api(), permission_mode: plan.permission_mode, effort: plan.effort }).await?;
+        let prompt_item = Item::UserText { text: std::mem::take(&mut plan.text) };
+        w.log(LogBody::ItemCompleted { turn_id: turn_id.clone(), item_id: krowk_store::new_id(), item: prompt_item.clone() }).await?;
+        let mut history = std::mem::take(&mut plan.past.items);
+        history.push(HistoryItem { item: prompt_item, response: None });
+
+        let gate = permissions::Gate::new(
+            plan.policy.clone(),
+            plan.permission_mode,
+            plan.grants.clone(),
+            self.cfg.permissions.approvals.then(|| self.approvals.clone()),
+            self.cfg.permissions.grants_file(),
+            &session_id,
+            &turn_id,
+        );
+        let compat = Arc::new(std::mem::take(&mut plan.compat));
+        let (cancel_tx, cancel) = watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
+        let steers = Steers::default();
+        self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), Running { cancel: cancel_tx.clone(), steers: steers.clone() });
+        // The agent definitions a subagent can be started from, read afresh
+        // each turn from the repository and the person's own.
+        let subagents = plan.spawns.then(|| {
+            let (defs, problems) = agents::discover(&trust::root(&plan.cwd), &self.cfg.agents.user_dirs);
+            let spawn = Spawn {
+                host: self.clone(),
+                parent: ParentTurn {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    model: model.clone(),
+                    provider: plan.provider.clone(),
+                    cwd: plan.cwd.clone(),
+                    permission_mode: plan.permission_mode,
+                    budget: plan.budget.clone(),
+                    evidence: plan.evidence.clone(),
+                    gate: gate.clone(),
+                    compat: compat.clone(),
+                    grants: plan.grants.clone(),
+                    cancel: cancel.clone(),
+                },
+                out: out.clone(),
+                gate: Arc::new(Semaphore::new(self.cfg.registry.subagents.max_parallel())),
+                defs,
+                spent: std::sync::Mutex::new((0.0, false)),
+            };
+            (Subagents(Arc::new(spawn)), problems)
+        });
+        let subagents = match subagents {
+            Some((s, problems)) => {
+                for why in problems {
+                    w.live(LiveEvent::Notice { session_id: session_id.clone(), turn_id: turn_id.clone(), text: format!("an agent definition was skipped — {why}") }).await;
+                }
+                Some(s)
+            }
+            None => None,
+        };
+        let budget = plan.budget.clone();
+        let spawned = subagents.clone();
         let ctx = TurnContext {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             model: model.clone(),
             history,
-            cwd,
-            permission_mode,
-            preset,
-            effort,
-            model_info: info,
+            cwd: plan.cwd.clone(),
+            permission_mode: plan.permission_mode,
+            preset: plan.preset,
+            effort: plan.effort,
+            model_info: plan.info.clone(),
             cancel,
             steers: steers.clone(),
-            backend_session,
+            backend_session: plan.backend_session.clone(),
             budget: budget.clone(),
-            evidence,
+            evidence: plan.evidence.clone(),
             gate,
-            compat: Arc::new(compat),
+            compat,
+            subagents,
+            agent: plan.agent.clone(),
         };
         let mut tally = Tally::default();
         // A backend's calls are the vendor's to make: its turn is not begun
@@ -378,8 +591,22 @@ impl Host {
             Some((b, _)) => b.admit_turn().await,
             None => Ok(()),
         };
+        // A subagent stops when its parent's turn is interrupted, the way
+        // it stops for its own interrupt: keeping what it made.
+        let parent_cancel = plan.parent_cancel.as_mut();
+        let follow = async {
+            if let Some(pc) = parent_cancel {
+                crate::engine::cancelled(pc).await;
+                let _ = cancel_tx.send(true);
+            }
+            std::future::pending::<()>().await
+        };
         let outcome = match before {
-            Ok(()) => w.drive(engine.as_ref(), ctx, &mut tally, &model, &budget, watch.as_ref()).await,
+            Ok(()) => tokio::select! {
+                biased;
+                o = w.drive(engine.as_ref(), ctx, &mut tally, &model, &budget, watch.as_ref()) => o,
+                _ = follow => unreachable!("following the parent never ends"),
+            },
             Err(e) => Err(e),
         };
         // A backend turn the budget interrupted failed on it, whatever the
@@ -391,8 +618,8 @@ impl Host {
         // Refused from here on, not queued for a turn that is over; what an
         // interrupted or failed turn never took goes back on its result.
         let unread_steers = steers.close();
-        self.approvals.forget_session(&session_id);
         self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&session_id);
+        self.approvals.forget_session(&session_id);
         if let Some(b) = self.backends.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&session_id) {
             b.used = Instant::now();
         }
@@ -402,9 +629,12 @@ impl Host {
             Ok(TurnEnd::Interrupted) => (TurnStatus::Interrupted, None),
             Err(e) => (TurnStatus::Failed, Some(e.info())),
         };
-        let duration_ms = started.elapsed().as_millis() as u64;
+        let duration_ms = plan.started.elapsed().as_millis() as u64;
+        // The turn's cost is its subagents' too, as a backend's own
+        // subagents' are part of its turn (R-SUB-4).
+        let (children_usd, children_unpriced) = spawned.as_ref().map_or((0.0, false), Subagents::spent);
         w.log(LogBody::TurnCompleted { turn_id: turn_id.clone(), status, usage: tally.usage, duration_ms, error: error.clone(), reported_cost_usd: tally.reported }).await?;
-        log.sync().map_err(log_failure)?;
+        plan.log.sync().map_err(log_failure)?;
         let result = RunResult {
             session_id,
             turn_id,
@@ -413,13 +643,15 @@ impl Host {
             result: tally.last_text,
             model,
             usage: tally.usage,
-            cost_usd: if tally.unpriced { None } else { Some(tally.cost) },
+            cost_usd: if tally.unpriced || children_unpriced { None } else { Some(tally.cost + children_usd) },
             duration_ms,
             num_model_calls: tally.calls,
             error,
             unread_steers,
         };
-        let _ = out.send(StreamLine::Live(LiveEvent::Result(result.clone()))).await;
+        if plan.announce {
+            let _ = out.send(StreamLine::Live(LiveEvent::Result(result.clone()))).await;
+        }
         Ok(result)
     }
 }
@@ -496,7 +728,9 @@ fn replay(branch: &[&LogEvent]) -> Past {
                 responses += 1;
             }
             LogBody::RunOpened { run, .. } => past.run = Some(run.clone()),
-            LogBody::TurnCompleted { .. } | LogBody::SubagentResponse { .. } => {}
+            // The subagents' own logs hold their conversations; the todo
+            // list is read back from the calls that set it.
+            LogBody::TurnCompleted { .. } | LogBody::SubagentResponse { .. } | LogBody::SubagentStarted { .. } | LogBody::TodosUpdated { .. } => {}
         }
     }
     past
@@ -528,6 +762,8 @@ struct Writer<'a> {
     /// The backend session last logged: one that did not change is not
     /// logged again.
     backend: Option<BackendRecord>,
+    /// A subagent's parent turn, whose spend the subagent's calls add to.
+    parent: Option<ParentLink>,
 }
 
 impl Writer<'_> {
@@ -554,6 +790,19 @@ impl Writer<'_> {
             generated_tokens: spent.total.generated(),
         })
         .await;
+        // A subagent spends during its parent's turn: the parent's figure,
+        // its whole tree counted again, moves with it (R-SUB-4).
+        if let Some(p) = &self.parent {
+            let tree = p.budget.refreshed().await;
+            self.live(LiveEvent::Cost {
+                session_id: p.session_id.clone(),
+                turn_id: p.turn_id.clone(),
+                cost_usd: tree.total.cost(),
+                turn_cost_usd: tree.turn.cost(),
+                generated_tokens: tree.total.generated(),
+            })
+            .await;
+        }
     }
 
     /// Runs the engine and handles its events as they come. A log that
@@ -635,10 +884,6 @@ impl Writer<'_> {
                 self.log(LogBody::ResponseCompleted { turn_id: turn_id.clone(), response_id, model: answered, usage, stop_reason, item_ids }).await?;
                 self.spent(session_id, turn_id, tally, &spent).await;
             }
-            EngineEvent::Approval(req) => self.live(LiveEvent::ApprovalRequested(req)).await,
-            EngineEvent::ApprovalResolved { request_id, decision } => {
-                self.live(LiveEvent::ApprovalResolved { session_id: session_id.into(), turn_id, request_id, decision }).await;
-            }
             EngineEvent::BackendSession { backend, session_id: vendor, transcript, billing } => {
                 let rec = BackendRecord { instance: model.instance.clone(), session_id: vendor.clone(), transcript: transcript.clone(), billing };
                 if self.backend.as_ref() != Some(&rec) {
@@ -663,6 +908,16 @@ impl Writer<'_> {
             }
             EngineEvent::Notice { text } => {
                 self.live(LiveEvent::Notice { session_id: session_id.into(), turn_id, text }).await;
+            }
+            EngineEvent::Approval(req) => self.live(LiveEvent::ApprovalRequested(req)).await,
+            EngineEvent::ApprovalResolved { request_id, decision } => {
+                self.live(LiveEvent::ApprovalResolved { session_id: session_id.into(), turn_id, request_id, decision }).await;
+            }
+            EngineEvent::Todos { todos } => {
+                self.log(LogBody::TodosUpdated { turn_id, todos }).await?;
+            }
+            EngineEvent::SubagentStarted { call_id, session_id: child, description, agent, model } => {
+                self.log(LogBody::SubagentStarted { turn_id, call_id, subagent_session_id: child, description, agent, model }).await?;
             }
         }
         Ok(())

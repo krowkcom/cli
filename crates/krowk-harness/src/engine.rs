@@ -43,7 +43,8 @@ use crate::budget::Budget;
 use crate::evidence::Evidence;
 use crate::toolset::Preset;
 use crate::catalog::ModelInfo;
-use crate::protocol::{ApprovalDecision, ApprovalRequest, Billing, Delta, Effort, ErrorInfo, Item, ItemKind, ModelRef, PermissionMode, ToolDefinition, Usage, WireApi};
+use crate::protocol::{ApprovalDecision, ApprovalRequest, Billing, Delta, Effort, ErrorInfo, Item, ItemKind, ModelRef, PermissionMode, Todo, ToolDefinition, Usage, WireApi};
+use crate::subagent::{AgentRun, Subagents};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -84,6 +85,11 @@ pub enum EngineEvent {
     Approval(ApprovalRequest),
     /// It was answered.
     ApprovalResolved { request_id: String, decision: ApprovalDecision },
+    /// `todo_write` replaced the session's todo list: the host logs it.
+    Todos { todos: Vec<Todo> },
+    /// A subagent started, as the child session `session_id`, answering
+    /// the tool call `call_id`: the host logs the link.
+    SubagentStarted { call_id: String, session_id: String, description: String, agent: Option<String>, model: ModelRef },
 }
 
 /// Where an engine sends its events. Bounded, so a slow client slows the
@@ -127,6 +133,12 @@ pub struct TurnContext {
     /// What the repository and the person's settings bring to a native
     /// turn: instructions, skills, hooks.
     pub compat: std::sync::Arc<crate::compat::Compat>,
+    /// What this turn may start subagents with; none in a subagent, which
+    /// starts none of its own, and for an engine that does not offer them.
+    pub subagents: Option<Subagents>,
+    /// For a subagent: the definition it runs — its instructions and its
+    /// tool allowlist.
+    pub agent: Option<AgentRun>,
 }
 
 /// The steering a running turn has been sent and not yet taken: a queue

@@ -65,6 +65,13 @@
               ],
               "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
             },
+            "agent": {
+              "description": "The agent definition a subagent runs, by name, when it runs one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "type": "string",
               "const": "session.started"
@@ -267,6 +274,73 @@
             "turnId",
             "model",
             "usage"
+          ]
+        },
+        {
+          "description": "A subagent this session started (R-SUB-1): the child session, which\nis its own log whose root names this session as its parent, and the\ntool call it answers — its final summary is that call's result. The\nlink both ways is what moves, syncs and rebuilds a session tree.",
+          "type": "object",
+          "properties": {
+            "turnId": {
+              "type": "string"
+            },
+            "callId": {
+              "description": "The `subagent` tool call the child answers.",
+              "type": "string"
+            },
+            "subagentSessionId": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            },
+            "description": {
+              "description": "The few words the model gave it, which the TUI shows.",
+              "type": "string"
+            },
+            "agent": {
+              "description": "The agent definition it runs, when any.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "$ref": "#/$defs/ModelRef"
+            },
+            "type": {
+              "type": "string",
+              "const": "subagent.started"
+            }
+          },
+          "required": [
+            "type",
+            "turnId",
+            "callId",
+            "subagentSessionId",
+            "description",
+            "model"
+          ]
+        },
+        {
+          "description": "The session's todo list, whole, as `todo_write` last set it\n(R-TODO-2): each write replaces the list before it.",
+          "type": "object",
+          "properties": {
+            "turnId": {
+              "type": "string"
+            },
+            "todos": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Todo"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "todos.updated"
+            }
+          },
+          "required": [
+            "type",
+            "turnId",
+            "todos"
           ]
         },
         {
@@ -590,6 +664,31 @@
       "enum": [
         "subscription",
         "apiKey"
+      ]
+    },
+    "Todo": {
+      "description": "One item of a todo list. Fields other harnesses' todo tools add —\nClaude Code's `activeForm`, an `id`, a `priority` — are taken and\ndropped, so a model trained on theirs is not refused for them.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/TodoStatus"
+        }
+      },
+      "required": [
+        "content",
+        "status"
+      ]
+    },
+    "TodoStatus": {
+      "description": "Where a todo stands. The names are the ones models are trained on.",
+      "type": "string",
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed"
       ]
     },
     "TurnStatus": {
@@ -1024,7 +1123,7 @@
           "$ref": "#/$defs/Usage"
         },
         "costUsd": {
-          "description": "USD at current models.dev prices; null when the model has no price.",
+          "description": "USD at current models.dev prices, the turn's subagents included;\nnull when any of it has no price.",
           "type": [
             "number",
             "null"

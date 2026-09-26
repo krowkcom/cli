@@ -247,3 +247,42 @@ fn ctrl_c_interrupts_a_turn_waiting_on_the_model_and_keeps_the_session() {
     let listed = krowk_sessions(&b);
     assert_eq!(listed[0]["harness"], "krowk", "the interrupted session is kept and listed");
 }
+
+/// Claude Code's `permissions.defaultMode: "auto"` in `~/.claude/settings.json`
+/// is a mode krowk does not run: the prompt still runs, in default, with a
+/// notice naming the file — and `--permission-mode` wins without one. A
+/// deny rule that does not parse still refuses the prompt.
+#[test]
+fn r_perm_1_krowk_p_runs_beside_a_claude_default_mode_it_does_not_run() {
+    let m = mock::serve(mock::readme_script);
+    let b = Sandbox::new("auto-mode", &m.url);
+    let settings = b.root.join("home/.claude/settings.json");
+    let write = |deny: &str| {
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let v = serde_json::json!({"model": "opus", "permissions": {"allow": ["Bash(npm test)"], "deny": [deny], "defaultMode": "auto"}, "alwaysThinkingEnabled": true});
+        std::fs::write(&settings, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    };
+    let mode_of = |out: &Output| -> String {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let started = stdout.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|l| l["type"] == "turn.started").unwrap_or_else(|| panic!("no turn.started in {stdout}"));
+        started["permissionMode"].as_str().unwrap().to_string()
+    };
+    write("Read(.env)");
+
+    let out = b.krowk(&["-p", "read README.md and summarise it in one line", "--model", "claude-sonnet-4-6", "--output-format", "stream-json"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    assert_eq!(mode_of(&out), "default");
+    assert!(err.contains(&settings.display().to_string()) && err.contains("\"auto\"") && err.contains("runs in default"), "the notice names the file and the value: {err}");
+
+    let out = b.krowk(&["-p", "read README.md and summarise it in one line", "--model", "claude-sonnet-4-6", "--output-format", "stream-json", "--permission-mode", "acceptEdits"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    assert_eq!(mode_of(&out), "acceptEdits");
+    assert!(!err.contains("\"auto\""), "with the flag given the file's mode is not mentioned: {err}");
+
+    write("Read(.env");
+    let out = b.krowk(&["-p", "hi", "--model", "claude-sonnet-4-6", "--permission-mode", "acceptEdits"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success() && err.contains("bad_settings") && err.contains("permissions.deny"), "{err}");
+}

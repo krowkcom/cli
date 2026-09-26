@@ -74,10 +74,14 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
     // What a repository's own settings would widen is asked about with the
     // trust question too; the TUI answers approvals itself (R-PERM-2).
     let probe = prompt::permissions_config(ctx, &config, Arc::new(|_: &std::path::Path| false), true);
+    // Every settings file is read — trusted or not, each rule parsed — before
+    // the trust question is asked and saved: one that does not load is named
+    // now, not after the answer was kept.
+    krowk_harness::permissions::settings::load(&probe, &runs_in).map_err(prompt::bad_settings)?;
     let widens = krowk_harness::permissions::settings::widens(&probe, &runs_in);
     let (trust, trusted) = prompt::tui_trust_gate(effective.as_ref(), &registry, &runs_in, home, widens);
     let permissions = prompt::permissions_config(ctx, &config, trusted, true);
-    let permission_mode = prompt::resolve_mode(flag_mode, &permissions, &runs_in)?;
+    let (permission_mode, mode_notices) = prompt::resolve_mode(flag_mode, &permissions, &runs_in)?;
     let host = HostConfig {
         sessions_dir,
         cwd,
@@ -101,7 +105,7 @@ pub(super) fn run(ctx: &mut Ctx) -> Result<(), Error> {
         budget,
         settings,
         history_file,
-        notices,
+        notices: notices.into_iter().chain(mode_notices).collect(),
         version: super::VERSION.into(),
     });
     // As after `krowk -p`: the log is the session, krowk.db its listing.

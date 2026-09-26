@@ -69,7 +69,10 @@ pub(super) fn run(ctx: &mut Ctx, positionals: &[String]) -> Result<(), Error> {
             _ => None,
         })
     });
-    let permission_mode = resolve_mode(flag_mode, &permissions, session_cwd.as_deref().unwrap_or(&cwd))?;
+    let (permission_mode, notices) = resolve_mode(flag_mode, &permissions, session_cwd.as_deref().unwrap_or(&cwd))?;
+    for n in notices {
+        let _ = writeln!(ctx.io.stderr, "! {n}");
+    }
     let cfg = HostConfig {
         sessions_dir,
         cwd,
@@ -122,14 +125,22 @@ pub(super) fn permission_flag(ctx: &Ctx) -> Result<Option<PermissionMode>, Error
 
 /// The mode a prompt runs in: the flag, else the most specific
 /// `permissions.defaultMode` the settings name (a repository's only once it
-/// is trusted, and never bypassPermissions), else default. A settings file
-/// that does not parse is named here, before anything runs.
-pub(super) fn resolve_mode(flag: Option<PermissionMode>, cfg: &permissions::Config, cwd: &std::path::Path) -> Result<PermissionMode, Error> {
-    if let Some(m) = flag {
-        return Ok(m);
-    }
-    let loaded = permissions::settings::load(cfg, cwd).map_err(|e| fail("bad_settings", format!("{e} — fix the file and run again")))?;
-    Ok(loaded.default_mode.unwrap_or_default())
+/// is trusted, and never bypassPermissions), else default — with the
+/// notices to show: a `defaultMode` krowk does not run is read as default,
+/// and with the flag given no file's mode matters. A settings file that
+/// does not parse is named here, flag or not, before anything runs — or
+/// any trust question is asked.
+pub(super) fn resolve_mode(flag: Option<PermissionMode>, cfg: &permissions::Config, cwd: &std::path::Path) -> Result<(PermissionMode, Vec<String>), Error> {
+    let loaded = permissions::settings::load(cfg, cwd).map_err(bad_settings)?;
+    Ok(match flag {
+        Some(m) => (m, Vec::new()),
+        None => (loaded.default_mode.unwrap_or_default(), loaded.notices),
+    })
+}
+
+/// A settings file that does not load, as the command's error.
+pub(super) fn bad_settings(e: String) -> Error {
+    fail("bad_settings", format!("{e} — fix the file and run again"))
 }
 
 /// What the harness reads permission rules, instructions, skills and hooks

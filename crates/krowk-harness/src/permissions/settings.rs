@@ -27,7 +27,10 @@
 //!
 //! A file that exists and does not parse, or holds a rule that does not,
 //! stops the turn with its name: a deny rule silently dropped is a rule
-//! that no longer holds.
+//! that no longer holds. A `defaultMode` krowk does not run (Claude Code's
+//! `auto`, or one added later) is the one exception: a mode can only widen,
+//! so the file is read as `default` — never looser — and a notice names
+//! the file and the value.
 
 use super::rules::{self, Kind, Rule};
 use crate::hooks::{self, Hooks};
@@ -100,6 +103,9 @@ pub struct Loaded {
     pub dirs: Vec<PathBuf>,
     /// The most specific `defaultMode`.
     pub default_mode: Option<PermissionMode>,
+    /// What the person is told of the files that count: a `defaultMode`
+    /// krowk does not run, read as `default`.
+    pub notices: Vec<String>,
     pub hooks: Hooks,
     /// The repository the working directory belongs to.
     pub root: PathBuf,
@@ -116,11 +122,24 @@ struct File {
     rules: Vec<(Kind, Rule)>,
     dirs: Vec<PathBuf>,
     default_mode: Option<PermissionMode>,
+    /// A `defaultMode` krowk does not run, as written: it counts as
+    /// `default`, with a notice.
+    unknown_mode: Option<String>,
     hooks: Hooks,
 }
 
-fn parse_mode(s: &str) -> Option<PermissionMode> {
-    PermissionMode::parse(s)
+impl File {
+    /// The mode this file sets, and the notice when it is read as
+    /// `default` because krowk does not run the one it names.
+    fn mode(&self) -> (Option<PermissionMode>, Option<String>) {
+        match &self.unknown_mode {
+            Some(m) => (
+                Some(PermissionMode::Default),
+                Some(format!("{}: permissions.defaultMode {m:?} is not a mode krowk runs, so it runs in default — one of {}, or --permission-mode", self.source, PermissionMode::NAMES.join(", "))),
+            ),
+            None => (self.default_mode, None),
+        }
+    }
 }
 
 /// Reads one settings object.
@@ -137,7 +156,10 @@ fn read_object(v: &Value, source: &str, root: &Path, base: &Path, home: Option<&
             }
         }
         if let Some(m) = p.get("defaultMode").and_then(Value::as_str) {
-            f.default_mode = Some(parse_mode(m).ok_or_else(|| format!("{source}: permissions.defaultMode {m:?} is not a mode — one of {}", PermissionMode::NAMES.join(", ")))?);
+            match PermissionMode::parse(m) {
+                Some(mode) => f.default_mode = Some(mode),
+                None => f.unknown_mode = Some(m.to_string()),
+            }
         }
         if let Some(dirs) = p.get("additionalDirectories") {
             let dirs = dirs.as_array().ok_or_else(|| format!("{source}: \"permissions.additionalDirectories\" must be a list of paths"))?;
@@ -230,19 +252,23 @@ pub fn load(cfg: &Config, cwd: &Path) -> Result<Loaded, String> {
     }
     let mut out = Loaded { root: root.clone(), trusted, ..Loaded::default() };
     for f in user {
+        let (mode, notice) = f.mode();
+        out.notices.extend(notice);
         out.rules.extend(f.rules);
         out.dirs.extend(f.dirs);
-        out.default_mode = f.default_mode.or(out.default_mode);
+        out.default_mode = mode.or(out.default_mode);
         out.hooks.extend(f.hooks);
     }
     for f in project {
         let widens = f.rules.iter().any(|(k, _)| *k == Kind::Allow) || !f.dirs.is_empty() || f.default_mode.is_some() || !f.hooks.is_empty();
         out.widens |= widens;
         if trusted {
+            // A repository never puts the person in bypassPermissions.
+            let (mode, notice) = f.mode();
+            out.notices.extend(notice);
             out.rules.extend(f.rules);
             out.dirs.extend(f.dirs);
-            // A repository never puts the person in bypassPermissions.
-            out.default_mode = f.default_mode.filter(|m| *m != PermissionMode::BypassPermissions).or(out.default_mode);
+            out.default_mode = mode.filter(|m| *m != PermissionMode::BypassPermissions).or(out.default_mode);
             out.hooks.extend(f.hooks);
         } else {
             for (k, r) in f.rules {

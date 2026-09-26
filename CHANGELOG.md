@@ -123,7 +123,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   `fix` in place of `auth`, with `state` spelled as `krowk status` spells
   it (`key_not_set`, `not_signed_in`, …). Claude Code and Codex are asked
   at the same time instead of one after the other, so a listing takes as
-  long as the slowest vendor (at most 10 seconds) rather than their sum;
+  long as the slowest vendor (at most 10 seconds, after which it and
+  anything it started are stopped) rather than their sum;
   Codex is asked through `codex app-server`'s `account/read`, falling back
   to `codex login status`. A SuperGrok login whose token expired and
   cannot be refreshed now shows as `expired` instead of ready.
@@ -135,7 +136,12 @@ the versions are the `v*` tags a release is cut from. Entries land under
   its model. Before, Claude Code was started and the turn failed. A
   signed-in answer is remembered for a minute in the TUI, so switching
   back and forth does not re-ask; a signed-out one is asked again every
-  time, so signing in in another terminal works at once.
+  time, so signing in in another terminal works at once. Before a turn the
+  vendor is asked in the (trusted) repository, so a project that signs
+  Claude Code in through its own settings — Bedrock, Vertex, an
+  `apiKeyHelper` — still runs; `krowk status` and `providers list` ask in
+  a directory of krowk's own, where such an account shows `not signed
+  in`.
 
 - **Switch model, instance or engine at any time, without losing the
   thread.** In the TUI, `/model` opens a picker of the models the session

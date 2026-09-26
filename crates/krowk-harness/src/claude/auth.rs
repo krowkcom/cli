@@ -55,10 +55,12 @@ fn not_found(b: &Backend, e: std::io::Error) -> String {
 /// `claude auth status`, read as JSON. Signed out is an answer (Claude Code
 /// exits 1 for it), not a failure; no answer is — nor one that takes longer
 /// than the readiness check waits for any vendor.
-pub fn status(b: &Backend) -> Result<Status, String> {
-    let out = crate::readiness::output_within(&mut command(b, &["auth", "status", "--json"]), crate::readiness::VENDOR_TIMEOUT)
+/// It runs where `probe` says: Claude Code reads the project settings of
+/// its working directory, and they can decide the answer.
+pub fn status(b: &Backend, probe: &crate::readiness::Probe) -> Result<Status, String> {
+    let out = crate::readiness::output_within(&mut command(b, &["auth", "status", "--json"]), probe)
         .map_err(|e| not_found(b, e))?
-        .ok_or_else(|| format!("`{} auth status` did not answer within {} seconds", b.binary, crate::readiness::VENDOR_TIMEOUT.as_secs()))?;
+        .ok_or_else(|| format!("`{} auth status` did not answer within {} seconds", b.binary, probe.within.as_secs_f32()))?;
     let v: Value = serde_json::from_slice(out.stdout.trim_ascii()).map_err(|_| format!("`{} auth status --json` did not answer in JSON — is it Claude Code?", b.binary))?;
     let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     Ok(Status { logged_in: v.get("loggedIn").and_then(Value::as_bool).unwrap_or(false), auth_method: s("authMethod"), subscription: s("subscriptionType") })

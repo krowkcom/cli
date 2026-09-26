@@ -10,10 +10,11 @@
 
 use crate::instances::Backend;
 use crate::protocol::Billing;
+use crate::readiness::Probe;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// What `codex login status` said. Only whether there is a login and what
 /// it is billed to are kept: an API-key login prints part of its key, and
@@ -72,10 +73,10 @@ pub fn command(b: &Backend, args: &[&str]) -> Command {
 
 /// Asks Codex whether this instance is signed in, as `codex login status`
 /// words it: the fallback for a Codex whose app-server cannot be asked.
-pub fn status(b: &Backend) -> Result<Status, String> {
-    let out = crate::readiness::output_within(&mut command(b, &["login", "status"]), crate::readiness::VENDOR_TIMEOUT)
+pub fn status(b: &Backend, probe: &Probe) -> Result<Status, String> {
+    let out = crate::readiness::output_within(&mut command(b, &["login", "status"]), probe)
         .map_err(|e| format!("{} could not be run: {e}", b.binary))?
-        .ok_or_else(|| format!("`{} login status` did not answer within {} seconds", b.binary, crate::readiness::VENDOR_TIMEOUT.as_secs()))?;
+        .ok_or_else(|| format!("`{} login status` did not answer within {} seconds", b.binary, probe.within.as_secs_f32()))?;
     let said = format!("{}\n{}", String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
     if !said.contains("Logged in") && !said.contains("Not logged in") {
         return Err(format!("`{} login status` answered in a way krowk does not read (exit {})", b.binary, out.status));
@@ -93,7 +94,8 @@ pub fn status(b: &Backend) -> Result<Status, String> {
 /// No account, where Codex says it needs none (`requiresOpenaiAuth` false —
 /// a model provider of its own config that takes no OpenAI login), is as
 /// good as signed in: a turn runs.
-pub fn account(b: &Backend, within: Duration) -> Result<Status, String> {
+pub fn account(b: &Backend, probe: &Probe) -> Result<Status, String> {
+    let within = probe.within;
     use std::io::{BufRead, Write};
     // The account's links to the person's configuration, as before any
     // app-server the backend starts: without them a new `skills` would be
@@ -101,15 +103,12 @@ pub fn account(b: &Backend, within: Duration) -> Result<Status, String> {
     if let (Some(home), Some(own)) = (&b.config_dir, &b.shared_home) {
         let _ = super::share(home, own);
     }
-    // Outside the repository, as every status check runs
-    // (`readiness::output_within`).
-    let mut child = command(b, &super::args(&b.args).iter().map(String::as_str).collect::<Vec<_>>())
-        .current_dir(std::env::temp_dir())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("{} could not be run: {e}", b.binary))?;
+    // Where the probe says, in a group of its own, as every check runs
+    // (`readiness::probing`): a project's `.codex/config.toml` can change
+    // whether a login is needed.
+    let mut cmd = command(b, &super::args(&b.args).iter().map(String::as_str).collect::<Vec<_>>());
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = crate::readiness::probing(&mut cmd, probe).map_err(|e| format!("{} could not be run: {e}", b.binary))?;
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let out = child.stdout.take().expect("piped");
     std::thread::spawn(move || {
@@ -146,13 +145,12 @@ pub fn account(b: &Backend, within: Duration) -> Result<Status, String> {
                         None => Err(format!("`{} app-server` refused account/read", b.binary)),
                     };
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break Err(format!("`{} app-server` did not answer account/read within {} seconds", b.binary, within.as_secs())),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break Err(format!("`{} app-server` did not answer account/read within {} seconds", b.binary, within.as_secs_f32())),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Err(format!("`{} app-server` exited before it answered account/read", b.binary)),
             }
         },
     };
-    let _ = child.kill();
-    let _ = child.wait();
+    crate::readiness::stop(&mut child);
     answer
 }
 
@@ -160,8 +158,18 @@ pub fn account(b: &Backend, within: Duration) -> Result<Status, String> {
 /// `codex login status`'s words (`status`) only when app-server cannot be
 /// asked — an older Codex, one that will not start it. What each failed on
 /// is the error when both do.
-pub fn signed_in(b: &Backend) -> Result<Status, String> {
-    account(b, crate::readiness::VENDOR_TIMEOUT).or_else(|structured| status(b).map_err(|text| format!("{structured}; {text}")))
+///
+/// Both share the probe's one deadline: the fallback gets what is left, so
+/// the whole check is over by then, as for any vendor.
+pub fn signed_in(b: &Backend, probe: &Probe) -> Result<Status, String> {
+    let started = Instant::now();
+    account(b, probe).or_else(|structured| {
+        let left = probe.within.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(structured);
+        }
+        status(b, &Probe { within: left, ..probe.clone() }).map_err(|text| format!("{structured}; {text}"))
+    })
 }
 
 /// `account/read`'s result: a ChatGPT account is a subscription, any other

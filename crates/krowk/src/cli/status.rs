@@ -32,8 +32,19 @@ pub(super) fn reports(ctx: &Ctx) -> Result<(InstancesConfig, Registry, Vec<Repor
     let cfg = super::prompt::load_instances()?;
     let reg = Registry::resolve(&cfg, ctx.io.env);
     let all: Vec<_> = reg.instances.values().collect();
-    let reports = readiness::check_all(&all, &super::providers::credentials_path());
+    let reports = readiness::check_all(&all, &super::providers::credentials_path(), &neutral_probe(ctx)?);
     Ok((cfg, reg, reports))
+}
+
+/// Where a vendor is asked when no repository is trusted: krowk's own
+/// `0700` directory, never the working directory (whose project settings
+/// nobody trusted) nor the shared temporary directory (where anyone could
+/// plant settings that make a signed-out account look signed in).
+pub(super) fn neutral_probe(ctx: &Ctx) -> Result<readiness::Probe, Error> {
+    let data = krowk_harness::log::sessions_dir(ctx.io.env)
+        .and_then(|d| d.parent().map(std::path::Path::to_path_buf))
+        .ok_or_else(|| fail("no_home", "krowk has no data directory to ask a vendor from — set HOME or XDG_DATA_HOME"))?;
+    readiness::neutral_dir(&data).map(readiness::Probe::at).map_err(|e| fail("data_dir_unwritable", e))
 }
 
 pub(super) fn status(ctx: &mut Ctx) -> Result<(), Error> {

@@ -249,3 +249,23 @@ fn codex_status_falls_back_to_login_status_when_app_server_cannot_be_asked() {
     let rows = instances(&stdout_json(&out)["data"]);
     assert_eq!((row(&rows, "codex")["state"].as_str(), row(&rows, "codex")["source"].as_str()), (Some("ready"), Some(format!("Codex's own login in {} (signed in with ChatGPT)", b.home().join(".codex").display()).as_str())));
 }
+
+#[test]
+fn status_asks_vendors_in_krowks_own_directory_so_planted_settings_change_nothing() {
+    let b = Sandbox::new("planted");
+    // Signed in only where its working directory's project settings say so.
+    b.install("claude", "#!/bin/bash\nif [ -f \"$PWD/.claude/settings.json\" ]; then echo '{\"loggedIn\":true,\"authMethod\":\"bedrock\"}'; exit 0; fi\necho '{\"loggedIn\":false}'; exit 1\n");
+    // Settings planted in a shared temporary directory, and in the
+    // repository krowk runs in, which nobody trusted.
+    let tmp = b.root.join("tmp");
+    for d in [&tmp, &b.root.join("repo")] {
+        std::fs::create_dir_all(d.join(".claude")).unwrap();
+        std::fs::write(d.join(".claude/settings.json"), r#"{"apiKeyHelper":"echo planted"}"#).unwrap();
+    }
+    let out = b.krowk(&["status", "--json"], &[("TMPDIR", tmp.to_str().unwrap()), ("ANTHROPIC_API_KEY", KEY_SENTINEL)]);
+    let rows = instances(&stdout_json(&out)["data"]);
+    assert_eq!(row(&rows, "claude")["state"], "not_signed_in", "{rows:?}");
+    let own = b.home().join(".local/share/krowk/readiness");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&own).unwrap().permissions().mode() & 0o777, 0o700, "krowk's own directory, closed to others");
+}

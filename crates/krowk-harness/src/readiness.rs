@@ -15,8 +15,21 @@
 //! --json`, Codex's `account/read` over `codex app-server` with `codex login
 //! status` as the fallback — never by reading its files (R-BACK-2, R-BACK-3).
 //!
+//! **Where a vendor is asked matters.** Claude Code reads a project's
+//! `.claude/settings.json` from its working directory, and a project can
+//! make the login moot there (Bedrock or Vertex in its `env`, an
+//! `apiKeyHelper`); Codex reads a project's `.codex/config.toml` the same
+//! way (a `model_provider` that needs no OpenAI login). So a `Probe` names
+//! the directory: before a turn, the repository's root, once it is trusted
+//! — the answer the turn will get — and for `krowk status`, `providers
+//! list`, `doctor` and a rollover offer, where no repository has been
+//! trusted, krowk's own `0700` directory (`neutral_dir`), which holds
+//! nothing and which nobody else can write into — never the shared
+//! temporary directory, where anyone could plant a `.claude/settings.json`.
+//!
 //! Vendor checks spawn a process, so `check_all` runs them in parallel,
-//! each bounded by `VENDOR_TIMEOUT`, and a long-lived host (the TUI) does
+//! each bounded by one deadline (`VENDOR_TIMEOUT`) and killed with its
+//! whole process group when it passes, and a long-lived host (the TUI) does
 //! not re-ask for every switch: a vendor's "signed in" is kept for
 //! `CACHE_FOR`. Only "signed in" is kept. A person who is told to sign in
 //! does so in another terminal and tries again at once, and a remembered
@@ -30,7 +43,7 @@ use crate::oauth;
 use crate::protocol::WireApi;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -41,6 +54,50 @@ use std::time::{Duration, Instant};
 pub const VENDOR_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a vendor's "signed in" is believed without asking again.
 pub const CACHE_FOR: Duration = Duration::from_secs(60);
+/// krowk's own directory for vendor checks outside any repository, under
+/// its data directory.
+pub const NEUTRAL_DIR: &str = "readiness";
+
+/// Where a vendor is asked, and how long it has to answer — one deadline
+/// for the whole check, a fallback included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub dir: PathBuf,
+    pub within: Duration,
+}
+
+impl Probe {
+    /// In `dir`, with `VENDOR_TIMEOUT`.
+    pub fn at(dir: impl Into<PathBuf>) -> Probe {
+        Probe { dir: dir.into(), within: VENDOR_TIMEOUT }
+    }
+}
+
+/// krowk's own directory for asking a vendor outside any repository:
+/// `<data dir>/readiness`, made `0700` and kept that way, and refused when
+/// it is anything but a directory of its own (a symlink planted there
+/// would lead the check somewhere else). It holds nothing, so a vendor
+/// started in it reads only the person's own settings.
+pub fn neutral_dir(data_dir: &Path) -> Result<PathBuf, String> {
+    let dir = data_dir.join(NEUTRAL_DIR);
+    let fail = |e: std::io::Error| format!("{} cannot be made krowk's own: {e}", dir.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        match std::fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).map_err(fail)?,
+            Err(e) => return Err(fail(e)),
+            Ok(m) if !m.is_dir() => return Err(format!("{} is not a directory — move it aside", dir.display())),
+            // SAFETY: getuid has no preconditions and cannot fail.
+            Ok(m) if m.uid() != unsafe { libc::getuid() } => return Err(format!("{} belongs to another user — move it aside", dir.display())),
+            Ok(_) => {}
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(fail)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&dir).map_err(fail)?;
+    Ok(dir)
+}
 
 /// Whether an instance can run a turn, and if not, which kind of not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,11 +244,11 @@ fn oauth_login(inst: &Resolved, credentials: &Path) -> Readiness {
 }
 
 /// One instance, asked: locally when that answers, else of its vendor
-/// (bounded by `VENDOR_TIMEOUT`, a "signed in" cached for `CACHE_FOR`).
-/// Blocks for as long as the vendor takes.
-pub fn check(inst: &Resolved, credentials: &Path) -> Report {
+/// where `probe` says (bounded by its deadline, a "signed in" cached for
+/// `CACHE_FOR`). Blocks for as long as the vendor takes.
+pub fn check(inst: &Resolved, credentials: &Path, probe: &Probe) -> Report {
     let readiness = local(inst, credentials).unwrap_or_else(|| match &inst.backend {
-        Some(b) => vendor_cached(inst, b),
+        Some(b) => vendor_cached(inst, b, probe),
         None => Readiness::Unknown { reason: "no way to check this instance".into() },
     });
     report(inst, readiness, credentials)
@@ -199,9 +256,9 @@ pub fn check(inst: &Resolved, credentials: &Path) -> Report {
 
 /// Every instance, the vendor checks in parallel: as long as the slowest
 /// one, never their sum. In the order given.
-pub fn check_all(instances: &[&Resolved], credentials: &Path) -> Vec<Report> {
+pub fn check_all(instances: &[&Resolved], credentials: &Path, probe: &Probe) -> Vec<Report> {
     std::thread::scope(|s| {
-        let running: Vec<_> = instances.iter().map(|inst| s.spawn(move || check(inst, credentials))).collect();
+        let running: Vec<_> = instances.iter().map(|inst| s.spawn(move || check(inst, credentials, probe))).collect();
         running
             .into_iter()
             .zip(instances)
@@ -213,12 +270,12 @@ pub fn check_all(instances: &[&Resolved], credentials: &Path) -> Vec<Report> {
 /// `check`, off an async runtime's thread: a vendor check blocks on a
 /// process for up to `VENDOR_TIMEOUT`, and the host's runtime has one
 /// thread that the TUI's drawing and every other session also run on.
-pub async fn check_async(inst: &Resolved, credentials: &Path) -> Report {
+pub async fn check_async(inst: &Resolved, credentials: &Path, probe: &Probe) -> Report {
     if let Some(r) = local(inst, credentials) {
         return report(inst, r, credentials);
     }
-    let (inst2, creds) = (inst.clone(), credentials.to_path_buf());
-    match tokio::task::spawn_blocking(move || check(&inst2, &creds)).await {
+    let (inst2, creds, probe) = (inst.clone(), credentials.to_path_buf(), probe.clone());
+    match tokio::task::spawn_blocking(move || check(&inst2, &creds, &probe)).await {
         Ok(r) => r,
         Err(_) => report(inst, Readiness::Unknown { reason: "the check did not finish".into() }, credentials),
     }
@@ -289,20 +346,21 @@ fn fix(inst: &Resolved, r: &Readiness) -> Option<String> {
 /// Vendor answers that said "signed in", by instance, and when.
 static SIGNED_IN: Mutex<Option<HashMap<String, (Instant, String)>>> = Mutex::new(None);
 
-/// What makes two vendor checks the same question: the instance and
-/// everything that changes which login the vendor reads. No key value is
-/// in it — a keyed backend never reaches the vendor check.
-fn cache_key(inst: &Resolved, b: &Backend) -> String {
-    format!("{}\0{:?}\0{:?}\0{:?}\0{:?}", inst.name, b.path, b.config_dir, b.env, b.args)
+/// What makes two vendor checks the same question: the instance, the
+/// directory it is asked in (a project's settings can change the answer),
+/// and everything that changes which login the vendor reads. No key value
+/// is in it — a keyed backend never reaches the vendor check.
+fn cache_key(inst: &Resolved, b: &Backend, probe: &Probe) -> String {
+    format!("{}\0{:?}\0{:?}\0{:?}\0{:?}\0{:?}", inst.name, probe.dir, b.path, b.config_dir, b.env, b.args)
 }
 
-fn vendor_cached(inst: &Resolved, b: &Backend) -> Readiness {
-    let key = cache_key(inst, b);
+fn vendor_cached(inst: &Resolved, b: &Backend, probe: &Probe) -> Readiness {
+    let key = cache_key(inst, b, probe);
     let known = SIGNED_IN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key)).filter(|(at, _)| at.elapsed() < CACHE_FOR).map(|(_, s)| s.clone());
     if let Some(source) = known {
         return Readiness::Ready { source };
     }
-    let r = vendor(inst, b);
+    let r = vendor(inst, b, probe);
     if let Readiness::Ready { source } = &r {
         SIGNED_IN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, (Instant::now(), source.clone()));
     }
@@ -311,10 +369,10 @@ fn vendor_cached(inst: &Resolved, b: &Backend) -> Readiness {
 
 /// Asks the vendor. Only whether there is a login and its kind come back;
 /// an email, a plan's owner, the part of a key Codex prints, stay out.
-fn vendor(inst: &Resolved, b: &Backend) -> Readiness {
+fn vendor(inst: &Resolved, b: &Backend, probe: &Probe) -> Readiness {
     let said = match inst.wire_api {
-        WireApi::CodexAppServer => codex_auth::signed_in(b).map(|st| (st.logged_in, st.describe())),
-        _ => claude_auth::status(b).map(|st| (st.logged_in, st.describe())),
+        WireApi::CodexAppServer => codex_auth::signed_in(b, probe).map(|st| (st.logged_in, st.describe())),
+        _ => claude_auth::status(b, probe).map(|st| (st.logged_in, st.describe())),
     };
     match said {
         Ok((true, how)) => Readiness::Ready { source: vendor_login_source(inst, Some(&how)) },
@@ -323,15 +381,36 @@ fn vendor(inst: &Resolved, b: &Backend) -> Readiness {
     }
 }
 
-/// Runs a command to its end, or kills it at `within`: none then. Its
-/// output is read while it runs, so a chatty vendor cannot fill a pipe and
-/// hang on it. It runs in the temporary directory, never the repository
-/// krowk was started in: a status check is not a reason to read a project's
-/// settings, which may name commands (an `apiKeyHelper`), in a repository
-/// nobody trusted.
-pub(crate) fn output_within(cmd: &mut Command, within: Duration) -> std::io::Result<Option<Output>> {
+/// A vendor process for a check: started in `probe.dir` — never wherever
+/// krowk happens to run, whose project settings nobody may have trusted —
+/// in a process group of its own, so the whole of it can be stopped.
+pub(crate) fn probing(cmd: &mut Command, probe: &Probe) -> std::io::Result<std::process::Child> {
+    cmd.current_dir(&probe.dir);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(cmd, 0);
+    cmd.spawn()
+}
+
+/// Stops a check's process and everything it started — a Node runtime's
+/// workers, a shell's `sleep` — and reaps it: nothing outlives a check.
+pub(crate) fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: kill with a negative pid signals the process group the child
+    // leads (`probing` made it its own); it touches no memory.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Runs a check's command to its end, or stops it at `probe.within`: none
+/// then. Its output is read while it runs, so a chatty vendor cannot fill a
+/// pipe and hang on it.
+pub(crate) fn output_within(cmd: &mut Command, probe: &Probe) -> std::io::Result<Option<Output>> {
     use std::io::Read;
-    let mut child = cmd.current_dir(std::env::temp_dir()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let within = probe.within;
+    let mut child = probing(cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()), probe)?;
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -349,8 +428,7 @@ pub(crate) fn output_within(cmd: &mut Command, within: Duration) -> std::io::Res
             break s;
         }
         if started.elapsed() > within {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop(&mut child);
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(20));

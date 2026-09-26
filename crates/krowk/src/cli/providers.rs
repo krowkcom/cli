@@ -365,6 +365,8 @@ fn sign_in_claude(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<
     if backend.path.is_none() {
         return Err(fail("backend_not_found", format!("{} was not found — install Claude Code (https://claude.com/claude-code), or name the binary with --binary", backend.binary)));
     }
+    // Asked in krowk's own directory, as `krowk status` asks.
+    let probe = super::status::neutral_probe(ctx)?;
     let made = match &backend.config_dir {
         Some(dir) if !dir.exists() => {
             private_dir(dir).map_err(|e| fail("config_unwritable", format!("create {}: {e}", dir.display())))?;
@@ -378,7 +380,7 @@ fn sign_in_claude(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<
         }
         e
     };
-    let status = claude_auth::status(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
+    let status = claude_auth::status(&backend, &probe).map_err(|e| undo(fail("backend_failed", e)))?;
     // A keyed instance — a router, a Console key — signs in with its key,
     // not a Claude login.
     if status.logged_in || backend.env.contains_key("ANTHROPIC_BASE_URL") || backend.key.is_some() {
@@ -387,7 +389,7 @@ fn sign_in_claude(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<
     let _ = writeln!(ctx.io.stderr, "Signing {instance} in to Claude Code — what follows is Claude's own login (`claude auth login`){}:", backend.config_dir.as_ref().map(|d| format!(", kept in {}", d.display())).unwrap_or_default());
     let _ = ctx.io.stderr.flush();
     let exit = claude_auth::login(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
-    let status = claude_auth::status(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
+    let status = claude_auth::status(&backend, &probe).map_err(|e| undo(fail("backend_failed", e)))?;
     if !status.logged_in {
         let how = if exit.success() { "finished without signing in".to_string() } else { format!("stopped ({exit})") };
         return Err(undo(fail("not_authenticated", format!("`claude auth login` {how}, so {instance} was not added — run `krowk providers add claude{}` again to retry", instance.split_once(':').map(|(_, n)| format!(" --name {n}")).unwrap_or_default()))));
@@ -409,6 +411,8 @@ fn sign_in_codex(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<(
     if backend.path.is_none() {
         return Err(fail("backend_not_found", format!("{} was not found — install Codex (https://developers.openai.com/codex), or name the binary with --binary", backend.binary)));
     }
+    // Asked in krowk's own directory, as `krowk status` asks.
+    let probe = super::status::neutral_probe(ctx)?;
     let made = match &backend.config_dir {
         Some(dir) if !dir.exists() => {
             private_dir(dir).map_err(|e| fail("config_unwritable", format!("create {}: {e}", dir.display())))?;
@@ -428,14 +432,14 @@ fn sign_in_codex(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<(
         (Some(dir), Some(own)) => codex::share(dir, own).map_err(|e| undo(fail("config_unwritable", format!("link {} into {}: {e}", own.display(), dir.display()))))?,
         _ => Vec::new(),
     };
-    let status = codex_auth::signed_in(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
+    let status = codex_auth::signed_in(&backend, &probe).map_err(|e| undo(fail("backend_failed", e)))?;
     if status.logged_in || backend.key.is_some() {
         return Ok((status, shared));
     }
     let _ = writeln!(ctx.io.stderr, "Signing {instance} in to Codex — what follows is Codex's own login (`codex login`){}:", backend.config_dir.as_ref().map(|d| format!(", kept in {}", d.display())).unwrap_or_default());
     let _ = ctx.io.stderr.flush();
     let exit = codex_auth::login(&backend, ctx.f.device).map_err(|e| undo(fail("backend_failed", e)))?;
-    let status = codex_auth::signed_in(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
+    let status = codex_auth::signed_in(&backend, &probe).map_err(|e| undo(fail("backend_failed", e)))?;
     if !status.logged_in {
         let how = if exit.success() { "finished without signing in".to_string() } else { format!("stopped ({exit})") };
         return Err(undo(fail("not_authenticated", format!("`codex login` {how}, so {instance} was not added — run `krowk providers add codex{}` again to retry", instance.split_once(':').map(|(_, n)| format!(" --name {n}")).unwrap_or_default()))));

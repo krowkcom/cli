@@ -408,8 +408,11 @@ impl Shared {
     /// The readiness check before a turn runs on `instance` (`readiness`):
     /// what needs no process first, then for a backend the repository's
     /// trust, then the vendor's own login — so nothing at all is spawned
-    /// for a repository nobody trusted. `known_good` skips the vendor: a
-    /// session whose process is up and serving it has shown its login.
+    /// for a repository nobody trusted. The vendor is asked in the
+    /// repository's root, now trusted: its project settings (Bedrock, an
+    /// `apiKeyHelper`, a Codex model provider) are part of the answer the
+    /// turn will get. `known_good` skips the vendor: a session whose process
+    /// is up and serving it has shown its login.
     async fn ready(&self, instance: &Resolved, cwd: &std::path::Path, known_good: bool) -> Result<(), EngineError> {
         let creds = &self.cfg.credentials;
         if let Some(r) = readiness::local(instance, creds)
@@ -420,11 +423,19 @@ impl Shared {
         if instance.backend.is_none() {
             return Ok(());
         }
-        (self.cfg.trust)(&trust::root(cwd))?;
+        let root = trust::root(cwd);
+        (self.cfg.trust)(&root)?;
         if known_good {
             return Ok(());
         }
-        readiness::check_async(instance, creds).await.refusal(instance).map_or(Ok(()), Err)
+        readiness::check_async(instance, creds, &readiness::Probe::at(root)).await.refusal(instance).map_or(Ok(()), Err)
+    }
+
+    /// Where a vendor is asked outside any repository: krowk's own `0700`
+    /// directory beside the sessions (`readiness::neutral_dir`).
+    fn neutral_probe(&self) -> Result<readiness::Probe, String> {
+        let data = self.cfg.sessions_dir.parent().unwrap_or(&self.cfg.sessions_dir);
+        readiness::neutral_dir(data).map(readiness::Probe::at)
     }
 
     /// Whether `session_id` has a backend process for `instance` up now.
@@ -485,15 +496,23 @@ impl Shared {
 
     /// Where a session limited on `from` may continue: the first candidate
     /// that can run here (R-INST-7, R-INST-8). A rollover (`full`) checks
-    /// each as `switchModel` does, trust included; an offer asks the
-    /// readiness check alone, and leaves trust to be asked when the person
-    /// takes it and the turn runs there — a signed-out account is never
-    /// offered.
+    /// each as `switchModel` does: the checks that need no process, trust,
+    /// then the vendor in the repository. An offer never asks about trust —
+    /// that is asked when the person takes it and the turn runs there — so
+    /// it asks the readiness check as `krowk status` does: the checks that
+    /// need no process, then the vendor in krowk's own directory, never the
+    /// repository nobody has trusted yet. A signed-out account is never
+    /// offered; one whose login only a project's settings provide
+    /// (Bedrock, an `apiKeyHelper`) is not offered either, and is reached
+    /// by naming it.
     async fn next_instance(&self, from: &ModelRef, tried: &[String], cwd: &std::path::Path, full: bool) -> Option<ModelRef> {
         for m in self.cfg.registry.rollover_candidates(from, tried) {
             let Ok(i) = self.cfg.registry.get(&m.instance) else { continue };
             let ok = match &i.backend {
-                Some(_) if !full => readiness::check_async(i, &self.cfg.credentials).await.refusal(i).is_none(),
+                Some(_) if !full => match self.neutral_probe() {
+                    Ok(probe) => readiness::check_async(i, &self.cfg.credentials, &probe).await.refusal(i).is_none(),
+                    Err(_) => false,
+                },
                 _ => self.check_model(&m, cwd, None).await.is_ok(),
             };
             if ok {

@@ -372,6 +372,13 @@ impl<W: Write> Term<W> {
         above + self.caret_col / width
     }
 
+    /// Sets the window title with the next frame (OSC 2, which moves
+    /// nothing).
+    pub fn title(&mut self, title: &str) -> io::Result<()> {
+        let title: String = title.chars().filter(|c| !c.is_control()).collect();
+        write!(self.buf.clone(), "\x1b]2;{title}\x07")
+    }
+
     /// One frame: `lines` into scrollback, then the live region redrawn as
     /// `rows` with the cursor at `caret` (column, row), all as one
     /// synchronized write.

@@ -313,11 +313,11 @@ fn r_back_6_the_tui_asks_before_claude_runs_in_an_untrusted_repository() {
         let cmd = b.command(&["--model", "claude/sonnet"], &[("TERM", "xterm-256color")]);
         // Wide enough that a long temporary path does not wrap the question.
         let mut t = pty::Pty::spawn(cmd, 400, 30);
-        assert!(t.wait_for("(y/N)", std::time::Duration::from_secs(10)).is_some(), "no trust prompt: {:?}", t.text());
-        assert!(t.text().contains("Trust ") && t.text().contains("run Claude Code in it?"), "{:?}", t.text());
+        assert!(t.wait_for("remember", std::time::Duration::from_secs(10)).is_some(), "no trust prompt: {:?}", t.text());
+        assert!(t.text().contains("Trust ") && t.text().contains("Claude Code runs a repository's own hooks"), "{:?}", t.text());
         assert!(!b.fake_log().contains("argv -p"), "nothing spawned before the answer");
-        t.write(if yes { b"y\r" } else { b"n\r" });
-        assert!(t.wait_for("ask anything", std::time::Duration::from_secs(10)).is_some(), "the TUI opens: {:?}", t.text());
+        t.write(if yes { b"y" } else { b"n" });
+        assert!(t.wait_for("anything", std::time::Duration::from_secs(10)).is_some(), "the TUI opens: {:?}", t.text());
         t.write(b"hello\r");
         let trusted = b.root.join("home/.config/krowk/trusted.json");
         if yes {
@@ -399,7 +399,7 @@ fn r_back_1_a_second_ctrl_c_leaves_at_once_and_kills_claude_codes_process_group(
     std::fs::write(&trusted, serde_json::json!({"directories": [b.root.join("repo")]}).to_string()).unwrap();
     let cmd = b.command(&["--model", "claude/sonnet"], &[("TERM", "xterm-256color"), ("FAKE_CLAUDE_SCENARIO", &scenario("hang.jsonl"))]);
     let mut t = pty::Pty::spawn(cmd, 200, 30);
-    assert!(t.wait_for("ask anything", std::time::Duration::from_secs(10)).is_some(), "{:?}", t.text());
+    assert!(t.wait_for("anything", std::time::Duration::from_secs(10)).is_some(), "{:?}", t.text());
     t.write(b"work for a long time\r");
     let (server, grandchild) = claude_pids(&b);
     t.write(b"\x03");

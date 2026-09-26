@@ -273,7 +273,7 @@ fn r_perm_1_krowk_p_runs_beside_a_claude_default_mode_it_does_not_run() {
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(out.status.success(), "{err}");
     assert_eq!(mode_of(&out), "default");
-    assert!(err.contains(&settings.display().to_string()) && err.contains("\"auto\"") && err.contains("runs in default"), "the notice names the file and the value: {err}");
+    assert!(err.contains("~/.claude/settings.json sets defaultMode \"auto\"") && err.contains("asks before edits and commands"), "the notice names the file and the value: {err}");
 
     let out = b.krowk(&["-p", "read README.md and summarise it in one line", "--model", "claude-sonnet-4-6", "--output-format", "stream-json", "--permission-mode", "acceptEdits"]);
     let err = String::from_utf8_lossy(&out.stderr).into_owned();

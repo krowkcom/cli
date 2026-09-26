@@ -305,7 +305,7 @@ fn r_back_3_a_second_ctrl_c_in_the_tui_during_a_codex_turn_leaves_at_once() {
     std::fs::write(&trusted, serde_json::json!({"directories": [b.root.join("repo")]}).to_string()).unwrap();
     let cmd = b.command(&["--model", "codex:team/gpt-5.5"], &[("TERM", "xterm-256color"), ("FAKE_CODEX_SCENARIO", &scenario("hang.jsonl"))]);
     let mut t = pty::Pty::spawn(cmd, 200, 30);
-    assert!(t.wait_for("ask anything", std::time::Duration::from_secs(10)).is_some(), "{:?}", t.text());
+    assert!(t.wait_for("anything", std::time::Duration::from_secs(10)).is_some(), "{:?}", t.text());
     t.write(b"work for a long time\r");
     assert!(t.wait_for("Responding", std::time::Duration::from_secs(10)).is_some(), "the answer streams: {:?}", t.text());
     let log = (0..100).find_map(|_| {

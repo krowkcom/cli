@@ -308,33 +308,21 @@ pub(super) fn vendor_of(model: Option<&krowk_harness::protocol::ModelRef>, regis
 /// no. A yes is remembered.
 pub(super) fn ask_trust(store: &trust::Store, root: &std::path::Path, vendor: &str) -> bool {
     let runs = trust::what_runs(root);
-    use std::io::Write as _;
-    let mut stderr = std::io::stderr();
-    match vendor {
-        "Claude Code" => {
-            let _ = writeln!(stderr, "Claude Code (`claude -p`) runs a repository's own hooks and MCP servers without asking.");
-        }
-        "krowk" => {
-            let _ = writeln!(stderr, "This repository's settings would let krowk run its hooks and follow its allow rules and extra directories — krowk takes them only from a repository you trust.");
-        }
-        v => {
-            let _ = writeln!(stderr, "{v} runs what a repository configures it to — its project config's hooks and MCP servers — without asking.");
-        }
+    let why = match vendor {
+        "Claude Code" => "Claude Code runs a repository's own hooks and MCP servers without asking.".to_string(),
+        "krowk" => "krowk takes a repository's hooks, allow rules and extra directories only once you trust it.".to_string(),
+        v => format!("{v} runs a repository's own hooks and MCP servers without asking."),
+    };
+    let has = if runs.is_empty() { "Nothing of that kind is there now.".to_string() } else { format!("It has {}.", runs.join(", ")) };
+    let title = format!("Trust {}?", krowk_tui::home_relative(root));
+    if !krowk_tui::card::confirm(&title, &[why, has], "trust and remember", "not now") {
+        return false;
     }
-    if runs.is_empty() {
-        let _ = writeln!(stderr, "{} has none of those files now, but it is not a repository you have trusted.", root.display());
-    } else {
-        let _ = writeln!(stderr, "{} has {}.", root.display(), runs.join(", "));
+    if let Err(e) = store.trust(root) {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "! trusted for this run, but not remembered: {e}");
     }
-    match inquire::Confirm::new(&format!("Trust {} and run {vendor} in it?", root.display())).with_default(false).prompt() {
-        Ok(true) => {
-            if let Err(e) = store.trust(root) {
-                let _ = writeln!(stderr, "! trusted for this run, but not remembered: {e}");
-            }
-            true
-        }
-        _ => false,
-    }
+    true
 }
 
 /// The TUI's gate. The TUI owns the terminal in raw mode once it opens, so

@@ -29,6 +29,9 @@
 //!   one. The terminal keeps the cursor on the caret through a resize, so a
 //!   frame that moves up and down from it still starts at the region's top
 //!   and still leaves the cursor on the caret, whichever size it is read at.
+//!   The row it is on is tracked, not re-read: a glyph the terminal draws
+//!   wider than `unicode-width` says would put that off until the next
+//!   resize or job stop asks the terminal again.
 //! - **The terminal is asked where the cursor is only when nothing else is
 //!   reading it**: at start, and after a resize, with the key reader stopped
 //!   (the caller drops it). Everything in between — a taller or shorter live
@@ -96,6 +99,10 @@ impl FrameBuf {
         b.row = b.sent_row;
     }
 
+    fn row(&self) -> u16 {
+        self.0.borrow().row
+    }
+
     /// The terminal says, or a sequence just sent sets, where the cursor is.
     fn set_row(&self, row: u16) {
         let mut b = self.0.borrow_mut();
@@ -136,7 +143,11 @@ impl FrameBuf {
 /// that would otherwise talk to the terminal answered from what is known:
 /// its size (so ratatui never resizes behind our back) and the cursor (so
 /// ratatui never queries it while the key reader owns the input). Cells are
-/// drawn here rather than by crossterm, which moves to absolute rows.
+/// drawn here rather than by crossterm, which moves to absolute rows, and
+/// with `sgr`'s styles: blink, hidden and underline colours, which nothing
+/// here uses, are not drawn. `scroll_region_*` and `clear` still go through
+/// crossterm and set a scroll region, which moves the cursor where the row
+/// model cannot follow; nothing calls them (ratatui's `insert_before` would).
 pub struct Back {
     inner: CrosstermBackend<FrameBuf>,
     buf: FrameBuf,
@@ -342,7 +353,14 @@ impl<W: Write> Term<W> {
         let top = match cursor_row {
             Some(row) if narrowed && self.reflows => row.saturating_sub(self.reflowed_above_caret(size.width)),
             Some(row) => row.saturating_sub(self.caret_row),
-            None => self.drawn_top,
+            // Not asked: the cursor is still on the caret, but its row was
+            // numbered on the old screen. On the new one it is at most the
+            // last, and the region's top is the caret's row above it.
+            None => {
+                let row = self.buf.row().min(size.height.saturating_sub(1));
+                self.buf.set_row(row);
+                row.saturating_sub(self.caret_row)
+            }
         };
         // A shorter screen can leave the region's top too low for all of it:
         // the terminal took the rows below the caret. The rows it needs are

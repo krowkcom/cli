@@ -33,7 +33,7 @@ impl Write for Out {
 struct Pane {
     socket: String,
     fifo: std::path::PathBuf,
-    input: std::fs::File,
+    input: Option<std::fs::File>,
     marks: u32,
 }
 
@@ -48,15 +48,18 @@ impl Pane {
         let tmp = std::env::temp_dir();
         let (fifo, conf) = (tmp.join(format!("{socket}.fifo")), tmp.join(format!("{socket}.conf")));
         let _ = std::fs::remove_file(&fifo);
-        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        // Made first, so a failure from here on still kills the server and
+        // removes the fifo.
+        let mut pane = Pane { socket, fifo, input: None, marks: 0 };
+        assert!(Command::new("mkfifo").arg(&pane.fifo).status().unwrap().success());
         std::fs::write(&conf, "set -g history-limit 10000\nset -g status off\n").unwrap();
-        let cmd = format!("stty raw -echo; exec cat '{}'", fifo.display());
+        let cmd = format!("stty raw -echo; exec cat '{}'", pane.fifo.display());
         let (x, y) = (cols.to_string(), rows.to_string());
-        let st = Command::new("tmux").args(["-L", &socket, "-f"]).arg(&conf).args(["new-session", "-d", "-s", "t", "-x", &x, "-y", &y, &cmd]).status().unwrap();
+        let st = Command::new("tmux").args(["-L", &pane.socket, "-f"]).arg(&conf).args(["new-session", "-d", "-s", "t", "-x", &x, "-y", &y, &cmd]).status().unwrap();
         let _ = std::fs::remove_file(&conf);
         assert!(st.success());
-        let input = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-        Some(Pane { socket, fifo, input, marks: 0 })
+        pane.input = Some(std::fs::OpenOptions::new().write(true).open(&pane.fifo).unwrap());
+        Some(pane)
     }
 
     fn tmux(&self, args: &[&str]) -> String {
@@ -69,9 +72,10 @@ impl Pane {
     fn send(&mut self, out: &Out) {
         self.marks += 1;
         let mark = format!("mark-{}", self.marks);
-        self.input.write_all(&std::mem::take(&mut *out.0.borrow_mut())).unwrap();
-        write!(self.input, "\x1b]2;{mark}\x07").unwrap();
-        self.input.flush().unwrap();
+        let input = self.input.as_mut().unwrap();
+        input.write_all(&std::mem::take(&mut *out.0.borrow_mut())).unwrap();
+        write!(input, "\x1b]2;{mark}\x07").unwrap();
+        input.flush().unwrap();
         let t0 = Instant::now();
         while self.tmux(&["display", "-p", "-t", "t", "#{pane_title}"]).trim() != mark {
             assert!(t0.elapsed() < Duration::from_secs(10), "the pane never read {mark}");
@@ -101,9 +105,10 @@ impl Drop for Pane {
 
 /// Forty lines in scrollback and the forty-first streaming, at 100x30; the
 /// frame that finishes it is read by the pane before the window shrinks to
-/// 70x20, or after. Then the resize is handled and line 42 comes. Every
+/// 70x20, or after. Then the resize is handled — with the cursor asked
+/// for, or with the question gone unanswered — and line 42 comes. Every
 /// line must be in scrollback once, and the live region only on screen.
-fn shrunk_around_a_frame(name: &str, frame_read_first: bool) {
+fn shrunk_around_a_frame(name: &str, frame_read_first: bool, answered: bool) {
     let Some(mut pane) = Pane::start(name, 100, 30) else { return };
     let line = |n: u32| Line::from(format!("line {n:05}: the quick brown fox jumps over the lazy dog again"));
     let live = |tail: Option<&str>| {
@@ -126,7 +131,7 @@ fn shrunk_around_a_frame(name: &str, frame_read_first: bool) {
         pane.resize(70, 20);
         pane.send(&out);
     }
-    t.resize(Size { width: 70, height: 20 }, Some(pane.cursor_row())).unwrap();
+    t.resize(Size { width: 70, height: 20 }, answered.then(|| pane.cursor_row())).unwrap();
     t.frame(&[line(42)], &rows, caret).unwrap();
     pane.send(&out);
     let history = pane.history();
@@ -139,7 +144,14 @@ fn shrunk_around_a_frame(name: &str, frame_read_first: bool) {
 fn r_tui_3_a_shorter_screen_scrolls_the_conversation_up_rather_than_clearing_it() {
     // tmux takes the rows below the caret first, so the region no longer
     // fits under its top: rows are made for it, and none is cleared.
-    shrunk_around_a_frame("shrink", true);
+    shrunk_around_a_frame("shrink", true, true);
+}
+
+#[test]
+fn r_tui_3_a_shorter_screen_is_measured_from_the_caret_when_the_cursor_goes_unanswered() {
+    // The row the model had for the cursor was numbered on the taller
+    // screen; the move to the region's top is from the caret regardless.
+    shrunk_around_a_frame("unanswered", true, false);
 }
 
 #[test]
@@ -147,5 +159,5 @@ fn r_tui_3_a_frame_the_terminal_reads_after_it_resized_still_lands_on_the_region
     // Drawn for 100x30 and read at 70x20: its moves from the caret still
     // start at the region's top, where absolute rows would clamp to the
     // bottom and leave the old region, and the line it held, above it.
-    shrunk_around_a_frame("race", false);
+    shrunk_around_a_frame("race", false, true);
 }

@@ -618,10 +618,16 @@ impl<'h> Ui<'h> {
             term.title(&title)?;
         }
         if std::mem::take(&mut app.copy) {
-            let text = app.answer.trim_end().to_string();
-            term.clipboard(&text)?;
-            clipboard::system(&text);
-            app.flash = Some(format!("copied the last answer ({} lines)", text.lines().count()));
+            // What was shown, not what was sent: no escape or bidi control
+            // reaches the place it is pasted.
+            let text: String = app.answer.trim_end().split('\n').map(|l| card::clean(&l.replace('\t', "    "))).collect::<Vec<_>>().join("\n");
+            app.flash = Some(if text.len() > clipboard::MAX {
+                format!("the answer is too long to copy ({} KB)", text.len() / 1024)
+            } else {
+                term.clipboard(&text)?;
+                clipboard::system(&text);
+                format!("sent the last answer to the clipboard ({} lines)", text.lines().count())
+            });
         }
         term.frame(&lines, &rows, caret)
     }

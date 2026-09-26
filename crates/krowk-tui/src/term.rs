@@ -306,8 +306,6 @@ impl<W: Write> Term<W> {
         self.size.width
     }
 
-
-
     pub fn size(&self) -> Size {
         self.size
     }

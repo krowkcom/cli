@@ -267,8 +267,9 @@ pub struct App {
     /// the first is shown over the prompt until it is answered, here or by
     /// another client.
     pub approvals: Vec<ApprovalRequest>,
-    /// The last answer as the model wrote it, unwrapped and unpadded: what
-    /// Ctrl-Y copies. One answer, not the conversation.
+    /// The last turn's answer as the model wrote it, unwrapped and
+    /// unpadded: what Ctrl-Y copies, cleaned as it was shown. One answer,
+    /// not the conversation.
     pub answer: String,
     /// Set by Ctrl-Y; the next frame puts `answer` on the clipboard.
     pub copy: bool,
@@ -431,10 +432,10 @@ impl App {
     }
 
     fn push_wrapped(&mut self, first: &str, rest: &str, text: &str, prefix_style: Style, style: Style) {
-        // Unprefixed text — the answer itself, most of scrollback — goes
-        // out as one line for the terminal to wrap, so it rewraps when the
-        // window does and copies whole. Prefixed items wrap here, under
-        // their hanging indent.
+        // Unprefixed text — the answer itself, most of scrollback — stays
+        // one line here and is wrapped with everything else on its way out
+        // (`take_pending`). Prefixed items wrap here, under their hanging
+        // indent.
         if first.is_empty() && rest.is_empty() {
             let line = Line::from(Span::styled(clean(text), style));
             self.last_blank = line.width() == 0;
@@ -477,7 +478,7 @@ impl App {
         self.push_wrapped("  ", "  ", &format!("({})", e.code), dim(), dim());
     }
 
-    /// One line of an answer, in light markdown, for the terminal to wrap.
+    /// One line of an answer, in light markdown, wrapped on its way out.
     fn push_md(&mut self, text: &str) {
         let line = look::markdown_line(&clean(text), &mut self.fence);
         self.last_blank = line.width() == 0;
@@ -589,8 +590,10 @@ impl App {
                     ItemKind::ToolResult { .. } => LiveKind::Result,
                     ItemKind::UserText => return,
                 };
-                if kind == LiveKind::Text {
-                    self.answer.clear();
+                // The turn's answer is all its text, the parts between
+                // tool calls a paragraph apart.
+                if kind == LiveKind::Text && !self.answer.is_empty() && !self.answer.ends_with("\n\n") {
+                    self.answer.push_str(if self.answer.ends_with('\n') { "\n" } else { "\n\n" });
                 }
                 self.live = Some(Live { id: item_id.clone(), kind, tail: String::new(), committed: false });
                 self.dirty = true;
@@ -1366,6 +1369,7 @@ impl App {
 
     /// A turn has started: `Command::Prompt` is on its way.
     pub fn start_turn(&mut self, now: Instant) {
+        self.answer.clear();
         self.turn = Some(Turn { started: now, want_interrupt: false, interrupt_sent: false, tool_running: false, prompt_seen: false });
         self.dirty = true;
     }
@@ -1472,14 +1476,16 @@ pub fn wrap(s: &str, width: usize) -> Vec<String> {
 /// answer, unwrapped, is Ctrl-Y.
 pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    if text.width() <= width.max(1) || text.contains('\n') {
+    if text.width() <= width.max(1) {
         return vec![line];
     }
     let styled: Vec<(char, Style)> = line.spans.iter().flat_map(|s| s.content.chars().map(move |c| (c, s.style))).collect();
     let mut at = 0;
-    wrap(&text, width)
-        .into_iter()
-        .map(|row| {
+    let rows = wrap(&text, width);
+    let last = rows.len().saturating_sub(1);
+    rows.into_iter()
+        .enumerate()
+        .map(|(r, row)| {
             let n = row.chars().count();
             let mut spans: Vec<Span<'static>> = Vec::new();
             for &(c, st) in &styled[at..at + n] {
@@ -1490,9 +1496,11 @@ pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             }
             at += n;
             // The space a row broke at is not drawn at its end.
-            if let Some(last) = spans.last_mut() {
-                let trimmed = last.content.trim_end().to_string();
-                last.content = trimmed.into();
+            if r < last
+                && let Some(end) = spans.last_mut()
+                && end.content.ends_with(' ')
+            {
+                end.content.to_mut().pop();
             }
             Line::from(spans).style(line.style)
         })
@@ -1775,6 +1783,13 @@ mod tests {
         let t = text(&a.take_pending());
         assert!(t.iter().all(|r| r.chars().count() <= 12), "{t:?}");
         assert_eq!(a.answer, "a rather long first line of the answer\nand a second\n", "Ctrl-Y copies it unwrapped");
+        // After a tool call, the answer goes on, a paragraph apart; a new
+        // turn starts it again.
+        a.on_line(&live(LiveEvent::ItemStarted { session_id: "s".into(), turn_id: "t".into(), item_id: "j".into(), item: ItemKind::AssistantText }));
+        a.on_line(&delta("j", "then more\n"));
+        assert_eq!(a.answer, "a rather long first line of the answer\nand a second\n\nthen more\n");
+        a.start_turn(Instant::now());
+        assert!(a.answer.is_empty());
     }
 
     #[test]

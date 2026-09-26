@@ -7,6 +7,10 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+/// The most sent at once: terminals and multiplexers drop an OSC 52 much
+/// past 100 KB of base64, silently.
+pub const MAX: usize = 74 * 1024;
+
 /// `ESC ] 52 ; c ; <base64> BEL`.
 pub fn osc52(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
@@ -20,7 +24,7 @@ pub fn system(text: &str) {
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
     } else if wayland {
-        &[("wl-copy", &[])]
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
     } else if x11 {
         &[("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])]
     } else {

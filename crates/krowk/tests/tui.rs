@@ -500,6 +500,9 @@ fn narrowing(name: &str, before: &str, steps: &[&str]) {
         assert_eq!(history.matches(row).count(), 1, "{row:?} is in scrollback twice — the old live region was left behind:\n{history}");
     }
     assert_eq!(history.matches("krowk · claude-opus-5-5").count(), 1, "the header is still there, once:\n{history}");
+    for edge in ['┌', '└'] {
+        assert_eq!(history.matches(edge).count(), 1, "one prompt box, its {edge} edge once:\n{history}");
+    }
     if !before.is_empty() {
         // What was on the terminal is kept: the open scrolls it into
         // scrollback, the way a clear that keeps scrollback does, and the

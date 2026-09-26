@@ -184,7 +184,9 @@ the versions are the `v*` tags a release is cut from. Entries land under
   one header line (`krowk · opus via claude · ~/project`), the prompt in a
   box (`→ Plan, search, build anything`) and one row under it for the
   model, the keys worth knowing and the cost. A repository it has not
-  trusted yet is asked about as a short card answered with one key. The
+  trusted yet is asked about as a short card answered with one key — `y`
+  trusts it; any other key, or anything typed before the card showed,
+  does not; Ctrl-C leaves. The
   window title says what it is doing (`✳ krowk` waiting, `◑ <what you
   asked>` working, `✋` when a call waits for your yes), and inside herdr
   krowk reports the same to its pane, so herdr lists it as an agent with
@@ -222,8 +224,8 @@ the versions are the `v*` tags a release is cut from. Entries land under
   should, and a shorter window scrolls the conversation up rather than
   clearing a line of it. **Known limits:** a resize the terminal takes in
   the middle of a single frame can still cost that line, and a frame read
-  after the window narrowed below the width of a row above the prompt can
-  blank a line above the prompt area; krowk takes a terminal to reflow on
+  after the window narrowed (the prompt box spans the window) can blank
+  the line above the prompt area; krowk takes a terminal to reflow on
   resize unless it is real xterm (`XTERM_VERSION`) or the Linux console;
   one that is taken wrongly can leave a copy of the prompt area in
   scrollback, or blank a few lines above it. A live region that reflows
@@ -576,7 +578,10 @@ the versions are the `v*` tags a release is cut from. Entries land under
   even with `--permission-mode` given. Such a mode now sets nothing: a
   mode in krowk's own config (`permissions.defaultMode` in
   `~/.config/krowk/config.json`) or `--permission-mode` wins without a
-  word, and with neither krowk runs in `default` and says so in one line. A rule that does not parse
+  word, and with neither krowk runs in `default` and says so in one line.
+  That is Claude Code's `auto`; any other mode krowk does not run
+  (`dontAsk`, a value that is not a mode) is read as `default`, so it
+  still narrows a looser mode set before it. A rule that does not parse
   still refuses the prompt, and the TUI now says so before it asks the
   trust question rather than after saving the answer.
 

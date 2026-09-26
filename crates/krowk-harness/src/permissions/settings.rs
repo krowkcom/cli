@@ -104,7 +104,7 @@ pub struct Loaded {
     /// The most specific `defaultMode`.
     pub default_mode: Option<PermissionMode>,
     /// What the person is told of the files that count: a `defaultMode`
-    /// krowk does not run, read as `default`.
+    /// krowk does not run.
     pub notices: Vec<String>,
     pub hooks: Hooks,
     /// The repository the working directory belongs to.
@@ -122,28 +122,29 @@ struct File {
     rules: Vec<(Kind, Rule)>,
     dirs: Vec<PathBuf>,
     default_mode: Option<PermissionMode>,
-    /// A `defaultMode` krowk does not run, as JSON text: it counts as
-    /// `default`, with a notice.
-    unknown_mode: Option<String>,
+    /// A `defaultMode` krowk does not run, as JSON text, and whether it
+    /// counts as `default` (anything but Claude Code's `auto`, which sets
+    /// nothing).
+    unknown_mode: Option<(String, bool)>,
     hooks: Hooks,
 }
 
 impl File {
-    /// The mode this file sets, and the notice for a mode krowk does not
-    /// run: that one sets nothing, so another file's mode still counts,
-    /// and the notice is shown only when none does and krowk runs in
-    /// `default` because of it.
-    fn mode(&self, home: Option<&Path>) -> (Option<PermissionMode>, Option<String>) {
-        match &self.unknown_mode {
-            Some(m) => {
-                let source = match home.and_then(|h| Path::new(&self.source).strip_prefix(h).ok()) {
-                    Some(rest) => format!("~/{}", rest.display()),
-                    None => self.source.clone(),
-                };
-                (None, Some(format!("{source} sets defaultMode {m}, which krowk doesn't have, so it asks before edits and commands · set permissions.defaultMode in ~/.config/krowk/config.json to choose")))
-            }
-            None => (self.default_mode, None),
-        }
+    /// The mode this file sets, and what is said of a mode krowk does not
+    /// run. `auto` sets nothing, and is spoken of only if no file sets a
+    /// mode (`load` decides); anything else is `default`, said at once.
+    fn mode(&self, home: Option<&Path>, config: &str) -> (Option<PermissionMode>, Option<String>) {
+        let Some((m, narrows)) = &self.unknown_mode else { return (self.default_mode, None) };
+        let why = format!("{} sets defaultMode {m}, which krowk doesn't have, so it asks before edits and commands · set permissions.defaultMode in {config} to choose", tilde(&self.source, home));
+        (narrows.then_some(PermissionMode::Default), Some(why))
+    }
+}
+
+/// `~/…` for a path under the home directory.
+fn tilde(path: &str, home: Option<&Path>) -> String {
+    match home.and_then(|h| Path::new(path).strip_prefix(h).ok()) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.to_string(),
     }
 }
 
@@ -160,15 +161,19 @@ fn read_object(v: &Value, source: &str, root: &Path, base: &Path, home: Option<&
                 f.rules.push((kind, rules::parse(text, source, root).map_err(|e| format!("{source}: permissions.{key}: {e}"))?));
             }
         }
-        // Anything else there — a mode krowk does not run, or not a string
-        // at all — is read as default: never left to an earlier file's.
+        // Claude Code's `auto` — looser than default, a classifier deciding
+        // — sets nothing, so another file's mode still counts. Anything
+        // else krowk does not run (`dontAsk`, a mode from a later Claude
+        // Code, not a string at all) may have meant stricter, so it is read
+        // as default, and an earlier file's looser mode does not stand.
         match p.get("defaultMode") {
             None => {}
             Some(Value::String(m)) => match PermissionMode::parse(m) {
                 Some(mode) => f.default_mode = Some(mode),
-                None => f.unknown_mode = Some(format!("{m:?}")),
+                None if m == "auto" => f.unknown_mode = Some((format!("{m:?}"), false)),
+                None => f.unknown_mode = Some((format!("{m:?}"), true)),
             },
-            Some(other) => f.unknown_mode = Some(other.to_string()),
+            Some(other) => f.unknown_mode = Some((other.to_string(), true)),
         }
         if let Some(dirs) = p.get("additionalDirectories") {
             let dirs = dirs.as_array().ok_or_else(|| format!("{source}: \"permissions.additionalDirectories\" must be a list of paths"))?;
@@ -260,10 +265,17 @@ pub fn load(cfg: &Config, cwd: &Path) -> Result<Loaded, String> {
         project.retain(|f| f.source != user_file);
     }
     let mut out = Loaded { root: root.clone(), trusted, ..Loaded::default() };
+    let config = cfg.user_path.as_ref().map(|p| tilde(&p.display().to_string(), home)).unwrap_or_else(|| "krowk's config.json".into());
+    // `auto`'s notices, said only if nothing sets a mode.
     let mut unknown: Vec<String> = Vec::new();
+    let mut said = |mode: Option<PermissionMode>, notice: Option<String>, out: &mut Loaded| match (mode, notice) {
+        (Some(_), Some(n)) => out.notices.push(n),
+        (None, Some(n)) => unknown.push(n),
+        _ => {}
+    };
     for f in user {
-        let (mode, notice) = f.mode(home);
-        unknown.extend(notice);
+        let (mode, notice) = f.mode(home, &config);
+        said(mode, notice, &mut out);
         out.rules.extend(f.rules);
         out.dirs.extend(f.dirs);
         out.default_mode = mode.or(out.default_mode);
@@ -274,8 +286,8 @@ pub fn load(cfg: &Config, cwd: &Path) -> Result<Loaded, String> {
         out.widens |= widens;
         if trusted {
             // A repository never puts the person in bypassPermissions.
-            let (mode, notice) = f.mode(home);
-            unknown.extend(notice);
+            let (mode, notice) = f.mode(home, &config);
+            said(mode, notice, &mut out);
             out.rules.extend(f.rules);
             out.dirs.extend(f.dirs);
             out.default_mode = mode.filter(|m| *m != PermissionMode::BypassPermissions).or(out.default_mode);

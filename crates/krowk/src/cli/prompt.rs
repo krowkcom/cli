@@ -303,9 +303,9 @@ pub(super) fn vendor_of(model: Option<&krowk_harness::protocol::ModelRef>, regis
     model.and_then(|m| registry.get(&m.instance).ok()).filter(|i| i.backend.is_some()).map(|i| i.vendor).unwrap_or("the backend")
 }
 
-/// The trust prompt itself, on the terminal as it is (not raw): what the
-/// repository would make the vendor run, and a yes-or-no that defaults to
-/// no. A yes is remembered.
+/// The trust prompt itself, a card answered with one key before anything
+/// takes the terminal: what the repository would make the vendor run, and
+/// `y` to trust it, anything else not. A yes is remembered.
 pub(super) fn ask_trust(store: &trust::Store, root: &std::path::Path, vendor: &str) -> bool {
     let runs = trust::what_runs(root);
     let why = match vendor {

@@ -529,7 +529,7 @@ the versions are the `v*` tags a release is cut from. Entries land under
   threads, and signs it in by running `codex login` — OpenAI's own login,
   on your terminal (`--device` for its device code). krowk never reads
   Codex's login file or uses Codex's OAuth client; `providers list` asks
-  `codex login status`. One `codex app-server` serves the whole session:
+  Codex itself (`account/read`, else `codex login status`). One `codex app-server` serves the whole session:
   its turns stream into the same log and `krowk sessions` listing as
   native ones, with the commands Codex ran and the patches it applied as
   tool calls; typing while a turn runs steers it; Ctrl-C interrupts it

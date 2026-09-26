@@ -313,7 +313,7 @@ fn vendor_cached(inst: &Resolved, b: &Backend) -> Readiness {
 /// an email, a plan's owner, the part of a key Codex prints, stay out.
 fn vendor(inst: &Resolved, b: &Backend) -> Readiness {
     let said = match inst.wire_api {
-        WireApi::CodexAppServer => codex_auth::account(b, VENDOR_TIMEOUT).or_else(|structured| codex_auth::status(b).map_err(|text| format!("{structured}; {text}"))).map(|st| (st.logged_in, st.describe())),
+        WireApi::CodexAppServer => codex_auth::signed_in(b).map(|st| (st.logged_in, st.describe())),
         _ => claude_auth::status(b).map(|st| (st.logged_in, st.describe())),
     };
     match said {

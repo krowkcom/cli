@@ -156,6 +156,14 @@ pub fn account(b: &Backend, within: Duration) -> Result<Status, String> {
     answer
 }
 
+/// Whether this instance is signed in: `account/read` (`account`) first,
+/// `codex login status`'s words (`status`) only when app-server cannot be
+/// asked — an older Codex, one that will not start it. What each failed on
+/// is the error when both do.
+pub fn signed_in(b: &Backend) -> Result<Status, String> {
+    account(b, crate::readiness::VENDOR_TIMEOUT).or_else(|structured| status(b).map_err(|text| format!("{structured}; {text}")))
+}
+
 /// `account/read`'s result: a ChatGPT account is a subscription, any other
 /// an API key; none is signed out unless Codex needs no login at all.
 fn read_account(r: &Value) -> Status {

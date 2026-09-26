@@ -397,7 +397,8 @@ fn sign_in_claude(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<
 
 /// R-INST-2, with `codex login`: a Codex account is signed in by Codex. Its
 /// home is made (0700) if it is new and given links to the person's own
-/// Codex configuration (`codex::share`), `codex login status` is asked, and
+/// Codex configuration (`codex::share`), Codex is asked whether it is signed
+/// in (`account/read`, else `codex login status`), and
 /// when it says no, `codex login` runs on this terminal in OpenAI's own
 /// flow; then status is asked again. A keyed instance — a router, named by
 /// `--api-key-env` — runs on that key, so no login is run for it. A failure
@@ -427,14 +428,14 @@ fn sign_in_codex(ctx: &mut Ctx, instance: &str, kind: &InstanceKind) -> Result<(
         (Some(dir), Some(own)) => codex::share(dir, own).map_err(|e| undo(fail("config_unwritable", format!("link {} into {}: {e}", own.display(), dir.display()))))?,
         _ => Vec::new(),
     };
-    let status = codex_auth::status(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
+    let status = codex_auth::signed_in(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
     if status.logged_in || backend.key.is_some() {
         return Ok((status, shared));
     }
     let _ = writeln!(ctx.io.stderr, "Signing {instance} in to Codex — what follows is Codex's own login (`codex login`){}:", backend.config_dir.as_ref().map(|d| format!(", kept in {}", d.display())).unwrap_or_default());
     let _ = ctx.io.stderr.flush();
     let exit = codex_auth::login(&backend, ctx.f.device).map_err(|e| undo(fail("backend_failed", e)))?;
-    let status = codex_auth::status(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
+    let status = codex_auth::signed_in(&backend).map_err(|e| undo(fail("backend_failed", e)))?;
     if !status.logged_in {
         let how = if exit.success() { "finished without signing in".to_string() } else { format!("stopped ({exit})") };
         return Err(undo(fail("not_authenticated", format!("`codex login` {how}, so {instance} was not added — run `krowk providers add codex{}` again to retry", instance.split_once(':').map(|(_, n)| format!(" --name {n}")).unwrap_or_default()))));

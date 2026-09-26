@@ -110,13 +110,13 @@ fn r_inst_2_two_codex_accounts_sign_in_through_codex_login_and_each_runs_a_sessi
         assert_eq!(std::fs::read_link(dir.join("config.toml")).unwrap(), b.root.join("home/.codex/config.toml"));
     }
     // Codex's own login ran once per account, each with its own CODEX_HOME,
-    // after `codex login status` said there was none.
+    // after app-server's `account/read` said there was none.
     let fake = b.fake_log();
     let lines: Vec<&str> = fake.lines().collect();
     for name in ["team", "personal"] {
         let dir = b.data().join("codex").join(format!("codex-{name}"));
         let at = lines.iter().position(|l| *l == format!("home {}", dir.display())).expect("ran with the instance's CODEX_HOME");
-        assert_eq!(lines[at - 1], "argv login status");
+        assert_eq!(lines[at - 1], "argv app-server --listen stdio://");
     }
     assert_eq!(fake.lines().filter(|l| *l == "argv login").count(), 2);
 
@@ -124,7 +124,7 @@ fn r_inst_2_two_codex_accounts_sign_in_through_codex_login_and_each_runs_a_sessi
     b.json(&["providers", "add", "codex", "--name", "team", "--json"], &[]);
     assert_eq!(b.fake_log().lines().filter(|l| *l == "argv login").count(), 2);
 
-    // Status comes from `codex login status`, per instance.
+    // Status comes from `account/read`, per instance.
     let before = b.fake_log().lines().count();
     let listed = b.json(&["providers", "list", "--json"], &[]);
     let rows = listed["data"]["instances"].as_array().unwrap();
@@ -202,11 +202,12 @@ fn r_inst_2_a_codex_login_that_fails_adds_nothing() {
 fn r_back_6_a_codex_turn_is_not_started_headless_in_an_untrusted_repository() {
     let b = Sandbox::new("trust");
     b.json(&["providers", "add", "codex", "--name", "team", "--json"], &[]);
+    let added = b.fake_log().len();
     let out = b.krowk(&["-p", "hi", "--model", "codex:team/gpt-5.5", "--output-format", "json"], &[]);
     assert_eq!(out.status.code(), Some(4), "{}", String::from_utf8_lossy(&out.stderr));
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(said.contains("untrusted_directory") && said.contains("--trust"), "{said}");
-    assert!(!b.fake_log().contains("argv app-server"), "nothing was spawned");
+    assert!(!b.fake_log()[added..].contains("argv "), "nothing was spawned, not even a status check");
     assert!(!b.data().join("sessions").exists() || std::fs::read_dir(b.data().join("sessions")).unwrap().next().is_none(), "no session was left behind");
 }
 

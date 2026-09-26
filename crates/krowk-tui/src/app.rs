@@ -1209,6 +1209,15 @@ impl App {
             };
             let label_style = if t.want_interrupt { red() } else { look::accent() };
             let right = format!(" {}{SEP}esc to interrupt", look::duration(since));
+            // A blank line above, unless there is one already: straight
+            // under streaming text, the spinner read as part of it.
+            let above_blank = match rows.last() {
+                Some(l) => l.width() == 0,
+                None => self.last_blank,
+            };
+            if !above_blank {
+                rows.push(Line::default());
+            }
             rows.push(Line::from(vec![
                 Span::styled(format!("{frame} "), look::accent()),
                 Span::styled(clip(&label, width.saturating_sub(right.width() + 2)), label_style),

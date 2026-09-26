@@ -914,3 +914,31 @@ fn r_switch_4_a_switch_during_a_fan_out_moves_the_parent_and_leaves_its_subagent
     let seen = w.seen_by(Eng::Xai, from);
     assert!(seen.contains("toolu_sub") && seen.contains("child did it"), "{seen}");
 }
+
+#[test]
+fn readiness_a_vendors_signed_in_is_believed_for_a_minute_and_a_signed_out_asked_every_time() {
+    let mut w = World::new("readiness-cache");
+    w.claude("claude:in", "claude-in", None, true);
+    let out_dir = w.claude("claude:out", "claude-out", None, false);
+    let host = w.host();
+    let rt = rt();
+    let (r1, _) = rt.block_on(run(&host, prompt(None, "first", Some(Eng::Anthropic.model()))));
+    let id = r1.session_id.clone();
+    let asked = |dir: &str| w.fake_log(dir).lines().filter(|l| *l == "argv auth status --json").count();
+    let switch = |instance: &str| {
+        let (tx, _rx) = mpsc::channel(16);
+        rt.block_on(host.execute(Command::SwitchModel { session_id: Some(id.clone()), model: ModelRef { instance: instance.into(), model: "haiku".into() } }, tx))
+    };
+    // Signed in: asked once, then believed — a long-lived host (the TUI)
+    // does not spawn Claude Code's status for every switch.
+    switch("claude:in").unwrap();
+    switch(&Eng::Anthropic.model().instance).unwrap();
+    switch("claude:in").unwrap();
+    assert_eq!(asked("claude-in"), 1);
+    // Signed out: asked every time, so signing in elsewhere and trying again
+    // works at once.
+    assert_eq!(switch("claude:out").unwrap_err().code, "not_authenticated");
+    std::fs::write(out_dir.join("fake-login"), "").unwrap();
+    switch("claude:out").unwrap();
+    assert_eq!(asked("claude-out"), 2);
+}

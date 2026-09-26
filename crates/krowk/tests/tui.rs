@@ -132,6 +132,43 @@ fn r_perf_2_nothing_is_drawn_while_idle() {
     assert_eq!(t.output().len(), before, "an idle TUI wrote {:?}", String::from_utf8_lossy(&t.output()[before..]));
 }
 
+/// R-INST-7 and R-SWITCH-4 in the TUI itself: an instance at its rate
+/// limit offers the next one as one question, `y` continues the prompt
+/// there, `/model` opens the picker, and a switch to an instance with no key
+/// is refused with its fix while the session stays where it was.
+#[test]
+fn r_inst_7_the_tui_offers_the_next_instance_and_y_continues_there() {
+    let limited = mock::serve(|_, _| mock::Reply { headers: vec![("retry-after".into(), "0".into())], ..mock::Reply::json(429, &serde_json::json!({"type": "error", "error": {"type": "rate_limit_error", "message": "rate limited"}})) });
+    let ok = mock::serve(mock::readme_script);
+    let b = Sandbox::new("offer");
+    let config = b.root.join("home/.config/krowk");
+    std::fs::create_dir_all(&config).unwrap();
+    let instances = serde_json::json!({"instances": {
+        "anthropic:personal": {"kind": "anthropic-api", "apiKeyEnv": "ANTHROPIC_API_KEY", "baseUrl": ok.url},
+        "anthropic:nokey": {"kind": "anthropic-api", "apiKeyEnv": "NO_SUCH_KEY", "baseUrl": ok.url},
+    }});
+    std::fs::write(config.join("config.json"), instances.to_string()).unwrap();
+    let mut t = pty::Pty::spawn(b.command(&limited.url, &["--model", "anthropic/claude-sonnet-4-6"]), 120, 30);
+    assert!(t.wait_for("ask anything", Duration::from_secs(10)).is_some(), "{:?}", t.text());
+    t.write(b"read README.md and summarise it\r");
+    assert!(t.wait_for("[y/N]", Duration::from_secs(20)).is_some(), "no offer: {:?}", t.text());
+    assert!(t.text().contains("anthropic:personal?"), "{:?}", t.text());
+    t.write(b"y");
+    assert!(t.wait_for("anywhere.", Duration::from_secs(20)).is_some(), "the prompt did not continue there: {:?}", t.text());
+    assert!(ok.seen.lock().unwrap().iter().any(|s| s.body.to_string().contains("read README.md and summarise it")), "sent to the instance it moved to");
+    // The picker, and a switch refused with its fix.
+    t.write(b"/model\r");
+    assert!(t.wait_for("anthropic:nokey/claude-sonnet-4-6", Duration::from_secs(10)).is_some(), "{:?}", t.text());
+    // Esc on its own, not the start of an Alt-/ chord.
+    t.write(b"\x1b");
+    std::thread::sleep(Duration::from_millis(300));
+    t.write(b"/model anthropic:nokey/claude-sonnet-4-6\r");
+    assert!(t.wait_for("NO_SUCH_KEY", Duration::from_secs(10)).is_some(), "{:?}", t.text());
+    assert!(t.wait_for("stays", Duration::from_secs(5)).is_some(), "{:?}", t.text());
+    t.write(b"\x04");
+    assert!(t.wait(Duration::from_secs(10)).is_some_and(|s| s.success()));
+}
+
 /// A provider that takes the request and never answers: a turn that waits.
 fn silent_provider() -> String {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();

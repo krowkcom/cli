@@ -22,6 +22,8 @@ pub const TOOL: &str = "◆ ";
 pub const WARN: &str = "⚠ ";
 pub const STOPPED: &str = "◌ ";
 pub const STEER: &str = "↳ ";
+/// Before a switch of model, instance or engine.
+pub const SWITCH: &str = "⇄ ";
 pub const SEP: &str = " │ ";
 
 /// Braille spinner, one frame per `SPIN_FRAME` while a turn runs.

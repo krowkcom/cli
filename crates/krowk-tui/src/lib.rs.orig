@@ -180,7 +180,7 @@ async fn session(opts: Options) -> Outcome {
         Err(e) => return Outcome { session_id: None, abandoned: false, error: Some(format!("the terminal could not be drawn on: {e}")) },
     };
     let host = Host::new(opts.host);
-    let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, effort: opts.effort, budget: opts.budget, target, keys: None, turn: None, rx: None, abandoned: false, last_prompt: String::new() };
+    let mut ui = Ui { host: &host, model: opts.model, permission_mode: opts.permission_mode, toolset: opts.toolset, effort: opts.effort, budget: opts.budget, target, keys: None, turn: None, rx: None, abandoned: false };
     let result = ui.run(&mut app, &mut term).await;
     // A turn still running is let go first: its future holds its backend's
     // lock, and would hold a shutdown waiting on it forever.
@@ -217,9 +217,6 @@ struct Ui<'h> {
     rx: Option<mpsc::Receiver<StreamLine>>,
     /// Set to leave now, without the running turn's end.
     abandoned: bool,
-    /// The last prompt sent: what a yes to a limit's offer sends again on
-    /// the instance it moves to (R-INST-7).
-    last_prompt: String,
 }
 
 /// SIGTERM and SIGHUP as one stream, registered once. Either asks the TUI
@@ -426,7 +423,6 @@ impl<'h> Ui<'h> {
                         probe_at = None;
                     }
                     app.on_line(&line);
-                    self.follow(app);
                     self.flush_requests(app).await;
                 }
                 r = finish(&mut self.turn) => {
@@ -437,7 +433,6 @@ impl<'h> Ui<'h> {
                             app.on_line(&line);
                         }
                     }
-                    self.follow(app);
                     // What the engine never read, as the host says on the
                     // result (its own queue, so nothing is guessed), and what
                     // was never accepted at all.
@@ -553,49 +548,7 @@ impl<'h> Ui<'h> {
         term.frame(&lines, &rows, caret)
     }
 
-    /// A switch the stream brought — a rollover, a failed switch going
-    /// back — is where the next prompt goes.
-    fn follow(&mut self, app: &mut App) {
-        if let Some(m) = app.switched.take() {
-            self.retarget(&m);
-            self.model = Some(m);
-        }
-    }
-
-    /// The connectivity probe follows the model's host.
-    fn retarget(&mut self, m: &ModelRef) {
-        if let Ok(i) = self.host.registry().get(&m.instance) {
-            self.target = Target::for_url(&i.base_url, &|k| std::env::var(k).unwrap_or_default());
-        }
-    }
-
-    /// Moves the session to `m` (R-SWITCH-4): checked by the host first,
-    /// and refused with its fix — the session staying where it was — when
-    /// it cannot run there. During a turn it takes effect when the turn is
-    /// over.
-    async fn switch(&mut self, app: &mut App, m: ModelRef) -> bool {
-        let (tx, _rx) = mpsc::channel(4);
-        match self.host.execute(Command::SwitchModel { session_id: app.session_id.clone(), model: m.clone() }, tx).await {
-            Ok(_) => {
-                let when = if app.running() { " once this turn is over" } else { "" };
-                app.gap_say(&format!("{}now on {m}{when}", look::SWITCH));
-                self.retarget(&m);
-                self.model = Some(m.clone());
-                if !app.running() {
-                    app.model = Some(m);
-                }
-                true
-            }
-            Err(e) => {
-                app.error(&e.info());
-                false
-            }
-        }
-    }
-
     fn prompt(&mut self, app: &mut App, text: String) {
-        self.last_prompt = text.clone();
-        app.offer = None;
         let (tx, rx) = mpsc::channel(1024);
         let cmd = Command::Prompt { session_id: app.session_id.clone(), text, model: self.model.clone(), permission_mode: self.permission_mode, toolset: self.toolset.clone(), effort: self.effort, budget: self.budget };
         self.turn = Some(Box::pin(self.host.execute(cmd, tx)));
@@ -749,56 +702,6 @@ impl<'h> Ui<'h> {
                 _ => {}
             }
         }
-        // A limit's offer (R-INST-7): one keystroke, y, and never taken
-        // silently — anything else declines it, and a key that is not an
-        // answer still does what it does.
-        if let Some(offer) = app.offer.clone()
-            && !ctrl
-            && !app.running()
-        {
-            app.offer = None;
-            match k.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if self.switch(app, offer.to).await && !self.last_prompt.is_empty() {
-                        let text = self.last_prompt.clone();
-                        self.prompt(app, text);
-                    }
-                    return false;
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => return false,
-                _ => {}
-            }
-        }
-        // The model picker takes the arrows and enter while it is open.
-        if app.overlay == Overlay::Models && !ctrl {
-            match k.code {
-                KeyCode::Up => {
-                    app.pick_at = app.pick_at.saturating_sub(1);
-                    return false;
-                }
-                KeyCode::Down => {
-                    app.pick_at = (app.pick_at + 1).min(app.picks.len().saturating_sub(1));
-                    return false;
-                }
-                KeyCode::Enter => {
-                    app.overlay = Overlay::None;
-                    if let Some(p) = app.picks.get(app.pick_at).cloned() {
-                        match p.model {
-                            Some(model) => {
-                                self.switch(app, ModelRef { instance: p.instance, model }).await;
-                            }
-                            // No model known for it: the id is the person's to type.
-                            None => {
-                                app.editor.clear();
-                                app.editor.insert_str(&format!("/model {}/", p.instance));
-                            }
-                        }
-                    }
-                    return false;
-                }
-                _ => {}
-            }
-        }
         let e = &mut app.editor;
         match k.code {
             KeyCode::Char('c') if ctrl => {
@@ -901,22 +804,6 @@ impl<'h> Ui<'h> {
             "/help" => {
                 app.editor.clear();
                 app.overlay = Overlay::Keys;
-                return false;
-            }
-            "/model" => {
-                app.editor.clear();
-                let instances: Vec<(String, &'static str)> = self.host.registry().instances.values().map(|i| (i.name.clone(), i.kind)).collect();
-                app.open_picker(&instances);
-                return false;
-            }
-            t if t.starts_with("/model ") => {
-                app.editor.clear();
-                match self.host.registry().parse_model(&t["/model ".len()..]) {
-                    Ok(m) => {
-                        self.switch(app, m).await;
-                    }
-                    Err(e) => app.notice(&format!("/model: {e}")),
-                }
                 return false;
             }
             _ => {}

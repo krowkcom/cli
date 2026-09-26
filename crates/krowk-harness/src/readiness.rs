@@ -423,35 +423,82 @@ fn kill_group(child: &std::process::Child) {
 
 /// Runs a check's command to its end, or stops it at `probe.within`: none
 /// then. Its output is read while it runs, so a chatty vendor cannot fill a
-/// pipe and hang on it.
+/// pipe and hang on it, and read only until the deadline even once it has
+/// exited: a process it left behind that escaped its group (`setsid`, a
+/// daemonizing credential helper) can hold the pipes open for good, and is
+/// then abandoned with whatever had been read — the check never waits on
+/// it past the deadline.
 pub(crate) fn output_within(cmd: &mut Command, probe: &Probe) -> std::io::Result<Option<Output>> {
     use std::io::Read;
+    use std::sync::{mpsc, Arc};
     let within = probe.within;
     let mut child = probing(cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()), probe)?;
+    // Each pipe is read into a buffer shared with this thread, and says
+    // when it reached its end.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (done, finished) = mpsc::channel::<()>();
+        let into = buf.clone();
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
             if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
+                let mut chunk = [0u8; 8192];
+                while let Ok(n) = p.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    into.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]);
+                }
             }
-            buf
-        })
+            let _ = done.send(());
+        });
+        (buf, finished)
     };
     let out = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let started = Instant::now();
-    let status = loop {
-        if let Some(s) = child.try_wait()? {
-            // The vendor answered and left; anything it left running in its
-            // group still holds the pipes the answer is read from.
+    loop {
+        if exited(&mut child)? {
+            // The vendor answered and left, not yet reaped, so its pid —
+            // the group's id — is still its own: whatever it left running
+            // in the group, holding the pipes the answer is read from, is
+            // stopped before the pid can go to anyone else.
             kill_group(&child);
-            break s;
+            break;
         }
         if started.elapsed() > within {
             stop(&mut child);
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.wait()?;
+    let take = |(buf, finished): (Arc<Mutex<Vec<u8>>>, mpsc::Receiver<()>)| {
+        let _ = finished.recv_timeout(within.saturating_sub(started.elapsed()));
+        std::mem::take(&mut *buf.lock().unwrap_or_else(|e| e.into_inner()))
     };
-    Ok(Some(Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() }))
+    Ok(Some(Output { status, stdout: take(out), stderr: take(err) }))
+}
+
+/// Whether the child has exited, without reaping it: its pid stays its own
+/// (a zombie) until `wait`, so `kill_group` cannot reach a group id the
+/// system has since handed to someone else.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    // SAFETY: waitid writes only into the zeroed siginfo it is handed;
+    // WNOWAIT leaves the child to be reaped by `wait`.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info.si_pid() != 0)
+    }
+}
+
+/// Elsewhere `try_wait` reaps the child as it reports it, so the group is
+/// signalled after its leader's pid is free. Accepted: the pid would have
+/// to be reused, as a group id, within the few microseconds in between.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    Ok(child.try_wait()?.is_some())
 }

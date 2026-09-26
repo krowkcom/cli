@@ -215,3 +215,26 @@ fn readiness_a_vendor_that_answers_and_leaves_a_process_behind_does_not_hold_the
     });
     assert!(gone, "the sleeper ({sleeper}) outlived the check");
 }
+
+#[test]
+fn readiness_a_leftover_that_escaped_the_group_cannot_hold_a_check_past_its_deadline() {
+    let h = Home::new("setsid");
+    let pids = h.root.join("pids");
+    // Answers and exits 0, leaving a sleeper in a session of its own —
+    // out of reach of the group kill — that holds its stdout.
+    let claude = h.install("claude", &format!("#!/bin/bash\nsetsid sleep 60 &\necho $! >>'{}'\necho '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}}'\nexit 0\n", pids.display()));
+    let reg = h.registry(vec![("claude:escapes", h.claude(&claude))]);
+    let neutral = readiness::neutral_dir(&h.root.join("data")).unwrap();
+    let started = Instant::now();
+    let r = readiness::check(reg.get("claude:escapes").unwrap(), &h.root.join("creds.json"), &Probe { dir: neutral, within: Duration::from_millis(800) });
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(2), "the escaped sleeper held the check for {took:?}");
+    // What had been read by the deadline is the answer.
+    assert!(r.readiness.is_ready(), "{:?}", r.readiness);
+    if let Ok(p) = std::fs::read_to_string(&pids) {
+        for pid in p.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
+            // SAFETY: the test's own sleeper, which the check could not reach.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
